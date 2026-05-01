@@ -143,6 +143,13 @@ func deployAppConfig(flags *Flags, appCfg *config.AppConfig, serverName, image, 
 		return err
 	}
 
+	// Static deploys take an entirely different path (no docker, no image,
+	// no health checks) so we branch here before the container build/run
+	// machinery runs.
+	if appCfg.IsStatic() {
+		return runStaticDeploy(appCfg, host, user, key)
+	}
+
 	// 3. Resolve image.
 	if image == "" {
 		image = appCfg.Image
@@ -464,4 +471,50 @@ func gitShortHash() (string, error) {
 		return "", err
 	}
 	return strings.TrimSpace(string(out)), nil
+}
+
+// runStaticDeploy handles the type:static deploy path: build (locally) →
+// rsync → symlink → Caddyfile mirror. Container build/run/health-check
+// machinery is intentionally bypassed.
+func runStaticDeploy(cfg *config.AppConfig, host, user, key string) error {
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer cancel()
+
+	fmt.Printf("Connecting to %s@%s...\n", user, host)
+	executor, err := ssh.Connect(ctx, ssh.ConnectConfig{
+		Host:    host,
+		User:    user,
+		KeyPath: key,
+	})
+	if err != nil {
+		return err
+	}
+	defer executor.Close()
+
+	staticCfg := deploy.StaticConfig{
+		App:          cfg.App,
+		Domain:       cfg.Domain,
+		Source:       cfg.Source,
+		Build:        cfg.Build,
+		BuildRemote:  cfg.BuildRemote,
+		SPA:          cfg.SPA,
+		SPAFallback:  cfg.SPAFallback,
+		Cache:        cfg.Cache,
+		Headers:      cfg.Headers,
+		KeepReleases: cfg.KeepReleases,
+		CaddyExtra:   cfg.CaddyExtra,
+	}
+
+	d := deploy.NewStaticDeployer(executor, os.Stdout)
+	if err := d.Deploy(ctx, staticCfg); err != nil {
+		state.AppendLog(ctx, executor, state.LogEntry{
+			Timestamp: time.Now().UTC(),
+			App:       cfg.App,
+			Type:      "deploy",
+			Success:   false,
+			Message:   err.Error(),
+		})
+		return err
+	}
+	return nil
 }

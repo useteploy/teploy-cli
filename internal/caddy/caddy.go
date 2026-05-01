@@ -514,3 +514,99 @@ func loadBalancerBlock(hosts []string, upstreams []Upstream) string {
 		strings.Join(hosts, ", "), strings.Join(dials, " "),
 	)
 }
+
+// StaticBlockOpts configures the Caddyfile site block produced by StaticBlock
+// for a type:static deploy. All fields are optional; defaults match the Vercel-
+// style "drop a folder, get a working site" experience.
+type StaticBlockOpts struct {
+	Hosts       []string          // required: ["example.com", "www.example.com"]
+	Root        string            // required: container-side path to the served files (e.g. /srv/static/myapp/current)
+	SPA         bool              // try_files fallback for SPA routing
+	SPAFallback string            // file to serve as fallback (default: /index.html)
+	Cache       map[string]string // path glob → Cache-Control value
+	Headers     map[string]string // arbitrary response headers
+	CaddyExtra  string            // raw Caddy directives appended into the site block (escape hatch)
+}
+
+// StaticBlock renders the Caddyfile snippet that serves a static deploy. It
+// pairs with SetStaticRoute() and the on-disk Caddyfile mirror so the result
+// survives caddy reloads.
+//
+// Sensible defaults are applied: gzip encoding, file_server with
+// precompressed gzip, common security headers, and no-cache-by-default for
+// HTML alongside immutable cache for hashed asset paths Vite-style.
+func StaticBlock(opts StaticBlockOpts) string {
+	var b strings.Builder
+	b.WriteString(strings.Join(opts.Hosts, ", "))
+	b.WriteString(" {\n")
+	b.WriteString("\tencode gzip\n")
+	b.WriteString(fmt.Sprintf("\troot * %s\n", opts.Root))
+	if opts.SPA {
+		fallback := opts.SPAFallback
+		if fallback == "" {
+			fallback = "/index.html"
+		}
+		b.WriteString(fmt.Sprintf("\ttry_files {path} {path}/ {path}/index.html %s\n", fallback))
+	}
+	b.WriteString("\tfile_server {\n\t\tprecompressed gzip\n\t}\n")
+
+	// Default security headers. Users can override via opts.Headers (which we
+	// emit afterwards so it wins on duplicate keys).
+	b.WriteString("\theader {\n")
+	b.WriteString("\t\tX-Content-Type-Options \"nosniff\"\n")
+	b.WriteString("\t\tX-Frame-Options \"SAMEORIGIN\"\n")
+	b.WriteString("\t\tReferrer-Policy \"strict-origin-when-cross-origin\"\n")
+	b.WriteString("\t\tPermissions-Policy \"camera=(), microphone=(), geolocation=()\"\n")
+	for k, v := range opts.Headers {
+		b.WriteString(fmt.Sprintf("\t\t%s %q\n", k, v))
+	}
+	b.WriteString("\t}\n")
+
+	// Per-path Cache-Control rules. Each becomes a named matcher + header.
+	i := 0
+	for pattern, value := range opts.Cache {
+		i++
+		matcher := fmt.Sprintf("@cache%d", i)
+		b.WriteString(fmt.Sprintf("\t%s path %s\n", matcher, pattern))
+		b.WriteString(fmt.Sprintf("\theader %s Cache-Control %q\n", matcher, value))
+	}
+
+	if extra := strings.TrimSpace(opts.CaddyExtra); extra != "" {
+		b.WriteString("\n\t# user-supplied caddy_extra:\n")
+		for _, line := range strings.Split(extra, "\n") {
+			if line == "" {
+				b.WriteString("\n")
+			} else {
+				b.WriteString("\t" + line + "\n")
+			}
+		}
+	}
+
+	b.WriteString("}")
+	return b.String()
+}
+
+// SetStaticRoute upserts a Caddyfile block for a static deploy and removes any
+// previously-installed reverse_proxy/load-balancer block for the same app
+// (covers the case of a container-to-static migration where the user changes
+// `type:` in teploy.yml).
+func (c *Client) SetStaticRoute(ctx context.Context, app, domain string, opts StaticBlockOpts) error {
+	hosts := parseDomains(domain)
+	if len(hosts) == 0 {
+		return fmt.Errorf("SetStaticRoute: domain must be non-empty")
+	}
+	opts.Hosts = hosts
+
+	// If the same app previously deployed as a container, the admin API still
+	// holds its teploy-<app> route. Surgically remove it so the static block
+	// in the Caddyfile becomes the only route for these hosts.
+	_ = c.deleteRouteByID(ctx, "teploy-"+app)
+	_ = c.deleteRouteByID(ctx, "teploy-lb-"+app)
+
+	// Likewise drop any stale lb-<app> Caddyfile block.
+	if err := c.upsertCaddyfileBlock(ctx, "lb-"+app, ""); err != nil {
+		return err
+	}
+
+	return c.upsertCaddyfileBlock(ctx, app, StaticBlock(opts))
+}

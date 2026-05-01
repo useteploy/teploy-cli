@@ -63,10 +63,18 @@ type NetworkConfig struct {
 	SetupKey string `yaml:"setup_key,omitempty" toml:"setup_key"`
 }
 
+// Deploy types. Empty string and "container" both mean container; "static"
+// switches to the file-based deploy path (no docker, just rsync + Caddy).
+const (
+	TypeContainer = "container"
+	TypeStatic    = "static"
+)
+
 // AppConfig represents the teploy configuration (yml, yaml, or toml).
 type AppConfig struct {
 	App           string                     `yaml:"app" toml:"app"`
 	Domain        string                     `yaml:"domain" toml:"domain"`
+	Type          string                     `yaml:"type,omitempty" toml:"type"`
 	Server        string                     `yaml:"server,omitempty" toml:"server"`
 	Servers       []string                   `yaml:"servers,omitempty" toml:"servers"`
 	Image         string                     `yaml:"image,omitempty" toml:"image"`
@@ -83,6 +91,22 @@ type AppConfig struct {
 	Assets        AssetsConfig               `yaml:"assets,omitempty" toml:"assets"`
 	Notifications NotificationsConfig        `yaml:"notifications,omitempty" toml:"notifications"`
 	Network       NetworkConfig              `yaml:"network,omitempty" toml:"network"`
+
+	// Static deploy fields. Only used when Type == "static".
+	Source       string            `yaml:"source,omitempty" toml:"source"`             // local path to built files
+	Build        []string          `yaml:"build,omitempty" toml:"build"`               // pre-rsync shell commands (run locally by default)
+	BuildRemote  bool              `yaml:"build_remote,omitempty" toml:"build_remote"` // run Build commands on the target server instead of locally
+	SPA          bool              `yaml:"spa,omitempty" toml:"spa"`                   // enable SPA fallback (try_files)
+	SPAFallback  string            `yaml:"spa_fallback,omitempty" toml:"spa_fallback"` // fallback path (default /index.html)
+	Cache        map[string]string `yaml:"cache,omitempty" toml:"cache"`               // path glob → Cache-Control value
+	Headers      map[string]string `yaml:"headers,omitempty" toml:"headers"`           // arbitrary response headers
+	KeepReleases int               `yaml:"keep_releases,omitempty" toml:"keep_releases"` // retention count (default 5)
+	CaddyExtra   string            `yaml:"caddy_extra,omitempty" toml:"caddy_extra"`   // raw Caddy directives appended into the site block
+}
+
+// IsStatic reports whether this app deploys as static files (no container).
+func (c *AppConfig) IsStatic() bool {
+	return c.Type == TypeStatic
 }
 
 func (c *AppConfig) validate() error {
@@ -112,6 +136,32 @@ func (c *AppConfig) validate() error {
 	}
 	if c.Platform != "" && !validPlatform.MatchString(c.Platform) {
 		return fmt.Errorf("'platform' must be os/arch (e.g. linux/amd64, linux/arm64), got %q", c.Platform)
+	}
+	// Validate deploy type and its required fields. Empty type means container.
+	switch c.Type {
+	case "", TypeContainer:
+		// container path uses Image / BuildLocal / Port / etc. — nothing extra to enforce here
+	case TypeStatic:
+		if c.Source == "" {
+			return fmt.Errorf("'source' is required when type is 'static'")
+		}
+		if c.Image != "" {
+			return fmt.Errorf("'image' cannot be set when type is 'static'")
+		}
+		if c.BuildLocal {
+			return fmt.Errorf("'build_local' is for container builds; use 'build_remote' for static deploys")
+		}
+		if c.Replicas > 0 {
+			return fmt.Errorf("'replicas' is not supported for type:static (no processes to replicate)")
+		}
+		if c.SPAFallback != "" && !strings.HasPrefix(c.SPAFallback, "/") {
+			return fmt.Errorf("'spa_fallback' must start with / (got %q)", c.SPAFallback)
+		}
+		if c.KeepReleases < 0 {
+			return fmt.Errorf("'keep_releases' must be >= 0 (got %d)", c.KeepReleases)
+		}
+	default:
+		return fmt.Errorf("'type' must be 'container' or 'static' (got %q)", c.Type)
 	}
 	for name := range c.Volumes {
 		if !validName.MatchString(name) {
@@ -280,6 +330,47 @@ func mergeConfigs(base, overlay *AppConfig) {
 	}
 	if overlay.Network.Provider != "" {
 		base.Network = overlay.Network
+	}
+	// Static-deploy fields.
+	if overlay.Type != "" {
+		base.Type = overlay.Type
+	}
+	if overlay.Source != "" {
+		base.Source = overlay.Source
+	}
+	if len(overlay.Build) > 0 {
+		base.Build = overlay.Build
+	}
+	if overlay.BuildRemote {
+		base.BuildRemote = overlay.BuildRemote
+	}
+	if overlay.SPA {
+		base.SPA = overlay.SPA
+	}
+	if overlay.SPAFallback != "" {
+		base.SPAFallback = overlay.SPAFallback
+	}
+	if len(overlay.Cache) > 0 {
+		if base.Cache == nil {
+			base.Cache = map[string]string{}
+		}
+		for k, v := range overlay.Cache {
+			base.Cache[k] = v
+		}
+	}
+	if len(overlay.Headers) > 0 {
+		if base.Headers == nil {
+			base.Headers = map[string]string{}
+		}
+		for k, v := range overlay.Headers {
+			base.Headers[k] = v
+		}
+	}
+	if overlay.KeepReleases > 0 {
+		base.KeepReleases = overlay.KeepReleases
+	}
+	if overlay.CaddyExtra != "" {
+		base.CaddyExtra = overlay.CaddyExtra
 	}
 }
 

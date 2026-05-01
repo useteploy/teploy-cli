@@ -16,26 +16,32 @@ import (
 
 func newRollbackCmd(flags *Flags) *cobra.Command {
 	var appName string
+	var toHash string
 
 	cmd := &cobra.Command{
 		Use:   "rollback",
 		Short: "Roll back to the previous deploy",
-		Long:  "Start the previous version's containers, health check, re-route traffic, and stop the current containers.",
-		Args:  cobra.NoArgs,
+		Long: `Start the previous version's containers (or, for type:static apps, flip the
+release symlink), health check, re-route traffic, and stop the current containers.
+
+For type:static apps, --to <hash> rolls back to a specific retained release;
+without --to, the previous deploy is used.`,
+		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if appName != "" {
 				return runRollbackByApp(flags, appName)
 			}
-			return runRollback(flags)
+			return runRollback(flags, toHash)
 		},
 	}
 
 	cmd.Flags().StringVar(&appName, "app", "", "app name — reads state from server instead of teploy.yml (requires --host)")
+	cmd.Flags().StringVar(&toHash, "to", "", "specific release hash to roll back to (type:static only)")
 
 	return cmd
 }
 
-func runRollback(flags *Flags) error {
+func runRollback(flags *Flags, toHash string) error {
 	appCfg, err := config.LoadApp(".")
 	if err != nil {
 		return err
@@ -49,6 +55,25 @@ func runRollback(flags *Flags) error {
 		return err
 	}
 	defer executor.Close()
+
+	// Static apps take the file-based rollback path.
+	if appCfg.IsStatic() {
+		d := deploy.NewStaticDeployer(executor, os.Stdout)
+		return d.Rollback(ctx, deploy.StaticRollbackConfig{
+			App:         appCfg.App,
+			Domain:      appCfg.Domain,
+			ToHash:      toHash,
+			SPA:         appCfg.SPA,
+			SPAFallback: appCfg.SPAFallback,
+			Cache:       appCfg.Cache,
+			Headers:     appCfg.Headers,
+			CaddyExtra:  appCfg.CaddyExtra,
+		})
+	}
+
+	if toHash != "" {
+		return fmt.Errorf("--to is only supported for type:static apps")
+	}
 
 	rollbackErr := deploy.Rollback(ctx, executor, os.Stdout, deploy.RollbackConfig{
 		App:         appCfg.App,
