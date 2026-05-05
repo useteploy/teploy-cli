@@ -200,7 +200,8 @@ func runTemplateInstall(flags *Flags, name, domain, server string, extraVars []s
 	fmt.Printf("  Domain: %s\n", domain)
 	fmt.Printf("  Server: %s\n", server)
 
-	return deployAppConfig(flags, appCfg, server, appCfg.Image, "", false)
+	// Templates are first-deploys by definition, so volume mismatch can't apply yet.
+	return deployAppConfig(flags, appCfg, server, appCfg.Image, "", false, false)
 }
 
 func joinStrings(ss []string) string {

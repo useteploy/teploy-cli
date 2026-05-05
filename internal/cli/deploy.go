@@ -25,14 +25,15 @@ import (
 
 func newDeployCmd(flags *Flags) *cobra.Command {
 	var (
-		image        string
-		version      string
-		skipDNSCheck bool
-		parallel     int
-		destination  string
-		appName      string
-		domain       string
-		port         int
+		image           string
+		version         string
+		skipDNSCheck    bool
+		parallel        int
+		destination     string
+		appName         string
+		domain          string
+		port            int
+		migrateVolumes  bool
 	)
 
 	cmd := &cobra.Command{
@@ -42,7 +43,13 @@ func newDeployCmd(flags *Flags) *cobra.Command {
 Use -d to deploy with a destination overlay (e.g. -d staging merges teploy.staging.yml).
 
 For ad-hoc deploys without a teploy.yml (e.g. from teploy-dash), pass --app, --image, and --domain:
-  teploy deploy myserver --app myapp --image nginx:latest --domain app.example.com`,
+  teploy deploy myserver --app myapp --image nginx:latest --domain app.example.com
+
+If a previously-deployed container mounted volumes from a different host path
+(common when migrating from Dokploy or hand-rolled docker run setups), the
+deploy aborts safely rather than orphaning data. Pass --migrate-volumes to
+copy data from the existing source into the teploy-expected path before
+swapping traffic.`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			var serverName string
@@ -50,9 +57,9 @@ For ad-hoc deploys without a teploy.yml (e.g. from teploy-dash), pass --app, --i
 				serverName = args[0]
 			}
 			if appName != "" {
-				return runAdHocDeploy(flags, serverName, appName, image, domain, port, version, skipDNSCheck)
+				return runAdHocDeploy(flags, serverName, appName, image, domain, port, version, skipDNSCheck, migrateVolumes)
 			}
-			return runDeploy(flags, serverName, image, version, skipDNSCheck, parallel, destination)
+			return runDeploy(flags, serverName, image, version, skipDNSCheck, parallel, destination, migrateVolumes)
 		},
 	}
 
@@ -64,13 +71,14 @@ For ad-hoc deploys without a teploy.yml (e.g. from teploy-dash), pass --app, --i
 	cmd.Flags().StringVar(&appName, "app", "", "app name for ad-hoc deploy (bypasses teploy.yml)")
 	cmd.Flags().StringVar(&domain, "domain", "", "domain for ad-hoc deploy")
 	cmd.Flags().IntVar(&port, "port", 80, "container port for ad-hoc deploy")
+	cmd.Flags().BoolVar(&migrateVolumes, "migrate-volumes", false, "auto-migrate data from foreign volume sources to teploy paths (cp -a)")
 
 	return cmd
 }
 
 // runAdHocDeploy handles deploys without a teploy.yml — used by teploy-dash
 // and scripting. Requires --app and --image at minimum.
-func runAdHocDeploy(flags *Flags, serverName, appName, image, domain string, port int, version string, skipDNSCheck bool) error {
+func runAdHocDeploy(flags *Flags, serverName, appName, image, domain string, port int, version string, skipDNSCheck, migrateVolumes bool) error {
 	if image == "" {
 		return fmt.Errorf("--image is required for ad-hoc deploy (no teploy.yml)")
 	}
@@ -95,10 +103,10 @@ func runAdHocDeploy(flags *Flags, serverName, appName, image, domain string, por
 		Server: serverName,
 	}
 
-	return deployAppConfig(flags, appCfg, serverName, image, version, skipDNSCheck)
+	return deployAppConfig(flags, appCfg, serverName, image, version, skipDNSCheck, migrateVolumes)
 }
 
-func runDeploy(flags *Flags, serverName, image, version string, skipDNSCheck bool, parallel int, destination string) error {
+func runDeploy(flags *Flags, serverName, image, version string, skipDNSCheck bool, parallel int, destination string, migrateVolumes bool) error {
 	// 1. Load teploy.yml from current directory (with optional destination overlay).
 	var appCfg *config.AppConfig
 	var err error
@@ -114,15 +122,19 @@ func runDeploy(flags *Flags, serverName, image, version string, skipDNSCheck boo
 	// Multi-server deploy: if teploy.yml lists multiple servers and no explicit
 	// server argument was provided, deploy to all of them in parallel.
 	if len(appCfg.Servers) > 1 && serverName == "" {
+		// TODO(autodeploy/multideploy): plumb migrateVolumes through the
+		// multi-server path. The volume-mismatch check currently runs only on
+		// single-server deploys (deployAppConfig). Same fix applies in
+		// internal/cli/singledeploy.go's deployApp.
 		return runMultiDeploy(flags, appCfg, image, version, skipDNSCheck, parallel)
 	}
 
-	return deployAppConfig(flags, appCfg, serverName, image, version, skipDNSCheck)
+	return deployAppConfig(flags, appCfg, serverName, image, version, skipDNSCheck, migrateVolumes)
 }
 
 // deployAppConfig runs a single-server deploy from an already-loaded AppConfig.
 // Used by both runDeploy (from teploy.yml) and runTemplateInstall (from template).
-func deployAppConfig(flags *Flags, appCfg *config.AppConfig, serverName, image, version string, skipDNSCheck bool) error {
+func deployAppConfig(flags *Flags, appCfg *config.AppConfig, serverName, image, version string, skipDNSCheck, migrateVolumes bool) error {
 	var err error
 
 	// 2. Resolve server (single-server deploy).
@@ -306,6 +318,27 @@ func deployAppConfig(flags *Flags, appCfg *config.AppConfig, serverName, image, 
 			volumes[hostPath] = containerPath
 			if _, err := executor.Run(ctx, fmt.Sprintf("mkdir -p %s", hostPath)); err != nil {
 				return fmt.Errorf("creating volume directory %s: %w", hostPath, err)
+			}
+		}
+	}
+
+	// 10a. Detect any existing container whose volume mount source doesn't match
+	// what teploy resolved above. Without this check, redeploying an app that
+	// was originally launched with a Docker named volume (or any non-teploy
+	// bind mount) would silently create empty bind mounts, swap traffic, and
+	// orphan the data. See tyler/teploy-cli#1.
+	if len(volumes) > 0 {
+		dockerClient := docker.NewClient(executor)
+		mismatches, err := dockerClient.DetectVolumeMismatches(ctx, appCfg.App, volumes)
+		if err != nil {
+			return fmt.Errorf("checking existing volume mounts: %w", err)
+		}
+		if len(mismatches) > 0 {
+			if !migrateVolumes {
+				return docker.FormatMismatchError(appCfg.App, mismatches)
+			}
+			if err := docker.MigrateVolumes(ctx, executor, appCfg.App, mismatches, os.Stdout); err != nil {
+				return fmt.Errorf("migrating volumes: %w", err)
 			}
 		}
 	}
