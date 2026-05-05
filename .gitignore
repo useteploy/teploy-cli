@@ -31,3 +31,4 @@ test-results/
 
 # Claude Code
 CLAUDE.md
+.claude/
