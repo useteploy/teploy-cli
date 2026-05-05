@@ -12,7 +12,25 @@ import (
 const (
 	deploymentsDir = "/deployments"
 	scriptName     = "autodeploy.sh"
+	// scheduledScriptName is the per-app on-server script that the scheduled
+	// redeploy cron job invokes. It checks for a newer image digest and
+	// recreates the container if there is one — otherwise no-ops silently.
+	scheduledScriptName = "scheduled-redeploy.sh"
 )
+
+// ValidateSchedule rejects cron strings containing characters outside the
+// canonical 5-field grammar. Mirrors backup.ValidateSchedule so the two
+// scheduled features behave identically. We're not enforcing the field count
+// here (cron itself rejects malformed strings on install) — just blocking
+// characters that could enable shell injection through the crontab call.
+func ValidateSchedule(schedule string) error {
+	for _, c := range schedule {
+		if !((c >= '0' && c <= '9') || c == ' ' || c == '*' || c == '/' || c == '-' || c == ',') {
+			return fmt.Errorf("invalid cron schedule %q — unexpected character %q", schedule, string(c))
+		}
+	}
+	return nil
+}
 
 // Config holds auto-deploy configuration.
 type Config struct {
@@ -142,7 +160,97 @@ func (m *Manager) Status(ctx context.Context, app string) (bool, string, error) 
 	return status == "active", status, nil
 }
 
-// Remove disables and removes the auto-deploy webhook for the app.
+// ScheduleStatus reports whether a scheduled redeploy is configured for the
+// app, returning the cron expression on success. Empty string means none.
+func (m *Manager) ScheduleStatus(ctx context.Context, app string) (string, error) {
+	scriptPath := fmt.Sprintf("%s/%s/%s", deploymentsDir, app, scheduledScriptName)
+	// crontab -l exits non-zero when there is no crontab. Treat that as "no schedule".
+	out, err := m.exec.Run(ctx, fmt.Sprintf("crontab -l 2>/dev/null | grep -F %q || true", scriptPath))
+	if err != nil {
+		return "", nil
+	}
+	line := strings.TrimSpace(out)
+	if line == "" {
+		return "", nil
+	}
+	// A cron entry looks like: `<5 fields> <command>`. Split off the command.
+	idx := strings.Index(line, scriptPath)
+	if idx <= 0 {
+		return line, nil
+	}
+	return strings.TrimSpace(line[:idx]), nil
+}
+
+// Schedule installs a server-side cron job that periodically checks for a
+// newer image digest and redeploys the running container if one is found.
+//
+// The on-server script does the work entirely with docker CLI commands, so
+// the teploy binary does not need to be installed on the server. It pulls
+// the image referenced by the currently-running container, compares digests,
+// and only recreates the container if the digest changed. No new image, no
+// container restart — quiet no-op.
+func (m *Manager) Schedule(ctx context.Context, app, schedule string) error {
+	if app == "" {
+		return fmt.Errorf("app name is required")
+	}
+	if err := ValidateSchedule(schedule); err != nil {
+		return err
+	}
+
+	appDir := fmt.Sprintf("%s/%s", deploymentsDir, app)
+	scriptPath := fmt.Sprintf("%s/%s", appDir, scheduledScriptName)
+
+	if _, err := m.exec.Run(ctx, "mkdir -p "+appDir); err != nil {
+		return fmt.Errorf("creating app directory: %w", err)
+	}
+
+	fmt.Fprintln(m.out, "Installing scheduled-redeploy script...")
+	script := generateScheduledRedeployScript(app)
+	if err := m.exec.Upload(ctx, strings.NewReader(script), scriptPath, "0755"); err != nil {
+		return fmt.Errorf("uploading scheduled-redeploy script: %w", err)
+	}
+
+	// Replace any existing entry pointing at this script, then add the new one.
+	// A bare && would short-circuit if there's no existing crontab; the
+	// `crontab -l 2>/dev/null || true` form keeps the pipeline going from
+	// a zero-state install.
+	cronCmd := fmt.Sprintf(
+		"(crontab -l 2>/dev/null | grep -vF %q; echo '%s %s >> %s/scheduled-redeploy.log 2>&1') | crontab -",
+		scriptPath, schedule, scriptPath, appDir,
+	)
+	if _, err := m.exec.Run(ctx, cronCmd); err != nil {
+		return fmt.Errorf("installing cron entry: %w", err)
+	}
+
+	fmt.Fprintf(m.out, "Scheduled redeploy installed for %s\n", app)
+	fmt.Fprintf(m.out, "  Schedule: %s\n", schedule)
+	fmt.Fprintf(m.out, "  Script:   %s\n", scriptPath)
+	fmt.Fprintf(m.out, "  Log:      %s/scheduled-redeploy.log\n", appDir)
+	return nil
+}
+
+// Unschedule removes the scheduled redeploy cron entry for the app.
+// The on-server script file is left in place so a subsequent Schedule()
+// call doesn't have to reupload it.
+func (m *Manager) Unschedule(ctx context.Context, app string) error {
+	if app == "" {
+		return fmt.Errorf("app name is required")
+	}
+	scriptPath := fmt.Sprintf("%s/%s/%s", deploymentsDir, app, scheduledScriptName)
+
+	cronCmd := fmt.Sprintf(
+		"(crontab -l 2>/dev/null | grep -vF %q) | crontab - || crontab -r 2>/dev/null || true",
+		scriptPath,
+	)
+	if _, err := m.exec.Run(ctx, cronCmd); err != nil {
+		return fmt.Errorf("removing cron entry: %w", err)
+	}
+	fmt.Fprintf(m.out, "Scheduled redeploy removed for %s\n", app)
+	return nil
+}
+
+// Remove disables and removes both the auto-deploy webhook and any
+// scheduled redeploy for the app.
 func (m *Manager) Remove(ctx context.Context, app string) error {
 	serviceName := fmt.Sprintf("teploy-webhook-%s", app)
 
@@ -156,6 +264,10 @@ func (m *Manager) Remove(ctx context.Context, app string) error {
 	for _, cmd := range cmds {
 		m.exec.Run(ctx, cmd)
 	}
+
+	// Remove scheduled redeploy too, if configured. Errors are non-fatal —
+	// we're best-effort cleaning up.
+	_ = m.Unschedule(ctx, app)
 
 	fmt.Fprintf(m.out, "Auto-deploy removed for %s\n", app)
 	return nil
@@ -228,6 +340,124 @@ while true; do
     }
 done
 `, app, secretCheck, scriptPath, app)
+}
+
+// generateScheduledRedeployScript returns the bash script that the cron job
+// invokes. It runs entirely on the server with no teploy-binary dependency:
+//   1. Find the running container for this app's "web" process by labels.
+//   2. Pull the image tag the container was started with.
+//   3. Compare the running image digest with the just-pulled one. If they
+//      match, exit silently — the container is already current.
+//   4. Otherwise, capture the current container's env, volumes, ports,
+//      labels, network, and restart policy via docker inspect, then
+//      stop+rm and recreate it with the same name and the new image.
+//
+// We keep the same container name on purpose: Caddy's reverse_proxy upstream
+// resolves containers by their network alias / DNS name, and re-using the
+// name avoids a Caddy reconfigure step. The trade-off is a brief downtime
+// window between stop and start (typically 1-3 seconds for Forgejo-class
+// services). True zero-downtime swap belongs in a v2 that runs through
+// teploy deploy on the server side.
+func generateScheduledRedeployScript(app string) string {
+	return fmt.Sprintf(`#!/bin/bash
+# Scheduled redeploy script for %[1]s
+# Pulls the image and recreates the container if (and only if) the digest changed.
+set -e
+
+APP=%[1]q
+PROCESS="web"
+LOG="/deployments/$APP/scheduled-redeploy.log"
+
+ts() { date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ; }
+
+CONTAINER=$(docker ps --filter "label=teploy.app=$APP" --filter "label=teploy.process=$PROCESS" --format '{{.Names}}' | head -n 1)
+if [ -z "$CONTAINER" ]; then
+    echo "$(ts) [skip] no running container for $APP/$PROCESS" >> "$LOG"
+    exit 0
+fi
+
+IMAGE=$(docker inspect --format='{{.Config.Image}}' "$CONTAINER")
+if [ -z "$IMAGE" ]; then
+    echo "$(ts) [error] could not read image for $CONTAINER" >> "$LOG"
+    exit 1
+fi
+
+CURRENT_DIGEST=$(docker inspect --format='{{.Image}}' "$CONTAINER")
+
+# Pull the same tag — gets the latest digest if the upstream was updated.
+if ! docker pull "$IMAGE" >> "$LOG" 2>&1; then
+    echo "$(ts) [error] docker pull failed for $IMAGE" >> "$LOG"
+    exit 1
+fi
+
+NEW_DIGEST=$(docker image inspect --format='{{.Id}}' "$IMAGE")
+
+if [ "$CURRENT_DIGEST" = "$NEW_DIGEST" ]; then
+    # No-op silent exit. Don't spam the log on every cron tick.
+    exit 0
+fi
+
+echo "$(ts) [redeploy] new digest for $IMAGE — recreating $CONTAINER" >> "$LOG"
+
+# Snapshot config from the running container before we tear it down.
+ENV_FILE=$(mktemp)
+docker inspect --format='{{range .Config.Env}}{{println .}}{{end}}' "$CONTAINER" > "$ENV_FILE"
+
+VOL_ARGS=()
+while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    VOL_ARGS+=("-v" "$line")
+done < <(docker inspect --format='{{range .Mounts}}{{if eq .Type "volume"}}{{.Name}}:{{.Destination}}
+{{else if eq .Type "bind"}}{{.Source}}:{{.Destination}}
+{{end}}{{end}}' "$CONTAINER")
+
+LABEL_ARGS=()
+NEW_VERSION=$(date +%%s)
+while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    KEY="${line%%%%=*}"
+    VAL="${line#*=}"
+    if [ "$KEY" = "teploy.version" ]; then
+        VAL="$NEW_VERSION"
+    fi
+    LABEL_ARGS+=("--label" "$KEY=$VAL")
+done < <(docker inspect --format='{{range $k, $v := .Config.Labels}}{{$k}}={{$v}}
+{{end}}' "$CONTAINER")
+
+PORT_ARGS=()
+while IFS= read -r line; do
+    [ -z "$line" ] && continue
+    PORT_ARGS+=("-p" "$line")
+done < <(docker inspect --format='{{range $port, $bindings := .NetworkSettings.Ports}}{{range $bindings}}{{.HostIp}}:{{.HostPort}}:{{$port}}
+{{end}}{{end}}' "$CONTAINER" | sed 's|/tcp||;s|/udp||')
+
+NETWORK=$(docker inspect --format='{{range $n, $v := .NetworkSettings.Networks}}{{$n}}{{end}}' "$CONTAINER" | head -n 1)
+RESTART=$(docker inspect --format='{{.HostConfig.RestartPolicy.Name}}' "$CONTAINER")
+[ -z "$RESTART" ] && RESTART=no
+
+# Tear down the old container.
+docker stop "$CONTAINER" >> "$LOG" 2>&1 || true
+docker rm "$CONTAINER" >> "$LOG" 2>&1 || true
+
+# Recreate with the same name and config + new image.
+NEW_ID=$(docker run -d \
+    --name "$CONTAINER" \
+    --network "${NETWORK:-bridge}" \
+    --restart "$RESTART" \
+    --env-file "$ENV_FILE" \
+    "${LABEL_ARGS[@]}" \
+    "${VOL_ARGS[@]}" \
+    "${PORT_ARGS[@]}" \
+    "$IMAGE" 2>>"$LOG") || {
+        echo "$(ts) [error] docker run failed — container is down" >> "$LOG"
+        rm -f "$ENV_FILE"
+        exit 1
+    }
+
+rm -f "$ENV_FILE"
+
+echo "$(ts) [ok] $CONTAINER redeployed (id=${NEW_ID:0:12} version=$NEW_VERSION)" >> "$LOG"
+`, app)
 }
 
 func generateService(name, listenerPath string) string {

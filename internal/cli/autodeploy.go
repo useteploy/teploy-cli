@@ -14,12 +14,14 @@ import (
 func newAutoDeployCmd(flags *Flags) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "autodeploy",
-		Short: "Manage webhook-triggered auto-deploys",
+		Short: "Manage webhook-triggered and scheduled auto-deploys",
 	}
 
 	cmd.AddCommand(newAutoDeploySetupCmd(flags))
 	cmd.AddCommand(newAutoDeployStatusCmd(flags))
 	cmd.AddCommand(newAutoDeployRemoveCmd(flags))
+	cmd.AddCommand(newAutoDeployScheduleCmd(flags))
+	cmd.AddCommand(newAutoDeployUnscheduleCmd(flags))
 
 	return cmd
 }
@@ -120,14 +122,103 @@ func runAutoDeployStatus(flags *Flags) error {
 		return err
 	}
 
+	fmt.Println("Webhook auto-deploy:")
 	if active {
-		fmt.Printf("Auto-deploy: active (%s)\n", status)
-		fmt.Printf("  Webhook URL: https://%s/teploy-webhook/%s\n", appCfg.Domain, appCfg.App)
+		fmt.Printf("  status:      active (%s)\n", status)
+		fmt.Printf("  webhook URL: https://%s/teploy-webhook/%s\n", appCfg.Domain, appCfg.App)
 	} else {
-		fmt.Println("Auto-deploy: not configured")
-		fmt.Println("  Run 'teploy autodeploy setup' to enable")
+		fmt.Println("  status:      not configured")
+		fmt.Println("  enable with: teploy autodeploy setup")
+	}
+
+	schedule, err := mgr.ScheduleStatus(ctx, appCfg.App)
+	if err != nil {
+		return err
+	}
+	fmt.Println("Scheduled redeploy:")
+	if schedule != "" {
+		fmt.Printf("  status:      active\n")
+		fmt.Printf("  cron:        %s\n", schedule)
+		fmt.Printf("  log:         /deployments/%s/scheduled-redeploy.log\n", appCfg.App)
+	} else {
+		fmt.Println("  status:      not configured")
+		fmt.Println("  enable with: teploy autodeploy schedule \"<cron>\"")
 	}
 	return nil
+}
+
+func newAutoDeployScheduleCmd(flags *Flags) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "schedule <cron>",
+		Short: "Schedule periodic redeploys to refresh the image",
+		Long: `Installs a cron job on the server that periodically pulls the image
+referenced by the running container and redeploys only if a newer
+digest is available. No-op when the image is already current.
+
+Use this when the image tag is pinned to a major version (e.g. :14)
+and you want to receive its patch releases automatically.
+
+Examples:
+  teploy autodeploy schedule "0 4 * * 0"      # Sundays at 4am
+  teploy autodeploy schedule "0 */6 * * *"    # every 6 hours`,
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runAutoDeploySchedule(flags, args[0])
+		},
+	}
+	return cmd
+}
+
+func runAutoDeploySchedule(flags *Flags, schedule string) error {
+	appCfg, err := config.LoadApp(".")
+	if err != nil {
+		return err
+	}
+	if err := autodeploy.ValidateSchedule(schedule); err != nil {
+		return err
+	}
+
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer cancel()
+
+	executor, err := connectForApp(ctx, flags, appCfg)
+	if err != nil {
+		return err
+	}
+	defer executor.Close()
+
+	mgr := autodeploy.NewManager(executor, os.Stdout)
+	return mgr.Schedule(ctx, appCfg.App, schedule)
+}
+
+func newAutoDeployUnscheduleCmd(flags *Flags) *cobra.Command {
+	return &cobra.Command{
+		Use:   "unschedule",
+		Short: "Remove the scheduled redeploy cron entry",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runAutoDeployUnschedule(flags)
+		},
+	}
+}
+
+func runAutoDeployUnschedule(flags *Flags) error {
+	appCfg, err := config.LoadApp(".")
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer cancel()
+
+	executor, err := connectForApp(ctx, flags, appCfg)
+	if err != nil {
+		return err
+	}
+	defer executor.Close()
+
+	mgr := autodeploy.NewManager(executor, os.Stdout)
+	return mgr.Unschedule(ctx, appCfg.App)
 }
 
 func newAutoDeployRemoveCmd(flags *Flags) *cobra.Command {

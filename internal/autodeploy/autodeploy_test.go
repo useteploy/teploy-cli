@@ -159,3 +159,147 @@ func TestGenerateService(t *testing.T) {
 		t.Error("service should restart always")
 	}
 }
+
+func TestValidateSchedule(t *testing.T) {
+	cases := []struct {
+		in      string
+		wantErr bool
+	}{
+		{"0 4 * * 0", false},
+		{"*/5 * * * *", false},
+		{"0,30 1-6 * * 1-5", false},
+		{"0 4 * * 0; rm -rf /", true}, // shell metachar — must reject
+		{"0 4 * * 0 && curl evil.com", true},
+		{"$(whoami)", true},
+		{"`whoami`", true},
+	}
+	for _, c := range cases {
+		err := ValidateSchedule(c.in)
+		if (err != nil) != c.wantErr {
+			t.Errorf("ValidateSchedule(%q): wantErr=%v, got %v", c.in, c.wantErr, err)
+		}
+	}
+}
+
+func TestSchedule(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "mkdir -p /deployments/myapp", Output: ""},
+		ssh.MockCommand{Match: "UPLOAD:", Output: ""},
+		ssh.MockCommand{Match: "(crontab", Output: ""},
+	)
+
+	var buf bytes.Buffer
+	mgr := NewManager(mock, &buf)
+	err := mgr.Schedule(context.Background(), "myapp", "0 4 * * 0")
+	if err != nil {
+		t.Fatalf("Schedule: %v", err)
+	}
+
+	script, ok := mock.Files["/deployments/myapp/scheduled-redeploy.sh"]
+	if !ok {
+		t.Fatal("scheduled-redeploy.sh not uploaded")
+	}
+	for _, want := range []string{
+		`APP="myapp"`,
+		"docker pull",
+		"docker inspect",
+		"teploy.app=$APP",
+		"teploy.process=$PROCESS",
+		"CURRENT_DIGEST",
+		"NEW_DIGEST",
+	} {
+		if !strings.Contains(string(script), want) {
+			t.Errorf("scheduled-redeploy.sh missing %q", want)
+		}
+	}
+
+	if !strings.Contains(buf.String(), "Scheduled redeploy installed for myapp") {
+		t.Error("expected install confirmation")
+	}
+	if !strings.Contains(buf.String(), "0 4 * * 0") {
+		t.Error("expected cron schedule in output")
+	}
+}
+
+func TestSchedule_RejectsBadCron(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4")
+	mgr := NewManager(mock, &bytes.Buffer{})
+
+	err := mgr.Schedule(context.Background(), "myapp", "0 4 * * 0; echo pwned")
+	if err == nil {
+		t.Fatal("expected validation error for shell-metachar cron string")
+	}
+}
+
+func TestSchedule_RejectsEmptyApp(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4")
+	mgr := NewManager(mock, &bytes.Buffer{})
+
+	if err := mgr.Schedule(context.Background(), "", "0 4 * * 0"); err == nil {
+		t.Fatal("expected error for empty app name")
+	}
+}
+
+func TestUnschedule(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "(crontab", Output: ""},
+	)
+
+	var buf bytes.Buffer
+	mgr := NewManager(mock, &buf)
+	if err := mgr.Unschedule(context.Background(), "myapp"); err != nil {
+		t.Fatalf("Unschedule: %v", err)
+	}
+	if !strings.Contains(buf.String(), "Scheduled redeploy removed for myapp") {
+		t.Error("expected removal message")
+	}
+}
+
+func TestScheduleStatus_Inactive(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "crontab -l", Output: ""},
+	)
+
+	mgr := NewManager(mock, &bytes.Buffer{})
+	got, err := mgr.ScheduleStatus(context.Background(), "myapp")
+	if err != nil {
+		t.Fatalf("ScheduleStatus: %v", err)
+	}
+	if got != "" {
+		t.Errorf("expected empty schedule, got %q", got)
+	}
+}
+
+func TestScheduleStatus_Active(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "crontab -l", Output: "0 4 * * 0 /deployments/myapp/scheduled-redeploy.sh >> /deployments/myapp/scheduled-redeploy.log 2>&1"},
+	)
+
+	mgr := NewManager(mock, &bytes.Buffer{})
+	got, err := mgr.ScheduleStatus(context.Background(), "myapp")
+	if err != nil {
+		t.Fatalf("ScheduleStatus: %v", err)
+	}
+	if got != "0 4 * * 0" {
+		t.Errorf("expected schedule '0 4 * * 0', got %q", got)
+	}
+}
+
+func TestGenerateScheduledRedeployScript(t *testing.T) {
+	script := generateScheduledRedeployScript("myapp")
+	for _, want := range []string{
+		`APP="myapp"`,
+		`PROCESS="web"`,
+		"docker pull",
+		"teploy.version",
+		"docker inspect",
+		"docker run -d",
+		"--name \"$CONTAINER\"",   // preserve same name to avoid Caddy reconfig
+		"date +%s",                // new version timestamp
+		"$(ts) [redeploy]",
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("scheduled redeploy script missing %q", want)
+		}
+	}
+}
