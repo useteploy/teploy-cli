@@ -19,6 +19,7 @@ import (
 	"github.com/useteploy/teploy/internal/docker"
 	"github.com/useteploy/teploy/internal/multideploy"
 	"github.com/useteploy/teploy/internal/notify"
+	"github.com/useteploy/teploy/internal/secret"
 	"github.com/useteploy/teploy/internal/ssh"
 	"github.com/useteploy/teploy/internal/state"
 )
@@ -309,6 +310,17 @@ func deployAppConfig(flags *Flags, appCfg *config.AppConfig, serverName, image, 
 		envFile = envPath
 	}
 
+	// Decrypt secrets (set via `teploy secret set`) and inject as -e
+	// container args. Previously secrets were stored encrypted but never
+	// surfaced to containers — apps reading process.env.KEY would get
+	// undefined for anything set via `teploy secret`, defeating the
+	// "encrypted at rest" workflow's whole point.
+	secretMgr := secret.NewManager(executor)
+	deploySecrets, err := secretMgr.DecryptAll(ctx, appCfg.App)
+	if err != nil {
+		return fmt.Errorf("decrypting secrets: %w", err)
+	}
+
 	// 10. Resolve persistent volumes.
 	var volumes map[string]string
 	if len(appCfg.Volumes) > 0 {
@@ -351,6 +363,7 @@ func deployAppConfig(flags *Flags, appCfg *config.AppConfig, serverName, image, 
 		Image:         image,
 		Version:       version,
 		EnvFile:       envFile,
+		Env:           deploySecrets,
 		Volumes:       volumes,
 		Processes:     appCfg.Processes,
 		ContainerPort: appCfg.Port,
