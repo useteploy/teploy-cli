@@ -316,7 +316,7 @@ func mergeConfigs(base, overlay *AppConfig) {
 			base.Accessories = map[string]AccessoryConfig{}
 		}
 		for k, v := range overlay.Accessories {
-			base.Accessories[k] = v
+			base.Accessories[k] = mergeAccessory(base.Accessories[k], v)
 		}
 	}
 	if overlay.Assets.Path != "" {
@@ -372,6 +372,40 @@ func mergeConfigs(base, overlay *AppConfig) {
 	if overlay.CaddyExtra != "" {
 		base.CaddyExtra = overlay.CaddyExtra
 	}
+}
+
+// mergeAccessory deep-merges overlay fields onto base. Image / Port use
+// the overlay value when non-zero; Env and Volumes are key-wise merged
+// so an overlay can add just POSTGRES_PASSWORD without dropping the
+// base's POSTGRES_USER / POSTGRES_DB. Previously the entire
+// AccessoryConfig was replaced by the overlay value, which broke any
+// partial overlay (e.g. a gitignored teploy.prod.yml that only carried
+// the password while teploy.yml carried image / port / volumes).
+func mergeAccessory(base, overlay AccessoryConfig) AccessoryConfig {
+	out := base
+	if overlay.Image != "" {
+		out.Image = overlay.Image
+	}
+	if overlay.Port != 0 {
+		out.Port = overlay.Port
+	}
+	if len(overlay.Env) > 0 {
+		if out.Env == nil {
+			out.Env = map[string]string{}
+		}
+		for k, v := range overlay.Env {
+			out.Env[k] = v
+		}
+	}
+	if len(overlay.Volumes) > 0 {
+		if out.Volumes == nil {
+			out.Volumes = map[string]string{}
+		}
+		for k, v := range overlay.Volumes {
+			out.Volumes[k] = v
+		}
+	}
+	return out
 }
 
 // ParseAppBytes parses raw YAML bytes as an AppConfig.
