@@ -12,12 +12,30 @@ import (
 	"github.com/useteploy/teploy/internal/config"
 )
 
+// destination holds the -d / --destination flag value, set as a persistent
+// flag on the accessory parent command so every subcommand can layer a
+// destination overlay (teploy.<dest>.yml) on top of teploy.yml. Without
+// this, accessory commands couldn't read overlay-supplied env values such
+// as accessory POSTGRES_PASSWORD.
+var accessoryDestination string
+
+// loadAppCfgForAccessory loads teploy.yml and merges teploy.<dest>.yml on
+// top when -d is supplied. Falls back to plain LoadApp otherwise.
+func loadAppCfgForAccessory() (*config.AppConfig, error) {
+	if accessoryDestination != "" {
+		return config.LoadAppWithDestination(".", accessoryDestination)
+	}
+	return config.LoadApp(".")
+}
+
 func newAccessoryCmd(flags *Flags) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:     "accessory",
 		Aliases: []string{"acc"},
 		Short:   "Manage accessories (databases, caches)",
 	}
+
+	cmd.PersistentFlags().StringVarP(&accessoryDestination, "destination", "d", "", "destination overlay (e.g. prod merges teploy.prod.yml)")
 
 	cmd.AddCommand(newAccessoryListCmd(flags))
 	cmd.AddCommand(newAccessoryStopCmd(flags))
@@ -42,7 +60,7 @@ func newAccessoryListCmd(flags *Flags) *cobra.Command {
 }
 
 func runAccessoryList(flags *Flags) error {
-	appCfg, err := config.LoadApp(".")
+	appCfg, err := loadAppCfgForAccessory()
 	if err != nil {
 		return err
 	}
@@ -85,7 +103,7 @@ func newAccessoryStopCmd(flags *Flags) *cobra.Command {
 }
 
 func runAccessoryStop(flags *Flags, name string) error {
-	appCfg, err := config.LoadApp(".")
+	appCfg, err := loadAppCfgForAccessory()
 	if err != nil {
 		return err
 	}
@@ -120,7 +138,7 @@ func newAccessoryStartCmd(flags *Flags) *cobra.Command {
 }
 
 func runAccessoryStart(flags *Flags, name string) error {
-	appCfg, err := config.LoadApp(".")
+	appCfg, err := loadAppCfgForAccessory()
 	if err != nil {
 		return err
 	}
@@ -162,7 +180,7 @@ func newAccessoryLogsCmd(flags *Flags) *cobra.Command {
 }
 
 func runAccessoryLogs(flags *Flags, name string, lines int) error {
-	appCfg, err := config.LoadApp(".")
+	appCfg, err := loadAppCfgForAccessory()
 	if err != nil {
 		return err
 	}
@@ -192,7 +210,7 @@ func newAccessoryUpgradeCmd(flags *Flags) *cobra.Command {
 }
 
 func runAccessoryUpgrade(flags *Flags, name, newImage string) error {
-	appCfg, err := config.LoadApp(".")
+	appCfg, err := loadAppCfgForAccessory()
 	if err != nil {
 		return err
 	}
@@ -239,7 +257,7 @@ func newAccessoryBackupCmd(flags *Flags) *cobra.Command {
 }
 
 func runAccessoryBackup(flags *Flags, name, bucket, region, schedule string) error {
-	appCfg, err := config.LoadApp(".")
+	appCfg, err := loadAppCfgForAccessory()
 	if err != nil {
 		return err
 	}
@@ -310,7 +328,7 @@ func newAccessoryRestoreCmd(flags *Flags) *cobra.Command {
 }
 
 func runAccessoryRestore(flags *Flags, name, date, bucket, region string) error {
-	appCfg, err := config.LoadApp(".")
+	appCfg, err := loadAppCfgForAccessory()
 	if err != nil {
 		return err
 	}
@@ -342,20 +360,7 @@ func runAccessoryRestore(flags *Flags, name, date, bucket, region string) error 
 	}
 	defer executor.Close()
 
-	// Stop the accessory before restoring.
-	mgr := accessories.NewManager(executor, os.Stdout)
-	fmt.Printf("Stopping %s for restore...\n", name)
-	mgr.Stop(ctx, appCfg.App, name)
-
 	client := backup.NewClient(executor, os.Stdout)
-	if err := client.AccessoryRestore(ctx, appCfg.App, name, accCfg.Image, date, backup.S3Config{
-		Bucket: bucket,
-		Region: region,
-	}); err != nil {
-		return err
-	}
-
-	// Restart the accessory.
-	fmt.Printf("Starting %s...\n", name)
-	return mgr.Start(ctx, appCfg.App, name)
+	s3Cfg := backup.S3Config{Bucket: bucket, Region: region}
+	return client.AccessoryRestore(ctx, appCfg.App, name, accCfg.Image, date, s3Cfg)
 }
