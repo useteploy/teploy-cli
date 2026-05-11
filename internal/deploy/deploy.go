@@ -123,15 +123,22 @@ func (d *Deployer) Deploy(ctx context.Context, cfg Config) error {
 		}
 
 		// Extract assets from image using a one-shot container.
+		// --user 0 (root) so the cp can write into the host-owned
+		// /deployments/<app>/assets dir without permission denied,
+		// regardless of the image's USER directive. Drop `2>/dev/null`
+		// from cp so genuine failures surface in the deploy output —
+		// the previous silent-fail mode meant an empty host volume
+		// was bind-mounted over the in-image static dir, hiding all
+		// files and serving 404 for every static asset.
 		extractCmd := fmt.Sprintf(
-			"docker run --rm -v %s:/bridge %s sh -c 'cp -r %s/. /bridge/ 2>/dev/null || true'",
+			"docker run --rm --user 0 -v %s:/bridge %s sh -c 'cp -r %s/. /bridge/ && echo ok-bridge'",
 			hostAssetDir, cfg.Image, cfg.AssetPath,
 		)
-		if _, err := d.exec.Run(ctx, extractCmd); err != nil {
-			fmt.Fprintf(d.out, "  Warning: asset extraction failed: %v\n", err)
-		} else {
-			fmt.Fprintln(d.out, "  Assets extracted to host")
+		out, err := d.exec.Run(ctx, extractCmd)
+		if err != nil || !strings.Contains(out, "ok-bridge") {
+			return fmt.Errorf("asset extraction failed: %s", strings.TrimSpace(out))
 		}
+		fmt.Fprintln(d.out, "  Assets extracted to host")
 
 		// Mount the shared asset directory into the container.
 		if cfg.Volumes == nil {

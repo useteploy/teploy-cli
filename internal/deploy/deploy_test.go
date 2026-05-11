@@ -775,7 +775,7 @@ func TestDeploy_AssetBridging(t *testing.T) {
 		ssh.MockCommand{Match: "ss -tln", Output: ssOutput},
 		// 5. Asset bridging: create dir + extract.
 		ssh.MockCommand{Match: "mkdir -p /deployments/myapp/assets", Output: ""},
-		ssh.MockCommand{Match: "docker run --rm -v /deployments/myapp/assets:/bridge", Output: ""},
+		ssh.MockCommand{Match: "docker run --rm --user 0 -v /deployments/myapp/assets:/bridge", Output: "ok-bridge\n"},
 		// 6. Start container.
 		ssh.MockCommand{Match: "docker run --detach", Output: "abc123container"},
 		// 7. Verify running.
@@ -859,7 +859,7 @@ func TestDeploy_AssetBridgingCustomKeepDays(t *testing.T) {
 		ssh.MockCommand{Match: "cat /deployments/myapp/state", Err: fmt.Errorf("no state")},
 		ssh.MockCommand{Match: "ss -tln", Output: ssOutput},
 		ssh.MockCommand{Match: "mkdir -p /deployments/myapp/assets", Output: ""},
-		ssh.MockCommand{Match: "docker run --rm", Output: ""},
+		ssh.MockCommand{Match: "docker run --rm --user 0", Output: "ok-bridge\n"},
 		ssh.MockCommand{Match: "docker run --detach", Output: "abc123"},
 		ssh.MockCommand{Match: "docker inspect", Output: "running"},
 		ssh.MockCommand{Match: "curl -s -o /dev/null", Output: "200"},
