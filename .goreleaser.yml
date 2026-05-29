@@ -27,7 +27,12 @@ changelog:
   sort: asc
 
 brews:
-  - repository:
+  # Pin the formula name to `teploy` (the binary + what users install). Without
+  # this, goreleaser derives it from the project/repo name — which became
+  # `teploy-cli` after the repo rename and split the formula (a stale
+  # `teploy-cli.rb` at 0.1.5 alongside the real `teploy.rb`). Keep it `teploy`.
+  - name: teploy
+    repository:
       owner: useteploy
       name: homebrew-tap
       token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
@@ -38,7 +43,8 @@ brews:
       bin.install "teploy"
 
 scoops:
-  - repository:
+  - name: teploy
+    repository:
       owner: useteploy
       name: scoop-bucket
       token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
