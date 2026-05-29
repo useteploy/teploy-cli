@@ -61,6 +61,15 @@ func runPreviewDeploy(flags *Flags, branch, ttlStr string) error {
 		return err
 	}
 
+	// Preview environments need Teploy-managed Caddy to provision a
+	// branch.app.example.com subdomain route on demand. With external
+	// ingress (CF Tunnel, etc.), preview hostnames have to be added at
+	// the external layer — out of scope for Teploy. Reject explicitly so
+	// the failure mode is "useful error" not "silently broken preview".
+	if !appCfg.UsesCaddy() {
+		return fmt.Errorf("'teploy preview' requires Teploy-managed Caddy; this app uses ingress: %s — add the preview hostname route at your external ingress and deploy the branch with -d instead", appCfg.Ingress)
+	}
+
 	ttl, err := time.ParseDuration(ttlStr)
 	if err != nil {
 		return fmt.Errorf("invalid TTL: %w", err)

@@ -79,6 +79,7 @@ func runRollback(flags *Flags, toHash string) error {
 		App:         appCfg.App,
 		Domain:      appCfg.Domain,
 		StopTimeout: appCfg.StopTimeout,
+		Ingress:     appCfg.Ingress,
 	})
 
 	// Fire notification (best-effort).

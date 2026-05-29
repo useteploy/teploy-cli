@@ -25,6 +25,14 @@ type Config struct {
 	Volumes     map[string]string
 	Cmd         string            // command override for single-process deploys
 	Processes   map[string]string // process_name -> command (overrides Cmd)
+	// Ingress selects the routing layer; see config.IngressCaddy /
+	// IngressExternal. Empty defaults to caddy. When external, the
+	// deployer skips every Caddy interaction (route update, reload) —
+	// the user's external ingress is responsible for getting traffic
+	// to the container. The container still joins the teploy network
+	// with its app-name alias and is reachable from cloudflared,
+	// nginx, etc. inside the same network.
+	Ingress     string
 	Memory        string
 	CPU           string
 	ContainerPort int // internal container port (default 80)
@@ -275,21 +283,28 @@ func (d *Deployer) Deploy(ctx context.Context, cfg Config) error {
 	// 11. Update Caddy route to point at new web container(s).
 	// Use container names with the internal container port (not host-mapped ports),
 	// since Caddy and app containers communicate over the Docker network.
-	fmt.Fprintln(d.out, "Updating routes...")
-	if replicas > 1 {
-		upstreams := make([]caddy.Upstream, replicas)
-		for i := range replicas {
-			upstreams[i] = caddy.Upstream{Dial: fmt.Sprintf("%s:%d", webContainerNames[i], cfg.ContainerPort)}
+	// Skipped entirely under ingress: external — the user's CF Tunnel /
+	// nginx / etc. reaches the container by its app-name alias on the
+	// teploy docker network, so Teploy has nothing to do here.
+	if cfg.usesCaddy() {
+		fmt.Fprintln(d.out, "Updating routes...")
+		if replicas > 1 {
+			upstreams := make([]caddy.Upstream, replicas)
+			for i := range replicas {
+				upstreams[i] = caddy.Upstream{Dial: fmt.Sprintf("%s:%d", webContainerNames[i], cfg.ContainerPort)}
+			}
+			if err := d.caddy.SetLoadBalancer(ctx, cfg.App, cfg.Domain, upstreams); err != nil {
+				return fail(fmt.Errorf("updating load balancer route: %w", err))
+			}
+			fmt.Fprintf(d.out, "  Traffic load-balanced across %d replicas\n", replicas)
+		} else {
+			if err := d.caddy.SetRoute(ctx, cfg.App, cfg.Domain, webContainerName, cfg.ContainerPort); err != nil {
+				return fail(fmt.Errorf("updating route: %w", err))
+			}
+			fmt.Fprintln(d.out, "  Traffic routed to new container")
 		}
-		if err := d.caddy.SetLoadBalancer(ctx, cfg.App, cfg.Domain, upstreams); err != nil {
-			return fail(fmt.Errorf("updating load balancer route: %w", err))
-		}
-		fmt.Fprintf(d.out, "  Traffic load-balanced across %d replicas\n", replicas)
 	} else {
-		if err := d.caddy.SetRoute(ctx, cfg.App, cfg.Domain, webContainerName, cfg.ContainerPort); err != nil {
-			return fail(fmt.Errorf("updating route: %w", err))
-		}
-		fmt.Fprintln(d.out, "  Traffic routed to new container")
+		fmt.Fprintf(d.out, "Skipping Caddy route update (ingress: %s)\n", cfg.Ingress)
 	}
 
 	// 12. Post-deploy hook (runs in web container after traffic switch — failure warns, no rollback).
@@ -405,4 +420,11 @@ func sortedProcessNames(processes map[string]string) []string {
 	}
 	sort.Strings(others)
 	return append([]string{"web"}, others...)
+}
+
+// usesCaddy reports whether Teploy should drive Caddy for this deploy.
+// Default (empty Ingress) and "caddy" both return true; only "external"
+// turns off all Caddy interactions.
+func (c Config) usesCaddy() bool {
+	return c.Ingress == "" || c.Ingress == "caddy"
 }
