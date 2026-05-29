@@ -120,6 +120,16 @@ func (s *singleServerDeployer) deployApp(ctx context.Context, appCfg *config.App
 		}
 	}
 
+	// Upload custom TLS cert (if configured) before deploy.
+	var tlsCert, tlsKey string
+	if appCfg.TLS != nil {
+		tlsCert, tlsKey, err = uploadAppTLS(ctx, s.exec, appCfg.App, appCfg.TLS)
+		if err != nil {
+			return err
+		}
+		fmt.Fprintln(s.out, "  TLS certificate uploaded")
+	}
+
 	// Deploy.
 	deployer := deploy.NewDeployer(s.exec, s.out)
 	deployCfg := deploy.Config{
@@ -138,6 +148,8 @@ func (s *singleServerDeployer) deployApp(ctx context.Context, appCfg *config.App
 		PostDeploy:    appCfg.Hooks.PostDeploy,
 		AssetPath:     appCfg.Assets.Path,
 		AssetKeepDays: appCfg.Assets.KeepDays,
+		TLSCert:       tlsCert,
+		TLSKey:        tlsKey,
 	}
 
 	return deployer.Deploy(ctx, deployCfg)

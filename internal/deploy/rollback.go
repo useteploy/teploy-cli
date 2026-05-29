@@ -19,6 +19,12 @@ type RollbackConfig struct {
 	Domain      string
 	StopTimeout int
 	Health      HealthConfig
+	// TLSCert / TLSKey preserve custom-cert TLS termination across a
+	// rollback (container-side paths, already on the server from deploy).
+	// Empty = ACME. Without these, rolling back would regenerate the Caddy
+	// block without the cert and break TLS the same way a deploy would.
+	TLSCert string
+	TLSKey  string
 }
 
 // Rollback reverts to the previous deploy version.
@@ -100,7 +106,7 @@ func Rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg Rollbac
 	if err != nil {
 		return fmt.Errorf("inspecting previous container port: %w", err)
 	}
-	if err := cd.SetRoute(ctx, cfg.App, cfg.Domain, previousContainer, internalPort); err != nil {
+	if err := cd.SetRoute(ctx, cfg.App, cfg.Domain, previousContainer, internalPort, caddy.TLS{Cert: cfg.TLSCert, Key: cfg.TLSKey}); err != nil {
 		return fmt.Errorf("updating route: %w", err)
 	}
 	fmt.Fprintln(out, "  Traffic routed to previous version")

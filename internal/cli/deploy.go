@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -355,6 +356,17 @@ func deployAppConfig(flags *Flags, appCfg *config.AppConfig, serverName, image, 
 		}
 	}
 
+	// 10b. Upload custom TLS cert (if configured) so Caddy can terminate
+	// HTTPS with it instead of ACME — required behind Cloudflare proxy/Tunnel.
+	var tlsCert, tlsKey string
+	if appCfg.TLS != nil {
+		tlsCert, tlsKey, err = uploadAppTLS(ctx, executor, appCfg.App, appCfg.TLS)
+		if err != nil {
+			return err
+		}
+		fmt.Println("  TLS certificate uploaded")
+	}
+
 	// 11. Deploy.
 	deployer := deploy.NewDeployer(executor, os.Stdout)
 	deployCfg := deploy.Config{
@@ -373,6 +385,8 @@ func deployAppConfig(flags *Flags, appCfg *config.AppConfig, serverName, image, 
 		PostDeploy:    appCfg.Hooks.PostDeploy,
 		AssetPath:     appCfg.Assets.Path,
 		AssetKeepDays: appCfg.Assets.KeepDays,
+		TLSCert:       tlsCert,
+		TLSKey:        tlsKey,
 	}
 
 	multiNotifier := buildNotifier(appCfg)
@@ -563,4 +577,39 @@ func runStaticDeploy(cfg *config.AppConfig, host, user, key string) error {
 		return err
 	}
 	return nil
+}
+
+// appTLSContainerPaths returns the container-side cert/key paths for an app's
+// custom TLS certificate. These live under /etc/caddy/tls, which the Caddy
+// container sees via the /deployments/caddy directory mount.
+func appTLSContainerPaths(app string) (cert, key string) {
+	return "/etc/caddy/tls/" + app + ".crt", "/etc/caddy/tls/" + app + ".key"
+}
+
+// uploadAppTLS reads the local cert + key referenced by the app's tls config
+// and uploads them to the server's /deployments/caddy/tls directory (key mode
+// 0600), where the directory-mounted Caddy container reads them. It returns
+// the container-side paths to reference in the Caddy site block.
+func uploadAppTLS(ctx context.Context, exec ssh.Executor, app string, tls *config.TLSConfig) (cert, key string, err error) {
+	certBytes, err := os.ReadFile(tls.Cert)
+	if err != nil {
+		return "", "", fmt.Errorf("reading tls cert %s: %w", tls.Cert, err)
+	}
+	keyBytes, err := os.ReadFile(tls.Key)
+	if err != nil {
+		return "", "", fmt.Errorf("reading tls key %s: %w", tls.Key, err)
+	}
+	if _, err := exec.Run(ctx, "mkdir -p /deployments/caddy/tls"); err != nil {
+		return "", "", fmt.Errorf("creating tls dir: %w", err)
+	}
+	hostCert := "/deployments/caddy/tls/" + app + ".crt"
+	hostKey := "/deployments/caddy/tls/" + app + ".key"
+	if err := exec.Upload(ctx, bytes.NewReader(certBytes), hostCert, "0644"); err != nil {
+		return "", "", fmt.Errorf("uploading tls cert: %w", err)
+	}
+	if err := exec.Upload(ctx, bytes.NewReader(keyBytes), hostKey, "0600"); err != nil {
+		return "", "", fmt.Errorf("uploading tls key: %w", err)
+	}
+	cert, key = appTLSContainerPaths(app)
+	return cert, key, nil
 }

@@ -75,10 +75,22 @@ func runRollback(flags *Flags, toHash string) error {
 		return fmt.Errorf("--to is only supported for type:static apps")
 	}
 
+	// Preserve custom TLS termination across rollback. The cert is already
+	// on the server from the last deploy; re-upload to be safe (idempotent).
+	var tlsCert, tlsKey string
+	if appCfg.TLS != nil {
+		tlsCert, tlsKey, err = uploadAppTLS(ctx, executor, appCfg.App, appCfg.TLS)
+		if err != nil {
+			return err
+		}
+	}
+
 	rollbackErr := deploy.Rollback(ctx, executor, os.Stdout, deploy.RollbackConfig{
 		App:         appCfg.App,
 		Domain:      appCfg.Domain,
 		StopTimeout: appCfg.StopTimeout,
+		TLSCert:     tlsCert,
+		TLSKey:      tlsKey,
 	})
 
 	// Fire notification (best-effort).

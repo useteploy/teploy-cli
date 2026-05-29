@@ -35,6 +35,12 @@ type Config struct {
 	PostDeploy  string // hook: runs in web container after traffic switch (failure warns)
 	AssetPath     string // container path for asset bridging (e.g. "/app/public/assets")
 	AssetKeepDays int    // cleanup bridged assets older than N days (default 7)
+	// TLSCert / TLSKey are container-side cert/key paths for terminating TLS
+	// on the Caddy site block (custom cert instead of ACME). Empty = ACME.
+	// The CLI uploads the local cert files and sets these to their on-server
+	// container paths (e.g. /etc/caddy/tls/<app>.crt).
+	TLSCert string
+	TLSKey  string
 }
 
 // Deployer orchestrates zero-downtime deploys.
@@ -276,17 +282,18 @@ func (d *Deployer) Deploy(ctx context.Context, cfg Config) error {
 	// Use container names with the internal container port (not host-mapped ports),
 	// since Caddy and app containers communicate over the Docker network.
 	fmt.Fprintln(d.out, "Updating routes...")
+	tls := caddy.TLS{Cert: cfg.TLSCert, Key: cfg.TLSKey}
 	if replicas > 1 {
 		upstreams := make([]caddy.Upstream, replicas)
 		for i := range replicas {
 			upstreams[i] = caddy.Upstream{Dial: fmt.Sprintf("%s:%d", webContainerNames[i], cfg.ContainerPort)}
 		}
-		if err := d.caddy.SetLoadBalancer(ctx, cfg.App, cfg.Domain, upstreams); err != nil {
+		if err := d.caddy.SetLoadBalancer(ctx, cfg.App, cfg.Domain, upstreams, tls); err != nil {
 			return fail(fmt.Errorf("updating load balancer route: %w", err))
 		}
 		fmt.Fprintf(d.out, "  Traffic load-balanced across %d replicas\n", replicas)
 	} else {
-		if err := d.caddy.SetRoute(ctx, cfg.App, cfg.Domain, webContainerName, cfg.ContainerPort); err != nil {
+		if err := d.caddy.SetRoute(ctx, cfg.App, cfg.Domain, webContainerName, cfg.ContainerPort, tls); err != nil {
 			return fail(fmt.Errorf("updating route: %w", err))
 		}
 		fmt.Fprintln(d.out, "  Traffic routed to new container")
