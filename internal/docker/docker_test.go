@@ -46,7 +46,7 @@ func TestClient_Run(t *testing.T) {
 		"--label teploy.app=myapp",
 		"--label teploy.process=web",
 		"--label teploy.version=abc123",
-		"-p 49152:80",
+		"-p 127.0.0.1:49152:80",
 		"-e PORT=80",
 		"--log-opt max-size=10m",
 		"nginx:latest",

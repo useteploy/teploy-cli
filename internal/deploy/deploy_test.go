@@ -109,8 +109,8 @@ func TestDeploy_FirstDeploy(t *testing.T) {
 	// Verify docker run included the right port.
 	for _, call := range mock.Calls {
 		if strings.HasPrefix(call, "docker run") {
-			if !strings.Contains(call, "-p 49152:80") {
-				t.Errorf("expected port mapping 49152:80 in docker run: %s", call)
+			if !strings.Contains(call, "-p 127.0.0.1:49152:80") {
+				t.Errorf("expected port mapping 127.0.0.1:49152:80 in docker run: %s", call)
 			}
 			if !strings.Contains(call, "-e PORT=80") {
 				t.Errorf("expected PORT=80 env var in docker run: %s", call)
@@ -357,6 +357,26 @@ func TestHealthCheck_TCPFallback(t *testing.T) {
 
 	if err := d.healthCheck(context.Background(), 49152, cfg); err != nil {
 		t.Fatalf("healthCheck with TCP fallback: %v", err)
+	}
+}
+
+func TestHealthCheck_RedirectFallback(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		// curl returns 301 — app redirects /health (e.g. WordPress canonical).
+		ssh.MockCommand{Match: "curl -s -o /dev/null", Output: "301"},
+		// TCP check succeeds.
+		ssh.MockCommand{Match: "bash -c '</dev/tcp", Output: ""},
+	)
+
+	d := &Deployer{exec: mock, out: &bytes.Buffer{}}
+	cfg := HealthConfig{
+		Path:     "/health",
+		Timeout:  5 * time.Second,
+		Interval: 10 * time.Millisecond,
+	}
+
+	if err := d.healthCheck(context.Background(), 49152, cfg); err != nil {
+		t.Fatalf("healthCheck with redirect TCP fallback: %v", err)
 	}
 }
 

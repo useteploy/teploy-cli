@@ -74,8 +74,12 @@ func (d *Deployer) checkHealth(ctx context.Context, port int, path string) bool 
 		if code == "200" {
 			return true
 		}
-		// No /health endpoint — fall back to TCP check.
-		if code == "404" {
+		// A 404 (no /health endpoint) or a 3xx redirect means the app is
+		// listening but the health path isn't a 200 — for example WordPress
+		// 301-redirects /health to its canonical HTTPS URL. Fall back to a TCP
+		// check rather than failing the deploy. A 5xx or "000" (no response)
+		// falls through and is retried until the timeout.
+		if code == "404" || strings.HasPrefix(code, "3") {
 			return d.checkTCP(ctx, port)
 		}
 	}

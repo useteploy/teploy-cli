@@ -101,7 +101,13 @@ func (c *Client) Run(ctx context.Context, cfg RunConfig) (string, error) {
 			containerPort = 80
 		}
 		cPortStr := strconv.Itoa(containerPort)
-		args = append(args, "-p", hostPort+":"+cPortStr, "-e", "PORT="+cPortStr)
+		// Bind the published port to localhost only. Caddy reaches the
+		// container over the teploy network via its network alias (see
+		// InternalPort), so this host mapping exists solely for local health
+		// checks. Publishing on 0.0.0.0 would expose the app directly on a
+		// high port — bypassing Caddy/TLS, and Docker bypasses UFW — so we
+		// restrict it to 127.0.0.1.
+		args = append(args, "-p", "127.0.0.1:"+hostPort+":"+cPortStr, "-e", "PORT="+cPortStr)
 	}
 
 	// Env file on server.
