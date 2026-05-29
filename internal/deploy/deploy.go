@@ -31,6 +31,16 @@ type Config struct {
 	// healthcheck (e.g. a worker that shares an image with web but has no
 	// HTTP listener for the image's curl probe to hit).
 	NoHealthcheck map[string]bool
+	// KeepVersions caps the number of past app versions retained on the
+	// server after a successful deploy. Zero (default) keeps every version
+	// — the historical behavior, in which Teploy stopped but never removed
+	// old containers, letting disk usage climb across deploys. Set this to
+	// 2 or 3 to keep the current version + a small rollback window and
+	// have superseded versions auto-pruned (containers + images).
+	// Versions are scored by newest container creation timestamp; the
+	// current and immediately-previous versions are always protected even
+	// if older than other versions on disk.
+	KeepVersions int
 	Memory        string
 	CPU           string
 	ContainerPort int // internal container port (default 80)
@@ -382,6 +392,23 @@ func (d *Deployer) Deploy(ctx context.Context, cfg Config) error {
 			cfg.App, keepDays,
 		)
 		d.exec.Run(ctx, cleanCmd)
+	}
+
+	// 15b. Prune superseded app versions (containers + images) if the
+	// operator opted in via keep_versions. Always protects the current
+	// version and the immediately-previous version so a rollback target
+	// is preserved regardless of timestamp ordering.
+	if cfg.KeepVersions > 0 {
+		var prevHash string
+		if current != nil {
+			prevHash = current.CurrentHash
+		}
+		pruned, err := d.docker.PruneVersions(ctx, cfg.App, cfg.KeepVersions, cfg.Version, prevHash)
+		if err != nil {
+			fmt.Fprintf(d.out, "Warning: version prune failed: %v\n", err)
+		} else if len(pruned) > 0 {
+			fmt.Fprintf(d.out, "Pruned %d superseded version(s): %s\n", len(pruned), strings.Join(pruned, ", "))
+		}
 	}
 
 	// 16. Log success.

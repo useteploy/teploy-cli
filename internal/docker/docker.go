@@ -13,11 +13,13 @@ import (
 
 // Container represents a Docker container as reported by docker ps.
 type Container struct {
-	ID     string
-	Name   string
-	Image  string
-	State  string // "running", "exited", "created"
-	Status string // human-readable, e.g. "Up 2 hours"
+	ID        string
+	Name      string
+	Image     string
+	State     string // "running", "exited", "created"
+	Status    string // human-readable, e.g. "Up 2 hours"
+	CreatedAt string // raw docker timestamp, e.g. "2026-05-28 21:33:29 -0700 PDT" — lexicographically sortable for same-TZ comparisons
+	Labels    map[string]string
 }
 
 // RunConfig holds the parameters for starting a new container.
@@ -253,6 +255,107 @@ func (c *Client) ListContainers(ctx context.Context, app string) ([]Container, e
 	return ParseContainers(output)
 }
 
+// PruneVersions removes containers and images for app versions older than
+// the `keep` most-recent (by newest container creation time), always
+// preserving the explicitly-named protectedVersions even if their
+// containers are stopped or older than other versions on disk. Use this
+// to bound the disk footprint of past deploys while keeping the current
+// version + a rollback window.
+//
+// Returns the list of pruned versions and a non-nil error only when the
+// initial container listing fails. Per-container removal failures are
+// non-fatal — this is best-effort disk cleanup, not a deploy gate.
+func (c *Client) PruneVersions(ctx context.Context, app string, keep int, protectedVersions ...string) ([]string, error) {
+	if keep < 0 {
+		keep = 0
+	}
+	containers, err := c.ListContainers(ctx, app)
+	if err != nil {
+		return nil, fmt.Errorf("listing containers for prune: %w", err)
+	}
+
+	// Group containers by teploy.version label. Track newest creation
+	// timestamp + container names + image names per version. Containers
+	// without the label (e.g. caddy, postgres accessory) are ignored.
+	type vinfo struct {
+		newestCreated  string
+		containerNames []string
+		images         map[string]struct{}
+	}
+	versions := map[string]*vinfo{}
+	for _, ct := range containers {
+		v := ct.Labels["teploy.version"]
+		if v == "" {
+			continue
+		}
+		info, ok := versions[v]
+		if !ok {
+			info = &vinfo{images: map[string]struct{}{}}
+			versions[v] = info
+		}
+		if ct.CreatedAt > info.newestCreated {
+			info.newestCreated = ct.CreatedAt
+		}
+		info.containerNames = append(info.containerNames, ct.Name)
+		if ct.Image != "" {
+			info.images[ct.Image] = struct{}{}
+		}
+	}
+
+	if len(versions) == 0 {
+		return nil, nil
+	}
+
+	// Sort versions by recency (newest first).
+	type entry struct {
+		version string
+		info    *vinfo
+	}
+	sorted := make([]entry, 0, len(versions))
+	for v, info := range versions {
+		sorted = append(sorted, entry{v, info})
+	}
+	sort.Slice(sorted, func(i, j int) bool {
+		return sorted[i].info.newestCreated > sorted[j].info.newestCreated
+	})
+
+	// Build the protected set: explicit names + top-`keep` by recency.
+	protect := map[string]bool{}
+	for _, v := range protectedVersions {
+		if v != "" {
+			protect[v] = true
+		}
+	}
+	kept := 0
+	for _, e := range sorted {
+		if kept < keep {
+			protect[e.version] = true
+			kept++
+		}
+	}
+
+	var pruned []string
+	for _, e := range sorted {
+		if protect[e.version] {
+			continue
+		}
+		// Force-remove containers in case any are still running. We
+		// already took ownership of cleanup; refusing to nuke a stray
+		// running container from an older version defeats the point.
+		for _, name := range e.info.containerNames {
+			_, _ = c.exec.Run(ctx, "docker rm -f "+name)
+		}
+		// Best-effort image removal. Fails (silently) if another
+		// container or tag still references the image, which is the
+		// safe behavior.
+		for img := range e.info.images {
+			_, _ = c.exec.Run(ctx, "docker rmi "+img)
+		}
+		pruned = append(pruned, e.version)
+	}
+	return pruned, nil
+}
+
 // EnsureNetwork creates the "teploy" Docker network if it doesn't already exist.
 func (c *Client) EnsureNetwork(ctx context.Context) error {
 	cmd := "docker network inspect teploy >/dev/null 2>&1 || docker network create teploy"
@@ -281,11 +384,13 @@ func (c *Client) FindAvailablePort(ctx context.Context) (int, error) {
 
 // psEntry matches Docker's JSON output from docker ps --format '{{json .}}'.
 type psEntry struct {
-	ID     string `json:"ID"`
-	Names  string `json:"Names"`
-	Image  string `json:"Image"`
-	State  string `json:"State"`
-	Status string `json:"Status"`
+	ID        string `json:"ID"`
+	Names     string `json:"Names"`
+	Image     string `json:"Image"`
+	State     string `json:"State"`
+	Status    string `json:"Status"`
+	CreatedAt string `json:"CreatedAt"`
+	Labels    string `json:"Labels"` // comma-separated "k=v,k=v"
 }
 
 // ParseContainers parses Docker JSON output into Container structs.
@@ -303,14 +408,34 @@ func ParseContainers(output string) ([]Container, error) {
 		}
 
 		containers = append(containers, Container{
-			ID:     entry.ID,
-			Name:   entry.Names,
-			Image:  entry.Image,
-			State:  entry.State,
-			Status: entry.Status,
+			ID:        entry.ID,
+			Name:      entry.Names,
+			Image:     entry.Image,
+			State:     entry.State,
+			Status:    entry.Status,
+			CreatedAt: entry.CreatedAt,
+			Labels:    parseLabels(entry.Labels),
 		})
 	}
 	return containers, nil
+}
+
+// parseLabels splits docker ps's comma-separated "k=v,k=v" label string
+// into a map. Values containing commas would break this, but teploy labels
+// (teploy.app, teploy.process, teploy.version) are safe and known.
+func parseLabels(s string) map[string]string {
+	if s == "" {
+		return nil
+	}
+	out := make(map[string]string)
+	for _, pair := range strings.Split(s, ",") {
+		k, v, ok := strings.Cut(pair, "=")
+		if !ok {
+			continue
+		}
+		out[strings.TrimSpace(k)] = strings.TrimSpace(v)
+	}
+	return out
 }
 
 // parseListeningPorts extracts port numbers from ss -tln output.

@@ -98,6 +98,12 @@ type AppConfig struct {
 	StopTimeout   int                        `yaml:"stop_timeout,omitempty" toml:"stop_timeout"`
 	Parallel      int                        `yaml:"parallel,omitempty" toml:"parallel"`
 	Replicas      int                        `yaml:"replicas,omitempty" toml:"replicas"`
+	// KeepVersions caps the number of past app versions retained after a
+	// successful deploy (containers + images). Zero (default) keeps
+	// everything — historical behavior. Set to 2 or 3 to enable auto-prune
+	// with a rollback window. Container-deploy only; static deploy uses
+	// KeepReleases instead.
+	KeepVersions  int                        `yaml:"keep_versions,omitempty" toml:"keep_versions"`
 	Hooks         HooksConfig                `yaml:"hooks,omitempty" toml:"hooks"`
 	Volumes       map[string]string          `yaml:"volumes,omitempty" toml:"volumes"`
 	Processes     map[string]string          `yaml:"processes,omitempty" toml:"processes"`
@@ -178,6 +184,9 @@ func (c *AppConfig) validate() error {
 		if c.KeepReleases < 0 {
 			return fmt.Errorf("'keep_releases' must be >= 0 (got %d)", c.KeepReleases)
 		}
+		if c.KeepVersions != 0 {
+			return fmt.Errorf("'keep_versions' is container-deploy only; static deploys use 'keep_releases'")
+		}
 	default:
 		return fmt.Errorf("'type' must be 'container' or 'static' (got %q)", c.Type)
 	}
@@ -203,6 +212,9 @@ func (c *AppConfig) validate() error {
 		if _, ok := c.Processes[name]; !ok {
 			return fmt.Errorf("healthcheck refers to unknown process %q (must match a key in processes)", name)
 		}
+	}
+	if c.KeepVersions < 0 {
+		return fmt.Errorf("'keep_versions' must be >= 0 (got %d)", c.KeepVersions)
 	}
 	return nil
 }
@@ -313,6 +325,9 @@ func mergeConfigs(base, overlay *AppConfig) {
 	}
 	if overlay.Parallel != 0 {
 		base.Parallel = overlay.Parallel
+	}
+	if overlay.KeepVersions != 0 {
+		base.KeepVersions = overlay.KeepVersions
 	}
 	if overlay.Hooks.PreDeploy != "" {
 		base.Hooks.PreDeploy = overlay.Hooks.PreDeploy
