@@ -34,6 +34,20 @@ type AccessoryConfig struct {
 	Volumes map[string]string `yaml:"volumes,omitempty" toml:"volumes"`
 }
 
+// ProcessHealth overrides the container HEALTHCHECK behavior for a single
+// process. Keyed by process name (matching a key in Processes) in the
+// AppConfig.Healthcheck map.
+//
+// Used when a process shouldn't be probed by the image's built-in HEALTHCHECK
+// directive — e.g. a worker container that shares its runner image with a web
+// container and inherits the web's HTTP healthcheck, which then fails forever
+// for the worker because the worker has no HTTP listener.
+type ProcessHealth struct {
+	// Disable, when true, passes --no-healthcheck to docker run so the
+	// container ignores the image HEALTHCHECK directive.
+	Disable bool `yaml:"disable,omitempty" toml:"disable"`
+}
+
 // NotificationChannelConfig represents a single notification channel.
 type NotificationChannelConfig struct {
 	Type   string   `yaml:"type,omitempty" toml:"type"`
@@ -87,6 +101,10 @@ type AppConfig struct {
 	Hooks         HooksConfig                `yaml:"hooks,omitempty" toml:"hooks"`
 	Volumes       map[string]string          `yaml:"volumes,omitempty" toml:"volumes"`
 	Processes     map[string]string          `yaml:"processes,omitempty" toml:"processes"`
+	// Healthcheck holds per-process overrides for the container HEALTHCHECK,
+	// keyed by process name. Keys must match a key in Processes. Additive to
+	// the scalar `processes:` schema — does not replace it.
+	Healthcheck   map[string]ProcessHealth   `yaml:"healthcheck,omitempty" toml:"healthcheck"`
 	Accessories   map[string]AccessoryConfig `yaml:"accessories,omitempty" toml:"accessories"`
 	Assets        AssetsConfig               `yaml:"assets,omitempty" toml:"assets"`
 	Notifications NotificationsConfig        `yaml:"notifications,omitempty" toml:"notifications"`
@@ -176,6 +194,14 @@ func (c *AppConfig) validate() error {
 	for name := range c.Processes {
 		if !validName.MatchString(name) {
 			return fmt.Errorf("process name %q must be lowercase alphanumeric with hyphens", name)
+		}
+	}
+	for name := range c.Healthcheck {
+		if !validName.MatchString(name) {
+			return fmt.Errorf("healthcheck key %q must be lowercase alphanumeric with hyphens", name)
+		}
+		if _, ok := c.Processes[name]; !ok {
+			return fmt.Errorf("healthcheck refers to unknown process %q (must match a key in processes)", name)
 		}
 	}
 	return nil
@@ -309,6 +335,14 @@ func mergeConfigs(base, overlay *AppConfig) {
 		}
 		for k, v := range overlay.Processes {
 			base.Processes[k] = v
+		}
+	}
+	if len(overlay.Healthcheck) > 0 {
+		if base.Healthcheck == nil {
+			base.Healthcheck = map[string]ProcessHealth{}
+		}
+		for k, v := range overlay.Healthcheck {
+			base.Healthcheck[k] = v
 		}
 	}
 	if len(overlay.Accessories) > 0 {

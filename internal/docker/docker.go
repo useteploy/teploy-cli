@@ -35,6 +35,7 @@ type RunConfig struct {
 	Memory        string            // memory limit, e.g. "512m"
 	CPU           string            // CPU limit, e.g. "1.0"
 	Name          string            // explicit container name (overrides auto-generated)
+	NoHealthcheck bool              // pass --no-healthcheck so the container ignores the image HEALTHCHECK
 }
 
 // ContainerName returns the standard teploy container name: {app}-{process}-{version}.
@@ -141,6 +142,14 @@ func (c *Client) Run(ctx context.Context, cfg RunConfig) (string, error) {
 
 	// Log rotation to prevent disk fill.
 	args = append(args, "--log-opt", "max-size=10m")
+
+	// Per-process HEALTHCHECK override. When set, the container ignores the
+	// image's HEALTHCHECK directive. Useful for non-web processes (workers,
+	// schedulers) that share a runner image with web but don't expose the
+	// HTTP surface the image's probe assumes.
+	if cfg.NoHealthcheck {
+		args = append(args, "--no-healthcheck")
+	}
 
 	// Image must come after all flags.
 	args = append(args, cfg.Image)

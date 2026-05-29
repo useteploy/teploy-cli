@@ -733,6 +733,79 @@ func TestDeploy_WithWorkers(t *testing.T) {
 	}
 }
 
+// TestDeploy_NoHealthcheckForWorker verifies that NoHealthcheck["worker"]=true
+// in the deploy.Config translates into --no-healthcheck on the worker's
+// docker run, while leaving the web container's docker run untouched.
+func TestDeploy_NoHealthcheckForWorker(t *testing.T) {
+	ssOutput := "State  Recv-Q Send-Q  Local Address:Port\nLISTEN 0      128     0.0.0.0:80\n"
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "mkdir -p /deployments/myapp", Output: ""},
+		ssh.MockCommand{Match: "mkdir /deployments/myapp/.lock", Output: ""},
+		ssh.MockCommand{Match: "cat /deployments/myapp/state", Err: fmt.Errorf("no state")},
+		ssh.MockCommand{Match: "ss -tln", Output: ssOutput},
+		ssh.MockCommand{Match: "docker run", Output: "web123container"},
+		ssh.MockCommand{Match: "docker inspect -f", Output: "running"},
+		ssh.MockCommand{Match: "curl -s -o /dev/null", Output: "200"},
+		ssh.MockCommand{Match: "curl -sf http://localhost:2019/config/apps/http/servers/srv0", Output: `{"listen":[":80",":443"]}`},
+		ssh.MockCommand{Match: "curl -sf -X PATCH", Err: fmt.Errorf("not found")},
+		ssh.MockCommand{Match: "curl -sf -X POST http://localhost:2019/config/apps/http/servers/srv0/routes", Output: ""},
+		ssh.MockCommand{Match: "rm -f /tmp/teploy_caddy", Output: ""},
+		ssh.MockCommand{Match: "cat /deployments/caddy/Caddyfile", Output: "{\n\tadmin 0.0.0.0:2019\n}\n"},
+		ssh.MockCommand{Match: "mv /tmp/teploy_caddyfile.tmp", Output: ""},
+		ssh.MockCommand{Match: "mkdir /deployments/caddy/.lock", Output: ""},
+		ssh.MockCommand{Match: "docker exec caddy caddy reload", Output: ""},
+		ssh.MockCommand{Match: "rmdir /deployments/caddy/.lock", Output: ""},
+		ssh.MockCommand{Match: "cat /tmp/teploy_log_entry", Output: ""},
+		ssh.MockCommand{Match: "rm -rf /deployments/myapp/.lock", Output: ""},
+	)
+
+	var buf bytes.Buffer
+	deployer := NewDeployer(mock, &buf)
+
+	err := deployer.Deploy(context.Background(), Config{
+		App:     "myapp",
+		Domain:  "myapp.com",
+		Image:   "myapp:latest",
+		Version: "abc123",
+		Processes: map[string]string{
+			"web":    "npm start",
+			"worker": "npm run worker",
+		},
+		NoHealthcheck: map[string]bool{
+			"worker": true,
+		},
+		Health: HealthConfig{Timeout: 5 * time.Second, Interval: 10 * time.Millisecond},
+	})
+	if err != nil {
+		t.Fatalf("Deploy: %v", err)
+	}
+
+	var webCmd, workerCmd string
+	for _, call := range mock.Calls {
+		if !strings.HasPrefix(call, "docker run") {
+			continue
+		}
+		if strings.Contains(call, "--name myapp-web-abc123") {
+			webCmd = call
+		}
+		if strings.Contains(call, "--name myapp-worker-abc123") {
+			workerCmd = call
+		}
+	}
+	if workerCmd == "" {
+		t.Fatal("worker docker run not captured")
+	}
+	if webCmd == "" {
+		t.Fatal("web docker run not captured")
+	}
+	if !strings.Contains(workerCmd, "--no-healthcheck") {
+		t.Errorf("worker should have --no-healthcheck\ngot: %s", workerCmd)
+	}
+	if strings.Contains(webCmd, "--no-healthcheck") {
+		t.Errorf("web should NOT have --no-healthcheck when only worker is configured\ngot: %s", webCmd)
+	}
+}
+
 func TestDeploy_WorkerStartFailure(t *testing.T) {
 	// Use a separate mock command for the worker run that fails.
 	// We need the web "docker run" to succeed and the worker "docker run" to fail.

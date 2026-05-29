@@ -25,6 +25,12 @@ type Config struct {
 	Volumes     map[string]string
 	Cmd         string            // command override for single-process deploys
 	Processes   map[string]string // process_name -> command (overrides Cmd)
+	// NoHealthcheck disables the container HEALTHCHECK for specific processes.
+	// Keyed by process name; true means pass --no-healthcheck to docker run.
+	// Used when a process shouldn't be probed by the image's built-in
+	// healthcheck (e.g. a worker that shares an image with web but has no
+	// HTTP listener for the image's curl probe to hit).
+	NoHealthcheck map[string]bool
 	Memory        string
 	CPU           string
 	ContainerPort int // internal container port (default 80)
@@ -183,6 +189,7 @@ func (d *Deployer) Deploy(ctx context.Context, cfg Config) error {
 			Memory:        cfg.Memory,
 			CPU:           cfg.CPU,
 			Name:          name,
+			NoHealthcheck: cfg.NoHealthcheck["web"],
 		})
 		if err != nil {
 			return fmt.Errorf("starting container %s: %w", name, err)
@@ -254,17 +261,18 @@ func (d *Deployer) Deploy(ctx context.Context, cfg Config) error {
 		name := docker.ContainerName(cfg.App, process, cfg.Version)
 		fmt.Fprintf(d.out, "Starting %s...\n", name)
 		_, err := d.docker.Run(ctx, docker.RunConfig{
-			App:     cfg.App,
-			Process: process,
-			Version: cfg.Version,
-			Image:   cfg.Image,
-			Port:    0, // non-web processes don't get a port
-			EnvFile: cfg.EnvFile,
-			Env:     cfg.Env,
-			Volumes: cfg.Volumes,
-			Cmd:     processes[process],
-			Memory:  cfg.Memory,
-			CPU:     cfg.CPU,
+			App:           cfg.App,
+			Process:       process,
+			Version:       cfg.Version,
+			Image:         cfg.Image,
+			Port:          0, // non-web processes don't get a port
+			EnvFile:       cfg.EnvFile,
+			Env:           cfg.Env,
+			Volumes:       cfg.Volumes,
+			Cmd:           processes[process],
+			Memory:        cfg.Memory,
+			CPU:           cfg.CPU,
+			NoHealthcheck: cfg.NoHealthcheck[process],
 		})
 		if err != nil {
 			return fail(fmt.Errorf("starting %s: %w", name, err))

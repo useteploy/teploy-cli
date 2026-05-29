@@ -92,6 +92,62 @@ func TestClient_Run_Worker(t *testing.T) {
 	}
 }
 
+func TestClient_Run_NoHealthcheck(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "docker run", Output: "nohealth123"},
+	)
+	client := NewClient(mock)
+
+	_, err := client.Run(context.Background(), RunConfig{
+		App:           "myapp",
+		Process:       "worker",
+		Version:       "abc123",
+		Image:         "myapp:abc123",
+		Cmd:           "npm run worker",
+		NoHealthcheck: true,
+	})
+	if err != nil {
+		t.Fatalf("Run failed: %v", err)
+	}
+
+	cmd := mock.Calls[0]
+	if !strings.Contains(cmd, "--no-healthcheck") {
+		t.Errorf("NoHealthcheck=true should add --no-healthcheck to command\ngot: %s", cmd)
+	}
+
+	// The flag must precede the image so docker treats it as a run flag,
+	// not a command argument to the container.
+	imageIdx := strings.Index(cmd, "myapp:abc123")
+	flagIdx := strings.Index(cmd, "--no-healthcheck")
+	if flagIdx < 0 || flagIdx > imageIdx {
+		t.Errorf("--no-healthcheck must appear before the image\ngot: %s", cmd)
+	}
+}
+
+func TestClient_Run_HealthcheckDefault(t *testing.T) {
+	// When NoHealthcheck is false (zero value), --no-healthcheck must not
+	// be added. This is the default for all existing Teploy users.
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "docker run", Output: "default123"},
+	)
+	client := NewClient(mock)
+
+	_, err := client.Run(context.Background(), RunConfig{
+		App:     "myapp",
+		Process: "web",
+		Version: "abc123",
+		Image:   "myapp:abc123",
+		Port:    49152,
+	})
+	if err != nil {
+		t.Fatalf("Run failed: %v", err)
+	}
+
+	if strings.Contains(mock.Calls[0], "--no-healthcheck") {
+		t.Errorf("NoHealthcheck=false should not add --no-healthcheck\ngot: %s", mock.Calls[0])
+	}
+}
+
 func TestClient_Run_WithOptions(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "docker run", Output: "opts123"},

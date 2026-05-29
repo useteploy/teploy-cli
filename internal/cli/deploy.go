@@ -366,6 +366,7 @@ func deployAppConfig(flags *Flags, appCfg *config.AppConfig, serverName, image, 
 		Env:           deploySecrets,
 		Volumes:       volumes,
 		Processes:     appCfg.Processes,
+		NoHealthcheck: disabledHealthchecks(appCfg.Healthcheck),
 		ContainerPort: appCfg.Port,
 		StopTimeout:   appCfg.StopTimeout,
 		Replicas:      appCfg.Replicas,
@@ -563,4 +564,24 @@ func runStaticDeploy(cfg *config.AppConfig, host, user, key string) error {
 		return err
 	}
 	return nil
+}
+
+// disabledHealthchecks returns the set of process names whose container
+// HEALTHCHECK should be disabled (--no-healthcheck), built from the
+// teploy.yml `healthcheck:` block. Returns nil when nothing is disabled
+// so deploy.Config carries a nil map and skips the lookup hot path.
+func disabledHealthchecks(hc map[string]config.ProcessHealth) map[string]bool {
+	if len(hc) == 0 {
+		return nil
+	}
+	out := make(map[string]bool, len(hc))
+	for name, h := range hc {
+		if h.Disable {
+			out[name] = true
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
