@@ -32,3 +32,7 @@ test-results/
 # Claude Code
 CLAUDE.md
 .claude/
+
+# Private notes — local only, never committed
+/_internal/
+/INTERNAL.md
