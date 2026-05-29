@@ -69,11 +69,15 @@ func TestSetupServer(t *testing.T) {
 		"-p 80:80",
 		"-p 443:443",
 		"caddy_data:/data",
-		"/deployments/caddy/Caddyfile:/etc/caddy/Caddyfile",
+		"/deployments/caddy:/etc/caddy",
 	} {
 		if !strings.Contains(caddyCmd, want) {
 			t.Errorf("Caddy command missing %q\ngot: %s", want, caddyCmd)
 		}
+	}
+	// Must mount the directory, not the single file (stale-bind-mount bug).
+	if strings.Contains(caddyCmd, "/deployments/caddy/Caddyfile:/etc/caddy/Caddyfile") {
+		t.Errorf("Caddy must not single-file-mount the Caddyfile\ngot: %s", caddyCmd)
 	}
 	// Caddyfile-authoritative model: no --resume, and the admin API is not
 	// published to the host (reached via docker exec only).
@@ -130,8 +134,10 @@ func TestSetupServer_CaddyAlreadyRunning(t *testing.T) {
 		ssh.MockCommand{Match: "test -s /deployments/caddy/Caddyfile", Output: ""},
 		ssh.MockCommand{Match: "sed -i", Output: ""},
 		ssh.MockCommand{Match: "docker ps -a --filter name=", Output: "caddy"},
-		// Existing Caddy already runs without --resume (Caddyfile-authoritative): skip recreation.
-		ssh.MockCommand{Match: "docker inspect -f", Output: "caddy run --config /etc/caddy/Caddyfile --adapter caddyfile"},
+		// Existing Caddy already on the new model: no --resume, AND directory-
+		// mounted (/etc/caddy). Both checks pass → skip recreation.
+		ssh.MockCommand{Match: "docker inspect -f '{{join .Config.Cmd", Output: "caddy run --config /etc/caddy/Caddyfile --adapter caddyfile"},
+		ssh.MockCommand{Match: "docker inspect -f '{{range .Mounts}}", Output: "/data /config /etc/caddy "},
 	)
 
 	var buf bytes.Buffer
@@ -170,6 +176,7 @@ func TestSetupServer_CaddyUpgradePreservesNetworksAndCaddyfile(t *testing.T) {
 		ssh.MockCommand{Match: "docker ps -a --filter name=", Output: "caddy"},
 		// Legacy Caddy cmd: launched WITH --resume, must migrate.
 		ssh.MockCommand{Match: "docker inspect -f '{{join .Config.Cmd", Output: "caddy run --config /etc/caddy/Caddyfile --adapter caddyfile --resume"},
+		ssh.MockCommand{Match: "docker inspect -f '{{range .Mounts}}", Output: "/data /config /etc/caddy/Caddyfile "},
 		// Extra networks the existing caddy is attached to.
 		ssh.MockCommand{Match: "docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}", Output: "teploy dokploy-network bridge "},
 		ssh.MockCommand{Match: "docker rm -f caddy", Output: ""},
@@ -227,6 +234,58 @@ func TestSetupServer_CaddyUpgradePreservesNetworksAndCaddyfile(t *testing.T) {
 	}
 	if foundTeployReattach {
 		t.Error("should not reattach base teploy network — already attached via docker run")
+	}
+}
+
+// TestSetupServer_MigratesLegacyFileMount covers a server already on the
+// no-resume model but still using the old single-file Caddyfile bind mount.
+// That mount is pinned to a stale inode after teploy's atomic Caddyfile
+// writes, so setup must recreate Caddy onto the directory mount even though
+// --resume is absent.
+func TestSetupServer_MigratesLegacyFileMount(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "whoami", Output: "root"},
+		ssh.MockCommand{Match: "docker --version", Output: "Docker version 24.0.0"},
+		ssh.MockCommand{Match: "ufw status", Err: fmt.Errorf("not found")},
+		ssh.MockCommand{Match: "systemctl", Err: fmt.Errorf("inactive")},
+		ssh.MockCommand{Match: "docker info", Output: ""},
+		ssh.MockCommand{Match: "docker network", Output: "teploy"},
+		ssh.MockCommand{Match: "mkdir", Output: ""},
+		ssh.MockCommand{Match: "chown", Output: ""},
+		ssh.MockCommand{Match: "test -s /deployments/caddy/Caddyfile", Output: ""},
+		ssh.MockCommand{Match: "sed -i", Output: ""},
+		ssh.MockCommand{Match: "docker ps -a --filter name=", Output: "caddy"},
+		// No --resume, but the legacy single-file mount is present → recreate.
+		ssh.MockCommand{Match: "docker inspect -f '{{join .Config.Cmd", Output: "caddy run --config /etc/caddy/Caddyfile --adapter caddyfile"},
+		ssh.MockCommand{Match: "docker inspect -f '{{range .Mounts}}", Output: "/data /config /etc/caddy/Caddyfile "},
+		ssh.MockCommand{Match: "docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}", Output: "teploy "},
+		ssh.MockCommand{Match: "docker rm -f caddy", Output: ""},
+		ssh.MockCommand{Match: "docker run", Output: "caddy_id"},
+	)
+
+	var buf bytes.Buffer
+	if err := setupServer(context.Background(), mock, &buf, true); err != nil {
+		t.Fatalf("setupServer: %v", err)
+	}
+
+	// Must have removed and recreated Caddy.
+	removed, recreatedDirMount := false, false
+	for _, c := range mock.Calls {
+		if strings.HasPrefix(c, "docker rm -f caddy") {
+			removed = true
+		}
+		if strings.HasPrefix(c, "docker run") && strings.Contains(c, "/deployments/caddy:/etc/caddy") {
+			recreatedDirMount = true
+		}
+	}
+	if !removed {
+		t.Error("legacy file-mount Caddy should have been removed")
+	}
+	if !recreatedDirMount {
+		t.Error("recreated Caddy must use the directory mount /deployments/caddy:/etc/caddy")
+	}
+	if !strings.Contains(buf.String(), "single-file Caddyfile mount") {
+		t.Errorf("should explain the file-mount migration reason, got:\n%s", buf.String())
 	}
 }
 

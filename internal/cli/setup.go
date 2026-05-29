@@ -506,11 +506,24 @@ func setupServer(ctx context.Context, exec ssh.Executor, w io.Writer, yes bool) 
 	caddyCheck, _ := exec.Run(ctx, dockerCmd+" ps -a --filter name=^caddy$ --format '{{.Names}}'")
 	extraNetworks := []string{}
 	if strings.TrimSpace(caddyCheck) != "" {
-		// Detect old Caddy containers missing --resume. Recreation is
-		// destructive (brief outage + requires re-attaching any non-teploy
+		// Two legacy conditions require recreating the Caddy container. Both
+		// recreations are destructive (brief outage + re-attaching non-teploy
 		// networks), so we require explicit confirmation.
 		cmdOut, _ := exec.Run(ctx, dockerCmd+" inspect -f '{{join .Config.Cmd \" \"}}' caddy")
-		if strings.Contains(cmdOut, "--resume") {
+		mountOut, _ := exec.Run(ctx, dockerCmd+" inspect -f '{{range .Mounts}}{{.Destination}} {{end}}' caddy")
+
+		// (1) --resume boots from admin-API autosave, shadowing the Caddyfile.
+		legacyResume := strings.Contains(cmdOut, "--resume")
+		// (2) A single-file Caddyfile bind mount (Destination
+		// /etc/caddy/Caddyfile) is pinned by Docker to the file's original
+		// inode. Teploy writes the Caddyfile atomically (write tmp + mv),
+		// which swaps the inode — so the running container never sees route
+		// updates and `caddy reload` reloads stale config. The directory
+		// mount (/etc/caddy) re-resolves the file by path on each reload and
+		// avoids this. Detect the legacy file mount and migrate.
+		legacyFileMount := strings.Contains(mountOut, "/etc/caddy/Caddyfile")
+
+		if legacyResume || legacyFileMount {
 			// Capture every network the existing Caddy is attached to so
 			// we can reattach them after recreating. Previously these were
 			// silently dropped, leaving apps on other networks (e.g.
@@ -522,7 +535,11 @@ func setupServer(ctx context.Context, exec ssh.Executor, w io.Writer, yes bool) 
 				}
 			}
 
-			fmt.Fprintln(w, "  Caddy is running with --resume (legacy admin-API mode) — migrating to Caddyfile-authoritative.")
+			reason := "running with --resume (legacy admin-API mode)"
+			if !legacyResume && legacyFileMount {
+				reason = "using a single-file Caddyfile mount (atomic config writes don't reach the container)"
+			}
+			fmt.Fprintf(w, "  Caddy is %s — migrating to the directory-mounted, Caddyfile-authoritative model.\n", reason)
 			fmt.Fprintln(w, "  This recreates the container (brief outage).")
 			if len(extraNetworks) > 0 {
 				fmt.Fprintf(w, "  Additional networks to reattach: %s\n", strings.Join(extraNetworks, ", "))
@@ -547,7 +564,14 @@ func setupServer(ctx context.Context, exec ssh.Executor, w io.Writer, yes bool) 
 			"-p", "443:443",
 			"-v", "caddy_data:/data",
 			"-v", "caddy_config:/config",
-			"-v", "/deployments/caddy/Caddyfile:/etc/caddy/Caddyfile",
+			// Mount the directory, NOT the single Caddyfile. A single-file
+			// bind mount pins Docker to the file's inode, so teploy's atomic
+			// (tmp + mv) Caddyfile writes never reach the container. Mounting
+			// the directory lets `caddy reload` re-read the current file by
+			// path. It also exposes /deployments/caddy/tls/* as /etc/caddy/tls
+			// for apps that terminate TLS with a custom cert (e.g. a
+			// Cloudflare Origin Certificate).
+			"-v", "/deployments/caddy:/etc/caddy",
 			"caddy",
 			"caddy", "run", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile",
 		}, " ")
