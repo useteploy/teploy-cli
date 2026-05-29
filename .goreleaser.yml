@@ -31,7 +31,7 @@ brews:
       owner: useteploy
       name: homebrew-tap
       token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
-    homepage: https://github.com/useteploy/teploy
+    homepage: https://github.com/useteploy/teploy-cli
     description: Zero-downtime Docker deploys to any server via SSH
     license: MIT
     install: |
@@ -42,6 +42,6 @@ scoops:
       owner: useteploy
       name: scoop-bucket
       token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
-    homepage: https://github.com/useteploy/teploy
+    homepage: https://github.com/useteploy/teploy-cli
     description: Zero-downtime Docker deploys to any server via SSH
     license: MIT

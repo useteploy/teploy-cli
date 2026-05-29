@@ -4,9 +4,9 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/useteploy/teploy/releases"><img src="https://img.shields.io/github/v/release/useteploy/teploy" alt="Release"></a>
-  <a href="https://github.com/useteploy/teploy/actions"><img src="https://github.com/useteploy/teploy/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <a href="https://github.com/useteploy/teploy/blob/main/LICENSE"><img src="https://img.shields.io/github/license/useteploy/teploy" alt="License"></a>
+  <a href="https://github.com/useteploy/teploy-cli/releases"><img src="https://img.shields.io/github/v/release/useteploy/teploy-cli" alt="Release"></a>
+  <a href="https://github.com/useteploy/teploy-cli/actions"><img src="https://github.com/useteploy/teploy-cli/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/useteploy/teploy-cli/blob/main/LICENSE"><img src="https://img.shields.io/github/license/useteploy/teploy-cli" alt="License"></a>
 </p>
 
 ---
@@ -39,7 +39,7 @@ scoop bucket add teploy https://github.com/useteploy/scoop-bucket
 scoop install teploy
 
 # Download binary (macOS/Linux)
-curl -fsSL https://github.com/useteploy/teploy/releases/latest/download/teploy_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/').tar.gz | tar xz
+curl -fsSL https://github.com/useteploy/teploy-cli/releases/latest/download/teploy_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/').tar.gz | tar xz
 sudo mv teploy /usr/local/bin/
 
 # From source
