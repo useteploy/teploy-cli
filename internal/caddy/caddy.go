@@ -71,6 +71,28 @@ type Upstream struct {
 	Dial string `json:"dial"`
 }
 
+// TLS carries container-side paths to a custom certificate + key for
+// terminating TLS on a site block (e.g. a Cloudflare Origin Certificate).
+// When both are empty, Caddy uses automatic HTTPS (ACME) — the default.
+//
+// Custom certs are required when the public hostname is fronted by a proxy
+// that hides the origin from ACME challenges (Cloudflare proxied DNS,
+// behind a tunnel, etc.), so Caddy can't complete an ACME challenge and
+// must present a pre-issued cert instead.
+type TLS struct {
+	Cert string // container path, e.g. /etc/caddy/tls/myapp.crt
+	Key  string // container path, e.g. /etc/caddy/tls/myapp.key
+}
+
+// directive returns the indented `tls <cert> <key>` line for a site block,
+// or "" when no custom cert is configured (automatic HTTPS).
+func (t TLS) directive() string {
+	if t.Cert == "" || t.Key == "" {
+		return ""
+	}
+	return fmt.Sprintf("\ttls %s %s\n", t.Cert, t.Key)
+}
+
 // HealthChecks configures active health checking for upstreams.
 type HealthChecks struct {
 	Active *ActiveHealthCheck `json:"active,omitempty"`
@@ -118,23 +140,23 @@ func NewClient(exec ssh.Executor) *Client {
 // If a hand-written (non-Teploy) site block already serves any of these hosts —
 // common when adopting a server that previously ran another proxy — it is
 // replaced, so Teploy's block becomes the single authority for the domain.
-func (c *Client) SetRoute(ctx context.Context, app, domain, upstream string, containerPort int) error {
+func (c *Client) SetRoute(ctx context.Context, app, domain, upstream string, containerPort int, tls TLS) error {
 	hosts := parseDomains(domain)
 	if len(hosts) == 0 {
 		return fmt.Errorf("SetRoute: domain must be non-empty")
 	}
-	return c.applyManagedBlock(ctx, app, hosts, reverseProxyBlock(hosts, upstream, containerPort))
+	return c.applyManagedBlock(ctx, app, hosts, reverseProxyBlock(hosts, upstream, containerPort, tls))
 }
 
 // SetLoadBalancer adds or updates a load-balanced reverse proxy route: traffic
 // for the domain is distributed across upstreams via round-robin with active
 // /up health checks. Replaces any prior route block for the same app.
-func (c *Client) SetLoadBalancer(ctx context.Context, app, domain string, upstreams []Upstream) error {
+func (c *Client) SetLoadBalancer(ctx context.Context, app, domain string, upstreams []Upstream, tls TLS) error {
 	hosts := parseDomains(domain)
 	if len(hosts) == 0 {
 		return fmt.Errorf("SetLoadBalancer: domain must be non-empty")
 	}
-	return c.applyManagedBlock(ctx, app, hosts, loadBalancerBlock(hosts, upstreams))
+	return c.applyManagedBlock(ctx, app, hosts, loadBalancerBlock(hosts, upstreams, tls))
 }
 
 // SetStaticRoute upserts a Caddyfile block that serves a static deploy.
@@ -443,20 +465,20 @@ func parseDomains(domain string) []string {
 }
 
 // reverseProxyBlock renders a Caddyfile reverse-proxy site block.
-func reverseProxyBlock(hosts []string, upstream string, port int) string {
-	return fmt.Sprintf("%s {\n\treverse_proxy %s:%d\n}", strings.Join(hosts, ", "), upstream, port)
+func reverseProxyBlock(hosts []string, upstream string, port int, tls TLS) string {
+	return fmt.Sprintf("%s {\n%s\treverse_proxy %s:%d\n}", strings.Join(hosts, ", "), tls.directive(), upstream, port)
 }
 
 // loadBalancerBlock renders a round-robin reverse-proxy block with active /up
 // health checks.
-func loadBalancerBlock(hosts []string, upstreams []Upstream) string {
+func loadBalancerBlock(hosts []string, upstreams []Upstream, tls TLS) string {
 	dials := make([]string, len(upstreams))
 	for i, u := range upstreams {
 		dials[i] = u.Dial
 	}
 	return fmt.Sprintf(
-		"%s {\n\treverse_proxy %s {\n\t\tlb_policy round_robin\n\t\thealth_uri /up\n\t\thealth_interval 10s\n\t\thealth_timeout 5s\n\t}\n}",
-		strings.Join(hosts, ", "), strings.Join(dials, " "),
+		"%s {\n%s\treverse_proxy %s {\n\t\tlb_policy round_robin\n\t\thealth_uri /up\n\t\thealth_interval 10s\n\t\thealth_timeout 5s\n\t}\n}",
+		strings.Join(hosts, ", "), tls.directive(), strings.Join(dials, " "),
 	)
 }
 

@@ -34,6 +34,21 @@ type AccessoryConfig struct {
 	Volumes map[string]string `yaml:"volumes,omitempty" toml:"volumes"`
 }
 
+// TLSConfig declares a custom certificate for terminating TLS on the app's
+// Caddy site block, instead of Caddy's automatic HTTPS (ACME). Use this when
+// the public hostname is proxied so ACME challenges can't reach the origin —
+// e.g. Cloudflare proxied DNS or a Cloudflare Tunnel, where you terminate
+// with a Cloudflare Origin Certificate.
+//
+// Cert and Key are LOCAL file paths (on the machine running teploy). On deploy
+// they are uploaded to the server and referenced from the generated Caddy
+// block, so the cert survives every deploy (unlike a hand-edited Caddyfile,
+// which the authoritative model overwrites).
+type TLSConfig struct {
+	Cert string `yaml:"cert" toml:"cert"` // local path to PEM certificate (chain)
+	Key  string `yaml:"key" toml:"key"`   // local path to PEM private key
+}
+
 // NotificationChannelConfig represents a single notification channel.
 type NotificationChannelConfig struct {
 	Type   string   `yaml:"type,omitempty" toml:"type"`
@@ -89,6 +104,9 @@ type AppConfig struct {
 	Processes     map[string]string          `yaml:"processes,omitempty" toml:"processes"`
 	Accessories   map[string]AccessoryConfig `yaml:"accessories,omitempty" toml:"accessories"`
 	Assets        AssetsConfig               `yaml:"assets,omitempty" toml:"assets"`
+	// TLS terminates the app's HTTPS with a custom cert instead of ACME.
+	// Required behind Cloudflare proxy / Tunnel (origin cert). Nil = ACME.
+	TLS           *TLSConfig                 `yaml:"tls,omitempty" toml:"tls"`
 	Notifications NotificationsConfig        `yaml:"notifications,omitempty" toml:"notifications"`
 	Network       NetworkConfig              `yaml:"network,omitempty" toml:"network"`
 
@@ -160,8 +178,19 @@ func (c *AppConfig) validate() error {
 		if c.KeepReleases < 0 {
 			return fmt.Errorf("'keep_releases' must be >= 0 (got %d)", c.KeepReleases)
 		}
+		if c.TLS != nil {
+			// Static deploys generate a different Caddy block (file_server);
+			// custom-cert support there is a separate change. Reject for now
+			// rather than silently ignore.
+			return fmt.Errorf("'tls' is not yet supported for type:static")
+		}
 	default:
 		return fmt.Errorf("'type' must be 'container' or 'static' (got %q)", c.Type)
+	}
+	if c.TLS != nil {
+		if c.TLS.Cert == "" || c.TLS.Key == "" {
+			return fmt.Errorf("'tls' requires both 'cert' and 'key' paths")
+		}
 	}
 	for name := range c.Volumes {
 		if !validName.MatchString(name) {
@@ -321,6 +350,9 @@ func mergeConfigs(base, overlay *AppConfig) {
 	}
 	if overlay.Assets.Path != "" {
 		base.Assets = overlay.Assets
+	}
+	if overlay.TLS != nil {
+		base.TLS = overlay.TLS
 	}
 	if overlay.Notifications.Webhook != "" {
 		base.Notifications.Webhook = overlay.Notifications.Webhook

@@ -192,8 +192,20 @@ func updateLoadBalancer(ctx context.Context, flags *Flags, appCfg *config.AppCon
 			return fmt.Errorf("connecting to LB %s: %w", name, err)
 		}
 
+		// Upload + reference the app's custom TLS cert on this LB host so the
+		// load balancer terminates HTTPS the same way the app servers do.
+		var tls caddy.TLS
+		if appCfg.TLS != nil {
+			cert, key, upErr := uploadAppTLS(ctx, executor, appCfg.App, appCfg.TLS)
+			if upErr != nil {
+				executor.Close()
+				return fmt.Errorf("uploading TLS to LB %s: %w", name, upErr)
+			}
+			tls = caddy.TLS{Cert: cert, Key: key}
+		}
+
 		client := caddy.NewClient(executor)
-		err = client.SetLoadBalancer(ctx, appCfg.App, appCfg.Domain, upstreams)
+		err = client.SetLoadBalancer(ctx, appCfg.App, appCfg.Domain, upstreams, tls)
 		executor.Close()
 		if err != nil {
 			return fmt.Errorf("updating LB %s: %w", name, err)

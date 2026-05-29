@@ -36,7 +36,7 @@ func TestSetRoute_WritesBlockAndReloads(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4", lockCmds("{\n\tadmin 127.0.0.1:2019\n}\n")...)
 
 	client := NewClient(mock)
-	if err := client.SetRoute(context.Background(), "myapp", "myapp.com", "myapp-v1", 80); err != nil {
+	if err := client.SetRoute(context.Background(), "myapp", "myapp.com", "myapp-v1", 80, TLS{}); err != nil {
 		t.Fatalf("SetRoute: %v", err)
 	}
 
@@ -60,7 +60,7 @@ func TestSetRoute_UpdateExisting(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4", lockCmds(existing)...)
 
 	client := NewClient(mock)
-	if err := client.SetRoute(context.Background(), "myapp", "myapp.com", "myapp-v2", 3000); err != nil {
+	if err := client.SetRoute(context.Background(), "myapp", "myapp.com", "myapp-v2", 3000, TLS{}); err != nil {
 		t.Fatalf("SetRoute: %v", err)
 	}
 
@@ -86,7 +86,7 @@ func TestSetRoute_AdoptsForeignBlock(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4", lockCmds(existing)...)
 
 	client := NewClient(mock)
-	if err := client.SetRoute(context.Background(), "myapp", "myapp.com, www.myapp.com", "myapp-v1", 80); err != nil {
+	if err := client.SetRoute(context.Background(), "myapp", "myapp.com, www.myapp.com", "myapp-v1", 80, TLS{}); err != nil {
 		t.Fatalf("SetRoute: %v", err)
 	}
 
@@ -108,7 +108,7 @@ func TestSetRoute_AdoptsForeignBlock(t *testing.T) {
 func TestSetRoute_MultiHost(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4", lockCmds("{\n\tadmin 127.0.0.1:2019\n}\n")...)
 	client := NewClient(mock)
-	if err := client.SetRoute(context.Background(), "myapp", "myapp.com, www.myapp.com", "myapp-v1", 80); err != nil {
+	if err := client.SetRoute(context.Background(), "myapp", "myapp.com, www.myapp.com", "myapp-v1", 80, TLS{}); err != nil {
 		t.Fatalf("SetRoute: %v", err)
 	}
 	if !strings.Contains(string(mock.Files[tmpCaddyfile]), "myapp.com, www.myapp.com {") {
@@ -129,7 +129,7 @@ func TestSetRoute_ReloadFailureRollsBack(t *testing.T) {
 	)
 
 	client := NewClient(mock)
-	err := client.SetRoute(context.Background(), "myapp", "myapp.com", "myapp-v1", 80)
+	err := client.SetRoute(context.Background(), "myapp", "myapp.com", "myapp-v1", 80, TLS{})
 	if err == nil {
 		t.Fatal("expected error on reload failure")
 	}
@@ -143,7 +143,7 @@ func TestSetLoadBalancer(t *testing.T) {
 	mock := ssh.NewMockExecutor("10.0.0.100", lockCmds("{\n\tadmin 127.0.0.1:2019\n}\n")...)
 	client := NewClient(mock)
 	upstreams := []Upstream{{Dial: "10.0.0.1:80"}, {Dial: "10.0.0.2:80"}, {Dial: "10.0.0.3:80"}}
-	if err := client.SetLoadBalancer(context.Background(), "myapp", "myapp.com", upstreams); err != nil {
+	if err := client.SetLoadBalancer(context.Background(), "myapp", "myapp.com", upstreams, TLS{}); err != nil {
 		t.Fatalf("SetLoadBalancer: %v", err)
 	}
 
@@ -303,7 +303,7 @@ func TestRemoveCaddyfileBlock(t *testing.T) {
 }
 
 func TestReverseProxyBlock(t *testing.T) {
-	got := reverseProxyBlock([]string{"example.com"}, "myapp-v1", 8080)
+	got := reverseProxyBlock([]string{"example.com"}, "myapp-v1", 8080, TLS{})
 	want := "example.com {\n\treverse_proxy myapp-v1:8080\n}"
 	if got != want {
 		t.Errorf("reverseProxyBlock:\nwant: %q\ngot:  %q", want, got)
@@ -311,7 +311,7 @@ func TestReverseProxyBlock(t *testing.T) {
 }
 
 func TestReverseProxyBlockMultiHost(t *testing.T) {
-	got := reverseProxyBlock([]string{"example.com", "www.example.com"}, "myapp", 80)
+	got := reverseProxyBlock([]string{"example.com", "www.example.com"}, "myapp", 80, TLS{})
 	want := "example.com, www.example.com {\n\treverse_proxy myapp:80\n}"
 	if got != want {
 		t.Errorf("multi-host:\nwant: %q\ngot:  %q", want, got)
@@ -319,11 +319,44 @@ func TestReverseProxyBlockMultiHost(t *testing.T) {
 }
 
 func TestLoadBalancerBlock(t *testing.T) {
-	got := loadBalancerBlock([]string{"example.com"}, []Upstream{{Dial: "a:80"}, {Dial: "b:80"}})
+	got := loadBalancerBlock([]string{"example.com"}, []Upstream{{Dial: "a:80"}, {Dial: "b:80"}}, TLS{})
 	for _, want := range []string{"example.com {", "reverse_proxy a:80 b:80 {", "lb_policy round_robin", "health_uri /up", "health_interval 10s", "health_timeout 5s"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("loadBalancerBlock missing %q\nfull:\n%s", want, got)
 		}
+	}
+}
+
+func TestReverseProxyBlock_WithTLS(t *testing.T) {
+	got := reverseProxyBlock([]string{"fylun.ai"}, "fylun-web-v1", 3000,
+		TLS{Cert: "/etc/caddy/tls/fylun-web.crt", Key: "/etc/caddy/tls/fylun-web.key"})
+	want := "fylun.ai {\n\ttls /etc/caddy/tls/fylun-web.crt /etc/caddy/tls/fylun-web.key\n\treverse_proxy fylun-web-v1:3000\n}"
+	if got != want {
+		t.Errorf("reverseProxyBlock with TLS:\nwant: %q\ngot:  %q", want, got)
+	}
+}
+
+func TestLoadBalancerBlock_WithTLS(t *testing.T) {
+	got := loadBalancerBlock([]string{"fylun.ai"}, []Upstream{{Dial: "a:3000"}, {Dial: "b:3000"}},
+		TLS{Cert: "/etc/caddy/tls/fylun-web.crt", Key: "/etc/caddy/tls/fylun-web.key"})
+	if !strings.Contains(got, "\ttls /etc/caddy/tls/fylun-web.crt /etc/caddy/tls/fylun-web.key\n") {
+		t.Errorf("loadBalancerBlock with TLS missing tls directive\nfull:\n%s", got)
+	}
+	// The tls directive must come before the reverse_proxy directive.
+	if strings.Index(got, "tls ") > strings.Index(got, "reverse_proxy") {
+		t.Errorf("tls directive must precede reverse_proxy\nfull:\n%s", got)
+	}
+}
+
+func TestTLS_Directive_EmptyWhenUnset(t *testing.T) {
+	if (TLS{}).directive() != "" {
+		t.Error("empty TLS should produce no directive")
+	}
+	if (TLS{Cert: "x"}).directive() != "" {
+		t.Error("TLS with only cert (no key) should produce no directive")
+	}
+	if (TLS{Key: "y"}).directive() != "" {
+		t.Error("TLS with only key (no cert) should produce no directive")
 	}
 }
 
