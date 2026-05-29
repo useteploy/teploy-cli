@@ -43,6 +43,9 @@ func TestDeploy(t *testing.T) {
 		ssh.MockCommand{Match: "rm -f /tmp/teploy_caddy_config.json", Output: ""},
 		ssh.MockCommand{Match: "cat /deployments/caddy/Caddyfile", Output: "{\n\tadmin 0.0.0.0:2019\n}\n"},
 		ssh.MockCommand{Match: "mv /tmp/teploy_caddyfile.tmp", Output: ""},
+		ssh.MockCommand{Match: "mkdir /deployments/caddy/.lock", Output: ""},
+		ssh.MockCommand{Match: "docker exec caddy caddy reload", Output: ""},
+		ssh.MockCommand{Match: "rmdir /deployments/caddy/.lock", Output: ""},
 		ssh.MockCommand{Match: "UPLOAD:", Output: ""},
 	)
 

@@ -1,9 +1,7 @@
 package caddy
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -11,15 +9,30 @@ import (
 )
 
 const (
-	adminAPI        = "http://localhost:2019"
-	tmpConfig       = "/tmp/teploy_caddy_config.json"
-	caddyfilePath   = "/deployments/caddy/Caddyfile"
-	tmpCaddyfile    = "/tmp/teploy_caddyfile.tmp"
-	markerBeginFmt  = "# TEPLOY BEGIN %s"
-	markerEndFmt    = "# TEPLOY END %s"
+	caddyfilePath = "/deployments/caddy/Caddyfile"
+	tmpCaddyfile  = "/tmp/teploy_caddyfile.tmp"
+
+	markerBeginFmt = "# TEPLOY BEGIN %s"
+	markerEndFmt   = "# TEPLOY END %s"
+
+	// reloadCmd hot-reloads Caddy from the on-disk Caddyfile (zero-downtime).
+	// Run inside the container so it reaches Caddy's admin API on the
+	// container's loopback — the admin API is never exposed off-box.
+	reloadCmd = "docker exec caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile"
+
+	// lockDir serializes Caddyfile edits + reloads so concurrent deploys of
+	// different apps to the same server can't clobber the shared file.
+	lockDir          = "/deployments/caddy/.lock"
+	staleLockSeconds = 120 // break a lock left behind by a crashed deploy
+	lockWaitTries    = 60  // ~30s of contention before giving up
+
+	// maintStashFmt holds an app's pre-maintenance route block so it can be
+	// restored on RemoveMaintenance without re-deploying.
+	maintStashFmt = "/deployments/%s/.maintenance-block"
 )
 
-// HTTPApp represents Caddy's HTTP application configuration.
+// HTTPApp represents Caddy's HTTP application configuration. Kept for callers
+// (e.g. the dashboard) that read the live admin API for read-only display.
 type HTTPApp struct {
 	Servers map[string]*HTTPServer `json:"servers"`
 }
@@ -66,8 +79,8 @@ type HealthChecks struct {
 // ActiveHealthCheck configures how Caddy actively probes upstream health.
 type ActiveHealthCheck struct {
 	Path     string `json:"path,omitempty"`
-	Interval string `json:"interval,omitempty"` // duration string, e.g. "10s"
-	Timeout  string `json:"timeout,omitempty"`  // duration string, e.g. "5s"
+	Interval string `json:"interval,omitempty"`
+	Timeout  string `json:"timeout,omitempty"`
 }
 
 // LoadBalancing configures load balancing strategy.
@@ -77,100 +90,66 @@ type LoadBalancing struct {
 
 // SelectionPolicy defines how an upstream is selected.
 type SelectionPolicy struct {
-	Policy string `json:"policy,omitempty"` // round_robin, least_conn, etc.
+	Policy string `json:"policy,omitempty"`
 }
 
-// Client communicates with the Caddy admin API on a remote server via SSH.
-// The admin API is accessible at localhost:2019 on the server (bound to
-// 127.0.0.1 only, never publicly exposed).
+// Client manages Caddy routing by editing the on-disk Caddyfile — the single
+// source of truth — and hot-reloading Caddy. The Caddyfile is loaded on every
+// boot and reload, so there is no hidden admin-API/autosave state to diverge
+// from what's on disk. All mutations are serialized behind a server-side lock,
+// and a failed reload rolls the file back so Caddy never persists a config it
+// can't load.
 type Client struct {
 	exec ssh.Executor
 }
 
-// NewClient creates a Caddy admin API client.
+// NewClient creates a Caddy client backed by the given SSH executor.
 func NewClient(exec ssh.Executor) *Client {
 	return &Client{exec: exec}
 }
 
-// SetRoute adds or updates a reverse proxy route for the given app.
-// Routes traffic for the domain to the given upstream at the specified
-// container port. Caddy provisions HTTPS certificates automatically.
+// SetRoute adds or updates a reverse proxy route for the given app, serving the
+// (comma-separated) domain to the given upstream container:port.
 //
-// The `domain` argument may be a comma-separated list (e.g.
-// "example.com, www.example.com") to serve the same app on multiple hosts.
+// Callers should pass a specific container name as the upstream rather than a
+// shared network alias: during deploys the alias can resolve to both old and
+// new containers and Docker DNS round-robins between them.
 //
-// Callers should pass a specific container name as the upstream rather
-// than a shared network alias: during deploys the alias can resolve to
-// both old and new containers and Docker DNS round-robins between them,
-// briefly routing traffic to a container that's about to be stopped.
-//
-// Uses Caddy's ID-based API to surgically upsert a single route without
-// touching any other routes (including those defined in the Caddyfile).
+// If a hand-written (non-Teploy) site block already serves any of these hosts —
+// common when adopting a server that previously ran another proxy — it is
+// replaced, so Teploy's block becomes the single authority for the domain.
 func (c *Client) SetRoute(ctx context.Context, app, domain, upstream string, containerPort int) error {
 	hosts := parseDomains(domain)
 	if len(hosts) == 0 {
 		return fmt.Errorf("SetRoute: domain must be non-empty")
 	}
-	routeID := "teploy-" + app
-	newRoute := Route{
-		ID:    routeID,
-		Match: []Match{{Host: hosts}},
-		Handle: []Handler{{
-			Handler:   "reverse_proxy",
-			Upstreams: []Upstream{{Dial: fmt.Sprintf("%s:%d", upstream, containerPort)}},
-		}},
-	}
-
-	if err := c.ensureServer(ctx); err != nil {
-		return err
-	}
-	if err := c.putRouteByID(ctx, routeID, newRoute); err != nil {
-		return err
-	}
-	// Mirror to on-disk Caddyfile so the route survives a manual
-	// `caddy reload --config <file>` (which would otherwise wipe admin-API
-	// state not present in the Caddyfile).
-	return c.upsertCaddyfileBlock(ctx, app, reverseProxyBlock(hosts, upstream, containerPort))
+	return c.applyManagedBlock(ctx, app, hosts, reverseProxyBlock(hosts, upstream, containerPort))
 }
 
-// SetLoadBalancer adds or updates a load-balanced reverse proxy route for the
-// given app. Traffic for the domain is distributed across multiple upstreams
-// using round-robin with active health checks. `domain` supports comma-
-// separated lists like SetRoute.
+// SetLoadBalancer adds or updates a load-balanced reverse proxy route: traffic
+// for the domain is distributed across upstreams via round-robin with active
+// /up health checks. Replaces any prior route block for the same app.
 func (c *Client) SetLoadBalancer(ctx context.Context, app, domain string, upstreams []Upstream) error {
 	hosts := parseDomains(domain)
 	if len(hosts) == 0 {
 		return fmt.Errorf("SetLoadBalancer: domain must be non-empty")
 	}
-	routeID := "teploy-lb-" + app
-	newRoute := Route{
-		ID:    routeID,
-		Match: []Match{{Host: hosts}},
-		Handle: []Handler{{
-			Handler:   "reverse_proxy",
-			Upstreams: upstreams,
-			HealthChecks: &HealthChecks{
-				Active: &ActiveHealthCheck{
-					Path:     "/up",
-					Interval: "10s",
-					Timeout:  "5s",
-				},
-			},
-			LoadBalancing: &LoadBalancing{
-				SelectionPolicy: &SelectionPolicy{
-					Policy: "round_robin",
-				},
-			},
-		}},
-	}
+	return c.applyManagedBlock(ctx, app, hosts, loadBalancerBlock(hosts, upstreams))
+}
 
-	if err := c.ensureServer(ctx); err != nil {
-		return err
+// SetStaticRoute upserts a Caddyfile block that serves a static deploy.
+func (c *Client) SetStaticRoute(ctx context.Context, app, domain string, opts StaticBlockOpts) error {
+	hosts := parseDomains(domain)
+	if len(hosts) == 0 {
+		return fmt.Errorf("SetStaticRoute: domain must be non-empty")
 	}
-	if err := c.putRouteByID(ctx, routeID, newRoute); err != nil {
-		return err
-	}
-	return c.upsertCaddyfileBlock(ctx, "lb-"+app, loadBalancerBlock(hosts, upstreams))
+	opts.Hosts = hosts
+	return c.applyManagedBlock(ctx, app, hosts, StaticBlock(opts))
+}
+
+// RemoveRoute removes the route block for the given app. No-op if absent.
+func (c *Client) RemoveRoute(ctx context.Context, app string) error {
+	return c.applyManagedBlock(ctx, app, nil, "")
 }
 
 // maintenancePage is the HTML returned during maintenance mode.
@@ -191,233 +170,107 @@ p{color:#666}
 </div>
 </body></html>`
 
-// SetMaintenance enables maintenance mode for the given app.
-// Inserts a 503 static response route that intercepts traffic for the domain.
-// The existing reverse proxy route is left in place. `domain` supports comma-
-// separated lists like SetRoute.
+// SetMaintenance enables maintenance mode: the app's domain returns a 503
+// maintenance page. The app's current route block is stashed so it can be
+// restored by RemoveMaintenance without a redeploy.
 func (c *Client) SetMaintenance(ctx context.Context, app, domain string) error {
 	hosts := parseDomains(domain)
 	if len(hosts) == 0 {
 		return fmt.Errorf("SetMaintenance: domain must be non-empty")
 	}
-	routeID := "teploy-maint-" + app
-	maintRoute := Route{
-		ID:    routeID,
-		Match: []Match{{Host: hosts}},
-		Handle: []Handler{{
-			Handler:    "static_response",
-			StatusCode: "503",
-			Headers: map[string][]string{
-				"Content-Type": {"text/html; charset=utf-8"},
-				"Retry-After":  {"3600"},
-			},
-			Body: maintenancePage,
-		}},
-	}
-
-	if err := c.ensureServer(ctx); err != nil {
-		return err
-	}
-
-	// Maintenance routes must appear before regular routes to intercept traffic.
-	// Prepend by inserting at index 0 of the routes array.
-	return c.prependRouteByID(ctx, routeID, maintRoute)
-}
-
-// RemoveMaintenance disables maintenance mode for the given app.
-func (c *Client) RemoveMaintenance(ctx context.Context, app string) error {
-	return c.deleteRouteByID(ctx, "teploy-maint-"+app)
-}
-
-// RemoveRoute removes the route for the given app. No-op if no route exists.
-func (c *Client) RemoveRoute(ctx context.Context, app string) error {
-	if err := c.deleteRouteByID(ctx, "teploy-"+app); err != nil {
-		return err
-	}
-	// Remove both the regular and lb-variants on-disk in a single file
-	// rewrite — an app only uses one mode at a time, and two separate reads
-	// would race with the first rewrite on any real filesystem.
-	return c.removeCaddyfileBlocks(ctx, app, "lb-"+app)
-}
-
-// ensureServer makes sure Caddy has an HTTP server (srv0) configured with
-// listen addresses. On a fresh Caddy instance with only a minimal Caddyfile,
-// the HTTP app may not exist yet. This creates the skeleton without touching
-// any existing routes.
-func (c *Client) ensureServer(ctx context.Context) error {
-	// Check if srv0 already exists.
-	_, err := c.exec.Run(ctx, "curl -sf "+adminAPI+"/config/apps/http/servers/srv0")
-	if err == nil {
-		return nil // server already exists
-	}
-
-	// Create the server skeleton. PUT to the specific path so we don't
-	// overwrite any existing config at other paths.
-	srv := HTTPServer{Listen: []string{":80", ":443"}, Routes: []Route{}}
-	body, err := json.Marshal(srv)
-	if err != nil {
-		return fmt.Errorf("marshaling server config: %w", err)
-	}
-
-	if err := c.exec.Upload(ctx, bytes.NewReader(body), tmpConfig, "0644"); err != nil {
-		return fmt.Errorf("uploading server config: %w", err)
-	}
-
-	cmd := fmt.Sprintf(
-		"curl -sf -X PUT %s/config/apps/http/servers/srv0 -H 'Content-Type: application/json' -d @%s",
-		adminAPI, tmpConfig,
-	)
-	_, err = c.exec.Run(ctx, cmd)
-	c.exec.Run(ctx, "rm -f "+tmpConfig)
-	if err != nil {
-		return fmt.Errorf("creating caddy server: %w", err)
-	}
-	return nil
-}
-
-// putRouteByID upserts a route using Caddy's /id/ API endpoint.
-// This only touches the targeted route — all other routes (including
-// Caddyfile-defined routes) are left untouched.
-func (c *Client) putRouteByID(ctx context.Context, routeID string, route Route) error {
-	body, err := json.Marshal(route)
-	if err != nil {
-		return fmt.Errorf("marshaling route: %w", err)
-	}
-
-	if err := c.exec.Upload(ctx, bytes.NewReader(body), tmpConfig, "0644"); err != nil {
-		return fmt.Errorf("uploading route config: %w", err)
-	}
-
-	// Try PATCH on existing route first (update in place).
-	cmd := fmt.Sprintf(
-		"curl -sf -X PATCH %s/id/%s -H 'Content-Type: application/json' -d @%s",
-		adminAPI, routeID, tmpConfig,
-	)
-	_, err = c.exec.Run(ctx, cmd)
-
-	if err != nil {
-		// Route doesn't exist yet — append it to the routes array.
-		cmd = fmt.Sprintf(
-			"curl -sf -X POST %s/config/apps/http/servers/srv0/routes -H 'Content-Type: application/json' -d @%s",
-			adminAPI, tmpConfig,
-		)
-		_, err = c.exec.Run(ctx, cmd)
-	}
-
-	c.exec.Run(ctx, "rm -f "+tmpConfig)
-	if err != nil {
-		return fmt.Errorf("setting route %s: %w", routeID, err)
-	}
-	return nil
-}
-
-// prependRouteByID inserts a route at the beginning of the routes array.
-// Used for maintenance routes that must intercept before reverse proxy routes.
-// If a route with the same ID already exists, it is removed first.
-func (c *Client) prependRouteByID(ctx context.Context, routeID string, route Route) error {
-	// Remove existing route with this ID if present.
-	c.deleteRouteByID(ctx, routeID)
-
-	body, err := json.Marshal(route)
-	if err != nil {
-		return fmt.Errorf("marshaling route: %w", err)
-	}
-
-	if err := c.exec.Upload(ctx, bytes.NewReader(body), tmpConfig, "0644"); err != nil {
-		return fmt.Errorf("uploading route config: %w", err)
-	}
-
-	// Prepend: POST to routes array at index 0 isn't directly supported,
-	// so we read current routes, prepend, and write the full routes array.
-	httpApp, _ := c.getHTTPApp(ctx)
-	if httpApp == nil || httpApp.Servers == nil || httpApp.Servers["srv0"] == nil {
-		// No existing routes — just append.
-		cmd := fmt.Sprintf(
-			"curl -sf -X POST %s/config/apps/http/servers/srv0/routes -H 'Content-Type: application/json' -d @%s",
-			adminAPI, tmpConfig,
-		)
-		_, err = c.exec.Run(ctx, cmd)
-		c.exec.Run(ctx, "rm -f "+tmpConfig)
-		if err != nil {
-			return fmt.Errorf("prepending route %s: %w", routeID, err)
+	return c.mutate(ctx, func(prev string) (string, error) {
+		begin := fmt.Sprintf(markerBeginFmt, app)
+		end := fmt.Sprintf(markerEndFmt, app)
+		if cur := extractCaddyfileBlock(prev, begin, end); cur != "" {
+			stash := fmt.Sprintf(maintStashFmt, app)
+			if err := c.exec.Upload(ctx, strings.NewReader(cur), stash, "0644"); err != nil {
+				return "", fmt.Errorf("stashing route for maintenance: %w", err)
+			}
 		}
-		return nil
-	}
-
-	routes := append([]Route{route}, httpApp.Servers["srv0"].Routes...)
-	routesBody, err := json.Marshal(routes)
-	if err != nil {
-		return fmt.Errorf("marshaling routes: %w", err)
-	}
-
-	if err := c.exec.Upload(ctx, bytes.NewReader(routesBody), tmpConfig, "0644"); err != nil {
-		return fmt.Errorf("uploading routes: %w", err)
-	}
-
-	cmd := fmt.Sprintf(
-		"curl -sf -X PUT %s/config/apps/http/servers/srv0/routes -H 'Content-Type: application/json' -d @%s",
-		adminAPI, tmpConfig,
-	)
-	_, err = c.exec.Run(ctx, cmd)
-	c.exec.Run(ctx, "rm -f "+tmpConfig)
-	if err != nil {
-		return fmt.Errorf("prepending route %s: %w", routeID, err)
-	}
-	return nil
+		return renderUpdated(prev, app, hosts, maintenanceBlock(hosts)), nil
+	})
 }
 
-// deleteRouteByID removes a route by its @id. No-op if the route doesn't exist.
-func (c *Client) deleteRouteByID(ctx context.Context, routeID string) error {
-	cmd := fmt.Sprintf("curl -sf -X DELETE %s/id/%s", adminAPI, routeID)
-	c.exec.Run(ctx, cmd) // ignore error — route may not exist
-	return nil
+// RemoveMaintenance disables maintenance mode, restoring the stashed route
+// block if one exists.
+func (c *Client) RemoveMaintenance(ctx context.Context, app string) error {
+	return c.mutate(ctx, func(prev string) (string, error) {
+		stash := fmt.Sprintf(maintStashFmt, app)
+		saved, _ := c.exec.Run(ctx, "cat "+stash+" 2>/dev/null")
+		restored := strings.Trim(saved, "\n")
+		out := renderUpdated(prev, app, nil, restored)
+		c.exec.Run(ctx, "rm -f "+stash)
+		return out, nil
+	})
 }
 
-func (c *Client) getHTTPApp(ctx context.Context) (*HTTPApp, error) {
-	output, err := c.exec.Run(ctx, "curl -sf "+adminAPI+"/config/apps/http")
-	if err != nil {
-		return nil, err
+// mutate serializes a Caddyfile edit + reload behind the server lock. transform
+// receives the current Caddyfile and returns the new contents. If the reload
+// fails (e.g. the new config is invalid), the on-disk file is rolled back so
+// Caddy never persists a config it can't boot from.
+func (c *Client) mutate(ctx context.Context, transform func(prev string) (string, error)) error {
+	if err := c.acquireLock(ctx); err != nil {
+		return err
 	}
+	defer c.releaseLock(ctx)
 
-	var app HTTPApp
-	if err := json.Unmarshal([]byte(output), &app); err != nil {
-		return nil, fmt.Errorf("parsing caddy HTTP config: %w", err)
-	}
-	return &app, nil
-}
-
-// upsertCaddyfileBlock idempotently writes a Teploy-managed snippet for `app`
-// into the on-disk Caddyfile, wrapped in per-app markers. Passing block=""
-// removes the block.
-//
-// This exists because Teploy routes live only in Caddy's admin API config.
-// Without mirroring to disk, a manual `caddy reload --config <file>` loads
-// the Caddyfile and wipes every Teploy route. Mirroring makes the on-disk
-// Caddyfile the source of truth that survives any reload.
-//
-// The caller is expected to have already updated admin API state; this
-// function only syncs the on-disk representation. Written atomically via a
-// temp-file + mv to avoid a partial Caddyfile being observed by another
-// reader mid-write.
-func (c *Client) upsertCaddyfileBlock(ctx context.Context, app, block string) error {
-	current, err := c.exec.Run(ctx, "cat "+caddyfilePath)
+	prev, err := c.exec.Run(ctx, "cat "+caddyfilePath)
 	if err != nil {
 		return fmt.Errorf("reading caddyfile (did setup run?): %w", err)
 	}
 
-	begin := fmt.Sprintf(markerBeginFmt, app)
-	end := fmt.Sprintf(markerEndFmt, app)
-	updated := removeCaddyfileBlock(current, begin, end)
-
-	if block != "" {
-		wrapped := begin + "\n" + strings.TrimRight(block, "\n") + "\n" + end
-		updated = strings.TrimRight(updated, "\n") + "\n\n" + wrapped + "\n"
-	} else {
-		// On removal, tidy trailing whitespace so repeated remove calls don't drift.
-		updated = strings.TrimRight(updated, "\n") + "\n"
+	updated, err := transform(prev)
+	if err != nil {
+		return err
+	}
+	if updated == prev {
+		return nil
 	}
 
-	if err := c.exec.Upload(ctx, strings.NewReader(updated), tmpCaddyfile, "0644"); err != nil {
+	if err := c.writeCaddyfile(ctx, updated); err != nil {
+		return err
+	}
+	if err := c.reload(ctx); err != nil {
+		// Roll back so a bad config is never left on disk to break the next boot.
+		if rbErr := c.writeCaddyfile(ctx, prev); rbErr == nil {
+			c.reload(ctx) // best-effort restore of the live config
+		}
+		return fmt.Errorf("caddy reload failed, rolled back: %w", err)
+	}
+	return nil
+}
+
+// applyManagedBlock upserts (block != "") or removes (block == "") the app's
+// marker-delimited block, adopting any foreign block for the same hosts.
+func (c *Client) applyManagedBlock(ctx context.Context, app string, hosts []string, block string) error {
+	return c.mutate(ctx, func(prev string) (string, error) {
+		return renderUpdated(prev, app, hosts, block), nil
+	})
+}
+
+// renderUpdated produces new Caddyfile contents: it removes the app's previous
+// Teploy block (and a legacy lb-<app> block), removes any non-Teploy block
+// serving the same hosts (brownfield adoption), then appends the new block
+// wrapped in per-app markers. An empty block just performs the removals.
+func renderUpdated(prev, app string, hosts []string, block string) string {
+	updated := removeCaddyfileBlock(prev, fmt.Sprintf(markerBeginFmt, app), fmt.Sprintf(markerEndFmt, app))
+	// Legacy: older versions used a separate lb-<app> marker block.
+	updated = removeCaddyfileBlock(updated, fmt.Sprintf(markerBeginFmt, "lb-"+app), fmt.Sprintf(markerEndFmt, "lb-"+app))
+	if len(hosts) > 0 {
+		updated = removeForeignHostBlocks(updated, hosts)
+	}
+
+	if block != "" {
+		begin := fmt.Sprintf(markerBeginFmt, app)
+		end := fmt.Sprintf(markerEndFmt, app)
+		wrapped := begin + "\n" + strings.TrimRight(block, "\n") + "\n" + end
+		return strings.TrimRight(updated, "\n") + "\n\n" + wrapped + "\n"
+	}
+	return strings.TrimRight(updated, "\n") + "\n"
+}
+
+func (c *Client) writeCaddyfile(ctx context.Context, content string) error {
+	if err := c.exec.Upload(ctx, strings.NewReader(content), tmpCaddyfile, "0644"); err != nil {
 		return fmt.Errorf("uploading caddyfile: %w", err)
 	}
 	if _, err := c.exec.Run(ctx, "mv "+tmpCaddyfile+" "+caddyfilePath); err != nil {
@@ -426,10 +279,131 @@ func (c *Client) upsertCaddyfileBlock(ctx context.Context, app, block string) er
 	return nil
 }
 
-// removeCaddyfileBlock removes every region bounded by `begin`..`end` from the
-// content, collapsing surrounding blank lines so repeated upserts don't cause
-// the Caddyfile to grow stray whitespace. Tolerates a missing end marker by
-// trimming from the begin marker to end-of-file.
+func (c *Client) reload(ctx context.Context) error {
+	if _, err := c.exec.Run(ctx, reloadCmd); err != nil {
+		return err
+	}
+	return nil
+}
+
+// acquireLock takes a mkdir-based mutex on the Caddyfile, breaking a stale lock
+// left by a crashed deploy. Held only for the brief edit+reload, so contention
+// is rare and short.
+func (c *Client) acquireLock(ctx context.Context) error {
+	for i := 0; i < lockWaitTries; i++ {
+		if _, err := c.exec.Run(ctx, "mkdir "+lockDir); err == nil {
+			return nil
+		}
+		// Break a stale lock (older than staleLockSeconds), then wait and retry.
+		c.exec.Run(ctx, fmt.Sprintf(
+			"[ -d %s ] && [ $(( $(date +%%s) - $(stat -c %%Y %s 2>/dev/null || echo 0) )) -gt %d ] && rm -rf %s || true",
+			lockDir, lockDir, staleLockSeconds, lockDir,
+		))
+		c.exec.Run(ctx, "sleep 0.5")
+	}
+	return fmt.Errorf("timed out acquiring caddy lock %s", lockDir)
+}
+
+func (c *Client) releaseLock(ctx context.Context) {
+	c.exec.Run(ctx, "rmdir "+lockDir+" 2>/dev/null || true")
+}
+
+// removeForeignHostBlocks strips top-level Caddyfile site blocks that serve any
+// of the given hosts and are NOT inside a Teploy marker region. This lets a
+// deploy adopt a domain previously served by a hand-written block, leaving a
+// single authoritative block per host (no duplicate-address errors, no
+// route-ordering ambiguity).
+func removeForeignHostBlocks(content string, hosts []string) string {
+	lines := strings.Split(content, "\n")
+	out := make([]string, 0, len(lines))
+	inMarker := false
+	for i := 0; i < len(lines); {
+		line := lines[i]
+		trimmed := strings.TrimSpace(line)
+
+		if strings.HasPrefix(trimmed, "# TEPLOY BEGIN ") {
+			inMarker = true
+			out = append(out, line)
+			i++
+			continue
+		}
+		if strings.HasPrefix(trimmed, "# TEPLOY END ") {
+			inMarker = false
+			out = append(out, line)
+			i++
+			continue
+		}
+
+		// A top-level site-block opener: column 0, not a comment, not the
+		// global options block "{", not a snippet "(name) {", ends with "{".
+		isOpener := !inMarker && len(line) > 0 && !isSpaceByte(line[0]) &&
+			!strings.HasPrefix(trimmed, "#") && !strings.HasPrefix(trimmed, "{") &&
+			!strings.HasPrefix(trimmed, "(") && strings.HasSuffix(trimmed, "{")
+
+		if isOpener {
+			depth := strings.Count(line, "{") - strings.Count(line, "}")
+			block := []string{line}
+			j := i + 1
+			for j < len(lines) && depth > 0 {
+				block = append(block, lines[j])
+				depth += strings.Count(lines[j], "{") - strings.Count(lines[j], "}")
+				j++
+			}
+			addr := strings.TrimSpace(strings.TrimSuffix(trimmed, "{"))
+			if addressMatchesHosts(addr, hosts) {
+				i = j // drop the foreign block
+				continue
+			}
+			out = append(out, block...)
+			i = j
+			continue
+		}
+
+		out = append(out, line)
+		i++
+	}
+	return strings.Join(out, "\n")
+}
+
+// addressMatchesHosts reports whether a Caddyfile site-address (e.g.
+// "example.com, www.example.com") references any of the given hosts.
+func addressMatchesHosts(addr string, hosts []string) bool {
+	for _, a := range strings.Split(addr, ",") {
+		a = strings.TrimSpace(a)
+		a = strings.TrimPrefix(a, "https://")
+		a = strings.TrimPrefix(a, "http://")
+		if sp := strings.IndexAny(a, " \t"); sp >= 0 {
+			a = a[:sp]
+		}
+		for _, h := range hosts {
+			if a == h {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func isSpaceByte(b byte) bool { return b == ' ' || b == '\t' }
+
+// extractCaddyfileBlock returns the content between the begin and end markers
+// (markers excluded), or "" if not found.
+func extractCaddyfileBlock(content, begin, end string) string {
+	bi := strings.Index(content, begin)
+	if bi < 0 {
+		return ""
+	}
+	tail := content[bi+len(begin):]
+	ei := strings.Index(tail, end)
+	if ei < 0 {
+		return ""
+	}
+	return strings.Trim(tail[:ei], "\n")
+}
+
+// removeCaddyfileBlock removes every region bounded by `begin`..`end`,
+// collapsing surrounding blank lines so repeated upserts don't grow stray
+// whitespace. Tolerates a missing end marker by trimming to end-of-file.
 func removeCaddyfileBlock(content, begin, end string) string {
 	for {
 		bi := strings.Index(content, begin)
@@ -439,7 +413,6 @@ func removeCaddyfileBlock(content, begin, end string) string {
 		tail := content[bi:]
 		ei := strings.Index(tail, end)
 		if ei < 0 {
-			// Malformed (missing end marker) — best-effort truncate.
 			return strings.TrimRight(content[:bi], "\n") + "\n"
 		}
 		ei = bi + ei + len(end)
@@ -456,35 +429,8 @@ func removeCaddyfileBlock(content, begin, end string) string {
 	}
 }
 
-// removeCaddyfileBlocks strips Teploy-managed blocks for all given apps in a
-// single file read/write. Used by paths like RemoveRoute that would otherwise
-// issue overlapping reads and race on the on-disk state.
-func (c *Client) removeCaddyfileBlocks(ctx context.Context, apps ...string) error {
-	current, err := c.exec.Run(ctx, "cat "+caddyfilePath)
-	if err != nil {
-		return fmt.Errorf("reading caddyfile (did setup run?): %w", err)
-	}
-
-	updated := current
-	for _, app := range apps {
-		begin := fmt.Sprintf(markerBeginFmt, app)
-		end := fmt.Sprintf(markerEndFmt, app)
-		updated = removeCaddyfileBlock(updated, begin, end)
-	}
-	updated = strings.TrimRight(updated, "\n") + "\n"
-
-	if err := c.exec.Upload(ctx, strings.NewReader(updated), tmpCaddyfile, "0644"); err != nil {
-		return fmt.Errorf("uploading caddyfile: %w", err)
-	}
-	if _, err := c.exec.Run(ctx, "mv "+tmpCaddyfile+" "+caddyfilePath); err != nil {
-		return fmt.Errorf("writing caddyfile: %w", err)
-	}
-	return nil
-}
-
 // parseDomains splits a Teploy config "domain" field into a normalized host
-// list, tolerating comma-separated entries with incidental whitespace. Returns
-// nil when the input yields no non-empty hosts.
+// list, tolerating comma-separated entries with incidental whitespace.
 func parseDomains(domain string) []string {
 	parts := strings.Split(domain, ",")
 	hosts := make([]string, 0, len(parts))
@@ -496,14 +442,13 @@ func parseDomains(domain string) []string {
 	return hosts
 }
 
-// reverseProxyBlock renders a Caddyfile snippet equivalent to the admin-API
-// route produced by SetRoute. Kept in lockstep with putRouteByID's payload.
+// reverseProxyBlock renders a Caddyfile reverse-proxy site block.
 func reverseProxyBlock(hosts []string, upstream string, port int) string {
 	return fmt.Sprintf("%s {\n\treverse_proxy %s:%d\n}", strings.Join(hosts, ", "), upstream, port)
 }
 
-// loadBalancerBlock renders a Caddyfile snippet equivalent to the admin-API
-// route produced by SetLoadBalancer. Round-robin + active /up health checks.
+// loadBalancerBlock renders a round-robin reverse-proxy block with active /up
+// health checks.
 func loadBalancerBlock(hosts []string, upstreams []Upstream) string {
 	dials := make([]string, len(upstreams))
 	for i, u := range upstreams {
@@ -515,26 +460,31 @@ func loadBalancerBlock(hosts []string, upstreams []Upstream) string {
 	)
 }
 
-// StaticBlockOpts configures the Caddyfile site block produced by StaticBlock
-// for a type:static deploy. All fields are optional; defaults match the Vercel-
-// style "drop a folder, get a working site" experience.
-type StaticBlockOpts struct {
-	Hosts       []string          // required: ["example.com", "www.example.com"]
-	Root        string            // required: container-side path to the served files (e.g. /srv/static/myapp/current)
-	SPA         bool              // try_files fallback for SPA routing
-	SPAFallback string            // file to serve as fallback (default: /index.html)
-	Cache       map[string]string // path glob → Cache-Control value
-	Headers     map[string]string // arbitrary response headers
-	CaddyExtra  string            // raw Caddy directives appended into the site block (escape hatch)
+// maintenanceBlock renders a site block that returns a 503 maintenance page for
+// the given hosts. Caddy adapts the `respond` directive to a static_response
+// handler, which the dashboard detects as maintenance mode.
+func maintenanceBlock(hosts []string) string {
+	return fmt.Sprintf(
+		"%s {\n\theader Content-Type \"text/html; charset=utf-8\"\n\theader Retry-After \"3600\"\n\trespond 503 {\n\t\tbody `%s`\n\t}\n}",
+		strings.Join(hosts, ", "), maintenancePage,
+	)
 }
 
-// StaticBlock renders the Caddyfile snippet that serves a static deploy. It
-// pairs with SetStaticRoute() and the on-disk Caddyfile mirror so the result
-// survives caddy reloads.
-//
-// Sensible defaults are applied: gzip encoding, file_server with
-// precompressed gzip, common security headers, and no-cache-by-default for
-// HTML alongside immutable cache for hashed asset paths Vite-style.
+// StaticBlockOpts configures the Caddyfile site block produced by StaticBlock
+// for a type:static deploy.
+type StaticBlockOpts struct {
+	Hosts       []string
+	Root        string
+	SPA         bool
+	SPAFallback string
+	Cache       map[string]string
+	Headers     map[string]string
+	CaddyExtra  string
+}
+
+// StaticBlock renders the Caddyfile snippet that serves a static deploy, with
+// sensible defaults: gzip, precompressed file_server, security headers, and
+// immutable caching for hashed assets.
 func StaticBlock(opts StaticBlockOpts) string {
 	var b strings.Builder
 	b.WriteString(strings.Join(opts.Hosts, ", "))
@@ -550,8 +500,6 @@ func StaticBlock(opts StaticBlockOpts) string {
 	}
 	b.WriteString("\tfile_server {\n\t\tprecompressed gzip\n\t}\n")
 
-	// Default security headers. Users can override via opts.Headers (which we
-	// emit afterwards so it wins on duplicate keys).
 	b.WriteString("\theader {\n")
 	b.WriteString("\t\tX-Content-Type-Options \"nosniff\"\n")
 	b.WriteString("\t\tX-Frame-Options \"SAMEORIGIN\"\n")
@@ -562,7 +510,6 @@ func StaticBlock(opts StaticBlockOpts) string {
 	}
 	b.WriteString("\t}\n")
 
-	// Per-path Cache-Control rules. Each becomes a named matcher + header.
 	i := 0
 	for pattern, value := range opts.Cache {
 		i++
@@ -584,29 +531,4 @@ func StaticBlock(opts StaticBlockOpts) string {
 
 	b.WriteString("}")
 	return b.String()
-}
-
-// SetStaticRoute upserts a Caddyfile block for a static deploy and removes any
-// previously-installed reverse_proxy/load-balancer block for the same app
-// (covers the case of a container-to-static migration where the user changes
-// `type:` in teploy.yml).
-func (c *Client) SetStaticRoute(ctx context.Context, app, domain string, opts StaticBlockOpts) error {
-	hosts := parseDomains(domain)
-	if len(hosts) == 0 {
-		return fmt.Errorf("SetStaticRoute: domain must be non-empty")
-	}
-	opts.Hosts = hosts
-
-	// If the same app previously deployed as a container, the admin API still
-	// holds its teploy-<app> route. Surgically remove it so the static block
-	// in the Caddyfile becomes the only route for these hosts.
-	_ = c.deleteRouteByID(ctx, "teploy-"+app)
-	_ = c.deleteRouteByID(ctx, "teploy-lb-"+app)
-
-	// Likewise drop any stale lb-<app> Caddyfile block.
-	if err := c.upsertCaddyfileBlock(ctx, "lb-"+app, ""); err != nil {
-		return err
-	}
-
-	return c.upsertCaddyfileBlock(ctx, app, StaticBlock(opts))
 }

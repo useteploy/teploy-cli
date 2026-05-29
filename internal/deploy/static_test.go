@@ -62,6 +62,8 @@ func TestStaticDeploy_FreshFirstDeploy(t *testing.T) {
 		// Caddyfile mirror operations — for lb- removal and main upsert
 		ssh.MockCommand{Match: "cat /deployments/caddy/Caddyfile", Output: "{\n\tadmin 0.0.0.0:2019\n}\n"},
 		ssh.MockCommand{Match: "mv /tmp/teploy_caddyfile.tmp", Output: ""},
+		ssh.MockCommand{Match: "mkdir /deployments/caddy/.lock", Output: ""},
+		ssh.MockCommand{Match: "rmdir /deployments/caddy/.lock", Output: ""},
 		// caddy reload
 		ssh.MockCommand{Match: "docker exec caddy caddy reload", Output: ""},
 		// state.Write — ensure app dir is already present
@@ -98,6 +100,8 @@ func TestStaticDeploy_FreshFirstDeploy(t *testing.T) {
 		ssh.MockCommand{Match: "curl -sf -X DELETE", Err: fmt.Errorf("not found")},
 		ssh.MockCommand{Match: "cat /deployments/caddy/Caddyfile", Output: "{\n\tadmin 0.0.0.0:2019\n}\n"},
 		ssh.MockCommand{Match: "mv /tmp/teploy_caddyfile.tmp", Output: ""},
+		ssh.MockCommand{Match: "mkdir /deployments/caddy/.lock", Output: ""},
+		ssh.MockCommand{Match: "rmdir /deployments/caddy/.lock", Output: ""},
 		ssh.MockCommand{Match: "docker exec caddy caddy reload", Output: ""},
 		ssh.MockCommand{Match: "ls -1t /deployments/myapp/releases", Output: ""},
 		ssh.MockCommand{Match: "rm -rf /deployments/myapp/.lock", Output: ""},

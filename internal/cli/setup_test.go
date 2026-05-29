@@ -48,8 +48,8 @@ func TestSetupServer(t *testing.T) {
 	if !ok {
 		t.Fatal("Caddyfile not uploaded")
 	}
-	if !strings.Contains(string(content), "admin 0.0.0.0:2019") {
-		t.Errorf("Caddyfile missing admin config, got: %s", string(content))
+	if !strings.Contains(string(content), "admin 127.0.0.1:2019") {
+		t.Errorf("Caddyfile missing loopback-bound admin config, got: %s", string(content))
 	}
 
 	// Verify Caddy docker run command contains required flags.
@@ -68,13 +68,20 @@ func TestSetupServer(t *testing.T) {
 		"--network teploy",
 		"-p 80:80",
 		"-p 443:443",
-		"-p 127.0.0.1:2019:2019",
 		"caddy_data:/data",
 		"/deployments/caddy/Caddyfile:/etc/caddy/Caddyfile",
 	} {
 		if !strings.Contains(caddyCmd, want) {
 			t.Errorf("Caddy command missing %q\ngot: %s", want, caddyCmd)
 		}
+	}
+	// Caddyfile-authoritative model: no --resume, and the admin API is not
+	// published to the host (reached via docker exec only).
+	if strings.Contains(caddyCmd, "--resume") {
+		t.Errorf("Caddy command must not use --resume\ngot: %s", caddyCmd)
+	}
+	if strings.Contains(caddyCmd, "2019:2019") {
+		t.Errorf("admin API must not be host-published\ngot: %s", caddyCmd)
 	}
 }
 
@@ -121,9 +128,10 @@ func TestSetupServer_CaddyAlreadyRunning(t *testing.T) {
 		ssh.MockCommand{Match: "mkdir", Output: ""},
 		ssh.MockCommand{Match: "chown", Output: ""},
 		ssh.MockCommand{Match: "test -s /deployments/caddy/Caddyfile", Output: ""},
+		ssh.MockCommand{Match: "sed -i", Output: ""},
 		ssh.MockCommand{Match: "docker ps -a --filter name=", Output: "caddy"},
-		// Existing Caddy already launched with --resume: skip recreation.
-		ssh.MockCommand{Match: "docker inspect -f", Output: "caddy run --config /etc/caddy/Caddyfile --adapter caddyfile --resume"},
+		// Existing Caddy already runs without --resume (Caddyfile-authoritative): skip recreation.
+		ssh.MockCommand{Match: "docker inspect -f", Output: "caddy run --config /etc/caddy/Caddyfile --adapter caddyfile"},
 	)
 
 	var buf bytes.Buffer
@@ -143,11 +151,11 @@ func TestSetupServer_CaddyAlreadyRunning(t *testing.T) {
 }
 
 func TestSetupServer_CaddyUpgradePreservesNetworksAndCaddyfile(t *testing.T) {
-	// Simulates an existing server (e.g., post-Dokploy migration) where
-	// Caddy was launched without --resume, the Caddyfile holds real
-	// production routes, and Caddy is on multiple networks. Upgrade must
-	// preserve Caddyfile, reattach non-teploy networks, and not silently
-	// take the server down.
+	// Simulates an existing server running the legacy admin-API model: Caddy
+	// was launched WITH --resume, the Caddyfile holds real production routes,
+	// and Caddy is on multiple networks. Migrating to the Caddyfile-
+	// authoritative model must recreate Caddy WITHOUT --resume, preserve the
+	// Caddyfile, and reattach non-teploy networks.
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "whoami", Output: "root"},
 		ssh.MockCommand{Match: "docker --version", Output: "Docker version 24.0.0"},
@@ -158,9 +166,10 @@ func TestSetupServer_CaddyUpgradePreservesNetworksAndCaddyfile(t *testing.T) {
 		ssh.MockCommand{Match: "mkdir", Output: ""},
 		ssh.MockCommand{Match: "chown", Output: ""},
 		ssh.MockCommand{Match: "test -s /deployments/caddy/Caddyfile", Output: ""},
+		ssh.MockCommand{Match: "sed -i", Output: ""},
 		ssh.MockCommand{Match: "docker ps -a --filter name=", Output: "caddy"},
-		// Legacy Caddy cmd: no --resume, must upgrade.
-		ssh.MockCommand{Match: "docker inspect -f '{{join .Config.Cmd", Output: "caddy run --config /etc/caddy/Caddyfile --adapter caddyfile"},
+		// Legacy Caddy cmd: launched WITH --resume, must migrate.
+		ssh.MockCommand{Match: "docker inspect -f '{{join .Config.Cmd", Output: "caddy run --config /etc/caddy/Caddyfile --adapter caddyfile --resume"},
 		// Extra networks the existing caddy is attached to.
 		ssh.MockCommand{Match: "docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}", Output: "teploy dokploy-network bridge "},
 		ssh.MockCommand{Match: "docker rm -f caddy", Output: ""},
@@ -182,17 +191,19 @@ func TestSetupServer_CaddyUpgradePreservesNetworksAndCaddyfile(t *testing.T) {
 		t.Error("should report existing Caddyfile preserved")
 	}
 
-	// The upgraded container must launch with --resume and /config volume.
+	// The upgraded container must launch WITHOUT --resume (Caddyfile-
+	// authoritative) while keeping the /config volume.
 	var runCmd string
 	for _, c := range mock.Calls {
 		if strings.HasPrefix(c, "docker run") {
 			runCmd = c
 		}
 	}
-	for _, want := range []string{"--resume", "caddy_config:/config"} {
-		if !strings.Contains(runCmd, want) {
-			t.Errorf("recreated Caddy missing %q\ngot: %s", want, runCmd)
-		}
+	if !strings.Contains(runCmd, "caddy_config:/config") {
+		t.Errorf("recreated Caddy missing %q\ngot: %s", "caddy_config:/config", runCmd)
+	}
+	if strings.Contains(runCmd, "--resume") {
+		t.Errorf("recreated Caddy must not use --resume\ngot: %s", runCmd)
 	}
 
 	// Must reattach dokploy-network and bridge, but not the base teploy network.

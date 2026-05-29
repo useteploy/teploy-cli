@@ -485,19 +485,23 @@ func setupServer(ctx context.Context, exec ssh.Executor, w io.Writer, yes bool) 
 	// were provisioned by other tooling (e.g., Dokploy) or hand-edited,
 	// the existing Caddyfile holds live production routes and must be
 	// preserved.
-	const stubCaddyfile = "{\n\tadmin 0.0.0.0:2019\n}\n"
+	const stubCaddyfile = "{\n\tadmin 127.0.0.1:2019\n}\n"
 	if _, err := exec.Run(ctx, "test -s /deployments/caddy/Caddyfile"); err != nil {
 		if err := exec.Upload(ctx, strings.NewReader(stubCaddyfile), "/deployments/caddy/Caddyfile", "0644"); err != nil {
 			return fmt.Errorf("uploading Caddyfile: %w", err)
 		}
 	} else {
 		fmt.Fprintln(w, "  Existing Caddyfile preserved")
+		// Lock the admin API to the container loopback. Older setups bound it to
+		// 0.0.0.0:2019, reachable by any container on the teploy network.
+		exec.Run(ctx, "sed -i 's/admin 0.0.0.0:2019/admin 127.0.0.1:2019/' /deployments/caddy/Caddyfile")
 	}
 
 	// 5. Start Caddy (idempotent — skip if container already exists).
-	// `--resume` makes Caddy boot from /config/caddy/autosave.json (which it
-	// auto-writes on every admin API change) instead of the Caddyfile, so
-	// admin-API-managed routes survive reloads and container restarts.
+	// The on-disk Caddyfile is Teploy's single source of truth: Caddy loads it
+	// on every boot and `caddy reload`, so we run WITHOUT `--resume` (which
+	// would boot from admin-API autosave and shadow the file). The admin API
+	// binds the container loopback only and is never exposed off-box.
 	fmt.Fprintln(w, "Starting Caddy...")
 	caddyCheck, _ := exec.Run(ctx, dockerCmd+" ps -a --filter name=^caddy$ --format '{{.Names}}'")
 	extraNetworks := []string{}
@@ -506,7 +510,7 @@ func setupServer(ctx context.Context, exec ssh.Executor, w io.Writer, yes bool) 
 		// destructive (brief outage + requires re-attaching any non-teploy
 		// networks), so we require explicit confirmation.
 		cmdOut, _ := exec.Run(ctx, dockerCmd+" inspect -f '{{join .Config.Cmd \" \"}}' caddy")
-		if !strings.Contains(cmdOut, "--resume") {
+		if strings.Contains(cmdOut, "--resume") {
 			// Capture every network the existing Caddy is attached to so
 			// we can reattach them after recreating. Previously these were
 			// silently dropped, leaving apps on other networks (e.g.
@@ -518,8 +522,8 @@ func setupServer(ctx context.Context, exec ssh.Executor, w io.Writer, yes bool) 
 				}
 			}
 
-			fmt.Fprintln(w, "  Caddy is running without --resume — admin API routes won't survive reloads.")
-			fmt.Fprintln(w, "  Upgrading requires recreating the container (brief outage).")
+			fmt.Fprintln(w, "  Caddy is running with --resume (legacy admin-API mode) — migrating to Caddyfile-authoritative.")
+			fmt.Fprintln(w, "  This recreates the container (brief outage).")
 			if len(extraNetworks) > 0 {
 				fmt.Fprintf(w, "  Additional networks to reattach: %s\n", strings.Join(extraNetworks, ", "))
 			}
@@ -541,12 +545,11 @@ func setupServer(ctx context.Context, exec ssh.Executor, w io.Writer, yes bool) 
 			"--network", "teploy",
 			"-p", "80:80",
 			"-p", "443:443",
-			"-p", "127.0.0.1:2019:2019",
 			"-v", "caddy_data:/data",
 			"-v", "caddy_config:/config",
 			"-v", "/deployments/caddy/Caddyfile:/etc/caddy/Caddyfile",
 			"caddy",
-			"caddy", "run", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile", "--resume",
+			"caddy", "run", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile",
 		}, " ")
 		if _, err := exec.Run(ctx, caddyRun); err != nil {
 			return fmt.Errorf("starting caddy: %w", err)

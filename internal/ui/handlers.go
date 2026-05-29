@@ -227,14 +227,15 @@ func (s *Server) handleServerProxy(w http.ResponseWriter, r *http.Request) {
 		Routes: make([]routeInfo, 0),
 	}
 
-	// Check if Caddy is running
-	if out, err := exec.Run(ctx, "curl -sf http://localhost:2019/config/ 2>/dev/null && echo ok"); err == nil && strings.Contains(out, "ok") {
+	// Check if Caddy is running. The admin API binds the container's loopback
+	// only (never exposed off-box), so reach it via docker exec.
+	if out, err := exec.Run(ctx, "docker exec caddy curl -sf http://localhost:2019/config/ 2>/dev/null && echo ok"); err == nil && strings.Contains(out, "ok") {
 		status.Running = true
 	}
 
 	// Get Caddy HTTP config to extract routes
 	if status.Running {
-		out, err := exec.Run(ctx, "curl -sf http://localhost:2019/config/apps/http 2>/dev/null")
+		out, err := exec.Run(ctx, "docker exec caddy curl -sf http://localhost:2019/config/apps/http 2>/dev/null")
 		if err == nil && strings.TrimSpace(out) != "" {
 			var httpApp caddy.HTTPApp
 			if err := json.Unmarshal([]byte(out), &httpApp); err == nil {

@@ -191,11 +191,7 @@ func (d *StaticDeployer) Deploy(ctx context.Context, cfg StaticConfig) error {
 	}); err != nil {
 		return fmt.Errorf("caddy route: %w", err)
 	}
-
-	// 9. Reload Caddy to apply the new Caddyfile.
-	if _, err := d.exec.Run(ctx, "docker exec caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile"); err != nil {
-		return fmt.Errorf("caddy reload: %w", err)
-	}
+	// SetStaticRoute writes the Caddyfile block and reloads Caddy itself.
 
 	// 10. Write new app state. Reuse the container state file format so the
 	//     same `state.AppState` works for both deploy types — only the hash
@@ -428,9 +424,7 @@ func (d *StaticDeployer) Rollback(ctx context.Context, cfg StaticRollbackConfig)
 	}); err != nil {
 		return fmt.Errorf("caddy route: %w", err)
 	}
-	if _, err := d.exec.Run(ctx, "docker exec caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile"); err != nil {
-		return fmt.Errorf("caddy reload: %w", err)
-	}
+	// SetStaticRoute writes the Caddyfile block and reloads Caddy itself.
 
 	// Swap state: previous becomes current, current becomes previous.
 	newState := &state.AppState{
