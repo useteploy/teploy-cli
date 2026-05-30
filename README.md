@@ -103,6 +103,21 @@ port: 3000
 build_local: true
 platform: linux/amd64
 stop_timeout: 30
+keep_versions: 3              # auto-prune older versions after deploy (0 = keep all, default)
+
+# Custom TLS cert — e.g. Cloudflare Origin Certificate behind a CF-proxied
+# domain where ACME can't reach the origin. Cert + key are LOCAL file paths,
+# uploaded to the server on deploy. Default is ACME (automatic HTTPS).
+tls:
+  cert: ./certs/origin.crt
+  key: ./certs/origin.key
+
+# Routing layer. Default "caddy" — Teploy writes the Caddyfile. "external"
+# means you front the app with Cloudflare Tunnel / Tailscale Funnel / nginx
+# / ALB / etc., and Teploy must not touch Caddy. The container still joins
+# the teploy network with its app-name alias so the external thing can
+# reach it.
+ingress: caddy                # or "external"
 
 volumes:
   data: /app/data
@@ -110,6 +125,13 @@ volumes:
 processes:
   web: "npm start"
   worker: "npm run worker"
+
+# Per-process HEALTHCHECK overrides. disable: true passes --no-healthcheck
+# so the container ignores the image's HEALTHCHECK — useful when a worker
+# shares an image with web but has no HTTP listener for the inherited probe.
+healthcheck:
+  worker:
+    disable: true
 
 hooks:
   pre_deploy: "npm run migrate"
