@@ -25,6 +25,22 @@ type Config struct {
 	Volumes     map[string]string
 	Cmd         string            // command override for single-process deploys
 	Processes   map[string]string // process_name -> command (overrides Cmd)
+	// NoHealthcheck disables the container HEALTHCHECK for specific processes.
+	// Keyed by process name; true means pass --no-healthcheck to docker run.
+	// Used when a process shouldn't be probed by the image's built-in
+	// healthcheck (e.g. a worker that shares an image with web but has no
+	// HTTP listener for the image's curl probe to hit).
+	NoHealthcheck map[string]bool
+	// KeepVersions caps the number of past app versions retained on the
+	// server after a successful deploy. Zero (default) keeps every version
+	// — the historical behavior, in which Teploy stopped but never removed
+	// old containers, letting disk usage climb across deploys. Set this to
+	// 2 or 3 to keep the current version + a small rollback window and
+	// have superseded versions auto-pruned (containers + images).
+	// Versions are scored by newest container creation timestamp; the
+	// current and immediately-previous versions are always protected even
+	// if older than other versions on disk.
+	KeepVersions int
 	Memory        string
 	CPU           string
 	ContainerPort int // internal container port (default 80)
@@ -189,6 +205,7 @@ func (d *Deployer) Deploy(ctx context.Context, cfg Config) error {
 			Memory:        cfg.Memory,
 			CPU:           cfg.CPU,
 			Name:          name,
+			NoHealthcheck: cfg.NoHealthcheck["web"],
 		})
 		if err != nil {
 			return fmt.Errorf("starting container %s: %w", name, err)
@@ -260,17 +277,18 @@ func (d *Deployer) Deploy(ctx context.Context, cfg Config) error {
 		name := docker.ContainerName(cfg.App, process, cfg.Version)
 		fmt.Fprintf(d.out, "Starting %s...\n", name)
 		_, err := d.docker.Run(ctx, docker.RunConfig{
-			App:     cfg.App,
-			Process: process,
-			Version: cfg.Version,
-			Image:   cfg.Image,
-			Port:    0, // non-web processes don't get a port
-			EnvFile: cfg.EnvFile,
-			Env:     cfg.Env,
-			Volumes: cfg.Volumes,
-			Cmd:     processes[process],
-			Memory:  cfg.Memory,
-			CPU:     cfg.CPU,
+			App:           cfg.App,
+			Process:       process,
+			Version:       cfg.Version,
+			Image:         cfg.Image,
+			Port:          0, // non-web processes don't get a port
+			EnvFile:       cfg.EnvFile,
+			Env:           cfg.Env,
+			Volumes:       cfg.Volumes,
+			Cmd:           processes[process],
+			Memory:        cfg.Memory,
+			CPU:           cfg.CPU,
+			NoHealthcheck: cfg.NoHealthcheck[process],
 		})
 		if err != nil {
 			return fail(fmt.Errorf("starting %s: %w", name, err))
@@ -381,6 +399,23 @@ func (d *Deployer) Deploy(ctx context.Context, cfg Config) error {
 			cfg.App, keepDays,
 		)
 		d.exec.Run(ctx, cleanCmd)
+	}
+
+	// 15b. Prune superseded app versions (containers + images) if the
+	// operator opted in via keep_versions. Always protects the current
+	// version and the immediately-previous version so a rollback target
+	// is preserved regardless of timestamp ordering.
+	if cfg.KeepVersions > 0 {
+		var prevHash string
+		if current != nil {
+			prevHash = current.CurrentHash
+		}
+		pruned, err := d.docker.PruneVersions(ctx, cfg.App, cfg.KeepVersions, cfg.Version, prevHash)
+		if err != nil {
+			fmt.Fprintf(d.out, "Warning: version prune failed: %v\n", err)
+		} else if len(pruned) > 0 {
+			fmt.Fprintf(d.out, "Pruned %d superseded version(s): %s\n", len(pruned), strings.Join(pruned, ", "))
+		}
 	}
 
 	// 16. Log success.
