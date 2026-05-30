@@ -11,6 +11,8 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
 
 ### Fixed
 - `.goreleaser.yml`: migrated `archives.format` and `format_overrides.format` to the new `formats: [tar.gz|zip]` list syntax (goreleaser 2.x deprecation cleanup).
+- `teploy setup` hung during `fail2ban` install on fresh Debian/Ubuntu VMs because `apt-get`'s debconf step prompted for input. All `apt-get` calls (ufw, fail2ban, unattended-upgrades, sudo, age) now pass `DEBIAN_FRONTEND=noninteractive` to suppress prompts.
+- SSH auth-failure errors now suggest concrete next steps (`--user <name>`, `--key <path>`, `--password`) instead of surfacing the raw `crypto/ssh` `unable to authenticate, attempted methods [...]` message. Root SSH is disabled on most modern distros, so the default `root` user fails silently for first-time users — the new message points to that fix.
 
 ### Docs
 - README Config section now documents `tls`, `keep_versions`, `healthcheck`, and `ingress` (previously undocumented).
