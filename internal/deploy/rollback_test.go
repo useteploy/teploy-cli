@@ -27,9 +27,13 @@ func TestRollback(t *testing.T) {
 			Output: `{"ID":"aaa","Names":"myapp-web-v1","Image":"myapp:latest","State":"exited","Status":"Exited"}` + "\n" +
 				`{"ID":"bbb","Names":"myapp-web-v2","Image":"myapp:latest","State":"running","Status":"Up 1h"}`,
 		},
-		ssh.MockCommand{Match: "docker start", Output: ""},
+		// rollback uses Restart (inspect → rm -f → docker run) instead of bare
+		// `docker start` so HostConfig.PortBindings actually re-apply on Docker 29.
+		ssh.MockCommand{Match: "docker inspect myapp-web-v1", Output: `[{"Config":{"Image":"myapp:latest","Labels":{"teploy.app":"myapp"}},"HostConfig":{"NetworkMode":"teploy","PortBindings":{"3000/tcp":[{"HostIp":"127.0.0.1","HostPort":"49152"}]},"RestartPolicy":{"Name":"no"}},"NetworkSettings":{"Networks":{"teploy":{"Aliases":["myapp"]}}}}]`},
+		ssh.MockCommand{Match: "docker rm -f myapp-web-v1", Output: ""},
+		ssh.MockCommand{Match: "docker run", Output: ""},
 		ssh.MockCommand{Match: "curl", Output: "200"},
-		// Previous container's internal port resolved via docker inspect.
+		// Previous container's internal port resolved via docker inspect -f.
 		ssh.MockCommand{Match: "docker inspect -f '{{range $p, $_ := .NetworkSettings.Ports}}", Output: "3000/tcp"},
 		ssh.MockCommand{Match: "caddy", Output: ""},
 		ssh.MockCommand{Match: "cat /deployments/caddy/Caddyfile", Output: "{\n\tadmin 0.0.0.0:2019\n}\n"},
@@ -57,18 +61,21 @@ func TestRollback(t *testing.T) {
 		t.Errorf("expected rollback success message, got: %s", output)
 	}
 
-	// Verify previous container was started.
-	startCalls := 0
+	// Verify previous container was recreated (Restart = inspect → rm -f → run).
+	var inspected, removed, ran bool
 	for _, call := range mock.Calls {
-		if strings.HasPrefix(call, "docker start") {
-			startCalls++
-			if !strings.Contains(call, "myapp-web-v1") {
-				t.Errorf("expected start for v1 container, got: %s", call)
-			}
+		switch {
+		case strings.HasPrefix(call, "docker inspect myapp-web-v1"):
+			inspected = true
+		case strings.HasPrefix(call, "docker rm -f myapp-web-v1"):
+			removed = true
+		case strings.HasPrefix(call, "docker run") && strings.Contains(call, "myapp-web-v1"):
+			ran = true
 		}
 	}
-	if startCalls != 1 {
-		t.Errorf("expected 1 start call, got %d", startCalls)
+	if !inspected || !removed || !ran {
+		t.Errorf("expected Restart sequence (inspect+rm+run) for v1; inspected=%v removed=%v ran=%v",
+			inspected, removed, ran)
 	}
 
 	// Verify Caddy was pointed at the container's *internal* port, not
@@ -168,7 +175,10 @@ func TestRollback_HealthCheckFails(t *testing.T) {
 			Output: `{"ID":"aaa","Names":"myapp-web-v1","Image":"myapp:latest","State":"exited","Status":"Exited"}` + "\n" +
 				`{"ID":"bbb","Names":"myapp-web-v2","Image":"myapp:latest","State":"running","Status":"Up 1h"}`,
 		},
-		ssh.MockCommand{Match: "docker start", Output: ""},
+		// Restart (inspect → rm -f → docker run).
+		ssh.MockCommand{Match: "docker inspect myapp-web-v1", Output: `[{"Config":{"Image":"myapp:latest","Labels":{"teploy.app":"myapp"}},"HostConfig":{"NetworkMode":"teploy","PortBindings":{"3000/tcp":[{"HostIp":"127.0.0.1","HostPort":"49152"}]},"RestartPolicy":{"Name":"no"}},"NetworkSettings":{"Networks":{"teploy":{"Aliases":["myapp"]}}}}]`},
+		ssh.MockCommand{Match: "docker rm -f myapp-web-v1", Output: ""},
+		ssh.MockCommand{Match: "docker run", Output: ""},
 		ssh.MockCommand{Match: "curl", Err: fmt.Errorf("connection refused")},
 		ssh.MockCommand{Match: "bash -c", Err: fmt.Errorf("connection refused")},
 		ssh.MockCommand{Match: "docker stop", Output: ""},

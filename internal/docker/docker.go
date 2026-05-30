@@ -189,11 +189,175 @@ func (c *Client) Exec(ctx context.Context, name, command string) (string, error)
 }
 
 // Start starts a stopped container.
+//
+// NOTE: prefer Restart() for rollback flows. Docker (≥ 29) may silently fail
+// to re-publish HostConfig.PortBindings on `docker start` if another container
+// has taken+released the host port since this container was stopped. Restart()
+// avoids that by force-removing + recreating with the same config.
 func (c *Client) Start(ctx context.Context, name string) error {
 	if _, err := c.exec.Run(ctx, "docker start "+name); err != nil {
 		return fmt.Errorf("starting container %s: %w", name, err)
 	}
 	return nil
+}
+
+// containerInspect mirrors the subset of `docker inspect` JSON we use to
+// reconstruct a container's `docker run` invocation.
+type containerInspect struct {
+	Config struct {
+		Image       string
+		Env         []string
+		Cmd         []string
+		WorkingDir  string
+		User        string
+		Labels      map[string]string
+		Healthcheck *struct {
+			Test []string
+		}
+	}
+	HostConfig struct {
+		NetworkMode  string
+		PortBindings map[string][]struct {
+			HostIp   string
+			HostPort string
+		}
+		Binds         []string
+		RestartPolicy struct {
+			Name string
+		}
+	}
+	NetworkSettings struct {
+		Networks map[string]struct {
+			Aliases []string
+		}
+	}
+}
+
+// Restart fully recreates a container with its original configuration:
+// inspect the existing container, force-remove it, then `docker run` with
+// the same name + extracted args.
+//
+// Use this in rollback flows where plain Start() is insufficient. Docker
+// 29 silently fails to re-publish HostConfig.PortBindings if another
+// container has taken + released the host port since the original stop
+// (the bind also detaches from custom networks). Recreating from scratch
+// sidesteps that landmine.
+//
+// Preserved across the recreate: image, network mode + aliases, port
+// bindings, env, bind mounts, command, working dir, user, labels, restart
+// policy, and the --no-healthcheck NONE marker.
+func (c *Client) Restart(ctx context.Context, name string) error {
+	raw, err := c.exec.Run(ctx, "docker inspect "+name)
+	if err != nil {
+		return fmt.Errorf("inspecting %s: %w", name, err)
+	}
+	var arr []containerInspect
+	if err := json.Unmarshal([]byte(raw), &arr); err != nil {
+		return fmt.Errorf("parsing inspect of %s: %w", name, err)
+	}
+	if len(arr) == 0 {
+		return fmt.Errorf("container %s not found", name)
+	}
+	spec := arr[0]
+
+	args := []string{"-d", "--name", name}
+
+	// Network mode (e.g. "teploy"). Skip docker's "default" / "bridge".
+	if spec.HostConfig.NetworkMode != "" && spec.HostConfig.NetworkMode != "default" && spec.HostConfig.NetworkMode != "bridge" {
+		args = append(args, "--network", spec.HostConfig.NetworkMode)
+	}
+
+	// Network aliases on the primary network. Skip the container-name auto-alias
+	// and anything that's a prefix of the container ID (also auto-added).
+	primary := spec.HostConfig.NetworkMode
+	if netInfo, ok := spec.NetworkSettings.Networks[primary]; ok {
+		seenAlias := map[string]bool{name: true}
+		aliases := append([]string(nil), netInfo.Aliases...)
+		sort.Strings(aliases)
+		for _, alias := range aliases {
+			if alias == "" || seenAlias[alias] {
+				continue
+			}
+			seenAlias[alias] = true
+			args = append(args, "--network-alias", alias)
+		}
+	}
+
+	// Port bindings: sorted for deterministic args ordering.
+	pbKeys := make([]string, 0, len(spec.HostConfig.PortBindings))
+	for k := range spec.HostConfig.PortBindings {
+		pbKeys = append(pbKeys, k)
+	}
+	sort.Strings(pbKeys)
+	for _, containerPort := range pbKeys {
+		for _, b := range spec.HostConfig.PortBindings[containerPort] {
+			host := b.HostIp
+			if host == "" {
+				host = "0.0.0.0"
+			}
+			args = append(args, "-p", fmt.Sprintf("%s:%s:%s", host, b.HostPort, containerPort))
+		}
+	}
+
+	// Env vars.
+	for _, e := range spec.Config.Env {
+		args = append(args, "-e", shellQuoteSingle(e))
+	}
+
+	// Bind mounts (already host:container[:mode] formatted by docker).
+	for _, b := range spec.HostConfig.Binds {
+		args = append(args, "-v", b)
+	}
+
+	// Labels (sorted for determinism).
+	labelKeys := make([]string, 0, len(spec.Config.Labels))
+	for k := range spec.Config.Labels {
+		labelKeys = append(labelKeys, k)
+	}
+	sort.Strings(labelKeys)
+	for _, k := range labelKeys {
+		args = append(args, "--label", shellQuoteSingle(k+"="+spec.Config.Labels[k]))
+	}
+
+	// Preserve the explicit-NONE healthcheck (set by --no-healthcheck at run).
+	if spec.Config.Healthcheck != nil && len(spec.Config.Healthcheck.Test) == 1 && spec.Config.Healthcheck.Test[0] == "NONE" {
+		args = append(args, "--no-healthcheck")
+	}
+
+	// Restart policy (skip docker default "no").
+	if spec.HostConfig.RestartPolicy.Name != "" && spec.HostConfig.RestartPolicy.Name != "no" {
+		args = append(args, "--restart", spec.HostConfig.RestartPolicy.Name)
+	}
+
+	if spec.Config.WorkingDir != "" {
+		args = append(args, "-w", spec.Config.WorkingDir)
+	}
+	if spec.Config.User != "" {
+		args = append(args, "-u", spec.Config.User)
+	}
+
+	// Image (last positional before cmd).
+	args = append(args, spec.Config.Image)
+
+	// Cmd.
+	for _, cmdPart := range spec.Config.Cmd {
+		args = append(args, shellQuoteSingle(cmdPart))
+	}
+
+	// Force-remove old container, then run fresh.
+	if _, err := c.exec.Run(ctx, "docker rm -f "+name); err != nil {
+		return fmt.Errorf("removing old %s: %w", name, err)
+	}
+	if _, err := c.exec.Run(ctx, "docker run "+strings.Join(args, " ")); err != nil {
+		return fmt.Errorf("recreating %s: %w", name, err)
+	}
+	return nil
+}
+
+// shellQuoteSingle wraps s in single quotes for safe shell interpolation,
+// escaping embedded single quotes (POSIX-portable).
+func shellQuoteSingle(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'"'"'`) + "'"
 }
 
 // Pull pulls a Docker image from a registry.

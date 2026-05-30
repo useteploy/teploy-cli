@@ -76,8 +76,15 @@ func Rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg Rollbac
 	for _, c := range containers {
 		if strings.HasSuffix(c.Name, suffix) {
 			fmt.Fprintf(out, "Starting %s...\n", c.Name)
-			if err := dk.Start(ctx, c.Name); err != nil {
-				return fmt.Errorf("starting previous container %s: %w", c.Name, err)
+			// Recreate rather than `docker start`: Docker 29 silently fails
+			// to re-publish HostConfig.PortBindings on `docker start` when
+			// another container has taken+released the host port in the
+			// interim — a common case if rolling back after deploying a
+			// neighboring app that reused the port. Restart() inspects the
+			// stopped container, force-removes, and `docker run`s fresh
+			// with the same config.
+			if err := dk.Restart(ctx, c.Name); err != nil {
+				return fmt.Errorf("restarting previous container %s: %w", c.Name, err)
 			}
 			started = append(started, c.Name)
 		}
