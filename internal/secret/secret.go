@@ -37,7 +37,7 @@ func (m *Manager) EnsureAge(ctx context.Context) error {
 	if id, err := m.exec.Run(ctx, "id -u"); err == nil && strings.TrimSpace(id) == "0" {
 		prefix = ""
 	}
-	_, err := m.exec.Run(ctx, fmt.Sprintf("%sapt-get update -qq && %sapt-get install -y -qq age 2>/dev/null || %syum install -y age 2>/dev/null", prefix, prefix, prefix))
+	_, err := m.exec.Run(ctx, fmt.Sprintf("%sDEBIAN_FRONTEND=noninteractive apt-get update -qq && %sDEBIAN_FRONTEND=noninteractive apt-get install -y -qq age 2>/dev/null || %syum install -y age 2>/dev/null", prefix, prefix, prefix))
 	if err != nil {
 		return fmt.Errorf("installing age: %w", err)
 	}

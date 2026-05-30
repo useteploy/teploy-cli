@@ -24,7 +24,7 @@ func ConfigureUFW(ctx context.Context, exec ssh.Executor, w io.Writer, sudo stri
 
 	if _, err := exec.Run(ctx, "which ufw"); err != nil {
 		fmt.Fprintln(w, "  Installing UFW...")
-		if _, err := exec.Run(ctx, sudo+"apt-get update -qq && "+sudo+"apt-get install -y -qq ufw"); err != nil {
+		if _, err := exec.Run(ctx, sudo+"DEBIAN_FRONTEND=noninteractive apt-get update -qq && "+sudo+"DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ufw"); err != nil {
 			return fmt.Errorf("installing ufw: %w", err)
 		}
 	}
@@ -53,7 +53,7 @@ func InstallFail2ban(ctx context.Context, exec ssh.Executor, w io.Writer, sudo s
 
 	if _, err := exec.Run(ctx, "which fail2ban-server"); err != nil {
 		fmt.Fprintln(w, "  Installing fail2ban...")
-		if _, err := exec.Run(ctx, sudo+"apt-get update -qq && "+sudo+"apt-get install -y -qq fail2ban"); err != nil {
+		if _, err := exec.Run(ctx, sudo+"DEBIAN_FRONTEND=noninteractive apt-get update -qq && "+sudo+"DEBIAN_FRONTEND=noninteractive apt-get install -y -qq fail2ban"); err != nil {
 			return fmt.Errorf("installing fail2ban: %w", err)
 		}
 	}
@@ -123,7 +123,7 @@ func EnableAutoUpdates(ctx context.Context, exec ssh.Executor, w io.Writer, sudo
 	fmt.Fprintln(w, "Configuring auto-updates...")
 
 	if _, err := exec.Run(ctx, "which unattended-upgrades"); err != nil {
-		if _, err := exec.Run(ctx, sudo+"apt-get update -qq && "+sudo+"apt-get install -y -qq unattended-upgrades"); err != nil {
+		if _, err := exec.Run(ctx, sudo+"DEBIAN_FRONTEND=noninteractive apt-get update -qq && "+sudo+"DEBIAN_FRONTEND=noninteractive apt-get install -y -qq unattended-upgrades"); err != nil {
 			return fmt.Errorf("installing unattended-upgrades: %w", err)
 		}
 	}

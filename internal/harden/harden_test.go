@@ -38,7 +38,7 @@ func TestConfigureUFW_AlreadyInstalled(t *testing.T) {
 func TestConfigureUFW_FreshInstall(t *testing.T) {
 	mock := ssh.NewMockExecutor("server1",
 		ssh.MockCommand{Match: "which ufw", Err: fmt.Errorf("not found")},
-		ssh.MockCommand{Match: "apt-get update", Output: ""},
+		ssh.MockCommand{Match: "DEBIAN_FRONTEND=noninteractive apt-get update", Output: ""},
 		ssh.MockCommand{Match: "ufw default deny incoming", Output: ""},
 		ssh.MockCommand{Match: "ufw allow 22/tcp", Output: ""},
 		ssh.MockCommand{Match: `sh -c 'echo "y" | ufw enable'`, Output: "Firewall is active"},
@@ -58,7 +58,7 @@ func TestConfigureUFW_FreshInstall(t *testing.T) {
 func TestConfigureUFW_WithSudo(t *testing.T) {
 	mock := ssh.NewMockExecutor("server1",
 		ssh.MockCommand{Match: "which ufw", Err: fmt.Errorf("not found")},
-		ssh.MockCommand{Match: "sudo apt-get update", Output: ""},
+		ssh.MockCommand{Match: "sudo DEBIAN_FRONTEND=noninteractive apt-get update", Output: ""},
 		ssh.MockCommand{Match: "sudo ufw default deny incoming", Output: ""},
 		ssh.MockCommand{Match: "sudo ufw allow 22/tcp", Output: ""},
 		ssh.MockCommand{Match: "sudo sh -c", Output: "Firewall is active"},
@@ -72,7 +72,7 @@ func TestConfigureUFW_WithSudo(t *testing.T) {
 
 	var foundSudo bool
 	for _, call := range mock.Calls {
-		if strings.HasPrefix(call, "sudo apt-get") {
+		if strings.HasPrefix(call, "sudo DEBIAN_FRONTEND=noninteractive apt-get") {
 			foundSudo = true
 		}
 	}
@@ -116,7 +116,7 @@ func TestInstallFail2ban_AlreadyInstalled(t *testing.T) {
 func TestInstallFail2ban_FreshInstall(t *testing.T) {
 	mock := ssh.NewMockExecutor("server1",
 		ssh.MockCommand{Match: "which fail2ban-server", Err: fmt.Errorf("not found")},
-		ssh.MockCommand{Match: "apt-get update", Output: ""},
+		ssh.MockCommand{Match: "DEBIAN_FRONTEND=noninteractive apt-get update", Output: ""},
 		ssh.MockCommand{Match: "systemctl enable --now fail2ban", Output: ""},
 		ssh.MockCommand{Match: "UPLOAD:", Output: ""},
 		ssh.MockCommand{Match: "mv /tmp/teploy-fail2ban-sshd.conf", Output: ""},

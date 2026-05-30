@@ -141,7 +141,7 @@ func runSetup(flags *Flags, host string, name string, noHarden bool, networkProv
 		rootExec, rootErr := ssh.Connect(ctx, rootCfg)
 		if rootErr == nil {
 			// Root SSH works — install sudo directly.
-			if _, err := rootExec.Run(ctx, "apt-get update -qq && apt-get install -y -qq sudo && usermod -aG sudo "+user); err != nil {
+			if _, err := rootExec.Run(ctx, "DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq sudo && usermod -aG sudo "+user); err != nil {
 				rootExec.Close()
 				return fmt.Errorf("installing sudo: %w", err)
 			}
@@ -156,7 +156,7 @@ func runSetup(flags *Flags, host string, name string, noHarden bool, networkProv
 			// Write a helper script that uses su with the password from a file.
 			script := fmt.Sprintf(`#!/bin/bash
 exec 2>&1
-echo '%s' | su -c 'apt-get update -qq && apt-get install -y -qq sudo >/dev/null 2>&1 && usermod -aG sudo %s && echo "%s ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/%s && chmod 440 /etc/sudoers.d/%s && echo TEPLOY_SUDO_OK' - root 2>&1
+echo '%s' | su -c 'DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq sudo >/dev/null 2>&1 && usermod -aG sudo %s && echo "%s ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/%s && chmod 440 /etc/sudoers.d/%s && echo TEPLOY_SUDO_OK' - root 2>&1
 `, strings.ReplaceAll(rootPass, "'", "'\"'\"'"), user, user, user, user)
 			if err := executor.Upload(ctx, strings.NewReader(script), "/tmp/teploy_install_sudo.sh", "0700"); err != nil {
 				return fmt.Errorf("uploading sudo installer: %w", err)
