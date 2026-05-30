@@ -91,6 +91,7 @@ func runRollback(flags *Flags, toHash string) error {
 		StopTimeout: appCfg.StopTimeout,
 		TLSCert:     tlsCert,
 		TLSKey:      tlsKey,
+		Ingress:     appCfg.Ingress,
 	})
 
 	// Fire notification (best-effort).

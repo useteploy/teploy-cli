@@ -1095,3 +1095,55 @@ func TestDeploy_SameVersionWithWorkers(t *testing.T) {
 		t.Error("expected renamed worker container to be stopped")
 	}
 }
+
+// TestDeploy_IngressExternalSkipsCaddy verifies that a deploy with
+// Ingress="external" issues zero Caddy commands. The user's external
+// ingress (CF Tunnel, nginx, etc.) is responsible for routing; Teploy
+// only ensures the container is running and joined to the docker
+// network with its app-name alias.
+func TestDeploy_IngressExternalSkipsCaddy(t *testing.T) {
+	ssOutput := "State  Recv-Q Send-Q  Local Address:Port\nLISTEN 0      128     0.0.0.0:80\n"
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "mkdir -p /deployments/myapp", Output: ""},
+		ssh.MockCommand{Match: "mkdir /deployments/myapp/.lock", Output: ""},
+		ssh.MockCommand{Match: "cat /deployments/myapp/state", Err: fmt.Errorf("no state")},
+		ssh.MockCommand{Match: "ss -tln", Output: ssOutput},
+		ssh.MockCommand{Match: "docker run", Output: "web123container"},
+		ssh.MockCommand{Match: "docker inspect -f", Output: "running"},
+		ssh.MockCommand{Match: "curl -s -o /dev/null", Output: "200"},
+		// No Caddy mocks — the deploy must not call them.
+		ssh.MockCommand{Match: "cat /tmp/teploy_log_entry", Output: ""},
+		ssh.MockCommand{Match: "rm -rf /deployments/myapp/.lock", Output: ""},
+	)
+
+	var buf bytes.Buffer
+	deployer := NewDeployer(mock, &buf)
+
+	err := deployer.Deploy(context.Background(), Config{
+		App:     "myapp",
+		Domain:  "myapp.com",
+		Image:   "myapp:latest",
+		Version: "abc123",
+		Ingress: "external",
+		Health:  HealthConfig{Timeout: 5 * time.Second, Interval: 10 * time.Millisecond},
+	})
+	if err != nil {
+		t.Fatalf("Deploy: %v", err)
+	}
+
+	// No call should reach Caddy admin API or Caddyfile.
+	for _, call := range mock.Calls {
+		lower := strings.ToLower(call)
+		if strings.Contains(call, "localhost:2019") ||
+			strings.Contains(call, "/deployments/caddy/Caddyfile") ||
+			strings.Contains(call, "caddy reload") ||
+			strings.Contains(lower, "/config/apps/http/servers") {
+			t.Errorf("ingress: external should issue zero Caddy commands; got: %s", call)
+		}
+	}
+
+	// Skip message should appear in output.
+	if !strings.Contains(buf.String(), "Skipping Caddy route update") {
+		t.Errorf("expected skip message in output, got:\n%s", buf.String())
+	}
+}

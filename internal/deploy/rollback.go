@@ -25,6 +25,16 @@ type RollbackConfig struct {
 	// block without the cert and break TLS the same way a deploy would.
 	TLSCert string
 	TLSKey  string
+	// Ingress mirrors Config.Ingress — set to "external" to skip Caddy
+	// route restoration on rollback. With external ingress, the user's
+	// CF Tunnel / nginx / etc. already points at the app-name alias on
+	// the teploy docker network; reverting the container set is enough.
+	Ingress string
+}
+
+// usesCaddy reports whether the rollback should drive Caddy.
+func (c RollbackConfig) usesCaddy() bool {
+	return c.Ingress == "" || c.Ingress == "caddy"
 }
 
 // Rollback reverts to the previous deploy version.
@@ -100,16 +110,24 @@ func Rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg Rollbac
 	// match but can differ when the app's ContainerPort config has
 	// changed. Inspect the live container so rollback routes correctly
 	// regardless.
-	fmt.Fprintln(out, "Updating routes...")
-	previousContainer := docker.ContainerName(cfg.App, "web", current.PreviousHash)
-	internalPort, err := dk.InternalPort(ctx, previousContainer)
-	if err != nil {
-		return fmt.Errorf("inspecting previous container port: %w", err)
+	//
+	// Skipped under ingress: external — the external thing already
+	// points at the app's network alias, which will resolve to whichever
+	// container Teploy starts (in this case, the previous one).
+	if cfg.usesCaddy() {
+		fmt.Fprintln(out, "Updating routes...")
+		previousContainer := docker.ContainerName(cfg.App, "web", current.PreviousHash)
+		internalPort, err := dk.InternalPort(ctx, previousContainer)
+		if err != nil {
+			return fmt.Errorf("inspecting previous container port: %w", err)
+		}
+		if err := cd.SetRoute(ctx, cfg.App, cfg.Domain, previousContainer, internalPort, caddy.TLS{Cert: cfg.TLSCert, Key: cfg.TLSKey}); err != nil {
+			return fmt.Errorf("updating route: %w", err)
+		}
+		fmt.Fprintln(out, "  Traffic routed to previous version")
+	} else {
+		fmt.Fprintf(out, "Skipping Caddy route restore (ingress: %s)\n", cfg.Ingress)
 	}
-	if err := cd.SetRoute(ctx, cfg.App, cfg.Domain, previousContainer, internalPort, caddy.TLS{Cert: cfg.TLSCert, Key: cfg.TLSKey}); err != nil {
-		return fmt.Errorf("updating route: %w", err)
-	}
-	fmt.Fprintln(out, "  Traffic routed to previous version")
 
 	// 5. Stop current containers.
 	currentSuffix := "-" + current.CurrentHash

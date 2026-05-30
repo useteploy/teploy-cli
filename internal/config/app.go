@@ -99,11 +99,30 @@ const (
 	TypeStatic    = "static"
 )
 
+// Ingress modes. Empty string and "caddy" both mean Teploy manages the
+// Caddyfile and reloads Caddy on every deploy / rollback / maintenance
+// toggle (current behavior). "external" means the user is fronting the
+// container with their own ingress (Cloudflare Tunnel, Tailscale Funnel,
+// nginx, HAProxy, an AWS ALB, …) and Teploy must not touch Caddy for
+// this app. With "external", Teploy still publishes the container port
+// on 127.0.0.1 for local health checks and joins the container to the
+// teploy network so the external thing can reach it by its app-name
+// alias.
+const (
+	IngressCaddy    = "caddy"
+	IngressExternal = "external"
+)
+
 // AppConfig represents the teploy configuration (yml, yaml, or toml).
 type AppConfig struct {
 	App           string                     `yaml:"app" toml:"app"`
 	Domain        string                     `yaml:"domain" toml:"domain"`
 	Type          string                     `yaml:"type,omitempty" toml:"type"`
+	// Ingress selects the routing layer. Empty / "caddy" (default) means
+	// Teploy manages the Caddyfile. "external" means the user fronts the
+	// container with their own ingress (Cloudflare Tunnel, nginx, …) and
+	// Teploy must not touch Caddy for this app. See the Ingress* consts.
+	Ingress       string                     `yaml:"ingress,omitempty" toml:"ingress"`
 	Server        string                     `yaml:"server,omitempty" toml:"server"`
 	Servers       []string                   `yaml:"servers,omitempty" toml:"servers"`
 	Image         string                     `yaml:"image,omitempty" toml:"image"`
@@ -151,6 +170,12 @@ func (c *AppConfig) IsStatic() bool {
 	return c.Type == TypeStatic
 }
 
+// UsesCaddy reports whether Teploy should manage Caddy for this app.
+// Default (empty Ingress) is true; only explicit "external" turns it off.
+func (c *AppConfig) UsesCaddy() bool {
+	return c.Ingress == "" || c.Ingress == IngressCaddy
+}
+
 func (c *AppConfig) validate() error {
 	if c.App == "" {
 		return fmt.Errorf("'app' is required")
@@ -179,6 +204,12 @@ func (c *AppConfig) validate() error {
 	if c.Platform != "" && !validPlatform.MatchString(c.Platform) {
 		return fmt.Errorf("'platform' must be os/arch (e.g. linux/amd64, linux/arm64), got %q", c.Platform)
 	}
+	// Validate ingress. Empty defaults to "caddy" at consumption time.
+	switch c.Ingress {
+	case "", IngressCaddy, IngressExternal:
+	default:
+		return fmt.Errorf("'ingress' must be one of: caddy, external (got %q)", c.Ingress)
+	}
 	// Validate deploy type and its required fields. Empty type means container.
 	switch c.Type {
 	case "", TypeContainer:
@@ -189,6 +220,11 @@ func (c *AppConfig) validate() error {
 		}
 		if c.Image != "" {
 			return fmt.Errorf("'image' cannot be set when type is 'static'")
+		}
+		// Static deploys ARE Caddy-served by definition (rsync + Caddy
+		// file_server). External ingress wouldn't have anything to serve.
+		if c.Ingress == IngressExternal {
+			return fmt.Errorf("'ingress: external' is not supported for type:static (static deploys require Caddy)")
 		}
 		if c.BuildLocal {
 			return fmt.Errorf("'build_local' is for container builds; use 'build_remote' for static deploys")
@@ -339,6 +375,9 @@ func mergeConfigs(base, overlay *AppConfig) {
 	}
 	if overlay.Image != "" {
 		base.Image = overlay.Image
+	}
+	if overlay.Ingress != "" {
+		base.Ingress = overlay.Ingress
 	}
 	if overlay.Port != 0 {
 		base.Port = overlay.Port
