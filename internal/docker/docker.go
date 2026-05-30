@@ -221,10 +221,18 @@ type containerInspect struct {
 			HostIp   string
 			HostPort string
 		}
-		Binds         []string
+		Binds  []string
+		Mounts []struct {
+			Type     string // "bind" | "volume" | "tmpfs"
+			Source   string
+			Target   string
+			ReadOnly bool
+		}
 		RestartPolicy struct {
 			Name string
 		}
+		Memory   int64 // bytes
+		NanoCpus int64 // nano-CPUs (1 CPU = 1e9)
 	}
 	NetworkSettings struct {
 		Networks map[string]struct {
@@ -244,8 +252,9 @@ type containerInspect struct {
 // sidesteps that landmine.
 //
 // Preserved across the recreate: image, network mode + aliases, port
-// bindings, env, bind mounts, command, working dir, user, labels, restart
-// policy, and the --no-healthcheck NONE marker.
+// bindings, env, bind mounts, named-volume + tmpfs mounts, command, working
+// dir, user, labels, restart policy, memory + CPU limits, and the
+// --no-healthcheck NONE marker.
 func (c *Client) Restart(ctx context.Context, name string) error {
 	raw, err := c.exec.Run(ctx, "docker inspect "+name)
 	if err != nil {
@@ -307,6 +316,32 @@ func (c *Client) Restart(ctx context.Context, name string) error {
 	// Bind mounts (already host:container[:mode] formatted by docker).
 	for _, b := range spec.HostConfig.Binds {
 		args = append(args, "-v", b)
+	}
+
+	// Named volume + tmpfs + non-bind mounts (Binds covers bind mounts; this
+	// covers everything created via --mount). Use --mount syntax for fidelity.
+	for _, m := range spec.HostConfig.Mounts {
+		if m.Type == "" || m.Target == "" {
+			continue
+		}
+		parts := []string{"type=" + m.Type, "target=" + m.Target}
+		if m.Source != "" {
+			parts = append(parts, "source="+m.Source)
+		}
+		if m.ReadOnly {
+			parts = append(parts, "readonly")
+		}
+		args = append(args, "--mount", shellQuoteSingle(strings.Join(parts, ",")))
+	}
+
+	// Resource limits.
+	if spec.HostConfig.Memory > 0 {
+		args = append(args, "--memory", fmt.Sprintf("%db", spec.HostConfig.Memory))
+	}
+	if spec.HostConfig.NanoCpus > 0 {
+		// NanoCpus → fractional --cpus (1e9 nano = 1.0 cpu).
+		cpus := float64(spec.HostConfig.NanoCpus) / 1e9
+		args = append(args, "--cpus", strconv.FormatFloat(cpus, 'f', -1, 64))
 	}
 
 	// Labels (sorted for determinism).
