@@ -254,6 +254,13 @@ func (c *AppConfig) validate() error {
 		if c.TLS.Cert == "" || c.TLS.Key == "" {
 			return fmt.Errorf("'tls' requires both 'cert' and 'key' paths")
 		}
+		// TLS only takes effect via the Caddy site block. With ingress:external
+		// the user's external ingress (Cloudflare Tunnel, nginx, ALB, …)
+		// handles TLS termination, so the cert/key would be uploaded but never
+		// wired up — silent no-op that wastes bytes and confuses operators.
+		if c.Ingress == IngressExternal {
+			return fmt.Errorf("'tls' has no effect with 'ingress: external' — your external ingress should handle TLS termination")
+		}
 	}
 	for name := range c.Volumes {
 		if !validName.MatchString(name) {
