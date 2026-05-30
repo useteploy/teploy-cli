@@ -83,6 +83,13 @@ func Connect(ctx context.Context, cfg ConnectConfig) (*RemoteExecutor, error) {
 
 	client, err := dialWithContext(ctx, "tcp", host, clientConfig)
 	if err != nil {
+		// Detect SSH auth failures and surface an actionable hint. The raw
+		// crypto/ssh message ("unable to authenticate, attempted methods [...]")
+		// doesn't tell users that root SSH is commonly disabled and they need
+		// --user.
+		if strings.Contains(err.Error(), "unable to authenticate") {
+			return nil, fmt.Errorf("authentication failed for %s@%s; try --user <name> if the server account isn't %q (root SSH is disabled on most distros), --key <path> for a specific key, or --password to use password auth", cfg.User, cfg.Host, cfg.User)
+		}
 		return nil, fmt.Errorf("connecting to %s: %w", cfg.Host, err)
 	}
 
