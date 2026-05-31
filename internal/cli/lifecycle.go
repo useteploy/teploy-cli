@@ -7,54 +7,57 @@ import (
 	"os/signal"
 
 	"github.com/spf13/cobra"
-	"github.com/useteploy/teploy/internal/config"
 	"github.com/useteploy/teploy/internal/deploy"
 	"github.com/useteploy/teploy/internal/notify"
 )
 
 func newStopCmd(flags *Flags) *cobra.Command {
-	return &cobra.Command{
+	var appName string
+	cmd := &cobra.Command{
 		Use:   "stop",
 		Short: "Stop all containers for the app",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runLifecycle(flags, "stop")
+			return runLifecycle(flags, appName, "stop")
 		},
 	}
+	cmd.Flags().StringVar(&appName, "app", "", "app name — act on server state instead of teploy.yml (requires --host)")
+	return cmd
 }
 
 func newStartCmd(flags *Flags) *cobra.Command {
-	return &cobra.Command{
+	var appName string
+	cmd := &cobra.Command{
 		Use:   "start",
 		Short: "Start all stopped containers for the app",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runLifecycle(flags, "start")
+			return runLifecycle(flags, appName, "start")
 		},
 	}
+	cmd.Flags().StringVar(&appName, "app", "", "app name — act on server state instead of teploy.yml (requires --host)")
+	return cmd
 }
 
 func newRestartCmd(flags *Flags) *cobra.Command {
-	return &cobra.Command{
+	var appName string
+	cmd := &cobra.Command{
 		Use:   "restart",
 		Short: "Restart all containers for the app",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runLifecycle(flags, "restart")
+			return runLifecycle(flags, appName, "restart")
 		},
 	}
+	cmd.Flags().StringVar(&appName, "app", "", "app name — act on server state instead of teploy.yml (requires --host)")
+	return cmd
 }
 
-func runLifecycle(flags *Flags, action string) error {
-	appCfg, err := config.LoadApp(".")
-	if err != nil {
-		return err
-	}
-
+func runLifecycle(flags *Flags, appName, action string) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
-	executor, err := connectForApp(ctx, flags, appCfg)
+	appCfg, executor, err := resolveApp(ctx, flags, appName)
 	if err != nil {
 		return err
 	}

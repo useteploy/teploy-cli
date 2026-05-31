@@ -25,45 +25,55 @@ func newMaintenanceCmd(flags *Flags) *cobra.Command {
 }
 
 func newMaintenanceOnCmd(flags *Flags) *cobra.Command {
-	return &cobra.Command{
+	var appName string
+	cmd := &cobra.Command{
 		Use:   "on",
 		Short: "Enable maintenance mode (returns 503 to all visitors)",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runMaintenanceToggle(flags, true)
+			return runMaintenanceToggle(flags, appName, true)
 		},
 	}
+	cmd.Flags().StringVar(&appName, "app", "", "app name — act on server state instead of teploy.yml (requires --host)")
+	return cmd
 }
 
 func newMaintenanceOffCmd(flags *Flags) *cobra.Command {
-	return &cobra.Command{
+	var appName string
+	cmd := &cobra.Command{
 		Use:   "off",
 		Short: "Disable maintenance mode (restore normal traffic)",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runMaintenanceToggle(flags, false)
+			return runMaintenanceToggle(flags, appName, false)
 		},
 	}
+	cmd.Flags().StringVar(&appName, "app", "", "app name — act on server state instead of teploy.yml (requires --host)")
+	return cmd
 }
 
-func runMaintenanceToggle(flags *Flags, enable bool) error {
-	appCfg, err := config.LoadApp(".")
-	if err != nil {
-		return err
-	}
-
-	// Maintenance mode is served by Caddy as a 503 route block. With
-	// external ingress, Teploy doesn't control the routing layer, so
-	// there's nothing to swap. Surface this clearly rather than silently
-	// no-op'ing or pretending it worked.
-	if !appCfg.UsesCaddy() {
-		return fmt.Errorf("'teploy maintenance' requires Teploy-managed Caddy; this app uses ingress: %s — route traffic away from the container via your external ingress instead", appCfg.Ingress)
+func runMaintenanceToggle(flags *Flags, appName string, enable bool) error {
+	// With --app there's no teploy.yml to check ingress against; the server
+	// state doesn't record ingress mode. Only enforce the Caddy-required check
+	// in the cwd path where we have full config.
+	if appName == "" {
+		appCfg, err := config.LoadApp(".")
+		if err != nil {
+			return err
+		}
+		// Maintenance mode is served by Caddy as a 503 route block. With
+		// external ingress, Teploy doesn't control the routing layer, so
+		// there's nothing to swap. Surface this clearly rather than silently
+		// no-op'ing or pretending it worked.
+		if !appCfg.UsesCaddy() {
+			return fmt.Errorf("'teploy maintenance' requires Teploy-managed Caddy; this app uses ingress: %s — route traffic away from the container via your external ingress instead", appCfg.Ingress)
+		}
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
-	executor, err := connectForApp(ctx, flags, appCfg)
+	appCfg, executor, err := resolveApp(ctx, flags, appName)
 	if err != nil {
 		return err
 	}

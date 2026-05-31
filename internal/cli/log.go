@@ -15,6 +15,7 @@ import (
 
 func newLogCmd(flags *Flags) *cobra.Command {
 	var last int
+	var appName string
 
 	cmd := &cobra.Command{
 		Use:   "log",
@@ -22,25 +23,21 @@ func newLogCmd(flags *Flags) *cobra.Command {
 		Long:  "Display the deploy log from the server — deploys, rollbacks, restarts, and failures.",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runLog(flags, last)
+			return runLog(flags, appName, last)
 		},
 	}
 
 	cmd.Flags().IntVar(&last, "last", 20, "number of entries to show")
+	cmd.Flags().StringVar(&appName, "app", "", "app name — act on server state instead of teploy.yml (requires --host)")
 
 	return cmd
 }
 
-func runLog(flags *Flags, last int) error {
-	appCfg, err := config.LoadApp(".")
-	if err != nil {
-		return err
-	}
-
+func runLog(flags *Flags, appName string, last int) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
-	executor, err := connectForApp(ctx, flags, appCfg)
+	appCfg, executor, err := resolveApp(ctx, flags, appName)
 	if err != nil {
 		return err
 	}

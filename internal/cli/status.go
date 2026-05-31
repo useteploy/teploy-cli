@@ -9,32 +9,29 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
-	"github.com/useteploy/teploy/internal/config"
 	"github.com/useteploy/teploy/internal/docker"
 	"github.com/useteploy/teploy/internal/state"
 )
 
 func newStatusCmd(flags *Flags) *cobra.Command {
-	return &cobra.Command{
+	var appName string
+	cmd := &cobra.Command{
 		Use:   "status",
 		Short: "Show what's running for the app",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runStatus(flags)
+			return runStatus(flags, appName)
 		},
 	}
+	cmd.Flags().StringVar(&appName, "app", "", "app name — act on server state instead of teploy.yml (requires --host)")
+	return cmd
 }
 
-func runStatus(flags *Flags) error {
-	appCfg, err := config.LoadApp(".")
-	if err != nil {
-		return err
-	}
-
+func runStatus(flags *Flags, appName string) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
-	executor, err := connectForApp(ctx, flags, appCfg)
+	appCfg, executor, err := resolveApp(ctx, flags, appName)
 	if err != nil {
 		return err
 	}
@@ -83,26 +80,24 @@ func runStatus(flags *Flags) error {
 }
 
 func newStatsCmd(flags *Flags) *cobra.Command {
-	return &cobra.Command{
+	var appName string
+	cmd := &cobra.Command{
 		Use:   "stats",
 		Short: "Show CPU/RAM per container",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runStats(flags)
+			return runStats(flags, appName)
 		},
 	}
+	cmd.Flags().StringVar(&appName, "app", "", "app name — act on server state instead of teploy.yml (requires --host)")
+	return cmd
 }
 
-func runStats(flags *Flags) error {
-	appCfg, err := config.LoadApp(".")
-	if err != nil {
-		return err
-	}
-
+func runStats(flags *Flags, appName string) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
-	executor, err := connectForApp(ctx, flags, appCfg)
+	appCfg, executor, err := resolveApp(ctx, flags, appName)
 	if err != nil {
 		return err
 	}

@@ -8,12 +8,12 @@ import (
 	"os/user"
 
 	"github.com/spf13/cobra"
-	"github.com/useteploy/teploy/internal/config"
 	"github.com/useteploy/teploy/internal/state"
 )
 
 func newLockCmd(flags *Flags) *cobra.Command {
 	var message string
+	var appName string
 
 	cmd := &cobra.Command{
 		Use:   "lock",
@@ -21,24 +21,20 @@ func newLockCmd(flags *Flags) *cobra.Command {
 		Long:  "Place a manual deploy lock on the app. All deploys are blocked until 'teploy unlock' is run.",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runLock(flags, message)
+			return runLock(flags, appName, message)
 		},
 	}
 
 	cmd.Flags().StringVarP(&message, "message", "m", "", "reason for locking")
+	cmd.Flags().StringVar(&appName, "app", "", "app name — act on server state instead of teploy.yml (requires --host)")
 	return cmd
 }
 
-func runLock(flags *Flags, message string) error {
-	appCfg, err := config.LoadApp(".")
-	if err != nil {
-		return err
-	}
-
+func runLock(flags *Flags, appName, message string) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
-	executor, err := connectForApp(ctx, flags, appCfg)
+	appCfg, executor, err := resolveApp(ctx, flags, appName)
 	if err != nil {
 		return err
 	}
@@ -66,27 +62,25 @@ func runLock(flags *Flags, message string) error {
 }
 
 func newUnlockCmd(flags *Flags) *cobra.Command {
-	return &cobra.Command{
+	var appName string
+	cmd := &cobra.Command{
 		Use:   "unlock",
 		Short: "Release deploy lock for the app",
 		Long:  "Remove the manual deploy lock, allowing deploys to proceed.",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runUnlock(flags)
+			return runUnlock(flags, appName)
 		},
 	}
+	cmd.Flags().StringVar(&appName, "app", "", "app name — act on server state instead of teploy.yml (requires --host)")
+	return cmd
 }
 
-func runUnlock(flags *Flags) error {
-	appCfg, err := config.LoadApp(".")
-	if err != nil {
-		return err
-	}
-
+func runUnlock(flags *Flags, appName string) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
-	executor, err := connectForApp(ctx, flags, appCfg)
+	appCfg, executor, err := resolveApp(ctx, flags, appName)
 	if err != nil {
 		return err
 	}

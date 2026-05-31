@@ -49,26 +49,28 @@ func newAccessoryCmd(flags *Flags) *cobra.Command {
 }
 
 func newAccessoryListCmd(flags *Flags) *cobra.Command {
-	return &cobra.Command{
+	var appName string
+	cmd := &cobra.Command{
 		Use:   "list",
 		Short: "List accessory containers",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runAccessoryList(flags)
+			return runAccessoryList(flags, appName)
 		},
 	}
+	// `list` only needs the app name (read-only container listing), so it
+	// supports --app for use outside an app directory (e.g. teploy-dash).
+	// The other accessory subcommands need accessory config from teploy.yml
+	// and remain cwd-bound.
+	cmd.Flags().StringVar(&appName, "app", "", "app name — act on server state instead of teploy.yml (requires --host)")
+	return cmd
 }
 
-func runAccessoryList(flags *Flags) error {
-	appCfg, err := loadAppCfgForAccessory()
-	if err != nil {
-		return err
-	}
-
+func runAccessoryList(flags *Flags, appName string) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
-	executor, err := connectForApp(ctx, flags, appCfg)
+	appCfg, executor, err := resolveApp(ctx, flags, appName)
 	if err != nil {
 		return err
 	}

@@ -27,7 +27,8 @@ func newEnvCmd(flags *Flags) *cobra.Command {
 }
 
 func newEnvSetCmd(flags *Flags) *cobra.Command {
-	return &cobra.Command{
+	var appName string
+	cmd := &cobra.Command{
 		Use:   "set KEY=value [KEY=value...]",
 		Short: "Set one or more environment variables",
 		Args:  cobra.MinimumNArgs(1),
@@ -40,21 +41,18 @@ func newEnvSetCmd(flags *Flags) *cobra.Command {
 				}
 				pairs[arg[:idx]] = arg[idx+1:]
 			}
-			return runEnvSet(flags, pairs)
+			return runEnvSet(flags, appName, pairs)
 		},
 	}
+	cmd.Flags().StringVar(&appName, "app", "", "app name — act on server state instead of teploy.yml (requires --host)")
+	return cmd
 }
 
-func runEnvSet(flags *Flags, pairs map[string]string) error {
-	appCfg, err := config.LoadApp(".")
-	if err != nil {
-		return err
-	}
-
+func runEnvSet(flags *Flags, appName string, pairs map[string]string) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
-	executor, err := connectForApp(ctx, flags, appCfg)
+	appCfg, executor, err := resolveApp(ctx, flags, appName)
 	if err != nil {
 		return err
 	}
@@ -72,26 +70,24 @@ func runEnvSet(flags *Flags, pairs map[string]string) error {
 }
 
 func newEnvGetCmd(flags *Flags) *cobra.Command {
-	return &cobra.Command{
+	var appName string
+	cmd := &cobra.Command{
 		Use:   "get KEY",
 		Short: "Get the value of an environment variable",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runEnvGet(flags, args[0])
+			return runEnvGet(flags, appName, args[0])
 		},
 	}
+	cmd.Flags().StringVar(&appName, "app", "", "app name — act on server state instead of teploy.yml (requires --host)")
+	return cmd
 }
 
-func runEnvGet(flags *Flags, key string) error {
-	appCfg, err := config.LoadApp(".")
-	if err != nil {
-		return err
-	}
-
+func runEnvGet(flags *Flags, appName, key string) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
-	executor, err := connectForApp(ctx, flags, appCfg)
+	appCfg, executor, err := resolveApp(ctx, flags, appName)
 	if err != nil {
 		return err
 	}
@@ -110,30 +106,27 @@ func runEnvGet(flags *Flags, key string) error {
 func newEnvListCmd(flags *Flags) *cobra.Command {
 	var reveal bool
 
+	var appName string
 	cmd := &cobra.Command{
 		Use:   "list",
 		Short: "List all environment variables",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runEnvList(flags, reveal)
+			return runEnvList(flags, appName, reveal)
 		},
 	}
 
 	cmd.Flags().BoolVar(&reveal, "reveal", false, "show values instead of masking them")
+	cmd.Flags().StringVar(&appName, "app", "", "app name — act on server state instead of teploy.yml (requires --host)")
 
 	return cmd
 }
 
-func runEnvList(flags *Flags, reveal bool) error {
-	appCfg, err := config.LoadApp(".")
-	if err != nil {
-		return err
-	}
-
+func runEnvList(flags *Flags, appName string, reveal bool) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
-	executor, err := connectForApp(ctx, flags, appCfg)
+	appCfg, executor, err := resolveApp(ctx, flags, appName)
 	if err != nil {
 		return err
 	}
@@ -161,26 +154,24 @@ func runEnvList(flags *Flags, reveal bool) error {
 }
 
 func newEnvUnsetCmd(flags *Flags) *cobra.Command {
-	return &cobra.Command{
+	var appName string
+	cmd := &cobra.Command{
 		Use:   "unset KEY",
 		Short: "Remove an environment variable",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runEnvUnset(flags, args[0])
+			return runEnvUnset(flags, appName, args[0])
 		},
 	}
+	cmd.Flags().StringVar(&appName, "app", "", "app name — act on server state instead of teploy.yml (requires --host)")
+	return cmd
 }
 
-func runEnvUnset(flags *Flags, key string) error {
-	appCfg, err := config.LoadApp(".")
-	if err != nil {
-		return err
-	}
-
+func runEnvUnset(flags *Flags, appName, key string) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
-	executor, err := connectForApp(ctx, flags, appCfg)
+	appCfg, executor, err := resolveApp(ctx, flags, appName)
 	if err != nil {
 		return err
 	}
