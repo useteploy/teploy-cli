@@ -8,7 +8,6 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
-	"github.com/useteploy/teploy/internal/config"
 	"github.com/useteploy/teploy/internal/env"
 )
 
