@@ -10,6 +10,7 @@ import (
 	"github.com/useteploy/teploy/internal/accessories"
 	"github.com/useteploy/teploy/internal/backup"
 	"github.com/useteploy/teploy/internal/config"
+	"github.com/useteploy/teploy/internal/ssh"
 )
 
 // destination holds the -d / --destination flag value, set as a persistent
@@ -26,6 +27,27 @@ func loadAppCfgForAccessory() (*config.AppConfig, error) {
 		return config.LoadAppWithDestination(".", accessoryDestination)
 	}
 	return config.LoadApp(".")
+}
+
+// resolveAppForAccessory resolves the app config + an SSH connection for an
+// accessory subcommand. With --app it reads server-side state (no teploy.yml
+// needed — the path teploy-dash uses); without, it loads teploy.yml honoring
+// the -d destination overlay. Only stop/start/logs use this: they address
+// {app}-{accessory} containers by name. upgrade/backup/restore need accessory
+// image config from teploy.yml and stay cwd-bound.
+func resolveAppForAccessory(ctx context.Context, flags *Flags, appName string) (*config.AppConfig, ssh.Executor, error) {
+	if appName != "" {
+		return resolveApp(ctx, flags, appName)
+	}
+	appCfg, err := loadAppCfgForAccessory()
+	if err != nil {
+		return nil, nil, err
+	}
+	ex, err := connectForApp(ctx, flags, appCfg)
+	if err != nil {
+		return nil, nil, err
+	}
+	return appCfg, ex, nil
 }
 
 func newAccessoryCmd(flags *Flags) *cobra.Command {
@@ -94,26 +116,24 @@ func runAccessoryList(flags *Flags, appName string) error {
 }
 
 func newAccessoryStopCmd(flags *Flags) *cobra.Command {
-	return &cobra.Command{
+	var appName string
+	cmd := &cobra.Command{
 		Use:   "stop <name>",
 		Short: "Stop an accessory container",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runAccessoryStop(flags, args[0])
+			return runAccessoryStop(flags, appName, args[0])
 		},
 	}
+	cmd.Flags().StringVar(&appName, "app", "", "app name — act on server state instead of teploy.yml (requires --host)")
+	return cmd
 }
 
-func runAccessoryStop(flags *Flags, name string) error {
-	appCfg, err := loadAppCfgForAccessory()
-	if err != nil {
-		return err
-	}
-
+func runAccessoryStop(flags *Flags, appName, name string) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
-	executor, err := connectForApp(ctx, flags, appCfg)
+	appCfg, executor, err := resolveAppForAccessory(ctx, flags, appName)
 	if err != nil {
 		return err
 	}
@@ -129,26 +149,24 @@ func runAccessoryStop(flags *Flags, name string) error {
 }
 
 func newAccessoryStartCmd(flags *Flags) *cobra.Command {
-	return &cobra.Command{
+	var appName string
+	cmd := &cobra.Command{
 		Use:   "start <name>",
 		Short: "Start a stopped accessory container",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runAccessoryStart(flags, args[0])
+			return runAccessoryStart(flags, appName, args[0])
 		},
 	}
+	cmd.Flags().StringVar(&appName, "app", "", "app name — act on server state instead of teploy.yml (requires --host)")
+	return cmd
 }
 
-func runAccessoryStart(flags *Flags, name string) error {
-	appCfg, err := loadAppCfgForAccessory()
-	if err != nil {
-		return err
-	}
-
+func runAccessoryStart(flags *Flags, appName, name string) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
-	executor, err := connectForApp(ctx, flags, appCfg)
+	appCfg, executor, err := resolveAppForAccessory(ctx, flags, appName)
 	if err != nil {
 		return err
 	}
@@ -165,32 +183,29 @@ func runAccessoryStart(flags *Flags, name string) error {
 
 func newAccessoryLogsCmd(flags *Flags) *cobra.Command {
 	var lines int
+	var appName string
 
 	cmd := &cobra.Command{
 		Use:   "logs <name>",
 		Short: "Show accessory container logs",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runAccessoryLogs(flags, args[0], lines)
+			return runAccessoryLogs(flags, appName, args[0], lines)
 		},
 	}
 
 	cmd.Flags().IntVar(&lines, "lines", 50, "number of log lines to show (--tail is an alias)")
+	cmd.Flags().StringVar(&appName, "app", "", "app name — act on server state instead of teploy.yml (requires --host)")
 	cmd.Flags().SetNormalizeFunc(tailToLines)
 
 	return cmd
 }
 
-func runAccessoryLogs(flags *Flags, name string, lines int) error {
-	appCfg, err := loadAppCfgForAccessory()
-	if err != nil {
-		return err
-	}
-
+func runAccessoryLogs(flags *Flags, appName, name string, lines int) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
-	executor, err := connectForApp(ctx, flags, appCfg)
+	appCfg, executor, err := resolveAppForAccessory(ctx, flags, appName)
 	if err != nil {
 		return err
 	}
