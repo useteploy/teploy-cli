@@ -227,6 +227,17 @@ func (c *Client) AccessoryRestore(ctx context.Context, app, name, image, date st
 		s3Key = fmt.Sprintf("s3://%s/%s/accessories/%s/%s.archive.gz", s3.Bucket, app, name, date)
 		restorePath = "/tmp/restore.archive.gz"
 		restoreCmd = fmt.Sprintf("cat %s | docker exec -i %s mongorestore --archive --gzip --drop", restorePath, containerName)
+	case isDBType(image, "redis"):
+		// AccessoryBackup stores redis as <date>.rdb.gz; without this case the
+		// default branch looked for a .tar.gz that doesn't exist, so redis
+		// restores always failed. Stop redis first so its shutdown save can't
+		// overwrite the snapshot we copy in, then start so it loads dump.rdb.
+		s3Key = fmt.Sprintf("s3://%s/%s/accessories/%s/%s.rdb.gz", s3.Bucket, app, name, date)
+		restorePath = "/tmp/restore.rdb.gz"
+		restoreCmd = fmt.Sprintf(
+			"gunzip -c %s > /tmp/restore.rdb && docker stop %s && docker cp /tmp/restore.rdb %s:/data/dump.rdb && docker start %s && rm -f /tmp/restore.rdb",
+			restorePath, containerName, containerName, containerName,
+		)
 	default:
 		// Generic: extract tar to volume directory.
 		s3Key = fmt.Sprintf("s3://%s/%s/accessories/%s/%s.tar.gz", s3.Bucket, app, name, date)

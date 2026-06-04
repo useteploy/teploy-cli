@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"strings"
 	"time"
 
 	"github.com/useteploy/teploy/internal/caddy"
@@ -71,10 +70,14 @@ func Rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg Rollbac
 		return fmt.Errorf("listing containers: %w", err)
 	}
 
-	suffix := "-" + current.PreviousHash
+	// Match by the teploy.version label, not a name suffix: replica web
+	// containers are named "<app>-web-<version>-1/-2", which end in "-1"/"-2",
+	// not "-<version>" — a suffix match silently skips every replica (leaving
+	// them stopped on rollback / orphaned on the next deploy). Every teploy
+	// container carries the version label.
 	var started []string
 	for _, c := range containers {
-		if strings.HasSuffix(c.Name, suffix) {
+		if c.Labels["teploy.version"] == current.PreviousHash {
 			fmt.Fprintf(out, "Starting %s...\n", c.Name)
 			// Recreate rather than `docker start`: Docker 29 silently fails
 			// to re-publish HostConfig.PortBindings on `docker start` when
@@ -136,21 +139,27 @@ func Rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg Rollbac
 		fmt.Fprintf(out, "Skipping Caddy route restore (ingress: %s)\n", cfg.Ingress)
 	}
 
-	// 5. Stop current containers.
-	currentSuffix := "-" + current.CurrentHash
+	// 5. Stop current containers (match by version label — see step 2).
 	for _, c := range containers {
-		if strings.HasSuffix(c.Name, currentSuffix) && c.State == "running" {
+		if c.Labels["teploy.version"] == current.CurrentHash && c.State == "running" {
 			fmt.Fprintf(out, "Stopping %s...\n", c.Name)
 			dk.Stop(ctx, c.Name, stopTimeout)
 		}
 	}
 
 	// 6. Swap state: previous becomes current, current becomes previous.
+	// Carry the durable Domain through (state.Write omits an empty domain, so
+	// dropping it here blanked the persisted domain and broke the next
+	// rollback), and mirror the replica port arrays alongside the scalar swap
+	// so a multi-replica app's port set stays consistent.
 	newState := &state.AppState{
-		CurrentPort:  current.PreviousPort,
-		CurrentHash:  current.PreviousHash,
-		PreviousPort: current.CurrentPort,
-		PreviousHash: current.CurrentHash,
+		CurrentPort:   current.PreviousPort,
+		CurrentHash:   current.PreviousHash,
+		PreviousPort:  current.CurrentPort,
+		PreviousHash:  current.CurrentHash,
+		Domain:        current.Domain,
+		CurrentPorts:  current.PreviousPorts,
+		PreviousPorts: current.CurrentPorts,
 	}
 	if err := state.Write(ctx, exec, cfg.App, newState); err != nil {
 		return fmt.Errorf("writing state: %w", err)

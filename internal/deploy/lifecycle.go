@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"strings"
 	"time"
 
 	"github.com/useteploy/teploy/internal/docker"
@@ -156,10 +155,12 @@ func (l *Lifecycle) appContainersByVersion(ctx context.Context, app, version str
 		return nil, err
 	}
 
-	suffix := "-" + version
+	// Match by the teploy.version label, not a name suffix — replica containers
+	// ("<app>-<proc>-<version>-1") don't end in "-<version>", so a suffix match
+	// silently skips them (restart/start would miss every web replica).
 	var matched []docker.Container
 	for _, c := range containers {
-		if strings.HasSuffix(c.Name, suffix) {
+		if c.Labels["teploy.version"] == version {
 			matched = append(matched, c)
 		}
 	}

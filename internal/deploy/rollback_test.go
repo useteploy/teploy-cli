@@ -24,8 +24,8 @@ func TestRollback(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "cat /deployments/myapp/state", Output: stateContent},
 		ssh.MockCommand{Match: "docker ps --all --filter label=teploy.app=myapp",
-			Output: `{"ID":"aaa","Names":"myapp-web-v1","Image":"myapp:latest","State":"exited","Status":"Exited"}` + "\n" +
-				`{"ID":"bbb","Names":"myapp-web-v2","Image":"myapp:latest","State":"running","Status":"Up 1h"}`,
+			Output: `{"ID":"aaa","Names":"myapp-web-v1","Image":"myapp:latest","State":"exited","Status":"Exited","Labels":"teploy.app=myapp,teploy.version=v1"}` + "\n" +
+				`{"ID":"bbb","Names":"myapp-web-v2","Image":"myapp:latest","State":"running","Status":"Up 1h","Labels":"teploy.app=myapp,teploy.version=v2"}`,
 		},
 		// rollback uses Restart (inspect → rm -f → docker run) instead of bare
 		// `docker start` so HostConfig.PortBindings actually re-apply on Docker 29.
@@ -154,7 +154,7 @@ func TestRollback_NoPreviousContainers(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "cat /deployments/myapp/state", Output: stateContent},
 		ssh.MockCommand{Match: "docker ps --all --filter label=teploy.app=myapp",
-			Output: `{"ID":"bbb","Names":"myapp-web-v2","Image":"myapp:latest","State":"running","Status":"Up 1h"}`,
+			Output: `{"ID":"bbb","Names":"myapp-web-v2","Image":"myapp:latest","State":"running","Status":"Up 1h","Labels":"teploy.app=myapp,teploy.version=v2"}`,
 		},
 	)
 
@@ -172,8 +172,8 @@ func TestRollback_HealthCheckFails(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "cat /deployments/myapp/state", Output: stateContent},
 		ssh.MockCommand{Match: "docker ps --all --filter label=teploy.app=myapp",
-			Output: `{"ID":"aaa","Names":"myapp-web-v1","Image":"myapp:latest","State":"exited","Status":"Exited"}` + "\n" +
-				`{"ID":"bbb","Names":"myapp-web-v2","Image":"myapp:latest","State":"running","Status":"Up 1h"}`,
+			Output: `{"ID":"aaa","Names":"myapp-web-v1","Image":"myapp:latest","State":"exited","Status":"Exited","Labels":"teploy.app=myapp,teploy.version=v1"}` + "\n" +
+				`{"ID":"bbb","Names":"myapp-web-v2","Image":"myapp:latest","State":"running","Status":"Up 1h","Labels":"teploy.app=myapp,teploy.version=v2"}`,
 		},
 		// Restart (inspect → rm -f → docker run).
 		ssh.MockCommand{Match: "docker inspect myapp-web-v1", Output: `[{"Config":{"Image":"myapp:latest","Labels":{"teploy.app":"myapp"}},"HostConfig":{"NetworkMode":"teploy","PortBindings":{"3000/tcp":[{"HostIp":"127.0.0.1","HostPort":"49152"}]},"RestartPolicy":{"Name":"no"}},"NetworkSettings":{"Networks":{"teploy":{"Aliases":["myapp"]}}}}]`},

@@ -5,11 +5,13 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 
 	"github.com/spf13/cobra"
 	"github.com/useteploy/teploy/internal/accessories"
 	"github.com/useteploy/teploy/internal/backup"
 	"github.com/useteploy/teploy/internal/config"
+	"github.com/useteploy/teploy/internal/docker"
 	"github.com/useteploy/teploy/internal/ssh"
 )
 
@@ -60,6 +62,7 @@ func newAccessoryCmd(flags *Flags) *cobra.Command {
 	cmd.PersistentFlags().StringVarP(&accessoryDestination, "destination", "d", "", "destination overlay (e.g. prod merges teploy.prod.yml)")
 
 	cmd.AddCommand(newAccessoryListCmd(flags))
+	cmd.AddCommand(newAccessoryExecCmd(flags))
 	cmd.AddCommand(newAccessoryStopCmd(flags))
 	cmd.AddCommand(newAccessoryStartCmd(flags))
 	cmd.AddCommand(newAccessoryLogsCmd(flags))
@@ -68,6 +71,45 @@ func newAccessoryCmd(flags *Flags) *cobra.Command {
 	cmd.AddCommand(newAccessoryRestoreCmd(flags))
 
 	return cmd
+}
+
+func newAccessoryExecCmd(flags *Flags) *cobra.Command {
+	var appName string
+	cmd := &cobra.Command{
+		Use:   "exec <name> [command...]",
+		Short: "Run a command in an accessory container",
+		Long: "Run a one-off command in an accessory's running container — e.g. a query\n" +
+			"against a database accessory. The command runs via the container's shell, and a\n" +
+			"non-zero exit is propagated.\n\n" +
+			"Examples:\n" +
+			"  teploy accessory exec db -- psql -U postgres -c 'SELECT 1'\n" +
+			"  teploy accessory exec cache -- redis-cli INFO",
+		Args: cobra.MinimumNArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runAccessoryExec(flags, appName, args[0], args[1:])
+		},
+	}
+	cmd.Flags().StringVar(&appName, "app", "", "app name — act on server state instead of teploy.yml (requires --host)")
+	return cmd
+}
+
+func runAccessoryExec(flags *Flags, appName, name string, args []string) error {
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer cancel()
+
+	appCfg, executor, err := resolveAppForAccessory(ctx, flags, appName)
+	if err != nil {
+		return err
+	}
+	defer executor.Close()
+
+	dk := docker.NewClient(executor)
+	container := accessories.ContainerName(appCfg.App, name)
+	command := strings.Join(args, " ")
+	if err := dk.ExecStream(ctx, container, command, os.Stdout, os.Stderr); err != nil {
+		return fmt.Errorf("command failed in %s: %w", container, err)
+	}
+	return nil
 }
 
 func newAccessoryListCmd(flags *Flags) *cobra.Command {

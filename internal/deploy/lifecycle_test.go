@@ -14,8 +14,8 @@ import (
 func TestStop(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "docker ps --all --filter label=teploy.app=myapp",
-			Output: `{"ID":"abc123","Names":"myapp-web-v1","Image":"myapp:latest","State":"running","Status":"Up 2h"}` + "\n" +
-				`{"ID":"def456","Names":"myapp-worker-v1","Image":"myapp:latest","State":"running","Status":"Up 2h"}`,
+			Output: `{"ID":"abc123","Names":"myapp-web-v1","Image":"myapp:latest","State":"running","Status":"Up 2h","Labels":"teploy.app=myapp,teploy.version=v1"}` + "\n" +
+				`{"ID":"def456","Names":"myapp-worker-v1","Image":"myapp:latest","State":"running","Status":"Up 2h","Labels":"teploy.app=myapp,teploy.version=v1"}`,
 		},
 		ssh.MockCommand{Match: "docker stop", Output: ""},
 		ssh.MockCommand{Match: "cat /tmp", Output: ""},
@@ -61,7 +61,7 @@ func TestStart(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "cat /deployments/myapp/state", Output: stateContent},
 		ssh.MockCommand{Match: "docker ps --all --filter label=teploy.app=myapp",
-			Output: `{"ID":"abc123","Names":"myapp-web-v1","Image":"myapp:latest","State":"exited","Status":"Exited (0)"}`,
+			Output: `{"ID":"abc123","Names":"myapp-web-v1","Image":"myapp:latest","State":"exited","Status":"Exited (0)","Labels":"teploy.app=myapp,teploy.version=v1"}`,
 		},
 		ssh.MockCommand{Match: "docker start", Output: ""},
 		ssh.MockCommand{Match: "curl", Output: "200"},
@@ -100,7 +100,7 @@ func TestRestart(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "cat /deployments/myapp/state", Output: stateContent},
 		ssh.MockCommand{Match: "docker ps --all --filter label=teploy.app=myapp",
-			Output: `{"ID":"abc123","Names":"myapp-web-v1","Image":"myapp:latest","State":"running","Status":"Up 2h"}`,
+			Output: `{"ID":"abc123","Names":"myapp-web-v1","Image":"myapp:latest","State":"running","Status":"Up 2h","Labels":"teploy.app=myapp,teploy.version=v1"}`,
 		},
 		ssh.MockCommand{Match: "docker stop", Output: ""},
 		ssh.MockCommand{Match: "docker start", Output: ""},
@@ -130,7 +130,7 @@ func TestRestart(t *testing.T) {
 func TestStop_LogsAction(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "docker ps --all --filter label=teploy.app=myapp",
-			Output: `{"ID":"abc123","Names":"myapp-web-v1","Image":"myapp:latest","State":"running","Status":"Up 2h"}`,
+			Output: `{"ID":"abc123","Names":"myapp-web-v1","Image":"myapp:latest","State":"running","Status":"Up 2h","Labels":"teploy.app=myapp,teploy.version=v1"}`,
 		},
 		ssh.MockCommand{Match: "docker stop", Output: ""},
 		ssh.MockCommand{Match: "cat /tmp", Output: ""},

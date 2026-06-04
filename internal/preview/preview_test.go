@@ -37,6 +37,7 @@ func TestDeploy(t *testing.T) {
 		ssh.MockCommand{Match: "cat /deployments/myapp/previews/feature-login.json", Output: "", Err: nil},
 		ssh.MockCommand{Match: "ss -tln", Output: ""},
 		ssh.MockCommand{Match: "docker run", Output: "abc123"},
+		ssh.MockCommand{Match: "docker inspect -f '{{range $p", Output: "80/tcp"},
 		ssh.MockCommand{Match: "curl -sf http://localhost:2019/config/apps/http/servers/srv0", Output: `{"listen":[":80",":443"]}`},
 		ssh.MockCommand{Match: "curl -sf -X PATCH", Err: fmt.Errorf("not found")},
 		ssh.MockCommand{Match: "curl -sf -X POST http://localhost:2019/config/apps/http/servers/srv0/routes", Output: ""},

@@ -103,7 +103,13 @@ func (m *Manager) Set(ctx context.Context, app, key, value string) error {
 	}
 
 	path := secretPath(app, key)
-	cmd := fmt.Sprintf("echo %q | age -r %s -o %s", value, recipient, path)
+	// Single-quote every interpolated value so the remote shell can't expand or
+	// execute it. echo %q wraps in DOUBLE quotes, under which $, backticks and
+	// backslashes are still interpreted — so a secret like $(...) or pa$word was
+	// executed/corrupted at set-time as the SSH user. printf '%s' emits the value
+	// literally (no echo escape processing), and ssh.ShellQuote blocks expansion.
+	cmd := fmt.Sprintf("printf '%%s' %s | age -r %s -o %s",
+		ssh.ShellQuote(value), ssh.ShellQuote(recipient), ssh.ShellQuote(path))
 	if _, err := m.exec.Run(ctx, cmd); err != nil {
 		return fmt.Errorf("encrypting secret %s: %w", key, err)
 	}

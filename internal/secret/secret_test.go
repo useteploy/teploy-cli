@@ -14,7 +14,7 @@ func TestSet(t *testing.T) {
 		ssh.MockCommand{Match: "test -f /deployments/.age-key", Output: ""},
 		ssh.MockCommand{Match: "grep 'public key:'", Output: "# public key: age1abc123"},
 		ssh.MockCommand{Match: "mkdir -p /deployments/myapp/secrets", Output: ""},
-		ssh.MockCommand{Match: "echo", Output: ""},
+		ssh.MockCommand{Match: "printf", Output: ""},
 	)
 
 	mgr := NewManager(mock)
@@ -25,7 +25,7 @@ func TestSet(t *testing.T) {
 	// Verify age encrypt command was called.
 	found := false
 	for _, call := range mock.Calls {
-		if len(call) > 4 && call[:4] == "echo" {
+		if len(call) >= 6 && call[:6] == "printf" {
 			found = true
 		}
 	}
@@ -102,7 +102,7 @@ func TestRotate(t *testing.T) {
 		ssh.MockCommand{Match: "test -f /deployments/.age-key", Output: ""},
 		ssh.MockCommand{Match: "grep 'public key:'", Output: "# public key: age1abc123"},
 		ssh.MockCommand{Match: "mkdir -p /deployments/myapp/secrets", Output: ""},
-		ssh.MockCommand{Match: "echo", Output: ""},
+		ssh.MockCommand{Match: "printf", Output: ""},
 	)
 
 	mgr := NewManager(mock)

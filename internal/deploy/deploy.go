@@ -131,15 +131,20 @@ func (d *Deployer) Deploy(ctx context.Context, cfg Config) error {
 	// 3. Read current state.
 	current, _ := state.Read(ctx, d.exec, cfg.App)
 
-	// 4. Allocate ports for all web replicas.
+	// 4. Allocate ports for all web replicas. Track the ports claimed so far in
+	// this loop — containers aren't started until step 7, so `ss` can't see
+	// them yet; without excluding already-claimed ports every replica would get
+	// the same one and the second replica's `docker run -p` would collide.
 	fmt.Fprintf(d.out, "Allocating %d port(s)...\n", replicas)
 	ports := make([]int, replicas)
+	claimed := make(map[int]bool, replicas)
 	for i := 0; i < replicas; i++ {
-		port, err := d.docker.FindAvailablePort(ctx)
+		port, err := d.docker.FindAvailablePortExcluding(ctx, claimed)
 		if err != nil {
 			return fmt.Errorf("allocating port %d/%d: %w", i+1, replicas, err)
 		}
 		ports[i] = port
+		claimed[port] = true
 	}
 	port := ports[0] // primary port for health check, hooks, etc.
 	fmt.Fprintf(d.out, "  Ports allocated: %v\n", ports)

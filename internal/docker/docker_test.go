@@ -40,16 +40,16 @@ func TestClient_Run(t *testing.T) {
 	for _, want := range []string{
 		"docker run --detach",
 		"--restart unless-stopped",
-		"--name myapp-web-abc123",
+		"--name 'myapp-web-abc123'",
 		"--network teploy",
-		"--network-alias myapp",
-		"--label teploy.app=myapp",
-		"--label teploy.process=web",
-		"--label teploy.version=abc123",
+		"--network-alias 'myapp'",
+		"--label 'teploy.app=myapp'",
+		"--label 'teploy.process=web'",
+		"--label 'teploy.version=abc123'",
 		"-p 127.0.0.1:49152:80",
 		"-e PORT=80",
 		"--log-opt max-size=10m",
-		"nginx:latest",
+		"'nginx:latest'",
 	} {
 		if !strings.Contains(cmd, want) {
 			t.Errorf("command missing %q\ngot: %s", want, cmd)
@@ -77,7 +77,7 @@ func TestClient_Run_Worker(t *testing.T) {
 	cmd := mock.Calls[0]
 
 	// Worker gets app-process alias, not just app name.
-	if !strings.Contains(cmd, "--network-alias myapp-worker") {
+	if !strings.Contains(cmd, "--network-alias 'myapp-worker'") {
 		t.Errorf("worker should get alias myapp-worker\ngot: %s", cmd)
 	}
 
@@ -172,12 +172,12 @@ func TestClient_Run_WithOptions(t *testing.T) {
 
 	cmd := mock.Calls[0]
 	for _, want := range []string{
-		"--env-file /deployments/myapp/.env",
-		"-e APP_KEY=secret",
-		"-e NODE_ENV=production",
-		"-v /deployments/myapp/volumes/data:/app/data",
-		"--memory 512m",
-		"--cpus 1.0",
+		"--env-file '/deployments/myapp/.env'",
+		"-e 'APP_KEY=secret'",
+		"-e 'NODE_ENV=production'",
+		"-v '/deployments/myapp/volumes/data:/app/data'",
+		"--memory '512m'",
+		"--cpus '1.0'",
 	} {
 		if !strings.Contains(cmd, want) {
 			t.Errorf("command missing %q\ngot: %s", want, cmd)
@@ -462,7 +462,7 @@ func TestClient_Exec(t *testing.T) {
 	}
 
 	cmd := mock.Calls[0]
-	if !strings.Contains(cmd, "docker exec myapp-web-abc123") {
+	if !strings.Contains(cmd, "docker exec 'myapp-web-abc123'") {
 		t.Errorf("expected docker exec with container name: %s", cmd)
 	}
 	if !strings.Contains(cmd, "sh -c") {
@@ -482,5 +482,68 @@ func TestClient_Exec_Failure(t *testing.T) {
 	}
 	if output != "error: relation does not exist" {
 		t.Errorf("expected error output, got %s", output)
+	}
+}
+
+func TestRunningContainer(t *testing.T) {
+	// Two web containers: an old stopped one and the current running one,
+	// plus a worker. RunningContainer("web") must return the running web.
+	psOutput := `{"ID":"old","Names":"myapp-web-v1","Image":"myapp:v1","State":"exited","Status":"Exited","Labels":"teploy.app=myapp,teploy.process=web,teploy.version=v1"}
+{"ID":"cur","Names":"myapp-web-v2","Image":"myapp:v2","State":"running","Status":"Up 1m","Labels":"teploy.app=myapp,teploy.process=web,teploy.version=v2"}
+{"ID":"wk","Names":"myapp-worker-v2","Image":"myapp:v2","State":"running","Status":"Up 1m","Labels":"teploy.app=myapp,teploy.process=worker,teploy.version=v2"}`
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "docker ps --all --filter label=teploy.app=myapp", Output: psOutput},
+	)
+	client := NewClient(mock)
+
+	name, err := client.RunningContainer(context.Background(), "myapp", "web")
+	if err != nil {
+		t.Fatalf("RunningContainer: %v", err)
+	}
+	if name != "myapp-web-v2" {
+		t.Errorf("expected running web myapp-web-v2, got %q", name)
+	}
+
+	worker, err := client.RunningContainer(context.Background(), "myapp", "worker")
+	if err != nil || worker != "myapp-worker-v2" {
+		t.Errorf("expected myapp-worker-v2, got %q (err %v)", worker, err)
+	}
+}
+
+func TestRunningContainer_NoneRunning(t *testing.T) {
+	psOutput := `{"ID":"old","Names":"myapp-web-v1","Image":"myapp:v1","State":"exited","Status":"Exited","Labels":"teploy.app=myapp,teploy.process=web,teploy.version=v1"}`
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "docker ps --all --filter label=teploy.app=myapp", Output: psOutput},
+	)
+	client := NewClient(mock)
+	if _, err := client.RunningContainer(context.Background(), "myapp", "web"); err == nil {
+		t.Error("expected error when no running web container exists")
+	}
+}
+
+func TestExecStream(t *testing.T) {
+	// Verify the exec command is single-quoted (name + command) and output streams.
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "docker exec 'myapp-web-v2' sh -c 'bin/rails db:migrate'", Output: "migrated\n"},
+	)
+	client := NewClient(mock)
+
+	var out strings.Builder
+	if err := client.ExecStream(context.Background(), "myapp-web-v2", "bin/rails db:migrate", &out, &out); err != nil {
+		t.Fatalf("ExecStream: %v", err)
+	}
+	if out.String() != "migrated\n" {
+		t.Errorf("expected streamed output 'migrated', got %q", out.String())
+	}
+}
+
+func TestExecStream_PropagatesError(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "docker exec 'c' sh -c 'false'", Output: "", Err: fmt.Errorf("exit status 1")},
+	)
+	client := NewClient(mock)
+	var out strings.Builder
+	if err := client.ExecStream(context.Background(), "c", "false", &out, &out); err == nil {
+		t.Error("expected ExecStream to propagate the command's non-zero exit")
 	}
 }

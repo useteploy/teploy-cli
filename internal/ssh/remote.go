@@ -142,10 +142,10 @@ func (e *RemoteExecutor) Upload(ctx context.Context, content io.Reader, remotePa
 	dir := path.Dir(remotePath)
 
 	cmd := fmt.Sprintf("mkdir -p %s && cat > %s && chmod %s %s",
-		shellQuote(dir),
-		shellQuote(remotePath),
-		shellQuote(mode),
-		shellQuote(remotePath),
+		ShellQuote(dir),
+		ShellQuote(remotePath),
+		ShellQuote(mode),
+		ShellQuote(remotePath),
 	)
 
 	session, err := e.client.NewSession()
@@ -184,9 +184,14 @@ func defaultHostKeyCallback() (ssh.HostKeyCallback, error) {
 
 	knownHostsPath := filepath.Join(home, ".ssh", "known_hosts")
 	if _, err := os.Stat(knownHostsPath); err != nil {
-		// No known_hosts file — accept any host key.
-		// This matches default ssh behavior for first connections.
-		return ssh.InsecureIgnoreHostKey(), nil
+		// No known_hosts file — fall back to trust-on-first-use rather than
+		// accept-all: record the key on first connect and detect a mismatch on
+		// every connection after. InsecureIgnoreHostKey never records and never
+		// detects a MITM, so a fresh box (the common CI/first-deploy case) had
+		// no host-key protection at all. TOFU keeps first-connect frictionless
+		// while closing the silent-MITM hole; a changed key then errors (use
+		// --accept-new or clear the entry after a deliberate re-provision).
+		return acceptNewHostKeyCallback(knownHostsPath), nil
 	}
 
 	callback, err := knownhosts.New(knownHostsPath)
@@ -321,6 +326,10 @@ func PublicKeyPath(keyPath string) (string, error) {
 	return "", fmt.Errorf("no SSH public key found")
 }
 
-func shellQuote(s string) string {
+// ShellQuote returns s wrapped in single quotes, safe for POSIX shells —
+// single quotes suppress all expansion ($, backticks, backslash, globbing), so
+// arbitrary values can be passed through a remote shell without injection or
+// corruption. Exported for use by other packages that build remote commands.
+func ShellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'"
 }

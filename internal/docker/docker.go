@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"sort"
 	"strconv"
 	"strings"
@@ -75,25 +76,31 @@ func (c *Client) Run(ctx context.Context, cfg RunConfig) (string, error) {
 		name = ContainerName(cfg.App, cfg.Process, cfg.Version)
 	}
 
+	// The full command is sent to a remote shell as one string, so every
+	// interpolated value (name, app, image, env values, volume specs, …) is
+	// single-quoted to prevent a space or shell metacharacter from breaking the
+	// command or injecting. The fixed flags are literals and need no quoting;
+	// the optional Cmd override is left raw on purpose (see below).
+	q := ssh.ShellQuote
 	args := []string{
 		"docker", "run", "--detach",
 		"--restart", "unless-stopped",
-		"--name", name,
+		"--name", q(name),
 		"--network", "teploy",
 	}
 
 	// Network alias: web process gets the app name, others get app-process.
 	if cfg.Process == "web" {
-		args = append(args, "--network-alias", cfg.App)
+		args = append(args, "--network-alias", q(cfg.App))
 	} else {
-		args = append(args, "--network-alias", cfg.App+"-"+cfg.Process)
+		args = append(args, "--network-alias", q(cfg.App+"-"+cfg.Process))
 	}
 
 	// Labels for filtering containers by app, process, and version.
 	args = append(args,
-		"--label", "teploy.app="+cfg.App,
-		"--label", "teploy.process="+cfg.Process,
-		"--label", "teploy.version="+cfg.Version,
+		"--label", q("teploy.app="+cfg.App),
+		"--label", q("teploy.process="+cfg.Process),
+		"--label", q("teploy.version="+cfg.Version),
 	)
 
 	// Port publishing and PORT env var injection.
@@ -115,14 +122,14 @@ func (c *Client) Run(ctx context.Context, cfg RunConfig) (string, error) {
 
 	// Env file on server.
 	if cfg.EnvFile != "" {
-		args = append(args, "--env-file", cfg.EnvFile)
+		args = append(args, "--env-file", q(cfg.EnvFile))
 	}
 
 	// Additional env vars, sorted for deterministic command output.
 	if len(cfg.Env) > 0 {
 		keys := sortedKeys(cfg.Env)
 		for _, k := range keys {
-			args = append(args, "-e", k+"="+cfg.Env[k])
+			args = append(args, "-e", q(k+"="+cfg.Env[k]))
 		}
 	}
 
@@ -130,16 +137,16 @@ func (c *Client) Run(ctx context.Context, cfg RunConfig) (string, error) {
 	if len(cfg.Volumes) > 0 {
 		keys := sortedKeys(cfg.Volumes)
 		for _, k := range keys {
-			args = append(args, "-v", k+":"+cfg.Volumes[k])
+			args = append(args, "-v", q(k+":"+cfg.Volumes[k]))
 		}
 	}
 
 	// Resource limits.
 	if cfg.Memory != "" {
-		args = append(args, "--memory", cfg.Memory)
+		args = append(args, "--memory", q(cfg.Memory))
 	}
 	if cfg.CPU != "" {
-		args = append(args, "--cpus", cfg.CPU)
+		args = append(args, "--cpus", q(cfg.CPU))
 	}
 
 	// Log rotation to prevent disk fill.
@@ -154,9 +161,13 @@ func (c *Client) Run(ctx context.Context, cfg RunConfig) (string, error) {
 	}
 
 	// Image must come after all flags.
-	args = append(args, cfg.Image)
+	args = append(args, q(cfg.Image))
 
-	// Optional command override.
+	// Optional command override. Left RAW (unquoted) on purpose: Cmd is a
+	// command line (e.g. "npm run start"), so the remote shell must word-split
+	// it into the container's argv — quoting it as a single token would make
+	// docker treat the whole string as one non-existent executable. Cmd is
+	// operator-authored config (like a Dockerfile CMD), not external input.
 	if cfg.Cmd != "" {
 		args = append(args, cfg.Cmd)
 	}
@@ -180,12 +191,42 @@ func (c *Client) Stop(ctx context.Context, name string, timeout int) error {
 
 // Exec runs a command inside a running container via docker exec.
 func (c *Client) Exec(ctx context.Context, name, command string) (string, error) {
-	cmd := fmt.Sprintf("docker exec %s sh -c %q", name, command)
+	// Single-quote for the REMOTE shell so it doesn't expand $/backticks before
+	// docker sees the args; the container's `sh -c` then interprets command.
+	// %q (double quotes) would let the remote shell expand the value first.
+	cmd := fmt.Sprintf("docker exec %s sh -c %s", ssh.ShellQuote(name), ssh.ShellQuote(command))
 	output, err := c.exec.Run(ctx, cmd)
 	if err != nil {
 		return output, fmt.Errorf("exec in container %s: %w", name, err)
 	}
 	return output, nil
+}
+
+// ExecStream runs a command inside a running container and streams its
+// stdout/stderr to the given writers in real time. Unlike Exec it doesn't
+// buffer output (suited to long-running commands like migrations) and the
+// returned error carries the command's non-zero exit status. command is run
+// through the container's `sh -c`; both name and command are single-quoted for
+// the remote shell (see Exec).
+func (c *Client) ExecStream(ctx context.Context, name, command string, stdout, stderr io.Writer) error {
+	cmd := fmt.Sprintf("docker exec %s sh -c %s", ssh.ShellQuote(name), ssh.ShellQuote(command))
+	return c.exec.RunStream(ctx, cmd, stdout, stderr)
+}
+
+// RunningContainer returns the name of a running container for the app's given
+// process (e.g. "web"). For a multi-replica process it returns the first
+// replica. Used by `app exec` to pick a target to run a one-off command in.
+func (c *Client) RunningContainer(ctx context.Context, app, process string) (string, error) {
+	containers, err := c.ListContainers(ctx, app)
+	if err != nil {
+		return "", err
+	}
+	for _, ct := range containers {
+		if ct.State == "running" && ct.Labels["teploy.process"] == process {
+			return ct.Name, nil
+		}
+	}
+	return "", fmt.Errorf("no running %q container found for app %q — is it deployed and running?", process, app)
 }
 
 // Start starts a stopped container.
@@ -566,6 +607,19 @@ func (c *Client) EnsureNetwork(ctx context.Context) error {
 
 // FindAvailablePort returns the first unused port in the ephemeral range (49152-65535).
 func (c *Client) FindAvailablePort(ctx context.Context) (int, error) {
+	return c.FindAvailablePortExcluding(ctx, nil)
+}
+
+// FindAvailablePortExcluding returns the first port in the ephemeral range
+// (49152-65535) that is neither currently listening nor in the claimed set.
+//
+// Multi-replica deploys allocate every replica's port up front, before any
+// container starts — and `ss -tln` only reports ports that are actually bound.
+// Without excluding the ports already handed out this round, every replica gets
+// the same first-free port and replica 2's `docker run -p` fails with "port is
+// already allocated", aborting the whole deploy. Callers in a multi-port loop
+// must pass the ports they've already claimed.
+func (c *Client) FindAvailablePortExcluding(ctx context.Context, claimed map[int]bool) (int, error) {
 	output, err := c.exec.Run(ctx, "ss -tln")
 	if err != nil {
 		return 0, fmt.Errorf("checking listening ports: %w", err)
@@ -573,7 +627,7 @@ func (c *Client) FindAvailablePort(ctx context.Context) (int, error) {
 
 	used := parseListeningPorts(output)
 	for port := 49152; port <= 65535; port++ {
-		if !used[port] {
+		if !used[port] && !claimed[port] {
 			return port, nil
 		}
 	}

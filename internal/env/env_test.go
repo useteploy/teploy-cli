@@ -238,27 +238,27 @@ EMPTY=
 	}
 }
 
-func TestSerializeEnv_QuotesSpecialChars(t *testing.T) {
+func TestSerializeEnv_Verbatim(t *testing.T) {
+	// Values are written exactly as given — no quoting — because the file is
+	// consumed by `docker run --env-file`, which reads everything after '='
+	// literally. Quoting here would corrupt the value the container receives.
 	vars := map[string]string{
-		"SIMPLE":  "value",
-		"SPACED":  "hello world",
-		"DOLLAR":  "price is $5",
+		"SIMPLE":   "value",
+		"SPACED":   "hello world",
+		"DOLLAR":   "price is $5",
 		"SAFE_URL": "postgres://user:pass@host/db",
+		"QUOTED":   `say "hi"`,
 	}
 	output := serializeEnv(vars)
 
-	if !strings.Contains(output, "SIMPLE=value\n") {
-		t.Errorf("expected unquoted simple value, got: %s", output)
+	for k, v := range vars {
+		want := k + "=" + v + "\n"
+		if !strings.Contains(output, want) {
+			t.Errorf("expected verbatim line %q, got:\n%s", want, output)
+		}
 	}
-	if !strings.Contains(output, "SAFE_URL=postgres://user:pass@host/db\n") {
-		t.Errorf("expected unquoted URL, got: %s", output)
-	}
-	// Values with spaces and dollar signs should be quoted.
-	if !strings.Contains(output, `SPACED="hello world"`) {
-		t.Errorf("expected quoted spaced value, got: %s", output)
-	}
-	if !strings.Contains(output, `DOLLAR="price is $5"`) {
-		t.Errorf("expected quoted dollar value, got: %s", output)
+	if strings.Contains(output, `SPACED="hello world"`) {
+		t.Errorf("spaced value must NOT be quoted, got:\n%s", output)
 	}
 }
 

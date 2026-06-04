@@ -33,6 +33,7 @@ func NewRootCmd(version string) *cobra.Command {
 
 	root.AddCommand(newDeployCmd(flags))
 	root.AddCommand(newExecCmd(flags))
+	root.AddCommand(newAppCmd(flags))
 	root.AddCommand(newSetupCmd(flags))
 	root.AddCommand(newAccessoryCmd(flags))
 	root.AddCommand(newEnvCmd(flags))

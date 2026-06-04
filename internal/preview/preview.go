@@ -139,8 +139,18 @@ func (m *Manager) Deploy(ctx context.Context, cfg DeployConfig) error {
 	// dedicated network alias (cfg.App + "-preview-" + sanitized) via
 	// docker.RunConfig.Process, which is what we dial here.
 	routeApp := cfg.App + "-preview-" + sanitized
+	// Caddy dials the upstream over the docker network, so it needs the
+	// container's INTERNAL port, not the host-published port (which is what
+	// `port` is). Passing the host port made Caddy dial a port the container
+	// isn't listening on inside the network, so every preview route 502'd.
+	internalPort, err := m.docker.InternalPort(ctx, containerName)
+	if err != nil {
+		m.docker.Stop(ctx, containerName, 5)
+		m.docker.Remove(ctx, containerName)
+		return fmt.Errorf("inspecting preview container port: %w", err)
+	}
 	// Preview subdomains use Caddy automatic HTTPS (no custom cert).
-	if err := m.caddy.SetRoute(ctx, routeApp, domain, routeApp, port, caddy.TLS{}); err != nil {
+	if err := m.caddy.SetRoute(ctx, routeApp, domain, routeApp, internalPort, caddy.TLS{}); err != nil {
 		// Clean up container on route failure.
 		m.docker.Stop(ctx, containerName, 5)
 		m.docker.Remove(ctx, containerName)

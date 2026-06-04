@@ -43,9 +43,15 @@ func (m *Manager) Get(ctx context.Context, app, key string) (string, error) {
 // Existing keys are updated, new keys are appended.
 // Returns an error if any key is PORT (reserved by teploy).
 func (m *Manager) Set(ctx context.Context, app string, pairs map[string]string) error {
-	for k := range pairs {
+	for k, v := range pairs {
 		if strings.ToUpper(k) == "PORT" {
 			return fmt.Errorf("PORT is reserved — teploy sets it automatically on every container start")
+		}
+		// docker --env-file is a flat KEY=VALUE format with no line
+		// continuation, so a value containing a newline cannot be represented
+		// (it would be read as a second, malformed entry). Reject up front.
+		if strings.ContainsAny(v, "\n\r") {
+			return fmt.Errorf("value for %s contains a newline — docker --env-file cannot represent multi-line values", k)
 		}
 	}
 
@@ -147,7 +153,15 @@ func parseEnv(content string) map[string]string {
 	return vars
 }
 
-// serializeEnv writes a vars map as sorted key=value lines.
+// serializeEnv writes a vars map as sorted key=value lines, VERBATIM.
+//
+// The file is consumed by `docker run --env-file`, which takes everything after
+// the first '=' literally — it does NOT strip surrounding quotes or process
+// escapes. Writing Go %q here (the previous behaviour) meant a value like
+// `hello world` was stored as `KEY="hello world"` and the container received
+// the quotes as part of the value; `env list` (which unquotes on read)
+// disagreed with the running container, and repeated set→list compounded the
+// corruption. So we write the raw value. Newlines are rejected in Set().
 func serializeEnv(vars map[string]string) string {
 	keys := make([]string, 0, len(vars))
 	for k := range vars {
@@ -157,17 +171,15 @@ func serializeEnv(vars map[string]string) string {
 
 	var sb strings.Builder
 	for _, k := range keys {
-		v := vars[k]
-		if needsQuoting(v) {
-			fmt.Fprintf(&sb, "%s=%q\n", k, v)
-		} else {
-			fmt.Fprintf(&sb, "%s=%s\n", k, v)
-		}
+		fmt.Fprintf(&sb, "%s=%s\n", k, vars[k])
 	}
 	return sb.String()
 }
 
-// unquote strips surrounding single or double quotes from a value.
+// unquote strips surrounding single or double quotes from a value. Kept only as
+// a best-effort read of LEGACY env files that were written with the old %q
+// serializer; new files are written verbatim so this is a no-op for them.
+// (Backslash escapes inside an old %q value can't be perfectly recovered.)
 func unquote(s string) string {
 	if len(s) >= 2 {
 		if (s[0] == '"' && s[len(s)-1] == '"') || (s[0] == '\'' && s[len(s)-1] == '\'') {
@@ -175,9 +187,4 @@ func unquote(s string) string {
 		}
 	}
 	return s
-}
-
-// needsQuoting returns true if the value contains spaces, quotes, or special chars.
-func needsQuoting(s string) bool {
-	return strings.ContainsAny(s, " \t\"'\\$`!#&|;(){}[]")
 }

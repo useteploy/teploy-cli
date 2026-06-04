@@ -701,10 +701,10 @@ func TestDeploy_WithWorkers(t *testing.T) {
 	workerRunFound := false
 	for _, call := range mock.Calls {
 		if strings.HasPrefix(call, "docker run") {
-			if strings.Contains(call, "--name myapp-web-abc123") && strings.Contains(call, "npm start") {
+			if strings.Contains(call, "--name 'myapp-web-abc123'") && strings.Contains(call, "npm start") {
 				webRunFound = true
 			}
-			if strings.Contains(call, "--name myapp-worker-abc123") && strings.Contains(call, "npm run worker") {
+			if strings.Contains(call, "--name 'myapp-worker-abc123'") && strings.Contains(call, "npm run worker") {
 				workerRunFound = true
 			}
 		}
@@ -718,7 +718,7 @@ func TestDeploy_WithWorkers(t *testing.T) {
 
 	// Verify worker has no port published.
 	for _, call := range mock.Calls {
-		if strings.Contains(call, "--name myapp-worker-abc123") && strings.Contains(call, "-p ") {
+		if strings.Contains(call, "--name 'myapp-worker-abc123'") && strings.Contains(call, "-p ") {
 			t.Error("worker should not have a published port")
 		}
 	}
@@ -785,10 +785,10 @@ func TestDeploy_NoHealthcheckForWorker(t *testing.T) {
 		if !strings.HasPrefix(call, "docker run") {
 			continue
 		}
-		if strings.Contains(call, "--name myapp-web-abc123") {
+		if strings.Contains(call, "--name 'myapp-web-abc123'") {
 			webCmd = call
 		}
-		if strings.Contains(call, "--name myapp-worker-abc123") {
+		if strings.Contains(call, "--name 'myapp-worker-abc123'") {
 			workerCmd = call
 		}
 	}
@@ -939,7 +939,7 @@ func TestDeploy_AssetBridging(t *testing.T) {
 	// Verify docker run includes asset volume mount.
 	for _, call := range mock.Calls {
 		if strings.HasPrefix(call, "docker run --detach") {
-			if !strings.Contains(call, "-v /deployments/myapp/assets:/app/public/assets") {
+			if !strings.Contains(call, "-v '/deployments/myapp/assets:/app/public/assets'") {
 				t.Errorf("expected asset volume mount in docker run: %s", call)
 			}
 			break

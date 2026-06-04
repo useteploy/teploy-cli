@@ -214,16 +214,37 @@ func (c *Client) SetMaintenance(ctx context.Context, app, domain string) error {
 }
 
 // RemoveMaintenance disables maintenance mode, restoring the stashed route
-// block if one exists.
+// block. It fails safe: a missing stash is a no-op, and a stash that exists but
+// can't be read (or is empty) aborts WITHOUT touching the route — the previous
+// version ignored the read error, so any transient SSH/read failure rendered an
+// empty block and silently deleted the app's route, taking the domain offline.
 func (c *Client) RemoveMaintenance(ctx context.Context, app string) error {
-	return c.mutate(ctx, func(prev string) (string, error) {
-		stash := fmt.Sprintf(maintStashFmt, app)
-		saved, _ := c.exec.Run(ctx, "cat "+stash+" 2>/dev/null")
-		restored := strings.Trim(saved, "\n")
-		out := renderUpdated(prev, app, nil, restored)
-		c.exec.Run(ctx, "rm -f "+stash)
-		return out, nil
-	})
+	stash := fmt.Sprintf(maintStashFmt, app)
+
+	// Missing stash → maintenance isn't active (or was already removed). No-op.
+	// `test -f` so a genuine read error below isn't masked by `cat 2>/dev/null`.
+	if _, err := c.exec.Run(ctx, "test -f "+stash); err != nil {
+		return nil
+	}
+	saved, err := c.exec.Run(ctx, "cat "+stash)
+	if err != nil {
+		return fmt.Errorf("reading stashed maintenance route (route left unchanged): %w", err)
+	}
+	restored := strings.Trim(saved, "\n")
+	if restored == "" {
+		return fmt.Errorf("stashed maintenance route for %s is empty — refusing to remove the route; delete %s manually if this is intended", app, stash)
+	}
+
+	if err := c.mutate(ctx, func(prev string) (string, error) {
+		return renderUpdated(prev, app, nil, restored), nil
+	}); err != nil {
+		return err
+	}
+
+	// Delete the stash only after the reload succeeded, so a failed (rolled
+	// back) reload can be retried.
+	c.exec.Run(ctx, "rm -f "+stash)
+	return nil
 }
 
 // mutate serializes a Caddyfile edit + reload behind the server lock. transform

@@ -2,6 +2,8 @@ package cli
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"os/signal"
@@ -65,6 +67,19 @@ func runAutoDeploySetup(flags *Flags, branch, secret string) error {
 
 	mgr := autodeploy.NewManager(executor, os.Stdout)
 
+	// A secret is mandatory — without it the listener is an open deploy trigger.
+	// Generate one when the user didn't supply --secret, and surface it so they
+	// can configure it in their Git provider's webhook settings.
+	generated := false
+	if secret == "" {
+		buf := make([]byte, 32)
+		if _, err := rand.Read(buf); err != nil {
+			return fmt.Errorf("generating webhook secret: %w", err)
+		}
+		secret = hex.EncodeToString(buf)
+		generated = true
+	}
+
 	cfg := autodeploy.Config{
 		App:    appCfg.App,
 		Branch: branch,
@@ -83,7 +98,9 @@ func runAutoDeploySetup(flags *Flags, branch, secret string) error {
 	fmt.Printf("\nAuto-deploy configured for %s\n", appCfg.App)
 	fmt.Printf("  Webhook URL: https://%s/teploy-webhook/%s\n", appCfg.Domain, appCfg.App)
 	fmt.Printf("  Branch: %s\n", branch)
-	if secret != "" {
+	if generated {
+		fmt.Printf("  Secret (generated — add this to your Git provider's webhook):\n    %s\n", secret)
+	} else {
 		fmt.Printf("  Secret: configured\n")
 	}
 	fmt.Printf("\nAdd this URL to your Git provider's webhook settings (push events only).\n")

@@ -1,13 +1,19 @@
 package cli
 
 import (
+	"archive/tar"
+	"archive/zip"
+	"bytes"
+	"compress/gzip"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"os/exec"
+	"path"
 	"runtime"
 	"strings"
 	"time"
@@ -16,7 +22,7 @@ import (
 )
 
 const (
-	githubRepo   = "teploy/teploy"
+	githubRepo   = "useteploy/teploy"
 	releaseAPI   = "https://api.github.com/repos/" + githubRepo + "/releases/latest"
 	downloadBase = "https://github.com/" + githubRepo + "/releases/download"
 )
@@ -47,7 +53,7 @@ func runUpdate(currentVersion string, force bool) error {
 
 	// Fetch latest release info.
 	fmt.Println("Checking for updates...")
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
 	latest, err := fetchLatestRelease(ctx)
@@ -63,50 +69,78 @@ func runUpdate(currentVersion string, force bool) error {
 		return nil
 	}
 
-	// Determine binary name for this platform.
 	goos := runtime.GOOS
 	goarch := runtime.GOARCH
-	binaryName := fmt.Sprintf("teploy-%s-%s", goos, goarch)
+
+	// goreleaser publishes archives named teploy_{os}_{arch}.tar.gz (zip on
+	// Windows) plus a checksums.txt — not bare per-platform binaries.
+	ext := "tar.gz"
+	binName := "teploy"
 	if goos == "windows" {
-		binaryName += ".exe"
+		ext = "zip"
+		binName = "teploy.exe"
+	}
+	assetName := fmt.Sprintf("teploy_%s_%s.%s", goos, goarch, ext)
+
+	archiveURL := fmt.Sprintf("%s/%s/%s", downloadBase, latest.TagName, assetName)
+	checksumURL := fmt.Sprintf("%s/%s/checksums.txt", downloadBase, latest.TagName)
+
+	// Download the checksum manifest and the archive.
+	fmt.Printf("Downloading %s...\n", assetName)
+	archive, err := downloadToBytes(ctx, archiveURL)
+	if err != nil {
+		return fmt.Errorf("downloading update: %w", err)
+	}
+	checksums, err := downloadToBytes(ctx, checksumURL)
+	if err != nil {
+		return fmt.Errorf("downloading checksums: %w", err)
 	}
 
-	downloadURL := fmt.Sprintf("%s/%s/%s", downloadBase, latest.TagName, binaryName)
-	fmt.Printf("Downloading %s...\n", downloadURL)
+	// Verify the archive against the published checksum before trusting it.
+	want, err := checksumFor(checksums, assetName)
+	if err != nil {
+		return err
+	}
+	got := fmt.Sprintf("%x", sha256.Sum256(archive))
+	if !strings.EqualFold(got, want) {
+		return fmt.Errorf("checksum mismatch for %s — refusing to install (want %s, got %s)", assetName, want, got)
+	}
+	fmt.Println("  Checksum verified")
 
-	// Download to temp file.
+	// Extract the teploy binary from the archive.
+	binData, err := extractBinary(archive, ext, binName)
+	if err != nil {
+		return fmt.Errorf("extracting binary: %w", err)
+	}
+
+	// Write to a temp file, make executable, and sanity-check it runs.
 	tmpFile, err := os.CreateTemp("", "teploy-update-*")
 	if err != nil {
 		return fmt.Errorf("creating temp file: %w", err)
 	}
 	tmpPath := tmpFile.Name()
 	defer os.Remove(tmpPath)
-
-	if err := downloadFile(ctx, downloadURL, tmpFile); err != nil {
+	if _, err := tmpFile.Write(binData); err != nil {
 		tmpFile.Close()
-		return fmt.Errorf("downloading update: %w", err)
+		return fmt.Errorf("writing update: %w", err)
 	}
 	tmpFile.Close()
 
-	// Make executable.
 	if err := os.Chmod(tmpPath, 0755); err != nil {
 		return fmt.Errorf("setting permissions: %w", err)
 	}
 
-	// Verify the downloaded binary works.
 	out, err := exec.Command(tmpPath, "version").Output()
 	if err != nil {
 		return fmt.Errorf("downloaded binary is invalid: %w", err)
 	}
 	fmt.Printf("  Verified: %s", out)
 
-	// Find current binary path.
 	currentBinary, err := os.Executable()
 	if err != nil {
 		return fmt.Errorf("finding current binary: %w", err)
 	}
 
-	// Replace current binary.
 	fmt.Printf("Replacing %s...\n", currentBinary)
 	if err := replaceBinary(tmpPath, currentBinary); err != nil {
 		return fmt.Errorf("replacing binary: %w", err)
@@ -143,25 +177,78 @@ func fetchLatestRelease(ctx context.Context) (*githubRelease, error) {
 	return &release, nil
 }
 
-func downloadFile(ctx context.Context, url string, dest *os.File) error {
+// downloadToBytes fetches url into memory, following the redirect GitHub issues
+// to its asset CDN.
+func downloadToBytes(ctx context.Context, url string) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	req.Header.Set("User-Agent", "teploy-updater")
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
-		return fmt.Errorf("download returned status %d — binary may not exist for %s/%s", resp.StatusCode, runtime.GOOS, runtime.GOARCH)
+		return nil, fmt.Errorf("GET %s returned status %d", url, resp.StatusCode)
+	}
+	return io.ReadAll(resp.Body)
+}
+
+// checksumFor returns the hex sha256 recorded for asset in a goreleaser
+// checksums.txt ("<sha256>  <filename>" per line).
+func checksumFor(checksums []byte, asset string) (string, error) {
+	for _, line := range strings.Split(string(checksums), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 2 && path.Base(fields[1]) == asset {
+			return fields[0], nil
+		}
+	}
+	return "", fmt.Errorf("no checksum entry for %s — refusing to install unverified binary", asset)
+}
+
+// extractBinary pulls binName out of a tar.gz or zip archive held in memory.
+func extractBinary(archive []byte, ext, binName string) ([]byte, error) {
+	if ext == "zip" {
+		zr, err := zip.NewReader(bytes.NewReader(archive), int64(len(archive)))
+		if err != nil {
+			return nil, err
+		}
+		for _, f := range zr.File {
+			if path.Base(f.Name) == binName {
+				rc, err := f.Open()
+				if err != nil {
+					return nil, err
+				}
+				defer rc.Close()
+				return io.ReadAll(rc)
+			}
+		}
+		return nil, fmt.Errorf("%s not found in archive", binName)
 	}
 
-	_, err = io.Copy(dest, resp.Body)
-	return err
+	gz, err := gzip.NewReader(bytes.NewReader(archive))
+	if err != nil {
+		return nil, err
+	}
+	defer gz.Close()
+	tr := tar.NewReader(gz)
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		if path.Base(hdr.Name) == binName {
+			return io.ReadAll(tr)
+		}
+	}
+	return nil, fmt.Errorf("%s not found in archive", binName)
 }
 
 func replaceBinary(src, dst string) error {

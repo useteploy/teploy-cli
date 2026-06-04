@@ -217,6 +217,7 @@ func TestRemoveMaintenance(t *testing.T) {
 	existing := "{\n\tadmin 127.0.0.1:2019\n}\n\n" +
 		"# TEPLOY BEGIN myapp\nmyapp.com {\n\trespond 503\n}\n# TEPLOY END myapp\n"
 	cmds := append(lockCmds(existing),
+		ssh.MockCommand{Match: "test -f " + fmt.Sprintf(maintStashFmt, "myapp"), Output: ""},
 		ssh.MockCommand{Match: "cat " + fmt.Sprintf(maintStashFmt, "myapp"), Output: "myapp.com {\n\treverse_proxy myapp:80\n}"},
 		ssh.MockCommand{Match: "rm -f " + fmt.Sprintf(maintStashFmt, "myapp"), Output: ""},
 	)

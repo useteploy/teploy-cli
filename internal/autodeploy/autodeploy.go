@@ -70,6 +70,13 @@ func (m *Manager) Setup(ctx context.Context, cfg Config) error {
 	if cfg.Branch == "" {
 		cfg.Branch = "main"
 	}
+	// Require a secret. Without one the webhook listener accepts any POST and
+	// becomes an unauthenticated remote deploy trigger. The CLI generates a
+	// random secret when the user doesn't supply one, so an empty secret here
+	// is a programming error, not a user choice.
+	if strings.TrimSpace(cfg.Secret) == "" {
+		return fmt.Errorf("auto-deploy requires a webhook secret (refusing to install an unauthenticated listener)")
+	}
 
 	appDir := fmt.Sprintf("%s/%s", deploymentsDir, cfg.App)
 	scriptPath := fmt.Sprintf("%s/%s", appDir, scriptName)
@@ -306,40 +313,47 @@ echo "$(date -u '+%%Y-%%m-%%dT%%H:%%M:%%SZ') Build complete: ${APP}-build-${VERS
 }
 
 func generateListener(app, secret, scriptPath string) string {
-	secretCheck := ""
-	if secret != "" {
-		// Escape single quotes in the secret to prevent shell injection.
-		escaped := strings.ReplaceAll(secret, "'", "'\\''")
-		secretCheck = fmt.Sprintf(`
-    # Validate webhook secret.
-    SIGNATURE=$(echo "$BODY" | openssl dgst -sha256 -hmac '%s' | awk '{print $2}')
-    EXPECTED="sha256=$SIGNATURE"
-    if [ "$HTTP_X_HUB_SIGNATURE_256" != "$EXPECTED" ]; then
-        echo "HTTP/1.1 403 Forbidden\r\n\r\nInvalid signature"
-        continue
-    fi`, escaped)
-	}
+	// Escape single quotes in the secret for safe embedding in the single-quoted
+	// shell literal below.
+	escaped := strings.ReplaceAll(secret, "'", "'\\''")
 
 	return fmt.Sprintf(`#!/bin/bash
-# Webhook listener for %s
-# Listens on port 9876, validates requests, triggers deploy script
+# Webhook listener for %[1]s
+# Binds 127.0.0.1:9876 (Caddy proxies /teploy-webhook/%[1]s here), verifies the
+# HMAC-SHA256 signature over the request body, then triggers the deploy script.
 
 while true; do
     echo -e "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nok" | \
-    nc -l -p 9876 -q 1 | {
+    nc -l 127.0.0.1 -p 9876 -q 1 | {
         read -r METHOD PATH VERSION
-        BODY=""
+        SIG=""
+        # Capture the signature header, then stop at the blank line before the body.
         while IFS= read -r LINE; do
             LINE=$(echo "$LINE" | tr -d '\r')
             [ -z "$LINE" ] && break
+            case "$LINE" in
+                [Xx]-[Hh]ub-[Ss]ignature-256:*)
+                    SIG=${LINE#*:}
+                    SIG=${SIG# }
+                    ;;
+            esac
         done
         read -r BODY
-%s
+
+        # Verify HMAC-SHA256 over the raw body. printf avoids the trailing
+        # newline echo would add (which would change the digest).
+        SIGNATURE=$(printf '%%s' "$BODY" | openssl dgst -sha256 -hmac '%[2]s' | awk '{print $NF}')
+        EXPECTED="sha256=$SIGNATURE"
+        if [ -z "$SIG" ] || [ "$SIG" != "$EXPECTED" ]; then
+            # Reject silently (200 already sent above; don't reveal validity).
+            continue
+        fi
+
         # Trigger deploy in background.
-        nohup %s >> /deployments/%s/autodeploy.log 2>&1 &
+        nohup %[3]s >> /deployments/%[1]s/autodeploy.log 2>&1 &
     }
 done
-`, app, secretCheck, scriptPath, app)
+`, app, escaped, scriptPath)
 }
 
 // generateScheduledRedeployScript returns the bash script that the cron job

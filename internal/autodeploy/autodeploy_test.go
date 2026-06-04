@@ -64,7 +64,8 @@ func TestSetup_DefaultBranch(t *testing.T) {
 	var buf bytes.Buffer
 	mgr := NewManager(mock, &buf)
 	err := mgr.Setup(context.Background(), Config{
-		App: "myapp",
+		App:    "myapp",
+		Secret: "test-secret",
 	})
 	if err != nil {
 		t.Fatalf("Setup: %v", err)
