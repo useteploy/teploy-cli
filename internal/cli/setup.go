@@ -291,13 +291,15 @@ func setupNetwork(ctx context.Context, exec ssh.Executor, w io.Writer, providerN
 	// so we detach the command and poll from the local machine instead.
 	fmt.Fprintf(w, "Joining %s mesh...\n", providerName)
 	var joinCmd string
+	// Single-quote user-provided mesh credentials (auth keys, login server) so a
+	// value with a shell metacharacter can't break out of the join command.
 	switch providerName {
 	case "tailscale":
-		joinCmd = fmt.Sprintf(sudo+"nohup tailscale up --authkey=%q --accept-routes >/dev/null 2>&1 &", cfg.AuthKey)
+		joinCmd = fmt.Sprintf(sudo+"nohup tailscale up --authkey=%s --accept-routes >/dev/null 2>&1 &", shellQuote(cfg.AuthKey))
 	case "headscale":
-		joinCmd = fmt.Sprintf(sudo+"nohup tailscale up --login-server=%q --authkey=%q --accept-routes >/dev/null 2>&1 &", cfg.Server, cfg.AuthKey)
+		joinCmd = fmt.Sprintf(sudo+"nohup tailscale up --login-server=%s --authkey=%s --accept-routes >/dev/null 2>&1 &", shellQuote(cfg.Server), shellQuote(cfg.AuthKey))
 	case "netbird":
-		joinCmd = fmt.Sprintf(sudo+"nohup netbird up --setup-key %q >/dev/null 2>&1 &", cfg.SetupKey)
+		joinCmd = fmt.Sprintf(sudo+"nohup netbird up --setup-key %s >/dev/null 2>&1 &", shellQuote(cfg.SetupKey))
 	}
 	exec.Run(ctx, joinCmd) // ignore error — connection may die
 

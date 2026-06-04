@@ -85,7 +85,12 @@ func runRegistryLogin(flags *Flags, registry, serverName, username, password str
 		}
 	}
 
-	cmd := fmt.Sprintf("echo %q | docker login %q -u %q --password-stdin", password, registry, username)
+	// Single-quote every value so the remote shell can't expand or execute it.
+	// `echo %q` used double quotes, under which $/backticks in the password (or
+	// registry/username) still expand — a shell-injection running as the SSH
+	// user. printf '%s' emits the password literally to docker --password-stdin.
+	cmd := fmt.Sprintf("printf '%%s' %s | docker login %s -u %s --password-stdin",
+		ssh.ShellQuote(password), ssh.ShellQuote(registry), ssh.ShellQuote(username))
 	if _, err := executor.Run(ctx, cmd); err != nil {
 		return fmt.Errorf("docker login failed: %w", err)
 	}
