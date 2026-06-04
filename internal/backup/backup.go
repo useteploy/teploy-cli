@@ -271,10 +271,17 @@ func (c *Client) SetSchedule(ctx context.Context, schedule, command, marker stri
 	// at all, leaving duplicate cron entries piling up on every reschedule.
 	// Single-quoting via ShellQuote keeps the command's literal $(date …) intact
 	// (cron evaluates it at run time).
-	line := fmt.Sprintf("%s %s # %s", schedule, command, marker)
+	// Bracket the marker so the fixed-string dedup can't collide across apps
+	// whose names are prefixes of one another. grep -vF is an UNanchored
+	// substring match, so a bare marker `teploy-backup:web` would also match
+	// (and wrongly delete) the line for `teploy-backup:web-staging`. The
+	// brackets make the token uniquely terminable: `[teploy-backup:web]` is not
+	// a substring of `[teploy-backup:web-staging]`.
+	tag := "[" + marker + "]"
+	line := fmt.Sprintf("%s %s # %s", schedule, command, tag)
 	cmd := fmt.Sprintf(
 		`(crontab -l 2>/dev/null | grep -vF %s; printf '%%s\n' %s) | crontab -`,
-		ssh.ShellQuote(marker), ssh.ShellQuote(line),
+		ssh.ShellQuote(tag), ssh.ShellQuote(line),
 	)
 	if _, err := c.exec.Run(ctx, cmd); err != nil {
 		return fmt.Errorf("setting cron schedule: %w", err)

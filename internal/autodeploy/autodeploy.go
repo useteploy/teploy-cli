@@ -335,7 +335,10 @@ while true; do
                     ;;
             esac
         done
-        read -r BODY
+        # Read the FULL remaining body (cat, not a single-line read) so the HMAC
+        # is computed over every byte — a pretty-printed / multi-line payload
+        # would otherwise be truncated to its first line and rejected.
+        BODY=$(cat)
 
         # Verify HMAC-SHA256 over the raw body. printf avoids the trailing
         # newline echo would add (which would change the digest).

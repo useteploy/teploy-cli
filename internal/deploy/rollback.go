@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"sort"
 	"time"
 
 	"github.com/useteploy/teploy/internal/caddy"
@@ -97,15 +98,23 @@ func Rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg Rollbac
 		return fmt.Errorf("no previous containers found for version %s — they may have been removed", current.PreviousHash)
 	}
 
-	// 3. Health check on previous port.
+	// 3. Health check every previous replica port (not just the primary), so a
+	// replica that comes back unhealthy after recreation is caught before the
+	// traffic swap — mirrors the deploy path.
 	fmt.Fprintln(out, "Running health check...")
 	deployer := &Deployer{exec: exec, out: out}
-	if err := deployer.healthCheck(ctx, current.PreviousPort, healthCfg); err != nil {
-		// Stop what we started and bail.
-		for _, name := range started {
-			dk.Stop(ctx, name, 5)
+	healthPorts := current.PreviousPorts
+	if len(healthPorts) == 0 {
+		healthPorts = []int{current.PreviousPort}
+	}
+	for _, p := range healthPorts {
+		if err := deployer.healthCheck(ctx, p, healthCfg); err != nil {
+			// Stop what we started and bail.
+			for _, name := range started {
+				dk.Stop(ctx, name, 5)
+			}
+			return fmt.Errorf("health check failed on previous version: %w", err)
 		}
-		return fmt.Errorf("health check failed on previous version: %w", err)
 	}
 	fmt.Fprintln(out, "  Health check passed")
 
@@ -126,15 +135,47 @@ func Rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg Rollbac
 	// container Teploy starts (in this case, the previous one).
 	if cfg.usesCaddy() {
 		fmt.Fprintln(out, "Updating routes...")
-		previousContainer := docker.ContainerName(cfg.App, "web", current.PreviousHash)
-		internalPort, err := dk.InternalPort(ctx, previousContainer)
-		if err != nil {
-			return fmt.Errorf("inspecting previous container port: %w", err)
+		// Resolve the previous web container(s) by the teploy.version label —
+		// the same set started in step 2 — instead of reconstructing a single
+		// non-indexed name. A multi-replica previous version has containers
+		// named <app>-web-<hash>-1/-2, which docker.ContainerName() would miss,
+		// aborting the rollback; and a single SetRoute would send all traffic to
+		// one replica. Mirror the deploy path: load-balance across all replicas.
+		var prevWeb []docker.Container
+		for _, c := range containers {
+			if c.Labels["teploy.version"] == current.PreviousHash && c.Labels["teploy.process"] == "web" {
+				prevWeb = append(prevWeb, c)
+			}
 		}
-		if err := cd.SetRoute(ctx, cfg.App, cfg.Domain, previousContainer, internalPort, caddy.TLS{Cert: cfg.TLSCert, Key: cfg.TLSKey}); err != nil {
-			return fmt.Errorf("updating route: %w", err)
+		sort.Slice(prevWeb, func(i, j int) bool { return prevWeb[i].Name < prevWeb[j].Name })
+		if len(prevWeb) == 0 {
+			return fmt.Errorf("no previous web container found for version %s", current.PreviousHash)
 		}
-		fmt.Fprintln(out, "  Traffic routed to previous version")
+
+		tls := caddy.TLS{Cert: cfg.TLSCert, Key: cfg.TLSKey}
+		if len(prevWeb) > 1 {
+			upstreams := make([]caddy.Upstream, 0, len(prevWeb))
+			for _, c := range prevWeb {
+				port, err := dk.InternalPort(ctx, c.Name)
+				if err != nil {
+					return fmt.Errorf("inspecting previous container port: %w", err)
+				}
+				upstreams = append(upstreams, caddy.Upstream{Dial: fmt.Sprintf("%s:%d", c.Name, port)})
+			}
+			if err := cd.SetLoadBalancer(ctx, cfg.App, cfg.Domain, upstreams, tls); err != nil {
+				return fmt.Errorf("updating load balancer route: %w", err)
+			}
+			fmt.Fprintf(out, "  Traffic load-balanced across %d replicas\n", len(prevWeb))
+		} else {
+			port, err := dk.InternalPort(ctx, prevWeb[0].Name)
+			if err != nil {
+				return fmt.Errorf("inspecting previous container port: %w", err)
+			}
+			if err := cd.SetRoute(ctx, cfg.App, cfg.Domain, prevWeb[0].Name, port, tls); err != nil {
+				return fmt.Errorf("updating route: %w", err)
+			}
+			fmt.Fprintln(out, "  Traffic routed to previous version")
+		}
 	} else {
 		fmt.Fprintf(out, "Skipping Caddy route restore (ingress: %s)\n", cfg.Ingress)
 	}

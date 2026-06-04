@@ -80,7 +80,7 @@ func newAccessoryExecCmd(flags *Flags) *cobra.Command {
 		Short: "Run a command in an accessory container",
 		Long: "Run a one-off command in an accessory's running container — e.g. a query\n" +
 			"against a database accessory. The command runs via the container's shell, and a\n" +
-			"non-zero exit is propagated.\n\n" +
+			"non-zero exit reports failure.\n\n" +
 			"Examples:\n" +
 			"  teploy accessory exec db -- psql -U postgres -c 'SELECT 1'\n" +
 			"  teploy accessory exec cache -- redis-cli INFO",

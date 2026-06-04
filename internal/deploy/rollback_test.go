@@ -24,8 +24,8 @@ func TestRollback(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "cat /deployments/myapp/state", Output: stateContent},
 		ssh.MockCommand{Match: "docker ps --all --filter label=teploy.app=myapp",
-			Output: `{"ID":"aaa","Names":"myapp-web-v1","Image":"myapp:latest","State":"exited","Status":"Exited","Labels":"teploy.app=myapp,teploy.version=v1"}` + "\n" +
-				`{"ID":"bbb","Names":"myapp-web-v2","Image":"myapp:latest","State":"running","Status":"Up 1h","Labels":"teploy.app=myapp,teploy.version=v2"}`,
+			Output: `{"ID":"aaa","Names":"myapp-web-v1","Image":"myapp:latest","State":"exited","Status":"Exited","Labels":"teploy.app=myapp,teploy.version=v1,teploy.process=web"}` + "\n" +
+				`{"ID":"bbb","Names":"myapp-web-v2","Image":"myapp:latest","State":"running","Status":"Up 1h","Labels":"teploy.app=myapp,teploy.version=v2,teploy.process=web"}`,
 		},
 		// rollback uses Restart (inspect → rm -f → docker run) instead of bare
 		// `docker start` so HostConfig.PortBindings actually re-apply on Docker 29.
@@ -154,7 +154,7 @@ func TestRollback_NoPreviousContainers(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "cat /deployments/myapp/state", Output: stateContent},
 		ssh.MockCommand{Match: "docker ps --all --filter label=teploy.app=myapp",
-			Output: `{"ID":"bbb","Names":"myapp-web-v2","Image":"myapp:latest","State":"running","Status":"Up 1h","Labels":"teploy.app=myapp,teploy.version=v2"}`,
+			Output: `{"ID":"bbb","Names":"myapp-web-v2","Image":"myapp:latest","State":"running","Status":"Up 1h","Labels":"teploy.app=myapp,teploy.version=v2,teploy.process=web"}`,
 		},
 	)
 
@@ -172,8 +172,8 @@ func TestRollback_HealthCheckFails(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "cat /deployments/myapp/state", Output: stateContent},
 		ssh.MockCommand{Match: "docker ps --all --filter label=teploy.app=myapp",
-			Output: `{"ID":"aaa","Names":"myapp-web-v1","Image":"myapp:latest","State":"exited","Status":"Exited","Labels":"teploy.app=myapp,teploy.version=v1"}` + "\n" +
-				`{"ID":"bbb","Names":"myapp-web-v2","Image":"myapp:latest","State":"running","Status":"Up 1h","Labels":"teploy.app=myapp,teploy.version=v2"}`,
+			Output: `{"ID":"aaa","Names":"myapp-web-v1","Image":"myapp:latest","State":"exited","Status":"Exited","Labels":"teploy.app=myapp,teploy.version=v1,teploy.process=web"}` + "\n" +
+				`{"ID":"bbb","Names":"myapp-web-v2","Image":"myapp:latest","State":"running","Status":"Up 1h","Labels":"teploy.app=myapp,teploy.version=v2,teploy.process=web"}`,
 		},
 		// Restart (inspect → rm -f → docker run).
 		ssh.MockCommand{Match: "docker inspect myapp-web-v1", Output: `[{"Config":{"Image":"myapp:latest","Labels":{"teploy.app":"myapp"}},"HostConfig":{"NetworkMode":"teploy","PortBindings":{"3000/tcp":[{"HostIp":"127.0.0.1","HostPort":"49152"}]},"RestartPolicy":{"Name":"no"}},"NetworkSettings":{"Networks":{"teploy":{"Aliases":["myapp"]}}}}]`},
@@ -192,5 +192,66 @@ func TestRollback_HealthCheckFails(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "health check failed") {
 		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+// Rolling back TO a multi-replica previous version must start every previous
+// replica, health-check each, and restore a LOAD-BALANCED route across them —
+// not abort on a reconstructed single name or route to just one replica.
+func TestRollback_MultiReplica(t *testing.T) {
+	stateContent := "current_port=49153\ncurrent_hash=v2\nprevious_port=49152\nprevious_hash=v1\n" +
+		"current_ports=49153,49155\nprevious_ports=49152,49154\n"
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "cat /deployments/myapp/state", Output: stateContent},
+		ssh.MockCommand{Match: "docker ps --all --filter label=teploy.app=myapp",
+			Output: `{"ID":"a1","Names":"myapp-web-v1-1","Image":"myapp:latest","State":"exited","Status":"Exited","Labels":"teploy.app=myapp,teploy.version=v1,teploy.process=web"}` + "\n" +
+				`{"ID":"a2","Names":"myapp-web-v1-2","Image":"myapp:latest","State":"exited","Status":"Exited","Labels":"teploy.app=myapp,teploy.version=v1,teploy.process=web"}` + "\n" +
+				`{"ID":"b1","Names":"myapp-web-v2-1","Image":"myapp:latest","State":"running","Status":"Up 1h","Labels":"teploy.app=myapp,teploy.version=v2,teploy.process=web"}` + "\n" +
+				`{"ID":"b2","Names":"myapp-web-v2-2","Image":"myapp:latest","State":"running","Status":"Up 1h","Labels":"teploy.app=myapp,teploy.version=v2,teploy.process=web"}`,
+		},
+		// Restart (inspect → rm -f → run) for each previous replica; prefix
+		// "docker inspect myapp-web-v1" covers -1 and -2.
+		ssh.MockCommand{Match: "docker inspect myapp-web-v1", Output: `[{"Config":{"Image":"myapp:latest","Labels":{"teploy.app":"myapp"}},"HostConfig":{"NetworkMode":"teploy","PortBindings":{"3000/tcp":[{"HostIp":"127.0.0.1","HostPort":"49152"}]},"RestartPolicy":{"Name":"no"}},"NetworkSettings":{"Networks":{"teploy":{"Aliases":["myapp"]}}}}]`},
+		ssh.MockCommand{Match: "docker rm -f myapp-web-v1", Output: ""},
+		ssh.MockCommand{Match: "docker run", Output: ""},
+		ssh.MockCommand{Match: "curl", Output: "200"},
+		ssh.MockCommand{Match: "docker inspect -f '{{range $p, $_ := .NetworkSettings.Ports}}", Output: "3000/tcp"},
+		ssh.MockCommand{Match: "caddy", Output: ""},
+		ssh.MockCommand{Match: "cat /deployments/caddy/Caddyfile", Output: "{\n\tadmin 0.0.0.0:2019\n}\n"},
+		ssh.MockCommand{Match: "mv /tmp/teploy_caddyfile.tmp", Output: ""},
+		ssh.MockCommand{Match: "mkdir /deployments/caddy/.lock", Output: ""},
+		ssh.MockCommand{Match: "docker exec caddy caddy reload", Output: ""},
+		ssh.MockCommand{Match: "rmdir /deployments/caddy/.lock", Output: ""},
+		ssh.MockCommand{Match: "docker stop", Output: ""},
+		ssh.MockCommand{Match: "printf %s", Output: ""},
+		ssh.MockCommand{Match: "mkdir -p", Output: ""},
+		ssh.MockCommand{Match: "UPLOAD:", Output: ""},
+	)
+
+	var buf bytes.Buffer
+	if err := Rollback(context.Background(), mock, &buf, rollbackCfg()); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	out := buf.String()
+	if !strings.Contains(out, "load-balanced across 2 replicas") {
+		t.Errorf("expected load-balanced rollback route across 2 replicas, got:\n%s", out)
+	}
+	// Both previous replicas must be recreated (not just one).
+	for _, name := range []string{"myapp-web-v1-1", "myapp-web-v1-2"} {
+		found := false
+		for _, c := range mock.Calls {
+			if strings.HasPrefix(c, "docker rm -f "+name) {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("expected previous replica %s to be recreated", name)
+		}
+	}
+	// The Caddyfile written must reference both upstreams.
+	cf := string(mock.Files["/tmp/teploy_caddyfile.tmp"])
+	if !strings.Contains(cf, "myapp-web-v1-1:3000") || !strings.Contains(cf, "myapp-web-v1-2:3000") {
+		t.Errorf("expected both replica upstreams in Caddyfile, got:\n%s", cf)
 	}
 }

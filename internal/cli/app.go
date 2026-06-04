@@ -29,8 +29,8 @@ func newAppExecCmd(flags *Flags) *cobra.Command {
 		Short: "Run a one-off command in the app's running container",
 		Long: "Run a command inside the app's running container — e.g. a database migration,\n" +
 			"a seed, or a maintenance task. The command runs in the existing container (not a\n" +
-			"fresh one), via the container's shell, so pipes and redirects work. A non-zero\n" +
-			"exit from the command is propagated as teploy's exit code.\n\n" +
+			"fresh one), via the container's shell, so pipes and redirects work. teploy\n" +
+			"exits non-zero if the command fails.\n\n" +
 			"Examples:\n" +
 			"  teploy app exec -- bin/rails db:migrate\n" +
 			"  teploy app exec --process worker -- ./manage.py migrate\n" +
