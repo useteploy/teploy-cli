@@ -2,6 +2,7 @@ package state
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -249,7 +250,7 @@ func TestReleaseLock(t *testing.T) {
 
 func TestAppendLog(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
-		ssh.MockCommand{Match: "cat /tmp/teploy_log_entry", Output: ""},
+		ssh.MockCommand{Match: "printf %s", Output: ""},
 	)
 
 	entry := LogEntry{
@@ -264,10 +265,18 @@ func TestAppendLog(t *testing.T) {
 		t.Fatalf("AppendLog: %v", err)
 	}
 
-	// Log entry should be uploaded to temp file.
-	data, ok := mock.Files["/tmp/teploy_log_entry"]
-	if !ok {
-		t.Fatal("log entry not uploaded")
+	// The entry is base64-encoded in a single append command (no staging file).
+	// Decode it back out of the recorded call.
+	var data []byte
+	for _, call := range mock.Calls {
+		if strings.HasPrefix(call, "printf %s ") && strings.Contains(call, "teploy.log") {
+			b64 := strings.TrimSpace(strings.TrimPrefix(strings.SplitN(call, "|", 2)[0], "printf %s "))
+			b64 = strings.Trim(b64, "'")
+			data, _ = base64.StdEncoding.DecodeString(b64)
+		}
+	}
+	if len(data) == 0 {
+		t.Fatal("log entry not written")
 	}
 
 	var parsed LogEntry

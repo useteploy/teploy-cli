@@ -122,7 +122,33 @@ func AddServer(path, name, host, user, role, vpnIP string) error {
 		return fmt.Errorf("reading servers config: %w", err)
 	}
 
-	cfg.Servers[name] = Server{Host: host, User: user, Role: role, VpnIP: vpnIP}
+	// Preserve fields that aren't being changed. AddServer is an upsert, but it
+	// used to replace the whole entry — so re-adding a server (e.g. to change
+	// its host) silently dropped Tags entirely (there's no tags param; tags are
+	// hand-edited in servers.yml) and cleared VpnIP/Role/User. Tags drive
+	// per-host env injection at deploy time, so losing them broke deploys. Keep
+	// existing values; only overwrite an optional field when a new value is given.
+	existing := cfg.Servers[name]
+	merged := Server{
+		Host:  host,
+		User:  user,
+		Role:  role,
+		VpnIP: vpnIP,
+		Tags:  existing.Tags, // settable only via servers.yml — never drop on re-add
+	}
+	if merged.Host == "" {
+		merged.Host = existing.Host
+	}
+	if merged.User == "" {
+		merged.User = existing.User
+	}
+	if merged.Role == "" {
+		merged.Role = existing.Role
+	}
+	if merged.VpnIP == "" {
+		merged.VpnIP = existing.VpnIP
+	}
+	cfg.Servers[name] = merged
 
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return fmt.Errorf("creating config directory: %w", err)

@@ -8,9 +8,23 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/useteploy/teploy/internal/ssh"
 )
+
+// dockerTimeLayout matches docker ps's CreatedAt format, e.g.
+// "2026-05-28 21:33:29 -0700 PDT".
+const dockerTimeLayout = "2006-01-02 15:04:05 -0700 MST"
+
+// parseDockerTime parses a docker CreatedAt timestamp. On failure it returns a
+// far-future time so the caller treats the container as newest (never pruned).
+func parseDockerTime(s string) time.Time {
+	if t, err := time.Parse(dockerTimeLayout, strings.TrimSpace(s)); err == nil {
+		return t
+	}
+	return time.Date(9999, 1, 1, 0, 0, 0, 0, time.UTC)
+}
 
 // Container represents a Docker container as reported by docker ps.
 type Container struct {
@@ -518,7 +532,7 @@ func (c *Client) PruneVersions(ctx context.Context, app string, keep int, protec
 	// timestamp + container names + image names per version. Containers
 	// without the label (e.g. caddy, postgres accessory) are ignored.
 	type vinfo struct {
-		newestCreated  string
+		newestCreated  time.Time
 		containerNames []string
 		images         map[string]struct{}
 	}
@@ -533,8 +547,13 @@ func (c *Client) PruneVersions(ctx context.Context, app string, keep int, protec
 			info = &vinfo{images: map[string]struct{}{}}
 			versions[v] = info
 		}
-		if ct.CreatedAt > info.newestCreated {
-			info.newestCreated = ct.CreatedAt
+		// Compare as instants, not strings. docker's CreatedAt is a localized
+		// timestamp ("2006-01-02 15:04:05 -0700 MST"), so lexicographic ordering
+		// is wrong across timezones / DST. On a parse failure, treat the version
+		// as newest so cleanup never prunes something it can't date.
+		created := parseDockerTime(ct.CreatedAt)
+		if created.After(info.newestCreated) {
+			info.newestCreated = created
 		}
 		info.containerNames = append(info.containerNames, ct.Name)
 		if ct.Image != "" {
@@ -556,7 +575,11 @@ func (c *Client) PruneVersions(ctx context.Context, app string, keep int, protec
 		sorted = append(sorted, entry{v, info})
 	}
 	sort.Slice(sorted, func(i, j int) bool {
-		return sorted[i].info.newestCreated > sorted[j].info.newestCreated
+		if !sorted[i].info.newestCreated.Equal(sorted[j].info.newestCreated) {
+			return sorted[i].info.newestCreated.After(sorted[j].info.newestCreated)
+		}
+		// Deterministic tie-break when timestamps match (or both unparseable).
+		return sorted[i].version > sorted[j].version
 	})
 
 	// Build the protected set: explicit names + top-`keep` by recency.

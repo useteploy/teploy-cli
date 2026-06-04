@@ -3,6 +3,7 @@ package deploy
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -48,7 +49,7 @@ func TestDeploy_FirstDeploy(t *testing.T) {
 		ssh.MockCommand{Match: "docker exec caddy caddy reload", Output: ""},
 		ssh.MockCommand{Match: "rmdir /deployments/caddy/.lock", Output: ""},
 		// 11. Log append.
-		ssh.MockCommand{Match: "cat /tmp/teploy_log_entry", Output: ""},
+		ssh.MockCommand{Match: "printf %s", Output: ""},
 		// 12. Release lock.
 		ssh.MockCommand{Match: "rm -rf /deployments/myapp/.lock", Output: ""},
 	)
@@ -94,7 +95,7 @@ func TestDeploy_FirstDeploy(t *testing.T) {
 	}
 
 	// Verify deploy log was written.
-	logData, ok := mock.Files["/tmp/teploy_log_entry"]
+	logData, ok := logEntryFromCalls(mock)
 	if !ok {
 		t.Fatal("log entry not written")
 	}
@@ -150,7 +151,7 @@ func TestDeploy_UpdateExisting(t *testing.T) {
 		ssh.MockCommand{Match: "docker stop", Output: ""},
 		ssh.MockCommand{Match: "docker rm", Output: ""},
 		// Log and lock release.
-		ssh.MockCommand{Match: "cat /tmp/teploy_log_entry", Output: ""},
+		ssh.MockCommand{Match: "printf %s", Output: ""},
 		ssh.MockCommand{Match: "rm -rf /deployments/myapp/.lock", Output: ""},
 	)
 
@@ -202,7 +203,7 @@ func TestDeploy_HealthCheckFailure(t *testing.T) {
 		ssh.MockCommand{Match: "docker stop", Output: ""},
 		ssh.MockCommand{Match: "docker rm", Output: ""},
 		// Log failure entry.
-		ssh.MockCommand{Match: "cat /tmp/teploy_log_entry", Output: ""},
+		ssh.MockCommand{Match: "printf %s", Output: ""},
 		// Release lock.
 		ssh.MockCommand{Match: "rm -rf /deployments/myapp/.lock", Output: ""},
 	)
@@ -233,7 +234,7 @@ func TestDeploy_HealthCheckFailure(t *testing.T) {
 	}
 
 	// Verify failure was logged.
-	logData := mock.Files["/tmp/teploy_log_entry"]
+	logData, _ := logEntryFromCalls(mock)
 	var logEntry state.LogEntry
 	json.Unmarshal(logData, &logEntry)
 	if logEntry.Success {
@@ -259,7 +260,7 @@ func TestDeploy_ContainerCrash(t *testing.T) {
 		ssh.MockCommand{Match: "docker logs", Output: "OOM killed"},
 		ssh.MockCommand{Match: "docker stop", Output: ""},
 		ssh.MockCommand{Match: "docker rm", Output: ""},
-		ssh.MockCommand{Match: "cat /tmp/teploy_log_entry", Output: ""},
+		ssh.MockCommand{Match: "printf %s", Output: ""},
 		ssh.MockCommand{Match: "rm -rf /deployments/myapp/.lock", Output: ""},
 	)
 
@@ -432,7 +433,7 @@ func TestDeploy_SameVersion(t *testing.T) {
 		// Stop renamed container.
 		ssh.MockCommand{Match: "docker stop", Output: ""},
 		ssh.MockCommand{Match: "docker rm", Output: ""},
-		ssh.MockCommand{Match: "cat /tmp/teploy_log_entry", Output: ""},
+		ssh.MockCommand{Match: "printf %s", Output: ""},
 		ssh.MockCommand{Match: "rm -rf /deployments/myapp/.lock", Output: ""},
 	)
 
@@ -491,7 +492,7 @@ func TestDeploy_WithHooks(t *testing.T) {
 		ssh.MockCommand{Match: "docker exec caddy caddy reload", Output: ""},
 		ssh.MockCommand{Match: "rmdir /deployments/caddy/.lock", Output: ""},
 		// Log and lock.
-		ssh.MockCommand{Match: "cat /tmp/teploy_log_entry", Output: ""},
+		ssh.MockCommand{Match: "printf %s", Output: ""},
 		ssh.MockCommand{Match: "rm -rf /deployments/myapp/.lock", Output: ""},
 	)
 
@@ -548,7 +549,7 @@ func TestDeploy_PreDeployHookFailure(t *testing.T) {
 		ssh.MockCommand{Match: "docker logs", Output: "app started OK"},
 		ssh.MockCommand{Match: "docker stop", Output: ""},
 		ssh.MockCommand{Match: "docker rm", Output: ""},
-		ssh.MockCommand{Match: "cat /tmp/teploy_log_entry", Output: ""},
+		ssh.MockCommand{Match: "printf %s", Output: ""},
 		ssh.MockCommand{Match: "rm -rf /deployments/myapp/.lock", Output: ""},
 	)
 
@@ -581,7 +582,7 @@ func TestDeploy_PreDeployHookFailure(t *testing.T) {
 	}
 
 	// Verify failure was logged.
-	logData := mock.Files["/tmp/teploy_log_entry"]
+	logData, _ := logEntryFromCalls(mock)
 	var logEntry state.LogEntry
 	json.Unmarshal(logData, &logEntry)
 	if logEntry.Success {
@@ -612,7 +613,7 @@ func TestDeploy_PostDeployHookFailure(t *testing.T) {
 		// Post-deploy hook fails.
 		ssh.MockCommand{Match: "docker exec", Output: "cache clear failed", Err: fmt.Errorf("exit status 1")},
 		// Log and lock (deploy still succeeds).
-		ssh.MockCommand{Match: "cat /tmp/teploy_log_entry", Output: ""},
+		ssh.MockCommand{Match: "printf %s", Output: ""},
 		ssh.MockCommand{Match: "rm -rf /deployments/myapp/.lock", Output: ""},
 	)
 
@@ -643,7 +644,7 @@ func TestDeploy_PostDeployHookFailure(t *testing.T) {
 	}
 
 	// Verify success was logged.
-	logData := mock.Files["/tmp/teploy_log_entry"]
+	logData, _ := logEntryFromCalls(mock)
 	var logEntry state.LogEntry
 	json.Unmarshal(logData, &logEntry)
 	if !logEntry.Success {
@@ -674,7 +675,7 @@ func TestDeploy_WithWorkers(t *testing.T) {
 		ssh.MockCommand{Match: "docker exec caddy caddy reload", Output: ""},
 		ssh.MockCommand{Match: "rmdir /deployments/caddy/.lock", Output: ""},
 		// Log and lock.
-		ssh.MockCommand{Match: "cat /tmp/teploy_log_entry", Output: ""},
+		ssh.MockCommand{Match: "printf %s", Output: ""},
 		ssh.MockCommand{Match: "rm -rf /deployments/myapp/.lock", Output: ""},
 	)
 
@@ -755,7 +756,7 @@ func TestDeploy_NoHealthcheckForWorker(t *testing.T) {
 		ssh.MockCommand{Match: "mkdir /deployments/caddy/.lock", Output: ""},
 		ssh.MockCommand{Match: "docker exec caddy caddy reload", Output: ""},
 		ssh.MockCommand{Match: "rmdir /deployments/caddy/.lock", Output: ""},
-		ssh.MockCommand{Match: "cat /tmp/teploy_log_entry", Output: ""},
+		ssh.MockCommand{Match: "printf %s", Output: ""},
 		ssh.MockCommand{Match: "rm -rf /deployments/myapp/.lock", Output: ""},
 	)
 
@@ -845,7 +846,7 @@ func TestDeploy_WorkerStartFailure(t *testing.T) {
 		ssh.MockCommand{Match: "docker stop", Output: ""},
 		ssh.MockCommand{Match: "docker rm", Output: ""},
 		// Log and lock.
-		ssh.MockCommand{Match: "cat /tmp/teploy_log_entry", Output: ""},
+		ssh.MockCommand{Match: "printf %s", Output: ""},
 		ssh.MockCommand{Match: "rm -rf /deployments/myapp/.lock", Output: ""},
 	)
 
@@ -909,7 +910,7 @@ func TestDeploy_AssetBridging(t *testing.T) {
 		// 10. Asset cleanup.
 		ssh.MockCommand{Match: "find /deployments/myapp/assets", Output: ""},
 		// 11. Log and lock.
-		ssh.MockCommand{Match: "cat /tmp/teploy_log_entry", Output: ""},
+		ssh.MockCommand{Match: "printf %s", Output: ""},
 		ssh.MockCommand{Match: "rm -rf /deployments/myapp/.lock", Output: ""},
 	)
 
@@ -990,7 +991,7 @@ func TestDeploy_AssetBridgingCustomKeepDays(t *testing.T) {
 		ssh.MockCommand{Match: "docker exec caddy caddy reload", Output: ""},
 		ssh.MockCommand{Match: "rmdir /deployments/caddy/.lock", Output: ""},
 		ssh.MockCommand{Match: "find /deployments/myapp/assets", Output: ""},
-		ssh.MockCommand{Match: "cat /tmp/teploy_log_entry", Output: ""},
+		ssh.MockCommand{Match: "printf %s", Output: ""},
 		ssh.MockCommand{Match: "rm -rf /deployments/myapp/.lock", Output: ""},
 	)
 
@@ -1046,7 +1047,7 @@ func TestDeploy_SameVersionWithWorkers(t *testing.T) {
 		ssh.MockCommand{Match: "docker stop", Output: ""},
 		ssh.MockCommand{Match: "docker rm", Output: ""},
 		// Log and lock.
-		ssh.MockCommand{Match: "cat /tmp/teploy_log_entry", Output: ""},
+		ssh.MockCommand{Match: "printf %s", Output: ""},
 		ssh.MockCommand{Match: "rm -rf /deployments/myapp/.lock", Output: ""},
 	)
 
@@ -1112,7 +1113,7 @@ func TestDeploy_IngressExternalSkipsCaddy(t *testing.T) {
 		ssh.MockCommand{Match: "docker inspect -f", Output: "running"},
 		ssh.MockCommand{Match: "curl -s -o /dev/null", Output: "200"},
 		// No Caddy mocks — the deploy must not call them.
-		ssh.MockCommand{Match: "cat /tmp/teploy_log_entry", Output: ""},
+		ssh.MockCommand{Match: "printf %s", Output: ""},
 		ssh.MockCommand{Match: "rm -rf /deployments/myapp/.lock", Output: ""},
 	)
 
@@ -1146,4 +1147,30 @@ func TestDeploy_IngressExternalSkipsCaddy(t *testing.T) {
 	if !strings.Contains(buf.String(), "Skipping Caddy route update") {
 		t.Errorf("expected skip message in output, got:\n%s", buf.String())
 	}
+}
+
+// logEntryFromCalls extracts the JSON log line that AppendLog appends. AppendLog
+// runs `printf %s '<base64>' | base64 -d >> .../teploy.log` (no staging file),
+// so the entry is decoded from the recorded command rather than mock.Files.
+func logEntryFromCalls(mock *ssh.MockExecutor) ([]byte, bool) {
+	for _, call := range mock.Calls {
+		if !strings.HasPrefix(call, "printf %s ") || !strings.Contains(call, "teploy.log") {
+			continue
+		}
+		open := strings.IndexByte(call, '\'')
+		if open < 0 {
+			continue
+		}
+		rest := call[open+1:]
+		end := strings.IndexByte(rest, '\'')
+		if end < 0 {
+			continue
+		}
+		data, err := base64.StdEncoding.DecodeString(rest[:end])
+		if err != nil {
+			continue
+		}
+		return data, true
+	}
+	return nil, false
 }

@@ -355,7 +355,7 @@ func runAccessoryBackup(flags *Flags, name, bucket, region, schedule string) err
 
 	if schedule != "" {
 		backupCmd := fmt.Sprintf("teploy accessory backup %s --bucket %s --region %s", name, bucket, region)
-		if err := client.SetSchedule(ctx, schedule, backupCmd); err != nil {
+		if err := client.SetSchedule(ctx, schedule, backupCmd, "teploy-accessory-backup:"+appCfg.App+":"+name); err != nil {
 			return err
 		}
 		fmt.Printf("Scheduled backup: %s\n", schedule)

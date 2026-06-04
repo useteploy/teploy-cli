@@ -104,12 +104,20 @@ func (m *Manager) List(ctx context.Context, app string) ([]Entry, error) {
 	return entries, nil
 }
 
-// readEnv reads and parses the env file from the server.
-// Returns an empty map if the file doesn't exist.
+// readEnv reads and parses the env file from the server. A missing file yields
+// an empty map; a transport/exec failure is returned as an error.
+//
+// The previous form (`cat … 2>/dev/null`, treating any error as empty) could
+// not tell "file doesn't exist" from "couldn't reach the server" — so a
+// transient SSH failure during Set/Unset would return an empty map, and the
+// subsequent writeEnv would overwrite the real env file with nothing. The
+// `test -f` guard exits 0 for both present and absent files, so a non-nil error
+// now means a genuine failure and the caller (Set/Unset) aborts before writing.
 func (m *Manager) readEnv(ctx context.Context, app string) (map[string]string, error) {
-	output, err := m.exec.Run(ctx, "cat "+envPath(app)+" 2>/dev/null")
-	if err != nil || strings.TrimSpace(output) == "" {
-		return make(map[string]string), nil
+	path := envPath(app)
+	output, err := m.exec.Run(ctx, fmt.Sprintf("if test -f %s; then cat %s; fi", path, path))
+	if err != nil {
+		return nil, fmt.Errorf("reading env file: %w", err)
 	}
 	return parseEnv(output), nil
 }

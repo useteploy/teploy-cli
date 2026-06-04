@@ -141,7 +141,10 @@ func NewClient(exec ssh.Executor) *Client {
 // common when adopting a server that previously ran another proxy — it is
 // replaced, so Teploy's block becomes the single authority for the domain.
 func (c *Client) SetRoute(ctx context.Context, app, domain, upstream string, containerPort int, tls TLS) error {
-	hosts := parseDomains(domain)
+	hosts, err := parseDomains(domain)
+	if err != nil {
+		return err
+	}
 	if len(hosts) == 0 {
 		return fmt.Errorf("SetRoute: domain must be non-empty")
 	}
@@ -152,7 +155,10 @@ func (c *Client) SetRoute(ctx context.Context, app, domain, upstream string, con
 // for the domain is distributed across upstreams via round-robin with active
 // /up health checks. Replaces any prior route block for the same app.
 func (c *Client) SetLoadBalancer(ctx context.Context, app, domain string, upstreams []Upstream, tls TLS) error {
-	hosts := parseDomains(domain)
+	hosts, err := parseDomains(domain)
+	if err != nil {
+		return err
+	}
 	if len(hosts) == 0 {
 		return fmt.Errorf("SetLoadBalancer: domain must be non-empty")
 	}
@@ -161,7 +167,10 @@ func (c *Client) SetLoadBalancer(ctx context.Context, app, domain string, upstre
 
 // SetStaticRoute upserts a Caddyfile block that serves a static deploy.
 func (c *Client) SetStaticRoute(ctx context.Context, app, domain string, opts StaticBlockOpts) error {
-	hosts := parseDomains(domain)
+	hosts, err := parseDomains(domain)
+	if err != nil {
+		return err
+	}
 	if len(hosts) == 0 {
 		return fmt.Errorf("SetStaticRoute: domain must be non-empty")
 	}
@@ -196,7 +205,10 @@ p{color:#666}
 // maintenance page. The app's current route block is stashed so it can be
 // restored by RemoveMaintenance without a redeploy.
 func (c *Client) SetMaintenance(ctx context.Context, app, domain string) error {
-	hosts := parseDomains(domain)
+	hosts, err := parseDomains(domain)
+	if err != nil {
+		return err
+	}
 	if len(hosts) == 0 {
 		return fmt.Errorf("SetMaintenance: domain must be non-empty")
 	}
@@ -474,15 +486,27 @@ func removeCaddyfileBlock(content, begin, end string) string {
 
 // parseDomains splits a Teploy config "domain" field into a normalized host
 // list, tolerating comma-separated entries with incidental whitespace.
-func parseDomains(domain string) []string {
+// parseDomains splits a comma-separated domain list and rejects any entry
+// containing a character that would break out of a Caddyfile site address
+// (whitespace, newline, braces, comment hash, quote, backslash). This is a
+// defense-in-depth denylist at the sink: config-time validation already runs
+// the strict validDomain regex, but routes can also arrive from callers that
+// bypass it. A denylist (rather than re-applying the strict allowlist) blocks
+// injection without rejecting legitimate wildcard or host:port site addresses.
+func parseDomains(domain string) ([]string, error) {
 	parts := strings.Split(domain, ",")
 	hosts := make([]string, 0, len(parts))
 	for _, p := range parts {
-		if h := strings.TrimSpace(p); h != "" {
-			hosts = append(hosts, h)
+		h := strings.TrimSpace(p)
+		if h == "" {
+			continue
 		}
+		if strings.ContainsAny(h, " \t\r\n{}#\"\\") {
+			return nil, fmt.Errorf("invalid domain %q: contains characters not allowed in a Caddy site address", h)
+		}
+		hosts = append(hosts, h)
 	}
-	return hosts
+	return hosts, nil
 }
 
 // reverseProxyBlock renders a Caddyfile reverse-proxy site block.

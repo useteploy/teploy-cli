@@ -244,7 +244,7 @@ func runBackupSchedule(flags *Flags, schedule, bucket, region string) error {
 	)
 
 	client := backup.NewClient(executor, os.Stdout)
-	if err := client.SetSchedule(ctx, schedule, backupCmd); err != nil {
+	if err := client.SetSchedule(ctx, schedule, backupCmd, "teploy-backup:"+appCfg.App); err != nil {
 		return err
 	}
 

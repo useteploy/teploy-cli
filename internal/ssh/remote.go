@@ -128,6 +128,10 @@ func (e *RemoteExecutor) RunStream(ctx context.Context, cmd string, stdout, stde
 	case <-ctx.Done():
 		_ = session.Signal(ssh.SIGTERM)
 		_ = session.Close()
+		// Wait for session.Run to actually return before we do — otherwise the
+		// goroutine can keep writing to the caller's stdout/stderr after
+		// RunStream has returned (a data race on those writers).
+		<-done
 		return ctx.Err()
 	}
 }

@@ -2,6 +2,7 @@ package autodeploy
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"strings"
@@ -138,21 +139,17 @@ func (m *Manager) SetupCaddyRoute(ctx context.Context, app, domain string) error
 		"handle": [{"handler": "reverse_proxy", "upstreams": [{"dial": "localhost:9876"}]}]
 	}`, app, domain, app)
 
-	uploadPath := "/tmp/teploy_webhook_route.json"
-	if err := m.exec.Upload(ctx, strings.NewReader(webhookRoute), uploadPath, "0644"); err != nil {
-		return fmt.Errorf("uploading webhook route: %w", err)
-	}
-
-	// Try to add the route to existing Caddy config.
+	// Pipe the route JSON straight into curl over stdin instead of staging it in
+	// a fixed /tmp file that concurrent setups would clobber. base64 keeps the
+	// JSON shell-safe through the remote shell.
+	encoded := base64.StdEncoding.EncodeToString([]byte(webhookRoute))
 	cmd := fmt.Sprintf(
-		"curl -sf -X POST http://localhost:2019/config/apps/http/servers/srv0/routes -H 'Content-Type: application/json' -d @%s",
-		uploadPath,
+		"printf %%s %s | base64 -d | curl -sf -X POST http://localhost:2019/config/apps/http/servers/srv0/routes -H 'Content-Type: application/json' -d @-",
+		ssh.ShellQuote(encoded),
 	)
 	if _, err := m.exec.Run(ctx, cmd); err != nil {
 		return fmt.Errorf("adding Caddy webhook route: %w", err)
 	}
-
-	m.exec.Run(ctx, "rm -f "+uploadPath)
 	return nil
 }
 

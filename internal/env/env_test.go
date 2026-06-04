@@ -2,7 +2,6 @@ package env
 
 import (
 	"context"
-	"fmt"
 	"strings"
 	"testing"
 
@@ -11,7 +10,7 @@ import (
 
 func TestSet_NewFile(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
-		ssh.MockCommand{Match: "cat /deployments/myapp/.env", Err: fmt.Errorf("no such file")},
+		ssh.MockCommand{Match: "if test -f /deployments/myapp/.env", Output: ""},
 		ssh.MockCommand{Match: "mkdir -p", Output: ""},
 		ssh.MockCommand{Match: "chown", Output: ""},
 	)
@@ -48,7 +47,7 @@ func TestSet_NewFile(t *testing.T) {
 
 func TestSet_UpdateExisting(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
-		ssh.MockCommand{Match: "cat /deployments/myapp/.env", Output: "DB_HOST=old\nAPI_KEY=secret\n"},
+		ssh.MockCommand{Match: "if test -f /deployments/myapp/.env", Output: "DB_HOST=old\nAPI_KEY=secret\n"},
 		ssh.MockCommand{Match: "mkdir -p", Output: ""},
 		ssh.MockCommand{Match: "chown", Output: ""},
 	)
@@ -95,7 +94,7 @@ func TestSet_RejectsPortCaseInsensitive(t *testing.T) {
 
 func TestGet(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
-		ssh.MockCommand{Match: "cat /deployments/myapp/.env", Output: "DB_HOST=localhost\nDB_PORT=5432\n"},
+		ssh.MockCommand{Match: "if test -f /deployments/myapp/.env", Output: "DB_HOST=localhost\nDB_PORT=5432\n"},
 	)
 
 	mgr := NewManager(mock)
@@ -110,7 +109,7 @@ func TestGet(t *testing.T) {
 
 func TestGet_NotSet(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
-		ssh.MockCommand{Match: "cat /deployments/myapp/.env", Output: "DB_HOST=localhost\n"},
+		ssh.MockCommand{Match: "if test -f /deployments/myapp/.env", Output: "DB_HOST=localhost\n"},
 	)
 
 	mgr := NewManager(mock)
@@ -125,7 +124,7 @@ func TestGet_NotSet(t *testing.T) {
 
 func TestGet_EmptyFile(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
-		ssh.MockCommand{Match: "cat /deployments/myapp/.env", Err: fmt.Errorf("no such file")},
+		ssh.MockCommand{Match: "if test -f /deployments/myapp/.env", Output: ""},
 	)
 
 	mgr := NewManager(mock)
@@ -137,7 +136,7 @@ func TestGet_EmptyFile(t *testing.T) {
 
 func TestUnset(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
-		ssh.MockCommand{Match: "cat /deployments/myapp/.env", Output: "DB_HOST=localhost\nDB_PORT=5432\n"},
+		ssh.MockCommand{Match: "if test -f /deployments/myapp/.env", Output: "DB_HOST=localhost\nDB_PORT=5432\n"},
 		ssh.MockCommand{Match: "mkdir -p", Output: ""},
 		ssh.MockCommand{Match: "chown", Output: ""},
 	)
@@ -159,7 +158,7 @@ func TestUnset(t *testing.T) {
 
 func TestUnset_NotSet(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
-		ssh.MockCommand{Match: "cat /deployments/myapp/.env", Output: "DB_HOST=localhost\n"},
+		ssh.MockCommand{Match: "if test -f /deployments/myapp/.env", Output: "DB_HOST=localhost\n"},
 	)
 
 	mgr := NewManager(mock)
@@ -171,7 +170,7 @@ func TestUnset_NotSet(t *testing.T) {
 
 func TestList(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
-		ssh.MockCommand{Match: "cat /deployments/myapp/.env", Output: "Z_KEY=last\nA_KEY=first\nM_KEY=middle\n"},
+		ssh.MockCommand{Match: "if test -f /deployments/myapp/.env", Output: "Z_KEY=last\nA_KEY=first\nM_KEY=middle\n"},
 	)
 
 	mgr := NewManager(mock)
@@ -198,7 +197,7 @@ func TestList(t *testing.T) {
 
 func TestList_Empty(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
-		ssh.MockCommand{Match: "cat /deployments/myapp/.env", Err: fmt.Errorf("no such file")},
+		ssh.MockCommand{Match: "if test -f /deployments/myapp/.env", Output: ""},
 	)
 
 	mgr := NewManager(mock)

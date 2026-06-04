@@ -140,14 +140,13 @@ func TestStop_LogsAction(t *testing.T) {
 	lc := NewLifecycle(mock, &bytes.Buffer{})
 	lc.Stop(context.Background(), "myapp", 10)
 
-	// Verify a log entry was uploaded.
-	for path, data := range mock.Files {
-		if strings.Contains(path, "teploy_log") {
-			var entry map[string]interface{}
-			if err := json.Unmarshal(data, &entry); err == nil {
-				if entry["type"] == "stop" && entry["app"] == "myapp" {
-					return // found it
-				}
+	// Verify a log entry was written.
+	data, ok := logEntryFromCalls(mock)
+	if ok {
+		var entry map[string]interface{}
+		if err := json.Unmarshal(data, &entry); err == nil {
+			if entry["type"] == "stop" && entry["app"] == "myapp" {
+				return // found it
 			}
 		}
 	}

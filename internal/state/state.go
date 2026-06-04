@@ -3,6 +3,7 @@ package state
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"strconv"
@@ -207,11 +208,13 @@ func AppendLog(ctx context.Context, exec ssh.Executor, entry LogEntry) error {
 	}
 	line = append(line, '\n')
 
-	tmpPath := "/tmp/teploy_log_entry"
-	if err := exec.Upload(ctx, bytes.NewReader(line), tmpPath, "0644"); err != nil {
-		return fmt.Errorf("uploading log entry: %w", err)
-	}
-	if _, err := exec.Run(ctx, fmt.Sprintf("cat %s >> %s/teploy.log && rm -f %s", tmpPath, deploymentsDir, tmpPath)); err != nil {
+	// Append in a single command rather than staging through a fixed
+	// /tmp/teploy_log_entry that concurrent deploys (different apps) would
+	// clobber. base64 keeps the JSON shell-safe; a single >> append below
+	// PIPE_BUF is atomic on POSIX, so interleaved appends don't corrupt lines.
+	encoded := base64.StdEncoding.EncodeToString(line)
+	cmd := fmt.Sprintf("printf %%s %s | base64 -d >> %s/teploy.log", ssh.ShellQuote(encoded), deploymentsDir)
+	if _, err := exec.Run(ctx, cmd); err != nil {
 		return fmt.Errorf("appending log entry: %w", err)
 	}
 	return nil

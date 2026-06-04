@@ -404,6 +404,9 @@ func mergeConfigs(base, overlay *AppConfig) {
 	if overlay.KeepVersions != 0 {
 		base.KeepVersions = overlay.KeepVersions
 	}
+	if overlay.Replicas != 0 {
+		base.Replicas = overlay.Replicas
+	}
 	if overlay.Hooks.PreDeploy != "" {
 		base.Hooks.PreDeploy = overlay.Hooks.PreDeploy
 	}

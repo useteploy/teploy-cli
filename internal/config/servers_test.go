@@ -683,3 +683,43 @@ func TestLoadApp_ValidAppNames(t *testing.T) {
 		}
 	}
 }
+
+// AddServer must not lose tags/vpn_ip that were set in servers.yml when a server
+// is re-added (e.g. to change its host) — that data drives per-host env
+// injection and mesh routing, and dropping it silently broke deploys.
+func TestAddServer_PreservesTagsAndVpnIP(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "servers.yml")
+
+	// Seed a server with tags + vpn_ip (as if hand-edited in yaml).
+	seed := "servers:\n  prod:\n    host: 1.2.3.4\n    user: deploy\n    role: app\n    vpn_ip: 100.64.0.1\n    tags:\n      region: us-east\n"
+	if err := os.WriteFile(path, []byte(seed), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Re-add to change only the host, with empty user/role/vpnIP.
+	if err := AddServer(path, "prod", "5.6.7.8", "", "", ""); err != nil {
+		t.Fatalf("AddServer: %v", err)
+	}
+
+	cfg, err := LoadServers(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := cfg.Servers["prod"]
+	if s.Host != "5.6.7.8" {
+		t.Errorf("host should update, got %q", s.Host)
+	}
+	if s.User != "deploy" {
+		t.Errorf("user should be preserved, got %q", s.User)
+	}
+	if s.Role != "app" {
+		t.Errorf("role should be preserved, got %q", s.Role)
+	}
+	if s.VpnIP != "100.64.0.1" {
+		t.Errorf("vpn_ip should be preserved, got %q", s.VpnIP)
+	}
+	if s.Tags["region"] != "us-east" {
+		t.Errorf("tags should be preserved, got %v", s.Tags)
+	}
+}

@@ -261,12 +261,20 @@ func (c *Client) AccessoryRestore(ctx context.Context, app, name, image, date st
 	return nil
 }
 
-// SetSchedule creates a cron job for scheduled backups.
-func (c *Client) SetSchedule(ctx context.Context, schedule, command string) error {
-	// Add or replace cron entry.
+// SetSchedule creates (or replaces) a cron job for scheduled backups. marker is
+// a stable per-target tag (e.g. "teploy-backup:<app>") appended as a trailing
+// comment so the entry can be found and replaced on reschedule.
+func (c *Client) SetSchedule(ctx context.Context, schedule, command, marker string) error {
+	// Dedup on the marker with grep -vF (fixed string). The previous grep -v
+	// matched the whole COMMAND as a regex — backup commands are full of regex
+	// metacharacters (. * $ ( ) /), so the dedup matched the wrong lines or none
+	// at all, leaving duplicate cron entries piling up on every reschedule.
+	// Single-quoting via ShellQuote keeps the command's literal $(date …) intact
+	// (cron evaluates it at run time).
+	line := fmt.Sprintf("%s %s # %s", schedule, command, marker)
 	cmd := fmt.Sprintf(
-		`(crontab -l 2>/dev/null | grep -v '%s'; echo '%s %s') | crontab -`,
-		command, schedule, command,
+		`(crontab -l 2>/dev/null | grep -vF %s; printf '%%s\n' %s) | crontab -`,
+		ssh.ShellQuote(marker), ssh.ShellQuote(line),
 	)
 	if _, err := c.exec.Run(ctx, cmd); err != nil {
 		return fmt.Errorf("setting cron schedule: %w", err)

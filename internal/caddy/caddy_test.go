@@ -374,7 +374,11 @@ func TestParseDomains(t *testing.T) {
 		{",,,", nil},
 	}
 	for _, tt := range tests {
-		got := parseDomains(tt.in)
+		got, err := parseDomains(tt.in)
+		if err != nil {
+			t.Errorf("parseDomains(%q) unexpected error: %v", tt.in, err)
+			continue
+		}
 		if len(got) != len(tt.want) {
 			t.Errorf("parseDomains(%q) = %v, want %v", tt.in, got, tt.want)
 			continue
@@ -383,6 +387,13 @@ func TestParseDomains(t *testing.T) {
 			if got[i] != tt.want[i] {
 				t.Errorf("parseDomains(%q)[%d] = %q, want %q", tt.in, i, got[i], tt.want[i])
 			}
+		}
+	}
+
+	// Injection attempts must be rejected.
+	for _, bad := range []string{"ex ample.com", "evil.com {\n}", "a.com#c", "a\nb", `a"b`} {
+		if _, err := parseDomains(bad); err == nil {
+			t.Errorf("parseDomains(%q) should have rejected a Caddyfile-breaking character", bad)
 		}
 	}
 }
