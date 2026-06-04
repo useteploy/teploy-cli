@@ -4,6 +4,9 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+### Removed
+- The embedded `teploy ui` web dashboard (`internal/ui/`) has been removed. It was an unauthenticated, localhost HTTP/WebSocket server that duplicated a strict subset of **teploy-dash** — the dedicated dashboard product (separate repo, real auth, monitoring, its own releases). Maintaining a second, weaker dashboard inside a CLI whose identity is "single binary, no management server" was a standing security surface (no auth/CSRF/Origin checks) and a maintenance/drift tax. The CLI is now a pure deploy engine; use teploy-dash for a dashboard (it runs as a single binary too, including locally).
+
 ### Added
 - `teploy app exec [--process web] -- <cmd>` — run a one-off command inside the app's running container (resolved by the `teploy.version` label): database migrations, seeds, rake/`manage.py` tasks, etc. Runs in the existing container via its shell, streams output, and propagates the command's exit code. Works from an app directory or with `--app`+`--host`. `teploy exec` remains server-level (raw SSH); this is the container-level counterpart.
 - `teploy accessory exec <name> -- <cmd>` — the same for an accessory container, e.g. `accessory exec db -- psql -U postgres -c 'SELECT 1'` or `accessory exec cache -- redis-cli INFO`. (An interactive REPL variant — `console`/`db` — was considered but deferred; it requires PTY handling that can't be unit-tested cleanly. Non-interactive queries are covered by this command.)

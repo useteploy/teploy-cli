@@ -170,10 +170,10 @@ teploy status                             # show running containers
 teploy stats                              # CPU/RAM per container
 teploy health                             # run health check on live app
 teploy log                                # deploy history
-teploy exec <cmd>                         # run command on server
+teploy exec <server> <cmd>                # run a command on the server (SSH)
+teploy app exec -- <cmd>                  # run a command in the app container (migrations, etc.)
 teploy validate                           # check config and server readiness
 teploy scale <count>                      # multi-server deploy + LB update
-teploy ui                                 # launch local dashboard
 teploy version / update                   # version info and self-update
 ```
 
