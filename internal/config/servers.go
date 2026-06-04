@@ -10,12 +10,16 @@ import (
 )
 
 // Server represents a single server entry in servers.yml.
+//
+// JSON tags are explicit (lowercase) so `server list --json` emits keys that
+// consumers — notably the teploy-dash frontend, which is case-sensitive — can
+// read. Without them Go would emit capitalized field names (Host/User/…).
 type Server struct {
-	Host  string            `yaml:"host"`
-	User  string            `yaml:"user,omitempty"`   // default: root
-	Role  string            `yaml:"role,omitempty"`   // app, lb, or empty (single-server)
-	Tags  map[string]string `yaml:"tags,omitempty"`   // per-host env vars injected during deploy
-	VpnIP string            `yaml:"vpn_ip,omitempty"` // VPN mesh IP (tailscale, headscale, netbird)
+	Host  string            `yaml:"host" json:"host"`
+	User  string            `yaml:"user,omitempty" json:"user,omitempty"`     // default: root
+	Role  string            `yaml:"role,omitempty" json:"role,omitempty"`     // app, lb, or empty (single-server)
+	Tags  map[string]string `yaml:"tags,omitempty" json:"tags,omitempty"`     // per-host env vars injected during deploy
+	VpnIP string            `yaml:"vpn_ip,omitempty" json:"vpn_ip,omitempty"` // VPN mesh IP (tailscale, headscale, netbird)
 }
 
 // ServersConfig is the top-level structure of ~/.teploy/servers.yml.
