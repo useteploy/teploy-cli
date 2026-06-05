@@ -319,24 +319,12 @@ func (c *Client) mutate(ctx context.Context, transform func(prev string) (string
 // single file (mount Destination == containerCaddyfile) rather than mounting
 // its directory (/etc/caddy). A single-file bind mount pins the container to
 // the file's inode at create time, so an atomic rename (tmp + mv) swaps in a
-// new inode the container never observes. Mirrors the detection in
-// cli/setup.go. On inspect failure it returns false (the modern directory-mount
-// default); verifyDelivered is the backstop if that guess is wrong.
-func (c *Client) singleFileMount(ctx context.Context) bool {
-	out, err := c.exec.Run(ctx, fmt.Sprintf(
-		"docker inspect -f '{{range .Mounts}}{{.Destination}} {{end}}' %s", caddyContainer))
-	if err != nil {
-		return false
-	}
-	return strings.Contains(out, containerCaddyfile)
-}
-
 // verifyDelivered checks that the caddy container's view of the Caddyfile
 // matches the file Teploy wrote on the host, comparing checksums on each side
 // in a single command. A mismatch means the write never reached the running
-// container (the legacy single-file-mount inode-pinning bug). A failure to run
-// the check at all is not treated as fatal — the primary single-file handling
-// in writeCaddyfile already ran; this is defense in depth.
+// container — in practice a legacy single-file bind mount pinning a stale
+// inode. A failure to run the check at all is not treated as fatal (older shell
+// etc.); this is a safety net, not the primary path.
 func (c *Client) verifyDelivered(ctx context.Context) error {
 	check := fmt.Sprintf(
 		"[ \"$(docker exec %s md5sum %s 2>/dev/null | cut -d' ' -f1)\" = \"$(md5sum %s 2>/dev/null | cut -d' ' -f1)\" ] && echo %s || echo %s",
@@ -347,11 +335,12 @@ func (c *Client) verifyDelivered(ctx context.Context) error {
 	}
 	if !strings.Contains(out, deliveredOK) {
 		return fmt.Errorf(
-			"caddy reloaded but the container's %s still does not match the config Teploy wrote — "+
-				"the write did not reach the running container (legacy single-file bind mount with a "+
-				"pinned/diverged inode). The deploy was aborted before stopping the old container, so the "+
-				"site keeps serving. Durable fix: recreate caddy with the directory mount "+
-				"`-v /deployments/caddy:/etc/caddy` (reattach any extra networks)",
+			"caddy reloaded but the container's %s does not match the config Teploy wrote — "+
+				"the write did not reach the running container (legacy single-file Caddyfile bind mount "+
+				"pinning a stale inode). The deploy was aborted before stopping the old container, so the "+
+				"site keeps serving. Fix: recreate the caddy container with the directory mount "+
+				"`-v /deployments/caddy:/etc/caddy` (keep its other volumes/networks); the on-disk "+
+				"Caddyfile is preserved as-is, so no routes are lost",
 			containerCaddyfile)
 	}
 	return nil
@@ -386,35 +375,19 @@ func renderUpdated(prev, app string, hosts []string, block string) string {
 	return strings.TrimRight(updated, "\n") + "\n"
 }
 
-// writeCaddyfile persists the Caddyfile so the running caddy container sees it
-// on the next reload. On a directory-mounted caddy (the modern default) it
-// writes atomically via a temp file + rename: the container resolves the file
-// by path on each reload, so the swapped-in inode is picked up.
+// writeCaddyfile persists the Caddyfile atomically via a temp file + rename. The
+// caddy container is mounted with the directory (-v /deployments/caddy:/etc/caddy,
+// see cli/setup.go), so it resolves the file by path on each reload and picks up
+// the swapped-in inode.
 //
-// On a legacy single-file bind mount, Docker pins the container to the file's
-// inode at create time. A host-side write does not reach the container once a
-// prior tmp+mv deploy diverged the host path onto a new inode — the running
-// container still reads its original, now host-unreachable inode (verified on
-// the OVH box: host file and container file ended up as two different inodes).
-// So write THROUGH the container to that pinned inode via `docker exec` — what
-// `caddy reload` actually reads — then sync the host file so a future container
-// recreate/restart stays consistent. This heals an already-diverged box without
-// recreating the container.
+// Teploy deliberately does NOT special-case the legacy single-file Caddyfile
+// bind mount here. That mount pins the container to one inode (so atomic renames
+// never reach it) AND can't expose /etc/caddy/tls for custom certs — it's an
+// anti-pattern new setups never create. Writing around the pin would only let a
+// broken box limp along; the correct fix is to recreate caddy with the directory
+// mount (-v /deployments/caddy:/etc/caddy). verifyDelivered catches an
+// un-migrated box and aborts the deploy loudly before any damage.
 func (c *Client) writeCaddyfile(ctx context.Context, content string) error {
-	if c.singleFileMount(ctx) {
-		if err := c.exec.Upload(ctx, strings.NewReader(content), tmpCaddyfile, "0644"); err != nil {
-			return fmt.Errorf("staging caddyfile: %w", err)
-		}
-		into := fmt.Sprintf("docker exec -i %s sh -c 'cat > %s' < %s", caddyContainer, containerCaddyfile, tmpCaddyfile)
-		if _, err := c.exec.Run(ctx, into); err != nil {
-			return fmt.Errorf("writing caddyfile into the caddy container: %w", err)
-		}
-		if _, err := c.exec.Run(ctx, "cp "+tmpCaddyfile+" "+caddyfilePath); err != nil {
-			return fmt.Errorf("syncing caddyfile to host: %w", err)
-		}
-		c.exec.Run(ctx, "rm -f "+tmpCaddyfile)
-		return nil
-	}
 	if err := c.exec.Upload(ctx, strings.NewReader(content), tmpCaddyfile, "0644"); err != nil {
 		return fmt.Errorf("uploading caddyfile: %w", err)
 	}
