@@ -15,10 +15,22 @@ const (
 	markerBeginFmt = "# TEPLOY BEGIN %s"
 	markerEndFmt   = "# TEPLOY END %s"
 
+	// caddyContainer is the fixed name Teploy gives the front proxy (see
+	// cli/setup.go). containerCaddyfile is where the Caddyfile is mounted
+	// inside it — the path `caddy reload` reads.
+	caddyContainer     = "caddy"
+	containerCaddyfile = "/etc/caddy/Caddyfile"
+
 	// reloadCmd hot-reloads Caddy from the on-disk Caddyfile (zero-downtime).
 	// Run inside the container so it reaches Caddy's admin API on the
 	// container's loopback — the admin API is never exposed off-box.
 	reloadCmd = "docker exec caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile"
+
+	// deliveredOK / deliveredStale are sentinels echoed by the post-reload
+	// delivery check (verifyDelivered) so we can tell a config that actually
+	// reached the running container from a stale-inode divergence.
+	deliveredOK    = "TEPLOY_CADDY_OK"
+	deliveredStale = "TEPLOY_CADDY_STALE"
 
 	// lockDir serializes Caddyfile edits + reloads so concurrent deploys of
 	// different apps to the same server can't clobber the shared file.
@@ -292,6 +304,54 @@ func (c *Client) mutate(ctx context.Context, transform func(prev string) (string
 		}
 		return fmt.Errorf("caddy reload failed, rolled back: %w", err)
 	}
+	// Confirm the running container actually sees the config we just wrote.
+	// A legacy single-file Caddyfile bind mount pins the container to a stale
+	// inode, so `reload` can "succeed" against an old file while serving stale
+	// routes — a silent 502 once the old app container stops. Fail loudly here
+	// (the deploy aborts before the old container is torn down) instead.
+	if err := c.verifyDelivered(ctx); err != nil {
+		return err
+	}
+	return nil
+}
+
+// singleFileMount reports whether the caddy container binds the Caddyfile as a
+// single file (mount Destination == containerCaddyfile) rather than mounting
+// its directory (/etc/caddy). A single-file bind mount pins the container to
+// the file's inode at create time, so an atomic rename (tmp + mv) swaps in a
+// new inode the container never observes. Mirrors the detection in
+// cli/setup.go. On inspect failure it returns false (the modern directory-mount
+// default); verifyDelivered is the backstop if that guess is wrong.
+func (c *Client) singleFileMount(ctx context.Context) bool {
+	out, err := c.exec.Run(ctx, fmt.Sprintf(
+		"docker inspect -f '{{range .Mounts}}{{.Destination}} {{end}}' %s", caddyContainer))
+	if err != nil {
+		return false
+	}
+	return strings.Contains(out, containerCaddyfile)
+}
+
+// verifyDelivered checks that the caddy container's view of the Caddyfile
+// matches the file Teploy wrote on the host, comparing checksums on each side
+// in a single command. A mismatch means the write never reached the running
+// container (the legacy single-file-mount inode-pinning bug). A failure to run
+// the check at all is not treated as fatal — the primary single-file handling
+// in writeCaddyfile already ran; this is defense in depth.
+func (c *Client) verifyDelivered(ctx context.Context) error {
+	check := fmt.Sprintf(
+		"[ \"$(docker exec %s md5sum %s 2>/dev/null | cut -d' ' -f1)\" = \"$(md5sum %s 2>/dev/null | cut -d' ' -f1)\" ] && echo %s || echo %s",
+		caddyContainer, containerCaddyfile, caddyfilePath, deliveredOK, deliveredStale)
+	out, err := c.exec.Run(ctx, check)
+	if err != nil {
+		return nil
+	}
+	if !strings.Contains(out, deliveredOK) {
+		return fmt.Errorf(
+			"caddy reloaded but the container's %s does not match the config Teploy wrote to %s — "+
+				"the caddy container is likely using a legacy single-file bind mount that pins a stale inode; "+
+				"run `teploy setup` to migrate it to the directory mount",
+			containerCaddyfile, caddyfilePath)
+	}
 	return nil
 }
 
@@ -324,7 +384,22 @@ func renderUpdated(prev, app string, hosts []string, block string) string {
 	return strings.TrimRight(updated, "\n") + "\n"
 }
 
+// writeCaddyfile persists the Caddyfile so the running caddy container sees it
+// on the next reload. On a directory-mounted caddy (the modern default) it
+// writes atomically via a temp file + rename: the container resolves the file
+// by path on each reload, so the swapped-in inode is picked up. On a legacy
+// single-file bind mount, that rename would swap an inode the pinned container
+// can never see (silent-502 bug), so it writes in place instead — Upload's
+// `cat > path` truncates the existing inode, the only write such a container
+// observes. The atomicity trade-off is moot there: caddy reads the file only on
+// the explicit reload Teploy triggers after the write completes.
 func (c *Client) writeCaddyfile(ctx context.Context, content string) error {
+	if c.singleFileMount(ctx) {
+		if err := c.exec.Upload(ctx, strings.NewReader(content), caddyfilePath, "0644"); err != nil {
+			return fmt.Errorf("writing caddyfile in place: %w", err)
+		}
+		return nil
+	}
 	if err := c.exec.Upload(ctx, strings.NewReader(content), tmpCaddyfile, "0644"); err != nil {
 		return fmt.Errorf("uploading caddyfile: %w", err)
 	}

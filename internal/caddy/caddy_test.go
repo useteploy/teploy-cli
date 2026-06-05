@@ -17,8 +17,12 @@ func lockCmds(caddyfile string) []ssh.MockCommand {
 	return []ssh.MockCommand{
 		{Match: "mkdir " + lockDir, Output: ""},
 		{Match: "cat " + caddyfilePath, Output: caddyfile},
+		// Default: a directory-mounted caddy (modern setup) → atomic tmp+mv.
+		{Match: "docker inspect -f '{{range .Mounts}}{{.Destination}} {{end}}' caddy", Output: "/data /config /etc/caddy "},
 		{Match: "mv " + tmpCaddyfile, Output: ""},
 		{Match: reloadCmd, Output: ""},
+		// Post-reload delivery check: container's file matches what we wrote.
+		{Match: "[ \"$(docker exec caddy md5sum", Output: deliveredOK},
 		{Match: "rmdir " + lockDir, Output: ""},
 	}
 }
@@ -121,6 +125,7 @@ func TestSetRoute_ReloadFailureRollsBack(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "mkdir " + lockDir, Output: ""},
 		ssh.MockCommand{Match: "cat " + caddyfilePath, Output: initial},
+		ssh.MockCommand{Match: "docker inspect -f '{{range .Mounts}}{{.Destination}} {{end}}' caddy", Output: "/data /config /etc/caddy "},
 		ssh.MockCommand{Match: "mv " + tmpCaddyfile, Output: ""},
 		// First reload (new config) fails; rollback reload then succeeds.
 		ssh.MockCommand{Match: reloadCmd, Err: fmt.Errorf("invalid config"), Once: true},
@@ -136,6 +141,65 @@ func TestSetRoute_ReloadFailureRollsBack(t *testing.T) {
 	// The last write must restore the original contents (no broken config left on disk).
 	if string(mock.Files[tmpCaddyfile]) != initial {
 		t.Errorf("expected Caddyfile rolled back to original, got:\n%s", mock.Files[tmpCaddyfile])
+	}
+}
+
+// TestSetRoute_SingleFileMount_WritesInPlace covers the legacy single-file
+// Caddyfile bind mount: the write must go in place (preserving the inode the
+// container is pinned to), never through tmp+mv (which swaps in an inode the
+// container can never see — the silent-502 bug).
+func TestSetRoute_SingleFileMount_WritesInPlace(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "mkdir " + lockDir, Output: ""},
+		ssh.MockCommand{Match: "cat " + caddyfilePath, Output: "{\n\tadmin 127.0.0.1:2019\n}\n"},
+		ssh.MockCommand{Match: "docker inspect -f '{{range .Mounts}}{{.Destination}} {{end}}' caddy", Output: "/data /config /etc/caddy/Caddyfile "},
+		ssh.MockCommand{Match: reloadCmd, Output: ""},
+		ssh.MockCommand{Match: "[ \"$(docker exec caddy md5sum", Output: deliveredOK},
+		ssh.MockCommand{Match: "rmdir " + lockDir, Output: ""},
+	)
+
+	client := NewClient(mock)
+	if err := client.SetRoute(context.Background(), "myapp", "myapp.com", "myapp-v1", 80, TLS{}); err != nil {
+		t.Fatalf("SetRoute: %v", err)
+	}
+
+	got := string(mock.Files[caddyfilePath])
+	if !strings.Contains(got, "reverse_proxy myapp-v1:80") {
+		t.Errorf("expected in-place write to %s with the new upstream, got:\n%s", caddyfilePath, got)
+	}
+	if _, wroteTmp := mock.Files[tmpCaddyfile]; wroteTmp {
+		t.Error("single-file mount must not stage the write through the temp file")
+	}
+	if calledWith(mock, "mv "+tmpCaddyfile) {
+		t.Error("single-file mount must not use atomic rename (mv swaps the pinned inode)")
+	}
+}
+
+// TestSetRoute_StaleDeliveryFailsLoudly covers the backstop: detection guesses
+// a directory mount but the container does not actually see the write. The
+// post-reload delivery check must turn that into a hard error (deploy aborts
+// before the old container is torn down) rather than a silent 502.
+func TestSetRoute_StaleDeliveryFailsLoudly(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "mkdir " + lockDir, Output: ""},
+		ssh.MockCommand{Match: "cat " + caddyfilePath, Output: "{\n\tadmin 127.0.0.1:2019\n}\n"},
+		ssh.MockCommand{Match: "docker inspect -f '{{range .Mounts}}{{.Destination}} {{end}}' caddy", Output: "/data /config /etc/caddy "},
+		ssh.MockCommand{Match: "mv " + tmpCaddyfile, Output: ""},
+		ssh.MockCommand{Match: reloadCmd, Output: ""},
+		ssh.MockCommand{Match: "[ \"$(docker exec caddy md5sum", Output: deliveredStale},
+		ssh.MockCommand{Match: "rmdir " + lockDir, Output: ""},
+	)
+
+	client := NewClient(mock)
+	err := client.SetRoute(context.Background(), "myapp", "myapp.com", "myapp-v1", 80, TLS{})
+	if err == nil {
+		t.Fatal("expected SetRoute to fail when the config did not reach the container")
+	}
+	if !strings.Contains(err.Error(), "single-file bind mount") {
+		t.Errorf("expected a stale-delivery error mentioning the mount, got: %v", err)
+	}
+	if !calledWith(mock, "rmdir "+lockDir) {
+		t.Error("expected the caddy lock to be released after a failed delivery check")
 	}
 }
 
