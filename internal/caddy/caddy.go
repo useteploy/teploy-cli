@@ -347,10 +347,12 @@ func (c *Client) verifyDelivered(ctx context.Context) error {
 	}
 	if !strings.Contains(out, deliveredOK) {
 		return fmt.Errorf(
-			"caddy reloaded but the container's %s does not match the config Teploy wrote to %s — "+
-				"the caddy container is likely using a legacy single-file bind mount that pins a stale inode; "+
-				"run `teploy setup` to migrate it to the directory mount",
-			containerCaddyfile, caddyfilePath)
+			"caddy reloaded but the container's %s still does not match the config Teploy wrote — "+
+				"the write did not reach the running container (legacy single-file bind mount with a "+
+				"pinned/diverged inode). The deploy was aborted before stopping the old container, so the "+
+				"site keeps serving. Durable fix: recreate caddy with the directory mount "+
+				"`-v /deployments/caddy:/etc/caddy` (reattach any extra networks)",
+			containerCaddyfile)
 	}
 	return nil
 }
@@ -387,17 +389,30 @@ func renderUpdated(prev, app string, hosts []string, block string) string {
 // writeCaddyfile persists the Caddyfile so the running caddy container sees it
 // on the next reload. On a directory-mounted caddy (the modern default) it
 // writes atomically via a temp file + rename: the container resolves the file
-// by path on each reload, so the swapped-in inode is picked up. On a legacy
-// single-file bind mount, that rename would swap an inode the pinned container
-// can never see (silent-502 bug), so it writes in place instead — Upload's
-// `cat > path` truncates the existing inode, the only write such a container
-// observes. The atomicity trade-off is moot there: caddy reads the file only on
-// the explicit reload Teploy triggers after the write completes.
+// by path on each reload, so the swapped-in inode is picked up.
+//
+// On a legacy single-file bind mount, Docker pins the container to the file's
+// inode at create time. A host-side write does not reach the container once a
+// prior tmp+mv deploy diverged the host path onto a new inode — the running
+// container still reads its original, now host-unreachable inode (verified on
+// the OVH box: host file and container file ended up as two different inodes).
+// So write THROUGH the container to that pinned inode via `docker exec` — what
+// `caddy reload` actually reads — then sync the host file so a future container
+// recreate/restart stays consistent. This heals an already-diverged box without
+// recreating the container.
 func (c *Client) writeCaddyfile(ctx context.Context, content string) error {
 	if c.singleFileMount(ctx) {
-		if err := c.exec.Upload(ctx, strings.NewReader(content), caddyfilePath, "0644"); err != nil {
-			return fmt.Errorf("writing caddyfile in place: %w", err)
+		if err := c.exec.Upload(ctx, strings.NewReader(content), tmpCaddyfile, "0644"); err != nil {
+			return fmt.Errorf("staging caddyfile: %w", err)
 		}
+		into := fmt.Sprintf("docker exec -i %s sh -c 'cat > %s' < %s", caddyContainer, containerCaddyfile, tmpCaddyfile)
+		if _, err := c.exec.Run(ctx, into); err != nil {
+			return fmt.Errorf("writing caddyfile into the caddy container: %w", err)
+		}
+		if _, err := c.exec.Run(ctx, "cp "+tmpCaddyfile+" "+caddyfilePath); err != nil {
+			return fmt.Errorf("syncing caddyfile to host: %w", err)
+		}
+		c.exec.Run(ctx, "rm -f "+tmpCaddyfile)
 		return nil
 	}
 	if err := c.exec.Upload(ctx, strings.NewReader(content), tmpCaddyfile, "0644"); err != nil {

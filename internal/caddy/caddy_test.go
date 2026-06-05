@@ -144,15 +144,19 @@ func TestSetRoute_ReloadFailureRollsBack(t *testing.T) {
 	}
 }
 
-// TestSetRoute_SingleFileMount_WritesInPlace covers the legacy single-file
-// Caddyfile bind mount: the write must go in place (preserving the inode the
-// container is pinned to), never through tmp+mv (which swaps in an inode the
+// TestSetRoute_SingleFileMount_WritesThroughContainer covers the legacy
+// single-file Caddyfile bind mount: the write must go THROUGH the container to
+// its pinned inode via docker exec (so it reaches a box already diverged by a
+// past tmp+mv), never via the atomic rename (which swaps in an inode the pinned
 // container can never see — the silent-502 bug).
-func TestSetRoute_SingleFileMount_WritesInPlace(t *testing.T) {
+func TestSetRoute_SingleFileMount_WritesThroughContainer(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "mkdir " + lockDir, Output: ""},
 		ssh.MockCommand{Match: "cat " + caddyfilePath, Output: "{\n\tadmin 127.0.0.1:2019\n}\n"},
 		ssh.MockCommand{Match: "docker inspect -f '{{range .Mounts}}{{.Destination}} {{end}}' caddy", Output: "/data /config /etc/caddy/Caddyfile "},
+		ssh.MockCommand{Match: "docker exec -i caddy sh -c 'cat > /etc/caddy/Caddyfile' < " + tmpCaddyfile, Output: ""},
+		ssh.MockCommand{Match: "cp " + tmpCaddyfile + " " + caddyfilePath, Output: ""},
+		ssh.MockCommand{Match: "rm -f " + tmpCaddyfile, Output: ""},
 		ssh.MockCommand{Match: reloadCmd, Output: ""},
 		ssh.MockCommand{Match: "[ \"$(docker exec caddy md5sum", Output: deliveredOK},
 		ssh.MockCommand{Match: "rmdir " + lockDir, Output: ""},
@@ -163,12 +167,13 @@ func TestSetRoute_SingleFileMount_WritesInPlace(t *testing.T) {
 		t.Fatalf("SetRoute: %v", err)
 	}
 
-	got := string(mock.Files[caddyfilePath])
+	// The new config is staged to the temp file and piped into the container.
+	got := string(mock.Files[tmpCaddyfile])
 	if !strings.Contains(got, "reverse_proxy myapp-v1:80") {
-		t.Errorf("expected in-place write to %s with the new upstream, got:\n%s", caddyfilePath, got)
+		t.Errorf("expected staged config with the new upstream, got:\n%s", got)
 	}
-	if _, wroteTmp := mock.Files[tmpCaddyfile]; wroteTmp {
-		t.Error("single-file mount must not stage the write through the temp file")
+	if !calledWith(mock, "docker exec -i caddy sh -c 'cat > /etc/caddy/Caddyfile' < "+tmpCaddyfile) {
+		t.Error("single-file mount must write through the container to its pinned inode")
 	}
 	if calledWith(mock, "mv "+tmpCaddyfile) {
 		t.Error("single-file mount must not use atomic rename (mv swaps the pinned inode)")
