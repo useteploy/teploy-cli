@@ -153,6 +153,7 @@ func (s *singleServerDeployer) deployApp(ctx context.Context, appCfg *config.App
 		Volumes:       volumes,
 		Processes:     appCfg.Processes,
 		NoHealthcheck: disabledHealthchecks(appCfg.Healthcheck),
+		Health:        deploy.HealthConfig{Path: appCfg.Health.Path},
 		KeepVersions:  appCfg.KeepVersions,
 		Ingress:       appCfg.Ingress,
 		ContainerPort: appCfg.Port,

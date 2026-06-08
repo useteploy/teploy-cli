@@ -64,6 +64,14 @@ type ProcessHealth struct {
 	Disable bool `yaml:"disable,omitempty" toml:"disable"`
 }
 
+// AppHealthConfig configures the teploy-level deploy health check: the HTTP
+// poll that gates the traffic switch after a deploy. Distinct from the
+// container HEALTHCHECK directive (which is per-process, in Healthcheck map).
+type AppHealthConfig struct {
+	// Path is the URL path polled for a 200 response. Default: "/health".
+	Path string `yaml:"path,omitempty" toml:"path"`
+}
+
 // NotificationChannelConfig represents a single notification channel.
 type NotificationChannelConfig struct {
 	Type   string   `yaml:"type,omitempty" toml:"type"`
@@ -157,6 +165,10 @@ type AppConfig struct {
 	// may reference ${VAR} from the local environment (expanded at deploy
 	// time). Secrets set via `teploy secret` override these key-for-key.
 	Env           map[string]string          `yaml:"env,omitempty" toml:"env"`
+	// Health configures the teploy-level deploy health check (the HTTP poll
+	// that gates traffic switch after a deploy, separate from the container
+	// HEALTHCHECK). Path defaults to "/health" when unset.
+	Health        AppHealthConfig            `yaml:"health,omitempty" toml:"health"`
 	// Healthcheck holds per-process overrides for the container HEALTHCHECK,
 	// keyed by process name. Keys must match a key in Processes. Additive to
 	// the scalar `processes:` schema — does not replace it.
@@ -485,6 +497,9 @@ func mergeConfigs(base, overlay *AppConfig) {
 		for k, v := range overlay.Env {
 			base.Env[k] = v
 		}
+	}
+	if overlay.Health.Path != "" {
+		base.Health.Path = overlay.Health.Path
 	}
 	if len(overlay.Healthcheck) > 0 {
 		if base.Healthcheck == nil {
