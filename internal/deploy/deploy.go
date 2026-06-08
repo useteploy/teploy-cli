@@ -49,6 +49,9 @@ type Config struct {
 	// with its app-name alias and is reachable from cloudflared,
 	// nginx, etc. inside the same network.
 	Ingress string
+	// Bind is the host IP that ingress:host publishes the fixed port on
+	// (default 0.0.0.0 for host ingress). Ignored for caddy/external.
+	Bind          string
 	Memory        string
 	CPU           string
 	ContainerPort int // internal container port (default 80)
@@ -90,8 +93,13 @@ func NewDeployer(exec ssh.Executor, out io.Writer) *Deployer {
 // Flow: lock → start web → health check → start workers → route traffic →
 // write state → stop old containers → log → unlock.
 func (d *Deployer) Deploy(ctx context.Context, cfg Config) error {
-	if cfg.App == "" || cfg.Image == "" || cfg.Version == "" || cfg.Domain == "" {
-		return fmt.Errorf("app, image, version, and domain are required")
+	if cfg.App == "" || cfg.Image == "" || cfg.Version == "" {
+		return fmt.Errorf("app, image, and version are required")
+	}
+	// Caddy/external ingress route by domain; host ingress publishes a raw
+	// port and needs no domain.
+	if cfg.Domain == "" && !cfg.ingressHost() {
+		return fmt.Errorf("domain is required")
 	}
 
 	stopTimeout := cfg.StopTimeout
@@ -108,6 +116,14 @@ func (d *Deployer) Deploy(ctx context.Context, cfg Config) error {
 	replicas := cfg.Replicas
 	if replicas <= 0 {
 		replicas = 1
+	}
+
+	// Host ingress publishes the fixed port directly; default to all
+	// interfaces so it's reachable at IP:port (caddy/external leave this empty
+	// and fall back to the 127.0.0.1 health-check binding in docker.Run).
+	webBindHost := cfg.Bind
+	if cfg.ingressHost() && webBindHost == "" {
+		webBindHost = "0.0.0.0"
 	}
 
 	start := time.Now()
@@ -131,23 +147,34 @@ func (d *Deployer) Deploy(ctx context.Context, cfg Config) error {
 	// 3. Read current state.
 	current, _ := state.Read(ctx, d.exec, cfg.App)
 
-	// 4. Allocate ports for all web replicas. Track the ports claimed so far in
-	// this loop — containers aren't started until step 7, so `ss` can't see
-	// them yet; without excluding already-claimed ports every replica would get
-	// the same one and the second replica's `docker run -p` would collide.
-	fmt.Fprintf(d.out, "Allocating %d port(s)...\n", replicas)
-	ports := make([]int, replicas)
-	claimed := make(map[int]bool, replicas)
-	for i := 0; i < replicas; i++ {
-		port, err := d.docker.FindAvailablePortExcluding(ctx, claimed)
-		if err != nil {
-			return fmt.Errorf("allocating port %d/%d: %w", i+1, replicas, err)
+	// 4. Determine host ports for all web replicas.
+	var ports []int
+	if cfg.ingressHost() {
+		// Host ingress publishes on a FIXED host port (= the container port) so
+		// the app stays reachable at a stable bind:port. A fixed port can't be
+		// blue/green (two containers can't bind it), so host mode recreates:
+		// existing web containers are removed below before the new one starts.
+		ports = []int{cfg.ContainerPort}
+		fmt.Fprintf(d.out, "Publishing on %s:%d (host ingress)...\n", webBindHost, cfg.ContainerPort)
+	} else {
+		// Allocate ephemeral ports for blue/green. Track the ports claimed so
+		// far — containers aren't started until step 6, so `ss` can't see them
+		// yet; without excluding already-claimed ports every replica would get
+		// the same one and the second replica's `docker run -p` would collide.
+		fmt.Fprintf(d.out, "Allocating %d port(s)...\n", replicas)
+		ports = make([]int, replicas)
+		claimed := make(map[int]bool, replicas)
+		for i := 0; i < replicas; i++ {
+			port, err := d.docker.FindAvailablePortExcluding(ctx, claimed)
+			if err != nil {
+				return fmt.Errorf("allocating port %d/%d: %w", i+1, replicas, err)
+			}
+			ports[i] = port
+			claimed[port] = true
 		}
-		ports[i] = port
-		claimed[port] = true
+		fmt.Fprintf(d.out, "  Ports allocated: %v\n", ports)
 	}
 	port := ports[0] // primary port for health check, hooks, etc.
-	fmt.Fprintf(d.out, "  Ports allocated: %v\n", ports)
 
 	// 5. Asset bridging: extract assets from image before starting the container.
 	if cfg.AssetPath != "" {
@@ -195,6 +222,19 @@ func (d *Deployer) Deploy(ctx context.Context, cfg Config) error {
 		}
 	}
 
+	// Host ingress recreates rather than blue/greens: the new container reuses
+	// the old one's fixed host port, so remove existing web containers for this
+	// app first to free it. This is the ~few-seconds downtime window inherent
+	// to a stable single host port.
+	if cfg.ingressHost() {
+		ids, _ := d.exec.Run(ctx, fmt.Sprintf(
+			"docker ps -aq --filter label=teploy.app=%s --filter label=teploy.process=web", cfg.App))
+		for _, id := range strings.Fields(ids) {
+			d.docker.Stop(ctx, id, stopTimeout)
+			d.docker.Remove(ctx, id)
+		}
+	}
+
 	// Track started containers for cleanup on failure.
 	var started []string
 	webContainerNames := make([]string, replicas)
@@ -210,6 +250,7 @@ func (d *Deployer) Deploy(ctx context.Context, cfg Config) error {
 			Version:       cfg.Version,
 			Image:         cfg.Image,
 			Port:          ports[i],
+			BindHost:      webBindHost,
 			ContainerPort: cfg.ContainerPort,
 			EnvFile:       cfg.EnvFile,
 			Env:           cfg.Env,
@@ -475,4 +516,10 @@ func sortedProcessNames(processes map[string]string) []string {
 // turns off all Caddy interactions.
 func (c Config) usesCaddy() bool {
 	return c.Ingress == "" || c.Ingress == "caddy"
+}
+
+// ingressHost reports whether the app publishes directly on a fixed host
+// port (no Caddy, recreate instead of blue/green). See config.IngressHost.
+func (c Config) ingressHost() bool {
+	return c.Ingress == "host"
 }

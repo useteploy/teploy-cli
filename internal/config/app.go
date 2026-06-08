@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -108,9 +109,17 @@ const (
 // on 127.0.0.1 for local health checks and joins the container to the
 // teploy network so the external thing can reach it by its app-name
 // alias.
+//
+// "host" publishes the app directly on a fixed host port at the `bind`
+// address (default 0.0.0.0), with no Caddy and no proxy in front — handy
+// for a private/tailnet box where you reach the app at IP:port. A fixed
+// host port can't be blue/green (two containers can't bind it), so host
+// ingress deploys by recreate (stop old, start new): a few seconds of
+// downtime per deploy in exchange for a stable, directly-reachable port.
 const (
 	IngressCaddy    = "caddy"
 	IngressExternal = "external"
+	IngressHost     = "host"
 )
 
 // AppConfig represents the teploy configuration (yml, yaml, or toml).
@@ -123,6 +132,9 @@ type AppConfig struct {
 	// container with their own ingress (Cloudflare Tunnel, nginx, …) and
 	// Teploy must not touch Caddy for this app. See the Ingress* consts.
 	Ingress       string                     `yaml:"ingress,omitempty" toml:"ingress"`
+	// Bind is the host IP that `ingress: host` publishes the fixed port on
+	// (default 0.0.0.0 — all interfaces). Only valid with ingress: host.
+	Bind          string                     `yaml:"bind,omitempty" toml:"bind"`
 	Server        string                     `yaml:"server,omitempty" toml:"server"`
 	Servers       []string                   `yaml:"servers,omitempty" toml:"servers"`
 	Image         string                     `yaml:"image,omitempty" toml:"image"`
@@ -141,6 +153,10 @@ type AppConfig struct {
 	Hooks         HooksConfig                `yaml:"hooks,omitempty" toml:"hooks"`
 	Volumes       map[string]string          `yaml:"volumes,omitempty" toml:"volumes"`
 	Processes     map[string]string          `yaml:"processes,omitempty" toml:"processes"`
+	// Env are plain environment variables passed to the app container. Values
+	// may reference ${VAR} from the local environment (expanded at deploy
+	// time). Secrets set via `teploy secret` override these key-for-key.
+	Env           map[string]string          `yaml:"env,omitempty" toml:"env"`
 	// Healthcheck holds per-process overrides for the container HEALTHCHECK,
 	// keyed by process name. Keys must match a key in Processes. Additive to
 	// the scalar `processes:` schema — does not replace it.
@@ -186,19 +202,24 @@ func (c *AppConfig) validate() error {
 	if len(c.App) > 63 {
 		return fmt.Errorf("'app' name too long (max 63 chars, got %d)", len(c.App))
 	}
+	// Host ingress publishes a raw port and needs no domain; every other mode
+	// routes by hostname and requires one.
 	if c.Domain == "" {
-		return fmt.Errorf("'domain' is required")
-	}
-	// A single comma-separated list is supported so one app can serve multiple
-	// hosts (e.g. "example.com, www.example.com"). Each entry is validated
-	// independently against the single-host regex.
-	for _, host := range strings.Split(c.Domain, ",") {
-		host = strings.TrimSpace(host)
-		if host == "" {
-			return fmt.Errorf("'domain' contains an empty entry (got %q)", c.Domain)
+		if c.Ingress != IngressHost {
+			return fmt.Errorf("'domain' is required")
 		}
-		if !validDomain.MatchString(host) {
-			return fmt.Errorf("'domain' contains invalid characters (got %q)", c.Domain)
+	} else {
+		// A single comma-separated list is supported so one app can serve
+		// multiple hosts (e.g. "example.com, www.example.com"). Each entry is
+		// validated independently against the single-host regex.
+		for _, host := range strings.Split(c.Domain, ",") {
+			host = strings.TrimSpace(host)
+			if host == "" {
+				return fmt.Errorf("'domain' contains an empty entry (got %q)", c.Domain)
+			}
+			if !validDomain.MatchString(host) {
+				return fmt.Errorf("'domain' contains invalid characters (got %q)", c.Domain)
+			}
 		}
 	}
 	if c.Platform != "" && !validPlatform.MatchString(c.Platform) {
@@ -206,9 +227,33 @@ func (c *AppConfig) validate() error {
 	}
 	// Validate ingress. Empty defaults to "caddy" at consumption time.
 	switch c.Ingress {
-	case "", IngressCaddy, IngressExternal:
+	case "", IngressCaddy, IngressExternal, IngressHost:
 	default:
-		return fmt.Errorf("'ingress' must be one of: caddy, external (got %q)", c.Ingress)
+		return fmt.Errorf("'ingress' must be one of: caddy, external, host (got %q)", c.Ingress)
+	}
+	// 'bind' is meaningful only for ingress: host.
+	if c.Bind != "" {
+		if c.Ingress != IngressHost {
+			return fmt.Errorf("'bind' only applies to 'ingress: host'")
+		}
+		if net.ParseIP(c.Bind) == nil {
+			return fmt.Errorf("'bind' must be a valid IP address (e.g. 0.0.0.0 or 127.0.0.1), got %q", c.Bind)
+		}
+	}
+	// ingress: host publishes on a fixed host port via recreate.
+	if c.Ingress == IngressHost {
+		if c.Type == TypeStatic {
+			return fmt.Errorf("'ingress: host' is not supported for type:static (static deploys require Caddy)")
+		}
+		if c.Port <= 0 {
+			return fmt.Errorf("'ingress: host' requires 'port' (the fixed host port to publish on)")
+		}
+		if c.Replicas > 1 {
+			return fmt.Errorf("'ingress: host' supports a single replica (a fixed host port can't be load-balanced across containers)")
+		}
+		if c.TLS != nil {
+			return fmt.Errorf("'tls' has no effect with 'ingress: host' — terminate TLS in front of the published port")
+		}
 	}
 	// Validate deploy type and its required fields. Empty type means container.
 	switch c.Type {
@@ -386,6 +431,9 @@ func mergeConfigs(base, overlay *AppConfig) {
 	if overlay.Ingress != "" {
 		base.Ingress = overlay.Ingress
 	}
+	if overlay.Bind != "" {
+		base.Bind = overlay.Bind
+	}
 	if overlay.Port != 0 {
 		base.Port = overlay.Port
 	}
@@ -428,6 +476,14 @@ func mergeConfigs(base, overlay *AppConfig) {
 		}
 		for k, v := range overlay.Processes {
 			base.Processes[k] = v
+		}
+	}
+	if len(overlay.Env) > 0 {
+		if base.Env == nil {
+			base.Env = map[string]string{}
+		}
+		for k, v := range overlay.Env {
+			base.Env[k] = v
 		}
 	}
 	if len(overlay.Healthcheck) > 0 {

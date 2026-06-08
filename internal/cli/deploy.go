@@ -272,7 +272,9 @@ func deployAppConfig(flags *Flags, appCfg *config.AppConfig, serverName, image, 
 	}
 
 	// 8. DNS validation (first deploy only).
-	if !skipDNSCheck {
+	// Host ingress has no domain to validate (it publishes a raw port), and
+	// neither do domain-less external setups — skip the DNS check for them.
+	if !skipDNSCheck && appCfg.Domain != "" && appCfg.Ingress != config.IngressHost {
 		current, _ := state.Read(ctx, executor, appCfg.App)
 		if current == nil {
 			fmt.Println("Validating DNS...")
@@ -367,6 +369,18 @@ func deployAppConfig(flags *Flags, appCfg *config.AppConfig, serverName, image, 
 		fmt.Println("  TLS certificate uploaded")
 	}
 
+	// Container env: the teploy.yml `env:` block (with ${VAR} expanded from the
+	// local environment), then decrypted secrets layered on top so a `teploy
+	// secret` always wins over a plaintext default. Both are passed as -e args,
+	// which override the server-side --env-file (EnvFile) at runtime.
+	containerEnv := make(map[string]string, len(appCfg.Env)+len(deploySecrets))
+	for k, v := range appCfg.Env {
+		containerEnv[k] = os.Expand(v, os.Getenv)
+	}
+	for k, v := range deploySecrets {
+		containerEnv[k] = v
+	}
+
 	// 11. Deploy.
 	deployer := deploy.NewDeployer(executor, os.Stdout)
 	deployCfg := deploy.Config{
@@ -375,12 +389,13 @@ func deployAppConfig(flags *Flags, appCfg *config.AppConfig, serverName, image, 
 		Image:         image,
 		Version:       version,
 		EnvFile:       envFile,
-		Env:           deploySecrets,
+		Env:           containerEnv,
 		Volumes:       volumes,
 		Processes:     appCfg.Processes,
 		NoHealthcheck: disabledHealthchecks(appCfg.Healthcheck),
 		KeepVersions:  appCfg.KeepVersions,
 		Ingress:       appCfg.Ingress,
+		Bind:          appCfg.Bind,
 		ContainerPort: appCfg.Port,
 		StopTimeout:   appCfg.StopTimeout,
 		Replicas:      appCfg.Replicas,

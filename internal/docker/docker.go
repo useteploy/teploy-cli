@@ -44,6 +44,7 @@ type RunConfig struct {
 	Version       string            // short git hash (required)
 	Image         string            // Docker image (required)
 	Port          int               // host port for external access
+	BindHost      string            // host IP to publish the port on (default 127.0.0.1)
 	ContainerPort int               // port the app listens on inside the container (default 80)
 	EnvFile       string            // path to env file on the server
 	Env           map[string]string // additional env vars
@@ -125,13 +126,18 @@ func (c *Client) Run(ctx context.Context, cfg RunConfig) (string, error) {
 			containerPort = 80
 		}
 		cPortStr := strconv.Itoa(containerPort)
-		// Bind the published port to localhost only. Caddy reaches the
+		// Default: bind the published port to localhost only. Caddy reaches the
 		// container over the teploy network via its network alias (see
 		// InternalPort), so this host mapping exists solely for local health
 		// checks. Publishing on 0.0.0.0 would expose the app directly on a
 		// high port — bypassing Caddy/TLS, and Docker bypasses UFW — so we
-		// restrict it to 127.0.0.1.
-		args = append(args, "-p", "127.0.0.1:"+hostPort+":"+cPortStr, "-e", "PORT="+cPortStr)
+		// restrict it to 127.0.0.1 unless the caller opts into a wider bind
+		// (ingress: host sets BindHost to 0.0.0.0 for a directly-reachable port).
+		bindHost := cfg.BindHost
+		if bindHost == "" {
+			bindHost = "127.0.0.1"
+		}
+		args = append(args, "-p", bindHost+":"+hostPort+":"+cPortStr, "-e", "PORT="+cPortStr)
 	}
 
 	// Env file on server.

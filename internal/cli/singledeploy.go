@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 
 	"github.com/useteploy/teploy/internal/build"
 	"github.com/useteploy/teploy/internal/config"
@@ -130,6 +131,16 @@ func (s *singleServerDeployer) deployApp(ctx context.Context, appCfg *config.App
 		fmt.Fprintln(s.out, "  TLS certificate uploaded")
 	}
 
+	// Container env: the teploy.yml `env:` block (with ${VAR} expanded from the
+	// local environment), then per-host tags (from servers.yml) layered on top.
+	containerEnv := make(map[string]string, len(appCfg.Env)+len(tags))
+	for k, v := range appCfg.Env {
+		containerEnv[k] = os.Expand(v, os.Getenv)
+	}
+	for k, v := range tags {
+		containerEnv[k] = v
+	}
+
 	// Deploy.
 	deployer := deploy.NewDeployer(s.exec, s.out)
 	deployCfg := deploy.Config{
@@ -138,7 +149,7 @@ func (s *singleServerDeployer) deployApp(ctx context.Context, appCfg *config.App
 		Image:         image,
 		Version:       version,
 		EnvFile:       envFile,
-		Env:           tags,
+		Env:           containerEnv,
 		Volumes:       volumes,
 		Processes:     appCfg.Processes,
 		NoHealthcheck: disabledHealthchecks(appCfg.Healthcheck),

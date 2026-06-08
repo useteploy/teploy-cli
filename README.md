@@ -116,8 +116,17 @@ tls:
 # means you front the app with Cloudflare Tunnel / Tailscale Funnel / nginx
 # / ALB / etc., and Teploy must not touch Caddy. The container still joins
 # the teploy network with its app-name alias so the external thing can
-# reach it.
-ingress: caddy                # or "external"
+# reach it. "host" publishes the app directly on a fixed host port (no
+# Caddy, no proxy) — reach it at IP:port. Handy for a private/tailnet box.
+ingress: caddy                # "caddy" (default), "external", or "host"
+
+# Only with ingress: host. The host IP to publish `port` on (default
+# 0.0.0.0 — all interfaces). A fixed host port can't be zero-downtime
+# blue/green, so host ingress deploys by recreate (stop old, start new):
+# a few seconds of downtime per deploy for a stable, directly-reachable
+# port. Single replica only; container rollback isn't available (the prior
+# container is removed) — redeploy the previous version instead.
+# bind: 0.0.0.0
 
 volumes:
   data: /app/data

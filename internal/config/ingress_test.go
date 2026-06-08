@@ -127,6 +127,120 @@ ingress: external
 	}
 }
 
+func TestLoadApp_IngressHostValid(t *testing.T) {
+	dir := t.TempDir()
+	content := `app: myapp
+ingress: host
+bind: 0.0.0.0
+port: 3000
+`
+	if err := os.WriteFile(filepath.Join(dir, "teploy.yml"), []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadApp(dir)
+	if err != nil {
+		t.Fatalf("LoadApp: %v", err)
+	}
+	if cfg.Ingress != "host" {
+		t.Errorf("Ingress = %q, want 'host'", cfg.Ingress)
+	}
+	if cfg.Bind != "0.0.0.0" {
+		t.Errorf("Bind = %q, want '0.0.0.0'", cfg.Bind)
+	}
+	if cfg.UsesCaddy() {
+		t.Errorf("ingress: host should report UsesCaddy() = false")
+	}
+}
+
+func TestLoadApp_IngressHostDefaultBindValid(t *testing.T) {
+	// bind is optional; host mode defaults to 0.0.0.0 at deploy time.
+	dir := t.TempDir()
+	content := `app: myapp
+ingress: host
+port: 3000
+`
+	if err := os.WriteFile(filepath.Join(dir, "teploy.yml"), []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadApp(dir); err != nil {
+		t.Fatalf("LoadApp: %v", err)
+	}
+}
+
+func TestLoadApp_IngressHostRequiresPort(t *testing.T) {
+	dir := t.TempDir()
+	content := `app: myapp
+ingress: host
+`
+	if err := os.WriteFile(filepath.Join(dir, "teploy.yml"), []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := LoadApp(dir)
+	if err == nil {
+		t.Fatal("expected error: ingress=host requires port")
+	}
+	if !strings.Contains(err.Error(), "port") {
+		t.Errorf("error should mention port, got: %v", err)
+	}
+}
+
+func TestLoadApp_BindWithoutHostRejected(t *testing.T) {
+	dir := t.TempDir()
+	content := `app: myapp
+domain: myapp.com
+ingress: external
+bind: 0.0.0.0
+`
+	if err := os.WriteFile(filepath.Join(dir, "teploy.yml"), []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := LoadApp(dir)
+	if err == nil {
+		t.Fatal("expected error: bind requires ingress=host")
+	}
+	if !strings.Contains(err.Error(), "bind") {
+		t.Errorf("error should mention bind, got: %v", err)
+	}
+}
+
+func TestLoadApp_IngressHostInvalidBindRejected(t *testing.T) {
+	dir := t.TempDir()
+	content := `app: myapp
+ingress: host
+port: 3000
+bind: not-an-ip
+`
+	if err := os.WriteFile(filepath.Join(dir, "teploy.yml"), []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := LoadApp(dir)
+	if err == nil {
+		t.Fatal("expected error: invalid bind IP")
+	}
+	if !strings.Contains(err.Error(), "bind") {
+		t.Errorf("error should mention bind, got: %v", err)
+	}
+}
+
+func TestLoadApp_IngressHostMultiReplicaRejected(t *testing.T) {
+	dir := t.TempDir()
+	content := `app: myapp
+ingress: host
+port: 3000
+replicas: 2
+`
+	if err := os.WriteFile(filepath.Join(dir, "teploy.yml"), []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := LoadApp(dir)
+	if err == nil {
+		t.Fatal("expected error: ingress=host single replica only")
+	}
+	if !strings.Contains(err.Error(), "replica") {
+		t.Errorf("error should mention replica, got: %v", err)
+	}
+}
+
 func TestLoadApp_IngressOverlayMerge(t *testing.T) {
 	dir := t.TempDir()
 	base := `app: myapp

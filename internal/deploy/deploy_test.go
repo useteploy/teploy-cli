@@ -127,6 +127,79 @@ func TestDeploy_FirstDeploy(t *testing.T) {
 	}
 }
 
+func TestDeploy_HostIngress(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "mkdir -p /deployments/web", Output: ""},
+		ssh.MockCommand{Match: "mkdir /deployments/web/.lock", Output: ""},
+		ssh.MockCommand{Match: "cat /deployments/web/state", Err: fmt.Errorf("no such file")},
+		// Recreate pre-step: query existing web containers to free the port.
+		ssh.MockCommand{Match: "docker ps -aq --filter label=teploy.app=web", Output: ""},
+		ssh.MockCommand{Match: "docker run", Output: "abc123def456"},
+		ssh.MockCommand{Match: "docker inspect", Output: "running"},
+		ssh.MockCommand{Match: "curl -s -o /dev/null", Output: "200"},
+		ssh.MockCommand{Match: "printf %s", Output: ""},
+		ssh.MockCommand{Match: "rm -rf /deployments/web/.lock", Output: ""},
+	)
+
+	var buf bytes.Buffer
+	deployer := NewDeployer(mock, &buf)
+
+	err := deployer.Deploy(context.Background(), Config{
+		App:           "web",
+		Image:         "web:latest",
+		Version:       "abc123",
+		Ingress:       "host",
+		ContainerPort: 3000,
+		Health:        HealthConfig{Timeout: 5 * time.Second, Interval: 10 * time.Millisecond},
+	})
+	if err != nil {
+		t.Fatalf("Deploy: %v", err)
+	}
+
+	// No ephemeral port allocation in host mode.
+	for _, call := range mock.Calls {
+		if strings.HasPrefix(call, "ss -tln") {
+			t.Errorf("host ingress should not allocate ephemeral ports (saw: %s)", call)
+		}
+	}
+
+	// docker run must publish the fixed port on 0.0.0.0 and recreate-removed
+	// any prior container (the filter query must have run before run).
+	var sawFilter, sawRun bool
+	for _, call := range mock.Calls {
+		if strings.HasPrefix(call, "docker ps -aq --filter label=teploy.app=web") {
+			sawFilter = true
+		}
+		if strings.HasPrefix(call, "docker run") {
+			sawRun = true
+			if !strings.Contains(call, "-p 0.0.0.0:3000:3000") {
+				t.Errorf("expected -p 0.0.0.0:3000:3000 in docker run: %s", call)
+			}
+		}
+	}
+	if !sawFilter {
+		t.Error("expected recreate filter query for existing web containers")
+	}
+	if !sawRun {
+		t.Error("expected docker run")
+	}
+
+	// No Caddy interaction in host mode.
+	output := buf.String()
+	if !strings.Contains(output, "Skipping Caddy route update (ingress: host)") {
+		t.Errorf("expected Caddy skip message, got: %s", output)
+	}
+
+	// Fixed port recorded in state.
+	stateData, ok := mock.Files["/deployments/web/state"]
+	if !ok {
+		t.Fatal("state file not written")
+	}
+	if !strings.Contains(string(stateData), "current_port=3000") {
+		t.Errorf("expected current_port=3000 in state, got: %s", string(stateData))
+	}
+}
+
 func TestDeploy_UpdateExisting(t *testing.T) {
 	existingState := "current_port=49152\ncurrent_hash=old123\nprevious_port=0\nprevious_hash=\n"
 
