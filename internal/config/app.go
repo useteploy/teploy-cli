@@ -144,6 +144,7 @@ type AppConfig struct {
 	// (default 0.0.0.0 — all interfaces). Only valid with ingress: host.
 	Bind          string                     `yaml:"bind,omitempty" toml:"bind"`
 	Server        string                     `yaml:"server,omitempty" toml:"server"`
+	User          string                     `yaml:"user,omitempty" toml:"user"`
 	Servers       []string                   `yaml:"servers,omitempty" toml:"servers"`
 	Image         string                     `yaml:"image,omitempty" toml:"image"`
 	Port          int                        `yaml:"port,omitempty" toml:"port"`
@@ -433,6 +434,9 @@ func mergeConfigs(base, overlay *AppConfig) {
 	}
 	if overlay.Server != "" {
 		base.Server = overlay.Server
+	}
+	if overlay.User != "" {
+		base.User = overlay.User
 	}
 	if len(overlay.Servers) > 0 {
 		base.Servers = overlay.Servers
