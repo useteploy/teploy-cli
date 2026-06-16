@@ -210,14 +210,20 @@ func (d *Deployer) Deploy(ctx context.Context, cfg Config) error {
 	}
 
 	// 6. Handle same-version redeploy: rename existing containers to avoid name conflicts.
+	// Force-remove any stale _replaced container first — a prior interrupted deploy
+	// may have left one behind in Exited state, which would cause the rename to fail
+	// silently and leave the live container unrenamed, causing a "name already in use"
+	// conflict when docker run tries to start the new container.
 	if current != nil && current.CurrentHash == cfg.Version {
 		for _, process := range sortedProcessNames(processes) {
 			for ri := 1; ri <= replicas; ri++ {
 				name := docker.ReplicaContainerName(cfg.App, process, cfg.Version, ri, replicas)
+				d.exec.Run(ctx, fmt.Sprintf("docker rm -f %s 2>/dev/null", name+"_replaced"))
 				d.exec.Run(ctx, fmt.Sprintf("docker rename %s %s 2>/dev/null", name, name+"_replaced"))
 			}
 			// Also rename the non-indexed name (from pre-replica deploys).
 			name := docker.ContainerName(cfg.App, process, cfg.Version)
+			d.exec.Run(ctx, fmt.Sprintf("docker rm -f %s 2>/dev/null", name+"_replaced"))
 			d.exec.Run(ctx, fmt.Sprintf("docker rename %s %s 2>/dev/null", name, name+"_replaced"))
 		}
 	}
@@ -410,6 +416,9 @@ func (d *Deployer) Deploy(ctx context.Context, cfg Config) error {
 	}
 
 	// 14. Stop old containers (all processes + all replicas).
+	// For same-version redeploys the old containers were renamed to _replaced;
+	// remove them after stopping so they don't block the next same-version deploy.
+	sameVersion := current != nil && current.CurrentHash == cfg.Version
 	if current != nil && current.CurrentHash != "" {
 		// Stop old web replicas.
 		oldReplicas := len(current.CurrentPorts)
@@ -418,19 +427,25 @@ func (d *Deployer) Deploy(ctx context.Context, cfg Config) error {
 		}
 		for ri := 1; ri <= oldReplicas; ri++ {
 			oldName := docker.ReplicaContainerName(cfg.App, "web", current.CurrentHash, ri, oldReplicas)
-			if current.CurrentHash == cfg.Version {
+			if sameVersion {
 				oldName += "_replaced"
 			}
 			fmt.Fprintf(d.out, "Stopping old container %s...\n", oldName)
 			d.docker.Stop(ctx, oldName, stopTimeout)
+			if sameVersion {
+				d.docker.Remove(ctx, oldName)
+			}
 		}
 		// Also stop non-indexed name (from pre-replica deploys).
 		if oldReplicas <= 1 {
 			oldName := docker.ContainerName(cfg.App, "web", current.CurrentHash)
-			if current.CurrentHash == cfg.Version {
+			if sameVersion {
 				oldName += "_replaced"
 			}
 			d.docker.Stop(ctx, oldName, stopTimeout)
+			if sameVersion {
+				d.docker.Remove(ctx, oldName)
+			}
 		}
 		// Stop old worker processes (always 1 per type).
 		for _, process := range sortedProcessNames(processes) {
@@ -438,11 +453,14 @@ func (d *Deployer) Deploy(ctx context.Context, cfg Config) error {
 				continue
 			}
 			oldName := docker.ContainerName(cfg.App, process, current.CurrentHash)
-			if current.CurrentHash == cfg.Version {
+			if sameVersion {
 				oldName += "_replaced"
 			}
 			fmt.Fprintf(d.out, "Stopping old container %s...\n", oldName)
 			d.docker.Stop(ctx, oldName, stopTimeout)
+			if sameVersion {
+				d.docker.Remove(ctx, oldName)
+			}
 		}
 	}
 

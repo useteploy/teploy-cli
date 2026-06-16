@@ -542,6 +542,79 @@ func TestDeploy_SameVersion(t *testing.T) {
 	}
 }
 
+// TestDeploy_SameVersion_StaleReplaced verifies that a stale _replaced container
+// left by a prior interrupted same-version deploy does not block the next deploy.
+// The fix: docker rm -f the _replaced name before attempting the rename, so the
+// rename always succeeds even if the target already exists in Exited state.
+func TestDeploy_SameVersion_StaleReplaced(t *testing.T) {
+	existingState := "current_port=49152\ncurrent_hash=abc123\nprevious_port=0\nprevious_hash=\n"
+
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "mkdir -p /deployments/myapp", Output: ""},
+		ssh.MockCommand{Match: "mkdir /deployments/myapp/.lock", Output: ""},
+		ssh.MockCommand{Match: "cat /deployments/myapp/state", Output: existingState},
+		ssh.MockCommand{Match: "ss -tln", Output: ssOutput},
+		// Pre-rename cleanup of stale _replaced container.
+		ssh.MockCommand{Match: "docker rm -f", Output: ""},
+		// Rename live container.
+		ssh.MockCommand{Match: "docker rename", Output: ""},
+		ssh.MockCommand{Match: "docker run", Output: "newcontainer"},
+		ssh.MockCommand{Match: "docker inspect -f", Output: "running"},
+		ssh.MockCommand{Match: "curl -s -o /dev/null", Output: "200"},
+		ssh.MockCommand{Match: "curl -sf http://localhost:2019/config/apps/http/servers/srv0", Output: `{"listen":[":80",":443"]}`},
+		ssh.MockCommand{Match: "curl -sf -X PATCH", Err: fmt.Errorf("not found")},
+		ssh.MockCommand{Match: "curl -sf -X POST http://localhost:2019/config/apps/http/servers/srv0/routes", Output: ""},
+		ssh.MockCommand{Match: "rm -f /tmp/teploy_caddy", Output: ""},
+		ssh.MockCommand{Match: "cat /deployments/caddy/Caddyfile", Output: "{\n\tadmin 0.0.0.0:2019\n}\n"},
+		ssh.MockCommand{Match: "mv /tmp/teploy_caddyfile.tmp", Output: ""},
+		ssh.MockCommand{Match: "mkdir /deployments/caddy/.lock", Output: ""},
+		ssh.MockCommand{Match: "docker exec caddy caddy reload", Output: ""},
+		ssh.MockCommand{Match: "rmdir /deployments/caddy/.lock", Output: ""},
+		ssh.MockCommand{Match: "docker stop", Output: ""},
+		ssh.MockCommand{Match: "docker rm", Output: ""},
+		ssh.MockCommand{Match: "printf %s", Output: ""},
+		ssh.MockCommand{Match: "rm -rf /deployments/myapp/.lock", Output: ""},
+	)
+
+	var buf bytes.Buffer
+	deployer := NewDeployer(mock, &buf)
+
+	err := deployer.Deploy(context.Background(), Config{
+		App:     "myapp",
+		Domain:  "myapp.com",
+		Image:   "myapp:latest",
+		Version: "abc123",
+		Health:  HealthConfig{Timeout: 5 * time.Second, Interval: 10 * time.Millisecond},
+	})
+	if err != nil {
+		t.Fatalf("Deploy: %v", err)
+	}
+
+	// Verify docker rm -f was called before rename to clear stale _replaced.
+	rmfFound := false
+	renameFound := false
+	rmfIdx, renameIdx := -1, -1
+	for i, call := range mock.Calls {
+		if strings.Contains(call, "docker rm -f") && strings.Contains(call, "_replaced") && rmfIdx == -1 {
+			rmfFound = true
+			rmfIdx = i
+		}
+		if strings.Contains(call, "docker rename") && strings.Contains(call, "_replaced") && renameIdx == -1 {
+			renameFound = true
+			renameIdx = i
+		}
+	}
+	if !rmfFound {
+		t.Error("expected docker rm -f of stale _replaced before rename")
+	}
+	if !renameFound {
+		t.Error("expected docker rename after rm -f cleanup")
+	}
+	if rmfFound && renameFound && rmfIdx > renameIdx {
+		t.Error("docker rm -f must precede docker rename")
+	}
+}
+
 func TestDeploy_WithHooks(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "mkdir -p /deployments/myapp", Output: ""},
