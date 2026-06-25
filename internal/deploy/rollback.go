@@ -23,8 +23,9 @@ type RollbackConfig struct {
 	// rollback (container-side paths, already on the server from deploy).
 	// Empty = ACME. Without these, rolling back would regenerate the Caddy
 	// block without the cert and break TLS the same way a deploy would.
-	TLSCert string
-	TLSKey  string
+	TLSCert    string
+	TLSKey     string
+	CaddyExtra string // mirrors Config.CaddyExtra — preserves user directives across rollback
 	// Ingress mirrors Config.Ingress — set to "external" to skip Caddy
 	// route restoration on rollback. With external ingress, the user's
 	// CF Tunnel / nginx / etc. already points at the app-name alias on
@@ -162,7 +163,7 @@ func Rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg Rollbac
 				}
 				upstreams = append(upstreams, caddy.Upstream{Dial: fmt.Sprintf("%s:%d", c.Name, port)})
 			}
-			if err := cd.SetLoadBalancer(ctx, cfg.App, cfg.Domain, upstreams, tls); err != nil {
+			if err := cd.SetLoadBalancer(ctx, cfg.App, cfg.Domain, upstreams, tls, cfg.CaddyExtra); err != nil {
 				return fmt.Errorf("updating load balancer route: %w", err)
 			}
 			fmt.Fprintf(out, "  Traffic load-balanced across %d replicas\n", len(prevWeb))
@@ -171,7 +172,7 @@ func Rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg Rollbac
 			if err != nil {
 				return fmt.Errorf("inspecting previous container port: %w", err)
 			}
-			if err := cd.SetRoute(ctx, cfg.App, cfg.Domain, prevWeb[0].Name, port, tls); err != nil {
+			if err := cd.SetRoute(ctx, cfg.App, cfg.Domain, prevWeb[0].Name, port, tls, cfg.CaddyExtra); err != nil {
 				return fmt.Errorf("updating route: %w", err)
 			}
 			fmt.Fprintln(out, "  Traffic routed to previous version")

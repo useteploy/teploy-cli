@@ -409,6 +409,7 @@ func deployAppConfig(flags *Flags, appCfg *config.AppConfig, serverName, image, 
 		AssetKeepDays: appCfg.Assets.KeepDays,
 		TLSCert:       tlsCert,
 		TLSKey:        tlsKey,
+		CaddyExtra:    appCfg.CaddyExtra,
 	}
 
 	multiNotifier := buildNotifier(appCfg)

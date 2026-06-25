@@ -66,8 +66,9 @@ type Config struct {
 	// on the Caddy site block (custom cert instead of ACME). Empty = ACME.
 	// The CLI uploads the local cert files and sets these to their on-server
 	// container paths (e.g. /etc/caddy/tls/<app>.crt).
-	TLSCert string
-	TLSKey  string
+	TLSCert    string
+	TLSKey     string
+	CaddyExtra string // raw Caddy directives appended into the site block
 }
 
 // Deployer orchestrates zero-downtime deploys.
@@ -371,12 +372,12 @@ func (d *Deployer) Deploy(ctx context.Context, cfg Config) error {
 			for i := range replicas {
 				upstreams[i] = caddy.Upstream{Dial: fmt.Sprintf("%s:%d", webContainerNames[i], cfg.ContainerPort)}
 			}
-			if err := d.caddy.SetLoadBalancer(ctx, cfg.App, cfg.Domain, upstreams, tls); err != nil {
+			if err := d.caddy.SetLoadBalancer(ctx, cfg.App, cfg.Domain, upstreams, tls, cfg.CaddyExtra); err != nil {
 				return fail(fmt.Errorf("updating load balancer route: %w", err))
 			}
 			fmt.Fprintf(d.out, "  Traffic load-balanced across %d replicas\n", replicas)
 		} else {
-			if err := d.caddy.SetRoute(ctx, cfg.App, cfg.Domain, webContainerName, cfg.ContainerPort, tls); err != nil {
+			if err := d.caddy.SetRoute(ctx, cfg.App, cfg.Domain, webContainerName, cfg.ContainerPort, tls, cfg.CaddyExtra); err != nil {
 				return fail(fmt.Errorf("updating route: %w", err))
 			}
 			fmt.Fprintln(d.out, "  Traffic routed to new container")

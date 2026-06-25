@@ -205,7 +205,7 @@ func updateLoadBalancer(ctx context.Context, flags *Flags, appCfg *config.AppCon
 		}
 
 		client := caddy.NewClient(executor)
-		err = client.SetLoadBalancer(ctx, appCfg.App, appCfg.Domain, upstreams, tls)
+		err = client.SetLoadBalancer(ctx, appCfg.App, appCfg.Domain, upstreams, tls, appCfg.CaddyExtra)
 		executor.Close()
 		if err != nil {
 			return fmt.Errorf("updating LB %s: %w", name, err)

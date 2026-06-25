@@ -152,7 +152,7 @@ func NewClient(exec ssh.Executor) *Client {
 // If a hand-written (non-Teploy) site block already serves any of these hosts —
 // common when adopting a server that previously ran another proxy — it is
 // replaced, so Teploy's block becomes the single authority for the domain.
-func (c *Client) SetRoute(ctx context.Context, app, domain, upstream string, containerPort int, tls TLS) error {
+func (c *Client) SetRoute(ctx context.Context, app, domain, upstream string, containerPort int, tls TLS, caddyExtra string) error {
 	hosts, err := parseDomains(domain)
 	if err != nil {
 		return err
@@ -160,13 +160,13 @@ func (c *Client) SetRoute(ctx context.Context, app, domain, upstream string, con
 	if len(hosts) == 0 {
 		return fmt.Errorf("SetRoute: domain must be non-empty")
 	}
-	return c.applyManagedBlock(ctx, app, hosts, reverseProxyBlock(hosts, upstream, containerPort, tls))
+	return c.applyManagedBlock(ctx, app, hosts, reverseProxyBlock(hosts, upstream, containerPort, tls, caddyExtra))
 }
 
 // SetLoadBalancer adds or updates a load-balanced reverse proxy route: traffic
 // for the domain is distributed across upstreams via round-robin with active
 // /up health checks. Replaces any prior route block for the same app.
-func (c *Client) SetLoadBalancer(ctx context.Context, app, domain string, upstreams []Upstream, tls TLS) error {
+func (c *Client) SetLoadBalancer(ctx context.Context, app, domain string, upstreams []Upstream, tls TLS, caddyExtra string) error {
 	hosts, err := parseDomains(domain)
 	if err != nil {
 		return err
@@ -174,7 +174,7 @@ func (c *Client) SetLoadBalancer(ctx context.Context, app, domain string, upstre
 	if len(hosts) == 0 {
 		return fmt.Errorf("SetLoadBalancer: domain must be non-empty")
 	}
-	return c.applyManagedBlock(ctx, app, hosts, loadBalancerBlock(hosts, upstreams, tls))
+	return c.applyManagedBlock(ctx, app, hosts, loadBalancerBlock(hosts, upstreams, tls, caddyExtra))
 }
 
 // SetStaticRoute upserts a Caddyfile block that serves a static deploy.
@@ -573,21 +573,50 @@ func parseDomains(domain string) ([]string, error) {
 }
 
 // reverseProxyBlock renders a Caddyfile reverse-proxy site block.
-func reverseProxyBlock(hosts []string, upstream string, port int, tls TLS) string {
-	return fmt.Sprintf("%s {\n%s\treverse_proxy %s:%d\n}", strings.Join(hosts, ", "), tls.directive(), upstream, port)
+func reverseProxyBlock(hosts []string, upstream string, port int, tls TLS, caddyExtra string) string {
+	var b strings.Builder
+	b.WriteString(strings.Join(hosts, ", "))
+	b.WriteString(" {\n")
+	b.WriteString(tls.directive())
+	fmt.Fprintf(&b, "\treverse_proxy %s:%d\n", upstream, port)
+	if extra := strings.TrimSpace(caddyExtra); extra != "" {
+		b.WriteString("\n\t# user-supplied caddy_extra:\n")
+		for _, line := range strings.Split(extra, "\n") {
+			if line == "" {
+				b.WriteString("\n")
+			} else {
+				b.WriteString("\t" + line + "\n")
+			}
+		}
+	}
+	b.WriteString("}")
+	return b.String()
 }
 
 // loadBalancerBlock renders a round-robin reverse-proxy block with active /up
 // health checks.
-func loadBalancerBlock(hosts []string, upstreams []Upstream, tls TLS) string {
+func loadBalancerBlock(hosts []string, upstreams []Upstream, tls TLS, caddyExtra string) string {
 	dials := make([]string, len(upstreams))
 	for i, u := range upstreams {
 		dials[i] = u.Dial
 	}
-	return fmt.Sprintf(
-		"%s {\n%s\treverse_proxy %s {\n\t\tlb_policy round_robin\n\t\thealth_uri /up\n\t\thealth_interval 10s\n\t\thealth_timeout 5s\n\t}\n}",
-		strings.Join(hosts, ", "), tls.directive(), strings.Join(dials, " "),
-	)
+	var b strings.Builder
+	b.WriteString(strings.Join(hosts, ", "))
+	b.WriteString(" {\n")
+	b.WriteString(tls.directive())
+	fmt.Fprintf(&b, "\treverse_proxy %s {\n\t\tlb_policy round_robin\n\t\thealth_uri /up\n\t\thealth_interval 10s\n\t\thealth_timeout 5s\n\t}\n", strings.Join(dials, " "))
+	if extra := strings.TrimSpace(caddyExtra); extra != "" {
+		b.WriteString("\n\t# user-supplied caddy_extra:\n")
+		for _, line := range strings.Split(extra, "\n") {
+			if line == "" {
+				b.WriteString("\n")
+			} else {
+				b.WriteString("\t" + line + "\n")
+			}
+		}
+	}
+	b.WriteString("}")
+	return b.String()
 }
 
 // maintenanceBlock renders a site block that returns a 503 maintenance page for
