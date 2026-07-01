@@ -359,3 +359,66 @@ func TestRollback_ToHash_AlreadyCurrent(t *testing.T) {
 		t.Errorf("unexpected error: %v", err)
 	}
 }
+
+// TestRollback_ToHash_PortCollisionReallocates reproduces a real failure
+// found live-testing --to against a throwaway server: v1 originally ran on
+// 49152; after v1 stopped, a later deploy (v3) reused 49152 (Docker's
+// ephemeral allocator hands out freed ports); `rollback --to v1` then tried
+// to recreate v1 on its original port 49152 while v3 was still running
+// there (start-before-stop for zero-downtime) and docker run failed with
+// "port is already allocated". Restart must detect the collision against
+// the live current container and allocate a fresh port instead.
+func TestRollback_ToHash_PortCollisionReallocates(t *testing.T) {
+	stateContent := "current_port=49152\ncurrent_hash=v3\nprevious_port=49153\nprevious_hash=v2\n"
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "cat /deployments/myapp/state", Output: stateContent},
+		ssh.MockCommand{Match: "docker ps --all --filter label=teploy.app='myapp'",
+			Output: `{"ID":"aaa","Names":"myapp-web-v1","Image":"myapp:latest","State":"exited","Status":"Exited","Labels":"teploy.app=myapp,teploy.version=v1,teploy.process=web"}` + "\n" +
+				`{"ID":"ccc","Names":"myapp-web-v3","Image":"myapp:latest","State":"running","Status":"Up 1h","Labels":"teploy.app=myapp,teploy.version=v3,teploy.process=web"}`,
+		},
+		// v1's original binding is 49152 — exactly what v3 (current, still
+		// running) holds right now.
+		ssh.MockCommand{Match: "docker inspect 'myapp-web-v1'", Output: `[{"Config":{"Image":"myapp:latest","Labels":{"teploy.app":"myapp"}},"HostConfig":{"NetworkMode":"teploy","PortBindings":{"3000/tcp":[{"HostIp":"127.0.0.1","HostPort":"49152"}]},"RestartPolicy":{"Name":"no"}},"NetworkSettings":{"Networks":{"teploy":{"Aliases":["myapp"]}}}}]`},
+		ssh.MockCommand{Match: "docker rm -f 'myapp-web-v1'", Output: ""},
+		ssh.MockCommand{Match: "ss -tln", Output: "State  Recv-Q  Send-Q  Local Address:Port  Peer Address:Port\nLISTEN 0 128 0.0.0.0:49152 0.0.0.0:*"},
+		ssh.MockCommand{Match: "docker run", Output: ""},
+		ssh.MockCommand{Match: "docker inspect -f '{{range $p, $b := .NetworkSettings.Ports}}", Output: "49153"},
+		ssh.MockCommand{Match: "curl", Output: "200"},
+		ssh.MockCommand{Match: "docker inspect -f '{{range $p, $_ := .NetworkSettings.Ports}}", Output: "3000/tcp"},
+		ssh.MockCommand{Match: "caddy", Output: ""},
+		ssh.MockCommand{Match: "cat /deployments/caddy/Caddyfile", Output: "{\n\tadmin 0.0.0.0:2019\n}\n"},
+		ssh.MockCommand{Match: "mv /tmp/teploy_caddyfile.tmp", Output: ""},
+		ssh.MockCommand{Match: "mkdir /deployments/caddy/.lock", Output: ""},
+		ssh.MockCommand{Match: "docker exec caddy caddy reload", Output: ""},
+		ssh.MockCommand{Match: "rmdir /deployments/caddy/.lock", Output: ""},
+		ssh.MockCommand{Match: "docker stop", Output: ""},
+		ssh.MockCommand{Match: "mkdir -p", Output: ""},
+		ssh.MockCommand{Match: "cat /tmp", Output: ""},
+		ssh.MockCommand{Match: "UPLOAD:", Output: ""},
+	)
+
+	cfg := rollbackCfg()
+	cfg.ToHash = "v1"
+	var buf bytes.Buffer
+	if err := Rollback(context.Background(), mock, &buf, cfg); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// The recreated container must NOT have been asked to bind 49152 (still
+	// held by v3 at the time Restart runs) — it must get a different port.
+	for _, c := range mock.Calls {
+		if strings.HasPrefix(c, "docker run") && strings.Contains(c, ":49152:") {
+			t.Errorf("recreated container was bound to the colliding port 49152: %s", c)
+		}
+	}
+
+	stateData := string(mock.Files["/deployments/myapp/state"])
+	if !strings.Contains(stateData, "current_hash=v1") {
+		t.Errorf("expected current_hash=v1, got: %s", stateData)
+	}
+	// Port written to state must be the freshly allocated one (from
+	// HostPort() inspection), never the stale, now-colliding 49152.
+	if strings.Contains(stateData, "current_port=49152\n") {
+		t.Errorf("state still recorded the colliding port: %s", stateData)
+	}
+}

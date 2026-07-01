@@ -7,6 +7,7 @@ import (
 	"io"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/useteploy/teploy/internal/ssh"
 )
@@ -160,13 +161,24 @@ func (m *Manager) Setup(ctx context.Context, cfg Config) error {
 	// can contain whitespace or metacharacters.
 	execStart := fmt.Sprintf("%s autodeploy serve --app %s --branch %s --port %d",
 		cfg.TeployBinaryPath, cfg.App, cfg.Branch, cfg.Port)
+	// /etc/systemd/system is root-owned — Upload writes over SFTP as the
+	// connected user (tyler, say), which can't write there directly even
+	// with sudo group membership (SFTP doesn't go through sudo). Stage in
+	// /tmp (world-writable) and move into place with sudo, the same
+	// pattern internal/harden uses for every other root-owned file this
+	// codebase writes (e.g. fail2ban's jail.d config). Found live: this
+	// step silently failed on every non-root setup until fixed.
 	serviceContent := generateService(serviceName, execStart)
+	stagingPath := fmt.Sprintf("/tmp/teploy-%s.service", serviceName)
 	servicePath := fmt.Sprintf("/etc/systemd/system/%s.service", serviceName)
-	if err := m.exec.Upload(ctx, strings.NewReader(serviceContent), servicePath, "0644"); err != nil {
+	if err := m.exec.Upload(ctx, strings.NewReader(serviceContent), stagingPath, "0644"); err != nil {
 		return fmt.Errorf("uploading systemd service: %w", err)
 	}
 
 	sudo := m.sudoPrefix(ctx)
+	if _, err := m.exec.Run(ctx, fmt.Sprintf("%smv %s %s", sudo, stagingPath, servicePath)); err != nil {
+		return fmt.Errorf("installing systemd service: %w", err)
+	}
 	cmds := []string{
 		sudo + "systemctl daemon-reload",
 		fmt.Sprintf("%ssystemctl enable %s", sudo, serviceName),
@@ -178,30 +190,128 @@ func (m *Manager) Setup(ctx context.Context, cfg Config) error {
 		}
 	}
 
+	// systemctl restart returning success only means systemd accepted the
+	// request — it does NOT mean the process is actually running. Found
+	// live: TeployBinaryPath can point at a binary from the last published
+	// release (deployTeployBinaryToServer always fetches "latest"), which
+	// doesn't yet have the `autodeploy serve` subcommand if it's newer
+	// than that release. The unit then crash-loops on "unknown flag:
+	// --app" every restart while Setup still reported "Webhook listener
+	// running on port 9876" — a silent false success. Verify the service
+	// actually reached "active" before declaring victory.
+	time.Sleep(1 * time.Second)
+	active, _ := m.exec.Run(ctx, sudo+"systemctl is-active "+serviceName)
+	if strings.TrimSpace(active) != "active" {
+		logs, _ := m.exec.Run(ctx, fmt.Sprintf("%sjournalctl -u %s --no-pager -n 20 --output=cat", sudo, serviceName))
+		return fmt.Errorf("webhook listener failed to start (status: %s) — %s may not support 'autodeploy serve' yet (newer than the last published teploy release). Recent logs:\n%s",
+			strings.TrimSpace(active), cfg.TeployBinaryPath, strings.TrimSpace(logs))
+	}
+
 	fmt.Fprintf(m.out, "  Webhook listener running on port %d\n", cfg.Port)
+
+	// The listener binds 0.0.0.0 (see runAutoDeployServe) so Caddy's
+	// container can reach it via host.docker.internal — but teploy setup's
+	// hardening (internal/harden.ConfigureUFW) defaults to deny-incoming,
+	// so without an explicit allow rule UFW silently drops Caddy's
+	// requests before they ever reach this process. Found live: the
+	// listener was demonstrably active and healthy, but every webhook
+	// request timed out (curl exit 28) until this rule was added. Scoped
+	// to the "teploy" docker network's own subnet, not 0.0.0.0/0 — the
+	// public internet still can't reach this port directly. Best-effort:
+	// UFW may not be installed/active (a server set up with --no-harden,
+	// or one using a different firewall entirely), which is the user's
+	// choice to manage, not a reason to fail Setup.
+	if err := m.allowWebhookPortInFirewall(ctx, sudo, cfg.Port); err != nil {
+		fmt.Fprintf(m.out, "  Warning: could not open port %d in the firewall for Caddy: %v\n", cfg.Port, err)
+		fmt.Fprintln(m.out, "  If UFW (or another firewall) is active, webhook requests from Caddy may be silently dropped — allow the \"teploy\" docker network's subnet to reach this port manually.")
+	}
+
 	return nil
+}
+
+// allowWebhookPortInFirewall scopes a UFW allow rule to the "teploy" docker
+// network's own subnet, so the webhook listener is reachable from Caddy's
+// container without exposing it to the wider LAN/internet. No-op (not an
+// error) if UFW isn't installed or isn't active.
+func (m *Manager) allowWebhookPortInFirewall(ctx context.Context, sudo string, port int) error {
+	if _, err := m.exec.Run(ctx, "which ufw"); err != nil {
+		return nil // UFW not installed — nothing to configure.
+	}
+	status, _ := m.exec.Run(ctx, sudo+"ufw status")
+	if !strings.Contains(status, "Status: active") {
+		return nil // UFW installed but not enabled.
+	}
+
+	subnet, err := m.exec.Run(ctx, "docker network inspect teploy --format '{{(index .IPAM.Config 0).Subnet}}'")
+	if err != nil {
+		return fmt.Errorf("could not determine the teploy docker network's subnet: %w", err)
+	}
+	subnet = strings.TrimSpace(subnet)
+	if subnet == "" {
+		return fmt.Errorf("teploy docker network has no configured subnet")
+	}
+
+	cmd := fmt.Sprintf("%sufw allow from %s to any port %d proto tcp comment 'teploy autodeploy webhook listener'",
+		sudo, ssh.ShellQuote(subnet), port)
+	if _, err := m.exec.Run(ctx, cmd); err != nil {
+		return fmt.Errorf("adding ufw rule: %w", err)
+	}
+	return nil
+}
+
+// webhookRouteJSON builds the Caddy admin-API route object that proxies
+// POST /teploy-webhook/{app} to the webhook listener.
+//
+// dial targets host.docker.internal, not localhost: Caddy runs in its own
+// container on the "teploy" bridge network — a separate network namespace
+// from `teploy autodeploy serve` (a systemd-resident host process, not a
+// container, since it needs direct Docker CLI access to run deploys).
+// "localhost" inside the Caddy container would resolve to the container
+// itself, where nothing is listening. host.docker.internal resolves to the
+// host via the --add-host=host.docker.internal:host-gateway flag teploy
+// setup adds to the Caddy container (internal/cli/setup.go). Found live:
+// routes silently never connected with the old "localhost" dial target, on
+// top of the admin-API unreachability fixed in SetupCaddyRoute below.
+func webhookRouteJSON(app, domain string) string {
+	return fmt.Sprintf(`{
+		"@id": "teploy-webhook-%s",
+		"match": [{"host": ["%s"], "path": ["/teploy-webhook/%s"]}],
+		"handle": [{"handler": "reverse_proxy", "upstreams": [{"dial": "host.docker.internal:9876"}]}]
+	}`, app, domain, app)
 }
 
 // SetupCaddyRoute adds a Caddy route to proxy webhook requests to the listener.
 func (m *Manager) SetupCaddyRoute(ctx context.Context, app, domain string) error {
 	fmt.Fprintln(m.out, "Adding Caddy webhook route...")
 
-	// We add a route that matches POST to /teploy-webhook/{app} and proxies to the local listener.
-	// This uses a direct curl to the Caddy admin API to add a webhook-specific route.
-	webhookRoute := fmt.Sprintf(`{
-		"@id": "teploy-webhook-%s",
-		"match": [{"host": ["%s"], "path": ["/teploy-webhook/%s"]}],
-		"handle": [{"handler": "reverse_proxy", "upstreams": [{"dial": "localhost:9876"}]}]
-	}`, app, domain, app)
-
 	// Pipe the route JSON straight into curl over stdin instead of staging it in
 	// a fixed /tmp file that concurrent setups would clobber. base64 keeps the
 	// JSON shell-safe through the remote shell.
-	encoded := base64.StdEncoding.EncodeToString([]byte(webhookRoute))
-	cmd := fmt.Sprintf(
-		"printf %%s %s | base64 -d | curl -sf -X POST http://localhost:2019/config/apps/http/servers/srv0/routes -H 'Content-Type: application/json' -d @-",
+	//
+	// Runs via `docker exec caddy`, not directly on the host: Caddy's admin
+	// API (port 2019) is intentionally never published to the host (see
+	// setup.go's caddy `docker run` — only 80/443 are `-p` published), so
+	// curling http://localhost:2019 from the host shell always fails with
+	// connection refused. Every other admin-API interaction in this
+	// codebase (internal/caddy's reload) already goes through `docker exec
+	// caddy`; this was the one place that didn't. Found live: this step
+	// failed with curl exit 7 on every setup, every time.
+	//
+	// PUT .../routes/0, not POST .../routes: the app's own route (added by
+	// a normal `teploy deploy`, unconditional host match, terminal: true)
+	// is always routes[0]. Caddy evaluates routes in array order and stops
+	// at the first terminal match — POSTing appends to the END regardless
+	// of the trailing index, so the webhook route never got a chance to
+	// match; every /teploy-webhook/<app> request 404'd straight through to
+	// the app container instead. PUT to a numeric index inserts (shifts
+	// existing elements down), confirmed live — the only way to make the
+	// narrower, non-terminal webhook route win by evaluating first.
+	encoded := base64.StdEncoding.EncodeToString([]byte(webhookRouteJSON(app, domain)))
+	innerCmd := fmt.Sprintf(
+		"printf %%s %s | base64 -d | curl -sf -X PUT http://localhost:2019/config/apps/http/servers/srv0/routes/0 -H 'Content-Type: application/json' -d @-",
 		ssh.ShellQuote(encoded),
 	)
+	cmd := fmt.Sprintf("docker exec caddy sh -c %s", ssh.ShellQuote(innerCmd))
 	if _, err := m.exec.Run(ctx, cmd); err != nil {
 		return fmt.Errorf("adding Caddy webhook route: %w", err)
 	}

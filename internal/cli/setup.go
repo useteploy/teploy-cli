@@ -580,6 +580,17 @@ func setupServer(ctx context.Context, exec ssh.Executor, w io.Writer, yes bool) 
 			"--restart", "always",
 			"--name", "caddy",
 			"--network", "teploy",
+			// Lets Caddy (in its own network namespace on the "teploy"
+			// bridge) reach services bound only to the host's loopback —
+			// specifically `teploy autodeploy serve`, a systemd-resident
+			// host process (not a container, since it needs direct Docker
+			// CLI access to run deploys) listening on 0.0.0.0:9876. Without
+			// this, host.docker.internal doesn't resolve inside the
+			// container on native Linux Docker (only Docker Desktop adds it
+			// automatically) and the webhook route can never connect —
+			// found live: SetupCaddyRoute's dial target was unreachable
+			// from inside the container regardless of what host/IP it named.
+			"--add-host", "host.docker.internal:host-gateway",
 			"-p", "80:80",
 			"-p", "443:443",
 			"-v", "caddy_data:/data",

@@ -316,11 +316,30 @@ type containerInspect struct {
 // (the bind also detaches from custom networks). Recreating from scratch
 // sidesteps that landmine.
 //
+// avoidPorts is the set of host ports currently held by containers this
+// restart must not collide with — critically, the live container(s) being
+// rolled back FROM, which are still running (and still holding their port)
+// at the point Restart is called, since rollback starts the target before
+// stopping the current version for zero-downtime. A single-hop rollback
+// (to the immediately-previous version) can never collide: that version's
+// port was freed by the deploy that superseded it and nothing has claimed
+// it since. A --to rollback reaching back further can: Docker's ephemeral
+// port allocator reuses freed ports, so an older version's original port
+// may since have been handed to what is now the live container. Found via
+// live testing (v1→49152, v1-tls→49153, v2 reused 49152 after v1-tls
+// stopped; `rollback --to v1` then collided with the still-running v2).
+// When a binding's original port is in avoidPorts, a fresh one is
+// allocated instead — safe because HostPort() (not persisted state) is
+// what the rest of the rollback reads back afterward. Pass nil to
+// preserve every port binding exactly (no caller does today, but this
+// keeps the zero-collision-checking path available for a non-rollback use
+// of Restart in the future).
+//
 // Preserved across the recreate: image, network mode + aliases, port
-// bindings, env, bind mounts, named-volume + tmpfs mounts, command, working
-// dir, user, labels, restart policy, memory + CPU limits, and the
-// --no-healthcheck NONE marker.
-func (c *Client) Restart(ctx context.Context, name string) error {
+// bindings (subject to the above), env, bind mounts, named-volume + tmpfs
+// mounts, command, working dir, user, labels, restart policy, memory + CPU
+// limits, and the --no-healthcheck NONE marker.
+func (c *Client) Restart(ctx context.Context, name string, avoidPorts map[int]bool) error {
 	raw, err := c.exec.Run(ctx, "docker inspect "+ssh.ShellQuote(name))
 	if err != nil {
 		return fmt.Errorf("inspecting %s: %w", name, err)
@@ -363,13 +382,30 @@ func (c *Client) Restart(ctx context.Context, name string) error {
 		pbKeys = append(pbKeys, k)
 	}
 	sort.Strings(pbKeys)
+	// Ports claimed so far this call, merged into avoidPorts as bindings are
+	// resolved — so two colliding bindings on the same container (unusual,
+	// but possible with multiple published ports) don't get handed the same
+	// replacement port.
+	claimed := make(map[int]bool, len(avoidPorts))
+	for p := range avoidPorts {
+		claimed[p] = true
+	}
 	for _, containerPort := range pbKeys {
 		for _, b := range spec.HostConfig.PortBindings[containerPort] {
 			host := b.HostIp
 			if host == "" {
 				host = "0.0.0.0"
 			}
-			args = append(args, "-p", fmt.Sprintf("%s:%s:%s", host, b.HostPort, containerPort))
+			hostPort := b.HostPort
+			if origPort, err := strconv.Atoi(b.HostPort); err == nil && claimed[origPort] {
+				newPort, ferr := c.FindAvailablePortExcluding(ctx, claimed)
+				if ferr != nil {
+					return fmt.Errorf("port %s for %s is held by another running container and no replacement port is available: %w", b.HostPort, name, ferr)
+				}
+				hostPort = strconv.Itoa(newPort)
+				claimed[newPort] = true
+			}
+			args = append(args, "-p", fmt.Sprintf("%s:%s:%s", host, hostPort, containerPort))
 		}
 	}
 

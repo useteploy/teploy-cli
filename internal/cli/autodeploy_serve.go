@@ -43,7 +43,7 @@ func newAutoDeployServeCmd() *cobra.Command {
 
 	cmd.Flags().StringVar(&app, "app", "", "app name (required)")
 	cmd.Flags().StringVar(&branch, "branch", "main", "branch to watch for pushes")
-	cmd.Flags().IntVar(&port, "port", 9876, "port to listen on (127.0.0.1 only — Caddy proxies to this)")
+	cmd.Flags().IntVar(&port, "port", 9876, "port to listen on — 0.0.0.0, reachable from Caddy's docker bridge network; every request still requires a valid HMAC signature")
 	cmd.MarkFlagRequired("app")
 
 	return cmd
@@ -115,7 +115,14 @@ func runAutoDeployServe(app, branch string, port int) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", handler)
 
-	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	// Caddy runs as its own container on the "teploy" bridge network, a
+	// separate network namespace from this host process — 127.0.0.1 would
+	// only be reachable from other processes on the host itself, never
+	// from inside a container. 0.0.0.0 exposes this beyond just Caddy (to
+	// the docker bridge subnet, and to the LAN if the firewall doesn't
+	// block 9876), but every request is HMAC-signature-verified regardless
+	// of source, which is the actual security boundary here.
+	addr := fmt.Sprintf("0.0.0.0:%d", port)
 	logf("teploy autodeploy serve listening on %s for app %s (branch %s)", addr, app, branch)
 	return http.ListenAndServe(addr, mux)
 }

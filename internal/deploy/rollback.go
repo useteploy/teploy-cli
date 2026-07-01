@@ -98,6 +98,23 @@ func Rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg Rollbac
 		return fmt.Errorf("listing containers: %w", err)
 	}
 
+	// Ports the current (about-to-be-stopped) version is live on right now —
+	// must not be handed to the target's recreated containers. A single-hop
+	// rollback could never collide (the immediately-previous version's port
+	// was freed by the deploy that superseded it, and nothing's claimed it
+	// since), but a --to rollback reaching back further can: Docker's
+	// ephemeral port allocator reuses freed ports, so an older version's
+	// original port may since have been reassigned to what's now the live
+	// container. See docker.Client.Restart's doc comment for how this is
+	// resolved (fresh port allocated instead of reusing a colliding one).
+	avoidPorts := make(map[int]bool, len(current.CurrentPorts)+1)
+	for _, p := range current.CurrentPorts {
+		avoidPorts[p] = true
+	}
+	if current.CurrentPort != 0 {
+		avoidPorts[current.CurrentPort] = true
+	}
+
 	// Match by the teploy.version label, not a name suffix: replica web
 	// containers are named "<app>-web-<version>-1/-2", which end in "-1"/"-2",
 	// not "-<version>" — a suffix match silently skips every replica (leaving
@@ -116,8 +133,9 @@ func Rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg Rollbac
 		// interim — a common case if rolling back after deploying a
 		// neighboring app that reused the port. Restart() inspects the
 		// stopped container, force-removes, and `docker run`s fresh
-		// with the same config.
-		if err := dk.Restart(ctx, c.Name); err != nil {
+		// with the same config, reallocating any port binding that
+		// collides with avoidPorts.
+		if err := dk.Restart(ctx, c.Name, avoidPorts); err != nil {
 			return fmt.Errorf("restarting target container %s: %w", c.Name, err)
 		}
 		started = append(started, c.Name)
