@@ -152,7 +152,7 @@ func (c *Client) ListBackups(ctx context.Context, app, prefix string, s3 S3Confi
 }
 
 // AccessoryBackup performs a database-aware backup for an accessory.
-func (c *Client) AccessoryBackup(ctx context.Context, app, name, image string, s3 S3Config) error {
+func (c *Client) AccessoryBackup(ctx context.Context, app, name, image string, env map[string]string, s3 S3Config) error {
 	if err := c.ensureAWSCLI(ctx); err != nil {
 		return err
 	}
@@ -162,14 +162,26 @@ func (c *Client) AccessoryBackup(ctx context.Context, app, name, image string, s
 	dumpPath := fmt.Sprintf("/tmp/%s-%s-%s.sql.gz", app, name, timestamp)
 	s3Key := fmt.Sprintf("s3://%s/%s/accessories/%s/%s.sql.gz", s3.Bucket, app, name, timestamp)
 
+	// dumpTmp is redirected into with `>`, not piped into gzip: a shell
+	// pipeline's exit status is its LAST command's (gzip, which "succeeds"
+	// compressing an empty stream even when pg_dump/mysqldump errored to
+	// stderr) — `| gzip > path` would silently swallow a real dump
+	// failure. Confirmed live: a wrong db name (see postgresDBAndUser)
+	// produced a 20-byte gzip of nothing while the old `| gzip` version of
+	// this command reported "Backup complete". Redirecting to a plain
+	// file with `>` preserves the dump command's own exit code, which
+	// c.exec.Run already surfaces (with captured stderr) as a real error.
+	dumpTmp := fmt.Sprintf("/tmp/%s-%s-%s.sql", app, name, timestamp)
 	var dumpCmd string
 	switch {
 	case isDBType(image, "postgres"):
-		db := app // Default DB name
-		dumpCmd = fmt.Sprintf("docker exec %s pg_dump -U postgres %s | gzip > %s", containerName, db, dumpPath)
+		db, user := postgresDBAndUser(app, env)
+		dumpCmd = fmt.Sprintf("docker exec %s pg_dump -U %s %s > %s && gzip -c %s > %s && rm -f %s",
+			containerName, ssh.ShellQuote(user), ssh.ShellQuote(db), dumpTmp, dumpTmp, dumpPath, dumpTmp)
 	case isDBType(image, "mysql"), isDBType(image, "mariadb"):
-		db := app
-		dumpCmd = fmt.Sprintf("docker exec %s mysqldump -u root %s | gzip > %s", containerName, db, dumpPath)
+		db := mysqlDB(app, env)
+		dumpCmd = fmt.Sprintf("docker exec %s mysqldump -u root %s > %s && gzip -c %s > %s && rm -f %s",
+			containerName, ssh.ShellQuote(db), dumpTmp, dumpTmp, dumpPath, dumpTmp)
 	case isDBType(image, "mongo"):
 		dumpCmd = fmt.Sprintf("docker exec %s mongodump --archive --gzip > %s", containerName, dumpPath)
 		s3Key = fmt.Sprintf("s3://%s/%s/accessories/%s/%s.archive.gz", s3.Bucket, app, name, timestamp)
@@ -204,7 +216,7 @@ func (c *Client) AccessoryBackup(ctx context.Context, app, name, image string, s
 }
 
 // AccessoryRestore restores a database backup from S3.
-func (c *Client) AccessoryRestore(ctx context.Context, app, name, image, date string, s3 S3Config) error {
+func (c *Client) AccessoryRestore(ctx context.Context, app, name, image, date string, env map[string]string, s3 S3Config) error {
 	if err := c.ensureAWSCLI(ctx); err != nil {
 		return err
 	}
@@ -216,13 +228,17 @@ func (c *Client) AccessoryRestore(ctx context.Context, app, name, image, date st
 
 	switch {
 	case isDBType(image, "postgres"):
+		db, user := postgresDBAndUser(app, env)
 		s3Key = fmt.Sprintf("s3://%s/%s/accessories/%s/%s.sql.gz", s3.Bucket, app, name, date)
 		restorePath = "/tmp/restore.sql.gz"
-		restoreCmd = fmt.Sprintf("gunzip -c %s | docker exec -i %s psql -U postgres %s", restorePath, containerName, app)
+		restoreCmd = fmt.Sprintf("gunzip -c %s | docker exec -i %s psql -U %s %s",
+			restorePath, containerName, ssh.ShellQuote(user), ssh.ShellQuote(db))
 	case isDBType(image, "mysql"), isDBType(image, "mariadb"):
+		db := mysqlDB(app, env)
 		s3Key = fmt.Sprintf("s3://%s/%s/accessories/%s/%s.sql.gz", s3.Bucket, app, name, date)
 		restorePath = "/tmp/restore.sql.gz"
-		restoreCmd = fmt.Sprintf("gunzip -c %s | docker exec -i %s mysql -u root %s", restorePath, containerName, app)
+		restoreCmd = fmt.Sprintf("gunzip -c %s | docker exec -i %s mysql -u root %s",
+			restorePath, containerName, ssh.ShellQuote(db))
 	case isDBType(image, "mongo"):
 		s3Key = fmt.Sprintf("s3://%s/%s/accessories/%s/%s.archive.gz", s3.Bucket, app, name, date)
 		restorePath = "/tmp/restore.archive.gz"
@@ -301,4 +317,35 @@ func isDBType(image, dbType string) bool {
 	parts := strings.Split(base, "/")
 	name := parts[len(parts)-1]
 	return name == dbType
+}
+
+// postgresDBAndUser resolves the actual database name and superuser a
+// postgres accessory is running with, mirroring
+// internal/accessories.connectionEnvVars' exact fallback logic (POSTGRES_DB
+// / POSTGRES_USER, defaulting to the app name / "postgres"). Backup/restore
+// previously hardcoded db=app unconditionally — silently wrong (and
+// silently UNDETECTED, since `pg_dump | gzip` masked the resulting error —
+// see AccessoryBackup) for any accessory setting a custom POSTGRES_DB.
+func postgresDBAndUser(app string, env map[string]string) (db, user string) {
+	db = env["POSTGRES_DB"]
+	if db == "" {
+		db = app
+	}
+	user = env["POSTGRES_USER"]
+	if user == "" {
+		user = "postgres"
+	}
+	return db, user
+}
+
+// mysqlDB mirrors connectionEnvVars' MYSQL_DATABASE fallback (see
+// postgresDBAndUser). mysql/mariadb backup/restore always uses the "root"
+// user, matching connectionEnvVars' own hardcoded assumption there — no
+// equivalent MYSQL_USER override exists to resolve.
+func mysqlDB(app string, env map[string]string) string {
+	db := env["MYSQL_DATABASE"]
+	if db == "" {
+		db = app
+	}
+	return db
 }

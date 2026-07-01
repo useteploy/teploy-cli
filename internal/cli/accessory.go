@@ -108,11 +108,34 @@ func runAccessoryExec(flags *Flags, appName, name string, args []string) error {
 
 	dk := docker.NewClient(executor)
 	container := accessories.ContainerName(appCfg.App, name)
-	command := strings.Join(args, " ")
+	command := quoteExecArgs(args)
 	if err := dk.ExecStream(ctx, container, command, os.Stdout, os.Stderr); err != nil {
 		return fmt.Errorf("command failed in %s: %w", container, err)
 	}
 	return nil
+}
+
+// quoteExecArgs rebuilds a shell command line from cobra-parsed args,
+// preserving the argument boundaries cobra already resolved. A bare
+// strings.Join(args, " ") loses those boundaries (e.g. "-c" "SELECT 1" as
+// two argv entries collapse into one ambiguous string), so when the joined
+// string later gets re-split by the remote `sh -c` in
+// docker.Client.ExecStream, "SELECT 1" silently becomes two words
+// ("SELECT" and "1") instead of staying one argument. Found live running
+// exactly the example in this command's own --help text
+// (`psql -c 'SELECT 1'`) — psql reported "extra command-line argument
+// \"1\" ignored". Trades away shell-operator passthrough (pipes,
+// redirects) for correctness on quoted multi-word arguments — the right
+// tradeoff here since this command's own documented use case is
+// single-command invocations with flag values like -c, not pipelines
+// (unlike `teploy app exec`, which explicitly promises pipe/redirect
+// support and is intentionally NOT quoted this way).
+func quoteExecArgs(args []string) string {
+	quoted := make([]string, len(args))
+	for i, a := range args {
+		quoted[i] = ssh.ShellQuote(a)
+	}
+	return strings.Join(quoted, " ")
 }
 
 func newAccessoryListCmd(flags *Flags) *cobra.Command {
@@ -374,7 +397,7 @@ func runAccessoryBackup(flags *Flags, name, bucket, region, schedule string) err
 		return nil
 	}
 
-	return client.AccessoryBackup(ctx, appCfg.App, name, accCfg.Image, s3Cfg)
+	return client.AccessoryBackup(ctx, appCfg.App, name, accCfg.Image, accCfg.Env, s3Cfg)
 }
 
 func newAccessoryRestoreCmd(flags *Flags) *cobra.Command {
@@ -433,5 +456,5 @@ func runAccessoryRestore(flags *Flags, name, date, bucket, region string) error 
 
 	client := backup.NewClient(executor, os.Stdout)
 	s3Cfg := backup.S3Config{Bucket: bucket, Region: region}
-	return client.AccessoryRestore(ctx, appCfg.App, name, accCfg.Image, date, s3Cfg)
+	return client.AccessoryRestore(ctx, appCfg.App, name, accCfg.Image, date, accCfg.Env, s3Cfg)
 }
