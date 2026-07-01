@@ -12,6 +12,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/useteploy/teploy/internal/caddy"
 	"github.com/useteploy/teploy/internal/config"
+	"github.com/useteploy/teploy/internal/deploy"
 	"github.com/useteploy/teploy/internal/multideploy"
 	"github.com/useteploy/teploy/internal/ssh"
 )
@@ -155,6 +156,43 @@ func deploySingleServer(ctx context.Context, appCfg *config.AppConfig, target mu
 	return deployer.deployApp(ctx, appCfg, target.Tags)
 }
 
+// rollbackSingleServer connects to one server and rolls it back to its
+// previous version. Used by runMultiDeploy's rollback-all-on-partial-
+// failure path (see internal/multideploy: it reuses ParallelDeploy itself
+// to run this across every server that deployed successfully, so the
+// fleet ends up consistent instead of split-brain).
+func rollbackSingleServer(ctx context.Context, appCfg *config.AppConfig, target multideploy.ServerTarget, out io.Writer) error {
+	fmt.Fprintf(out, "Connecting to %s@%s...\n", target.User, target.Host)
+
+	executor, err := ssh.Connect(ctx, ssh.ConnectConfig{
+		Host:    target.Host,
+		User:    target.User,
+		KeyPath: target.Key,
+	})
+	if err != nil {
+		return fmt.Errorf("connecting to %s: %w", target.Name, err)
+	}
+	defer executor.Close()
+
+	// Preserve custom TLS termination across rollback, same as the
+	// interactive `teploy rollback` path (internal/cli/rollback.go).
+	tlsCert, tlsKey, tlsInternal, err := resolveAppTLS(ctx, executor, appCfg)
+	if err != nil {
+		return err
+	}
+
+	return deploy.Rollback(ctx, executor, out, deploy.RollbackConfig{
+		App:         appCfg.App,
+		Domain:      appCfg.Domain,
+		StopTimeout: appCfg.StopTimeout,
+		TLSCert:     tlsCert,
+		TLSKey:      tlsKey,
+		TLSInternal: tlsInternal,
+		CaddyExtra:  appCfg.CaddyExtra,
+		Ingress:     appCfg.Ingress,
+	})
+}
+
 // updateLoadBalancer updates the LB server's Caddy upstream list with the successful targets.
 func updateLoadBalancer(ctx context.Context, flags *Flags, appCfg *config.AppConfig, serversPath string, targets []multideploy.ServerTarget) error {
 	lbServers, err := config.GetServersByRole(serversPath, "lb")
@@ -194,15 +232,12 @@ func updateLoadBalancer(ctx context.Context, flags *Flags, appCfg *config.AppCon
 
 		// Upload + reference the app's custom TLS cert on this LB host so the
 		// load balancer terminates HTTPS the same way the app servers do.
-		var tls caddy.TLS
-		if appCfg.TLS != nil {
-			cert, key, upErr := uploadAppTLS(ctx, executor, appCfg.App, appCfg.TLS)
-			if upErr != nil {
-				executor.Close()
-				return fmt.Errorf("uploading TLS to LB %s: %w", name, upErr)
-			}
-			tls = caddy.TLS{Cert: cert, Key: key}
+		cert, key, internal, tlsErr := resolveAppTLS(ctx, executor, appCfg)
+		if tlsErr != nil {
+			executor.Close()
+			return fmt.Errorf("uploading TLS to LB %s: %w", name, tlsErr)
 		}
+		tls := caddy.TLS{Cert: cert, Key: key, Internal: internal}
 
 		client := caddy.NewClient(executor)
 		err = client.SetLoadBalancer(ctx, appCfg.App, appCfg.Domain, upstreams, tls, appCfg.CaddyExtra)

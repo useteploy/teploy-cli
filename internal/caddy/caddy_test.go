@@ -419,6 +419,98 @@ func TestLoadBalancerBlock_WithTLS(t *testing.T) {
 	}
 }
 
+// TestIsPubliclyRoutable is the detection helper behind the non-public
+// domain fix below: without it, a bare IP or LAN address in `domain:`
+// makes Caddy attempt (and hang on) a real ACME challenge it can never
+// complete.
+func TestIsPubliclyRoutable(t *testing.T) {
+	cases := []struct {
+		host string
+		want bool
+	}{
+		{"example.com", true},
+		{"myapp.example.com", true},
+		{"192.168.1.114", false}, // the investment-club incident this fix is for
+		{"10.0.0.5", false},
+		{"172.16.0.1", false},
+		{"127.0.0.1", false},
+		{"203.0.113.5", false}, // a real public IP still can't get an ACME cert bare
+		{"::1", false},
+		{"2001:db8::1", false},
+	}
+	for _, c := range cases {
+		if got := IsPubliclyRoutable(c.host); got != c.want {
+			t.Errorf("IsPubliclyRoutable(%q) = %v, want %v", c.host, got, c.want)
+		}
+	}
+}
+
+// TestReverseProxyBlock_NonPublicDomainGetsPlainHTTP is the direct
+// regression test for tonight's incident: a bare-IP domain used to render
+// as a plain `192.168.1.114 { ... }` site address, and Caddy's default
+// automatic HTTPS then hung forever trying an ACME challenge it could
+// never complete (HTTP 308 redirect to a TLS handshake that never
+// finishes). It must now get an explicit http:// scheme instead, which
+// tells Caddy not to manage TLS for that address.
+func TestReverseProxyBlock_NonPublicDomainGetsPlainHTTP(t *testing.T) {
+	got := reverseProxyBlock([]string{"192.168.1.114"}, "investment-club-v1", 3000, TLS{}, "")
+	want := "http://192.168.1.114 {\n\treverse_proxy investment-club-v1:3000\n}"
+	if got != want {
+		t.Errorf("reverseProxyBlock for a bare IP:\nwant: %q\ngot:  %q", want, got)
+	}
+}
+
+func TestStaticBlock_NonPublicDomainGetsPlainHTTP(t *testing.T) {
+	got := StaticBlock(StaticBlockOpts{Hosts: []string{"192.168.1.114"}, Root: "/srv/static/investment-club/current"})
+	if !strings.HasPrefix(got, "http://192.168.1.114 {") {
+		t.Errorf("StaticBlock for a bare IP should start with http://, got:\n%s", got)
+	}
+}
+
+// TestReverseProxyBlock_TLSInternalKeepsRealHost confirms the opt-in
+// escape hatch: a non-public host with tls.internal set should NOT get
+// the http:// fallback — the operator explicitly asked for HTTPS via
+// Caddy's local CA, so automatic-HTTPS avoidance would be wrong here.
+func TestReverseProxyBlock_TLSInternalKeepsRealHost(t *testing.T) {
+	got := reverseProxyBlock([]string{"192.168.1.114"}, "myapp-v1", 3000, TLS{Internal: true}, "")
+	want := "192.168.1.114 {\n\ttls internal\n\treverse_proxy myapp-v1:3000\n}"
+	if got != want {
+		t.Errorf("reverseProxyBlock with tls.internal:\nwant: %q\ngot:  %q", want, got)
+	}
+}
+
+// A custom cert is also an explicit opt-in into managed TLS, same as
+// tls.internal — must not get the http:// fallback either.
+func TestReverseProxyBlock_CustomCertKeepsRealHost(t *testing.T) {
+	got := reverseProxyBlock([]string{"192.168.1.114"}, "myapp-v1", 3000,
+		TLS{Cert: "/etc/caddy/tls/myapp.crt", Key: "/etc/caddy/tls/myapp.key"}, "")
+	if strings.HasPrefix(got, "http://") {
+		t.Errorf("a custom cert should keep the real host, not fall back to http://:\n%s", got)
+	}
+}
+
+func TestMaintenanceBlock_NonPublicDomainGetsPlainHTTP(t *testing.T) {
+	got := maintenanceBlock([]string{"192.168.1.114"})
+	if !strings.HasPrefix(got, "http://192.168.1.114 {") {
+		t.Errorf("maintenanceBlock for a bare IP should start with http://, got:\n%s", got)
+	}
+}
+
+// Public hosts must be completely unaffected — no regression for the
+// overwhelmingly common case of a real domain name.
+func TestSiteAddresses_PublicHostUnchanged(t *testing.T) {
+	got := siteAddresses([]string{"example.com", "www.example.com"}, TLS{})
+	want := []string{"example.com", "www.example.com"}
+	if len(got) != len(want) {
+		t.Fatalf("got %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("siteAddresses[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
 func TestTLS_Directive_EmptyWhenUnset(t *testing.T) {
 	if (TLS{}).directive() != "" {
 		t.Error("empty TLS should produce no directive")

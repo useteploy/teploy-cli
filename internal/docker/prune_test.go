@@ -48,10 +48,10 @@ func TestPruneVersions_KeepsNewest(t *testing.T) {
 	}, "\n")
 
 	mock := ssh.NewMockExecutor("1.2.3.4",
-		ssh.MockCommand{Match: "docker ps --all --filter label=teploy.app=myapp", Output: listOutput},
-		ssh.MockCommand{Match: "docker rm -f myapp-web-v1", Output: ""},
-		ssh.MockCommand{Match: "docker rm -f myapp-worker-v1", Output: ""},
-		ssh.MockCommand{Match: "docker rmi myapp:v1", Output: ""},
+		ssh.MockCommand{Match: "docker ps --all --filter label=teploy.app='myapp'", Output: listOutput},
+		ssh.MockCommand{Match: "docker rm -f 'myapp-web-v1'", Output: ""},
+		ssh.MockCommand{Match: "docker rm -f 'myapp-worker-v1'", Output: ""},
+		ssh.MockCommand{Match: "docker rmi 'myapp:v1'", Output: ""},
 	)
 	client := NewClient(mock)
 
@@ -83,9 +83,9 @@ func TestPruneVersions_ProtectsExplicit(t *testing.T) {
 	}, "\n")
 
 	mock := ssh.NewMockExecutor("1.2.3.4",
-		ssh.MockCommand{Match: "docker ps --all --filter label=teploy.app=myapp", Output: listOutput},
-		ssh.MockCommand{Match: "docker rm -f myapp-web-vB", Output: ""},
-		ssh.MockCommand{Match: "docker rmi myapp:vB", Output: ""},
+		ssh.MockCommand{Match: "docker ps --all --filter label=teploy.app='myapp'", Output: listOutput},
+		ssh.MockCommand{Match: "docker rm -f 'myapp-web-vB'", Output: ""},
+		ssh.MockCommand{Match: "docker rmi 'myapp:vB'", Output: ""},
 	)
 	client := NewClient(mock)
 
@@ -104,7 +104,7 @@ func TestPruneVersions_ProtectsExplicit(t *testing.T) {
 // keep) nothing is removed and nothing returned.
 func TestPruneVersions_NoOp(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
-		ssh.MockCommand{Match: "docker ps --all --filter label=teploy.app=myapp", Output: ""},
+		ssh.MockCommand{Match: "docker ps --all --filter label=teploy.app='myapp'", Output: ""},
 	)
 	client := NewClient(mock)
 	pruned, err := client.PruneVersions(context.Background(), "myapp", 5)
@@ -128,9 +128,9 @@ func TestPruneVersions_IgnoresUnlabeled(t *testing.T) {
 	}, "\n")
 
 	mock := ssh.NewMockExecutor("1.2.3.4",
-		ssh.MockCommand{Match: "docker ps --all --filter label=teploy.app=myapp", Output: listOutput},
-		ssh.MockCommand{Match: "docker rm -f myapp-web-v1", Output: ""},
-		ssh.MockCommand{Match: "docker rmi myapp:v1", Output: ""},
+		ssh.MockCommand{Match: "docker ps --all --filter label=teploy.app='myapp'", Output: listOutput},
+		ssh.MockCommand{Match: "docker rm -f 'myapp-web-v1'", Output: ""},
+		ssh.MockCommand{Match: "docker rmi 'myapp:v1'", Output: ""},
 	)
 	client := NewClient(mock)
 

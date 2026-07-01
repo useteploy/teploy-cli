@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"io"
+	"regexp"
 	"strings"
 
 	"github.com/useteploy/teploy/internal/ssh"
@@ -12,7 +13,6 @@ import (
 
 const (
 	deploymentsDir = "/deployments"
-	scriptName     = "autodeploy.sh"
 	// scheduledScriptName is the per-app on-server script that the scheduled
 	// redeploy cron job invokes. It checks for a newer image digest and
 	// recreates the container if there is one — otherwise no-ops silently.
@@ -33,11 +33,42 @@ func ValidateSchedule(schedule string) error {
 	return nil
 }
 
+// validBranch matches real-world git branch names (alphanumeric, dot,
+// underscore, slash, hyphen — e.g. "main", "feature/new-landing") while
+// excluding whitespace and shell/systemd metacharacters.
+var validBranch = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._/-]*$`)
+
+// ValidateBranch checks that a branch name is safe to embed in a systemd
+// ExecStart= line (Setup, below) and in the git commands `teploy autodeploy
+// serve` runs against it. Unvalidated, this was a latent shell-injection
+// vector in the previous generated-bash-script implementation too
+// (`BRANCH="%s"` interpolated directly) — not new to this rewrite, but
+// worth actually fixing now rather than carrying forward.
+func ValidateBranch(branch string) error {
+	if branch == "" {
+		return fmt.Errorf("branch is required")
+	}
+	if !validBranch.MatchString(branch) {
+		return fmt.Errorf("invalid branch %q — must be alphanumeric with .-_/ (no spaces or shell metacharacters)", branch)
+	}
+	return nil
+}
+
 // Config holds auto-deploy configuration.
 type Config struct {
 	App    string
 	Branch string // branch to watch (default "main")
 	Secret string // webhook secret for validation
+	// TeployBinaryPath is where the teploy binary was uploaded on the
+	// server (see internal/cli/binarydist.go's deployTeployBinaryToServer,
+	// called by the CLI layer before Setup — this package doesn't fetch it
+	// itself to avoid an import cycle with internal/cli, which already
+	// imports this package). The systemd unit's ExecStart runs `<this>
+	// autodeploy serve --app <app> --port <port>`.
+	TeployBinaryPath string
+	// Port is the local port `teploy autodeploy serve` listens on and
+	// Caddy's webhook route (SetupCaddyRoute) proxies to. Defaults to 9876.
+	Port int
 }
 
 // Manager handles webhook auto-deploy setup on the server.
@@ -59,17 +90,41 @@ func NewManager(exec ssh.Executor, out io.Writer) *Manager {
 	return &Manager{exec: exec, out: out}
 }
 
-// Setup installs the auto-deploy webhook handler on the server.
-// Creates a lightweight shell script that:
-//  1. Validates the webhook secret
-//  2. Checks if the push is to the watched branch
-//  3. Pulls the latest code and rebuilds
-//
-// Caddy is configured to route POST /teploy-webhook/<app> to the script
-// via a simple exec handler using a systemd service.
+// SecretPath returns the on-server path where the webhook secret is
+// stored (0600, root-owned) — written by Setup, read by `teploy autodeploy
+// serve` at startup. A fixed, well-known path rather than a --secret CLI
+// flag: an argument would be visible in this host's `ps aux` /
+// `/proc/<pid>/cmdline` for the life of the serve process, the same class
+// of exposure Phase 1/2 closed for shell command arguments elsewhere.
+func SecretPath(app string) string {
+	return fmt.Sprintf("%s/%s/.autodeploy-secret", deploymentsDir, app)
+}
+
+// BuildDir returns the on-server directory `teploy autodeploy serve`
+// fetches and builds from — the same path deployAppConfig's server-build
+// mode already uses for `teploy deploy` (internal/cli/deploy.go), so a
+// webhook-triggered deploy and a manual one share one checkout instead of
+// each maintaining their own.
+func BuildDir(app string) string {
+	return fmt.Sprintf("%s/%s/build", deploymentsDir, app)
+}
+
+// Setup installs the auto-deploy webhook listener on the server: writes
+// the webhook secret to SecretPath, then installs and starts a systemd
+// service running `<TeployBinaryPath> autodeploy serve` — a real Go HTTP
+// server (internal/cli/autodeploy_serve.go) that verifies the webhook
+// signature, dedups replayed deliveries, and calls the exact same deploy
+// code `teploy deploy` uses. Caddy is configured separately (see
+// SetupCaddyRoute) to proxy POST /teploy-webhook/<app> to it.
 func (m *Manager) Setup(ctx context.Context, cfg Config) error {
 	if cfg.Branch == "" {
 		cfg.Branch = "main"
+	}
+	if err := ValidateBranch(cfg.Branch); err != nil {
+		return err
+	}
+	if cfg.Port == 0 {
+		cfg.Port = 9876
 	}
 	// Require a secret. Without one the webhook listener accepts any POST and
 	// becomes an unauthenticated remote deploy trigger. The CLI generates a
@@ -78,34 +133,34 @@ func (m *Manager) Setup(ctx context.Context, cfg Config) error {
 	if strings.TrimSpace(cfg.Secret) == "" {
 		return fmt.Errorf("auto-deploy requires a webhook secret (refusing to install an unauthenticated listener)")
 	}
+	if strings.TrimSpace(cfg.TeployBinaryPath) == "" {
+		return fmt.Errorf("auto-deploy requires TeployBinaryPath (upload the teploy binary before calling Setup)")
+	}
 
 	appDir := fmt.Sprintf("%s/%s", deploymentsDir, cfg.App)
-	scriptPath := fmt.Sprintf("%s/%s", appDir, scriptName)
-
-	// Ensure app directory exists.
 	if _, err := m.exec.Run(ctx, "mkdir -p "+appDir); err != nil {
 		return fmt.Errorf("creating app directory: %w", err)
 	}
 
-	// Write the auto-deploy script.
-	fmt.Fprintln(m.out, "Installing auto-deploy script...")
-	script := generateScript(cfg)
-	if err := m.exec.Upload(ctx, strings.NewReader(script), scriptPath, "0755"); err != nil {
-		return fmt.Errorf("uploading deploy script: %w", err)
+	fmt.Fprintln(m.out, "Writing webhook secret...")
+	if err := m.exec.Upload(ctx, strings.NewReader(cfg.Secret), SecretPath(cfg.App), "0600"); err != nil {
+		return fmt.Errorf("uploading webhook secret: %w", err)
 	}
 
-	// Create systemd service for the webhook listener.
+	// Install and start systemd service running `teploy autodeploy serve`.
 	fmt.Fprintln(m.out, "Setting up webhook listener...")
 	serviceName := fmt.Sprintf("teploy-webhook-%s", cfg.App)
-	listenerScript := generateListener(cfg.App, cfg.Secret, scriptPath)
-	listenerPath := fmt.Sprintf("%s/webhook-listener.sh", appDir)
-
-	if err := m.exec.Upload(ctx, strings.NewReader(listenerScript), listenerPath, "0755"); err != nil {
-		return fmt.Errorf("uploading listener script: %w", err)
-	}
-
-	// Install and start systemd service.
-	serviceContent := generateService(serviceName, listenerPath)
+	// No shell-style quoting here: ExecStart= is parsed by systemd's own
+	// (POSIX-shell-similar but not identical) rules, not a real shell — so
+	// ssh.ShellQuote's escaping isn't guaranteed to apply correctly. Not
+	// needed anyway: App is constrained to config.validName's [a-z0-9-]+ by
+	// config.validate() before Config.App is ever set, Branch is checked
+	// above by ValidateBranch, and TeployBinaryPath is a fixed path this
+	// package controls (see internal/cli/autodeploy.go) — none of the three
+	// can contain whitespace or metacharacters.
+	execStart := fmt.Sprintf("%s autodeploy serve --app %s --branch %s --port %d",
+		cfg.TeployBinaryPath, cfg.App, cfg.Branch, cfg.Port)
+	serviceContent := generateService(serviceName, execStart)
 	servicePath := fmt.Sprintf("/etc/systemd/system/%s.service", serviceName)
 	if err := m.exec.Upload(ctx, strings.NewReader(serviceContent), servicePath, "0644"); err != nil {
 		return fmt.Errorf("uploading systemd service: %w", err)
@@ -123,7 +178,7 @@ func (m *Manager) Setup(ctx context.Context, cfg Config) error {
 		}
 	}
 
-	fmt.Fprintf(m.out, "  Webhook listener running on port 9876\n")
+	fmt.Fprintf(m.out, "  Webhook listener running on port %d\n", cfg.Port)
 	return nil
 }
 
@@ -169,7 +224,11 @@ func (m *Manager) Status(ctx context.Context, app string) (bool, string, error) 
 func (m *Manager) ScheduleStatus(ctx context.Context, app string) (string, error) {
 	scriptPath := fmt.Sprintf("%s/%s/%s", deploymentsDir, app, scheduledScriptName)
 	// crontab -l exits non-zero when there is no crontab. Treat that as "no schedule".
-	out, err := m.exec.Run(ctx, fmt.Sprintf("crontab -l 2>/dev/null | grep -F %q || true", scriptPath))
+	// app is validated (config.ValidateName) by every caller today, but quote
+	// scriptPath anyway rather than rely on that staying true forever — %q
+	// (Go double-quote) doesn't stop shell $()/backtick expansion the way
+	// ssh.ShellQuote's single-quoting does.
+	out, err := m.exec.Run(ctx, fmt.Sprintf("crontab -l 2>/dev/null | grep -F %s || true", ssh.ShellQuote(scriptPath)))
 	if err != nil {
 		return "", nil
 	}
@@ -219,8 +278,8 @@ func (m *Manager) Schedule(ctx context.Context, app, schedule string) error {
 	// `crontab -l 2>/dev/null || true` form keeps the pipeline going from
 	// a zero-state install.
 	cronCmd := fmt.Sprintf(
-		"(crontab -l 2>/dev/null | grep -vF %q; echo '%s %s >> %s/scheduled-redeploy.log 2>&1') | crontab -",
-		scriptPath, schedule, scriptPath, appDir,
+		"(crontab -l 2>/dev/null | grep -vF %s; echo '%s %s >> %s/scheduled-redeploy.log 2>&1') | crontab -",
+		ssh.ShellQuote(scriptPath), schedule, scriptPath, appDir,
 	)
 	if _, err := m.exec.Run(ctx, cronCmd); err != nil {
 		return fmt.Errorf("installing cron entry: %w", err)
@@ -243,8 +302,8 @@ func (m *Manager) Unschedule(ctx context.Context, app string) error {
 	scriptPath := fmt.Sprintf("%s/%s/%s", deploymentsDir, app, scheduledScriptName)
 
 	cronCmd := fmt.Sprintf(
-		"(crontab -l 2>/dev/null | grep -vF %q) | crontab - || crontab -r 2>/dev/null || true",
-		scriptPath,
+		"(crontab -l 2>/dev/null | grep -vF %s) | crontab - || crontab -r 2>/dev/null || true",
+		ssh.ShellQuote(scriptPath),
 	)
 	if _, err := m.exec.Run(ctx, cronCmd); err != nil {
 		return fmt.Errorf("removing cron entry: %w", err)
@@ -277,94 +336,15 @@ func (m *Manager) Remove(ctx context.Context, app string) error {
 	return nil
 }
 
-func generateScript(cfg Config) string {
-	return fmt.Sprintf(`#!/bin/bash
-# Auto-deploy script for %s
-# Triggered by webhook on push to %s
-set -e
-
-APP="%s"
-BRANCH="%s"
-DEPLOY_DIR="/deployments/$APP/build"
-LOG="/deployments/$APP/autodeploy.log"
-
-echo "$(date -u '+%%Y-%%m-%%dT%%H:%%M:%%SZ') Auto-deploy triggered for $APP (branch: $BRANCH)" >> "$LOG"
-
-cd "$DEPLOY_DIR" 2>/dev/null || { echo "No build directory" >> "$LOG"; exit 1; }
-
-# Pull latest changes.
-git fetch origin "$BRANCH" >> "$LOG" 2>&1
-git reset --hard "origin/$BRANCH" >> "$LOG" 2>&1
-
-# Detect build method and build.
-if [ -f Dockerfile ]; then
-    VERSION=$(git rev-parse --short HEAD)
-    docker build -t "${APP}-build-${VERSION}" . >> "$LOG" 2>&1
-else
-    echo "No Dockerfile found" >> "$LOG"
-    exit 1
-fi
-
-echo "$(date -u '+%%Y-%%m-%%dT%%H:%%M:%%SZ') Build complete: ${APP}-build-${VERSION}" >> "$LOG"
-`, cfg.App, cfg.Branch, cfg.App, cfg.Branch)
-}
-
-func generateListener(app, secret, scriptPath string) string {
-	// Escape single quotes in the secret for safe embedding in the single-quoted
-	// shell literal below.
-	escaped := strings.ReplaceAll(secret, "'", "'\\''")
-
-	return fmt.Sprintf(`#!/bin/bash
-# Webhook listener for %[1]s
-# Binds 127.0.0.1:9876 (Caddy proxies /teploy-webhook/%[1]s here), verifies the
-# HMAC-SHA256 signature over the request body, then triggers the deploy script.
-
-while true; do
-    echo -e "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nok" | \
-    nc -l 127.0.0.1 -p 9876 -q 1 | {
-        read -r METHOD PATH VERSION
-        SIG=""
-        # Capture the signature header, then stop at the blank line before the body.
-        while IFS= read -r LINE; do
-            LINE=$(echo "$LINE" | tr -d '\r')
-            [ -z "$LINE" ] && break
-            case "$LINE" in
-                [Xx]-[Hh]ub-[Ss]ignature-256:*)
-                    SIG=${LINE#*:}
-                    SIG=${SIG# }
-                    ;;
-            esac
-        done
-        # Read the FULL remaining body (cat, not a single-line read) so the HMAC
-        # is computed over every byte — a pretty-printed / multi-line payload
-        # would otherwise be truncated to its first line and rejected.
-        BODY=$(cat)
-
-        # Verify HMAC-SHA256 over the raw body. printf avoids the trailing
-        # newline echo would add (which would change the digest).
-        SIGNATURE=$(printf '%%s' "$BODY" | openssl dgst -sha256 -hmac '%[2]s' | awk '{print $NF}')
-        EXPECTED="sha256=$SIGNATURE"
-        if [ -z "$SIG" ] || [ "$SIG" != "$EXPECTED" ]; then
-            # Reject silently (200 already sent above; don't reveal validity).
-            continue
-        fi
-
-        # Trigger deploy in background.
-        nohup %[3]s >> /deployments/%[1]s/autodeploy.log 2>&1 &
-    }
-done
-`, app, escaped, scriptPath)
-}
-
 // generateScheduledRedeployScript returns the bash script that the cron job
 // invokes. It runs entirely on the server with no teploy-binary dependency:
-//   1. Find the running container for this app's "web" process by labels.
-//   2. Pull the image tag the container was started with.
-//   3. Compare the running image digest with the just-pulled one. If they
-//      match, exit silently — the container is already current.
-//   4. Otherwise, capture the current container's env, volumes, ports,
-//      labels, network, and restart policy via docker inspect, then
-//      stop+rm and recreate it with the same name and the new image.
+//  1. Find the running container for this app's "web" process by labels.
+//  2. Pull the image tag the container was started with.
+//  3. Compare the running image digest with the just-pulled one. If they
+//     match, exit silently — the container is already current.
+//  4. Otherwise, capture the current container's env, volumes, ports,
+//     labels, network, and restart policy via docker inspect, then
+//     stop+rm and recreate it with the same name and the new image.
 //
 // We keep the same container name on purpose: Caddy's reverse_proxy upstream
 // resolves containers by their network alias / DNS name, and re-using the
@@ -474,7 +454,10 @@ echo "$(ts) [ok] $CONTAINER redeployed (id=${NEW_ID:0:12} version=$NEW_VERSION)"
 `, app)
 }
 
-func generateService(name, listenerPath string) string {
+// generateService renders the systemd unit that runs execStart (the full
+// `<teploy binary> autodeploy serve ...` command line) as a resident
+// process, restarting it if it crashes.
+func generateService(name, execStart string) string {
 	return fmt.Sprintf(`[Unit]
 Description=Teploy webhook listener (%s)
 After=network.target
@@ -487,5 +470,5 @@ RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
-`, name, listenerPath)
+`, name, execStart)
 }

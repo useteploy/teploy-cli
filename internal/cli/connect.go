@@ -44,6 +44,15 @@ func resolveApp(ctx context.Context, flags *Flags, appName string) (*config.AppC
 	if flags.Host == "" {
 		return nil, nil, fmt.Errorf("--host is required when using --app")
 	}
+	// This path builds an AppConfig directly instead of going through
+	// config.LoadApp, so it never reaches AppConfig.validate() — appName
+	// (raw --app flag input) must be validated here before it reaches
+	// state.Read or any shell-interpolated command downstream (every
+	// command that supports --app, e.g. exec/logs/status/maintenance,
+	// goes through this helper).
+	if err := config.ValidateName(appName); err != nil {
+		return nil, nil, err
+	}
 	host, user, key, err := config.ResolveServer(flags.Host, flags.Host, flags.User, flags.Key)
 	if err != nil {
 		return nil, nil, err

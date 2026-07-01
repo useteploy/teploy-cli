@@ -11,6 +11,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/useteploy/teploy/internal/build"
+	"github.com/useteploy/teploy/internal/caddy"
 	"github.com/useteploy/teploy/internal/config"
 	"github.com/useteploy/teploy/internal/dns"
 	"github.com/useteploy/teploy/internal/ssh"
@@ -59,6 +60,15 @@ func runValidate(flags *Flags) error {
 		}
 	}
 
+	// 2b. Flag non-public domains (bare IPs, LAN addresses). dns.Validate
+	// below can't catch this — net.LookupHost short-circuits a literal IP
+	// straight back out, so a domain that's already an IP always "passes"
+	// DNS validation even though Caddy will serve it over plain HTTP (or
+	// self-signed HTTPS with tls.internal), never automatic HTTPS. Report
+	// it here explicitly so that's a documented, expected outcome instead
+	// of a surprise discovered mid-deploy.
+	result.Warns = append(result.Warns, nonPublicDomainWarnings(appCfg)...)
+
 	// 3. Check server connectivity.
 	if appCfg.Server == "" && flags.Host == "" {
 		result.Valid = false
@@ -100,6 +110,33 @@ func runValidate(flags *Flags) error {
 	}
 
 	return outputResult(flags, result)
+}
+
+// nonPublicDomainWarnings reports each host in appCfg.Domain that
+// caddy.IsPubliclyRoutable can't vouch for (bare IPs, LAN addresses),
+// worded according to how TLS is actually going to be handled for it —
+// plain HTTP by default, self-signed HTTPS with tls.internal, or a custom
+// certificate. Extracted from runValidate for direct unit testing.
+func nonPublicDomainWarnings(appCfg *config.AppConfig) []string {
+	var warns []string
+	for _, host := range strings.Split(appCfg.Domain, ",") {
+		host = strings.TrimSpace(host)
+		if host == "" || caddy.IsPubliclyRoutable(host) {
+			continue
+		}
+		switch {
+		case appCfg.TLS != nil && appCfg.TLS.Internal:
+			warns = append(warns, fmt.Sprintf(
+				"domain %q is not a public hostname — Caddy will serve it over self-signed HTTPS (tls.internal), not automatic HTTPS", host))
+		case appCfg.TLS != nil:
+			warns = append(warns, fmt.Sprintf(
+				"domain %q is not a public hostname — served via the configured custom certificate, not automatic HTTPS", host))
+		default:
+			warns = append(warns, fmt.Sprintf(
+				"domain %q is not a public hostname — will serve over plain HTTP (no TLS); add 'tls: {internal: true}' for self-signed HTTPS instead", host))
+		}
+	}
+	return warns
 }
 
 // runValidateServer connects to a named server and reports detailed status.

@@ -52,13 +52,13 @@ func TestEnsureRunning_New(t *testing.T) {
 		t.Fatal("expected docker run command")
 	}
 
-	if !strings.Contains(runCmd, "--name myapp-postgres") {
+	if !strings.Contains(runCmd, "--name 'myapp-postgres'") {
 		t.Error("expected container name myapp-postgres")
 	}
 	if !strings.Contains(runCmd, "--network teploy") {
 		t.Error("expected network teploy")
 	}
-	if !strings.Contains(runCmd, "--network-alias myapp-postgres") {
+	if !strings.Contains(runCmd, "--network-alias 'myapp-postgres'") {
 		t.Error("expected network alias myapp-postgres")
 	}
 	if !strings.Contains(runCmd, "--restart always") {
@@ -70,10 +70,10 @@ func TestEnsureRunning_New(t *testing.T) {
 	if !strings.Contains(runCmd, "teploy.accessory=postgres") {
 		t.Error("expected accessory name label")
 	}
-	if !strings.Contains(runCmd, "-e POSTGRES_DB=myapp") {
+	if !strings.Contains(runCmd, "-e 'POSTGRES_DB=myapp'") {
 		t.Error("expected POSTGRES_DB env var")
 	}
-	if !strings.Contains(runCmd, "-v /deployments/myapp/accessories/postgres/data:/var/lib/postgresql/data") {
+	if !strings.Contains(runCmd, "-v '/deployments/myapp/accessories/postgres/data:/var/lib/postgresql/data'") {
 		t.Error("expected volume mount")
 	}
 	if !strings.Contains(runCmd, "postgres:16") {
@@ -194,7 +194,7 @@ func TestEnsureRunning_StoredCredentials(t *testing.T) {
 			runCmd = call
 		}
 	}
-	if !strings.Contains(runCmd, "-e POSTGRES_PASSWORD=storedpass456") {
+	if !strings.Contains(runCmd, "-e 'POSTGRES_PASSWORD=storedpass456'") {
 		t.Error("expected stored password to be used")
 	}
 
@@ -233,7 +233,7 @@ func TestEnsureRunning_NoEnv(t *testing.T) {
 func TestList(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{
-			Match:  "docker ps --all --filter label=teploy.app=myapp --filter label=teploy.role=accessory",
+			Match:  "docker ps --all --filter label=teploy.app='myapp' --filter label=teploy.role=accessory",
 			Output: `{"ID":"abc123","Names":"myapp-postgres","Image":"postgres:16","State":"running","Status":"Up 2 hours"}`,
 		},
 	)
@@ -289,7 +289,7 @@ func TestStop(t *testing.T) {
 	if len(mock.Calls) != 1 {
 		t.Fatalf("expected 1 call, got %d", len(mock.Calls))
 	}
-	if !strings.Contains(mock.Calls[0], "docker stop -t 10 myapp-postgres") {
+	if !strings.Contains(mock.Calls[0], "docker stop -t 10 'myapp-postgres'") {
 		t.Errorf("unexpected command: %s", mock.Calls[0])
 	}
 }
@@ -309,7 +309,7 @@ func TestStart(t *testing.T) {
 	if len(mock.Calls) != 1 {
 		t.Fatalf("expected 1 call, got %d", len(mock.Calls))
 	}
-	if mock.Calls[0] != "docker start myapp-postgres" {
+	if mock.Calls[0] != "docker start 'myapp-postgres'" {
 		t.Errorf("unexpected command: %s", mock.Calls[0])
 	}
 }
@@ -326,7 +326,7 @@ func TestLogs(t *testing.T) {
 		t.Fatalf("Logs: %v", err)
 	}
 
-	if !strings.Contains(mock.Calls[0], "docker logs --tail 50 myapp-postgres") {
+	if !strings.Contains(mock.Calls[0], "docker logs --tail 50 'myapp-postgres'") {
 		t.Errorf("unexpected command: %s", mock.Calls[0])
 	}
 	if !strings.Contains(buf.String(), "database ready") {
@@ -370,7 +370,7 @@ func TestUpgrade(t *testing.T) {
 	}
 
 	// Verify pull was called with new image.
-	if !strings.Contains(mock.Calls[0], "docker pull postgres:17") {
+	if !strings.Contains(mock.Calls[0], "docker pull 'postgres:17'") {
 		t.Errorf("expected pull of postgres:17, got: %s", mock.Calls[0])
 	}
 

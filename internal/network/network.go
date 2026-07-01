@@ -79,7 +79,7 @@ func (t *TailscaleProvider) Join(ctx context.Context, exec ssh.Executor) error {
 	}
 	// Run tailscale up in the background. Tailscale modifies iptables which can kill
 	// the SSH connection that's running the command. Using nohup + background avoids this.
-	cmd := fmt.Sprintf(t.Sudo+"nohup tailscale up --authkey=%q --accept-routes >/dev/null 2>&1 & sleep 3 && "+t.Sudo+"tailscale status --json 2>/dev/null | grep -q Running", t.AuthKey)
+	cmd := t.Sudo + "nohup tailscale up --authkey=" + ssh.ShellQuote(t.AuthKey) + " --accept-routes >/dev/null 2>&1 & sleep 3 && " + t.Sudo + "tailscale status --json 2>/dev/null | grep -q Running"
 	if _, err := exec.Run(ctx, cmd); err != nil {
 		// SSH disconnect during tailscale up is expected — the iptables change can kill the connection.
 		// Check if tailscale actually joined by trying status again.
@@ -138,7 +138,7 @@ func (h *HeadscaleProvider) Join(ctx context.Context, exec ssh.Executor) error {
 	if err == nil && strings.Contains(out, `"BackendState":"Running"`) {
 		return nil
 	}
-	cmd := fmt.Sprintf(h.Sudo+"nohup tailscale up --login-server=%q --authkey=%q --accept-routes >/dev/null 2>&1 & sleep 3 && "+h.Sudo+"tailscale status --json 2>/dev/null | grep -q Running", h.Server, h.AuthKey)
+	cmd := h.Sudo + "nohup tailscale up --login-server=" + ssh.ShellQuote(h.Server) + " --authkey=" + ssh.ShellQuote(h.AuthKey) + " --accept-routes >/dev/null 2>&1 & sleep 3 && " + h.Sudo + "tailscale status --json 2>/dev/null | grep -q Running"
 	if _, err := exec.Run(ctx, cmd); err != nil {
 		out, statusErr := exec.Run(ctx, h.Sudo+"tailscale status --json 2>/dev/null")
 		if statusErr == nil && strings.Contains(out, `"BackendState":"Running"`) {
@@ -193,7 +193,7 @@ func (n *NetbirdProvider) Join(ctx context.Context, exec ssh.Executor) error {
 	if err == nil && strings.Contains(out, "Connected") {
 		return nil
 	}
-	cmd := fmt.Sprintf(n.Sudo+"netbird up --setup-key %q", n.SetupKey)
+	cmd := n.Sudo + "netbird up --setup-key " + ssh.ShellQuote(n.SetupKey)
 	if _, err := exec.Run(ctx, cmd); err != nil {
 		return fmt.Errorf("joining netbird mesh: %w", err)
 	}

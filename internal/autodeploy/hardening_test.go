@@ -1,76 +1,61 @@
 package autodeploy
 
 import (
+	"context"
 	"strings"
 	"testing"
 )
 
-func TestGenerateListener_SecretWithSingleQuote(t *testing.T) {
-	// A secret containing a single quote should be properly escaped
-	// to prevent shell injection.
-	listener := generateListener("myapp", "secret'with'quotes", "/deployments/myapp/autodeploy.sh")
+// These tests previously covered shell-escaping in the generated bash
+// webhook listener (generateListener/generateScript, removed by the
+// autodeploy rebuild — see autodeploy.go). HMAC verification and secret
+// handling moved into real Go code (webhook.go, tested in
+// webhook_test.go), which structurally can't have the shell-escaping bugs
+// those tests were guarding against: hmac.Equal never touches a shell at
+// all. What remains here is the branch-name validation this rewrite added
+// (the previous generateScript embedded BRANCH="%s" into bash unescaped —
+// a latent injection vector nothing tested before).
 
-	// The secret should NOT appear as an unescaped single-quoted string
-	// that would break the bash syntax.
-	if strings.Contains(listener, "hmac 'secret'with'quotes'") {
-		t.Error("single quotes in secret must be escaped")
-	}
-
-	// The escaped version should be present.
-	if !strings.Contains(listener, "secret") {
-		t.Error("listener should still contain the secret reference")
-	}
-
-	// Should still have the HMAC validation block.
-	if !strings.Contains(listener, "openssl dgst -sha256") {
-		t.Error("listener should contain HMAC validation")
-	}
-}
-
-func TestGenerateListener_AlwaysValidates(t *testing.T) {
-	// The listener now ALWAYS verifies an HMAC signature — there is no
-	// unauthenticated mode (Setup rejects an empty secret). Even when called
-	// with an empty key, the validation block must be present.
-	listener := generateListener("myapp", "", "/deployments/myapp/autodeploy.sh")
-	if !strings.Contains(listener, "openssl dgst -sha256") {
-		t.Error("listener must always contain HMAC validation")
-	}
-	if !strings.Contains(listener, "nc -l 127.0.0.1") {
-		t.Error("listener must bind to 127.0.0.1, not all interfaces")
-	}
-}
-
-func TestGenerateListener_SecretWithShellMetachars(t *testing.T) {
-	// Test various shell metacharacters that could be dangerous.
+func TestValidateBranch_RejectsShellMetacharacters(t *testing.T) {
 	dangerous := []string{
-		"secret$(whoami)",
-		"secret`id`",
-		"secret;rm -rf /",
-		"secret|cat /etc/passwd",
-		"secret\ninjected",
+		"",
+		"feature$(whoami)",
+		"feature`id`",
+		"feature;rm -rf /",
+		"feature|cat /etc/passwd",
+		"feature\ninjected",
+		"has spaces",
 	}
-
-	for _, secret := range dangerous {
-		listener := generateListener("myapp", secret, "/deployments/myapp/autodeploy.sh")
-		// Should still produce valid output (not crash).
-		if listener == "" {
-			t.Errorf("generateListener returned empty for secret %q", secret)
-		}
-		// Should contain the HMAC block.
-		if !strings.Contains(listener, "openssl dgst") {
-			t.Errorf("listener missing HMAC block for secret %q", secret)
+	for _, branch := range dangerous {
+		if err := ValidateBranch(branch); err == nil {
+			t.Errorf("ValidateBranch(%q) = nil, want error", branch)
 		}
 	}
 }
 
-func TestGenerateScript_SpecialBranch(t *testing.T) {
-	// Branch names with special chars should be safely embedded.
-	script := generateScript(Config{
-		App:    "myapp",
-		Branch: "feature/my-branch",
-	})
+func TestValidateBranch_AcceptsRealBranchNames(t *testing.T) {
+	valid := []string{"main", "master", "feature/my-branch", "release-1.2.3", "fix_bug_123"}
+	for _, branch := range valid {
+		if err := ValidateBranch(branch); err != nil {
+			t.Errorf("ValidateBranch(%q) = %v, want nil", branch, err)
+		}
+	}
+}
 
-	if !strings.Contains(script, `BRANCH="feature/my-branch"`) {
-		t.Error("script should contain the branch name with slash")
+// TestSetup_RejectsInvalidBranch confirms Setup itself enforces
+// ValidateBranch, not just the CLI layer, since Config can be constructed
+// directly by any caller.
+func TestSetup_RejectsInvalidBranch(t *testing.T) {
+	err := (&Manager{}).Setup(context.Background(), Config{
+		App:              "myapp",
+		Branch:           "feature; rm -rf /",
+		Secret:           "s3cret",
+		TeployBinaryPath: "/deployments/.bin/teploy",
+	})
+	if err == nil {
+		t.Fatal("expected error for a branch name with shell metacharacters")
+	}
+	if !strings.Contains(err.Error(), "branch") {
+		t.Errorf("error should mention the branch, got: %v", err)
 	}
 }

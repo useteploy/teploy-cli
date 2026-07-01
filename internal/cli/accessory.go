@@ -94,6 +94,9 @@ func newAccessoryExecCmd(flags *Flags) *cobra.Command {
 }
 
 func runAccessoryExec(flags *Flags, appName, name string, args []string) error {
+	if err := config.ValidateIdentifier("accessory", name); err != nil {
+		return err
+	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
@@ -172,6 +175,9 @@ func newAccessoryStopCmd(flags *Flags) *cobra.Command {
 }
 
 func runAccessoryStop(flags *Flags, appName, name string) error {
+	if err := config.ValidateIdentifier("accessory", name); err != nil {
+		return err
+	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
@@ -205,6 +211,9 @@ func newAccessoryStartCmd(flags *Flags) *cobra.Command {
 }
 
 func runAccessoryStart(flags *Flags, appName, name string) error {
+	if err := config.ValidateIdentifier("accessory", name); err != nil {
+		return err
+	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
@@ -244,6 +253,9 @@ func newAccessoryLogsCmd(flags *Flags) *cobra.Command {
 }
 
 func runAccessoryLogs(flags *Flags, appName, name string, lines int) error {
+	if err := config.ValidateIdentifier("accessory", name); err != nil {
+		return err
+	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 

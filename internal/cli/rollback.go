@@ -21,22 +21,24 @@ func newRollbackCmd(flags *Flags) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "rollback",
 		Short: "Roll back to the previous deploy",
-		Long: `Start the previous version's containers (or, for type:static apps, flip the
+		Long: `Start the target version's containers (or, for type:static apps, flip the
 release symlink), health check, re-route traffic, and stop the current containers.
 
-For type:static apps, --to <hash> rolls back to a specific retained release;
-without --to, the previous deploy is used.`,
+--to <hash> rolls back to a specific version instead of just the immediately
+previous one — for containers, whatever version's containers are still on the
+server (see keep_versions retention); for type:static apps, a specific retained
+release (see keep_releases). Without --to, the previous deploy is used.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if appName != "" {
-				return runRollbackByApp(flags, appName)
+				return runRollbackByApp(flags, appName, toHash)
 			}
 			return runRollback(flags, toHash)
 		},
 	}
 
 	cmd.Flags().StringVar(&appName, "app", "", "app name — reads state from server instead of teploy.yml (requires --host)")
-	cmd.Flags().StringVar(&toHash, "to", "", "specific release hash to roll back to (type:static only)")
+	cmd.Flags().StringVar(&toHash, "to", "", "specific version/release hash to roll back to")
 
 	return cmd
 }
@@ -71,26 +73,21 @@ func runRollback(flags *Flags, toHash string) error {
 		})
 	}
 
-	if toHash != "" {
-		return fmt.Errorf("--to is only supported for type:static apps")
-	}
-
 	// Preserve custom TLS termination across rollback. The cert is already
 	// on the server from the last deploy; re-upload to be safe (idempotent).
-	var tlsCert, tlsKey string
-	if appCfg.TLS != nil {
-		tlsCert, tlsKey, err = uploadAppTLS(ctx, executor, appCfg.App, appCfg.TLS)
-		if err != nil {
-			return err
-		}
+	tlsCert, tlsKey, tlsInternal, err := resolveAppTLS(ctx, executor, appCfg)
+	if err != nil {
+		return err
 	}
 
 	rollbackErr := deploy.Rollback(ctx, executor, os.Stdout, deploy.RollbackConfig{
 		App:         appCfg.App,
 		Domain:      appCfg.Domain,
 		StopTimeout: appCfg.StopTimeout,
+		ToHash:      toHash,
 		TLSCert:     tlsCert,
 		TLSKey:      tlsKey,
+		TLSInternal: tlsInternal,
 		CaddyExtra:  appCfg.CaddyExtra,
 		Ingress:     appCfg.Ingress,
 	})
@@ -115,9 +112,17 @@ func runRollback(flags *Flags, toHash string) error {
 	return rollbackErr
 }
 
-// runRollbackByApp rolls back using server-side state instead of a local teploy.yml.
-// Used by teploy-dash and for running rollback outside of an app directory.
-func runRollbackByApp(flags *Flags, appName string) error {
+// runRollbackByApp rolls back using server-side state instead of a local
+// teploy.yml. Used by teploy-dash and for running rollback outside of an
+// app directory.
+//
+// Known gap, not addressed here: this always calls the container
+// deploy.Rollback — it never checks whether the app is actually
+// type:static (that requires teploy.yml, which this path deliberately
+// doesn't need) and branches to StaticDeployer.Rollback the way
+// runRollback does. Calling `teploy rollback --app <static-app> --host
+// ...` will fail rather than correctly flip the release symlink.
+func runRollbackByApp(flags *Flags, appName, toHash string) error {
 	if flags.Host == "" {
 		return fmt.Errorf("--host is required when using --app")
 	}
@@ -150,5 +155,6 @@ func runRollbackByApp(flags *Flags, appName string) error {
 	return deploy.Rollback(ctx, executor, os.Stdout, deploy.RollbackConfig{
 		App:    appName,
 		Domain: appState.Domain,
+		ToHash: toHash,
 	})
 }

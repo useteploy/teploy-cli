@@ -22,34 +22,50 @@ func TestSetup(t *testing.T) {
 	var buf bytes.Buffer
 	mgr := NewManager(mock, &buf)
 	err := mgr.Setup(context.Background(), Config{
-		App:    "myapp",
-		Branch: "main",
-		Secret: "mysecret",
+		App:              "myapp",
+		Branch:           "main",
+		Secret:           "mysecret",
+		TeployBinaryPath: "/deployments/.bin/teploy",
 	})
 	if err != nil {
 		t.Fatalf("Setup: %v", err)
 	}
 
 	output := buf.String()
-	if !strings.Contains(output, "Installing auto-deploy script") {
-		t.Error("expected install message")
+	if !strings.Contains(output, "Writing webhook secret") {
+		t.Error("expected secret-write message")
 	}
 	if !strings.Contains(output, "webhook listener") {
 		t.Error("expected webhook listener message")
 	}
 
-	// Verify files were uploaded.
-	if len(mock.Files) < 3 {
-		t.Errorf("expected at least 3 file uploads, got %d", len(mock.Files))
+	// The secret must reach the server only via the dedicated secret file
+	// (SecretPath) — never embedded in a generated script or the systemd
+	// unit, either of which `systemctl cat`/`ps aux` could expose.
+	secret, ok := mock.Files[SecretPath("myapp")]
+	if !ok {
+		t.Fatal("webhook secret not uploaded to SecretPath")
+	}
+	if string(secret) != "mysecret" {
+		t.Errorf("secret file = %q, want %q", secret, "mysecret")
 	}
 
-	// Verify deploy script was uploaded.
-	script, ok := mock.Files["/deployments/myapp/autodeploy.sh"]
+	// The systemd unit's ExecStart must reference the uploaded teploy
+	// binary and the app/branch/port — this is what actually gets
+	// invoked, replacing the old bash listener script entirely.
+	svc, ok := mock.Files["/etc/systemd/system/teploy-webhook-myapp.service"]
 	if !ok {
-		t.Fatal("deploy script not uploaded")
+		t.Fatal("systemd service not uploaded")
 	}
-	if !strings.Contains(string(script), "BRANCH=\"main\"") {
-		t.Error("script should contain branch")
+	for _, want := range []string{
+		"ExecStart=/deployments/.bin/teploy autodeploy serve",
+		"--app myapp",
+		"--branch main",
+		"--port 9876",
+	} {
+		if !strings.Contains(string(svc), want) {
+			t.Errorf("systemd unit missing %q, got:\n%s", want, svc)
+		}
 	}
 }
 
@@ -64,16 +80,25 @@ func TestSetup_DefaultBranch(t *testing.T) {
 	var buf bytes.Buffer
 	mgr := NewManager(mock, &buf)
 	err := mgr.Setup(context.Background(), Config{
-		App:    "myapp",
-		Secret: "test-secret",
+		App:              "myapp",
+		Secret:           "test-secret",
+		TeployBinaryPath: "/deployments/.bin/teploy",
 	})
 	if err != nil {
 		t.Fatalf("Setup: %v", err)
 	}
 
-	script := string(mock.Files["/deployments/myapp/autodeploy.sh"])
-	if !strings.Contains(script, "BRANCH=\"main\"") {
+	svc := string(mock.Files["/etc/systemd/system/teploy-webhook-myapp.service"])
+	if !strings.Contains(svc, "--branch main") {
 		t.Error("default branch should be main")
+	}
+}
+
+func TestSetup_RequiresTeployBinaryPath(t *testing.T) {
+	mgr := NewManager(ssh.NewMockExecutor("1.2.3.4"), &bytes.Buffer{})
+	err := mgr.Setup(context.Background(), Config{App: "myapp", Secret: "s3cret"})
+	if err == nil {
+		t.Fatal("expected error when TeployBinaryPath is not set")
 	}
 }
 
@@ -132,32 +157,17 @@ func TestRemove(t *testing.T) {
 	}
 }
 
-func TestGenerateScript(t *testing.T) {
-	script := generateScript(Config{
-		App:    "myapp",
-		Branch: "develop",
-	})
-
-	for _, want := range []string{
-		`APP="myapp"`,
-		`BRANCH="develop"`,
-		"git fetch origin",
-		"docker build",
-	} {
-		if !strings.Contains(script, want) {
-			t.Errorf("script missing %q", want)
-		}
-	}
-}
-
 func TestGenerateService(t *testing.T) {
-	svc := generateService("teploy-webhook-myapp", "/deployments/myapp/webhook-listener.sh")
+	svc := generateService("teploy-webhook-myapp", "/deployments/.bin/teploy autodeploy serve --app myapp --branch main --port 9876")
 
 	if !strings.Contains(svc, "teploy-webhook-myapp") {
 		t.Error("service should contain name")
 	}
 	if !strings.Contains(svc, "Restart=always") {
 		t.Error("service should restart always")
+	}
+	if !strings.Contains(svc, "ExecStart=/deployments/.bin/teploy autodeploy serve --app myapp --branch main --port 9876") {
+		t.Error("service should run the given execStart command line")
 	}
 }
 
@@ -295,8 +305,8 @@ func TestGenerateScheduledRedeployScript(t *testing.T) {
 		"teploy.version",
 		"docker inspect",
 		"docker run -d",
-		"--name \"$CONTAINER\"",   // preserve same name to avoid Caddy reconfig
-		"date +%s",                // new version timestamp
+		"--name \"$CONTAINER\"", // preserve same name to avoid Caddy reconfig
+		"date +%s",              // new version timestamp
 		"$(ts) [redeploy]",
 	} {
 		if !strings.Contains(script, want) {

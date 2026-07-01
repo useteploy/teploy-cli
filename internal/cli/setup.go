@@ -101,7 +101,7 @@ func runSetup(flags *Flags, host string, name string, noHarden bool, networkProv
 		pubKey := strings.TrimSpace(string(pubKeyData))
 		installCmd := fmt.Sprintf(
 			"mkdir -p ~/.ssh && echo %s >> ~/.ssh/authorized_keys && chmod 700 ~/.ssh && chmod 600 ~/.ssh/authorized_keys",
-			shellQuote(pubKey),
+			ssh.ShellQuote(pubKey),
 		)
 		if _, err := executor.Run(ctx, installCmd); err != nil {
 			return fmt.Errorf("installing SSH key: %w", err)
@@ -295,11 +295,11 @@ func setupNetwork(ctx context.Context, exec ssh.Executor, w io.Writer, providerN
 	// value with a shell metacharacter can't break out of the join command.
 	switch providerName {
 	case "tailscale":
-		joinCmd = fmt.Sprintf(sudo+"nohup tailscale up --authkey=%s --accept-routes >/dev/null 2>&1 &", shellQuote(cfg.AuthKey))
+		joinCmd = fmt.Sprintf(sudo+"nohup tailscale up --authkey=%s --accept-routes >/dev/null 2>&1 &", ssh.ShellQuote(cfg.AuthKey))
 	case "headscale":
-		joinCmd = fmt.Sprintf(sudo+"nohup tailscale up --login-server=%s --authkey=%s --accept-routes >/dev/null 2>&1 &", shellQuote(cfg.Server), shellQuote(cfg.AuthKey))
+		joinCmd = fmt.Sprintf(sudo+"nohup tailscale up --login-server=%s --authkey=%s --accept-routes >/dev/null 2>&1 &", ssh.ShellQuote(cfg.Server), ssh.ShellQuote(cfg.AuthKey))
 	case "netbird":
-		joinCmd = fmt.Sprintf(sudo+"nohup netbird up --setup-key %s >/dev/null 2>&1 &", shellQuote(cfg.SetupKey))
+		joinCmd = fmt.Sprintf(sudo+"nohup netbird up --setup-key %s >/dev/null 2>&1 &", ssh.ShellQuote(cfg.SetupKey))
 	}
 	exec.Run(ctx, joinCmd) // ignore error — connection may die
 
@@ -612,10 +612,6 @@ func setupServer(ctx context.Context, exec ssh.Executor, w io.Writer, yes bool) 
 
 	fmt.Fprintln(w, "Server provisioned successfully")
 	return nil
-}
-
-func shellQuote(s string) string {
-	return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'"
 }
 
 // confirm prompts the user for a yes/no answer on stdin. Returns false

@@ -15,10 +15,22 @@ import (
 
 const deploymentsDir = "/deployments"
 
+// staleLockTTL is how long an "auto" deploy lock (see LockInfo.Type) is
+// honored before AcquireLock treats it as abandoned and breaks it. Deploys
+// that crash or lose their SSH connection mid-flight — before the deferred
+// ReleaseLock runs — would otherwise leave the app locked forever, needing
+// a human to notice and run `teploy unlock`. 30 minutes is generous enough
+// to never plausibly false-positive against a real, still-running deploy
+// (remote image builds, long health-check timeouts, migration hooks), but
+// short enough to self-heal within one operational cycle. Manual locks
+// (AcquireManualLock) are never auto-broken — those are an explicit,
+// intentional freeze with no expiry.
+const staleLockTTL = 30 * time.Minute
+
 // AppState represents the deploy state for an app on the server.
 // Stored at /deployments/<app>/state as key=value pairs.
 type AppState struct {
-	CurrentPort  int    // primary port (first replica or single instance)
+	CurrentPort  int // primary port (first replica or single instance)
 	CurrentHash  string
 	PreviousPort int
 	PreviousHash string
@@ -128,7 +140,7 @@ func Write(ctx context.Context, exec ssh.Executor, app string, s *AppState) erro
 
 // LockInfo represents the metadata stored in a .lock directory.
 type LockInfo struct {
-	Type    string `json:"type"`              // "auto" or "manual"
+	Type    string `json:"type"` // "auto" or "manual"
 	User    string `json:"user,omitempty"`
 	Message string `json:"message,omitempty"`
 	TS      string `json:"ts"`
@@ -149,11 +161,11 @@ func ReadLock(ctx context.Context, exec ssh.Executor, app string) (*LockInfo, er
 }
 
 // AcquireLock acquires the deploy lock for an app using atomic mkdir.
-// Returns an error if a lock already exists (another deploy in progress or manual freeze).
+// Returns an error if a lock already exists (another deploy in progress or
+// manual freeze) and isn't stale (see staleLockTTL).
 func AcquireLock(ctx context.Context, exec ssh.Executor, app string) error {
 	lockPath := fmt.Sprintf("%s/%s/.lock", deploymentsDir, app)
-	if _, err := exec.Run(ctx, fmt.Sprintf("mkdir %s 2>/dev/null", lockPath)); err != nil {
-		// Lock exists — read info for a descriptive error.
+	if _, err := tryMkdirLock(ctx, exec, lockPath); err != nil {
 		info, _ := ReadLock(ctx, exec, app)
 		if info != nil && info.Type == "manual" {
 			msg := fmt.Sprintf("Deploy locked by %s", info.User)
@@ -163,9 +175,26 @@ func AcquireLock(ctx context.Context, exec ssh.Executor, app string) error {
 			msg += fmt.Sprintf(". Locked at %s. Use 'teploy unlock' to release.", info.TS)
 			return fmt.Errorf("%s", msg)
 		}
+		if info != nil && info.Type == "auto" && isStale(info.TS) {
+			ReleaseLock(ctx, exec, app)
+			if _, retryErr := tryMkdirLock(ctx, exec, lockPath); retryErr != nil {
+				// Someone else's deploy won the race to re-acquire right
+				// after we broke the stale lock — fall through to the
+				// normal "in progress" error below.
+				return fmt.Errorf("deploy is already in progress for %s", app)
+			}
+			return writeLockInfo(ctx, exec, lockPath, app)
+		}
 		return fmt.Errorf("deploy is already in progress for %s", app)
 	}
+	return writeLockInfo(ctx, exec, lockPath, app)
+}
 
+func tryMkdirLock(ctx context.Context, exec ssh.Executor, lockPath string) (string, error) {
+	return exec.Run(ctx, fmt.Sprintf("mkdir %s 2>/dev/null", lockPath))
+}
+
+func writeLockInfo(ctx context.Context, exec ssh.Executor, lockPath, app string) error {
 	info, _ := json.Marshal(LockInfo{
 		Type: "auto",
 		TS:   time.Now().UTC().Format(time.RFC3339),
@@ -176,6 +205,17 @@ func AcquireLock(ctx context.Context, exec ssh.Executor, app string) error {
 		return fmt.Errorf("writing lock info: %w", err)
 	}
 	return nil
+}
+
+// isStale reports whether an "auto" lock's timestamp is older than
+// staleLockTTL. An unparseable timestamp is treated as stale — a lock file
+// too corrupted to read its own age isn't one worth respecting.
+func isStale(ts string) bool {
+	parsed, err := time.Parse(time.RFC3339, ts)
+	if err != nil {
+		return true
+	}
+	return time.Since(parsed) > staleLockTTL
 }
 
 // AcquireManualLock places a manual deploy freeze on an app.
@@ -198,6 +238,23 @@ func AcquireManualLock(ctx context.Context, exec ssh.Executor, app, user, messag
 func ReleaseLock(ctx context.Context, exec ssh.Executor, app string) {
 	lockPath := fmt.Sprintf("%s/%s/.lock", deploymentsDir, app)
 	exec.Run(ctx, fmt.Sprintf("rm -rf %s", lockPath))
+}
+
+// ReleaseLockDetached releases the deploy lock using a fresh, short-lived
+// context instead of the caller's — for use as `defer state.
+// ReleaseLockDetached(...)` cleanup at the end of a deploy. If the caller's
+// context was already cancelled (e.g. the operator hit Ctrl+C mid-deploy),
+// reusing it here would abort the unlock SSH command before it ever runs:
+// RemoteExecutor.RunStream races an already-closed ctx.Done() against
+// session.Run() finishing, and the closed channel wins almost every time
+// since Run() needs a real network round-trip first. That left the lock
+// stuck, requiring a human to notice and run `teploy unlock`. A detached
+// context lets the unlock actually reach the server even when the deploy
+// itself was interrupted.
+func ReleaseLockDetached(exec ssh.Executor, app string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	ReleaseLock(ctx, exec, app)
 }
 
 // AppendLog appends a deploy log entry to /deployments/teploy.log.

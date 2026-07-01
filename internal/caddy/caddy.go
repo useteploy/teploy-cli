@@ -3,6 +3,7 @@ package caddy
 import (
 	"context"
 	"fmt"
+	"net"
 	"strings"
 
 	"github.com/useteploy/teploy/internal/ssh"
@@ -85,7 +86,8 @@ type Upstream struct {
 
 // TLS carries container-side paths to a custom certificate + key for
 // terminating TLS on a site block (e.g. a Cloudflare Origin Certificate).
-// When both are empty, Caddy uses automatic HTTPS (ACME) — the default.
+// When Cert/Key/Internal are all empty, Caddy uses automatic HTTPS (ACME)
+// — the default.
 //
 // Custom certs are required when the public hostname is fronted by a proxy
 // that hides the origin from ACME challenges (Cloudflare proxied DNS,
@@ -94,15 +96,61 @@ type Upstream struct {
 type TLS struct {
 	Cert string // container path, e.g. /etc/caddy/tls/myapp.crt
 	Key  string // container path, e.g. /etc/caddy/tls/myapp.key
+	// Internal requests Caddy's own local CA (self-signed) instead of a
+	// custom cert or ACME. Mutually exclusive with Cert/Key — see
+	// config.TLSConfig.Internal, which is where this is actually set from
+	// teploy.yml.
+	Internal bool
 }
 
-// directive returns the indented `tls <cert> <key>` line for a site block,
-// or "" when no custom cert is configured (automatic HTTPS).
+// directive returns the indented `tls` line for a site block — `tls
+// internal` for Internal, `tls <cert> <key>` for a custom cert, or "" when
+// neither is configured (automatic HTTPS).
 func (t TLS) directive() string {
+	if t.Internal {
+		return "\ttls internal\n"
+	}
 	if t.Cert == "" || t.Key == "" {
 		return ""
 	}
 	return fmt.Sprintf("\ttls %s %s\n", t.Cert, t.Key)
+}
+
+// IsPubliclyRoutable reports whether host is a real hostname rather than a
+// literal IP address. Caddy's automatic HTTPS can't complete an ACME
+// challenge for a literal IP (Let's Encrypt's default issuance doesn't
+// cover IP SANs, and a private/LAN address isn't reachable from a public
+// CA at all) — left as the default, Caddy just hangs retrying forever.
+// siteAddresses (below) gives these an explicit http:// scheme instead,
+// which tells Caddy not to manage TLS for that address at all.
+//
+// Deliberately narrow: only literal IP addresses are checked, not
+// heuristics on hostname shape (.local, bare no-dot names, etc.). Those
+// are real non-public cases too, but less unambiguous — a false positive
+// here would silently break HTTPS for what's actually a legitimate public
+// domain, a worse failure mode than the hang this fixes.
+func IsPubliclyRoutable(host string) bool {
+	return net.ParseIP(host) == nil
+}
+
+// siteAddresses formats each host as a Caddyfile site address, adding an
+// explicit http:// scheme to any host IsPubliclyRoutable can't vouch for —
+// unless tls requests HTTPS anyway (a custom cert or tls.internal), in
+// which case the operator has explicitly opted in and automatic-HTTPS
+// avoidance would just be wrong. See IsPubliclyRoutable for why this
+// matters: without it, Caddy attempts (and hangs on) a real ACME challenge
+// for addresses that can never complete one.
+func siteAddresses(hosts []string, tls TLS) []string {
+	wantsTLS := tls.Internal || (tls.Cert != "" && tls.Key != "")
+	out := make([]string, len(hosts))
+	for i, h := range hosts {
+		if !wantsTLS && !IsPubliclyRoutable(h) {
+			out[i] = "http://" + h
+		} else {
+			out[i] = h
+		}
+	}
+	return out
 }
 
 // HealthChecks configures active health checking for upstreams.
@@ -575,7 +623,7 @@ func parseDomains(domain string) ([]string, error) {
 // reverseProxyBlock renders a Caddyfile reverse-proxy site block.
 func reverseProxyBlock(hosts []string, upstream string, port int, tls TLS, caddyExtra string) string {
 	var b strings.Builder
-	b.WriteString(strings.Join(hosts, ", "))
+	b.WriteString(strings.Join(siteAddresses(hosts, tls), ", "))
 	b.WriteString(" {\n")
 	b.WriteString(tls.directive())
 	fmt.Fprintf(&b, "\treverse_proxy %s:%d\n", upstream, port)
@@ -601,7 +649,7 @@ func loadBalancerBlock(hosts []string, upstreams []Upstream, tls TLS, caddyExtra
 		dials[i] = u.Dial
 	}
 	var b strings.Builder
-	b.WriteString(strings.Join(hosts, ", "))
+	b.WriteString(strings.Join(siteAddresses(hosts, tls), ", "))
 	b.WriteString(" {\n")
 	b.WriteString(tls.directive())
 	fmt.Fprintf(&b, "\treverse_proxy %s {\n\t\tlb_policy round_robin\n\t\thealth_uri /up\n\t\thealth_interval 10s\n\t\thealth_timeout 5s\n\t}\n", strings.Join(dials, " "))
@@ -623,9 +671,13 @@ func loadBalancerBlock(hosts []string, upstreams []Upstream, tls TLS, caddyExtra
 // the given hosts. Caddy adapts the `respond` directive to a static_response
 // handler, which the dashboard detects as maintenance mode.
 func maintenanceBlock(hosts []string) string {
+	// No custom-TLS param here — maintenance mode doesn't carry TLS config
+	// through today (a separate, pre-existing gap, not this fix's scope).
+	// Zero-value TLS still gets the right outcome for THIS fix: a non-public
+	// host falls back to http:// same as its regular route block would.
 	return fmt.Sprintf(
 		"%s {\n\theader Content-Type \"text/html; charset=utf-8\"\n\theader Retry-After \"3600\"\n\trespond 503 {\n\t\tbody `%s`\n\t}\n}",
-		strings.Join(hosts, ", "), maintenancePage,
+		strings.Join(siteAddresses(hosts, TLS{}), ", "), maintenancePage,
 	)
 }
 
@@ -646,7 +698,10 @@ type StaticBlockOpts struct {
 // immutable caching for hashed assets.
 func StaticBlock(opts StaticBlockOpts) string {
 	var b strings.Builder
-	b.WriteString(strings.Join(opts.Hosts, ", "))
+	// No custom-TLS param — type:static rejects tls: at config.validate()
+	// time, so zero-value TLS is always correct here: a non-public host
+	// falls back to http://.
+	b.WriteString(strings.Join(siteAddresses(opts.Hosts, TLS{}), ", "))
 	b.WriteString(" {\n")
 	b.WriteString("\tencode gzip\n")
 	b.WriteString(fmt.Sprintf("\troot * %s\n", opts.Root))

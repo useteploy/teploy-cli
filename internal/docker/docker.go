@@ -46,8 +46,8 @@ type RunConfig struct {
 	Port          int               // host port for external access
 	BindHost      string            // host IP to publish the port on (default 127.0.0.1)
 	ContainerPort int               // port the app listens on inside the container (default 80)
-	EnvFile       string            // path to env file on the server
-	Env           map[string]string // additional env vars
+	EnvFiles      []string          // paths to env files on the server, applied in order (later files' keys win)
+	Env           map[string]string // additional env vars — plaintext only; secrets belong in EnvFiles (see deploy.go), not here, since -e values are visible in this host's `ps aux`/`/proc/<pid>/cmdline` for the life of this docker run invocation
 	Volumes       map[string]string // host_path -> container_path
 	Cmd           string            // command override (appended after image)
 	Memory        string            // memory limit, e.g. "512m"
@@ -140,9 +140,13 @@ func (c *Client) Run(ctx context.Context, cfg RunConfig) (string, error) {
 		args = append(args, "-p", bindHost+":"+hostPort+":"+cPortStr, "-e", "PORT="+cPortStr)
 	}
 
-	// Env file on server.
-	if cfg.EnvFile != "" {
-		args = append(args, "--env-file", q(cfg.EnvFile))
+	// Env files on server, in order — docker merges --env-file flags with
+	// later files' keys winning over earlier ones, so callers put the
+	// highest-priority file (e.g. decrypted secrets) last.
+	for _, f := range cfg.EnvFiles {
+		if f != "" {
+			args = append(args, "--env-file", q(f))
+		}
 	}
 
 	// Additional env vars, sorted for deterministic command output.
@@ -202,7 +206,7 @@ func (c *Client) Run(ctx context.Context, cfg RunConfig) (string, error) {
 
 // Stop stops a container by name. Sends SIGTERM, then SIGKILL after timeout seconds.
 func (c *Client) Stop(ctx context.Context, name string, timeout int) error {
-	cmd := fmt.Sprintf("docker stop -t %d %s", timeout, name)
+	cmd := fmt.Sprintf("docker stop -t %d %s", timeout, ssh.ShellQuote(name))
 	if _, err := c.exec.Run(ctx, cmd); err != nil {
 		return fmt.Errorf("stopping container %s: %w", name, err)
 	}
@@ -256,7 +260,7 @@ func (c *Client) RunningContainer(ctx context.Context, app, process string) (str
 // has taken+released the host port since this container was stopped. Restart()
 // avoids that by force-removing + recreating with the same config.
 func (c *Client) Start(ctx context.Context, name string) error {
-	if _, err := c.exec.Run(ctx, "docker start "+name); err != nil {
+	if _, err := c.exec.Run(ctx, "docker start "+ssh.ShellQuote(name)); err != nil {
 		return fmt.Errorf("starting container %s: %w", name, err)
 	}
 	return nil
@@ -317,7 +321,7 @@ type containerInspect struct {
 // dir, user, labels, restart policy, memory + CPU limits, and the
 // --no-healthcheck NONE marker.
 func (c *Client) Restart(ctx context.Context, name string) error {
-	raw, err := c.exec.Run(ctx, "docker inspect "+name)
+	raw, err := c.exec.Run(ctx, "docker inspect "+ssh.ShellQuote(name))
 	if err != nil {
 		return fmt.Errorf("inspecting %s: %w", name, err)
 	}
@@ -330,7 +334,7 @@ func (c *Client) Restart(ctx context.Context, name string) error {
 	}
 	spec := arr[0]
 
-	args := []string{"-d", "--name", name}
+	args := []string{"-d", "--name", ssh.ShellQuote(name)}
 
 	// Network mode (e.g. "teploy"). Skip docker's "default" / "bridge".
 	if spec.HostConfig.NetworkMode != "" && spec.HostConfig.NetworkMode != "default" && spec.HostConfig.NetworkMode != "bridge" {
@@ -371,7 +375,7 @@ func (c *Client) Restart(ctx context.Context, name string) error {
 
 	// Env vars.
 	for _, e := range spec.Config.Env {
-		args = append(args, "-e", shellQuoteSingle(e))
+		args = append(args, "-e", ssh.ShellQuote(e))
 	}
 
 	// Bind mounts (already host:container[:mode] formatted by docker).
@@ -392,7 +396,7 @@ func (c *Client) Restart(ctx context.Context, name string) error {
 		if m.ReadOnly {
 			parts = append(parts, "readonly")
 		}
-		args = append(args, "--mount", shellQuoteSingle(strings.Join(parts, ",")))
+		args = append(args, "--mount", ssh.ShellQuote(strings.Join(parts, ",")))
 	}
 
 	// Resource limits.
@@ -412,7 +416,7 @@ func (c *Client) Restart(ctx context.Context, name string) error {
 	}
 	sort.Strings(labelKeys)
 	for _, k := range labelKeys {
-		args = append(args, "--label", shellQuoteSingle(k+"="+spec.Config.Labels[k]))
+		args = append(args, "--label", ssh.ShellQuote(k+"="+spec.Config.Labels[k]))
 	}
 
 	// Preserve the explicit-NONE healthcheck (set by --no-healthcheck at run).
@@ -433,15 +437,15 @@ func (c *Client) Restart(ctx context.Context, name string) error {
 	}
 
 	// Image (last positional before cmd).
-	args = append(args, spec.Config.Image)
+	args = append(args, ssh.ShellQuote(spec.Config.Image))
 
 	// Cmd.
 	for _, cmdPart := range spec.Config.Cmd {
-		args = append(args, shellQuoteSingle(cmdPart))
+		args = append(args, ssh.ShellQuote(cmdPart))
 	}
 
 	// Force-remove old container, then run fresh.
-	if _, err := c.exec.Run(ctx, "docker rm -f "+name); err != nil {
+	if _, err := c.exec.Run(ctx, "docker rm -f "+ssh.ShellQuote(name)); err != nil {
 		return fmt.Errorf("removing old %s: %w", name, err)
 	}
 	if _, err := c.exec.Run(ctx, "docker run "+strings.Join(args, " ")); err != nil {
@@ -450,15 +454,9 @@ func (c *Client) Restart(ctx context.Context, name string) error {
 	return nil
 }
 
-// shellQuoteSingle wraps s in single quotes for safe shell interpolation,
-// escaping embedded single quotes (POSIX-portable).
-func shellQuoteSingle(s string) string {
-	return "'" + strings.ReplaceAll(s, "'", `'"'"'`) + "'"
-}
-
 // Pull pulls a Docker image from a registry.
 func (c *Client) Pull(ctx context.Context, image string) error {
-	if _, err := c.exec.Run(ctx, "docker pull "+image); err != nil {
+	if _, err := c.exec.Run(ctx, "docker pull "+ssh.ShellQuote(image)); err != nil {
 		return fmt.Errorf("pulling image %s: %w", image, err)
 	}
 	return nil
@@ -466,10 +464,37 @@ func (c *Client) Pull(ctx context.Context, image string) error {
 
 // Remove removes a stopped container.
 func (c *Client) Remove(ctx context.Context, name string) error {
-	if _, err := c.exec.Run(ctx, "docker rm "+name); err != nil {
+	if _, err := c.exec.Run(ctx, "docker rm "+ssh.ShellQuote(name)); err != nil {
 		return fmt.Errorf("removing container %s: %w", name, err)
 	}
 	return nil
+}
+
+// HostPort returns the container's host-mapped port — the port a health
+// check on this machine connects to at http://localhost:<port>, as opposed
+// to InternalPort (the container-internal port Caddy dials over the
+// Docker network). Used by Rollback to derive health-check ports by
+// inspecting the actual container instead of relying on
+// state.AppState.PreviousPort, which only ever remembers the single most
+// recent previous version — inspection works for --to <hash> rolling back
+// further than that.
+func (c *Client) HostPort(ctx context.Context, name string) (int, error) {
+	out, err := c.exec.Run(ctx, fmt.Sprintf(
+		"docker inspect -f '{{range $p, $b := .NetworkSettings.Ports}}{{range $b}}{{.HostPort}} {{end}}{{end}}' %s",
+		ssh.ShellQuote(name),
+	))
+	if err != nil {
+		return 0, fmt.Errorf("inspecting container %s: %w", name, err)
+	}
+	fields := strings.Fields(out)
+	if len(fields) == 0 {
+		return 0, fmt.Errorf("container %s has no host-mapped ports", name)
+	}
+	port, err := strconv.Atoi(fields[0])
+	if err != nil {
+		return 0, fmt.Errorf("parsing host port %q from container %s: %w", fields[0], name, err)
+	}
+	return port, nil
 }
 
 // InternalPort returns the container's internal listening port — the port
@@ -481,7 +506,7 @@ func (c *Client) InternalPort(ctx context.Context, name string) (int, error) {
 	// `docker inspect` emits each exposed port once, e.g. "3000/tcp".
 	out, err := c.exec.Run(ctx, fmt.Sprintf(
 		"docker inspect -f '{{range $p, $_ := .NetworkSettings.Ports}}{{$p}} {{end}}' %s",
-		name,
+		ssh.ShellQuote(name),
 	))
 	if err != nil {
 		return 0, fmt.Errorf("inspecting container %s: %w", name, err)
@@ -501,7 +526,7 @@ func (c *Client) InternalPort(ctx context.Context, name string) (int, error) {
 
 // ListContainers returns all containers for the given app, including stopped ones.
 func (c *Client) ListContainers(ctx context.Context, app string) ([]Container, error) {
-	cmd := "docker ps --all --filter label=teploy.app=" + app + " --format '{{json .}}'"
+	cmd := "docker ps --all --filter label=teploy.app=" + ssh.ShellQuote(app) + " --format '{{json .}}'"
 	output, err := c.exec.Run(ctx, cmd)
 	if err != nil {
 		return nil, fmt.Errorf("listing containers for %s: %w", app, err)
@@ -612,13 +637,13 @@ func (c *Client) PruneVersions(ctx context.Context, app string, keep int, protec
 		// already took ownership of cleanup; refusing to nuke a stray
 		// running container from an older version defeats the point.
 		for _, name := range e.info.containerNames {
-			_, _ = c.exec.Run(ctx, "docker rm -f "+name)
+			_, _ = c.exec.Run(ctx, "docker rm -f "+ssh.ShellQuote(name))
 		}
 		// Best-effort image removal. Fails (silently) if another
 		// container or tag still references the image, which is the
 		// safe behavior.
 		for img := range e.info.images {
-			_, _ = c.exec.Run(ctx, "docker rmi "+img)
+			_, _ = c.exec.Run(ctx, "docker rmi "+ssh.ShellQuote(img))
 		}
 		pruned = append(pruned, e.version)
 	}

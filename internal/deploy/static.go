@@ -48,7 +48,7 @@ type StaticConfig struct {
 	SPAFallback  string
 	Cache        map[string]string
 	Headers      map[string]string
-	KeepReleases int    // 0 = use default
+	KeepReleases int // 0 = use default
 	CaddyExtra   string
 
 	// Server-side mount path (the directory Caddy is configured to serve from).
@@ -138,7 +138,7 @@ func (d *StaticDeployer) Deploy(ctx context.Context, cfg StaticConfig) error {
 	if err := state.AcquireLock(ctx, d.exec, cfg.App); err != nil {
 		return fmt.Errorf("acquire lock: %w", err)
 	}
-	defer state.ReleaseLock(ctx, d.exec, cfg.App)
+	defer state.ReleaseLockDetached(d.exec, cfg.App)
 
 	// 5. Read prior state for rollback bookkeeping.
 	prior, _ := state.Read(ctx, d.exec, cfg.App)
@@ -382,7 +382,7 @@ func (d *StaticDeployer) Rollback(ctx context.Context, cfg StaticRollbackConfig)
 	if err := state.AcquireLock(ctx, d.exec, cfg.App); err != nil {
 		return fmt.Errorf("acquire lock: %w", err)
 	}
-	defer state.ReleaseLock(ctx, d.exec, cfg.App)
+	defer state.ReleaseLockDetached(d.exec, cfg.App)
 
 	prior, _ := state.Read(ctx, d.exec, cfg.App)
 	if prior == nil {
@@ -394,7 +394,7 @@ func (d *StaticDeployer) Rollback(ctx context.Context, cfg StaticRollbackConfig)
 		target = prior.PreviousHash
 	}
 	if target == "" {
-		return errors.New("no previous deploy to roll back to")
+		return ErrNoPreviousDeploy
 	}
 	if target == prior.CurrentHash {
 		return fmt.Errorf("target hash %s is already current", target)

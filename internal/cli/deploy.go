@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -27,15 +28,15 @@ import (
 
 func newDeployCmd(flags *Flags) *cobra.Command {
 	var (
-		image           string
-		version         string
-		skipDNSCheck    bool
-		parallel        int
-		destination     string
-		appName         string
-		domain          string
-		port            int
-		migrateVolumes  bool
+		image          string
+		version        string
+		skipDNSCheck   bool
+		parallel       int
+		destination    string
+		appName        string
+		domain         string
+		port           int
+		migrateVolumes bool
 	)
 
 	cmd := &cobra.Command{
@@ -84,8 +85,15 @@ func runAdHocDeploy(flags *Flags, serverName, appName, image, domain string, por
 	if image == "" {
 		return fmt.Errorf("--image is required for ad-hoc deploy (no teploy.yml)")
 	}
-	if domain == "" {
-		return fmt.Errorf("--domain is required for ad-hoc deploy")
+	// This path builds an AppConfig directly instead of going through
+	// config.LoadApp, so it never reaches AppConfig.validate() — app and
+	// domain must be validated explicitly here before either one reaches
+	// the network (state paths, remote shell commands, Caddyfile content).
+	if err := config.ValidateName(appName); err != nil {
+		return err
+	}
+	if err := config.ValidateDomain(domain, false); err != nil {
+		return err
 	}
 	if serverName == "" {
 		serverName = flags.Host
@@ -288,6 +296,24 @@ func deployAppConfig(flags *Flags, appCfg *config.AppConfig, serverName, image, 
 		}
 	}
 
+	return deployBuiltImage(ctx, executor, appCfg, image, version, host, migrateVolumes, needsBuild)
+}
+
+// deployBuiltImage runs the shared post-build deploy orchestration:
+// ensuring accessories, decrypting secrets, resolving volumes/TLS, and
+// calling the actual deploy.Deployer.Deploy — the core both
+// deployAppConfig (SSH from an operator's machine) and `teploy autodeploy
+// serve` (running locally on the server via an ssh.LocalExecutor — see
+// runAutodeployServe in autodeploy_serve.go) share, so a fix here (e.g.
+// the secrets-via-env-file fix in buildContainerEnvFiles) can never
+// silently apply to only one of the two trigger paths the way the old
+// generated-bash-script autodeploy implementation did.
+//
+// executor must already be connected/ready; image and version must already
+// be resolved (built or pulled pre-built). serverDisplay is a display-only
+// string for the notification payload (a hostname for the SSH path,
+// "localhost" for the resident-server path).
+func deployBuiltImage(ctx context.Context, executor ssh.Executor, appCfg *config.AppConfig, image, version, serverDisplay string, migrateVolumes, needsBuild bool) error {
 	// 9. Ensure accessories are running.
 	var envFile string
 	if len(appCfg.Accessories) > 0 {
@@ -363,25 +389,20 @@ func deployAppConfig(flags *Flags, appCfg *config.AppConfig, serverName, image, 
 
 	// 10b. Upload custom TLS cert (if configured) so Caddy can terminate
 	// HTTPS with it instead of ACME — required behind Cloudflare proxy/Tunnel.
-	var tlsCert, tlsKey string
-	if appCfg.TLS != nil {
-		tlsCert, tlsKey, err = uploadAppTLS(ctx, executor, appCfg.App, appCfg.TLS)
-		if err != nil {
-			return err
-		}
+	tlsCert, tlsKey, tlsInternal, err := resolveAppTLS(ctx, executor, appCfg)
+	if err != nil {
+		return err
+	}
+	if tlsCert != "" {
 		fmt.Println("  TLS certificate uploaded")
 	}
 
-	// Container env: the teploy.yml `env:` block (with ${VAR} expanded from the
-	// local environment), then decrypted secrets layered on top so a `teploy
-	// secret` always wins over a plaintext default. Both are passed as -e args,
-	// which override the server-side --env-file (EnvFile) at runtime.
-	containerEnv := make(map[string]string, len(appCfg.Env)+len(deploySecrets))
-	for k, v := range appCfg.Env {
-		containerEnv[k] = os.Expand(v, os.Getenv)
-	}
-	for k, v := range deploySecrets {
-		containerEnv[k] = v
+	// Container env: teploy.yml's `env:` block plus decrypted secrets,
+	// uploaded to a fresh env file rather than passed as `docker run -e`
+	// args — see buildContainerEnvFiles for why.
+	envFiles, err := buildContainerEnvFiles(ctx, executor, appCfg.App, envFile, appCfg.Env, nil, deploySecrets)
+	if err != nil {
+		return err
 	}
 
 	// 11. Deploy.
@@ -391,12 +412,11 @@ func deployAppConfig(flags *Flags, appCfg *config.AppConfig, serverName, image, 
 		Domain:        appCfg.Domain,
 		Image:         image,
 		Version:       version,
-		EnvFile:       envFile,
-		Env:           containerEnv,
+		EnvFiles:      envFiles,
 		Volumes:       volumes,
 		Processes:     appCfg.Processes,
 		NoHealthcheck: disabledHealthchecks(appCfg.Healthcheck),
-		Health:        deploy.HealthConfig{Path: appCfg.Health.Path},
+		Health:        healthConfigFrom(appCfg.Health),
 		KeepVersions:  appCfg.KeepVersions,
 		Ingress:       appCfg.Ingress,
 		Bind:          appCfg.Bind,
@@ -409,6 +429,7 @@ func deployAppConfig(flags *Flags, appCfg *config.AppConfig, serverName, image, 
 		AssetKeepDays: appCfg.Assets.KeepDays,
 		TLSCert:       tlsCert,
 		TLSKey:        tlsKey,
+		TLSInternal:   tlsInternal,
 		CaddyExtra:    appCfg.CaddyExtra,
 	}
 
@@ -423,7 +444,7 @@ func deployAppConfig(flags *Flags, appCfg *config.AppConfig, serverName, image, 
 		}
 		if errs := multiNotifier.Send(ctx, notify.Payload{
 			App:     appCfg.App,
-			Server:  host,
+			Server:  serverDisplay,
 			Type:    "deploy",
 			Success: deployErr == nil,
 			Hash:    version,
@@ -501,7 +522,6 @@ func runMultiDeploy(flags *Flags, appCfg *config.AppConfig, image, version strin
 
 	fmt.Print(multideploy.FormatResults(results))
 
-	// Update LB if any servers succeeded.
 	var successTargets []multideploy.ServerTarget
 	var failCount int
 	for i, r := range results {
@@ -512,17 +532,57 @@ func runMultiDeploy(flags *Flags, appCfg *config.AppConfig, image, version strin
 		}
 	}
 
+	if failCount == 0 {
+		if len(successTargets) > 0 {
+			if err := updateLoadBalancer(ctx, flags, appCfg, serversPath, successTargets); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: LB update failed: %v\n", err)
+			}
+		}
+		return nil
+	}
+
+	// Partial failure: roll back every server that succeeded so the fleet
+	// ends up consistent on the old version everywhere, instead of
+	// split-brain (some servers on the new version, others on old, with no
+	// reconciliation). Deliberately skip the LB update above in this branch
+	// — none of successTargets should end up in rotation serving a version
+	// we're about to revert.
 	if len(successTargets) > 0 {
-		if err := updateLoadBalancer(ctx, flags, appCfg, serversPath, successTargets); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: LB update failed: %v\n", err)
+		fmt.Printf("\n%d of %d servers failed — rolling back the %d server(s) that succeeded...\n",
+			failCount, len(targets), len(successTargets))
+
+		rollbackResults := multideploy.ParallelDeploy(ctx, successTargets, parallel, func(ctx context.Context, target multideploy.ServerTarget, out io.Writer) error {
+			return rollbackSingleServer(ctx, appCfg, target, out)
+		}, os.Stdout)
+
+		var rolledBack, firstDeploys, rollbackFailed []string
+		for _, r := range rollbackResults {
+			switch {
+			case r.Success:
+				rolledBack = append(rolledBack, r.Server)
+			case errors.Is(r.Error, deploy.ErrNoPreviousDeploy):
+				// This was the server's first-ever deploy for this app —
+				// there's nothing to revert to. Not a rollback failure;
+				// the (partial/broken) new version is simply the only
+				// version that ever existed there.
+				firstDeploys = append(firstDeploys, r.Server)
+			default:
+				rollbackFailed = append(rollbackFailed, r.Server)
+				fmt.Fprintf(os.Stderr, "  WARNING: rollback also failed on %s: %v — needs manual attention\n", r.Server, r.Error)
+			}
+		}
+		if len(rolledBack) > 0 {
+			fmt.Printf("  Rolled back: %s\n", strings.Join(rolledBack, ", "))
+		}
+		if len(firstDeploys) > 0 {
+			fmt.Printf("  No previous version to roll back to (first deploy): %s\n", strings.Join(firstDeploys, ", "))
+		}
+		if len(rollbackFailed) > 0 {
+			fmt.Fprintf(os.Stderr, "  Rollback failed, still on the new version and needs manual attention: %s\n", strings.Join(rollbackFailed, ", "))
 		}
 	}
 
-	if failCount > 0 {
-		return fmt.Errorf("%d of %d servers failed", failCount, len(targets))
-	}
-
-	return nil
+	return fmt.Errorf("%d of %d servers failed", failCount, len(targets))
 }
 
 // buildNotifier creates a MultiNotifier from the app config.
@@ -553,6 +613,18 @@ func buildNotifier(appCfg *config.AppConfig) *notify.MultiNotifier {
 
 func gitShortHash() (string, error) {
 	out, err := exec.Command("git", "rev-parse", "--short", "HEAD").Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+// gitShortHashIn is gitShortHash for a specific directory instead of the
+// process's cwd — for `teploy autodeploy serve` (autodeploy_serve.go),
+// which resolves the version from the server-side build checkout it just
+// fetched, not from wherever systemd happened to start the process.
+func gitShortHashIn(dir string) (string, error) {
+	out, err := exec.Command("git", "-C", dir, "rev-parse", "--short", "HEAD").Output()
 	if err != nil {
 		return "", err
 	}
@@ -640,6 +712,22 @@ func uploadAppTLS(ctx context.Context, exec ssh.Executor, app string, tls *confi
 	return cert, key, nil
 }
 
+// resolveAppTLS uploads a custom cert/key (if configured) and reports
+// whether tls.internal was requested, so every deploy/rollback call site
+// can populate deploy.Config's (or RollbackConfig's) TLSCert/TLSKey/
+// TLSInternal fields with one call instead of repeating the appCfg.TLS !=
+// nil / .Internal branch five times.
+func resolveAppTLS(ctx context.Context, exec ssh.Executor, appCfg *config.AppConfig) (cert, key string, internal bool, err error) {
+	if appCfg.TLS == nil {
+		return "", "", false, nil
+	}
+	if appCfg.TLS.Internal {
+		return "", "", true, nil
+	}
+	cert, key, err = uploadAppTLS(ctx, exec, appCfg.App, appCfg.TLS)
+	return cert, key, false, err
+}
+
 // disabledHealthchecks returns the set of process names whose container
 // HEALTHCHECK should be disabled (--no-healthcheck), built from the
 // teploy.yml `healthcheck:` block. Returns nil when nothing is disabled
@@ -658,4 +746,17 @@ func disabledHealthchecks(hc map[string]config.ProcessHealth) map[string]bool {
 		return nil
 	}
 	return out
+}
+
+// healthConfigFrom builds a deploy.HealthConfig from teploy.yml's health:
+// block. Zero TimeoutSeconds/IntervalSeconds map to zero time.Duration,
+// which HealthConfig.withDefaults() (internal/deploy/health.go) fills in
+// as 30s/1s — so unset fields are zero behavior change from before these
+// were configurable.
+func healthConfigFrom(h config.AppHealthConfig) deploy.HealthConfig {
+	return deploy.HealthConfig{
+		Path:     h.Path,
+		Timeout:  time.Duration(h.TimeoutSeconds) * time.Second,
+		Interval: time.Duration(h.IntervalSeconds) * time.Second,
+	}
 }

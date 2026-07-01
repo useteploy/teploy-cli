@@ -6,11 +6,14 @@ import (
 	"encoding/hex"
 	"fmt"
 	"os"
+	"os/exec"
 	"os/signal"
+	"strings"
 
 	"github.com/spf13/cobra"
 	"github.com/useteploy/teploy/internal/autodeploy"
 	"github.com/useteploy/teploy/internal/config"
+	"github.com/useteploy/teploy/internal/ssh"
 )
 
 func newAutoDeployCmd(flags *Flags) *cobra.Command {
@@ -24,6 +27,7 @@ func newAutoDeployCmd(flags *Flags) *cobra.Command {
 	cmd.AddCommand(newAutoDeployRemoveCmd(flags))
 	cmd.AddCommand(newAutoDeployScheduleCmd(flags))
 	cmd.AddCommand(newAutoDeployUnscheduleCmd(flags))
+	cmd.AddCommand(newAutoDeployServeCmd())
 
 	return cmd
 }
@@ -37,8 +41,15 @@ func newAutoDeploySetupCmd(flags *Flags) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "setup",
 		Short: "Set up webhook auto-deploy",
-		Long:  "Installs a webhook listener on the server that triggers deploys on git push.\nConfigure your Git provider to POST to https://yourdomain.com/teploy-webhook/<app>",
-		Args:  cobra.NoArgs,
+		Long: "Installs the teploy binary and a real webhook listener (teploy autodeploy serve, run as a\n" +
+			"systemd unit) on the server, which triggers deploys on git push using the same deploy\n" +
+			"code `teploy deploy` uses. Also clones this repo's 'origin' remote into the server-side\n" +
+			"build directory if it isn't already a checkout there — a private repo needs credentials\n" +
+			"(e.g. an SSH deploy key) already configured for the server's user, or this step is\n" +
+			"skipped with a warning and the first real webhook will fail to fetch until it's set up\n" +
+			"manually. Configure your Git provider to POST to\n" +
+			"https://yourdomain.com/teploy-webhook/<app>.",
+		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runAutoDeploySetup(flags, branch, secret)
 		},
@@ -51,6 +62,10 @@ func newAutoDeploySetupCmd(flags *Flags) *cobra.Command {
 }
 
 func runAutoDeploySetup(flags *Flags, branch, secret string) error {
+	if err := autodeploy.ValidateBranch(branch); err != nil {
+		return err
+	}
+
 	appCfg, err := config.LoadApp(".")
 	if err != nil {
 		return err
@@ -80,10 +95,37 @@ func runAutoDeploySetup(flags *Flags, branch, secret string) error {
 		generated = true
 	}
 
+	// `teploy autodeploy serve` needs to run ON the server as a resident
+	// process — upload the matching-platform teploy binary before wiring
+	// the systemd unit up to run it. Reuses the same fetch/verify/extract
+	// pipeline as `teploy update` (see binarydist.go).
+	const teployBinaryPath = "/deployments/.bin/teploy"
+	fmt.Println("Installing teploy binary on server...")
+	binVersion, err := deployTeployBinaryToServer(ctx, executor, teployBinaryPath)
+	if err != nil {
+		return fmt.Errorf("installing teploy binary: %w", err)
+	}
+	fmt.Printf("  Installed teploy %s\n", binVersion)
+
+	// `teploy autodeploy serve` fetches from an existing git checkout at
+	// autodeploy.BuildDir(app) on every trigger — it has no operator
+	// machine to rsync from the way `teploy deploy`'s server-build mode
+	// does (and that path excludes .git from the rsync anyway, see
+	// internal/build/ignore.go, so it wouldn't leave a fetchable checkout
+	// even if it ran first). Clone it now, once, using the operator's own
+	// git remote — best-effort: a private repo needing credentials the
+	// server doesn't have yet will fail here with a clear message instead
+	// of a cryptic one on the first real webhook.
+	if err := ensureServerBuildCheckout(ctx, executor, appCfg.App); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: %v\n", err)
+		fmt.Fprintf(os.Stderr, "  teploy autodeploy serve will fail to fetch until %s is a valid, credentialed git checkout on the server.\n", autodeploy.BuildDir(appCfg.App))
+	}
+
 	cfg := autodeploy.Config{
-		App:    appCfg.App,
-		Branch: branch,
-		Secret: secret,
+		App:              appCfg.App,
+		Branch:           branch,
+		Secret:           secret,
+		TeployBinaryPath: teployBinaryPath,
 	}
 
 	if err := mgr.Setup(ctx, cfg); err != nil {
@@ -105,6 +147,46 @@ func runAutoDeploySetup(flags *Flags, branch, secret string) error {
 	}
 	fmt.Printf("\nAdd this URL to your Git provider's webhook settings (push events only).\n")
 	return nil
+}
+
+// ensureServerBuildCheckout clones the operator's local git remote into
+// autodeploy.BuildDir(app) on the server if a git checkout isn't already
+// there, so `teploy autodeploy serve`'s `git fetch` on the first
+// webhook-triggered deploy has something to fetch into. No-ops if a
+// checkout already exists (idempotent — safe to call on every `setup`).
+func ensureServerBuildCheckout(ctx context.Context, executor ssh.Executor, app string) error {
+	buildDir := autodeploy.BuildDir(app)
+
+	out, _ := executor.Run(ctx, fmt.Sprintf("test -d %s && echo yes || true", ssh.ShellQuote(buildDir+"/.git")))
+	if strings.TrimSpace(out) == "yes" {
+		return nil // already a checkout — nothing to do
+	}
+
+	remoteURL, err := localGitRemoteURL()
+	if err != nil {
+		return fmt.Errorf("determining local git remote (run this from the app's repo, with an 'origin' remote configured): %w", err)
+	}
+
+	if _, err := executor.Run(ctx, "mkdir -p "+ssh.ShellQuote(buildDir)); err != nil {
+		return fmt.Errorf("creating build directory: %w", err)
+	}
+	cloneCmd := fmt.Sprintf("git clone %s %s", ssh.ShellQuote(remoteURL), ssh.ShellQuote(buildDir))
+	if _, err := executor.Run(ctx, cloneCmd); err != nil {
+		return fmt.Errorf("cloning %s on the server (a private repo needs credentials — e.g. an SSH deploy key — already configured for the server's user): %w", remoteURL, err)
+	}
+	fmt.Printf("  Cloned %s into %s on the server\n", remoteURL, buildDir)
+	return nil
+}
+
+// localGitRemoteURL runs `git remote get-url origin` in the current
+// directory (the operator's local checkout — same directory teploy.yml
+// lives in).
+func localGitRemoteURL() (string, error) {
+	out, err := exec.Command("git", "remote", "get-url", "origin").Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
 }
 
 func newAutoDeployStatusCmd(flags *Flags) *cobra.Command {

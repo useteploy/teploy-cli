@@ -16,15 +16,15 @@ import (
 
 // Config holds all parameters for a deploy.
 type Config struct {
-	App         string
-	Domain      string
-	Image       string
-	Version     string // short git hash or tag
-	EnvFile     string
-	Env         map[string]string
-	Volumes     map[string]string
-	Cmd         string            // command override for single-process deploys
-	Processes   map[string]string // process_name -> command (overrides Cmd)
+	App       string
+	Domain    string
+	Image     string
+	Version   string   // short git hash or tag
+	EnvFiles  []string // paths to env files on the server, applied in order (later files' keys win) — see docker.RunConfig.EnvFiles
+	Env       map[string]string
+	Volumes   map[string]string
+	Cmd       string            // command override for single-process deploys
+	Processes map[string]string // process_name -> command (overrides Cmd)
 	// NoHealthcheck disables the container HEALTHCHECK for specific processes.
 	// Keyed by process name; true means pass --no-healthcheck to docker run.
 	// Used when a process shouldn't be probed by the image's built-in
@@ -57,18 +57,22 @@ type Config struct {
 	ContainerPort int // internal container port (default 80)
 	StopTimeout   int // graceful shutdown seconds (default 10)
 	Replicas      int // web process replicas per server (default 1)
-	Health      HealthConfig
-	PreDeploy   string // hook: runs in web container before traffic switch (failure aborts)
-	PostDeploy  string // hook: runs in web container after traffic switch (failure warns)
+	Health        HealthConfig
+	PreDeploy     string // hook: runs in web container before traffic switch (failure aborts)
+	PostDeploy    string // hook: runs in web container after traffic switch (failure warns)
 	AssetPath     string // container path for asset bridging (e.g. "/app/public/assets")
 	AssetKeepDays int    // cleanup bridged assets older than N days (default 7)
 	// TLSCert / TLSKey are container-side cert/key paths for terminating TLS
 	// on the Caddy site block (custom cert instead of ACME). Empty = ACME.
 	// The CLI uploads the local cert files and sets these to their on-server
 	// container paths (e.g. /etc/caddy/tls/<app>.crt).
-	TLSCert    string
-	TLSKey     string
-	CaddyExtra string // raw Caddy directives appended into the site block
+	TLSCert string
+	TLSKey  string
+	// TLSInternal requests Caddy's own local CA (self-signed) instead of a
+	// custom cert or ACME — see config.TLSConfig.Internal. Mutually
+	// exclusive with TLSCert/TLSKey (enforced at config.validate() time).
+	TLSInternal bool
+	CaddyExtra  string // raw Caddy directives appended into the site block
 }
 
 // Deployer orchestrates zero-downtime deploys.
@@ -143,7 +147,7 @@ func (d *Deployer) Deploy(ctx context.Context, cfg Config) error {
 	if err := state.AcquireLock(ctx, d.exec, cfg.App); err != nil {
 		return err
 	}
-	defer state.ReleaseLock(ctx, d.exec, cfg.App)
+	defer state.ReleaseLockDetached(d.exec, cfg.App)
 
 	// 3. Read current state.
 	current, _ := state.Read(ctx, d.exec, cfg.App)
@@ -259,7 +263,7 @@ func (d *Deployer) Deploy(ctx context.Context, cfg Config) error {
 			Port:          ports[i],
 			BindHost:      webBindHost,
 			ContainerPort: cfg.ContainerPort,
-			EnvFile:       cfg.EnvFile,
+			EnvFiles:      cfg.EnvFiles,
 			Env:           cfg.Env,
 			Volumes:       cfg.Volumes,
 			Cmd:           processes["web"],
@@ -343,7 +347,7 @@ func (d *Deployer) Deploy(ctx context.Context, cfg Config) error {
 			Version:       cfg.Version,
 			Image:         cfg.Image,
 			Port:          0, // non-web processes don't get a port
-			EnvFile:       cfg.EnvFile,
+			EnvFiles:      cfg.EnvFiles,
 			Env:           cfg.Env,
 			Volumes:       cfg.Volumes,
 			Cmd:           processes[process],
@@ -366,7 +370,7 @@ func (d *Deployer) Deploy(ctx context.Context, cfg Config) error {
 	// teploy docker network, so Teploy has nothing to do here.
 	if cfg.usesCaddy() {
 		fmt.Fprintln(d.out, "Updating routes...")
-		tls := caddy.TLS{Cert: cfg.TLSCert, Key: cfg.TLSKey}
+		tls := caddy.TLS{Cert: cfg.TLSCert, Key: cfg.TLSKey, Internal: cfg.TLSInternal}
 		if replicas > 1 {
 			upstreams := make([]caddy.Upstream, replicas)
 			for i := range replicas {

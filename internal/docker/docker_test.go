@@ -16,6 +16,32 @@ func TestContainerName(t *testing.T) {
 	}
 }
 
+func TestClient_HostPort(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "docker inspect -f", Output: "49153 "},
+	)
+	client := NewClient(mock)
+
+	port, err := client.HostPort(context.Background(), "myapp-web-abc123")
+	if err != nil {
+		t.Fatalf("HostPort: %v", err)
+	}
+	if port != 49153 {
+		t.Errorf("got %d, want 49153", port)
+	}
+}
+
+func TestClient_HostPort_NoBindings(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "docker inspect -f", Output: ""},
+	)
+	client := NewClient(mock)
+
+	if _, err := client.HostPort(context.Background(), "myapp-worker-abc123"); err == nil {
+		t.Error("expected an error for a container with no host-mapped ports")
+	}
+}
+
 func TestClient_Run(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "docker run", Output: "abc123def456"},
@@ -155,16 +181,16 @@ func TestClient_Run_WithOptions(t *testing.T) {
 	client := NewClient(mock)
 
 	_, err := client.Run(context.Background(), RunConfig{
-		App:     "myapp",
-		Process: "web",
-		Version: "abc123",
-		Image:   "myapp:abc123",
-		Port:    49152,
-		EnvFile: "/deployments/myapp/.env",
-		Env:     map[string]string{"NODE_ENV": "production", "APP_KEY": "secret"},
-		Volumes: map[string]string{"/deployments/myapp/volumes/data": "/app/data"},
-		Memory:  "512m",
-		CPU:     "1.0",
+		App:      "myapp",
+		Process:  "web",
+		Version:  "abc123",
+		Image:    "myapp:abc123",
+		Port:     49152,
+		EnvFiles: []string{"/deployments/myapp/.env"},
+		Env:      map[string]string{"NODE_ENV": "production", "APP_KEY": "secret"},
+		Volumes:  map[string]string{"/deployments/myapp/volumes/data": "/app/data"},
+		Memory:   "512m",
+		CPU:      "1.0",
 	})
 	if err != nil {
 		t.Fatalf("Run failed: %v", err)
@@ -216,7 +242,7 @@ func TestClient_Stop(t *testing.T) {
 		t.Fatalf("Stop failed: %v", err)
 	}
 
-	if mock.Calls[0] != "docker stop -t 10 myapp-web-abc123" {
+	if mock.Calls[0] != "docker stop -t 10 'myapp-web-abc123'" {
 		t.Fatalf("unexpected command: %s", mock.Calls[0])
 	}
 }
@@ -231,7 +257,7 @@ func TestClient_Remove(t *testing.T) {
 		t.Fatalf("Remove failed: %v", err)
 	}
 
-	if mock.Calls[0] != "docker rm myapp-web-abc123" {
+	if mock.Calls[0] != "docker rm 'myapp-web-abc123'" {
 		t.Fatalf("unexpected command: %s", mock.Calls[0])
 	}
 }
@@ -492,7 +518,7 @@ func TestRunningContainer(t *testing.T) {
 {"ID":"cur","Names":"myapp-web-v2","Image":"myapp:v2","State":"running","Status":"Up 1m","Labels":"teploy.app=myapp,teploy.process=web,teploy.version=v2"}
 {"ID":"wk","Names":"myapp-worker-v2","Image":"myapp:v2","State":"running","Status":"Up 1m","Labels":"teploy.app=myapp,teploy.process=worker,teploy.version=v2"}`
 	mock := ssh.NewMockExecutor("1.2.3.4",
-		ssh.MockCommand{Match: "docker ps --all --filter label=teploy.app=myapp", Output: psOutput},
+		ssh.MockCommand{Match: "docker ps --all --filter label=teploy.app='myapp'", Output: psOutput},
 	)
 	client := NewClient(mock)
 
@@ -513,7 +539,7 @@ func TestRunningContainer(t *testing.T) {
 func TestRunningContainer_NoneRunning(t *testing.T) {
 	psOutput := `{"ID":"old","Names":"myapp-web-v1","Image":"myapp:v1","State":"exited","Status":"Exited","Labels":"teploy.app=myapp,teploy.process=web,teploy.version=v1"}`
 	mock := ssh.NewMockExecutor("1.2.3.4",
-		ssh.MockCommand{Match: "docker ps --all --filter label=teploy.app=myapp", Output: psOutput},
+		ssh.MockCommand{Match: "docker ps --all --filter label=teploy.app='myapp'", Output: psOutput},
 	)
 	client := NewClient(mock)
 	if _, err := client.RunningContainer(context.Background(), "myapp", "web"); err == nil {

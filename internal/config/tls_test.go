@@ -92,6 +92,49 @@ tls:
 	}
 }
 
+func TestLoadApp_TLSInternal(t *testing.T) {
+	dir := t.TempDir()
+	content := `app: myapp
+domain: 192.168.1.114
+tls:
+  internal: true
+`
+	if err := os.WriteFile(filepath.Join(dir, "teploy.yml"), []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadApp(dir)
+	if err != nil {
+		t.Fatalf("LoadApp: %v", err)
+	}
+	if cfg.TLS == nil || !cfg.TLS.Internal {
+		t.Fatalf("expected tls.internal=true, got: %+v", cfg.TLS)
+	}
+	if cfg.TLS.Cert != "" || cfg.TLS.Key != "" {
+		t.Errorf("tls.internal should not require cert/key, got: %+v", cfg.TLS)
+	}
+}
+
+func TestLoadApp_TLSInternalRejectsCertAndKey(t *testing.T) {
+	dir := t.TempDir()
+	content := `app: myapp
+domain: 192.168.1.114
+tls:
+  internal: true
+  cert: ./c.pem
+  key: ./c.key
+`
+	if err := os.WriteFile(filepath.Join(dir, "teploy.yml"), []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := LoadApp(dir)
+	if err == nil {
+		t.Fatal("expected error combining tls.internal with cert/key")
+	}
+	if !strings.Contains(err.Error(), "internal") {
+		t.Errorf("error should mention internal, got: %v", err)
+	}
+}
+
 func TestLoadApp_TLSOverlayMerge(t *testing.T) {
 	dir := t.TempDir()
 	base := `app: fylun-web

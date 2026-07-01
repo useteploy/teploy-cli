@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/useteploy/teploy/internal/ssh"
@@ -82,6 +83,55 @@ func TestList_Empty(t *testing.T) {
 	}
 	if len(previews) != 0 {
 		t.Errorf("expected 0 previews, got %d", len(previews))
+	}
+}
+
+// TestPrune_OnlyDestroysExpired is the regression test for the piggyback
+// fix in internal/cli/preview.go's runPreviewDeploy: since teploy has no
+// server-side agent/daemon, ExpiresAt was written at deploy time but
+// nothing ever checked it. Prune is now called at the start of every
+// `teploy preview deploy` so expired previews for the app get torn down
+// (container + Caddy route) before a new one is created. This test proves
+// Prune destroys an expired preview and leaves a non-expired one alone.
+func TestPrune_OnlyDestroysExpired(t *testing.T) {
+	expiredJSON := `{"branch":"old-feature","domain":"preview-old-feature.myapp.com","port":49200,"container":"myapp-preview-old-feature-v1","image":"myapp:v1","created_at":"2020-01-01T00:00:00Z","expires_at":"2020-01-02T00:00:00Z"}`
+	freshJSON := fmt.Sprintf(`{"branch":"active-feature","domain":"preview-active-feature.myapp.com","port":49201,"container":"myapp-preview-active-feature-v2","image":"myapp:v2","created_at":"2020-01-01T00:00:00Z","expires_at":%q}`,
+		"2099-01-01T00:00:00Z")
+
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "ls /deployments/myapp/previews/*.json",
+			Output: "/deployments/myapp/previews/old-feature.json\n/deployments/myapp/previews/active-feature.json"},
+		ssh.MockCommand{Match: "cat /deployments/myapp/previews/old-feature.json", Output: expiredJSON},
+		ssh.MockCommand{Match: "cat /deployments/myapp/previews/active-feature.json", Output: freshJSON},
+
+		// Destroy(old-feature): docker stop/remove, then RemoveRoute's full
+		// Caddyfile-editing sequence (see TestDeploy for why this many
+		// steps are needed), then rm the state file.
+		ssh.MockCommand{Match: "docker stop -t 5 'myapp-preview-old-feature-v1'", Output: ""},
+		ssh.MockCommand{Match: "docker rm 'myapp-preview-old-feature-v1'", Output: ""},
+		ssh.MockCommand{Match: "cat /deployments/caddy/Caddyfile", Output: "{\n\tadmin 0.0.0.0:2019\n}\n"},
+		ssh.MockCommand{Match: "mv /tmp/teploy_caddyfile.tmp", Output: ""},
+		ssh.MockCommand{Match: "mkdir /deployments/caddy/.lock", Output: ""},
+		ssh.MockCommand{Match: "docker exec caddy caddy reload", Output: ""},
+		ssh.MockCommand{Match: "rmdir /deployments/caddy/.lock", Output: ""},
+		ssh.MockCommand{Match: "rm -f /deployments/myapp/previews/old-feature.json", Output: ""},
+	)
+
+	var buf bytes.Buffer
+	mgr := NewManager(mock, &buf)
+	pruned, err := mgr.Prune(context.Background(), "myapp")
+	if err != nil {
+		t.Fatalf("Prune: %v", err)
+	}
+	if pruned != 1 {
+		t.Errorf("expected 1 pruned preview, got %d", pruned)
+	}
+
+	// The non-expired preview must never have been touched.
+	for _, call := range mock.Calls {
+		if strings.Contains(call, "active-feature-v2") {
+			t.Errorf("non-expired preview should not be touched, but got call: %s", call)
+		}
 	}
 }
 

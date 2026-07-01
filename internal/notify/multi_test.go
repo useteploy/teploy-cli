@@ -2,8 +2,11 @@ package notify
 
 import (
 	"context"
+	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 )
@@ -72,6 +75,49 @@ func TestMultiNotifier_NilWhenEmpty(t *testing.T) {
 	n := NewMultiNotifier(nil)
 	if n != nil {
 		t.Error("expected nil notifier for empty channels")
+	}
+}
+
+func TestMultiNotifier_SlackSendsTextPayload(t *testing.T) {
+	var body []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ = io.ReadAll(r.Body)
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+
+	n := NewMultiNotifier([]Channel{
+		{Type: "slack", URL: srv.URL},
+	})
+	n.Send(context.Background(), Payload{App: "myapp", Type: "deploy", Server: "web1", Success: true})
+
+	var got slackMessage
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("slack payload wasn't valid JSON with a text field: %v (body: %s)", err, body)
+	}
+	if !strings.Contains(got.Text, "myapp") || !strings.Contains(got.Text, "deploy") {
+		t.Errorf("slack text = %q, want it to mention app and event type", got.Text)
+	}
+}
+
+func TestMultiNotifier_UnknownTypeIsNoOp(t *testing.T) {
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+
+	// discord isn't a recognized channel type — config.validate() rejects it
+	// before it ever reaches here, but MultiNotifier itself should still not
+	// panic or send anything for an unrecognized type slipping through.
+	n := NewMultiNotifier([]Channel{
+		{Type: "discord", URL: srv.URL},
+	})
+	n.Send(context.Background(), Payload{Type: "deploy", App: "myapp"})
+
+	if atomic.LoadInt32(&hits) != 0 {
+		t.Errorf("expected 0 hits for unrecognized channel type, got %d", hits)
 	}
 }
 

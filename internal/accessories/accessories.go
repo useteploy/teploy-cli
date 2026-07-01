@@ -50,7 +50,7 @@ func (m *Manager) EnsureRunning(ctx context.Context, app, name string, cfg confi
 
 	// Check if already running.
 	status, err := m.exec.Run(ctx, fmt.Sprintf(
-		"docker inspect -f '{{.State.Status}}' %s 2>/dev/null", containerName,
+		"docker inspect -f '{{.State.Status}}' %s 2>/dev/null", ssh.ShellQuote(containerName),
 	))
 	if err == nil && strings.TrimSpace(status) == "running" {
 		fmt.Fprintf(m.out, "  %s already running\n", containerName)
@@ -75,9 +75,9 @@ func (m *Manager) EnsureRunning(ctx context.Context, app, name string, cfg confi
 	args := []string{
 		"docker", "run", "--detach",
 		"--restart", "always",
-		"--name", containerName,
+		"--name", ssh.ShellQuote(containerName),
 		"--network", "teploy",
-		"--network-alias", containerName,
+		"--network-alias", ssh.ShellQuote(containerName),
 		"--label", "teploy.app=" + app,
 		"--label", "teploy.role=accessory",
 		"--label", "teploy.accessory=" + name,
@@ -85,18 +85,18 @@ func (m *Manager) EnsureRunning(ctx context.Context, app, name string, cfg confi
 
 	if len(env) > 0 {
 		for _, k := range sortedKeys(env) {
-			args = append(args, "-e", k+"="+env[k])
+			args = append(args, "-e", ssh.ShellQuote(k+"="+env[k]))
 		}
 	}
 
 	if len(volumes) > 0 {
 		for _, k := range sortedKeys(volumes) {
-			args = append(args, "-v", k+":"+volumes[k])
+			args = append(args, "-v", ssh.ShellQuote(k+":"+volumes[k]))
 		}
 	}
 
 	args = append(args, "--log-opt", "max-size=10m")
-	args = append(args, cfg.Image)
+	args = append(args, ssh.ShellQuote(cfg.Image))
 
 	if _, err := m.exec.Run(ctx, strings.Join(args, " ")); err != nil {
 		return nil, fmt.Errorf("starting accessory %s: %w", containerName, err)
@@ -227,7 +227,7 @@ func (m *Manager) InjectEnvVars(ctx context.Context, app string, vars map[string
 func (m *Manager) List(ctx context.Context, app string) ([]docker.Container, error) {
 	cmd := fmt.Sprintf(
 		"docker ps --all --filter label=teploy.app=%s --filter label=teploy.role=accessory --format '{{json .}}'",
-		app,
+		ssh.ShellQuote(app),
 	)
 	output, err := m.exec.Run(ctx, cmd)
 	if err != nil {
@@ -253,7 +253,7 @@ func (m *Manager) Start(ctx context.Context, app, name string) error {
 // Logs streams accessory container logs.
 func (m *Manager) Logs(ctx context.Context, app, name string, lines int) error {
 	containerName := ContainerName(app, name)
-	cmd := fmt.Sprintf("docker logs --tail %d %s 2>&1", lines, containerName)
+	cmd := fmt.Sprintf("docker logs --tail %d %s 2>&1", lines, ssh.ShellQuote(containerName))
 	return m.exec.RunStream(ctx, cmd, m.out, m.out)
 }
 

@@ -30,7 +30,7 @@ type State struct {
 // DeployConfig holds parameters for creating a preview.
 type DeployConfig struct {
 	App     string
-	Domain  string            // base domain (e.g., myapp.com)
+	Domain  string // base domain (e.g., myapp.com)
 	Branch  string
 	Image   string
 	Version string
@@ -121,15 +121,19 @@ func (m *Manager) Deploy(ctx context.Context, cfg DeployConfig) error {
 	fmt.Fprintf(m.out, "  Port: %d\n", port)
 
 	// Start container.
+	var envFiles []string
+	if cfg.EnvFile != "" {
+		envFiles = []string{cfg.EnvFile}
+	}
 	_, err = m.docker.Run(ctx, docker.RunConfig{
-		App:     cfg.App,
-		Process: "preview-" + sanitized,
-		Version: cfg.Version,
-		Image:   cfg.Image,
-		Port:    port,
-		EnvFile: cfg.EnvFile,
-		Env:     cfg.Env,
-		Volumes: cfg.Volumes,
+		App:      cfg.App,
+		Process:  "preview-" + sanitized,
+		Version:  cfg.Version,
+		Image:    cfg.Image,
+		Port:     port,
+		EnvFiles: envFiles,
+		Env:      cfg.Env,
+		Volumes:  cfg.Volumes,
 	})
 	if err != nil {
 		return fmt.Errorf("starting preview container: %w", err)

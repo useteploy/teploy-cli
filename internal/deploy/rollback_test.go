@@ -3,6 +3,7 @@ package deploy
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -23,17 +24,19 @@ func TestRollback(t *testing.T) {
 	stateContent := "current_port=49153\ncurrent_hash=v2\nprevious_port=49152\nprevious_hash=v1\n"
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "cat /deployments/myapp/state", Output: stateContent},
-		ssh.MockCommand{Match: "docker ps --all --filter label=teploy.app=myapp",
+		ssh.MockCommand{Match: "docker ps --all --filter label=teploy.app='myapp'",
 			Output: `{"ID":"aaa","Names":"myapp-web-v1","Image":"myapp:latest","State":"exited","Status":"Exited","Labels":"teploy.app=myapp,teploy.version=v1,teploy.process=web"}` + "\n" +
 				`{"ID":"bbb","Names":"myapp-web-v2","Image":"myapp:latest","State":"running","Status":"Up 1h","Labels":"teploy.app=myapp,teploy.version=v2,teploy.process=web"}`,
 		},
 		// rollback uses Restart (inspect → rm -f → docker run) instead of bare
 		// `docker start` so HostConfig.PortBindings actually re-apply on Docker 29.
-		ssh.MockCommand{Match: "docker inspect myapp-web-v1", Output: `[{"Config":{"Image":"myapp:latest","Labels":{"teploy.app":"myapp"}},"HostConfig":{"NetworkMode":"teploy","PortBindings":{"3000/tcp":[{"HostIp":"127.0.0.1","HostPort":"49152"}]},"RestartPolicy":{"Name":"no"}},"NetworkSettings":{"Networks":{"teploy":{"Aliases":["myapp"]}}}}]`},
-		ssh.MockCommand{Match: "docker rm -f myapp-web-v1", Output: ""},
+		ssh.MockCommand{Match: "docker inspect 'myapp-web-v1'", Output: `[{"Config":{"Image":"myapp:latest","Labels":{"teploy.app":"myapp"}},"HostConfig":{"NetworkMode":"teploy","PortBindings":{"3000/tcp":[{"HostIp":"127.0.0.1","HostPort":"49152"}]},"RestartPolicy":{"Name":"no"}},"NetworkSettings":{"Networks":{"teploy":{"Aliases":["myapp"]}}}}]`},
+		ssh.MockCommand{Match: "docker rm -f 'myapp-web-v1'", Output: ""},
 		ssh.MockCommand{Match: "docker run", Output: ""},
 		ssh.MockCommand{Match: "curl", Output: "200"},
-		// Previous container's internal port resolved via docker inspect -f.
+		// Target container's host port (health check) resolved via docker inspect -f.
+		ssh.MockCommand{Match: "docker inspect -f '{{range $p, $b := .NetworkSettings.Ports}}", Output: "49153"},
+		// Target container's internal port (Caddy upstream) resolved via docker inspect -f.
 		ssh.MockCommand{Match: "docker inspect -f '{{range $p, $_ := .NetworkSettings.Ports}}", Output: "3000/tcp"},
 		ssh.MockCommand{Match: "caddy", Output: ""},
 		ssh.MockCommand{Match: "cat /deployments/caddy/Caddyfile", Output: "{\n\tadmin 0.0.0.0:2019\n}\n"},
@@ -65,9 +68,9 @@ func TestRollback(t *testing.T) {
 	var inspected, removed, ran bool
 	for _, call := range mock.Calls {
 		switch {
-		case strings.HasPrefix(call, "docker inspect myapp-web-v1"):
+		case strings.HasPrefix(call, "docker inspect 'myapp-web-v1'"):
 			inspected = true
-		case strings.HasPrefix(call, "docker rm -f myapp-web-v1"):
+		case strings.HasPrefix(call, "docker rm -f 'myapp-web-v1'"):
 			removed = true
 		case strings.HasPrefix(call, "docker run") && strings.Contains(call, "myapp-web-v1"):
 			ran = true
@@ -147,13 +150,20 @@ func TestRollback_NoPreviousDeploy(t *testing.T) {
 	if !strings.Contains(err.Error(), "no previous deploy") {
 		t.Errorf("unexpected error: %v", err)
 	}
+	// Multi-server rollback-all (internal/cli/deploy.go's runMultiDeploy)
+	// distinguishes "first deploy, nothing to roll back" from a genuine
+	// rollback failure via this sentinel — it must actually be this error,
+	// not just one with similar text.
+	if !errors.Is(err, ErrNoPreviousDeploy) {
+		t.Errorf("expected errors.Is(err, ErrNoPreviousDeploy), got: %v", err)
+	}
 }
 
 func TestRollback_NoPreviousContainers(t *testing.T) {
 	stateContent := "current_port=49153\ncurrent_hash=v2\nprevious_port=49152\nprevious_hash=v1\n"
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "cat /deployments/myapp/state", Output: stateContent},
-		ssh.MockCommand{Match: "docker ps --all --filter label=teploy.app=myapp",
+		ssh.MockCommand{Match: "docker ps --all --filter label=teploy.app='myapp'",
 			Output: `{"ID":"bbb","Names":"myapp-web-v2","Image":"myapp:latest","State":"running","Status":"Up 1h","Labels":"teploy.app=myapp,teploy.version=v2,teploy.process=web"}`,
 		},
 	)
@@ -162,7 +172,7 @@ func TestRollback_NoPreviousContainers(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for missing previous containers")
 	}
-	if !strings.Contains(err.Error(), "no previous containers") {
+	if !strings.Contains(err.Error(), "no containers found for version") {
 		t.Errorf("unexpected error: %v", err)
 	}
 }
@@ -171,14 +181,15 @@ func TestRollback_HealthCheckFails(t *testing.T) {
 	stateContent := "current_port=49153\ncurrent_hash=v2\nprevious_port=49152\nprevious_hash=v1\n"
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "cat /deployments/myapp/state", Output: stateContent},
-		ssh.MockCommand{Match: "docker ps --all --filter label=teploy.app=myapp",
+		ssh.MockCommand{Match: "docker ps --all --filter label=teploy.app='myapp'",
 			Output: `{"ID":"aaa","Names":"myapp-web-v1","Image":"myapp:latest","State":"exited","Status":"Exited","Labels":"teploy.app=myapp,teploy.version=v1,teploy.process=web"}` + "\n" +
 				`{"ID":"bbb","Names":"myapp-web-v2","Image":"myapp:latest","State":"running","Status":"Up 1h","Labels":"teploy.app=myapp,teploy.version=v2,teploy.process=web"}`,
 		},
 		// Restart (inspect → rm -f → docker run).
-		ssh.MockCommand{Match: "docker inspect myapp-web-v1", Output: `[{"Config":{"Image":"myapp:latest","Labels":{"teploy.app":"myapp"}},"HostConfig":{"NetworkMode":"teploy","PortBindings":{"3000/tcp":[{"HostIp":"127.0.0.1","HostPort":"49152"}]},"RestartPolicy":{"Name":"no"}},"NetworkSettings":{"Networks":{"teploy":{"Aliases":["myapp"]}}}}]`},
-		ssh.MockCommand{Match: "docker rm -f myapp-web-v1", Output: ""},
+		ssh.MockCommand{Match: "docker inspect 'myapp-web-v1'", Output: `[{"Config":{"Image":"myapp:latest","Labels":{"teploy.app":"myapp"}},"HostConfig":{"NetworkMode":"teploy","PortBindings":{"3000/tcp":[{"HostIp":"127.0.0.1","HostPort":"49152"}]},"RestartPolicy":{"Name":"no"}},"NetworkSettings":{"Networks":{"teploy":{"Aliases":["myapp"]}}}}]`},
+		ssh.MockCommand{Match: "docker rm -f 'myapp-web-v1'", Output: ""},
 		ssh.MockCommand{Match: "docker run", Output: ""},
+		ssh.MockCommand{Match: "docker inspect -f '{{range $p, $b := .NetworkSettings.Ports}}", Output: "49153"},
 		ssh.MockCommand{Match: "curl", Err: fmt.Errorf("connection refused")},
 		ssh.MockCommand{Match: "bash -c", Err: fmt.Errorf("connection refused")},
 		ssh.MockCommand{Match: "docker stop", Output: ""},
@@ -203,17 +214,18 @@ func TestRollback_MultiReplica(t *testing.T) {
 		"current_ports=49153,49155\nprevious_ports=49152,49154\n"
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "cat /deployments/myapp/state", Output: stateContent},
-		ssh.MockCommand{Match: "docker ps --all --filter label=teploy.app=myapp",
+		ssh.MockCommand{Match: "docker ps --all --filter label=teploy.app='myapp'",
 			Output: `{"ID":"a1","Names":"myapp-web-v1-1","Image":"myapp:latest","State":"exited","Status":"Exited","Labels":"teploy.app=myapp,teploy.version=v1,teploy.process=web"}` + "\n" +
 				`{"ID":"a2","Names":"myapp-web-v1-2","Image":"myapp:latest","State":"exited","Status":"Exited","Labels":"teploy.app=myapp,teploy.version=v1,teploy.process=web"}` + "\n" +
 				`{"ID":"b1","Names":"myapp-web-v2-1","Image":"myapp:latest","State":"running","Status":"Up 1h","Labels":"teploy.app=myapp,teploy.version=v2,teploy.process=web"}` + "\n" +
 				`{"ID":"b2","Names":"myapp-web-v2-2","Image":"myapp:latest","State":"running","Status":"Up 1h","Labels":"teploy.app=myapp,teploy.version=v2,teploy.process=web"}`,
 		},
 		// Restart (inspect → rm -f → run) for each previous replica; prefix
-		// "docker inspect myapp-web-v1" covers -1 and -2.
-		ssh.MockCommand{Match: "docker inspect myapp-web-v1", Output: `[{"Config":{"Image":"myapp:latest","Labels":{"teploy.app":"myapp"}},"HostConfig":{"NetworkMode":"teploy","PortBindings":{"3000/tcp":[{"HostIp":"127.0.0.1","HostPort":"49152"}]},"RestartPolicy":{"Name":"no"}},"NetworkSettings":{"Networks":{"teploy":{"Aliases":["myapp"]}}}}]`},
-		ssh.MockCommand{Match: "docker rm -f myapp-web-v1", Output: ""},
+		// "docker inspect 'myapp-web-v1" (open quote, no close) covers -1 and -2.
+		ssh.MockCommand{Match: "docker inspect 'myapp-web-v1", Output: `[{"Config":{"Image":"myapp:latest","Labels":{"teploy.app":"myapp"}},"HostConfig":{"NetworkMode":"teploy","PortBindings":{"3000/tcp":[{"HostIp":"127.0.0.1","HostPort":"49152"}]},"RestartPolicy":{"Name":"no"}},"NetworkSettings":{"Networks":{"teploy":{"Aliases":["myapp"]}}}}]`},
+		ssh.MockCommand{Match: "docker rm -f 'myapp-web-v1", Output: ""},
 		ssh.MockCommand{Match: "docker run", Output: ""},
+		ssh.MockCommand{Match: "docker inspect -f '{{range $p, $b := .NetworkSettings.Ports}}", Output: "49153"},
 		ssh.MockCommand{Match: "curl", Output: "200"},
 		ssh.MockCommand{Match: "docker inspect -f '{{range $p, $_ := .NetworkSettings.Ports}}", Output: "3000/tcp"},
 		ssh.MockCommand{Match: "caddy", Output: ""},
@@ -241,7 +253,7 @@ func TestRollback_MultiReplica(t *testing.T) {
 	for _, name := range []string{"myapp-web-v1-1", "myapp-web-v1-2"} {
 		found := false
 		for _, c := range mock.Calls {
-			if strings.HasPrefix(c, "docker rm -f "+name) {
+			if strings.HasPrefix(c, "docker rm -f "+ssh.ShellQuote(name)) {
 				found = true
 			}
 		}
@@ -253,5 +265,97 @@ func TestRollback_MultiReplica(t *testing.T) {
 	cf := string(mock.Files["/tmp/teploy_caddyfile.tmp"])
 	if !strings.Contains(cf, "myapp-web-v1-1:3000") || !strings.Contains(cf, "myapp-web-v1-2:3000") {
 		t.Errorf("expected both replica upstreams in Caddyfile, got:\n%s", cf)
+	}
+}
+
+// TestRollback_ToSpecificHash is the direct regression test for Phase 8:
+// container rollback previously could only ever go back exactly one
+// version (state.AppState.PreviousHash), unlike type:static's --to. This
+// proves rolling back to v1 works even though the immediately previous
+// version is v2 — v1's containers are found by inspecting the live
+// container set (teploy.version label + HostPort/InternalPort), not by
+// any depth-tracking added to state.go (there isn't any — this mirrors
+// type:static's existing simple 1-level-swap state semantics exactly).
+func TestRollback_ToSpecificHash(t *testing.T) {
+	stateContent := "current_port=49154\ncurrent_hash=v3\nprevious_port=49153\nprevious_hash=v2\n"
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "cat /deployments/myapp/state", Output: stateContent},
+		ssh.MockCommand{Match: "docker ps --all --filter label=teploy.app='myapp'",
+			Output: `{"ID":"aaa","Names":"myapp-web-v1","Image":"myapp:latest","State":"exited","Status":"Exited","Labels":"teploy.app=myapp,teploy.version=v1,teploy.process=web"}` + "\n" +
+				`{"ID":"bbb","Names":"myapp-web-v2","Image":"myapp:latest","State":"exited","Status":"Exited","Labels":"teploy.app=myapp,teploy.version=v2,teploy.process=web"}` + "\n" +
+				`{"ID":"ccc","Names":"myapp-web-v3","Image":"myapp:latest","State":"running","Status":"Up 1h","Labels":"teploy.app=myapp,teploy.version=v3,teploy.process=web"}`,
+		},
+		ssh.MockCommand{Match: "docker inspect 'myapp-web-v1'", Output: `[{"Config":{"Image":"myapp:latest","Labels":{"teploy.app":"myapp"}},"HostConfig":{"NetworkMode":"teploy","PortBindings":{"3000/tcp":[{"HostIp":"127.0.0.1","HostPort":"49152"}]},"RestartPolicy":{"Name":"no"}},"NetworkSettings":{"Networks":{"teploy":{"Aliases":["myapp"]}}}}]`},
+		ssh.MockCommand{Match: "docker rm -f 'myapp-web-v1'", Output: ""},
+		ssh.MockCommand{Match: "docker run", Output: ""},
+		ssh.MockCommand{Match: "docker inspect -f '{{range $p, $b := .NetworkSettings.Ports}}", Output: "49152"},
+		ssh.MockCommand{Match: "curl", Output: "200"},
+		ssh.MockCommand{Match: "docker inspect -f '{{range $p, $_ := .NetworkSettings.Ports}}", Output: "3000/tcp"},
+		ssh.MockCommand{Match: "caddy", Output: ""},
+		ssh.MockCommand{Match: "cat /deployments/caddy/Caddyfile", Output: "{\n\tadmin 0.0.0.0:2019\n}\n"},
+		ssh.MockCommand{Match: "mv /tmp/teploy_caddyfile.tmp", Output: ""},
+		ssh.MockCommand{Match: "mkdir /deployments/caddy/.lock", Output: ""},
+		ssh.MockCommand{Match: "docker exec caddy caddy reload", Output: ""},
+		ssh.MockCommand{Match: "rmdir /deployments/caddy/.lock", Output: ""},
+		ssh.MockCommand{Match: "docker stop", Output: ""},
+		ssh.MockCommand{Match: "mkdir -p", Output: ""},
+		ssh.MockCommand{Match: "cat /tmp", Output: ""},
+		ssh.MockCommand{Match: "UPLOAD:", Output: ""},
+	)
+
+	cfg := rollbackCfg()
+	cfg.ToHash = "v1"
+	var buf bytes.Buffer
+	if err := Rollback(context.Background(), mock, &buf, cfg); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if !strings.Contains(buf.String(), "Rolled back myapp to version v1") {
+		t.Errorf("expected rollback to v1, got: %s", buf.String())
+	}
+
+	// v3 (current) must be stopped; v2 (the merely-previous version, not
+	// the target) must be left completely untouched.
+	var stoppedV3, touchedV2 bool
+	for _, c := range mock.Calls {
+		if strings.HasPrefix(c, "docker stop") && strings.Contains(c, "myapp-web-v3") {
+			stoppedV3 = true
+		}
+		if strings.Contains(c, "myapp-web-v2") {
+			touchedV2 = true
+		}
+	}
+	if !stoppedV3 {
+		t.Error("expected current version (v3) to be stopped")
+	}
+	if touchedV2 {
+		t.Error("v2 (previous, but not the --to target) should not be touched at all")
+	}
+
+	// State: v1 becomes current, v3 (what we just rolled back from) becomes
+	// previous — a plain 1-level swap, not a deeper history stack.
+	stateData := string(mock.Files["/deployments/myapp/state"])
+	if !strings.Contains(stateData, "current_hash=v1") {
+		t.Errorf("expected current_hash=v1, got: %s", stateData)
+	}
+	if !strings.Contains(stateData, "previous_hash=v3") {
+		t.Errorf("expected previous_hash=v3 (the version rolled back from), got: %s", stateData)
+	}
+}
+
+func TestRollback_ToHash_AlreadyCurrent(t *testing.T) {
+	stateContent := "current_port=49153\ncurrent_hash=v2\nprevious_port=49152\nprevious_hash=v1\n"
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "cat /deployments/myapp/state", Output: stateContent},
+	)
+
+	cfg := rollbackCfg()
+	cfg.ToHash = "v2" // same as current_hash
+	err := Rollback(context.Background(), mock, &bytes.Buffer{}, cfg)
+	if err == nil {
+		t.Fatal("expected error when --to targets the already-current version")
+	}
+	if !strings.Contains(err.Error(), "already current") {
+		t.Errorf("unexpected error: %v", err)
 	}
 }

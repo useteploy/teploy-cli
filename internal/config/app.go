@@ -49,8 +49,15 @@ type AccessoryConfig struct {
 // block, so the cert survives every deploy (unlike a hand-edited Caddyfile,
 // which the authoritative model overwrites).
 type TLSConfig struct {
-	Cert string `yaml:"cert" toml:"cert"` // local path to PEM certificate (chain)
-	Key  string `yaml:"key" toml:"key"`   // local path to PEM private key
+	Cert string `yaml:"cert,omitempty" toml:"cert"` // local path to PEM certificate (chain)
+	Key  string `yaml:"key,omitempty" toml:"key"`   // local path to PEM private key
+	// Internal requests Caddy's own local CA (self-signed, `tls internal`)
+	// instead of a custom cert or automatic HTTPS. Mutually exclusive with
+	// Cert/Key. Meaningful mainly for non-public domains (bare IPs, LAN
+	// hostnames) where automatic HTTPS can't complete an ACME challenge —
+	// see caddy.isPubliclyRoutable. Not needed for a real public domain,
+	// which should just use automatic HTTPS (the default, empty tls:).
+	Internal bool `yaml:"internal,omitempty" toml:"internal"`
 }
 
 // ProcessHealth overrides the container HEALTHCHECK behavior for a single
@@ -73,6 +80,13 @@ type ProcessHealth struct {
 type AppHealthConfig struct {
 	// Path is the URL path polled for a 200 response. Default: "/health".
 	Path string `yaml:"path,omitempty" toml:"path"`
+	// TimeoutSeconds is the total time to wait for a healthy response before
+	// the deploy fails and rolls back. Default: 30. Raise this for
+	// slow-starting apps (JVM boot, migrations that run before the app
+	// binds its port) instead of them always failing health and rolling back.
+	TimeoutSeconds int `yaml:"timeout_seconds,omitempty" toml:"timeout_seconds"`
+	// IntervalSeconds is the time between health check polls. Default: 1.
+	IntervalSeconds int `yaml:"interval_seconds,omitempty" toml:"interval_seconds"`
 }
 
 // NotificationChannelConfig represents a single notification channel.
@@ -135,66 +149,66 @@ const (
 
 // AppConfig represents the teploy configuration (yml, yaml, or toml).
 type AppConfig struct {
-	App           string                     `yaml:"app" toml:"app"`
-	Domain        string                     `yaml:"domain" toml:"domain"`
-	Type          string                     `yaml:"type,omitempty" toml:"type"`
+	App    string `yaml:"app" toml:"app"`
+	Domain string `yaml:"domain" toml:"domain"`
+	Type   string `yaml:"type,omitempty" toml:"type"`
 	// Ingress selects the routing layer. Empty / "caddy" (default) means
 	// Teploy manages the Caddyfile. "external" means the user fronts the
 	// container with their own ingress (Cloudflare Tunnel, nginx, …) and
 	// Teploy must not touch Caddy for this app. See the Ingress* consts.
-	Ingress       string                     `yaml:"ingress,omitempty" toml:"ingress"`
+	Ingress string `yaml:"ingress,omitempty" toml:"ingress"`
 	// Bind is the host IP that `ingress: host` publishes the fixed port on
 	// (default 0.0.0.0 — all interfaces). Only valid with ingress: host.
-	Bind          string                     `yaml:"bind,omitempty" toml:"bind"`
-	Server        string                     `yaml:"server,omitempty" toml:"server"`
-	User          string                     `yaml:"user,omitempty" toml:"user"`
-	Servers       []string                   `yaml:"servers,omitempty" toml:"servers"`
-	Image         string                     `yaml:"image,omitempty" toml:"image"`
-	Port          int                        `yaml:"port,omitempty" toml:"port"`
-	Platform      string                     `yaml:"platform,omitempty" toml:"platform"`
-	BuildLocal    bool                       `yaml:"build_local,omitempty" toml:"build_local"`
-	StopTimeout   int                        `yaml:"stop_timeout,omitempty" toml:"stop_timeout"`
-	Parallel      int                        `yaml:"parallel,omitempty" toml:"parallel"`
-	Replicas      int                        `yaml:"replicas,omitempty" toml:"replicas"`
+	Bind        string   `yaml:"bind,omitempty" toml:"bind"`
+	Server      string   `yaml:"server,omitempty" toml:"server"`
+	User        string   `yaml:"user,omitempty" toml:"user"`
+	Servers     []string `yaml:"servers,omitempty" toml:"servers"`
+	Image       string   `yaml:"image,omitempty" toml:"image"`
+	Port        int      `yaml:"port,omitempty" toml:"port"`
+	Platform    string   `yaml:"platform,omitempty" toml:"platform"`
+	BuildLocal  bool     `yaml:"build_local,omitempty" toml:"build_local"`
+	StopTimeout int      `yaml:"stop_timeout,omitempty" toml:"stop_timeout"`
+	Parallel    int      `yaml:"parallel,omitempty" toml:"parallel"`
+	Replicas    int      `yaml:"replicas,omitempty" toml:"replicas"`
 	// KeepVersions caps the number of past app versions retained after a
 	// successful deploy (containers + images). Zero (default) keeps
 	// everything — historical behavior. Set to 2 or 3 to enable auto-prune
 	// with a rollback window. Container-deploy only; static deploy uses
 	// KeepReleases instead.
-	KeepVersions  int                        `yaml:"keep_versions,omitempty" toml:"keep_versions"`
-	Hooks         HooksConfig                `yaml:"hooks,omitempty" toml:"hooks"`
-	Volumes       map[string]string          `yaml:"volumes,omitempty" toml:"volumes"`
-	Processes     map[string]string          `yaml:"processes,omitempty" toml:"processes"`
+	KeepVersions int               `yaml:"keep_versions,omitempty" toml:"keep_versions"`
+	Hooks        HooksConfig       `yaml:"hooks,omitempty" toml:"hooks"`
+	Volumes      map[string]string `yaml:"volumes,omitempty" toml:"volumes"`
+	Processes    map[string]string `yaml:"processes,omitempty" toml:"processes"`
 	// Env are plain environment variables passed to the app container. Values
 	// may reference ${VAR} from the local environment (expanded at deploy
 	// time). Secrets set via `teploy secret` override these key-for-key.
-	Env           map[string]string          `yaml:"env,omitempty" toml:"env"`
+	Env map[string]string `yaml:"env,omitempty" toml:"env"`
 	// Health configures the teploy-level deploy health check (the HTTP poll
 	// that gates traffic switch after a deploy, separate from the container
 	// HEALTHCHECK). Path defaults to "/health" when unset.
-	Health        AppHealthConfig            `yaml:"health,omitempty" toml:"health"`
+	Health AppHealthConfig `yaml:"health,omitempty" toml:"health"`
 	// Healthcheck holds per-process overrides for the container HEALTHCHECK,
 	// keyed by process name. Keys must match a key in Processes. Additive to
 	// the scalar `processes:` schema — does not replace it.
-	Healthcheck   map[string]ProcessHealth   `yaml:"healthcheck,omitempty" toml:"healthcheck"`
-	Accessories   map[string]AccessoryConfig `yaml:"accessories,omitempty" toml:"accessories"`
-	Assets        AssetsConfig               `yaml:"assets,omitempty" toml:"assets"`
+	Healthcheck map[string]ProcessHealth   `yaml:"healthcheck,omitempty" toml:"healthcheck"`
+	Accessories map[string]AccessoryConfig `yaml:"accessories,omitempty" toml:"accessories"`
+	Assets      AssetsConfig               `yaml:"assets,omitempty" toml:"assets"`
 	// TLS terminates the app's HTTPS with a custom cert instead of ACME.
 	// Required behind Cloudflare proxy / Tunnel (origin cert). Nil = ACME.
-	TLS           *TLSConfig                 `yaml:"tls,omitempty" toml:"tls"`
-	Notifications NotificationsConfig        `yaml:"notifications,omitempty" toml:"notifications"`
-	Network       NetworkConfig              `yaml:"network,omitempty" toml:"network"`
+	TLS           *TLSConfig          `yaml:"tls,omitempty" toml:"tls"`
+	Notifications NotificationsConfig `yaml:"notifications,omitempty" toml:"notifications"`
+	Network       NetworkConfig       `yaml:"network,omitempty" toml:"network"`
 
 	// Static deploy fields. Only used when Type == "static".
-	Source       string            `yaml:"source,omitempty" toml:"source"`             // local path to built files
-	Build        []string          `yaml:"build,omitempty" toml:"build"`               // pre-rsync shell commands (run locally by default)
-	BuildRemote  bool              `yaml:"build_remote,omitempty" toml:"build_remote"` // run Build commands on the target server instead of locally
-	SPA          bool              `yaml:"spa,omitempty" toml:"spa"`                   // enable SPA fallback (try_files)
-	SPAFallback  string            `yaml:"spa_fallback,omitempty" toml:"spa_fallback"` // fallback path (default /index.html)
-	Cache        map[string]string `yaml:"cache,omitempty" toml:"cache"`               // path glob → Cache-Control value
-	Headers      map[string]string `yaml:"headers,omitempty" toml:"headers"`           // arbitrary response headers
+	Source       string            `yaml:"source,omitempty" toml:"source"`               // local path to built files
+	Build        []string          `yaml:"build,omitempty" toml:"build"`                 // pre-rsync shell commands (run locally by default)
+	BuildRemote  bool              `yaml:"build_remote,omitempty" toml:"build_remote"`   // run Build commands on the target server instead of locally
+	SPA          bool              `yaml:"spa,omitempty" toml:"spa"`                     // enable SPA fallback (try_files)
+	SPAFallback  string            `yaml:"spa_fallback,omitempty" toml:"spa_fallback"`   // fallback path (default /index.html)
+	Cache        map[string]string `yaml:"cache,omitempty" toml:"cache"`                 // path glob → Cache-Control value
+	Headers      map[string]string `yaml:"headers,omitempty" toml:"headers"`             // arbitrary response headers
 	KeepReleases int               `yaml:"keep_releases,omitempty" toml:"keep_releases"` // retention count (default 5)
-	CaddyExtra   string            `yaml:"caddy_extra,omitempty" toml:"caddy_extra"`   // raw Caddy directives appended into the site block
+	CaddyExtra   string            `yaml:"caddy_extra,omitempty" toml:"caddy_extra"`     // raw Caddy directives appended into the site block
 }
 
 // IsStatic reports whether this app deploys as static files (no container).
@@ -208,35 +222,74 @@ func (c *AppConfig) UsesCaddy() bool {
 	return c.Ingress == "" || c.Ingress == IngressCaddy
 }
 
+// ValidateName checks that an app name is safe to use as a container name,
+// a state-directory path segment, and to interpolate into remote shell
+// commands (every such call site quotes the value too — this is defense in
+// depth, not the only protection). Exported so callers that build an
+// AppConfig directly instead of loading teploy.yml — the ad-hoc `--app`
+// deploy path (internal/cli/deploy.go's runAdHocDeploy), and the `--app`
+// flag shared by resolveApp (internal/cli/connect.go) — can validate
+// before the name reaches the network, since those paths never call
+// validate() below.
+func ValidateName(name string) error {
+	return ValidateIdentifier("app", name)
+}
+
+// ValidateIdentifier is the generic form of ValidateName for any other
+// value that ends up in the same places an app name does — most notably
+// accessory names, which validate() below already constrains to this same
+// pattern when they come from teploy.yml's `accessories:` block, but which
+// arrive unvalidated as a raw CLI positional arg for `teploy accessory
+// stop/start/logs/exec <name>` (internal/cli/accessory.go). label is used
+// only to produce an accurate error message (e.g. "accessory name ..." vs
+// "'app' ...").
+func ValidateIdentifier(label, name string) error {
+	if name == "" {
+		return fmt.Errorf("'%s' is required", label)
+	}
+	if !validName.MatchString(name) {
+		return fmt.Errorf("'%s' must be lowercase alphanumeric with hyphens (got %q)", label, name)
+	}
+	if len(name) > 63 {
+		return fmt.Errorf("'%s' name too long (max 63 chars, got %d)", label, len(name))
+	}
+	return nil
+}
+
+// ValidateDomain checks a (possibly comma-separated multi-host) domain
+// value. allowEmpty should be true only for ingress: host, which publishes
+// a raw port directly and needs no hostname. Exported for the same reason
+// as ValidateName.
+func ValidateDomain(domain string, allowEmpty bool) error {
+	if domain == "" {
+		if allowEmpty {
+			return nil
+		}
+		return fmt.Errorf("'domain' is required")
+	}
+	// A single comma-separated list is supported so one app can serve
+	// multiple hosts (e.g. "example.com, www.example.com"). Each entry is
+	// validated independently against the single-host regex.
+	for _, host := range strings.Split(domain, ",") {
+		host = strings.TrimSpace(host)
+		if host == "" {
+			return fmt.Errorf("'domain' contains an empty entry (got %q)", domain)
+		}
+		if !validDomain.MatchString(host) {
+			return fmt.Errorf("'domain' contains invalid characters (got %q)", domain)
+		}
+	}
+	return nil
+}
+
 func (c *AppConfig) validate() error {
-	if c.App == "" {
-		return fmt.Errorf("'app' is required")
-	}
-	if !validName.MatchString(c.App) {
-		return fmt.Errorf("'app' must be lowercase alphanumeric with hyphens (got %q)", c.App)
-	}
-	if len(c.App) > 63 {
-		return fmt.Errorf("'app' name too long (max 63 chars, got %d)", len(c.App))
+	if err := ValidateName(c.App); err != nil {
+		return err
 	}
 	// Host ingress publishes a raw port and needs no domain; every other mode
 	// routes by hostname and requires one.
-	if c.Domain == "" {
-		if c.Ingress != IngressHost {
-			return fmt.Errorf("'domain' is required")
-		}
-	} else {
-		// A single comma-separated list is supported so one app can serve
-		// multiple hosts (e.g. "example.com, www.example.com"). Each entry is
-		// validated independently against the single-host regex.
-		for _, host := range strings.Split(c.Domain, ",") {
-			host = strings.TrimSpace(host)
-			if host == "" {
-				return fmt.Errorf("'domain' contains an empty entry (got %q)", c.Domain)
-			}
-			if !validDomain.MatchString(host) {
-				return fmt.Errorf("'domain' contains invalid characters (got %q)", c.Domain)
-			}
-		}
+	if err := ValidateDomain(c.Domain, c.Ingress == IngressHost); err != nil {
+		return err
 	}
 	if c.Platform != "" && !validPlatform.MatchString(c.Platform) {
 		return fmt.Errorf("'platform' must be os/arch (e.g. linux/amd64, linux/arm64), got %q", c.Platform)
@@ -312,8 +365,12 @@ func (c *AppConfig) validate() error {
 		return fmt.Errorf("'type' must be 'container' or 'static' (got %q)", c.Type)
 	}
 	if c.TLS != nil {
-		if c.TLS.Cert == "" || c.TLS.Key == "" {
-			return fmt.Errorf("'tls' requires both 'cert' and 'key' paths")
+		if c.TLS.Internal {
+			if c.TLS.Cert != "" || c.TLS.Key != "" {
+				return fmt.Errorf("'tls.internal' cannot be combined with 'cert'/'key' — pick one")
+			}
+		} else if c.TLS.Cert == "" || c.TLS.Key == "" {
+			return fmt.Errorf("'tls' requires both 'cert' and 'key' paths (or 'internal: true' for a self-signed cert)")
 		}
 		// TLS only takes effect via the Caddy site block. With ingress:external
 		// the user's external ingress (Cloudflare Tunnel, nginx, ALB, …)
@@ -322,6 +379,19 @@ func (c *AppConfig) validate() error {
 		if c.Ingress == IngressExternal {
 			return fmt.Errorf("'tls' has no effect with 'ingress: external' — your external ingress should handle TLS termination")
 		}
+	}
+	for _, ch := range c.Notifications.Channels {
+		switch ch.Type {
+		case "", "webhook", "slack", "email":
+		default:
+			return fmt.Errorf("'notifications.channels[].type' must be one of: webhook, slack, email (got %q) — an unrecognized type silently never fires", ch.Type)
+		}
+	}
+	if c.Health.TimeoutSeconds < 0 {
+		return fmt.Errorf("'health.timeout_seconds' must be >= 0 (got %d)", c.Health.TimeoutSeconds)
+	}
+	if c.Health.IntervalSeconds < 0 {
+		return fmt.Errorf("'health.interval_seconds' must be >= 0 (got %d)", c.Health.IntervalSeconds)
 	}
 	for name := range c.Volumes {
 		if !validName.MatchString(name) {

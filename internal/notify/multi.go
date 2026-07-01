@@ -52,6 +52,10 @@ func (n *MultiNotifier) Send(ctx context.Context, p Payload) []error {
 			if err := sendWebhook(ctx, n.client, ch.URL, p); err != nil {
 				errs = append(errs, fmt.Errorf("webhook %s: %w", ch.URL, err))
 			}
+		case "slack":
+			if err := sendSlack(ctx, n.client, ch.URL, p); err != nil {
+				errs = append(errs, fmt.Errorf("slack %s: %w", ch.URL, err))
+			}
 		case "email":
 			// Email not yet implemented — log warning silently.
 			errs = append(errs, fmt.Errorf("email notifications not yet implemented (to: %s)", ch.To))
@@ -72,6 +76,48 @@ func matchesEvent(filter []string, eventType string) bool {
 		}
 	}
 	return false
+}
+
+// slackMessage is Slack's Incoming Webhook payload shape — a bare "text"
+// field. Slack's webhook endpoint rejects the generic Payload JSON (no
+// "text"/"blocks"/"attachments" key) with a 400 "invalid_payload", so
+// type: slack can't just reuse sendWebhook's body.
+type slackMessage struct {
+	Text string `json:"text"`
+}
+
+func sendSlack(ctx context.Context, client *http.Client, url string, p Payload) error {
+	status := "succeeded"
+	if !p.Success {
+		status = "failed"
+	}
+	text := fmt.Sprintf("*%s* %s on %s (%s)", p.App, p.Type, p.Server, status)
+	if p.Message != "" {
+		text += "\n" + p.Message
+	}
+
+	body, err := json.Marshal(slackMessage{Text: text})
+	if err != nil {
+		return fmt.Errorf("marshaling slack message: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("creating request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "teploy/1.0")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("sending slack message: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("slack webhook returned status %d", resp.StatusCode)
+	}
+	return nil
 }
 
 func sendWebhook(ctx context.Context, client *http.Client, url string, p Payload) error {

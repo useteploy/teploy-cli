@@ -4,12 +4,13 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"os"
 
+	"github.com/useteploy/teploy/internal/accessories"
 	"github.com/useteploy/teploy/internal/build"
 	"github.com/useteploy/teploy/internal/config"
 	"github.com/useteploy/teploy/internal/deploy"
 	"github.com/useteploy/teploy/internal/docker"
+	"github.com/useteploy/teploy/internal/secret"
 	"github.com/useteploy/teploy/internal/ssh"
 )
 
@@ -101,6 +102,31 @@ func (s *singleServerDeployer) deployApp(ctx context.Context, appCfg *config.App
 		fmt.Fprintln(s.out, "  Image pulled")
 	}
 
+	// Ensure accessories are running. This was previously missing entirely
+	// from the multi-server path (see the secrets fix above for the same
+	// pattern) — an app with `accessories:` in teploy.yml deployed to
+	// multiple servers never got its postgres/redis/etc. containers
+	// started on any but the (differently-coded) single-server path.
+	if len(appCfg.Accessories) > 0 {
+		fmt.Fprintln(s.out, "Ensuring accessories...")
+		accMgr := accessories.NewManager(s.exec, s.out)
+		allVars := make(map[string]string)
+		for _, name := range sortedAccessoryNames(appCfg.Accessories) {
+			vars, err := accMgr.EnsureRunning(ctx, appCfg.App, name, appCfg.Accessories[name])
+			if err != nil {
+				return fmt.Errorf("accessory %s: %w", name, err)
+			}
+			for k, v := range vars {
+				allVars[k] = v
+			}
+		}
+		if len(allVars) > 0 {
+			if err := accMgr.InjectEnvVars(ctx, appCfg.App, allVars); err != nil {
+				return fmt.Errorf("injecting accessory env vars: %w", err)
+			}
+		}
+	}
+
 	// Check for env file.
 	var envFile string
 	envPath := fmt.Sprintf("/deployments/%s/.env", appCfg.App)
@@ -122,23 +148,33 @@ func (s *singleServerDeployer) deployApp(ctx context.Context, appCfg *config.App
 	}
 
 	// Upload custom TLS cert (if configured) before deploy.
-	var tlsCert, tlsKey string
-	if appCfg.TLS != nil {
-		tlsCert, tlsKey, err = uploadAppTLS(ctx, s.exec, appCfg.App, appCfg.TLS)
-		if err != nil {
-			return err
-		}
+	tlsCert, tlsKey, tlsInternal, err := resolveAppTLS(ctx, s.exec, appCfg)
+	if err != nil {
+		return err
+	}
+	if tlsCert != "" {
 		fmt.Fprintln(s.out, "  TLS certificate uploaded")
 	}
 
-	// Container env: the teploy.yml `env:` block (with ${VAR} expanded from the
-	// local environment), then per-host tags (from servers.yml) layered on top.
-	containerEnv := make(map[string]string, len(appCfg.Env)+len(tags))
-	for k, v := range appCfg.Env {
-		containerEnv[k] = os.Expand(v, os.Getenv)
+	// Decrypt secrets (set via `teploy secret set`). This was previously
+	// missing entirely from the multi-server path — deploy.go (single
+	// server) had it, singledeploy.go (multi-server, also used by scale/
+	// parallel deploy) never called secret.NewManager at all, so any app
+	// deployed to multiple servers silently got `undefined` for every
+	// `teploy secret`-managed value.
+	secretMgr := secret.NewManager(s.exec)
+	deploySecrets, err := secretMgr.DecryptAll(ctx, appCfg.App)
+	if err != nil {
+		return fmt.Errorf("decrypting secrets: %w", err)
 	}
-	for k, v := range tags {
-		containerEnv[k] = v
+
+	// Container env: teploy.yml's `env:` block, per-host tags (from
+	// servers.yml), and decrypted secrets, uploaded to a fresh env file
+	// rather than passed as `docker run -e` args — see
+	// buildContainerEnvFiles for why.
+	envFiles, err := buildContainerEnvFiles(ctx, s.exec, appCfg.App, envFile, appCfg.Env, tags, deploySecrets)
+	if err != nil {
+		return err
 	}
 
 	// Deploy.
@@ -148,12 +184,11 @@ func (s *singleServerDeployer) deployApp(ctx context.Context, appCfg *config.App
 		Domain:        appCfg.Domain,
 		Image:         image,
 		Version:       version,
-		EnvFile:       envFile,
-		Env:           containerEnv,
+		EnvFiles:      envFiles,
 		Volumes:       volumes,
 		Processes:     appCfg.Processes,
 		NoHealthcheck: disabledHealthchecks(appCfg.Healthcheck),
-		Health:        deploy.HealthConfig{Path: appCfg.Health.Path},
+		Health:        healthConfigFrom(appCfg.Health),
 		KeepVersions:  appCfg.KeepVersions,
 		Ingress:       appCfg.Ingress,
 		ContainerPort: appCfg.Port,
@@ -165,6 +200,7 @@ func (s *singleServerDeployer) deployApp(ctx context.Context, appCfg *config.App
 		AssetKeepDays: appCfg.Assets.KeepDays,
 		TLSCert:       tlsCert,
 		TLSKey:        tlsKey,
+		TLSInternal:   tlsInternal,
 	}
 
 	return deployer.Deploy(ctx, deployCfg)

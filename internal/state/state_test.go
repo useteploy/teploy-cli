@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/useteploy/teploy/internal/ssh"
 )
@@ -115,9 +116,13 @@ func TestAcquireLock(t *testing.T) {
 }
 
 func TestAcquireLock_AlreadyLocked(t *testing.T) {
+	// A recent (non-stale) timestamp — this test is specifically for the
+	// "lock exists and is still fresh" case. See
+	// TestAcquireLock_StaleAutoLockIsBroken for the staleness path.
+	recentTS := time.Now().UTC().Format(time.RFC3339)
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "mkdir /deployments/myapp/.lock", Err: fmt.Errorf("mkdir: cannot create directory: File exists")},
-		ssh.MockCommand{Match: "cat /deployments/myapp/.lock/info", Output: `{"type":"auto","ts":"2026-03-11T00:00:00Z"}`},
+		ssh.MockCommand{Match: "cat /deployments/myapp/.lock/info", Output: fmt.Sprintf(`{"type":"auto","ts":%q}`, recentTS)},
 	)
 
 	err := AcquireLock(context.Background(), mock, "myapp")
@@ -126,6 +131,76 @@ func TestAcquireLock_AlreadyLocked(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "already in progress") {
 		t.Errorf("expected 'already in progress' error, got: %v", err)
+	}
+	// Must NOT have attempted to break a fresh lock.
+	for _, c := range mock.Calls {
+		if strings.HasPrefix(c, "rm -rf") {
+			t.Errorf("fresh lock should not be broken, but got rm call: %s", c)
+		}
+	}
+}
+
+// TestAcquireLock_StaleAutoLockIsBroken is the regression test for the
+// stale-lock self-healing fix: a deploy that crashed or lost its SSH
+// connection before its deferred ReleaseLockDetached ran would otherwise
+// leave the app locked forever. An "auto" lock older than staleLockTTL
+// should be broken and the new deploy allowed to proceed.
+func TestAcquireLock_StaleAutoLockIsBroken(t *testing.T) {
+	staleTS := time.Now().UTC().Add(-2 * staleLockTTL).Format(time.RFC3339)
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		// First mkdir call fails (lock exists) — Once so it's consumed and
+		// the second (persistent) entry below matches the retry after the
+		// stale lock is broken.
+		ssh.MockCommand{Match: "mkdir /deployments/myapp/.lock", Err: fmt.Errorf("exists"), Once: true},
+		ssh.MockCommand{Match: "mkdir /deployments/myapp/.lock", Output: ""},
+		ssh.MockCommand{Match: "cat /deployments/myapp/.lock/info", Output: fmt.Sprintf(`{"type":"auto","ts":%q}`, staleTS)},
+	)
+
+	if err := AcquireLock(context.Background(), mock, "myapp"); err != nil {
+		t.Fatalf("AcquireLock: %v", err)
+	}
+
+	var sawBreak, sawRetryMkdir bool
+	mkdirCount := 0
+	for _, c := range mock.Calls {
+		if strings.HasPrefix(c, "rm -rf /deployments/myapp/.lock") {
+			sawBreak = true
+		}
+		if strings.HasPrefix(c, "mkdir /deployments/myapp/.lock") {
+			mkdirCount++
+		}
+	}
+	sawRetryMkdir = mkdirCount >= 2
+	if !sawBreak {
+		t.Error("expected the stale lock to be broken (rm -rf)")
+	}
+	if !sawRetryMkdir {
+		t.Errorf("expected mkdir to be retried after breaking the stale lock, calls: %v", mock.Calls)
+	}
+}
+
+// TestAcquireLock_StaleManualLockNeverBreaks confirms manual locks
+// (an explicit, intentional freeze via `teploy lock`) are never
+// auto-broken regardless of age — only "auto" locks self-heal.
+func TestAcquireLock_StaleManualLockNeverBreaks(t *testing.T) {
+	veryOldTS := time.Now().UTC().Add(-10 * staleLockTTL).Format(time.RFC3339)
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "mkdir /deployments/myapp/.lock", Err: fmt.Errorf("exists")},
+		ssh.MockCommand{Match: "cat /deployments/myapp/.lock/info",
+			Output: fmt.Sprintf(`{"type":"manual","user":"tyler","message":"freeze","ts":%q}`, veryOldTS)},
+	)
+
+	err := AcquireLock(context.Background(), mock, "myapp")
+	if err == nil {
+		t.Fatal("expected error — manual lock must never be auto-broken")
+	}
+	if !strings.Contains(err.Error(), "Deploy locked by tyler") {
+		t.Errorf("expected manual-lock error, got: %v", err)
+	}
+	for _, c := range mock.Calls {
+		if strings.HasPrefix(c, "rm -rf") {
+			t.Errorf("manual lock must never be broken, but got rm call: %s", c)
+		}
 	}
 }
 
@@ -236,6 +311,31 @@ func TestReleaseLock(t *testing.T) {
 	)
 
 	ReleaseLock(context.Background(), mock, "myapp")
+
+	found := false
+	for _, call := range mock.Calls {
+		if strings.Contains(call, "rm -rf /deployments/myapp/.lock") {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected rm -rf command for lock release")
+	}
+}
+
+// TestReleaseLockDetached_WorksWithoutACallerContext is the regression
+// test for the Ctrl+C-leaves-a-stale-lock fix: unlike ReleaseLock,
+// ReleaseLockDetached takes no context from the caller at all — it builds
+// its own — so a deploy's cancelled context (from Ctrl+C or a dropped SSH
+// connection) can never prevent this cleanup call from reaching the
+// server. There is deliberately no way to pass in an already-cancelled
+// context here; that's the whole point of the fix.
+func TestReleaseLockDetached_WorksWithoutACallerContext(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "rm -rf /deployments/myapp/.lock", Output: ""},
+	)
+
+	ReleaseLockDetached(mock, "myapp")
 
 	found := false
 	for _, call := range mock.Calls {
