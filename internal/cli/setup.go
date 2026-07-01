@@ -442,7 +442,25 @@ func setupServer(ctx context.Context, exec ssh.Executor, w io.Writer, yes bool) 
 		fmt.Fprintln(w, "  Docker already installed")
 	}
 
-	// 2. Check firewall
+	// 2. Check/install rsync — required by type:static deploys (internal/deploy
+	// static.go shells out to it directly). Not preinstalled on minimal
+	// Debian/Ubuntu cloud images, so a fresh box otherwise deploys containers
+	// fine but fails static deploys on the first rsync with a cryptic
+	// "command not found" from the remote shell.
+	fmt.Fprintln(w, "Checking rsync...")
+	if _, err := exec.Run(ctx, "rsync --version"); err != nil {
+		fmt.Fprintln(w, "  Installing rsync...")
+		installCmd := sudo + "sh -c 'DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq rsync'"
+		if out, err := exec.Run(ctx, installCmd); err != nil {
+			fmt.Fprintln(w, out)
+			return fmt.Errorf("installing rsync: %w", err)
+		}
+		fmt.Fprintln(w, "  rsync installed")
+	} else {
+		fmt.Fprintln(w, "  rsync already installed")
+	}
+
+	// 3. Check firewall
 	fmt.Fprintln(w, "Checking firewall...")
 	ufwOutput, ufwErr := exec.Run(ctx, "ufw status 2>/dev/null")
 	if ufwErr == nil && strings.Contains(ufwOutput, "Status: active") {
@@ -465,14 +483,14 @@ func setupServer(ctx context.Context, exec ssh.Executor, w io.Writer, yes bool) 
 		dockerCmd = sudo + "docker"
 	}
 
-	// 3. Create Docker network
+	// 4. Create Docker network
 	fmt.Fprintln(w, "Creating Docker network...")
 	netCmd := dockerCmd + " network inspect teploy >/dev/null 2>&1 || " + dockerCmd + " network create teploy"
 	if _, err := exec.Run(ctx, netCmd); err != nil {
 		return fmt.Errorf("creating docker network: %w", err)
 	}
 
-	// 4. Create directories and upload Caddyfile
+	// 5. Create directories and upload Caddyfile
 	if _, err := exec.Run(ctx, sudo+"mkdir -p /deployments/caddy"); err != nil {
 		return fmt.Errorf("creating directories: %w", err)
 	}
@@ -499,7 +517,7 @@ func setupServer(ctx context.Context, exec ssh.Executor, w io.Writer, yes bool) 
 		exec.Run(ctx, "sed -i 's/admin 0.0.0.0:2019/admin 127.0.0.1:2019/' /deployments/caddy/Caddyfile")
 	}
 
-	// 5. Start Caddy (idempotent — skip if container already exists).
+	// 6. Start Caddy (idempotent — skip if container already exists).
 	// The on-disk Caddyfile is Teploy's single source of truth: Caddy loads it
 	// on every boot and `caddy reload`, so we run WITHOUT `--resume` (which
 	// would boot from admin-API autosave and shadow the file). The admin API
