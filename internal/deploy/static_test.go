@@ -135,7 +135,7 @@ func TestStaticDeploy_FreshFirstDeploy(t *testing.T) {
 		"# TEPLOY BEGIN myapp",
 		"# TEPLOY END myapp",
 		"myapp.com, www.myapp.com {",
-		"root * /srv/static/myapp/current",
+		"root * /deployments/myapp/current",
 		"file_server",
 		"Strict-Transport-Security",
 	} {

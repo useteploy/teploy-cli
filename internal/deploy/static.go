@@ -51,9 +51,9 @@ type StaticConfig struct {
 	KeepReleases int // 0 = use default
 	CaddyExtra   string
 
-	// Server-side mount path (the directory Caddy is configured to serve from).
-	// For the OVH box this is /srv/static/<app>/current — see DefaultStaticMount.
-	MountBase string // default: /srv/static
+	// Server-side mount path — the directory Caddy is configured to serve
+	// from, inside the Caddy container. See DefaultStaticMount.
+	MountBase string // default: /deployments
 	StateDir  string // default: /deployments
 }
 
@@ -61,9 +61,28 @@ type StaticConfig struct {
 const DefaultKeepReleases = 5
 
 // DefaultStaticMount is the path inside the Caddy container where static
-// content is served from. The host-side equivalent at the OVH box is
-// /deployments/static/<app>/, bind-mounted as /srv/static/<app>/.
-const DefaultStaticMount = "/srv/static"
+// content is served from, and DefaultStateDir is the equivalent real path
+// on the server's own filesystem where Deploy actually writes releases —
+// these are now the SAME path (both /deployments) by design: teploy setup
+// bind-mounts the server's whole /deployments tree into the Caddy
+// container at the identical path (read-only — Caddy the file server never
+// writes here), so a release Deploy writes to {StateDir}/{app}/current is
+// visible to Caddy at {MountBase}/{app}/current without any translation.
+//
+// Until 2026-07, these were two different constants (MountBase defaulted
+// to /srv/static) with no mount connecting them at all on a freshly
+// provisioned server — teploy setup never bind-mounted anything at
+// /srv/static, only /deployments/caddy specifically (for the Caddyfile
+// itself). Confirmed live: every type:static deploy on a fresh server
+// reported success (the release really did land on disk) while Caddy
+// 404'd every request, because /srv/static didn't exist in its container
+// at all. A previous comment here additionally claimed the OVH box's host
+// path was /deployments/static/<app>/ — also wrong; the real, only host
+// path Deploy ever writes to is /deployments/<app>/current, no "static"
+// segment. Reconciling both sides to the identical /deployments path
+// removes the entire class of drift by construction — there's no longer
+// a second convention that can silently diverge from the first.
+const DefaultStaticMount = "/deployments"
 
 // DefaultStateDir is where per-app deploy state and release directories live
 // on the target server.

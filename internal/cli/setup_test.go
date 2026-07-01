@@ -136,10 +136,11 @@ func TestSetupServer_CaddyAlreadyRunning(t *testing.T) {
 		ssh.MockCommand{Match: "test -s /deployments/caddy/Caddyfile", Output: ""},
 		ssh.MockCommand{Match: "sed -i", Output: ""},
 		ssh.MockCommand{Match: "docker ps -a --filter name=", Output: "caddy"},
-		// Existing Caddy already on the new model: no --resume, AND directory-
-		// mounted (/etc/caddy). Both checks pass → skip recreation.
+		// Existing Caddy already on the new model: no --resume, directory-
+		// mounted (/etc/caddy), AND has the /deployments mount type:static
+		// deploys need. All three checks pass → skip recreation.
 		ssh.MockCommand{Match: "docker inspect -f '{{join .Config.Cmd", Output: "caddy run --config /etc/caddy/Caddyfile --adapter caddyfile"},
-		ssh.MockCommand{Match: "docker inspect -f '{{range .Mounts}}", Output: "/data /config /etc/caddy "},
+		ssh.MockCommand{Match: "docker inspect -f '{{range .Mounts}}", Output: "/data /config /etc/caddy /deployments "},
 	)
 
 	var buf bytes.Buffer
@@ -290,6 +291,65 @@ func TestSetupServer_MigratesLegacyFileMount(t *testing.T) {
 	}
 	if !strings.Contains(buf.String(), "single-file Caddyfile mount") {
 		t.Errorf("should explain the file-mount migration reason, got:\n%s", buf.String())
+	}
+}
+
+// TestSetupServer_MigratesMissingStaticMount reproduces a real bug found
+// live: teploy setup never bind-mounted anything at /deployments (only the
+// narrower /deployments/caddy, for the Caddyfile itself), so type:static
+// deploys were completely non-functional on every server it had ever
+// provisioned — Deploy writes releases to /deployments/<app>/current on
+// the host, but that path didn't exist inside the Caddy container at all.
+// `teploy deploy` reported success (the release really did land on disk)
+// while every request 404'd. setupServer must detect a Caddy container
+// missing this mount and recreate it, the same way it already does for
+// the two older legacy-mount conditions.
+func TestSetupServer_MigratesMissingStaticMount(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "whoami", Output: "root"},
+		ssh.MockCommand{Match: "docker --version", Output: "Docker version 24.0.0"},
+		ssh.MockCommand{Match: "rsync --version", Output: "rsync  version 3.2.7"},
+		ssh.MockCommand{Match: "ufw status", Err: fmt.Errorf("not found")},
+		ssh.MockCommand{Match: "systemctl", Err: fmt.Errorf("inactive")},
+		ssh.MockCommand{Match: "docker info", Output: ""},
+		ssh.MockCommand{Match: "docker network", Output: "teploy"},
+		ssh.MockCommand{Match: "mkdir", Output: ""},
+		ssh.MockCommand{Match: "chown", Output: ""},
+		ssh.MockCommand{Match: "test -s /deployments/caddy/Caddyfile", Output: ""},
+		ssh.MockCommand{Match: "sed -i", Output: ""},
+		ssh.MockCommand{Match: "docker ps -a --filter name=", Output: "caddy"},
+		// Already on the directory-mount model (no --resume, /etc/caddy
+		// directory mount) — but missing the /deployments mount entirely,
+		// exactly what every server provisioned before this fix looks like.
+		ssh.MockCommand{Match: "docker inspect -f '{{join .Config.Cmd", Output: "caddy run --config /etc/caddy/Caddyfile --adapter caddyfile"},
+		ssh.MockCommand{Match: "docker inspect -f '{{range .Mounts}}", Output: "/data /config /etc/caddy "},
+		ssh.MockCommand{Match: "docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}", Output: "teploy "},
+		ssh.MockCommand{Match: "docker rm -f caddy", Output: ""},
+		ssh.MockCommand{Match: "docker run", Output: "caddy_id"},
+	)
+
+	var buf bytes.Buffer
+	if err := setupServer(context.Background(), mock, &buf, true); err != nil {
+		t.Fatalf("setupServer: %v", err)
+	}
+
+	removed, recreatedWithStaticMount := false, false
+	for _, c := range mock.Calls {
+		if strings.HasPrefix(c, "docker rm -f caddy") {
+			removed = true
+		}
+		if strings.HasPrefix(c, "docker run") && strings.Contains(c, "/deployments:/deployments:ro") {
+			recreatedWithStaticMount = true
+		}
+	}
+	if !removed {
+		t.Error("Caddy missing the /deployments mount should have been removed")
+	}
+	if !recreatedWithStaticMount {
+		t.Error("recreated Caddy must include the /deployments:/deployments:ro mount")
+	}
+	if !strings.Contains(buf.String(), "type:static deploys require") {
+		t.Errorf("should explain the missing-static-mount migration reason, got:\n%s", buf.String())
 	}
 }
 

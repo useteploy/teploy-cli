@@ -526,9 +526,9 @@ func setupServer(ctx context.Context, exec ssh.Executor, w io.Writer, yes bool) 
 	caddyCheck, _ := exec.Run(ctx, dockerCmd+" ps -a --filter name=^caddy$ --format '{{.Names}}'")
 	extraNetworks := []string{}
 	if strings.TrimSpace(caddyCheck) != "" {
-		// Two legacy conditions require recreating the Caddy container. Both
-		// recreations are destructive (brief outage + re-attaching non-teploy
-		// networks), so we require explicit confirmation.
+		// Three legacy conditions require recreating the Caddy container. All
+		// three recreations are destructive (brief outage + re-attaching
+		// non-teploy networks), so we require explicit confirmation.
 		cmdOut, _ := exec.Run(ctx, dockerCmd+" inspect -f '{{join .Config.Cmd \" \"}}' caddy")
 		mountOut, _ := exec.Run(ctx, dockerCmd+" inspect -f '{{range .Mounts}}{{.Destination}} {{end}}' caddy")
 
@@ -542,8 +542,20 @@ func setupServer(ctx context.Context, exec ssh.Executor, w io.Writer, yes bool) 
 		// mount (/etc/caddy) re-resolves the file by path on each reload and
 		// avoids this. Detect the legacy file mount and migrate.
 		legacyFileMount := strings.Contains(mountOut, "/etc/caddy/Caddyfile")
+		// (3) No /deployments bind mount at all means type:static deploys
+		// are completely non-functional on this server — Deploy writes
+		// releases to /deployments/<app>/current on the host, and Caddy's
+		// generated site block reads from {DefaultStaticMount}/<app>/current
+		// (also /deployments now — see internal/deploy/static.go), but
+		// without this mount that path doesn't exist inside the container
+		// at all. Confirmed live: `teploy deploy` reports success (the
+		// release really does land on disk) while every request 404s.
+		// Every server provisioned before this fix landed is missing this
+		// mount unconditionally — not a legacy-config edge case, a gap in
+		// what teploy setup has always provisioned.
+		missingStaticMount := !strings.Contains(mountOut, "/deployments ")
 
-		if legacyResume || legacyFileMount {
+		if legacyResume || legacyFileMount || missingStaticMount {
 			// Capture every network the existing Caddy is attached to so
 			// we can reattach them after recreating. Previously these were
 			// silently dropped, leaving apps on other networks (e.g.
@@ -556,8 +568,11 @@ func setupServer(ctx context.Context, exec ssh.Executor, w io.Writer, yes bool) 
 			}
 
 			reason := "running with --resume (legacy admin-API mode)"
-			if !legacyResume && legacyFileMount {
+			switch {
+			case !legacyResume && legacyFileMount:
 				reason = "using a single-file Caddyfile mount (atomic config writes don't reach the container)"
+			case !legacyResume && !legacyFileMount && missingStaticMount:
+				reason = "missing the /deployments mount type:static deploys require to actually be served"
 			}
 			fmt.Fprintf(w, "  Caddy is %s — migrating to the directory-mounted, Caddyfile-authoritative model.\n", reason)
 			fmt.Fprintln(w, "  This recreates the container (brief outage).")
@@ -603,6 +618,19 @@ func setupServer(ctx context.Context, exec ssh.Executor, w io.Writer, yes bool) 
 			// for apps that terminate TLS with a custom cert (e.g. a
 			// Cloudflare Origin Certificate).
 			"-v", "/deployments/caddy:/etc/caddy",
+			// Lets Caddy serve type:static apps. Deploy (internal/deploy/
+			// static.go) writes releases to /deployments/<app>/current on
+			// the server's own filesystem and points each site block's
+			// root at the identical path — /deployments/<app>/current —
+			// inside the Caddy container. Read-only: Caddy the file
+			// server never needs to write here, and this also mounts
+			// every other app's /deployments/<app>/ tree (state, .env,
+			// secrets) read-only into Caddy's filesystem — :ro caps what
+			// a compromised Caddy process could do with that visibility
+			// to read-only, even though none of it is web-exposed (each
+			// site block's root stays scoped to that one app's own
+			// current symlink).
+			"-v", "/deployments:/deployments:ro",
 			"caddy",
 			"caddy", "run", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile",
 		}, " ")
