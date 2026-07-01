@@ -234,10 +234,19 @@ func (m *Manager) Setup(ctx context.Context, cfg Config) error {
 // container without exposing it to the wider LAN/internet. No-op (not an
 // error) if UFW isn't installed or isn't active.
 func (m *Manager) allowWebhookPortInFirewall(ctx context.Context, sudo string, port int) error {
-	if _, err := m.exec.Run(ctx, "which ufw"); err != nil {
+	// Detect via `sudo ufw status`, not `which ufw`: ufw lives in
+	// /usr/sbin, which isn't on a non-interactive SSH session's default
+	// PATH for a non-root user (only /usr/local/bin:/usr/bin:/bin:
+	// /usr/games on stock Debian) — `which ufw` always failed here even
+	// with ufw installed and active, silently skipping this entire step
+	// on every server. sudo uses its own secure_path (includes
+	// /usr/sbin), so `sudo ufw status` finds it reliably. Found live on a
+	// fresh VM: the webhook route and listener were both fine, but every
+	// request 502'd because this rule silently never got added.
+	status, err := m.exec.Run(ctx, sudo+"ufw status")
+	if err != nil {
 		return nil // UFW not installed — nothing to configure.
 	}
-	status, _ := m.exec.Run(ctx, sudo+"ufw status")
 	if !strings.Contains(status, "Status: active") {
 		return nil // UFW installed but not enabled.
 	}
@@ -441,6 +450,18 @@ func (m *Manager) Remove(ctx context.Context, app string) error {
 	// Remove scheduled redeploy too, if configured. Errors are non-fatal —
 	// we're best-effort cleaning up.
 	_ = m.Unschedule(ctx, app)
+
+	// Remove the Caddy webhook route — without this, a stale route with
+	// this app's @id lingers forever (Caddy config has no TTL/GC), and a
+	// subsequent `autodeploy setup` for the same app fails outright: PUT
+	// with a duplicate @id is rejected. Found live: re-running setup after
+	// remove failed with curl exit 22 for exactly this reason. Best-effort
+	// like the rest of this cleanup — deleting an @id that's already gone
+	// (never set up, or Caddy's config was reset) 404s, which is fine.
+	routeID := fmt.Sprintf("teploy-webhook-%s", app)
+	deleteCmd := fmt.Sprintf("docker exec caddy sh -c %s",
+		ssh.ShellQuote(fmt.Sprintf("curl -s -X DELETE http://localhost:2019/id/%s", routeID)))
+	m.exec.Run(ctx, deleteCmd)
 
 	fmt.Fprintf(m.out, "Auto-deploy removed for %s\n", app)
 	return nil

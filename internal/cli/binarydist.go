@@ -64,8 +64,23 @@ func deployTeployBinaryToServer(ctx context.Context, exec ssh.Executor, remotePa
 		return "", fmt.Errorf("extracting binary: %w", err)
 	}
 
-	if err := exec.Upload(ctx, bytes.NewReader(binData), remotePath, "0755"); err != nil {
+	// Upload to a staging path and rename into place, rather than writing
+	// remotePath directly: if `teploy autodeploy serve` is already running
+	// from remotePath (re-running `autodeploy setup` to pick up a newer
+	// release), an SFTP write straight to that path fails with ETXTBSY
+	// ("text file busy") — Linux refuses to open-for-write a file that's
+	// currently mapped as a running executable. rename() has no such
+	// restriction: it only touches the directory entry, so it succeeds
+	// even while the old inode is still executing. The running process
+	// keeps its old code until the systemd restart later in Setup picks
+	// up the new binary at the same path. Found live: re-running
+	// `autodeploy setup` against an already-configured app failed outright.
+	stagingPath := remotePath + ".new"
+	if err := exec.Upload(ctx, bytes.NewReader(binData), stagingPath, "0755"); err != nil {
 		return "", fmt.Errorf("uploading teploy binary: %w", err)
+	}
+	if _, err := exec.Run(ctx, fmt.Sprintf("mv %s %s", ssh.ShellQuote(stagingPath), ssh.ShellQuote(remotePath))); err != nil {
+		return "", fmt.Errorf("installing teploy binary: %w", err)
 	}
 
 	// Sanity check the uploaded binary actually runs before wiring a

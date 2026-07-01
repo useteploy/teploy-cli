@@ -103,7 +103,6 @@ func TestSetup_OpensFirewallForWebhookPort(t *testing.T) {
 		ssh.MockCommand{Match: "systemctl enable", Output: ""},
 		ssh.MockCommand{Match: "systemctl restart", Output: ""},
 		ssh.MockCommand{Match: "systemctl is-active", Output: "active"},
-		ssh.MockCommand{Match: "which ufw", Output: "/usr/sbin/ufw"},
 		ssh.MockCommand{Match: "ufw status", Output: "Status: active"},
 		ssh.MockCommand{Match: "docker network inspect teploy", Output: "172.18.0.0/16\n"},
 		ssh.MockCommand{Match: "ufw allow from '172.18.0.0/16' to any port 9876 proto tcp", Output: "Rule added"},
@@ -146,7 +145,7 @@ func TestSetup_MissingUFWIsNotFatal(t *testing.T) {
 		ssh.MockCommand{Match: "systemctl enable", Output: ""},
 		ssh.MockCommand{Match: "systemctl restart", Output: ""},
 		ssh.MockCommand{Match: "systemctl is-active", Output: "active"},
-		ssh.MockCommand{Match: "which ufw", Err: fmt.Errorf("exit status 1")},
+		ssh.MockCommand{Match: "ufw status", Err: fmt.Errorf("exit status 127: command not found")},
 	)
 
 	var buf bytes.Buffer
@@ -331,6 +330,7 @@ func TestRemove(t *testing.T) {
 		ssh.MockCommand{Match: "systemctl disable", Output: ""},
 		ssh.MockCommand{Match: "rm -f", Output: ""},
 		ssh.MockCommand{Match: "systemctl daemon-reload", Output: ""},
+		ssh.MockCommand{Match: "docker exec caddy sh -c", Output: ""},
 	)
 
 	var buf bytes.Buffer
@@ -341,6 +341,20 @@ func TestRemove(t *testing.T) {
 
 	if !strings.Contains(buf.String(), "Auto-deploy removed") {
 		t.Error("expected removal message")
+	}
+
+	// Reproduces a real failure found live: without cleaning up the Caddy
+	// route, its @id lingers forever, and re-running `autodeploy setup`
+	// for the same app fails outright (PUT with a duplicate @id is
+	// rejected by Caddy's admin API).
+	var deletedRoute bool
+	for _, c := range mock.Calls {
+		if strings.Contains(c, "DELETE http://localhost:2019/id/teploy-webhook-myapp") {
+			deletedRoute = true
+		}
+	}
+	if !deletedRoute {
+		t.Error("expected Remove to delete the Caddy webhook route by its @id")
 	}
 }
 
