@@ -1,7 +1,10 @@
 package config
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -349,6 +352,26 @@ func (c *AppConfig) validate() error {
 	return nil
 }
 
+// unmarshalAppYAML strictly decodes a teploy.yml/teploy.<dest>.yml document.
+// KnownFields(true) rejects unrecognized top-level (and nested struct) keys
+// instead of silently dropping them. Teploy is Kamal-inspired but not
+// schema-compatible, and copy-pasted Kamal fields (service, proxy, builder,
+// registry, services, ...) are a common source of configs that parse clean
+// but produce an empty/wrong AppConfig otherwise. On any decode error —
+// unknown field or type mismatch alike — append a pointer at the schema
+// divergence so the fix is discoverable without cross-referencing source.
+func unmarshalAppYAML(data []byte, out *AppConfig) error {
+	dec := yaml.NewDecoder(bytes.NewReader(data))
+	dec.KnownFields(true)
+	if err := dec.Decode(out); err != nil {
+		if errors.Is(err, io.EOF) {
+			return nil // empty document — same as yaml.Unmarshal's no-op
+		}
+		return fmt.Errorf("%w\nnote: teploy.yml is Kamal-inspired but has its own schema (not Kamal's deploy.yml) — see https://teploy.com/docs/reference/config. Common mismatches: 'app' not 'service'; 'build' is a list of shell commands, not a {command, output} map; no 'proxy'/'builder'/'services' blocks", err)
+	}
+	return nil
+}
+
 // LoadApp reads and parses teploy config (yml, yaml, or toml) from the given directory.
 func LoadApp(dir string) (*AppConfig, error) {
 	for _, name := range []string{"teploy.yml", "teploy.yaml", "teploy.toml"} {
@@ -364,7 +387,7 @@ func LoadApp(dir string) (*AppConfig, error) {
 				return nil, fmt.Errorf("parsing %s: %w", name, err)
 			}
 		} else {
-			if err := yaml.Unmarshal(data, &cfg); err != nil {
+			if err := unmarshalAppYAML(data, &cfg); err != nil {
 				return nil, fmt.Errorf("parsing %s: %w", name, err)
 			}
 		}
@@ -409,7 +432,7 @@ func LoadAppWithDestination(dir, dest string) (*AppConfig, error) {
 				return nil, fmt.Errorf("parsing %s: %w", name, err)
 			}
 		} else {
-			if err := yaml.Unmarshal(data, &overlay); err != nil {
+			if err := unmarshalAppYAML(data, &overlay); err != nil {
 				return nil, fmt.Errorf("parsing %s: %w", name, err)
 			}
 		}
@@ -617,7 +640,7 @@ func mergeAccessory(base, overlay AccessoryConfig) AccessoryConfig {
 // Used by template deploy to parse fetched template content.
 func ParseAppBytes(data []byte) (*AppConfig, error) {
 	var cfg AppConfig
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
+	if err := unmarshalAppYAML(data, &cfg); err != nil {
 		return nil, fmt.Errorf("parsing config: %w", err)
 	}
 	if err := cfg.validate(); err != nil {
