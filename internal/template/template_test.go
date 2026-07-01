@@ -16,7 +16,7 @@ env:
   NORMAL_VAR: hello
   ANOTHER_SECRET: "generate"`
 
-	result := GenerateSecrets(input)
+	result, generated := GenerateSecrets(input)
 
 	// SECRET_KEY_BASE should be replaced.
 	if strings.Contains(result, ": generate") {
@@ -34,6 +34,28 @@ env:
 			if len(val) != 64 {
 				t.Errorf("expected 64-char hex, got %d chars: %s", len(val), val)
 			}
+		}
+	}
+
+	// The returned map must report both generated keys with the exact
+	// values written into the content — this is what runTemplateInstall
+	// relies on to show the operator their credentials, since a template
+	// deployed via `install` never otherwise writes the rendered content
+	// (with real secret values) anywhere retrievable.
+	if len(generated) != 2 {
+		t.Fatalf("expected 2 generated secrets, got %d: %v", len(generated), generated)
+	}
+	for _, key := range []string{"SECRET_KEY_BASE", "ANOTHER_SECRET"} {
+		val, ok := generated[key]
+		if !ok {
+			t.Errorf("expected %s in the generated map", key)
+			continue
+		}
+		if len(val) != 64 {
+			t.Errorf("generated[%s] = %q, expected 64-char hex", key, val)
+		}
+		if !strings.Contains(result, key+": "+val) {
+			t.Errorf("generated map value for %s doesn't match what's actually in the rendered content", key)
 		}
 	}
 }
@@ -54,7 +76,7 @@ env:
 	reg := NewRegistry()
 	reg.SetBaseURL(srv.URL)
 
-	content, err := reg.Fetch(context.Background(), "plausible", map[string]string{
+	content, _, err := reg.Fetch(context.Background(), "plausible", map[string]string{
 		"domain": "analytics.mysite.com",
 	})
 	if err != nil {
@@ -109,7 +131,7 @@ func TestRegistryFetch_NotFound(t *testing.T) {
 	reg := NewRegistry()
 	reg.SetBaseURL(srv.URL)
 
-	_, err := reg.Fetch(context.Background(), "nonexistent", nil)
+	_, _, err := reg.Fetch(context.Background(), "nonexistent", nil)
 	if err == nil {
 		t.Fatal("expected error for nonexistent template")
 	}

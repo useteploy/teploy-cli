@@ -68,7 +68,7 @@ func newTemplateInfoCmd(_ *Flags) *cobra.Command {
 			defer cancel()
 
 			reg := tmpl.NewRegistry()
-			content, err := reg.Fetch(ctx, args[0], nil)
+			content, _, err := reg.Fetch(ctx, args[0], nil)
 			if err != nil {
 				return err
 			}
@@ -106,7 +106,7 @@ func runTemplateDeploy(flags *Flags, name, domain, server string) error {
 
 	// Fetch and render template.
 	reg := tmpl.NewRegistry()
-	content, err := reg.Fetch(ctx, name, map[string]string{
+	content, generated, err := reg.Fetch(ctx, name, map[string]string{
 		"domain": domain,
 	})
 	if err != nil {
@@ -139,6 +139,7 @@ func runTemplateDeploy(flags *Flags, name, domain, server string) error {
 			fmt.Printf("    %s (%s)\n", accName, acc.Image)
 		}
 	}
+	printGeneratedSecrets(generated)
 	fmt.Println("\nRun 'teploy deploy' to deploy this template.")
 	return nil
 }
@@ -182,7 +183,7 @@ func runTemplateInstall(flags *Flags, name, domain, server string, extraVars []s
 	}
 
 	reg := tmpl.NewRegistry()
-	content, err := reg.Fetch(ctx, name, vars)
+	content, generated, err := reg.Fetch(ctx, name, vars)
 	if err != nil {
 		return err
 	}
@@ -201,7 +202,30 @@ func runTemplateInstall(flags *Flags, name, domain, server string, extraVars []s
 	fmt.Printf("  Server: %s\n", server)
 
 	// Templates are first-deploys by definition, so volume mismatch can't apply yet.
-	return deployAppConfig(flags, appCfg, server, appCfg.Image, "", false, false)
+	if err := deployAppConfig(flags, appCfg, server, appCfg.Image, "", false, false); err != nil {
+		return err
+	}
+	// Unlike `template deploy` (which writes the rendered content, secrets
+	// included, to a local teploy.yml the operator can reopen), install
+	// deploys directly — the rendered content with real generated secret
+	// values is never written anywhere else. Without printing them here,
+	// a "generate"d database password is used once to deploy and then
+	// permanently lost, locking the operator out of their own database.
+	printGeneratedSecrets(generated)
+	return nil
+}
+
+// printGeneratedSecrets shows the operator any "generate" sentinel values
+// a template resolved to a real random value, since nothing else captures
+// them — see Fetch's doc comment in internal/template/template.go.
+func printGeneratedSecrets(generated map[string]string) {
+	if len(generated) == 0 {
+		return
+	}
+	fmt.Println("\nGenerated credentials — save these now, they will not be shown again:")
+	for key, value := range generated {
+		fmt.Printf("  %s: %s\n", key, value)
+	}
 }
 
 func joinStrings(ss []string) string {
