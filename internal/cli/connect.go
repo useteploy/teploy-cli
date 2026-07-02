@@ -57,7 +57,11 @@ func resolveApp(ctx context.Context, flags *Flags, appName string) (*config.AppC
 	if err != nil {
 		return nil, nil, err
 	}
-	fmt.Printf("Connecting to %s@%s...\n", user, host)
+	// Skipped in --json mode — see connectForApp's matching comment below;
+	// same issue, same fix.
+	if !flags.JSON {
+		fmt.Printf("Connecting to %s@%s...\n", user, host)
+	}
 	ex, err := ssh.Connect(ctx, ssh.ConnectConfig{Host: host, User: user, KeyPath: key})
 	if err != nil {
 		return nil, nil, err
@@ -85,7 +89,15 @@ func connectForApp(ctx context.Context, flags *Flags, appCfg *config.AppConfig) 
 		return nil, err
 	}
 
-	fmt.Printf("Connecting to %s@%s...\n", user, host)
+	// Skipped in --json mode: this printed unconditionally to stdout,
+	// ahead of the actual JSON payload commands like `status --json`
+	// emit — a consumer treating stdout as one parseable blob (rather
+	// than reading Stdout/Stderr separately) would get "Connecting
+	// to...\n{...}" instead of valid JSON. Found checking whether
+	// teploy-dash's exact `status --host X --json` call parses cleanly.
+	if !flags.JSON {
+		fmt.Printf("Connecting to %s@%s...\n", user, host)
+	}
 	return ssh.Connect(ctx, ssh.ConnectConfig{
 		Host:    host,
 		User:    user,

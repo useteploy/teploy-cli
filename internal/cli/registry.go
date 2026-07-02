@@ -3,6 +3,8 @@ package cli
 import (
 	"bufio"
 	"context"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/signal"
@@ -115,6 +117,45 @@ func newRegistryListCmd(flags *Flags) *cobra.Command {
 	return cmd
 }
 
+// dockerAuthConfig mirrors the relevant subset of ~/.docker/config.json.
+type dockerAuthConfig struct {
+	Auths map[string]struct {
+		Auth string `json:"auth"` // base64("username:password")
+	} `json:"auths"`
+}
+
+// RegistryEntry is one configured registry — the username only, never the
+// password/token, which stays encoded in auth on the server and is never
+// surfaced by any teploy command.
+type RegistryEntry struct {
+	Server   string `json:"server"`
+	Username string `json:"username"`
+}
+
+// parseDockerAuths parses the real ~/.docker/config.json JSON structure and
+// extracts the username for each configured registry. Replaces an older
+// implementation that scanned lines for ":" outside braces, which broke on
+// any config.json with nested objects (credHelpers, auths entries with
+// extra fields like "email") since it had no real notion of JSON structure.
+func parseDockerAuths(configJSON string) ([]RegistryEntry, error) {
+	var cfg dockerAuthConfig
+	if err := json.Unmarshal([]byte(configJSON), &cfg); err != nil {
+		return nil, err
+	}
+
+	entries := make([]RegistryEntry, 0, len(cfg.Auths))
+	for registry, auth := range cfg.Auths {
+		username := ""
+		if decoded, err := base64.StdEncoding.DecodeString(auth.Auth); err == nil {
+			if u, _, ok := strings.Cut(string(decoded), ":"); ok {
+				username = u
+			}
+		}
+		entries = append(entries, RegistryEntry{Server: registry, Username: username})
+	}
+	return entries, nil
+}
+
 func runRegistryList(flags *Flags, serverName string) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
@@ -130,18 +171,29 @@ func runRegistryList(flags *Flags, serverName string) error {
 		return err
 	}
 
-	// Simple parse — just show registry names.
+	entries, err := parseDockerAuths(output)
+	if err != nil {
+		return fmt.Errorf("parsing ~/.docker/config.json: %w", err)
+	}
+
+	// --json is a documented, working global flag on every other
+	// list-style command — this one never checked it at all, always
+	// printing the human-readable format regardless. teploy-dash calls
+	// exactly `teploy registry list --json` and passes the stdout through
+	// verbatim as an HTTP response body, expecting real JSON — it was
+	// getting a plain-text list instead, an invalid JSON response that
+	// would fail to parse client-side.
+	if flags.JSON {
+		return json.NewEncoder(os.Stdout).Encode(entries)
+	}
+
+	if len(entries) == 0 {
+		fmt.Println("No registries configured")
+		return nil
+	}
 	fmt.Println("Configured registries:")
-	for _, line := range strings.Split(output, "\n") {
-		line = strings.TrimSpace(line)
-		if strings.Contains(line, ":") && !strings.Contains(line, "{") && !strings.Contains(line, "}") {
-			// Extract registry name from JSON key.
-			parts := strings.SplitN(line, ":", 2)
-			registry := strings.Trim(parts[0], `" `)
-			if registry != "" && registry != "auths" && registry != "credsStore" {
-				fmt.Printf("  %s\n", registry)
-			}
-		}
+	for _, e := range entries {
+		fmt.Printf("  %s (%s)\n", e.Server, e.Username)
 	}
 	return nil
 }
@@ -199,7 +251,13 @@ func connectForRegistry(ctx context.Context, flags *Flags, serverName string) (s
 		return nil, err
 	}
 
-	fmt.Printf("Connecting to %s@%s...\n", user, host)
+	// Skipped in --json mode — see runRegistryList's matching comment;
+	// this printed ahead of registry list --json's JSON payload on
+	// stdout, corrupting it for a consumer treating stdout as one
+	// parseable blob.
+	if !flags.JSON {
+		fmt.Printf("Connecting to %s@%s...\n", user, host)
+	}
 	return ssh.Connect(ctx, ssh.ConnectConfig{
 		Host:    host,
 		User:    user,

@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/signal"
@@ -26,7 +27,7 @@ func newTemplateCmd(flags *Flags) *cobra.Command {
 	return cmd
 }
 
-func newTemplateListCmd(_ *Flags) *cobra.Command {
+func newTemplateListCmd(flags *Flags) *cobra.Command {
 	return &cobra.Command{
 		Use:   "list",
 		Short: "List available templates",
@@ -39,6 +40,19 @@ func newTemplateListCmd(_ *Flags) *cobra.Command {
 			templates, err := reg.List(ctx)
 			if err != nil {
 				return err
+			}
+
+			// --json is a documented, working global flag on every other
+			// list-style command (server list, registry list, status) —
+			// this one silently discarded its *Flags argument and never
+			// checked it, always printing the human-readable format
+			// regardless. Found while checking whether teploy-dash (which
+			// calls exactly `teploy template list --json` and expects
+			// real JSON to unmarshal) would work now that the template
+			// registry itself is fixed — it wouldn't have, on this bug
+			// alone.
+			if flags.JSON {
+				return json.NewEncoder(os.Stdout).Encode(templates)
 			}
 
 			if len(templates) == 0 {
