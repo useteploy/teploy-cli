@@ -175,6 +175,72 @@ func TestResolveServer_FallbackToRawIP(t *testing.T) {
 	}
 }
 
+// TestResolveServer_NamedServerHonorsSSHKeyEnv reproduces a real bug found
+// live testing `teploy scale`: TEPLOY_SSH_KEY was only consulted by the
+// --host-flag and TEPLOY_HOST-env branches of ResolveServer, never by the
+// servers.yml-by-name lookup branch — by far the most common way teploy
+// resolves a host. A named server always got an empty keyPath back,
+// silently falling through to ssh.Connect's hardcoded ~/.ssh/id_ed25519
+// default regardless of TEPLOY_SSH_KEY, even though the connect-failure
+// error message advertises the env var unconditionally.
+func TestResolveServer_NamedServerHonorsSSHKeyEnv(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+	t.Setenv("TEPLOY_HOST", "")
+	t.Setenv("TEPLOY_USER", "")
+	t.Setenv("TEPLOY_SSH_KEY", "/env/key")
+
+	serversPath, err := DefaultServersPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := AddServer(serversPath, "prod", "10.0.0.5", "deploy", "app", ""); err != nil {
+		t.Fatalf("AddServer: %v", err)
+	}
+
+	host, user, key, err := ResolveServer("prod", "", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if host != "10.0.0.5" {
+		t.Errorf("expected host 10.0.0.5, got %s", host)
+	}
+	if user != "deploy" {
+		t.Errorf("expected user deploy, got %s", user)
+	}
+	if key != "/env/key" {
+		t.Errorf("expected TEPLOY_SSH_KEY to apply to a named-server lookup, got key=%q", key)
+	}
+}
+
+// TestResolveServer_NamedServerNotFoundHonorsSSHKeyEnv covers the sibling
+// branch of the same bug: a name that isn't in servers.yml (falls through
+// to being treated as a raw hostname) also silently dropped
+// TEPLOY_SSH_KEY.
+func TestResolveServer_NamedServerNotFoundHonorsSSHKeyEnv(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+	t.Setenv("TEPLOY_HOST", "")
+	t.Setenv("TEPLOY_USER", "")
+	t.Setenv("TEPLOY_SSH_KEY", "/env/key")
+
+	serversPath, err := DefaultServersPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := AddServer(serversPath, "prod", "10.0.0.5", "deploy", "app", ""); err != nil {
+		t.Fatalf("AddServer: %v", err)
+	}
+
+	_, _, key, err := ResolveServer("not-in-servers-yml.example.com", "", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if key != "/env/key" {
+		t.Errorf("expected TEPLOY_SSH_KEY to apply even when the name isn't found in servers.yml, got key=%q", key)
+	}
+}
+
 func TestAddServer(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, ".teploy", "servers.yml")

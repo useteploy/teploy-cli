@@ -82,6 +82,17 @@ func ResolveServer(name string, flagHost, flagUser, flagKey string) (host, user,
 	}
 
 	// 3. servers.yml lookup
+	//
+	// TEPLOY_SSH_KEY applies here too, same as cases 1/2 — found live
+	// while testing `teploy scale` in an isolated environment: this was
+	// the only one of the three ResolveServer branches that silently
+	// dropped the env var, so a named-server lookup (by far the most
+	// common way teploy resolves a host) could never honor it, even
+	// though the connect-failure error message advertises it
+	// unconditionally ("provide --key, set TEPLOY_SSH_KEY, or place a
+	// key at ~/.ssh/id_ed25519").
+	envKey := os.Getenv("TEPLOY_SSH_KEY")
+
 	serversPath, err := DefaultServersPath()
 	if err != nil {
 		return "", "", "", err
@@ -91,7 +102,7 @@ func ResolveServer(name string, flagHost, flagUser, flagKey string) (host, user,
 	if err != nil {
 		// If no servers.yml, treat the name as a raw IP/hostname
 		if errors.Is(err, os.ErrNotExist) {
-			return name, "root", "", nil
+			return name, "root", envKey, nil
 		}
 		return "", "", "", err
 	}
@@ -99,14 +110,14 @@ func ResolveServer(name string, flagHost, flagUser, flagKey string) (host, user,
 	server, ok := cfg.Servers[name]
 	if !ok {
 		// Not found in servers.yml — treat as raw IP/hostname
-		return name, "root", "", nil
+		return name, "root", envKey, nil
 	}
 
 	user = server.User
 	if user == "" {
 		user = "root"
 	}
-	return server.Host, user, "", nil
+	return server.Host, user, envKey, nil
 }
 
 // AddServer adds or updates a server entry in the given servers.yml file.

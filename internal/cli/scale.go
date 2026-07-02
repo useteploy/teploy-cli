@@ -73,18 +73,31 @@ func runScale(flags *Flags, count, parallel int) error {
 	sort.Strings(names)
 
 	// Select the first `count` servers.
+	//
+	// Resolve each through config.ResolveServer (matching runMultiDeploy's
+	// pattern) instead of hand-building the target from the Server struct
+	// directly — the hand-built version never resolved a key at all,
+	// meaning --key/TEPLOY_SSH_KEY could never apply to `teploy scale`,
+	// only the hardcoded ~/.ssh/id_ed25519 default path. Also thread
+	// through Tags (per-host env vars) — deployApp already expects
+	// target.Tags to be populated (scale.go's deploySingleServer passes it
+	// straight through), but the old code left it nil, silently dropping
+	// tag-based env injection for every `teploy scale` deploy. Both found
+	// live while testing scale against an isolated servers.yml.
 	targets := make([]multideploy.ServerTarget, count)
 	for i := 0; i < count; i++ {
 		srv := appServers[names[i]]
-		user := srv.User
-		if user == "" {
-			user = "root"
+		host, user, key, err := config.ResolveServer(names[i], flags.Host, flags.User, flags.Key)
+		if err != nil {
+			return fmt.Errorf("resolving server %s: %w", names[i], err)
 		}
 		targets[i] = multideploy.ServerTarget{
 			Name: names[i],
-			Host: srv.Host,
+			Host: host,
 			User: user,
+			Key:  key,
 			Role: srv.Role,
+			Tags: srv.Tags,
 		}
 	}
 
@@ -221,10 +234,14 @@ func updateLoadBalancer(ctx context.Context, flags *Flags, appCfg *config.AppCon
 
 		fmt.Printf("Updating LB %s (%s)...\n", name, srv.Host)
 
+		keyPath := flags.Key
+		if keyPath == "" {
+			keyPath = os.Getenv("TEPLOY_SSH_KEY")
+		}
 		executor, err := ssh.Connect(ctx, ssh.ConnectConfig{
 			Host:    srv.Host,
 			User:    user,
-			KeyPath: flags.Key,
+			KeyPath: keyPath,
 		})
 		if err != nil {
 			return fmt.Errorf("connecting to LB %s: %w", name, err)
