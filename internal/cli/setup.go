@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -401,6 +402,18 @@ func resolveNetworkConfig(providerName string, authKeyFlag string) (network.Conf
 	}
 }
 
+// dockerMount mirrors the fields teploy needs from `docker inspect`'s
+// per-mount JSON (Type/Name/Source/Destination/RW) — used to detect and
+// preserve mounts on an existing Caddy container that teploy didn't create
+// itself, when recreating it.
+type dockerMount struct {
+	Type        string
+	Name        string // set for Type "volume"; empty for "bind"
+	Source      string
+	Destination string
+	RW          bool
+}
+
 // setupServer runs the provisioning steps on a connected server.
 // Separated from runSetup for testability with MockExecutor.
 // yes skips interactive confirmation for destructive upgrade steps (Caddy recreate).
@@ -525,10 +538,11 @@ func setupServer(ctx context.Context, exec ssh.Executor, w io.Writer, yes bool) 
 	fmt.Fprintln(w, "Starting Caddy...")
 	caddyCheck, _ := exec.Run(ctx, dockerCmd+" ps -a --filter name=^caddy$ --format '{{.Names}}'")
 	extraNetworks := []string{}
+	var extraMountFlags []string
 	if strings.TrimSpace(caddyCheck) != "" {
 		// Three legacy conditions require recreating the Caddy container. All
 		// three recreations are destructive (brief outage + re-attaching
-		// non-teploy networks), so we require explicit confirmation.
+		// non-teploy networks/mounts), so we require explicit confirmation.
 		cmdOut, _ := exec.Run(ctx, dockerCmd+" inspect -f '{{join .Config.Cmd \" \"}}' caddy")
 		mountOut, _ := exec.Run(ctx, dockerCmd+" inspect -f '{{range .Mounts}}{{.Destination}} {{end}}' caddy")
 
@@ -567,6 +581,51 @@ func setupServer(ctx context.Context, exec ssh.Executor, w io.Writer, yes bool) 
 				}
 			}
 
+			// Capture every mount teploy itself didn't put there, so those
+			// are preserved too — the same principle as extraNetworks
+			// above, just for volumes. Without this, recreating Caddy
+			// blindly replaces its whole mount set with teploy's own fixed
+			// list (caddy_data, caddy_config, /etc/caddy, /deployments),
+			// silently dropping anything hand-added on a server that
+			// predates teploy or was adopted from other tooling — e.g. a
+			// legacy /srv/static bind mount serving live static sites,
+			// which would 404 the instant the container came back up.
+			// Confirmed live on a real production box before this fix:
+			// exactly that mount existed and would have been lost.
+			// This is what actually makes it safe to run `teploy setup`
+			// against an existing, previously-hand-managed server — not
+			// just a fresh one.
+			var extraMounts []dockerMount
+			mountJSON, _ := exec.Run(ctx, dockerCmd+" inspect -f '{{json .Mounts}}' caddy")
+			teployDestinations := map[string]bool{
+				"/data": true, "/config": true, "/etc/caddy": true, "/deployments": true,
+			}
+			if mountJSON != "" {
+				var mounts []dockerMount
+				if err := json.Unmarshal([]byte(mountJSON), &mounts); err == nil {
+					for _, m := range mounts {
+						if m.Type == "volume" && (m.Name == "caddy_data" || m.Name == "caddy_config") {
+							continue // teploy's own named volumes, re-added explicitly below
+						}
+						if teployDestinations[m.Destination] {
+							continue // teploy's own bind mounts, re-added explicitly below
+						}
+						extraMounts = append(extraMounts, m)
+					}
+				}
+			}
+			for _, m := range extraMounts {
+				src := m.Source
+				if m.Type == "volume" && m.Name != "" {
+					src = m.Name
+				}
+				flag := fmt.Sprintf("%s:%s", src, m.Destination)
+				if !m.RW {
+					flag += ":ro"
+				}
+				extraMountFlags = append(extraMountFlags, flag)
+			}
+
 			reason := "running with --resume (legacy admin-API mode)"
 			switch {
 			case !legacyResume && legacyFileMount:
@@ -579,6 +638,9 @@ func setupServer(ctx context.Context, exec ssh.Executor, w io.Writer, yes bool) 
 			if len(extraNetworks) > 0 {
 				fmt.Fprintf(w, "  Additional networks to reattach: %s\n", strings.Join(extraNetworks, ", "))
 			}
+			if len(extraMountFlags) > 0 {
+				fmt.Fprintf(w, "  Additional mounts to preserve: %s\n", strings.Join(extraMountFlags, ", "))
+			}
 			if !yes && !confirm(w, "  Recreate Caddy container now?") {
 				fmt.Fprintln(w, "  Skipping Caddy upgrade — re-run with --yes to apply.")
 				return nil
@@ -590,7 +652,7 @@ func setupServer(ctx context.Context, exec ssh.Executor, w io.Writer, yes bool) 
 		}
 	}
 	if strings.TrimSpace(caddyCheck) == "" {
-		caddyRun := strings.Join([]string{
+		caddyRunArgs := []string{
 			dockerCmd, "run", "-d",
 			"--restart", "always",
 			"--name", "caddy",
@@ -631,9 +693,20 @@ func setupServer(ctx context.Context, exec ssh.Executor, w io.Writer, yes bool) 
 			// site block's root stays scoped to that one app's own
 			// current symlink).
 			"-v", "/deployments:/deployments:ro",
+		}
+		// Re-add any mount that was on the previous container but isn't
+		// one of teploy's own (see extraMountFlags above) — e.g. a legacy
+		// /srv/static bind mount predating this fix, or anything else
+		// adopted from other tooling. Without this, whatever those mounts
+		// served would 404 the instant the recreated container came up.
+		for _, m := range extraMountFlags {
+			caddyRunArgs = append(caddyRunArgs, "-v", ssh.ShellQuote(m))
+		}
+		caddyRunArgs = append(caddyRunArgs,
 			"caddy",
 			"caddy", "run", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile",
-		}, " ")
+		)
+		caddyRun := strings.Join(caddyRunArgs, " ")
 		if _, err := exec.Run(ctx, caddyRun); err != nil {
 			return fmt.Errorf("starting caddy: %w", err)
 		}

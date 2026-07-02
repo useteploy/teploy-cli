@@ -241,6 +241,77 @@ func TestSetupServer_CaddyUpgradePreservesNetworksAndCaddyfile(t *testing.T) {
 	}
 }
 
+// TestSetupServer_PreservesForeignMountsOnRecreate reproduces a real,
+// confirmed production risk: a server adopted from other tooling (or
+// running an older teploy) can have Caddy mounts teploy itself never
+// created — e.g. a hand-added /srv/static bind mount serving live static
+// sites, discovered live on a real box with ~12 domains depending on it.
+// Recreating Caddy (here, because it's missing the new /deployments mount)
+// must preserve those foreign mounts exactly, the same way it already
+// preserves extra networks — otherwise every site served through them
+// 404s the instant the new container starts, without teploy ever having
+// touched the Caddyfile or any of those sites' actual content.
+func TestSetupServer_PreservesForeignMountsOnRecreate(t *testing.T) {
+	mountsJSON := `[` +
+		`{"Type":"volume","Name":"caddy_data","Source":"/var/lib/docker/volumes/caddy_data/_data","Destination":"/data","RW":true},` +
+		`{"Type":"bind","Source":"/deployments/caddy","Destination":"/etc/caddy","RW":true},` +
+		`{"Type":"bind","Source":"/deployments/static","Destination":"/srv/static","RW":false},` +
+		`{"Type":"bind","Source":"/deployments/dreamlucidgroup","Destination":"/srv/static/dreamlucidgroup","RW":false},` +
+		`{"Type":"volume","Name":"caddy_config","Source":"/var/lib/docker/volumes/caddy_config/_data","Destination":"/config","RW":true}` +
+		`]`
+
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "whoami", Output: "root"},
+		ssh.MockCommand{Match: "docker --version", Output: "Docker version 24.0.0"},
+		ssh.MockCommand{Match: "rsync --version", Output: "rsync  version 3.2.7"},
+		ssh.MockCommand{Match: "ufw status", Err: fmt.Errorf("not found")},
+		ssh.MockCommand{Match: "systemctl", Err: fmt.Errorf("inactive")},
+		ssh.MockCommand{Match: "docker info", Output: ""},
+		ssh.MockCommand{Match: "docker network", Output: "teploy"},
+		ssh.MockCommand{Match: "mkdir", Output: ""},
+		ssh.MockCommand{Match: "chown", Output: ""},
+		ssh.MockCommand{Match: "test -s /deployments/caddy/Caddyfile", Output: ""},
+		ssh.MockCommand{Match: "sed -i", Output: ""},
+		ssh.MockCommand{Match: "docker ps -a --filter name=", Output: "caddy"},
+		// No --resume, directory-mounted, but missing /deployments — the
+		// new static-mount check triggers a recreate.
+		ssh.MockCommand{Match: "docker inspect -f '{{join .Config.Cmd", Output: "caddy run --config /etc/caddy/Caddyfile --adapter caddyfile"},
+		ssh.MockCommand{Match: "docker inspect -f '{{range .Mounts}}", Output: "/data /config /etc/caddy /srv/static /srv/static/dreamlucidgroup "},
+		ssh.MockCommand{Match: "docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}", Output: "teploy "},
+		ssh.MockCommand{Match: "docker inspect -f '{{json .Mounts}}'", Output: mountsJSON},
+		ssh.MockCommand{Match: "docker rm -f caddy", Output: ""},
+		ssh.MockCommand{Match: "docker run", Output: "caddy_id"},
+	)
+
+	var buf bytes.Buffer
+	if err := setupServer(context.Background(), mock, &buf, true); err != nil {
+		t.Fatalf("setupServer: %v", err)
+	}
+
+	var runCmd string
+	for _, c := range mock.Calls {
+		if strings.HasPrefix(c, "docker run") {
+			runCmd = c
+		}
+	}
+	for _, want := range []string{
+		"/deployments/static:/srv/static:ro",
+		"/deployments/dreamlucidgroup:/srv/static/dreamlucidgroup:ro",
+	} {
+		if !strings.Contains(runCmd, want) {
+			t.Errorf("recreated Caddy must preserve the foreign mount %q, got: %s", want, runCmd)
+		}
+	}
+	// teploy's own mounts must still be there too — this isn't instead of
+	// the standard set, it's in addition to it.
+	if !strings.Contains(runCmd, "/deployments:/deployments:ro") {
+		t.Errorf("recreated Caddy missing its own new static mount, got: %s", runCmd)
+	}
+	if !strings.Contains(buf.String(), "Additional mounts to preserve") {
+		t.Error("should report the foreign mounts being preserved")
+	}
+}
+
 // TestSetupServer_MigratesLegacyFileMount covers a server already on the
 // no-resume model but still using the old single-file Caddyfile bind mount.
 // That mount is pinned to a stale inode after teploy's atomic Caddyfile
