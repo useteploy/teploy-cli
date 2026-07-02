@@ -3,6 +3,16 @@ version: 2
 builds:
   - main: ./cmd/teploy
     binary: teploy
+    env:
+      # Without this, the linked-against-glibc Linux binary fails to run
+      # at all inside any musl-based container (Alpine) with a bare "no
+      # such file or directory" — the actual error is a missing dynamic
+      # linker, not a missing file. Found live: a freshly downloaded
+      # release binary failed this way inside Alpine, breaking every
+      # delegate-to-CLI action in a containerized teploy-dash deployment.
+      # teploy-dash and teploy-observe's own goreleaser configs already
+      # set this; teploy-cli's never did.
+      - CGO_ENABLED=0
     ldflags:
       - -s -w -X main.version={{.Version}}
     goos:
