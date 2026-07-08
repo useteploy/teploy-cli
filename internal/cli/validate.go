@@ -76,6 +76,10 @@ func runValidate(flags *Flags) error {
 			result.Valid = false
 			result.Errors = append(result.Errors, fmt.Sprintf("server resolution: %v", err))
 		} else {
+			// Honor teploy.yml's user: (ResolveServer defaults a literal-IP
+			// server to root), same as deploy — so validate and deploy connect
+			// as the same account instead of validate always trying root.
+			user = config.EffectiveUser(user, flags.User, appCfg.User)
 			ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 			defer cancel()
 

@@ -120,6 +120,21 @@ func ResolveServer(name string, flagHost, flagUser, flagKey string) (host, user,
 	return server.Host, user, envKey, nil
 }
 
+// EffectiveUser resolves the SSH user to connect as, layering teploy.yml's
+// `user:` on top of ResolveServer's result. ResolveServer defaults a
+// literal-IP/hostname server: (one not in servers.yml) to "root" and has no
+// knowledge of the AppConfig, so callers apply the app-level user: here.
+// Precedence: an explicit --user flag (already baked into `resolved`) wins;
+// otherwise teploy.yml's `user:` overrides the root default; otherwise the
+// resolved value stands. Used by both `teploy deploy` and `teploy validate`
+// so they connect as the same account.
+func EffectiveUser(resolved, flagUser, appUser string) string {
+	if flagUser == "" && appUser != "" {
+		return appUser
+	}
+	return resolved
+}
+
 // AddServer adds or updates a server entry in the given servers.yml file.
 // Creates the file and parent directory if they don't exist.
 func AddServer(path, name, host, user, role, vpnIP string) error {

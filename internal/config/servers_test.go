@@ -789,3 +789,34 @@ func TestAddServer_PreservesTagsAndVpnIP(t *testing.T) {
 		t.Errorf("tags should be preserved, got %v", s.Tags)
 	}
 }
+
+func TestEffectiveUser(t *testing.T) {
+	tests := []struct {
+		name     string
+		resolved string // what ResolveServer returned
+		flagUser string // --user flag
+		appUser  string // teploy.yml user:
+		want     string
+	}{
+		// The bug this fixes: a literal-IP server: with user: in teploy.yml.
+		// ResolveServer defaulted it to root; the app-level user: must win.
+		{"app user overrides root default", "root", "", "tyler", "tyler"},
+		// No user: anywhere — the resolved default stands.
+		{"no app user keeps resolved", "root", "", "", "root"},
+		// A servers.yml entry already resolved to a non-root user, no override.
+		{"resolved non-root, no app user", "deploy", "", "", "deploy"},
+		// An explicit --user flag wins over teploy.yml's user: (flag is already
+		// baked into `resolved`, so app user must NOT override it).
+		{"flag user beats app user", "flaguser", "flaguser", "tyler", "flaguser"},
+		// Flag set and no app user — resolved (which carries the flag) stands.
+		{"flag user, no app user", "flaguser", "flaguser", "", "flaguser"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := EffectiveUser(tt.resolved, tt.flagUser, tt.appUser); got != tt.want {
+				t.Errorf("EffectiveUser(%q, %q, %q) = %q, want %q",
+					tt.resolved, tt.flagUser, tt.appUser, got, tt.want)
+			}
+		})
+	}
+}

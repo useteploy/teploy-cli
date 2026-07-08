@@ -164,9 +164,7 @@ func deployAppConfig(flags *Flags, appCfg *config.AppConfig, serverName, image, 
 	if err != nil {
 		return err
 	}
-	if flags.User == "" && appCfg.User != "" {
-		user = appCfg.User
-	}
+	user = config.EffectiveUser(user, flags.User, appCfg.User)
 
 	// Static deploys take an entirely different path (no docker, no image,
 	// no health checks) so we branch here before the container build/run
@@ -506,9 +504,7 @@ func runMultiDeploy(flags *Flags, appCfg *config.AppConfig, image, version strin
 		if err != nil {
 			return fmt.Errorf("resolving server %s: %w", name, err)
 		}
-		if flags.User == "" && appCfg.User != "" {
-			user = appCfg.User
-		}
+		user = config.EffectiveUser(user, flags.User, appCfg.User)
 		var tags map[string]string
 		if srv, ok := allServers[name]; ok {
 			tags = srv.Tags
