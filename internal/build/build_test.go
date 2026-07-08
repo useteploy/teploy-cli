@@ -310,3 +310,199 @@ func TestModeString(t *testing.T) {
 		}
 	}
 }
+
+// --- context / dockerfile support -----------------------------------------
+
+func TestDetectAt_DefaultDockerfile(t *testing.T) {
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "Dockerfile"), []byte("FROM node:20"), 0644)
+
+	mode, err := DetectAt(dir, "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if mode != ModeDockerfile {
+		t.Errorf("expected ModeDockerfile, got %s", mode)
+	}
+}
+
+func TestDetectAt_SubdirDockerfile(t *testing.T) {
+	dir := t.TempDir()
+	sub := filepath.Join(dir, "server", "monolith")
+	os.MkdirAll(sub, 0755)
+	os.WriteFile(filepath.Join(sub, "Dockerfile"), []byte("FROM node:20"), 0644)
+
+	mode, err := DetectAt(dir, filepath.Join("server", "monolith", "Dockerfile"))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if mode != ModeDockerfile {
+		t.Errorf("expected ModeDockerfile, got %s", mode)
+	}
+}
+
+func TestDetectAt_ContextSubdir(t *testing.T) {
+	dir := t.TempDir()
+	sub := filepath.Join(dir, "server")
+	os.MkdirAll(sub, 0755)
+	os.WriteFile(filepath.Join(sub, "Dockerfile"), []byte("FROM node:20"), 0644)
+
+	// Context = server, default Dockerfile name resolves inside it.
+	mode, err := DetectAt(filepath.Join(dir, "server"), "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if mode != ModeDockerfile {
+		t.Errorf("expected ModeDockerfile, got %s", mode)
+	}
+}
+
+func TestDetectAt_ExplicitDockerfileMissingIsError(t *testing.T) {
+	dir := t.TempDir()
+	// A named-but-absent Dockerfile is a config mistake, not a Nixpacks
+	// fallback.
+	mode, err := DetectAt(dir, "server/Dockerfile")
+	if err == nil {
+		t.Fatalf("expected error for missing explicit dockerfile, got mode %s", mode)
+	}
+	if !strings.Contains(err.Error(), "server/Dockerfile") {
+		t.Errorf("error should name the missing dockerfile, got: %v", err)
+	}
+}
+
+func TestDetectAt_NoDockerfileFallsBackToNixpacks(t *testing.T) {
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "package.json"), []byte("{}"), 0644)
+
+	mode, err := DetectAt(dir, "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if mode != ModeNixpacks {
+		t.Errorf("expected ModeNixpacks, got %s", mode)
+	}
+}
+
+func TestRemoteBuildTail(t *testing.T) {
+	const root = "/deployments/myapp/build"
+	tests := []struct {
+		name       string
+		contextSub string
+		dockerfile string
+		want       string
+	}{
+		{
+			name: "default is byte-identical to the legacy command",
+			want: " " + root,
+		},
+		{
+			name:       "explicit dot context, default dockerfile",
+			contextSub: ".",
+			want:       " " + root,
+		},
+		{
+			name:       "subdir dockerfile, root context (monorepo)",
+			dockerfile: "server/monolith/Dockerfile",
+			want:       " -f '" + root + "/server/monolith/Dockerfile' " + root,
+		},
+		{
+			name:       "context subdir, default dockerfile (no -f)",
+			contextSub: "server",
+			want:       " '" + root + "/server'",
+		},
+		{
+			name:       "context subdir plus a nested dockerfile",
+			contextSub: "server",
+			dockerfile: "docker/Dockerfile",
+			want:       " -f '" + root + "/server/docker/Dockerfile' '" + root + "/server'",
+		},
+		{
+			name:       "explicit default dockerfile name emits no -f",
+			dockerfile: "Dockerfile",
+			want:       " " + root,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := remoteBuildTail(root, tt.contextSub, tt.dockerfile); got != tt.want {
+				t.Errorf("remoteBuildTail(%q, %q, %q) = %q, want %q", root, tt.contextSub, tt.dockerfile, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestLocalBuildTail(t *testing.T) {
+	const dir = "/src/myapp"
+	tests := []struct {
+		name       string
+		contextSub string
+		dockerfile string
+		want       []string
+	}{
+		{name: "default", want: []string{dir}},
+		{name: "monorepo subdir dockerfile", dockerfile: "server/Dockerfile",
+			want: []string{"-f", filepath.Join(dir, "server", "Dockerfile"), dir}},
+		{name: "context subdir", contextSub: "web",
+			want: []string{filepath.Join(dir, "web")}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := localBuildTail(nil, dir, tt.contextSub, tt.dockerfile)
+			if strings.Join(got, "\x00") != strings.Join(tt.want, "\x00") {
+				t.Errorf("localBuildTail = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestBuild_SubdirDockerfileCommand(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "docker build", Output: "Successfully built abc123\n"},
+	)
+	var buf bytes.Buffer
+	builder := NewBuilder(mock, &buf)
+
+	_, err := builder.Build(context.Background(), BuildConfig{
+		App:        "myapp",
+		Version:    "abc1234",
+		Mode:       ModeDockerfile,
+		BuildDir:   "/deployments/myapp/build",
+		Dockerfile: "server/monolith/Dockerfile",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := "docker build -t myapp-build-abc1234 -f '/deployments/myapp/build/server/monolith/Dockerfile' /deployments/myapp/build"
+	if !strings.Contains(mock.Calls[0], want) {
+		t.Errorf("unexpected command:\n got: %s\nwant contains: %s", mock.Calls[0], want)
+	}
+}
+
+func TestBuild_ContextSubdirNixpacks(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "which nixpacks", Output: "/usr/bin/nixpacks\n"},
+		ssh.MockCommand{Match: "nixpacks build", Output: "built\n"},
+	)
+	var buf bytes.Buffer
+	builder := NewBuilder(mock, &buf)
+
+	_, err := builder.Build(context.Background(), BuildConfig{
+		App:      "myapp",
+		Version:  "abc1234",
+		Mode:     ModeNixpacks,
+		BuildDir: "/deployments/myapp/build",
+		Context:  "api",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	var nixpacksCall string
+	for _, c := range mock.Calls {
+		if strings.Contains(c, "nixpacks build") {
+			nixpacksCall = c
+		}
+	}
+	if !strings.Contains(nixpacksCall, "nixpacks build /deployments/myapp/build/api ") {
+		t.Errorf("nixpacks should build the context subdir, got: %s", nixpacksCall)
+	}
+}

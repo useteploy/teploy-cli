@@ -193,11 +193,17 @@ func deployAppConfig(flags *Flags, appCfg *config.AppConfig, serverName, image, 
 		}
 	}
 
-	// 5. Detect build mode (when no pre-built image).
+	// 5. Detect build mode (when no pre-built image). Honors the optional
+	// 'context'/'dockerfile' fields so a monorepo's subdir Dockerfile is
+	// found (and an explicitly-named-but-missing one errors, rather than
+	// silently falling back to Nixpacks).
 	needsBuild := image == ""
 	var buildMode build.Mode
 	if needsBuild {
-		buildMode = build.Detect(".")
+		buildMode, err = build.DetectAt(appCfg.Context, appCfg.Dockerfile)
+		if err != nil {
+			return err
+		}
 		fmt.Printf("No image specified — detected %s build\n", buildMode)
 	}
 
@@ -233,15 +239,17 @@ func deployAppConfig(flags *Flags, appCfg *config.AppConfig, serverName, image, 
 			// Local build mode: build on this machine, stream to server.
 			fmt.Println("Building image locally...")
 			image, err = build.LocalBuild(ctx, build.LocalBuildConfig{
-				App:      appCfg.App,
-				Version:  version,
-				Mode:     buildMode,
-				Dir:      ".",
-				Host:     host,
-				User:     user,
-				KeyPath:  key,
-				Platform: appCfg.Platform,
-				Exec:     executor,
+				App:        appCfg.App,
+				Version:    version,
+				Mode:       buildMode,
+				Dir:        ".",
+				Context:    appCfg.Context,
+				Dockerfile: appCfg.Dockerfile,
+				Host:       host,
+				User:       user,
+				KeyPath:    key,
+				Platform:   appCfg.Platform,
+				Exec:       executor,
 			}, os.Stdout)
 			if err != nil {
 				return fmt.Errorf("local build: %w", err)
@@ -269,11 +277,13 @@ func deployAppConfig(flags *Flags, appCfg *config.AppConfig, serverName, image, 
 			fmt.Println("Building image on server...")
 			builder := build.NewBuilder(executor, os.Stdout)
 			image, err = builder.Build(ctx, build.BuildConfig{
-				App:      appCfg.App,
-				Version:  version,
-				Mode:     buildMode,
-				BuildDir: remoteDir,
-				Platform: appCfg.Platform,
+				App:        appCfg.App,
+				Version:    version,
+				Mode:       buildMode,
+				BuildDir:   remoteDir,
+				Context:    appCfg.Context,
+				Dockerfile: appCfg.Dockerfile,
+				Platform:   appCfg.Platform,
 			})
 			if err != nil {
 				return fmt.Errorf("building image: %w", err)

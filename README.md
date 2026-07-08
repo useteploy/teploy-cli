@@ -105,6 +105,17 @@ platform: linux/amd64
 stop_timeout: 30
 keep_versions: 3              # auto-prune older versions after deploy (0 = keep all, default)
 
+# Build a Dockerfile that lives in a subdirectory (monorepos). Omit both
+# to use ./Dockerfile with the project root as context (the default).
+# `dockerfile` is resolved relative to `context`; `context` is relative to
+# this teploy.yml. Example: a Dockerfile under server/ that COPYs shared
+# packages from the repo root —
+#   context: .
+#   dockerfile: server/monolith/Dockerfile
+# Or build just one workspace of a monorepo —
+#   context: apps/api
+# These apply only when Teploy builds the image (no `image:` set).
+
 # Custom TLS cert — e.g. Cloudflare Origin Certificate behind a CF-proxied
 # domain where ACME can't reach the origin. Cert + key are LOCAL file paths,
 # uploaded to the server on deploy. Default is ACME (automatic HTTPS).

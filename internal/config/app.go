@@ -159,17 +159,29 @@ type AppConfig struct {
 	Ingress string `yaml:"ingress,omitempty" toml:"ingress"`
 	// Bind is the host IP that `ingress: host` publishes the fixed port on
 	// (default 0.0.0.0 — all interfaces). Only valid with ingress: host.
-	Bind        string   `yaml:"bind,omitempty" toml:"bind"`
-	Server      string   `yaml:"server,omitempty" toml:"server"`
-	User        string   `yaml:"user,omitempty" toml:"user"`
-	Servers     []string `yaml:"servers,omitempty" toml:"servers"`
-	Image       string   `yaml:"image,omitempty" toml:"image"`
-	Port        int      `yaml:"port,omitempty" toml:"port"`
-	Platform    string   `yaml:"platform,omitempty" toml:"platform"`
-	BuildLocal  bool     `yaml:"build_local,omitempty" toml:"build_local"`
-	StopTimeout int      `yaml:"stop_timeout,omitempty" toml:"stop_timeout"`
-	Parallel    int      `yaml:"parallel,omitempty" toml:"parallel"`
-	Replicas    int      `yaml:"replicas,omitempty" toml:"replicas"`
+	Bind       string   `yaml:"bind,omitempty" toml:"bind"`
+	Server     string   `yaml:"server,omitempty" toml:"server"`
+	User       string   `yaml:"user,omitempty" toml:"user"`
+	Servers    []string `yaml:"servers,omitempty" toml:"servers"`
+	Image      string   `yaml:"image,omitempty" toml:"image"`
+	Port       int      `yaml:"port,omitempty" toml:"port"`
+	Platform   string   `yaml:"platform,omitempty" toml:"platform"`
+	BuildLocal bool     `yaml:"build_local,omitempty" toml:"build_local"`
+	// Dockerfile names the Dockerfile to build from, resolved relative to
+	// Context (default "Dockerfile"). Set it when a monorepo's Dockerfile
+	// lives in a subdirectory — e.g. dockerfile: server/monolith/Dockerfile
+	// with context: . so the Dockerfile's COPY paths resolve against the
+	// repo root. Ignored when Image is set (a pre-built image is pulled,
+	// not built) and not valid for type:static.
+	Dockerfile string `yaml:"dockerfile,omitempty" toml:"dockerfile"`
+	// Context is the Docker build context directory, relative to the
+	// teploy.yml location (default "."). Dockerfile is resolved relative to
+	// it. Use it to build a subdirectory of a monorepo, or to hand a
+	// subdir Dockerfile a wider context (the repo root).
+	Context     string `yaml:"context,omitempty" toml:"context"`
+	StopTimeout int    `yaml:"stop_timeout,omitempty" toml:"stop_timeout"`
+	Parallel    int    `yaml:"parallel,omitempty" toml:"parallel"`
+	Replicas    int    `yaml:"replicas,omitempty" toml:"replicas"`
 	// KeepVersions caps the number of past app versions retained after a
 	// successful deploy (containers + images). Zero (default) keeps
 	// everything — historical behavior. Set to 2 or 3 to enable auto-prune
@@ -254,6 +266,23 @@ func ValidateIdentifier(label, name string) error {
 		return fmt.Errorf("'%s' name too long (max 63 chars, got %d)", label, len(name))
 	}
 	return nil
+}
+
+// isSafeSubPath reports whether p is a relative path that stays inside its
+// base — no absolute paths, and no ".." segment that escapes. Used for the
+// build 'context'/'dockerfile' fields, which are joined onto a synced
+// remote directory and must not reach outside it.
+func isSafeSubPath(p string) bool {
+	if p == "" || filepath.IsAbs(p) {
+		return false
+	}
+	// filepath.Clean collapses "a/../b" etc.; a leading ".." after cleaning
+	// means the path escapes its base.
+	clean := filepath.Clean(p)
+	if clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+		return false
+	}
+	return true
 }
 
 // ValidateDomain checks a (possibly comma-separated multi-host) domain
@@ -418,6 +447,21 @@ func (c *AppConfig) validate() error {
 	}
 	if c.KeepVersions < 0 {
 		return fmt.Errorf("'keep_versions' must be >= 0 (got %d)", c.KeepVersions)
+	}
+	// Build-context fields only apply when teploy builds the image itself.
+	if c.Dockerfile != "" || c.Context != "" {
+		if c.Image != "" {
+			return fmt.Errorf("'dockerfile'/'context' apply only when teploy builds the image; a pre-built 'image' is pulled, not built — remove one")
+		}
+		if c.Type == TypeStatic {
+			return fmt.Errorf("'dockerfile'/'context' are container-build fields with no effect on type:static")
+		}
+		if c.Context != "" && !isSafeSubPath(c.Context) {
+			return fmt.Errorf("'context' must be a relative path inside the project (no absolute paths, no '..' escaping), got %q", c.Context)
+		}
+		if c.Dockerfile != "" && !isSafeSubPath(c.Dockerfile) {
+			return fmt.Errorf("'dockerfile' must be a relative path inside the context (no absolute paths, no '..' escaping), got %q", c.Dockerfile)
+		}
 	}
 	return nil
 }

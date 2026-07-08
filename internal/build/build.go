@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"runtime"
 
@@ -35,10 +36,33 @@ func (m Mode) String() string {
 // Detect examines the directory and returns the appropriate build mode.
 // Priority: Dockerfile → Nixpacks fallback.
 func Detect(dir string) Mode {
-	if _, err := os.Stat(filepath.Join(dir, "Dockerfile")); err == nil {
-		return ModeDockerfile
+	mode, _ := DetectAt(dir, "")
+	return mode
+}
+
+// DetectAt resolves the build mode for a given context directory and
+// optional Dockerfile (relative to the context; empty means "Dockerfile").
+// A Dockerfile at the resolved path selects ModeDockerfile. When the caller
+// named a Dockerfile explicitly and it is missing, that is an error rather
+// than a silent fall-through to Nixpacks — an explicit path that points at
+// nothing is a config mistake worth surfacing. With no explicit Dockerfile
+// and none present, it falls back to ModeNixpacks.
+func DetectAt(contextDir, dockerfile string) (Mode, error) {
+	if contextDir == "" {
+		contextDir = "."
 	}
-	return ModeNixpacks
+	name := dockerfile
+	if name == "" {
+		name = "Dockerfile"
+	}
+	resolved := filepath.Join(contextDir, name)
+	if _, err := os.Stat(resolved); err == nil {
+		return ModeDockerfile, nil
+	}
+	if dockerfile != "" {
+		return ModeNone, fmt.Errorf("dockerfile %q not found (looked at %s)", dockerfile, resolved)
+	}
+	return ModeNixpacks, nil
 }
 
 // ImageTag returns the image tag used for server-built images.
@@ -51,8 +75,14 @@ type BuildConfig struct {
 	App      string
 	Version  string
 	Mode     Mode
-	BuildDir string // remote directory containing the source
-	Platform string // e.g. "linux/arm64" (optional)
+	BuildDir string // remote directory containing the synced source
+	// Context is the build-context subdirectory relative to BuildDir
+	// (empty or "." means BuildDir itself).
+	Context string
+	// Dockerfile is the Dockerfile path relative to Context (empty means
+	// "Dockerfile" in the context root).
+	Dockerfile string
+	Platform   string // e.g. "linux/arm64" (optional)
 }
 
 // Builder runs Docker or Nixpacks builds on the server via SSH.
@@ -72,32 +102,68 @@ func (b *Builder) Build(ctx context.Context, cfg BuildConfig) (string, error) {
 
 	switch cfg.Mode {
 	case ModeDockerfile:
-		return tag, b.buildDockerfile(ctx, tag, cfg.BuildDir, cfg.Platform)
+		return tag, b.buildDockerfile(ctx, tag, cfg.BuildDir, cfg.Context, cfg.Dockerfile, cfg.Platform)
 	case ModeNixpacks:
-		return tag, b.buildNixpacks(ctx, tag, cfg.App, cfg.BuildDir)
+		return tag, b.buildNixpacks(ctx, tag, cfg.App, cfg.BuildDir, cfg.Context)
 	default:
 		return "", fmt.Errorf("unknown build mode: %s", cfg.Mode)
 	}
 }
 
-func (b *Builder) buildDockerfile(ctx context.Context, tag, buildDir, platform string) error {
+func (b *Builder) buildDockerfile(ctx context.Context, tag, buildDir, contextSub, dockerfile, platform string) error {
 	cmd := "docker build -t " + tag
 	if platform != "" {
 		cmd += " --platform " + platform
 	}
-	cmd += " " + buildDir
+	// Remote paths are POSIX; use path.Join and quote for the shell.
+	cmd += remoteBuildTail(buildDir, contextSub, dockerfile)
 	return b.exec.RunStream(ctx, cmd, b.stdout, b.stdout)
 }
 
-func (b *Builder) buildNixpacks(ctx context.Context, tag, app, buildDir string) error {
+func (b *Builder) buildNixpacks(ctx context.Context, tag, app, buildDir, contextSub string) error {
 	// Ensure Nixpacks is installed (lazy installation).
 	if err := b.ensureNixpacks(ctx); err != nil {
 		return err
 	}
 
 	cachePath := fmt.Sprintf("/deployments/%s/cache", app)
-	cmd := fmt.Sprintf("nixpacks build %s --name %s --cache-path %s", buildDir, tag, cachePath)
+	buildTarget := subDir(path.Join, buildDir, contextSub)
+	cmd := fmt.Sprintf("nixpacks build %s --name %s --cache-path %s", buildTarget, tag, cachePath)
 	return b.exec.RunStream(ctx, cmd, b.stdout, b.stdout)
+}
+
+// subDir joins an optional context subdir onto a root, returning the root
+// unchanged for "" or ".". join is path.Join for remote (POSIX) paths and
+// filepath.Join for local ones.
+func subDir(join func(...string) string, root, contextSub string) string {
+	if contextSub == "" || contextSub == "." {
+		return root
+	}
+	return join(root, contextSub)
+}
+
+// remoteBuildTail builds the trailing docker-build arguments for a remote
+// (shell-string) build: an optional `-f <dockerfile>` plus the context dir.
+// When neither Context nor Dockerfile is customized it returns exactly
+// " <root>" — byte-identical to the long-standing default command — so the
+// common case is unchanged. Custom paths are quoted for the remote shell.
+func remoteBuildTail(root, contextSub, dockerfile string) string {
+	if contextSub == "" && dockerfile == "" {
+		return " " + root
+	}
+	contextDir := subDir(path.Join, root, contextSub)
+	tail := ""
+	if dockerfile != "" {
+		if dfPath := path.Join(contextDir, dockerfile); dfPath != path.Join(contextDir, "Dockerfile") {
+			tail += " -f " + ssh.ShellQuote(dfPath)
+		}
+	}
+	if contextDir == root {
+		tail += " " + root
+	} else {
+		tail += " " + ssh.ShellQuote(contextDir)
+	}
+	return tail
 }
 
 func (b *Builder) ensureNixpacks(ctx context.Context) error {
@@ -111,15 +177,21 @@ func (b *Builder) ensureNixpacks(ctx context.Context) error {
 
 // LocalBuildConfig holds parameters for building locally and streaming to server.
 type LocalBuildConfig struct {
-	App      string
-	Version  string
-	Mode     Mode
-	Dir      string // local source directory
-	Host     string
-	User     string
-	KeyPath  string
-	Platform string       // e.g. "linux/arm64" (optional, overrides auto-detection)
-	Exec     ssh.Executor // optional: if set, enables layer-optimized transfer
+	App     string
+	Version string
+	Mode    Mode
+	Dir     string // local source directory
+	// Context is the build-context subdirectory relative to Dir (empty or
+	// "." means Dir itself).
+	Context string
+	// Dockerfile is the Dockerfile path relative to Context (empty means
+	// "Dockerfile" in the context root).
+	Dockerfile string
+	Host       string
+	User       string
+	KeyPath    string
+	Platform   string       // e.g. "linux/arm64" (optional, overrides auto-detection)
+	Exec       ssh.Executor // optional: if set, enables layer-optimized transfer
 }
 
 // LocalBuild builds the image on the local machine, then streams it to the
@@ -130,11 +202,11 @@ func LocalBuild(ctx context.Context, cfg LocalBuildConfig, stdout io.Writer) (st
 	// Build locally.
 	switch cfg.Mode {
 	case ModeDockerfile:
-		if err := localBuildDockerfile(ctx, tag, cfg.Dir, cfg.Platform, stdout); err != nil {
+		if err := localBuildDockerfile(ctx, tag, cfg.Dir, cfg.Context, cfg.Dockerfile, cfg.Platform, stdout); err != nil {
 			return "", err
 		}
 	case ModeNixpacks:
-		if err := localBuildNixpacks(ctx, tag, cfg.Dir, stdout); err != nil {
+		if err := localBuildNixpacks(ctx, tag, subDir(filepath.Join, cfg.Dir, cfg.Context), stdout); err != nil {
 			return "", err
 		}
 	default:
@@ -160,7 +232,7 @@ func LocalBuild(ctx context.Context, cfg LocalBuildConfig, stdout io.Writer) (st
 	return tag, nil
 }
 
-func localBuildDockerfile(ctx context.Context, tag, dir, platform string, stdout io.Writer) error {
+func localBuildDockerfile(ctx context.Context, tag, dir, contextSub, dockerfile, platform string, stdout io.Writer) error {
 	args := []string{"build", "-t", tag}
 
 	if platform != "" {
@@ -171,7 +243,8 @@ func localBuildDockerfile(ctx context.Context, tag, dir, platform string, stdout
 		args = append(args, "--platform", "linux/amd64")
 	}
 
-	args = append(args, dir)
+	// exec.Command takes an argv, so no shell quoting is needed here.
+	args = localBuildTail(args, dir, contextSub, dockerfile)
 	cmd := exec.CommandContext(ctx, "docker", args...)
 	cmd.Stdout = stdout
 	cmd.Stderr = stdout
@@ -179,6 +252,23 @@ func localBuildDockerfile(ctx context.Context, tag, dir, platform string, stdout
 		return fmt.Errorf("local docker build failed: %w", err)
 	}
 	return nil
+}
+
+// localBuildTail appends the trailing docker-build arguments for a local
+// (argv) build: an optional `-f <dockerfile>` plus the context dir. Mirrors
+// remoteBuildTail but produces argv entries (no shell quoting) using host
+// path semantics.
+func localBuildTail(args []string, dir, contextSub, dockerfile string) []string {
+	if contextSub == "" && dockerfile == "" {
+		return append(args, dir)
+	}
+	contextDir := subDir(filepath.Join, dir, contextSub)
+	if dockerfile != "" {
+		if dfPath := filepath.Join(contextDir, dockerfile); dfPath != filepath.Join(contextDir, "Dockerfile") {
+			args = append(args, "-f", dfPath)
+		}
+	}
+	return append(args, contextDir)
 }
 
 func localBuildNixpacks(ctx context.Context, tag, dir string, stdout io.Writer) error {
