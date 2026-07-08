@@ -42,19 +42,34 @@ func TestQuoteExecArgs_PreservesMultiWordArgBoundary(t *testing.T) {
 	}
 }
 
+// TestQuoteExecArgs_SingleWordArgsUnaffected verifies the common case — a
+// command whose args have no whitespace — passes through quoteExecArgs
+// unaltered: two single-word args stay two args, neither split nor merged.
+//
+// It runs against the controlled argv-dumper, not a real binary. The prior
+// version exec'd `redis-cli PING` and keyed off "not found" in the error,
+// which made it environment-dependent and flaky: on a machine where
+// redis-cli IS installed but no Redis is running, the binary runs and exits
+// non-zero with "Connection refused" — no "not found" — and the test
+// failed for a reason unrelated to argument quoting.
 func TestQuoteExecArgs_SingleWordArgsUnaffected(t *testing.T) {
-	command := quoteExecArgs([]string{"redis-cli", "PING"})
+	dumper := writeArgvDumper(t)
+	command := quoteExecArgs([]string{dumper, "PING"})
+
 	wrapped := "sh -c " + shQuoteForTest(command)
-	// redis-cli isn't necessarily installed in the test sandbox — just
-	// confirm the reconstructed command line is syntactically sane (the
-	// shell can parse and attempt to exec it) rather than requiring the
-	// binary to exist.
 	out, err := exec.Command("/bin/sh", "-c", wrapped).CombinedOutput()
-	if err == nil {
-		return
+	if err != nil {
+		t.Fatalf("running wrapped command: %v (output: %s)", err, out)
 	}
-	if !strings.Contains(string(out), "not found") && !strings.Contains(string(out), "No such file") {
-		t.Errorf("unexpected shell error (command line may be malformed): %v (output: %s)", err, out)
+
+	got := string(out)
+	// The single-word arg survives as exactly one argument, verbatim.
+	if !strings.Contains(got, "ARG<PING>") {
+		t.Errorf("expected PING to survive as one argument, got:\n%s", got)
+	}
+	// No spurious splitting, empty args, or quote characters leaking through.
+	if strings.Contains(got, "ARG<>") || strings.Contains(got, "ARG<'PING'>") {
+		t.Errorf("single-word arg was altered by quoting:\n%s", got)
 	}
 }
 
