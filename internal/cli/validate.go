@@ -50,14 +50,11 @@ func runValidate(flags *Flags) error {
 	}
 
 	// 2. Check build prerequisites.
-	if appCfg.Image == "" {
-		mode := build.Detect(".")
-		switch mode {
-		case build.ModeDockerfile:
-			// Dockerfile exists — good.
-		case build.ModeNixpacks:
-			result.Warns = append(result.Warns, "No Dockerfile found — Nixpacks will be used (requires Nixpacks on server or locally)")
-		}
+	warns, errs := buildPrereqCheck(appCfg)
+	result.Warns = append(result.Warns, warns...)
+	if len(errs) > 0 {
+		result.Valid = false
+		result.Errors = append(result.Errors, errs...)
 	}
 
 	// 2b. Flag non-public domains (bare IPs, LAN addresses). dns.Validate
@@ -99,8 +96,10 @@ func runValidate(flags *Flags) error {
 					result.Errors = append(result.Errors, "Docker is not installed or not running on server")
 				}
 
-				// Check DNS.
-				if appCfg.Domain != "" {
+				// Check DNS. Skipped for ingress: external — the user's own
+				// front (Cloudflare Tunnel / nginx / ALB) serves the domain, so
+				// it legitimately resolves there, not to the server IP.
+				if appCfg.Domain != "" && appCfg.Ingress != config.IngressExternal {
 					if err := dns.Validate(appCfg.Domain, host, nil); err != nil {
 						result.Warns = append(result.Warns, fmt.Sprintf("DNS: %v", err))
 					}
@@ -110,6 +109,27 @@ func runValidate(flags *Flags) error {
 	}
 
 	return outputResult(flags, result)
+}
+
+// buildPrereqCheck reports on how the image will be built, honoring the
+// dockerfile:/context: fields (default ./Dockerfile). A pre-built image: is
+// pulled, not built, so there's nothing to check. An explicitly configured
+// dockerfile: that doesn't exist is an ERROR (the config points at nothing);
+// no Dockerfile configured or present is a WARN (Nixpacks fallback). Uses the
+// same build.DetectAt the deploy path uses, so validate and deploy agree.
+// Extracted from runValidate for direct unit testing (no SSH needed).
+func buildPrereqCheck(appCfg *config.AppConfig) (warns, errs []string) {
+	if appCfg.Image != "" {
+		return nil, nil
+	}
+	mode, err := build.DetectAt(appCfg.Context, appCfg.Dockerfile)
+	if err != nil {
+		return nil, []string{fmt.Sprintf("build: %v", err)}
+	}
+	if mode == build.ModeNixpacks {
+		warns = append(warns, "No Dockerfile found — Nixpacks will be used (requires Nixpacks on server or locally)")
+	}
+	return warns, nil
 }
 
 // nonPublicDomainWarnings reports each host in appCfg.Domain that

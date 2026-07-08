@@ -1,6 +1,8 @@
 package cli
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -60,5 +62,86 @@ func TestNonPublicDomainWarnings_MixedHosts(t *testing.T) {
 	warns := nonPublicDomainWarnings(&config.AppConfig{Domain: "example.com, 192.168.1.114"})
 	if len(warns) != 1 || !strings.Contains(warns[0], "192.168.1.114") {
 		t.Errorf("expected exactly one warning for the non-public host, got: %v", warns)
+	}
+}
+
+// --- buildPrereqCheck: dockerfile:/context: aware build detection ----------
+
+// mkDockerfile creates dir/rel (with parent dirs) as an empty Dockerfile and
+// returns dir. Context is passed as an absolute path so DetectAt resolves the
+// fixture without a chdir.
+func mkDockerfile(t *testing.T, rel string) string {
+	t.Helper()
+	dir := t.TempDir()
+	full := filepath.Join(dir, rel)
+	if err := os.MkdirAll(filepath.Dir(full), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(full, []byte("FROM alpine\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+// A configured subdir dockerfile: that exists must NOT warn about Nixpacks —
+// the exact false positive this change fixes.
+func TestBuildPrereqCheck_SubdirDockerfileNoWarning(t *testing.T) {
+	dir := mkDockerfile(t, "server/monolith/Dockerfile")
+	warns, errs := buildPrereqCheck(&config.AppConfig{
+		Context:    dir,
+		Dockerfile: "server/monolith/Dockerfile",
+	})
+	if len(warns) != 0 || len(errs) != 0 {
+		t.Errorf("configured subdir dockerfile should be clean, got warns=%v errs=%v", warns, errs)
+	}
+}
+
+// A configured dockerfile: that doesn't exist is an ERROR naming the path,
+// not a silent Nixpacks fallback.
+func TestBuildPrereqCheck_MissingConfiguredDockerfileErrors(t *testing.T) {
+	dir := t.TempDir() // empty — the configured dockerfile is absent
+	warns, errs := buildPrereqCheck(&config.AppConfig{
+		Context:    dir,
+		Dockerfile: "server/monolith/Dockerfile",
+	})
+	if len(errs) != 1 {
+		t.Fatalf("expected 1 error for a missing configured dockerfile, got %d: %v", len(errs), errs)
+	}
+	if !strings.Contains(errs[0], "server/monolith/Dockerfile") {
+		t.Errorf("error should name the missing dockerfile, got: %v", errs[0])
+	}
+	if len(warns) != 0 {
+		t.Errorf("a missing configured dockerfile should not also warn Nixpacks, got: %v", warns)
+	}
+}
+
+// No dockerfile: configured and no Dockerfile present → the Nixpacks WARN,
+// unchanged from the old behavior.
+func TestBuildPrereqCheck_NoDockerfileWarnsNixpacks(t *testing.T) {
+	dir := t.TempDir() // no Dockerfile, no config
+	warns, errs := buildPrereqCheck(&config.AppConfig{Context: dir})
+	if len(errs) != 0 {
+		t.Fatalf("no dockerfile is a warning, not an error, got errs=%v", errs)
+	}
+	if len(warns) != 1 || !strings.Contains(warns[0], "Nixpacks") {
+		t.Errorf("expected one Nixpacks warning, got: %v", warns)
+	}
+}
+
+// A context: subdirectory holding a plain Dockerfile (default name) must
+// resolve cleanly — no warning.
+func TestBuildPrereqCheck_ContextSubdirNoWarning(t *testing.T) {
+	dir := mkDockerfile(t, "Dockerfile") // Dockerfile at the context root
+	warns, errs := buildPrereqCheck(&config.AppConfig{Context: dir})
+	if len(warns) != 0 || len(errs) != 0 {
+		t.Errorf("a Dockerfile at the context root should be clean, got warns=%v errs=%v", warns, errs)
+	}
+}
+
+// A pre-built image: is pulled, not built — nothing to check, no warning.
+func TestBuildPrereqCheck_ImageSkipsBuildCheck(t *testing.T) {
+	warns, errs := buildPrereqCheck(&config.AppConfig{Image: "registry.example.com/app:latest"})
+	if len(warns) != 0 || len(errs) != 0 {
+		t.Errorf("a pre-built image needs no build check, got warns=%v errs=%v", warns, errs)
 	}
 }

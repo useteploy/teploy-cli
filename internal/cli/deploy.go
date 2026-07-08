@@ -293,9 +293,11 @@ func deployAppConfig(flags *Flags, appCfg *config.AppConfig, serverName, image, 
 	}
 
 	// 8. DNS validation (first deploy only).
-	// Host ingress has no domain to validate (it publishes a raw port), and
-	// neither do domain-less external setups — skip the DNS check for them.
-	if !skipDNSCheck && appCfg.Domain != "" && appCfg.Ingress != config.IngressHost {
+	// Skipped for host ingress (publishes a raw port, no domain) and for
+	// external ingress (the user's own front — Cloudflare Tunnel / nginx /
+	// ALB — serves the domain, so it resolves there, not to the server IP).
+	if !skipDNSCheck && appCfg.Domain != "" &&
+		appCfg.Ingress != config.IngressHost && appCfg.Ingress != config.IngressExternal {
 		current, _ := state.Read(ctx, executor, appCfg.App)
 		if current == nil {
 			fmt.Println("Validating DNS...")
