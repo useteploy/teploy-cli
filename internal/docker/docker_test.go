@@ -42,6 +42,47 @@ func TestClient_HostPort_NoBindings(t *testing.T) {
 	}
 }
 
+func TestClient_ImageExists_Present(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "docker image inspect", Output: "exists\n"},
+	)
+	client := NewClient(mock)
+
+	ok, err := client.ImageExists(context.Background(), "nginx:latest")
+	if err != nil {
+		t.Fatalf("ImageExists: %v", err)
+	}
+	if !ok {
+		t.Error("got false, want true for a locally-present image")
+	}
+}
+
+func TestClient_ImageExists_Missing(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "docker image inspect", Output: "missing\n"},
+	)
+	client := NewClient(mock)
+
+	ok, err := client.ImageExists(context.Background(), "nginx:latest")
+	if err != nil {
+		t.Fatalf("ImageExists: %v", err)
+	}
+	if ok {
+		t.Error("got true, want false for an absent image")
+	}
+}
+
+func TestClient_ImageExists_TransportError(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "docker image inspect", Err: fmt.Errorf("connection refused")},
+	)
+	client := NewClient(mock)
+
+	if _, err := client.ImageExists(context.Background(), "nginx:latest"); err == nil {
+		t.Error("expected an error when the command itself fails")
+	}
+}
+
 func TestClient_Run(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "docker run", Output: "abc123def456"},

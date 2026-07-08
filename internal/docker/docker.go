@@ -498,6 +498,21 @@ func (c *Client) Pull(ctx context.Context, image string) error {
 	return nil
 }
 
+// ImageExists reports whether the named image is already present in the
+// server's local Docker image cache. It runs `docker image inspect` behind a
+// shell guard that always exits 0 ("exists"/"missing"), so a real transport
+// failure (SSH/docker daemon down) surfaces as an error while a plain cache
+// miss does not — letting callers gate a pull without pull access failing the
+// check itself.
+func (c *Client) ImageExists(ctx context.Context, image string) (bool, error) {
+	cmd := "docker image inspect " + ssh.ShellQuote(image) + " >/dev/null 2>&1 && echo exists || echo missing"
+	out, err := c.exec.Run(ctx, cmd)
+	if err != nil {
+		return false, fmt.Errorf("checking for local image %s: %w", image, err)
+	}
+	return strings.TrimSpace(out) == "exists", nil
+}
+
 // Remove removes a stopped container.
 func (c *Client) Remove(ctx context.Context, name string) error {
 	if _, err := c.exec.Run(ctx, "docker rm "+ssh.ShellQuote(name)); err != nil {

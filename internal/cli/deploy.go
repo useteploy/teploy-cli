@@ -221,14 +221,15 @@ func deployAppConfig(flags *Flags, appCfg *config.AppConfig, serverName, image, 
 	}
 	defer executor.Close()
 
-	// 6b. Pull pre-built image (CI pipeline mode).
+	// 6b. Ensure the pre-built image is available (CI pipeline mode). An image
+	// already present on the server — built or `docker load`ed out of band, and
+	// possibly in no registry at all — must not be re-pulled, or the deploy
+	// would fail with "pull access denied" for something already on disk.
 	if !needsBuild && image != "" {
-		fmt.Printf("Pulling image %s...\n", image)
 		dk := docker.NewClient(executor)
-		if err := dk.Pull(ctx, image); err != nil {
-			return fmt.Errorf("image not found or registry auth failed: %w", err)
+		if err := ensureImage(ctx, dk, image, os.Stdout); err != nil {
+			return err
 		}
-		fmt.Println("  Image pulled")
 	}
 
 	// 7. Build (if no pre-built image).
@@ -767,4 +768,26 @@ func healthConfigFrom(h config.AppHealthConfig) deploy.HealthConfig {
 		Timeout:  time.Duration(h.TimeoutSeconds) * time.Second,
 		Interval: time.Duration(h.IntervalSeconds) * time.Second,
 	}
+}
+
+// ensureImage makes a pre-built image available on the server before it's used
+// to run containers. If the image is already in the server's local cache
+// (built or `docker load`ed out of band — including images that exist in no
+// registry) the pull is skipped; otherwise it's pulled from its registry,
+// preserving the original pull-on-miss behavior for real registry images.
+func ensureImage(ctx context.Context, dk *docker.Client, image string, out io.Writer) error {
+	exists, err := dk.ImageExists(ctx, image)
+	if err != nil {
+		return err
+	}
+	if exists {
+		fmt.Fprintf(out, "  Using local image %s\n", image)
+		return nil
+	}
+	fmt.Fprintf(out, "Pulling image %s...\n", image)
+	if err := dk.Pull(ctx, image); err != nil {
+		return fmt.Errorf("image not found or registry auth failed: %w", err)
+	}
+	fmt.Fprintln(out, "  Image pulled")
+	return nil
 }
