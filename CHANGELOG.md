@@ -80,7 +80,7 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
 - Template install (deploy directly from a registry or git URL).
 - Server hardening — firewall + SSH config + auto-updates wired into `teploy setup`.
 - Password bootstrap for fresh servers.
-- VPN integration in setup (Tailscale + WireGuard).
+- VPN integration in setup (Tailscale / Headscale / Netbird).
 - Comma-separated `domain:` field for apex + www served from one block.
 
 ### Fixed

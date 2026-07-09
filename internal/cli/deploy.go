@@ -37,6 +37,8 @@ func newDeployCmd(flags *Flags) *cobra.Command {
 		domain         string
 		port           int
 		migrateVolumes bool
+		role           string
+		tagFilters     []string
 	)
 
 	cmd := &cobra.Command{
@@ -62,7 +64,11 @@ swapping traffic.`,
 			if appName != "" {
 				return runAdHocDeploy(flags, serverName, appName, image, domain, port, version, skipDNSCheck, migrateVolumes)
 			}
-			return runDeploy(flags, serverName, image, version, skipDNSCheck, parallel, destination, migrateVolumes)
+			tags, err := parseTagFilters(tagFilters)
+			if err != nil {
+				return err
+			}
+			return runDeploy(flags, serverName, image, version, skipDNSCheck, parallel, destination, migrateVolumes, role, tags)
 		},
 	}
 
@@ -75,6 +81,8 @@ swapping traffic.`,
 	cmd.Flags().StringVar(&domain, "domain", "", "domain for ad-hoc deploy")
 	cmd.Flags().IntVar(&port, "port", 80, "container port for ad-hoc deploy")
 	cmd.Flags().BoolVar(&migrateVolumes, "migrate-volumes", false, "auto-migrate data from foreign volume sources to teploy paths (cp -a)")
+	cmd.Flags().StringVar(&role, "role", "", "only deploy to servers with this role (from servers.yml)")
+	cmd.Flags().StringSliceVar(&tagFilters, "tag", nil, "only deploy to servers matching tag key=value (repeatable)")
 
 	return cmd
 }
@@ -116,7 +124,7 @@ func runAdHocDeploy(flags *Flags, serverName, appName, image, domain string, por
 	return deployAppConfig(flags, appCfg, serverName, image, version, skipDNSCheck, migrateVolumes)
 }
 
-func runDeploy(flags *Flags, serverName, image, version string, skipDNSCheck bool, parallel int, destination string, migrateVolumes bool) error {
+func runDeploy(flags *Flags, serverName, image, version string, skipDNSCheck bool, parallel int, destination string, migrateVolumes bool, role string, tags map[string]string) error {
 	// 1. Load teploy.yml from current directory (with optional destination overlay).
 	var appCfg *config.AppConfig
 	var err error
@@ -129,17 +137,95 @@ func runDeploy(flags *Flags, serverName, image, version string, skipDNSCheck boo
 		return err
 	}
 
+	// Narrow the target list by --role/--tag (no-op if neither is set). Only
+	// affects the multi-server list; an explicit `deploy <server>` arg wins.
+	if err := filterServersByRoleTag(appCfg, role, tags); err != nil {
+		return err
+	}
+
 	// Multi-server deploy: if teploy.yml lists multiple servers and no explicit
 	// server argument was provided, deploy to all of them in parallel.
 	if len(appCfg.Servers) > 1 && serverName == "" {
-		// TODO(autodeploy/multideploy): plumb migrateVolumes through the
-		// multi-server path. The volume-mismatch check currently runs only on
-		// single-server deploys (deployAppConfig). Same fix applies in
-		// internal/cli/singledeploy.go's deployApp.
-		return runMultiDeploy(flags, appCfg, image, version, skipDNSCheck, parallel)
+		return runMultiDeploy(flags, appCfg, image, version, skipDNSCheck, parallel, migrateVolumes)
 	}
 
 	return deployAppConfig(flags, appCfg, serverName, image, version, skipDNSCheck, migrateVolumes)
+}
+
+// parseTagFilters parses repeated "key=value" flag values into a map.
+func parseTagFilters(pairs []string) (map[string]string, error) {
+	if len(pairs) == 0 {
+		return nil, nil
+	}
+	m := make(map[string]string, len(pairs))
+	for _, p := range pairs {
+		k, v, ok := strings.Cut(p, "=")
+		if !ok || k == "" {
+			return nil, fmt.Errorf("invalid --tag %q (want key=value)", p)
+		}
+		m[k] = v
+	}
+	return m, nil
+}
+
+// filterServersByRoleTag narrows appCfg.Servers to the servers whose
+// servers.yml entry matches the given role (empty role defaults to "app") and
+// every given tag. A no-op when neither role nor tags are set — so default
+// behavior (deploy to all listed servers) is unchanged. Errors if the filter
+// matches nothing, so a typo'd role/tag fails loudly instead of silently
+// deploying nowhere.
+func filterServersByRoleTag(appCfg *config.AppConfig, role string, tags map[string]string) error {
+	if role == "" && len(tags) == 0 {
+		return nil
+	}
+	serversPath, err := config.DefaultServersPath()
+	if err != nil {
+		return err
+	}
+	all, err := config.ListServers(serversPath)
+	if err != nil {
+		return err
+	}
+
+	kept := selectServersByRoleTag(appCfg.Servers, all, role, tags)
+	if len(kept) == 0 {
+		return fmt.Errorf("no servers match the --role/--tag filter")
+	}
+	appCfg.Servers = kept
+	return nil
+}
+
+// selectServersByRoleTag is the pure matcher behind filterServersByRoleTag:
+// from names, keep those whose servers.yml entry matches role (empty → "app")
+// and every tag.
+func selectServersByRoleTag(names []string, all map[string]config.Server, role string, tags map[string]string) []string {
+	var kept []string
+	for _, name := range names {
+		srv, ok := all[name]
+		if !ok {
+			continue
+		}
+		if role != "" {
+			r := srv.Role
+			if r == "" {
+				r = "app"
+			}
+			if r != role {
+				continue
+			}
+		}
+		matches := true
+		for k, v := range tags {
+			if srv.Tags[k] != v {
+				matches = false
+				break
+			}
+		}
+		if matches {
+			kept = append(kept, name)
+		}
+	}
+	return kept
 }
 
 // deployAppConfig runs a single-server deploy from an already-loaded AppConfig.
@@ -481,7 +567,7 @@ func deployBuiltImage(ctx context.Context, executor ssh.Executor, appCfg *config
 }
 
 // runMultiDeploy handles deploying to multiple servers in parallel.
-func runMultiDeploy(flags *Flags, appCfg *config.AppConfig, image, version string, skipDNSCheck bool, parallel int) error {
+func runMultiDeploy(flags *Flags, appCfg *config.AppConfig, image, version string, skipDNSCheck bool, parallel int, migrateVolumes bool) error {
 	// Resolve parallel setting.
 	if parallel <= 0 {
 		parallel = appCfg.Parallel
@@ -526,7 +612,7 @@ func runMultiDeploy(flags *Flags, appCfg *config.AppConfig, image, version strin
 	fmt.Printf("Deploying %s to %d servers (parallel=%d)...\n", appCfg.App, len(targets), parallel)
 
 	results := multideploy.ParallelDeploy(ctx, targets, parallel, func(ctx context.Context, target multideploy.ServerTarget, out io.Writer) error {
-		return deploySingleServer(ctx, appCfg, target, out)
+		return deploySingleServer(ctx, appCfg, target, out, migrateVolumes)
 	}, os.Stdout)
 
 	fmt.Print(multideploy.FormatResults(results))
@@ -560,7 +646,10 @@ func runMultiDeploy(flags *Flags, appCfg *config.AppConfig, image, version strin
 		fmt.Printf("\n%d of %d servers failed — rolling back the %d server(s) that succeeded...\n",
 			failCount, len(targets), len(successTargets))
 
-		rollbackResults := multideploy.ParallelDeploy(ctx, successTargets, parallel, func(ctx context.Context, target multideploy.ServerTarget, out io.Writer) error {
+		// Best-effort: attempt to roll back EVERY succeeded server even if one
+		// rollback fails — otherwise a single rollback failure would fail-fast
+		// and strand the remaining servers on the new version (M1).
+		rollbackResults := multideploy.ParallelDeployAll(ctx, successTargets, parallel, func(ctx context.Context, target multideploy.ServerTarget, out io.Writer) error {
 			return rollbackSingleServer(ctx, appCfg, target, out)
 		}, os.Stdout)
 
