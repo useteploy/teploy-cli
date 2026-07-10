@@ -62,7 +62,25 @@ func InstallFail2ban(ctx context.Context, exec ssh.Executor, w io.Writer, sudo s
 		return fmt.Errorf("enabling fail2ban: %w", err)
 	}
 
-	jailCfg := "[sshd]\nenabled = true\nmode = aggressive\n"
+	// Never ban the operator's own management traffic. Aggressive mode with a
+	// low maxretry will otherwise ban a trusted IP after a couple of failed
+	// auth attempts, locking the operator out of SSH for the full bantime
+	// (observed in the wild: a Tailscale IP banned for 24h after two failed
+	// pubkey attempts). ignoreip always covers loopback and the Tailscale
+	// CGNAT range (100.64.0.0/10, the mesh Teploy provisions over), plus the
+	// address this very session is connecting from — so `teploy setup` can
+	// never lock out the machine that ran it.
+	ignore := []string{"127.0.0.1/8", "::1", "100.64.0.0/10"}
+	if conn, _ := exec.Run(ctx, "echo $SSH_CONNECTION"); strings.TrimSpace(conn) != "" {
+		// SSH_CONNECTION = "<client-ip> <client-port> <server-ip> <server-port>".
+		if fields := strings.Fields(conn); len(fields) >= 1 {
+			if ip := fields[0]; ip != "" && !contains(ignore, ip) {
+				ignore = append(ignore, ip)
+			}
+		}
+	}
+
+	jailCfg := fmt.Sprintf("[sshd]\nenabled = true\nmode = aggressive\nignoreip = %s\n", strings.Join(ignore, " "))
 	if err := exec.Upload(ctx, strings.NewReader(jailCfg), "/tmp/teploy-fail2ban-sshd.conf", "0644"); err != nil {
 		return fmt.Errorf("writing fail2ban jail config: %w", err)
 	}
@@ -166,6 +184,15 @@ func Harden(ctx context.Context, exec ssh.Executor, w io.Writer) error {
 		return err
 	}
 	return nil
+}
+
+func contains(xs []string, s string) bool {
+	for _, x := range xs {
+		if x == s {
+			return true
+		}
+	}
+	return false
 }
 
 func splitFirstLine(s string) string {

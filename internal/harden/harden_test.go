@@ -85,6 +85,7 @@ func TestInstallFail2ban_AlreadyInstalled(t *testing.T) {
 	mock := ssh.NewMockExecutor("server1",
 		ssh.MockCommand{Match: "which fail2ban-server", Output: "/usr/bin/fail2ban-server"},
 		ssh.MockCommand{Match: "systemctl enable --now fail2ban", Output: ""},
+		ssh.MockCommand{Match: "echo $SSH_CONNECTION", Output: "203.0.113.7 54321 10.0.0.5 22"},
 		ssh.MockCommand{Match: "UPLOAD:", Output: ""},
 		ssh.MockCommand{Match: "mv /tmp/teploy-fail2ban-sshd.conf", Output: ""},
 		ssh.MockCommand{Match: "systemctl restart fail2ban", Output: ""},
@@ -111,6 +112,13 @@ func TestInstallFail2ban_AlreadyInstalled(t *testing.T) {
 	if !strings.Contains(string(content), "mode = aggressive") {
 		t.Errorf("jail config should contain aggressive mode, got: %s", string(content))
 	}
+	// ignoreip must protect loopback, the tailnet CGNAT range, and the IP
+	// this session connected from — otherwise setup can ban the operator.
+	for _, want := range []string{"ignoreip = ", "127.0.0.1/8", "100.64.0.0/10", "203.0.113.7"} {
+		if !strings.Contains(string(content), want) {
+			t.Errorf("jail config should contain %q, got: %s", want, string(content))
+		}
+	}
 }
 
 func TestInstallFail2ban_FreshInstall(t *testing.T) {
@@ -118,6 +126,7 @@ func TestInstallFail2ban_FreshInstall(t *testing.T) {
 		ssh.MockCommand{Match: "which fail2ban-server", Err: fmt.Errorf("not found")},
 		ssh.MockCommand{Match: "DEBIAN_FRONTEND=noninteractive apt-get update", Output: ""},
 		ssh.MockCommand{Match: "systemctl enable --now fail2ban", Output: ""},
+		ssh.MockCommand{Match: "echo $SSH_CONNECTION", Output: "203.0.113.7 54321 10.0.0.5 22"},
 		ssh.MockCommand{Match: "UPLOAD:", Output: ""},
 		ssh.MockCommand{Match: "mv /tmp/teploy-fail2ban-sshd.conf", Output: ""},
 		ssh.MockCommand{Match: "systemctl restart fail2ban", Output: ""},
@@ -220,6 +229,7 @@ func TestHarden_RunsAllSteps_AsRoot(t *testing.T) {
 		// fail2ban
 		ssh.MockCommand{Match: "which fail2ban-server", Output: "/usr/bin/fail2ban-server"},
 		ssh.MockCommand{Match: "systemctl enable --now fail2ban", Output: ""},
+		ssh.MockCommand{Match: "echo $SSH_CONNECTION", Output: "203.0.113.7 54321 10.0.0.5 22"},
 		ssh.MockCommand{Match: "UPLOAD:", Output: ""},
 		ssh.MockCommand{Match: "mv /tmp/teploy-fail2ban-sshd.conf", Output: ""},
 		ssh.MockCommand{Match: "systemctl restart fail2ban", Output: ""},
@@ -261,6 +271,7 @@ func TestHarden_RunsAllSteps_WithSudo(t *testing.T) {
 		// fail2ban
 		ssh.MockCommand{Match: "which fail2ban-server", Output: "/usr/bin/fail2ban-server"},
 		ssh.MockCommand{Match: "sudo systemctl enable --now fail2ban", Output: ""},
+		ssh.MockCommand{Match: "echo $SSH_CONNECTION", Output: "203.0.113.7 54321 10.0.0.5 22"},
 		ssh.MockCommand{Match: "UPLOAD:", Output: ""},
 		ssh.MockCommand{Match: "sudo mv /tmp/teploy-fail2ban-sshd.conf", Output: ""},
 		ssh.MockCommand{Match: "sudo systemctl restart fail2ban", Output: ""},
