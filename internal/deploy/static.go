@@ -267,12 +267,22 @@ func (d *StaticDeployer) runLocalBuild(ctx context.Context, cfg StaticConfig) er
 // rsyncTo shells out to local rsync to upload srcDir to the remote dest path.
 // Uses -az (archive + compress) and --delete so the destination matches the
 // source exactly. The remote path must already exist.
+//
+// The upload channel mirrors the control channel's host-key policy: strict
+// verification by default, accept-new only when the executor itself was
+// created with --accept-new. By rsync time the Go connection has already
+// verified (and, under accept-new, recorded) the host key in
+// ~/.ssh/known_hosts, so strict mode does not add first-run friction.
 func (d *StaticDeployer) rsyncTo(ctx context.Context, srcDir, remoteDest string) error {
+	hostKeyPolicy := "yes"
+	if a, ok := d.exec.(interface{ AcceptNewHost() bool }); ok && a.AcceptNewHost() {
+		hostKeyPolicy = "accept-new"
+	}
 	src := strings.TrimRight(srcDir, "/") + "/"
 	target := fmt.Sprintf("%s@%s:%s/", d.exec.User(), d.exec.Host(), remoteDest)
 	cmd := exec.CommandContext(ctx, "rsync",
 		"-az", "--delete",
-		"-e", "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new",
+		"-e", "ssh -o BatchMode=yes -o StrictHostKeyChecking="+hostKeyPolicy,
 		src, target,
 	)
 	cmd.Stdout = d.out

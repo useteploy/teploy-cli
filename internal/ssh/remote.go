@@ -25,6 +25,9 @@ type RemoteExecutor struct {
 	client *ssh.Client
 	host   string
 	user   string
+	// acceptNewHost records the host-key policy this connection was created
+	// with, so secondary channels (e.g. static-deploy rsync) can mirror it.
+	acceptNewHost bool
 }
 
 // ConnectConfig holds the parameters for establishing an SSH connection.
@@ -93,7 +96,7 @@ func Connect(ctx context.Context, cfg ConnectConfig) (*RemoteExecutor, error) {
 		return nil, fmt.Errorf("connecting to %s: %w", cfg.Host, err)
 	}
 
-	return &RemoteExecutor{client: client, host: cfg.Host, user: cfg.User}, nil
+	return &RemoteExecutor{client: client, host: cfg.Host, user: cfg.User, acceptNewHost: cfg.AcceptNewHost}, nil
 }
 
 func (e *RemoteExecutor) Run(ctx context.Context, cmd string) (string, error) {
@@ -172,6 +175,10 @@ func (e *RemoteExecutor) Close() error {
 
 func (e *RemoteExecutor) Host() string {
 	return e.host
+}
+
+func (e *RemoteExecutor) AcceptNewHost() bool {
+	return e.acceptNewHost
 }
 
 func (e *RemoteExecutor) User() string {
