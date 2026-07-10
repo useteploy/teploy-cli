@@ -162,7 +162,10 @@ accessories:
     image: postgres:16
     port: 5432
     env:
-      POSTGRES_PASSWORD: secret
+      POSTGRES_PASSWORD: auto                  # generated once, persisted server-side
+      # or reference an encrypted secret (set with `teploy secret set DB_PASSWORD=...`);
+      # the app container receives the same secret, so both sides agree:
+      # POSTGRES_PASSWORD: secret:DB_PASSWORD
 
 assets:
   path: /app/public/assets

@@ -427,9 +427,14 @@ func (c *AppConfig) validate() error {
 			return fmt.Errorf("volume name %q must be lowercase alphanumeric with hyphens", name)
 		}
 	}
-	for name := range c.Accessories {
+	for name, acc := range c.Accessories {
 		if !validName.MatchString(name) {
 			return fmt.Errorf("accessory name %q must be lowercase alphanumeric with hyphens", name)
+		}
+		for k, v := range acc.Env {
+			if strings.HasPrefix(v, "secret:") && strings.TrimSpace(strings.TrimPrefix(v, "secret:")) == "" {
+				return fmt.Errorf("accessory %s env %s: empty secret reference (expected secret:KEY)", name, k)
+			}
 		}
 	}
 	for name := range c.Processes {

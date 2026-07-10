@@ -572,3 +572,102 @@ func TestIsImageType(t *testing.T) {
 		}
 	}
 }
+
+func TestEnsureRunning_SecretReference(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		// No stored credentials.
+		ssh.MockCommand{Match: "cat /deployments/myapp/accessories/nucleus/credentials", Err: fmt.Errorf("not found")},
+		// Secret exists and decrypts.
+		ssh.MockCommand{Match: "test -f /deployments/myapp/secrets/NUCLEUS_PASSWORD.age", Output: ""},
+		ssh.MockCommand{Match: "age -d -i /deployments/.age-key /deployments/myapp/secrets/NUCLEUS_PASSWORD.age", Output: "s3cr3t-pa$$word\n"},
+		// Not running.
+		ssh.MockCommand{Match: "docker inspect", Err: fmt.Errorf("not found")},
+		ssh.MockCommand{Match: "mkdir -p /deployments/myapp/accessories/nucleus", Output: ""},
+		ssh.MockCommand{Match: "docker run", Output: "abc123"},
+	)
+
+	var buf bytes.Buffer
+	mgr := NewManager(mock, &buf)
+
+	_, err := mgr.EnsureRunning(context.Background(), "myapp", "nucleus", config.AccessoryConfig{
+		Image: "ghcr.io/neutron-build/nucleus:latest",
+		Port:  5432,
+		Env: map[string]string{
+			"NUCLEUS_PASSWORD": "secret:NUCLEUS_PASSWORD",
+			"NUCLEUS_PLAIN":    "literal",
+		},
+	})
+	if err != nil {
+		t.Fatalf("EnsureRunning: %v", err)
+	}
+
+	var runCmd string
+	for _, call := range mock.Calls {
+		if strings.HasPrefix(call, "docker run") {
+			runCmd = call
+		}
+	}
+	if runCmd == "" {
+		t.Fatal("expected docker run command")
+	}
+	// The decrypted value is injected (shell-quoted), not the reference.
+	if !strings.Contains(runCmd, `'NUCLEUS_PASSWORD=s3cr3t-pa$$word'`) {
+		t.Errorf("expected decrypted secret in docker run env, got: %s", runCmd)
+	}
+	if strings.Contains(runCmd, "secret:NUCLEUS_PASSWORD") {
+		t.Errorf("secret reference leaked into docker run: %s", runCmd)
+	}
+	if !strings.Contains(runCmd, `'NUCLEUS_PLAIN=literal'`) {
+		t.Errorf("literal env should pass through, got: %s", runCmd)
+	}
+
+	// The plaintext must never be persisted to the credentials file.
+	for path, content := range mock.Files {
+		if strings.Contains(path, "credentials") && strings.Contains(string(content), "s3cr3t") {
+			t.Errorf("secret value persisted in plaintext to %s", path)
+		}
+	}
+}
+
+func TestEnsureRunning_SecretReferenceMissing(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "cat /deployments/myapp/accessories/nucleus/credentials", Err: fmt.Errorf("not found")},
+		// Secret file does not exist.
+		ssh.MockCommand{Match: "test -f /deployments/myapp/secrets/NUCLEUS_PASSWORD.age", Err: fmt.Errorf("exit 1")},
+	)
+
+	var buf bytes.Buffer
+	mgr := NewManager(mock, &buf)
+
+	_, err := mgr.EnsureRunning(context.Background(), "myapp", "nucleus", config.AccessoryConfig{
+		Image: "ghcr.io/neutron-build/nucleus:latest",
+		Env:   map[string]string{"NUCLEUS_PASSWORD": "secret:NUCLEUS_PASSWORD"},
+	})
+	if err == nil {
+		t.Fatal("expected error for unset secret")
+	}
+	if !strings.Contains(err.Error(), "teploy secret set NUCLEUS_PASSWORD=") {
+		t.Errorf("error should tell the user how to set the secret, got: %v", err)
+	}
+	// Must fail before any container is started.
+	for _, call := range mock.Calls {
+		if strings.HasPrefix(call, "docker run") {
+			t.Error("container must not start when a secret reference is unresolvable")
+		}
+	}
+}
+
+func TestEnsureRunning_SecretReferenceEmptyKey(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "cat /deployments/myapp/accessories/nucleus/credentials", Err: fmt.Errorf("not found")},
+	)
+	var buf bytes.Buffer
+	mgr := NewManager(mock, &buf)
+	_, err := mgr.EnsureRunning(context.Background(), "myapp", "nucleus", config.AccessoryConfig{
+		Image: "nucleus:latest",
+		Env:   map[string]string{"NUCLEUS_PASSWORD": "secret:"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "empty secret reference") {
+		t.Fatalf("expected empty-reference error, got: %v", err)
+	}
+}

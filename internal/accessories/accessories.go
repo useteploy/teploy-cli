@@ -11,6 +11,7 @@ import (
 
 	"github.com/useteploy/teploy/internal/config"
 	"github.com/useteploy/teploy/internal/docker"
+	"github.com/useteploy/teploy/internal/secret"
 	"github.com/useteploy/teploy/internal/ssh"
 )
 
@@ -106,8 +107,16 @@ func (m *Manager) EnsureRunning(ctx context.Context, app, name string, cfg confi
 	return connectionEnvVars(app, name, cfg.Image, cfg.Port, env), nil
 }
 
-// resolveEnv processes env vars, replacing "auto" values with generated passwords.
-// Persists generated credentials to /deployments/{app}/accessories/{name}/credentials.
+// resolveEnv processes env vars, replacing "auto" values with generated
+// passwords and "secret:KEY" references with values decrypted from the app's
+// encrypted secret store (`teploy secret set KEY=value`).
+//
+// Generated ("auto") credentials are persisted to
+// /deployments/{app}/accessories/{name}/credentials. Secret references are
+// NOT persisted anywhere in plaintext — the age-encrypted store stays the
+// single source of truth, and because app deploys inject the same store into
+// the app container, one `teploy secret set` feeds both sides (e.g. a
+// database password the accessory sets and the app connects with).
 func (m *Manager) resolveEnv(ctx context.Context, app, name string, env map[string]string) (map[string]string, error) {
 	if len(env) == 0 {
 		return nil, nil
@@ -119,8 +128,10 @@ func (m *Manager) resolveEnv(ctx context.Context, app, name string, env map[stri
 	result := make(map[string]string)
 	needsWrite := false
 
+	var secrets *secret.Manager
 	for k, v := range env {
-		if v == "auto" {
+		switch {
+		case v == "auto":
 			if existing, ok := stored[k]; ok {
 				result[k] = existing
 			} else {
@@ -132,7 +143,20 @@ func (m *Manager) resolveEnv(ctx context.Context, app, name string, env map[stri
 				stored[k] = password
 				needsWrite = true
 			}
-		} else {
+		case strings.HasPrefix(v, "secret:"):
+			key := strings.TrimSpace(strings.TrimPrefix(v, "secret:"))
+			if key == "" {
+				return nil, fmt.Errorf("accessory %s env %s: empty secret reference (expected secret:KEY)", name, k)
+			}
+			if secrets == nil {
+				secrets = secret.NewManager(m.exec)
+			}
+			val, err := secrets.Get(ctx, app, key)
+			if err != nil {
+				return nil, fmt.Errorf("accessory %s env %s: %w — set it with: teploy secret set %s=<value>", name, k, err, key)
+			}
+			result[k] = val
+		default:
 			result[k] = v
 		}
 	}
