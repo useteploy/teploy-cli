@@ -2,7 +2,9 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"strings"
@@ -69,6 +71,7 @@ func newAccessoryCmd(flags *Flags) *cobra.Command {
 	cmd.AddCommand(newAccessoryUpgradeCmd(flags))
 	cmd.AddCommand(newAccessoryBackupCmd(flags))
 	cmd.AddCommand(newAccessoryRestoreCmd(flags))
+	cmd.AddCommand(newAccessoryVerifyBackupCmd(flags))
 
 	return cmd
 }
@@ -457,4 +460,91 @@ func runAccessoryRestore(flags *Flags, name, date, bucket, region string) error 
 	client := backup.NewClient(executor, os.Stdout)
 	s3Cfg := backup.S3Config{Bucket: bucket, Region: region}
 	return client.AccessoryRestore(ctx, appCfg.App, name, accCfg.Image, date, accCfg.Env, s3Cfg)
+}
+
+func newAccessoryVerifyBackupCmd(flags *Flags) *cobra.Command {
+	var (
+		appName string
+		bucket  string
+		region  string
+		date    string
+	)
+
+	cmd := &cobra.Command{
+		Use:   "verify-backup <name>",
+		Short: "Restore a backup into a scratch container and verify it's usable",
+		Long: "Downloads the latest backup (or --date) for an accessory, restores it into a\n" +
+			"throwaway scratch container, and verifies the restored copy is actually usable\n" +
+			"(tables exist, engine boots, keys load). The running accessory is never touched;\n" +
+			"the scratch container is always removed. Proves backups aren't write-only.\n\n" +
+			"Reads the accessory's image and env from the running container, so it works from\n" +
+			"server state alone: pass --app + --host to run without a teploy.yml (the mode\n" +
+			"teploy-dash and cron use).\n\n" +
+			"Examples:\n" +
+			"  teploy accessory verify-backup postgres --bucket my-backups\n" +
+			"  teploy accessory verify-backup db --app myapp --host 1.2.3.4 --bucket b --json",
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runAccessoryVerifyBackup(flags, appName, args[0], bucket, region, date)
+		},
+	}
+	cmd.Flags().StringVar(&appName, "app", "", "app name — act on server state instead of teploy.yml (requires --host)")
+	cmd.Flags().StringVar(&bucket, "bucket", "", "S3 bucket name")
+	cmd.Flags().StringVar(&region, "region", "us-east-1", "AWS region")
+	cmd.Flags().StringVar(&date, "date", "", "backup timestamp to verify (default: latest)")
+	return cmd
+}
+
+func runAccessoryVerifyBackup(flags *Flags, appName, name, bucket, region, date string) error {
+	if bucket == "" {
+		return fmt.Errorf("--bucket is required")
+	}
+	if err := backup.ValidateBucket(bucket); err != nil {
+		return err
+	}
+	if err := backup.ValidateRegion(region); err != nil {
+		return err
+	}
+	if date != "" {
+		if err := backup.ValidateDate(date); err != nil {
+			return err
+		}
+	}
+
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer cancel()
+
+	appCfg, executor, err := resolveAppForAccessory(ctx, flags, appName)
+	if err != nil {
+		return err
+	}
+	defer executor.Close()
+
+	out := io.Writer(os.Stdout)
+	if flags.JSON {
+		// Keep stdout clean for the JSON result; progress goes to stderr.
+		out = os.Stderr
+	}
+	client := backup.NewClient(executor, out)
+	res, err := client.VerifyBackup(ctx, appCfg.App, name, date, backup.S3Config{Bucket: bucket, Region: region})
+	if err != nil {
+		return err
+	}
+
+	if flags.JSON {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(res); err != nil {
+			return err
+		}
+	} else if res.OK {
+		fmt.Printf("OK: %s/%s backup %s verified (%s, %s in %.1fs)\n",
+			appCfg.App, name, res.Date, res.Kind, res.Metric, float64(res.DurationMs)/1000)
+	} else {
+		fmt.Printf("FAILED: %s/%s backup %s did not verify: %s\n", appCfg.App, name, res.Date, res.Detail)
+	}
+	if !res.OK {
+		return fmt.Errorf("backup verification failed")
+	}
+	return nil
 }
