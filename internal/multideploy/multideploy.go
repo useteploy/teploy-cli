@@ -87,8 +87,24 @@ type DeployFunc func(ctx context.Context, target ServerTarget, out io.Writer) er
 //
 // Servers are deployed in batches controlled by the parallel parameter.
 // If any server in a batch fails, subsequent servers that haven't started
-// are skipped and marked as such.
+// are skipped and marked as such (fail-fast) — the right behavior for a
+// forward deploy, where continuing to roll a bad release to more servers is
+// pointless.
 func ParallelDeploy(ctx context.Context, servers []ServerTarget, parallel int, deployFn DeployFunc, out io.Writer) []Result {
+	return parallelDeploy(ctx, servers, parallel, true, deployFn, out)
+}
+
+// ParallelDeployAll is like ParallelDeploy but best-effort: it attempts EVERY
+// server regardless of other servers' failures (no fail-fast skip). Use it for
+// rollback — skipping a server's rollback because a *different* server's
+// rollback failed would strand that server on the new version, leaving the
+// fleet split across two versions with no reconciliation (the exact desync a
+// rollback exists to avoid).
+func ParallelDeployAll(ctx context.Context, servers []ServerTarget, parallel int, deployFn DeployFunc, out io.Writer) []Result {
+	return parallelDeploy(ctx, servers, parallel, false, deployFn, out)
+}
+
+func parallelDeploy(ctx context.Context, servers []ServerTarget, parallel int, failFast bool, deployFn DeployFunc, out io.Writer) []Result {
 	if parallel <= 0 {
 		parallel = 1
 	}
@@ -104,20 +120,23 @@ func ParallelDeploy(ctx context.Context, servers []ServerTarget, parallel int, d
 		wg.Add(1)
 		sem <- struct{}{} // acquire semaphore (blocks until a slot is free)
 
-		// Check if a previous deploy failed — skip remaining.
-		mu.Lock()
-		if failed {
-			mu.Unlock()
-			<-sem
-			wg.Done()
-			results[i] = Result{
-				Server:  server.Name,
-				Success: false,
-				Error:   fmt.Errorf("skipped: previous server failed"),
+		// Fail-fast: if a previous deploy failed, skip the rest. Disabled for
+		// best-effort (rollback) runs, which must attempt every server.
+		if failFast {
+			mu.Lock()
+			if failed {
+				mu.Unlock()
+				<-sem
+				wg.Done()
+				results[i] = Result{
+					Server:  server.Name,
+					Success: false,
+					Error:   fmt.Errorf("skipped: previous server failed"),
+				}
+				continue
 			}
-			continue
+			mu.Unlock()
 		}
-		mu.Unlock()
 
 		go func(idx int, srv ServerTarget) {
 			defer wg.Done()

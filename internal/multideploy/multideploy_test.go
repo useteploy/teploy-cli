@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -146,6 +147,42 @@ func TestParallelDeploy_OneFailsSkipsRest(t *testing.T) {
 	}
 	if results[2].Error == nil || !strings.Contains(results[2].Error.Error(), "skipped") {
 		t.Errorf("app3 should be marked as skipped, got: %v", results[2].Error)
+	}
+}
+
+// ParallelDeployAll (best-effort, used for rollback) must attempt EVERY server
+// even after one fails — no fail-fast skip. This is the M1 fix: a rollback that
+// fail-fast-skipped would strand later servers on the new version.
+func TestParallelDeployAll_BestEffortAttemptsAll(t *testing.T) {
+	servers := []ServerTarget{
+		{Name: "app1", Host: "10.0.0.1"},
+		{Name: "app2", Host: "10.0.0.2"},
+		{Name: "app3", Host: "10.0.0.3"},
+	}
+
+	var attempted sync.Map
+	var out bytes.Buffer
+	// parallel=1 so ordering is deterministic; fail on app2.
+	results := ParallelDeployAll(context.Background(), servers, 1, func(ctx context.Context, target ServerTarget, w io.Writer) error {
+		attempted.Store(target.Name, true)
+		if target.Name == "app2" {
+			return fmt.Errorf("rollback failed on app2")
+		}
+		return nil
+	}, &out)
+
+	// app3 must have been ATTEMPTED (not skipped) despite app2 failing.
+	if _, ok := attempted.Load("app3"); !ok {
+		t.Fatal("app3 was skipped — best-effort must attempt every server")
+	}
+	if !results[0].Success || results[1].Success || !results[2].Success {
+		t.Fatalf("want app1=ok app2=fail app3=ok, got %v/%v/%v",
+			results[0].Success, results[1].Success, results[2].Success)
+	}
+	for _, r := range results {
+		if r.Error != nil && strings.Contains(r.Error.Error(), "skipped") {
+			t.Fatalf("no server should be skipped in best-effort mode; %s was", r.Server)
+		}
 	}
 }
 

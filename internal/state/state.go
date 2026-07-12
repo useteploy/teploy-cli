@@ -27,6 +27,16 @@ const deploymentsDir = "/deployments"
 // intentional freeze with no expiry.
 const staleLockTTL = 30 * time.Minute
 
+// staleHealLockTTL is how long a "heal" lock (see LockInfo.Type and
+// AcquireHealLock) is honored before it's treated as abandoned. Heal restarts
+// a single container and releases immediately, so a heal lock should never
+// live more than a few seconds; 2 minutes is a generous ceiling that still
+// lets a crashed heal's lock be broken quickly — by the next heal run OR by a
+// deploy — instead of blocking deploys for the full 30-minute auto TTL. The
+// invariant heal preserves: a running DEPLOY's lock (auto/manual) is never
+// breakable by heal, at any age; heal only ever breaks its OWN stale lock.
+const staleHealLockTTL = 2 * time.Minute
+
 // AppState represents the deploy state for an app on the server.
 // Stored at /deployments/<app>/state as key=value pairs.
 type AppState struct {
@@ -185,6 +195,18 @@ func AcquireLock(ctx context.Context, exec ssh.Executor, app string) error {
 			}
 			return writeLockInfo(ctx, exec, lockPath, app)
 		}
+		// A crashed heal can leave its short-lived "heal" lock behind. A deploy
+		// (authoritative) may break a STALE heal lock so it isn't blocked — but
+		// a FRESH heal lock (heal mid-restart, seconds) falls through to the
+		// "in progress" error below, so the deploy yields for that brief window
+		// rather than interrupting a heal restart.
+		if info != nil && info.Type == "heal" && isHealStale(info.TS) {
+			ReleaseLock(ctx, exec, app)
+			if _, retryErr := tryMkdirLock(ctx, exec, lockPath); retryErr != nil {
+				return fmt.Errorf("deploy is already in progress for %s", app)
+			}
+			return writeLockInfo(ctx, exec, lockPath, app)
+		}
 		return fmt.Errorf("deploy is already in progress for %s", app)
 	}
 	return writeLockInfo(ctx, exec, lockPath, app)
@@ -232,6 +254,65 @@ func AcquireManualLock(ctx context.Context, exec ssh.Executor, app, user, messag
 		TS:      time.Now().UTC().Format(time.RFC3339),
 	})
 	return exec.Upload(ctx, bytes.NewReader(info), lockPath+"/info", "0644")
+}
+
+// AcquireHealLock acquires a short-lived "heal" lock for an app so a heal
+// restart is mutually exclusive with a deploy. It is deliberately NOT
+// symmetric with AcquireLock:
+//
+//   - It YIELDS to any existing deploy lock (auto/manual) and to a fresh heal
+//     lock — returning (false, nil), never breaking it. A running deploy's
+//     lock must never be broken by heal, at any age (a >30-min deploy is legit:
+//     image builds, migrations).
+//   - It only ever breaks its OWN stale heal lock (a crashed prior heal), so
+//     heal can't be permanently blocked by its own dead predecessor.
+//
+// Returns (true, nil) when the lock was acquired and the caller must release it
+// (defer ReleaseLock), (false, nil) when heal should skip this app because
+// something else holds the lock, or (false, err) on an unexpected failure.
+func AcquireHealLock(ctx context.Context, exec ssh.Executor, app string) (bool, error) {
+	lockPath := fmt.Sprintf("%s/%s/.lock", deploymentsDir, app)
+	if _, err := tryMkdirLock(ctx, exec, lockPath); err != nil {
+		info, _ := ReadLock(ctx, exec, app)
+		// Break only our own stale heal lock; yield to everything else.
+		if info != nil && info.Type == "heal" && isHealStale(info.TS) {
+			ReleaseLock(ctx, exec, app)
+			if _, retryErr := tryMkdirLock(ctx, exec, lockPath); retryErr != nil {
+				return false, nil // lost the race — yield
+			}
+			if err := writeHealLockInfo(ctx, exec, lockPath, app); err != nil {
+				return false, err
+			}
+			return true, nil
+		}
+		return false, nil // deploy/manual/fresh-heal lock present — yield, never break
+	}
+	if err := writeHealLockInfo(ctx, exec, lockPath, app); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func writeHealLockInfo(ctx context.Context, exec ssh.Executor, lockPath, app string) error {
+	info, _ := json.Marshal(LockInfo{
+		Type: "heal",
+		TS:   time.Now().UTC().Format(time.RFC3339),
+	})
+	if err := exec.Upload(ctx, bytes.NewReader(info), lockPath+"/info", "0644"); err != nil {
+		ReleaseLock(ctx, exec, app)
+		return fmt.Errorf("writing heal lock info: %w", err)
+	}
+	return nil
+}
+
+// isHealStale reports whether a "heal" lock's timestamp is older than
+// staleHealLockTTL. An unparseable timestamp is treated as stale.
+func isHealStale(ts string) bool {
+	parsed, err := time.Parse(time.RFC3339, ts)
+	if err != nil {
+		return true
+	}
+	return time.Since(parsed) > staleHealLockTTL
 }
 
 // ReleaseLock releases the deploy lock for an app.
