@@ -232,6 +232,21 @@ teploy accessory start <name>      # start accessory (Postgres, Redis, etc.)
 teploy accessory stop / logs / upgrade / backup / restore <name>
 ```
 
+### Shared KV (config / feature flags)
+```
+teploy kv set flags/beta on        # set a key (--ttl 300 for expiring keys)
+teploy kv get flags/beta           # print a value (exit 1 if unset)
+teploy kv list 'flags/*'           # list keys by glob pattern
+teploy kv incr deploys/count       # atomic counter, prints new value
+teploy kv del / exists <key>
+```
+Operates on a [Nucleus](https://github.com/neutron-build/neutron) accessory
+(`--accessory`, default `nucleus`) — a shared config/flag/counter store your
+apps can also read directly over their `DATABASE_URL` (Consul-KV-style, but
+riding the database you already run). One global keyspace: key prefixes are
+convention, not isolation — share a store only between apps that trust each
+other, and give untrusted apps their own instance.
+
 ### Previews
 ```
 teploy preview deploy <branch>     # route subdomain to a pre-built image

@@ -36,6 +36,7 @@ func NewRootCmd(version string) *cobra.Command {
 	root.AddCommand(newAppCmd(flags))
 	root.AddCommand(newSetupCmd(flags))
 	root.AddCommand(newAccessoryCmd(flags))
+	root.AddCommand(newKvCmd(flags))
 	root.AddCommand(newEnvCmd(flags))
 	root.AddCommand(newStopCmd(flags))
 	root.AddCommand(newStartCmd(flags))
