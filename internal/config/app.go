@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/BurntSushi/toml"
@@ -28,6 +29,59 @@ var validPlatform = regexp.MustCompile(`^[a-z]+/[a-z0-9]+(/v[0-9]+)?$`)
 type HooksConfig struct {
 	PreDeploy  string `yaml:"pre_deploy,omitempty" toml:"pre_deploy"`
 	PostDeploy string `yaml:"post_deploy,omitempty" toml:"post_deploy"`
+}
+
+// RolloutConfig controls staged multi-server deploys (the `rollout:` block).
+//
+// Canary is the size of the first wave — an integer count ("2") or a percent
+// of the fleet ("10%"), minimum 1, deployed serially. Any canary failure
+// halts the rollout and rolls the canary back: the rest of the fleet is
+// never touched.
+//
+// MaxFailures is the failure tolerance for the main wave AFTER the canary
+// passes. 0 (default): any failure halts and rolls the whole fleet back to
+// the old version (no mixed-version fleet). N>0: every server is attempted;
+// up to N failures are tolerated — succeeded servers KEEP the new version,
+// the load balancer serves only them, and the command exits non-zero with an
+// explicit per-server report so stragglers are converged deliberately, never
+// silently.
+type RolloutConfig struct {
+	Canary      string `yaml:"canary,omitempty" toml:"canary"`
+	MaxFailures int    `yaml:"max_failures,omitempty" toml:"max_failures"`
+}
+
+// CanaryCount resolves the canary spec against the fleet size: integer count
+// or "N%" (rounded up, so a nonzero percent of a small fleet is never zero),
+// clamped to [1, total-1] — a canary that is the whole fleet is not a canary.
+func (r *RolloutConfig) CanaryCount(total int) (int, error) {
+	spec := strings.TrimSpace(r.Canary)
+	if spec == "" {
+		spec = "1"
+	}
+	var n int
+	if pct, ok := strings.CutSuffix(spec, "%"); ok {
+		p, err := strconv.Atoi(strings.TrimSpace(pct))
+		if err != nil || p <= 0 || p > 100 {
+			return 0, fmt.Errorf("rollout.canary: invalid percent %q", r.Canary)
+		}
+		n = (total*p + 99) / 100
+	} else {
+		c, err := strconv.Atoi(spec)
+		if err != nil || c <= 0 {
+			return 0, fmt.Errorf("rollout.canary: invalid count %q", r.Canary)
+		}
+		n = c
+	}
+	if n < 1 {
+		n = 1
+	}
+	if n >= total {
+		n = total - 1
+	}
+	if n < 1 {
+		n = 1
+	}
+	return n, nil
 }
 
 // AccessoryConfig represents a stateful service container (database, cache, etc.).
@@ -182,6 +236,11 @@ type AppConfig struct {
 	StopTimeout int    `yaml:"stop_timeout,omitempty" toml:"stop_timeout"`
 	Parallel    int    `yaml:"parallel,omitempty" toml:"parallel"`
 	Replicas    int    `yaml:"replicas,omitempty" toml:"replicas"`
+	// Rollout gates multi-server deploys: a canary wave that must succeed
+	// before the rest of the fleet deploys, and a bounded failure tolerance
+	// for the main wave. Absent (nil) = existing behavior (parallel batches,
+	// fail-fast + full-fleet rollback on any failure).
+	Rollout *RolloutConfig `yaml:"rollout,omitempty" toml:"rollout"`
 	// KeepVersions caps the number of past app versions retained after a
 	// successful deploy (containers + images). Zero (default) keeps
 	// everything — historical behavior. Set to 2 or 3 to enable auto-prune
@@ -606,6 +665,9 @@ func mergeConfigs(base, overlay *AppConfig) {
 	}
 	if overlay.Parallel != 0 {
 		base.Parallel = overlay.Parallel
+	}
+	if overlay.Rollout != nil {
+		base.Rollout = overlay.Rollout
 	}
 	if overlay.KeepVersions != 0 {
 		base.KeepVersions = overlay.KeepVersions

@@ -289,7 +289,27 @@ parallel: 2
 ```bash
 teploy deploy          # deploys to all servers in parallel
 teploy scale 3         # deploy to 3 app-role servers + update LB
+teploy deploy --role worker --tag region=eu   # target a subset by role/tags
 ```
+
+### Staged rollouts (canary + failure budget)
+
+```yaml
+rollout:
+  canary: 1            # or "10%" — first wave, deployed serially
+  max_failures: 0      # tolerated failures after the canary passes
+```
+
+With a `rollout:` block, multi-server deploys stage in two waves. The canary
+wave deploys first and must come up healthy — any canary failure halts the
+rollout, rolls the canary back, and leaves the rest of the fleet untouched.
+Then the main wave deploys with your `parallel` setting. `max_failures: 0`
+(default) keeps today's all-or-nothing behavior: any failure rolls the whole
+fleet back to the old version. With `max_failures: N`, every server is
+attempted, up to N failures are tolerated — servers that succeeded keep the
+new version and only they enter the load balancer — and the command still
+exits non-zero with a named straggler list and the exact converge command.
+A mixed-version fleet is never left silent.
 
 ## Destinations
 

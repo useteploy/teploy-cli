@@ -609,11 +609,47 @@ func runMultiDeploy(flags *Flags, appCfg *config.AppConfig, image, version strin
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
-	fmt.Printf("Deploying %s to %d servers (parallel=%d)...\n", appCfg.App, len(targets), parallel)
-
-	results := multideploy.ParallelDeploy(ctx, targets, parallel, func(ctx context.Context, target multideploy.ServerTarget, out io.Writer) error {
+	deployFn := func(ctx context.Context, target multideploy.ServerTarget, out io.Writer) error {
 		return deploySingleServer(ctx, appCfg, target, out, migrateVolumes)
-	}, os.Stdout)
+	}
+
+	// Staged rollout: canary wave first, gated, then the rest of the fleet.
+	maxFailures := 0
+	mainTargets := targets
+	var canarySucceeded []multideploy.ServerTarget
+	if appCfg.Rollout != nil && len(targets) > 1 {
+		maxFailures = appCfg.Rollout.MaxFailures
+		canaryN, err := appCfg.Rollout.CanaryCount(len(targets))
+		if err != nil {
+			return err
+		}
+		canary, rest := targets[:canaryN], targets[canaryN:]
+		fmt.Printf("Rollout: canary wave — deploying %s to %d of %d server(s) serially...\n",
+			appCfg.App, len(canary), len(targets))
+		canaryResults := multideploy.ParallelDeploy(ctx, canary, 1, deployFn, os.Stdout)
+		fmt.Print(multideploy.FormatResults(canaryResults))
+		if failed := rollbackFailedWave(ctx, appCfg, canary, canaryResults, parallel, migrateVolumes); failed > 0 {
+			// A canary failure halts everything: the rest of the fleet was
+			// never touched and the canary is back on the old version.
+			return fmt.Errorf("rollout halted: %d of %d canary server(s) failed; rest of fleet untouched", failed, len(canary))
+		}
+		fmt.Printf("Rollout: canary healthy — deploying remaining %d server(s) (parallel=%d, max_failures=%d)...\n",
+			len(rest), parallel, maxFailures)
+		canarySucceeded = canary
+		mainTargets = rest
+	} else {
+		fmt.Printf("Deploying %s to %d servers (parallel=%d)...\n", appCfg.App, len(targets), parallel)
+	}
+
+	var results []multideploy.Result
+	if maxFailures > 0 {
+		// Failure-tolerant wave: attempt every server (no fail-fast skip) so
+		// the failure count reflects reality, then judge against the budget.
+		results = multideploy.ParallelDeployAll(ctx, mainTargets, parallel, deployFn, os.Stdout)
+	} else {
+		results = multideploy.ParallelDeploy(ctx, mainTargets, parallel, deployFn, os.Stdout)
+	}
+	targets = mainTargets
 
 	fmt.Print(multideploy.FormatResults(results))
 
@@ -626,6 +662,10 @@ func runMultiDeploy(flags *Flags, appCfg *config.AppConfig, image, version strin
 			failCount++
 		}
 	}
+	// Canary servers that passed the gate are on the new version too: they
+	// belong in the LB on success, and in the convergence rollback if the
+	// main wave busts the failure budget.
+	successTargets = append(canarySucceeded, successTargets...)
 
 	if failCount == 0 {
 		if len(successTargets) > 0 {
@@ -634,6 +674,29 @@ func runMultiDeploy(flags *Flags, appCfg *config.AppConfig, image, version strin
 			}
 		}
 		return nil
+	}
+
+	// Within the rollout failure budget: succeeded servers KEEP the new
+	// version (no fleet-wide yo-yo on a large rollout) and only they enter
+	// the load balancer. The exit is still non-zero with an explicit
+	// straggler list — a mixed-version fleet must be converged deliberately,
+	// never left silent (the M1 version-divergence guard).
+	if maxFailures > 0 && failCount <= maxFailures {
+		if len(successTargets) > 0 {
+			if err := updateLoadBalancer(ctx, flags, appCfg, serversPath, successTargets); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: LB update failed: %v\n", err)
+			}
+		}
+		var stragglers []string
+		for i, r := range results {
+			if !r.Success {
+				stragglers = append(stragglers, targets[i].Name)
+				fmt.Fprintf(os.Stderr, "  straggler %s (still on the previous version): %v\n", targets[i].Name, r.Error)
+			}
+		}
+		fmt.Fprintf(os.Stderr, "\nConverge the stragglers with:  teploy deploy --version %s\n", version)
+		return fmt.Errorf("rollout completed within failure budget (%d/%d failed <= max_failures=%d) — stragglers on the old version: %s",
+			failCount, len(targets), maxFailures, strings.Join(stragglers, ", "))
 	}
 
 	// Partial failure: roll back every server that succeeded so the fleet
@@ -681,6 +744,38 @@ func runMultiDeploy(flags *Flags, appCfg *config.AppConfig, image, version strin
 	}
 
 	return fmt.Errorf("%d of %d servers failed", failCount, len(targets))
+}
+
+// rollbackFailedWave rolls back the succeeded servers of a deploy wave when
+// the wave had failures, so the wave converges back to the old version.
+// Returns the wave's failure count (0 = nothing to do). Used by the canary
+// gate: a failed canary must leave the canary servers on the old version.
+func rollbackFailedWave(ctx context.Context, appCfg *config.AppConfig, wave []multideploy.ServerTarget, results []multideploy.Result, parallel int, migrateVolumes bool) int {
+	_ = migrateVolumes // rollback re-routes to the previous version; no volume migration
+	var succeeded []multideploy.ServerTarget
+	failed := 0
+	for i, r := range results {
+		if r.Success {
+			succeeded = append(succeeded, wave[i])
+		} else {
+			failed++
+		}
+	}
+	if failed == 0 {
+		return 0
+	}
+	if len(succeeded) > 0 {
+		fmt.Printf("Rolling back %d canary server(s) that succeeded...\n", len(succeeded))
+		rollbackResults := multideploy.ParallelDeployAll(ctx, succeeded, parallel, func(ctx context.Context, target multideploy.ServerTarget, out io.Writer) error {
+			return rollbackSingleServer(ctx, appCfg, target, out)
+		}, os.Stdout)
+		for _, r := range rollbackResults {
+			if !r.Success && !errors.Is(r.Error, deploy.ErrNoPreviousDeploy) {
+				fmt.Fprintf(os.Stderr, "  WARNING: canary rollback failed on %s: %v — needs manual attention\n", r.Server, r.Error)
+			}
+		}
+	}
+	return failed
 }
 
 // buildNotifier creates a MultiNotifier from the app config.
