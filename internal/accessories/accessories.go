@@ -99,6 +99,14 @@ func (m *Manager) EnsureRunning(ctx context.Context, app, name string, cfg confi
 	args = append(args, "--log-opt", "max-size=10m")
 	args = append(args, ssh.ShellQuote(cfg.Image))
 
+	// Image command override (docker run trailing args), word-split like a
+	// shell command line and each word quoted for the remote shell.
+	if cfg.Command != "" {
+		for _, w := range strings.Fields(cfg.Command) {
+			args = append(args, ssh.ShellQuote(w))
+		}
+	}
+
 	if _, err := m.exec.Run(ctx, strings.Join(args, " ")); err != nil {
 		return nil, fmt.Errorf("starting accessory %s: %w", containerName, err)
 	}

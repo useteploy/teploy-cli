@@ -90,6 +90,10 @@ type AccessoryConfig struct {
 	Port    int               `yaml:"port,omitempty" toml:"port"`
 	Env     map[string]string `yaml:"env,omitempty" toml:"env"`
 	Volumes map[string]string `yaml:"volumes,omitempty" toml:"volumes"`
+	// Command overrides the image's default command (docker run trailing
+	// args) — required by images whose entrypoint needs an explicit verb,
+	// e.g. MinIO (`server /data --console-address :9001`) or ntfy (`serve`).
+	Command string `yaml:"command,omitempty" toml:"command"`
 }
 
 // TLSConfig declares a custom certificate for terminating TLS on the app's
@@ -797,6 +801,9 @@ func mergeAccessory(base, overlay AccessoryConfig) AccessoryConfig {
 	}
 	if overlay.Port != 0 {
 		out.Port = overlay.Port
+	}
+	if overlay.Command != "" {
+		out.Command = overlay.Command
 	}
 	if len(overlay.Env) > 0 {
 		if out.Env == nil {

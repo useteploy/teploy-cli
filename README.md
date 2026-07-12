@@ -167,6 +167,26 @@ accessories:
       # the app container receives the same secret, so both sides agree:
       # POSTGRES_PASSWORD: secret:DB_PASSWORD
 
+  # Self-hosted S3 (object storage / backup target). `command:` overrides the
+  # image command — needed by images that want an explicit verb.
+  minio:
+    image: minio/minio:latest
+    port: 9000
+    command: server /data --console-address :9001
+    env:
+      MINIO_ROOT_USER: admin
+      MINIO_ROOT_PASSWORD: secret:MINIO_ROOT_PASSWORD
+    volumes:
+      data: /data
+
+  # Self-hosted push notifications (point `notifications:` webhooks at it).
+  ntfy:
+    image: binwiederhier/ntfy:latest
+    port: 80
+    command: serve
+    volumes:
+      cache: /var/cache/ntfy
+
 assets:
   path: /app/public/assets
   keep_days: 14
