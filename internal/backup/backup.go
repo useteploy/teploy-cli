@@ -219,10 +219,17 @@ func (c *Client) AccessoryBackup(ctx context.Context, app, name, image string, e
 		)
 		s3Key = fmt.Sprintf("s3://%s/%s/accessories/%s/%s.rdb.gz", s3.Bucket, app, name, timestamp)
 	default:
-		// Generic: tar the volume directory.
+		// Generic: tar the volume directory. For a LIVE engine (nucleus and
+		// anything else that mutates its files during the read) this is a
+		// crash-consistent snapshot: GNU tar exits 1 with "file changed" /
+		// "file shrank" warnings when a WAL rotates or checkpoints mid-read.
+		// That shape is exactly what crash recovery is built for (torn-tail
+		// truncation + CRC skip), so tolerate exit 1 — real failures
+		// (unreadable dir, ENOSPC) exit 2. `accessory verify-backup` is the
+		// correctness gate: it boots the archive in a scratch container.
 		accDir := fmt.Sprintf("%s/%s/accessories/%s", deploymentsDir, app, name)
 		dumpPath = fmt.Sprintf("/tmp/%s-%s-%s.tar.gz", app, name, timestamp)
-		dumpCmd = fmt.Sprintf("tar -czf %s -C %s .", dumpPath, accDir)
+		dumpCmd = fmt.Sprintf("tar -czf %s -C %s . || [ $? -eq 1 ]", dumpPath, accDir)
 		s3Key = fmt.Sprintf("s3://%s/%s/accessories/%s/%s.tar.gz", s3.Bucket, app, name, timestamp)
 	}
 
