@@ -191,10 +191,10 @@ func envFlags(env map[string]string, prefixes ...string) string {
 	return strings.Join(parts, " ")
 }
 
-func (c *Client) download(ctx context.Context, s3Key, dest, region string) error {
+func (c *Client) download(ctx context.Context, s3Key, dest string, s3 S3Config) error {
 	fmt.Fprintf(c.out, "Downloading %s...\n", s3Key)
-	_, err := c.exec.Run(ctx, fmt.Sprintf("aws s3 cp %s %s --region %s",
-		ssh.ShellQuote(s3Key), ssh.ShellQuote(dest), region))
+	_, err := c.exec.Run(ctx, s3.AWS(fmt.Sprintf("s3 cp %s %s",
+		ssh.ShellQuote(s3Key), ssh.ShellQuote(dest))))
 	if err != nil {
 		return fmt.Errorf("downloading backup: %w", err)
 	}
@@ -217,7 +217,7 @@ func (c *Client) verifyPostgres(ctx context.Context, res *VerifyResult, app, nam
 	s3Key := fmt.Sprintf("s3://%s/%s/accessories/%s/%s.sql.gz", s3.Bucket, app, name, res.Date)
 	res.S3Key = s3Key
 	dump := tmpBase + ".sql.gz"
-	if err := c.download(ctx, s3Key, dump, s3.Region); err != nil {
+	if err := c.download(ctx, s3Key, dump, s3); err != nil {
 		return err
 	}
 
@@ -261,7 +261,7 @@ func (c *Client) verifyMySQL(ctx context.Context, res *VerifyResult, app, name, 
 	s3Key := fmt.Sprintf("s3://%s/%s/accessories/%s/%s.sql.gz", s3.Bucket, app, name, res.Date)
 	res.S3Key = s3Key
 	dump := tmpBase + ".sql.gz"
-	if err := c.download(ctx, s3Key, dump, s3.Region); err != nil {
+	if err := c.download(ctx, s3Key, dump, s3); err != nil {
 		return err
 	}
 
@@ -307,7 +307,7 @@ func (c *Client) verifyRedis(ctx context.Context, res *VerifyResult, app, name, 
 	s3Key := fmt.Sprintf("s3://%s/%s/accessories/%s/%s.rdb.gz", s3.Bucket, app, name, res.Date)
 	res.S3Key = s3Key
 	dump := tmpBase + ".rdb.gz"
-	if err := c.download(ctx, s3Key, dump, s3.Region); err != nil {
+	if err := c.download(ctx, s3Key, dump, s3); err != nil {
 		return err
 	}
 
@@ -337,7 +337,7 @@ func (c *Client) verifyMongo(ctx context.Context, res *VerifyResult, app, name, 
 	s3Key := fmt.Sprintf("s3://%s/%s/accessories/%s/%s.archive.gz", s3.Bucket, app, name, res.Date)
 	res.S3Key = s3Key
 	dump := tmpBase + ".archive.gz"
-	if err := c.download(ctx, s3Key, dump, s3.Region); err != nil {
+	if err := c.download(ctx, s3Key, dump, s3); err != nil {
 		return err
 	}
 
@@ -379,7 +379,7 @@ func (c *Client) verifyNucleus(ctx context.Context, res *VerifyResult, app, name
 	s3Key := fmt.Sprintf("s3://%s/%s/accessories/%s/%s.tar.gz", s3.Bucket, app, name, res.Date)
 	res.S3Key = s3Key
 	dump := tmpBase + ".tar.gz"
-	if err := c.download(ctx, s3Key, dump, s3.Region); err != nil {
+	if err := c.download(ctx, s3Key, dump, s3); err != nil {
 		return err
 	}
 
@@ -421,7 +421,7 @@ func (c *Client) verifyVolume(ctx context.Context, res *VerifyResult, app, name 
 	s3Key := fmt.Sprintf("s3://%s/%s/accessories/%s/%s.tar.gz", s3.Bucket, app, name, res.Date)
 	res.S3Key = s3Key
 	dump := tmpBase + ".tar.gz"
-	if err := c.download(ctx, s3Key, dump, s3.Region); err != nil {
+	if err := c.download(ctx, s3Key, dump, s3); err != nil {
 		return err
 	}
 	extractDir := tmpBase + ".d"

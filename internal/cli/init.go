@@ -15,8 +15,8 @@ import (
 
 func newInitCmd() *cobra.Command {
 	var (
-		force    bool
-		useTOML  bool
+		force   bool
+		useTOML bool
 	)
 
 	cmd := &cobra.Command{

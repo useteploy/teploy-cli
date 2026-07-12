@@ -94,6 +94,12 @@ type AccessoryConfig struct {
 	// args) — required by images whose entrypoint needs an explicit verb,
 	// e.g. MinIO (`server /data --console-address :9001`) or ntfy (`serve`).
 	Command string `yaml:"command,omitempty" toml:"command"`
+	// Publish adds docker -p mappings (e.g. "127.0.0.1:9100:9000") for the
+	// rare accessory that must be reachable from the HOST, not just the
+	// teploy network — e.g. a MinIO backup target, since `teploy backup`
+	// runs the aws CLI on the host where container DNS doesn't resolve.
+	// Prefer loopback binds; a bare port exposes the accessory publicly.
+	Publish []string `yaml:"publish,omitempty" toml:"publish"`
 }
 
 // TLSConfig declares a custom certificate for terminating TLS on the app's
@@ -804,6 +810,9 @@ func mergeAccessory(base, overlay AccessoryConfig) AccessoryConfig {
 	}
 	if overlay.Command != "" {
 		out.Command = overlay.Command
+	}
+	if len(overlay.Publish) > 0 {
+		out.Publish = overlay.Publish
 	}
 	if len(overlay.Env) > 0 {
 		if out.Env == nil {

@@ -28,8 +28,9 @@ func newBackupCmd(flags *Flags) *cobra.Command {
 
 func newBackupCreateCmd(flags *Flags) *cobra.Command {
 	var (
-		bucket string
-		region string
+		bucket   string
+		region   string
+		endpoint string
 	)
 
 	cmd := &cobra.Command{
@@ -37,17 +38,42 @@ func newBackupCreateCmd(flags *Flags) *cobra.Command {
 		Short: "Create a volume backup",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runBackupCreate(flags, bucket, region)
+			return runBackupCreate(flags, bucket, region, endpoint)
 		},
 	}
 
 	cmd.Flags().StringVar(&bucket, "bucket", "", "S3 bucket name")
 	cmd.Flags().StringVar(&region, "region", "us-east-1", "AWS region")
+	cmd.Flags().StringVar(&endpoint, "endpoint", "", "S3-compatible endpoint URL (MinIO/B2/R2); creds from TEPLOY_S3_ACCESS_KEY/SECRET_KEY or AWS_* env")
 
 	return cmd
 }
 
-func runBackupCreate(flags *Flags, bucket, region string) error {
+// s3Config assembles the backup target. --endpoint switches the server-side
+// aws CLI to an S3-compatible endpoint (a MinIO accessory, B2, R2, Bunny).
+// Credentials come from the LOCAL environment — TEPLOY_S3_ACCESS_KEY /
+// TEPLOY_S3_SECRET_KEY, falling back to AWS_ACCESS_KEY_ID /
+// AWS_SECRET_ACCESS_KEY — and ride inline on the remote aws command for
+// that invocation only; nothing is persisted server-side. Unset = the
+// server's ambient AWS credentials, exactly as before.
+func s3Config(bucket, region, endpoint string) backup.S3Config {
+	access := os.Getenv("TEPLOY_S3_ACCESS_KEY")
+	if access == "" {
+		access = os.Getenv("AWS_ACCESS_KEY_ID")
+	}
+	secret := os.Getenv("TEPLOY_S3_SECRET_KEY")
+	if secret == "" {
+		secret = os.Getenv("AWS_SECRET_ACCESS_KEY")
+	}
+	// Only pass creds inline when a custom endpoint is in play — for plain
+	// AWS the server's own credential chain keeps working untouched.
+	if endpoint == "" {
+		return backup.S3Config{Bucket: bucket, Region: region}
+	}
+	return backup.S3Config{Bucket: bucket, Region: region, Endpoint: endpoint, AccessKey: access, SecretKey: secret}
+}
+
+func runBackupCreate(flags *Flags, bucket, region, endpoint string) error {
 	appCfg, err := config.LoadApp(".")
 	if err != nil {
 		return err
@@ -73,10 +99,7 @@ func runBackupCreate(flags *Flags, bucket, region string) error {
 	defer executor.Close()
 
 	client := backup.NewClient(executor, os.Stdout)
-	err = client.BackupVolumes(ctx, appCfg.App, backup.S3Config{
-		Bucket: bucket,
-		Region: region,
-	})
+	err = client.BackupVolumes(ctx, appCfg.App, s3Config(bucket, region, endpoint))
 
 	// Fire notification (fire-and-forget).
 	if n := buildNotifier(appCfg); n != nil {
@@ -98,8 +121,9 @@ func runBackupCreate(flags *Flags, bucket, region string) error {
 
 func newBackupListCmd(flags *Flags) *cobra.Command {
 	var (
-		bucket string
-		region string
+		bucket   string
+		region   string
+		endpoint string
 	)
 
 	cmd := &cobra.Command{
@@ -107,17 +131,18 @@ func newBackupListCmd(flags *Flags) *cobra.Command {
 		Short: "List available backups",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runBackupList(flags, bucket, region)
+			return runBackupList(flags, bucket, region, endpoint)
 		},
 	}
 
 	cmd.Flags().StringVar(&bucket, "bucket", "", "S3 bucket name")
 	cmd.Flags().StringVar(&region, "region", "us-east-1", "AWS region")
+	cmd.Flags().StringVar(&endpoint, "endpoint", "", "S3-compatible endpoint URL (MinIO/B2/R2); creds from TEPLOY_S3_ACCESS_KEY/SECRET_KEY or AWS_* env")
 
 	return cmd
 }
 
-func runBackupList(flags *Flags, bucket, region string) error {
+func runBackupList(flags *Flags, bucket, region, endpoint string) error {
 	appCfg, err := config.LoadApp(".")
 	if err != nil {
 		return err
@@ -143,10 +168,7 @@ func runBackupList(flags *Flags, bucket, region string) error {
 	defer executor.Close()
 
 	client := backup.NewClient(executor, os.Stdout)
-	backups, err := client.ListBackups(ctx, appCfg.App, "volumes", backup.S3Config{
-		Bucket: bucket,
-		Region: region,
-	})
+	backups, err := client.ListBackups(ctx, appCfg.App, "volumes", s3Config(bucket, region, endpoint))
 	if err != nil {
 		return err
 	}
@@ -164,8 +186,9 @@ func runBackupList(flags *Flags, bucket, region string) error {
 
 func newBackupRestoreCmd(flags *Flags) *cobra.Command {
 	var (
-		bucket string
-		region string
+		bucket   string
+		region   string
+		endpoint string
 	)
 
 	cmd := &cobra.Command{
@@ -173,20 +196,22 @@ func newBackupRestoreCmd(flags *Flags) *cobra.Command {
 		Short: "Restore a volume backup",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runBackupRestore(flags, args[0], bucket, region)
+			return runBackupRestore(flags, args[0], bucket, region, endpoint)
 		},
 	}
 
 	cmd.Flags().StringVar(&bucket, "bucket", "", "S3 bucket name")
 	cmd.Flags().StringVar(&region, "region", "us-east-1", "AWS region")
+	cmd.Flags().StringVar(&endpoint, "endpoint", "", "S3-compatible endpoint URL (MinIO/B2/R2); creds from TEPLOY_S3_ACCESS_KEY/SECRET_KEY or AWS_* env")
 
 	return cmd
 }
 
 func newBackupScheduleCmd(flags *Flags) *cobra.Command {
 	var (
-		bucket string
-		region string
+		bucket   string
+		region   string
+		endpoint string
 	)
 
 	cmd := &cobra.Command{
@@ -195,17 +220,18 @@ func newBackupScheduleCmd(flags *Flags) *cobra.Command {
 		Long:  "Creates a cron job on the server to run backups automatically.\nExample: teploy backup schedule \"0 3 * * *\" --bucket my-backups",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runBackupSchedule(flags, args[0], bucket, region)
+			return runBackupSchedule(flags, args[0], bucket, region, endpoint)
 		},
 	}
 
 	cmd.Flags().StringVar(&bucket, "bucket", "", "S3 bucket name")
 	cmd.Flags().StringVar(&region, "region", "us-east-1", "AWS region")
+	cmd.Flags().StringVar(&endpoint, "endpoint", "", "S3-compatible endpoint URL (MinIO/B2/R2); creds from TEPLOY_S3_ACCESS_KEY/SECRET_KEY or AWS_* env")
 
 	return cmd
 }
 
-func runBackupSchedule(flags *Flags, schedule, bucket, region string) error {
+func runBackupSchedule(flags *Flags, schedule, bucket, region, endpoint string) error {
 	appCfg, err := config.LoadApp(".")
 	if err != nil {
 		return err
@@ -254,7 +280,7 @@ func runBackupSchedule(flags *Flags, schedule, bucket, region string) error {
 	return nil
 }
 
-func runBackupRestore(flags *Flags, date, bucket, region string) error {
+func runBackupRestore(flags *Flags, date, bucket, region, endpoint string) error {
 	appCfg, err := config.LoadApp(".")
 	if err != nil {
 		return err
@@ -283,8 +309,5 @@ func runBackupRestore(flags *Flags, date, bucket, region string) error {
 	defer executor.Close()
 
 	client := backup.NewClient(executor, os.Stdout)
-	return client.RestoreVolumes(ctx, appCfg.App, date, backup.S3Config{
-		Bucket: bucket,
-		Region: region,
-	})
+	return client.RestoreVolumes(ctx, appCfg.App, date, s3Config(bucket, region, endpoint))
 }

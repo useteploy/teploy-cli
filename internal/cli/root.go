@@ -19,9 +19,9 @@ func NewRootCmd(version string) *cobra.Command {
 	flags := &Flags{}
 
 	root := &cobra.Command{
-		Use:   "teploy",
-		Short: "Deploy apps to your servers",
-		Long:  "A single binary that deploys Docker containers to any server with SSH access. No management server, no hosted dependencies.",
+		Use:           "teploy",
+		Short:         "Deploy apps to your servers",
+		Long:          "A single binary that deploys Docker containers to any server with SSH access. No management server, no hosted dependencies.",
 		SilenceUsage:  true,
 		SilenceErrors: true,
 	}

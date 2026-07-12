@@ -52,9 +52,35 @@ func ValidateSchedule(schedule string) error {
 }
 
 // S3Config holds S3 bucket and credentials info (stored on server).
+//
+// Endpoint (optional) points at an S3-compatible server instead of AWS —
+// e.g. a self-hosted MinIO accessory (`http://<app>-minio:9000`) or
+// B2/R2/Bunny. AccessKey/SecretKey (optional) are passed inline to the aws
+// CLI call as env vars for that command only, never written to disk on the
+// server — omit them to use the server's ambient AWS credentials as before.
 type S3Config struct {
-	Bucket string
-	Region string
+	Bucket    string
+	Region    string
+	Endpoint  string
+	AccessKey string
+	SecretKey string
+}
+
+// AWS builds an aws-CLI invocation for this config: inline credential env
+// (if set), the subcommand, then --region and --endpoint-url as configured.
+func (s3 S3Config) AWS(args string) string {
+	var b strings.Builder
+	if s3.AccessKey != "" {
+		b.WriteString("AWS_ACCESS_KEY_ID=" + ssh.ShellQuote(s3.AccessKey) + " ")
+	}
+	if s3.SecretKey != "" {
+		b.WriteString("AWS_SECRET_ACCESS_KEY=" + ssh.ShellQuote(s3.SecretKey) + " ")
+	}
+	b.WriteString("aws " + args + " --region " + s3.Region)
+	if s3.Endpoint != "" {
+		b.WriteString(" --endpoint-url " + ssh.ShellQuote(s3.Endpoint))
+	}
+	return b.String()
 }
 
 // Client performs backup and restore operations on a remote server via SSH.
@@ -92,7 +118,7 @@ func (c *Client) BackupVolumes(ctx context.Context, app string, s3 S3Config) err
 
 	// Upload to S3.
 	fmt.Fprintf(c.out, "Uploading to %s...\n", s3Key)
-	uploadCmd := fmt.Sprintf("aws s3 cp %s %s --region %s", archivePath, s3Key, s3.Region)
+	uploadCmd := s3.AWS(fmt.Sprintf("s3 cp %s %s", archivePath, s3Key))
 	if _, err := c.exec.Run(ctx, uploadCmd); err != nil {
 		return fmt.Errorf("uploading to S3: %w", err)
 	}
@@ -114,7 +140,7 @@ func (c *Client) RestoreVolumes(ctx context.Context, app, date string, s3 S3Conf
 	archivePath := fmt.Sprintf("/tmp/%s-volumes-restore.tar.gz", app)
 
 	fmt.Fprintf(c.out, "Downloading %s...\n", s3Key)
-	if _, err := c.exec.Run(ctx, fmt.Sprintf("aws s3 cp %s %s --region %s", s3Key, archivePath, s3.Region)); err != nil {
+	if _, err := c.exec.Run(ctx, s3.AWS(fmt.Sprintf("s3 cp %s %s", s3Key, archivePath))); err != nil {
 		return fmt.Errorf("downloading from S3: %w", err)
 	}
 
@@ -135,7 +161,7 @@ func (c *Client) ListBackups(ctx context.Context, app, prefix string, s3 S3Confi
 	}
 
 	s3Path := fmt.Sprintf("s3://%s/%s/%s/", s3.Bucket, app, prefix)
-	output, err := c.exec.Run(ctx, fmt.Sprintf("aws s3 ls %s --region %s", s3Path, s3.Region))
+	output, err := c.exec.Run(ctx, s3.AWS(fmt.Sprintf("s3 ls %s", s3Path)))
 	if err != nil {
 		return nil, fmt.Errorf("listing backups: %w", err)
 	}
@@ -206,7 +232,7 @@ func (c *Client) AccessoryBackup(ctx context.Context, app, name, image string, e
 	}
 
 	fmt.Fprintf(c.out, "Uploading to %s...\n", s3Key)
-	if _, err := c.exec.Run(ctx, fmt.Sprintf("aws s3 cp %s %s --region %s", dumpPath, s3Key, s3.Region)); err != nil {
+	if _, err := c.exec.Run(ctx, s3.AWS(fmt.Sprintf("s3 cp %s %s", dumpPath, s3Key))); err != nil {
 		return fmt.Errorf("uploading to S3: %w", err)
 	}
 
@@ -263,7 +289,7 @@ func (c *Client) AccessoryRestore(ctx context.Context, app, name, image, date st
 	}
 
 	fmt.Fprintf(c.out, "Downloading %s...\n", s3Key)
-	if _, err := c.exec.Run(ctx, fmt.Sprintf("aws s3 cp %s %s --region %s", s3Key, restorePath, s3.Region)); err != nil {
+	if _, err := c.exec.Run(ctx, s3.AWS(fmt.Sprintf("s3 cp %s %s", s3Key, restorePath))); err != nil {
 		return fmt.Errorf("downloading backup: %w", err)
 	}
 

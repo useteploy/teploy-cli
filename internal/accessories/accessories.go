@@ -96,6 +96,11 @@ func (m *Manager) EnsureRunning(ctx context.Context, app, name string, cfg confi
 		}
 	}
 
+	// Host port mappings must precede the image (docker run flags).
+	for _, pub := range cfg.Publish {
+		args = append(args, "-p", ssh.ShellQuote(pub))
+	}
+
 	args = append(args, "--log-opt", "max-size=10m")
 	args = append(args, ssh.ShellQuote(cfg.Image))
 
