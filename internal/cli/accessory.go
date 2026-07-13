@@ -336,6 +336,8 @@ func newAccessoryBackupCmd(flags *Flags) *cobra.Command {
 		region   string
 		endpoint string
 		schedule string
+		appName  string
+		local    bool
 	)
 
 	cmd := &cobra.Command{
@@ -343,7 +345,7 @@ func newAccessoryBackupCmd(flags *Flags) *cobra.Command {
 		Short: "Back up an accessory (database-aware dump)",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runAccessoryBackup(flags, args[0], bucket, region, endpoint, schedule)
+			return runAccessoryBackup(flags, appName, args[0], bucket, region, endpoint, schedule, local)
 		},
 	}
 
@@ -351,19 +353,34 @@ func newAccessoryBackupCmd(flags *Flags) *cobra.Command {
 	cmd.Flags().StringVar(&region, "region", "us-east-1", "AWS region")
 	cmd.Flags().StringVar(&endpoint, "endpoint", "", "S3-compatible endpoint URL (MinIO/B2/R2); creds from TEPLOY_S3_ACCESS_KEY/SECRET_KEY or AWS_* env")
 	cmd.Flags().StringVar(&schedule, "schedule", "", "cron schedule for automated backups")
+	cmd.Flags().StringVar(&appName, "app", "", "app name — read accessory image/env from server state instead of teploy.yml")
+	cmd.Flags().BoolVar(&local, "local", false, "run against the local docker host (the mode scheduled cron jobs use; requires --app)")
 
 	return cmd
 }
 
-func runAccessoryBackup(flags *Flags, name, bucket, region, endpoint, schedule string) error {
-	appCfg, err := loadAppCfgForAccessory()
-	if err != nil {
-		return err
+func runAccessoryBackup(flags *Flags, appName, name, bucket, region, endpoint, schedule string, local bool) error {
+	if local && appName == "" {
+		return fmt.Errorf("--local requires --app (no teploy.yml exists on the server)")
 	}
 
-	accCfg, ok := appCfg.Accessories[name]
-	if !ok {
-		return fmt.Errorf("accessory %q not found in teploy.yml", name)
+	var app string
+	var accImage string
+	var accEnv map[string]string
+	if !local {
+		appCfg, err := loadAppCfgForAccessory()
+		if err != nil {
+			return err
+		}
+		accCfg, ok := appCfg.Accessories[name]
+		if !ok {
+			return fmt.Errorf("accessory %q not found in teploy.yml", name)
+		}
+		app = appCfg.App
+		accImage = accCfg.Image
+		accEnv = accCfg.Env
+	} else {
+		app = appName
 	}
 
 	if bucket == "" {
@@ -384,32 +401,61 @@ func runAccessoryBackup(flags *Flags, name, bucket, region, endpoint, schedule s
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
-	executor, err := connectForApp(ctx, flags, appCfg)
-	if err != nil {
-		return err
+	// --local runs on the server itself (the mode scheduled cron jobs use):
+	// docker + aws execute directly, no SSH hop, no teploy.yml — the
+	// accessory's image and env are read from the running container.
+	var executor ssh.Executor
+	if local {
+		executor = ssh.NewLocalExecutor()
+	} else {
+		appCfg, err := loadAppCfgForAccessory()
+		if err != nil {
+			return err
+		}
+		executor, err = connectForApp(ctx, flags, appCfg)
+		if err != nil {
+			return err
+		}
 	}
 	defer executor.Close()
 
 	client := backup.NewClient(executor, os.Stdout)
 	s3Cfg := s3Config(bucket, region, endpoint)
 
+	if local {
+		image, env, err := client.InspectAccessory(ctx, app, name)
+		if err != nil {
+			return err
+		}
+		accImage, accEnv = image, env
+	}
+
 	if schedule != "" {
-		backupCmd := fmt.Sprintf("teploy accessory backup %s --bucket %s --region %s", name, bucket, region)
+		// The scheduled job runs ON the server: --local --app makes it
+		// self-contained (no teploy.yml server-side), reading accessory
+		// config from the running container.
+		backupCmd := fmt.Sprintf("teploy accessory backup %s --local --app %s --bucket %s --region %s",
+			name, app, bucket, region)
 		if endpoint != "" {
-			// The cron job runs server-side where the local TEPLOY_S3_* env
-			// doesn't exist — embed endpoint + creds in the crontab line
-			// (root-only readable, same trust class as ~/.aws/credentials).
+			// Cron has no TEPLOY_S3_* env — embed endpoint + creds in the
+			// crontab line (root-only readable, same trust class as
+			// ~/.aws/credentials).
 			backupCmd = fmt.Sprintf("TEPLOY_S3_ACCESS_KEY=%s TEPLOY_S3_SECRET_KEY=%s %s --endpoint %s",
 				ssh.ShellQuote(s3Cfg.AccessKey), ssh.ShellQuote(s3Cfg.SecretKey), backupCmd, ssh.ShellQuote(endpoint))
 		}
-		if err := client.SetSchedule(ctx, schedule, backupCmd, "teploy-accessory-backup:"+appCfg.App+":"+name); err != nil {
+		// The cron job needs the teploy binary on the server; ship it via
+		// the existing checksum-verified pipeline (same as heal/autodeploy).
+		if _, err := deployTeployBinaryToServer(ctx, executor, "/usr/local/bin/teploy"); err != nil {
+			return fmt.Errorf("installing teploy binary for the scheduled job: %w", err)
+		}
+		if err := client.SetSchedule(ctx, schedule, backupCmd, "teploy-accessory-backup:"+app+":"+name); err != nil {
 			return err
 		}
 		fmt.Printf("Scheduled backup: %s\n", schedule)
 		return nil
 	}
 
-	return client.AccessoryBackup(ctx, appCfg.App, name, accCfg.Image, accCfg.Env, s3Cfg)
+	return client.AccessoryBackup(ctx, app, name, accImage, accEnv, s3Cfg)
 }
 
 func newAccessoryRestoreCmd(flags *Flags) *cobra.Command {
