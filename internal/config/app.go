@@ -251,6 +251,12 @@ type AppConfig struct {
 	// for the main wave. Absent (nil) = existing behavior (parallel batches,
 	// fail-fast + full-fleet rollback on any failure).
 	Rollout *RolloutConfig `yaml:"rollout,omitempty" toml:"rollout"`
+	// EnvFiles are local dotenv/YAML files merged into the container env at
+	// deploy, resolved relative to teploy.yml. Encrypted files are decrypted
+	// on the operator's machine: *.age via the age identity, *.sops.*/*.enc.*
+	// via `sops -d` — the GitOps pattern (secrets encrypted in the repo,
+	// never plaintext on disk). Later files and explicit env: keys win.
+	EnvFiles []string `yaml:"env_files,omitempty" toml:"env_files"`
 	// KeepVersions caps the number of past app versions retained after a
 	// successful deploy (containers + images). Zero (default) keeps
 	// everything — historical behavior. Set to 2 or 3 to enable auto-prune
@@ -678,6 +684,9 @@ func mergeConfigs(base, overlay *AppConfig) {
 	}
 	if overlay.Rollout != nil {
 		base.Rollout = overlay.Rollout
+	}
+	if len(overlay.EnvFiles) > 0 {
+		base.EnvFiles = append(base.EnvFiles, overlay.EnvFiles...)
 	}
 	if overlay.KeepVersions != 0 {
 		base.KeepVersions = overlay.KeepVersions

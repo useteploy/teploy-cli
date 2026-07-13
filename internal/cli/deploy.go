@@ -19,6 +19,7 @@ import (
 	"github.com/useteploy/teploy/internal/deploy"
 	"github.com/useteploy/teploy/internal/dns"
 	"github.com/useteploy/teploy/internal/docker"
+	"github.com/useteploy/teploy/internal/env"
 	"github.com/useteploy/teploy/internal/multideploy"
 	"github.com/useteploy/teploy/internal/notify"
 	"github.com/useteploy/teploy/internal/secret"
@@ -141,6 +142,24 @@ func runDeploy(flags *Flags, serverName, image, version string, skipDNSCheck boo
 	// affects the multi-server list; an explicit `deploy <server>` arg wins.
 	if err := filterServersByRoleTag(appCfg, role, tags); err != nil {
 		return err
+	}
+
+	// Resolve env_files (SOPS/age-encrypted or plain, decrypted locally)
+	// once, before dispatch — both the single- and multi-server paths then
+	// pick them up from appCfg.Env. Explicit env: keys win over file values.
+	if len(appCfg.EnvFiles) > 0 {
+		fileVars, err := env.LoadLocalEnvFiles(".", appCfg.EnvFiles)
+		if err != nil {
+			return err
+		}
+		if appCfg.Env == nil {
+			appCfg.Env = map[string]string{}
+		}
+		for k, v := range fileVars {
+			if _, explicit := appCfg.Env[k]; !explicit {
+				appCfg.Env[k] = v
+			}
+		}
 	}
 
 	// Multi-server deploy: if teploy.yml lists multiple servers and no explicit

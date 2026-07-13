@@ -193,6 +193,15 @@ assets:
 
 notifications:
   webhook: https://hooks.slack.com/services/xxx
+
+# GitOps secrets: local env files merged into the container env at deploy.
+# Encrypted files decrypt on YOUR machine (never plaintext in the repo or
+# on the server): *.age via age (identity from TEPLOY_AGE_IDENTITY,
+# SOPS_AGE_KEY_FILE, or ~/.config/teploy/age.txt), *.sops.* / *.enc.* via
+# `sops -d` (any backend in your .sops.yaml — age, KMS, PGP). Later files
+# and explicit env: keys win.
+env_files:
+  - secrets.env.age
 ```
 
 TOML is also supported (`teploy.toml`).
