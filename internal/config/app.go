@@ -300,6 +300,63 @@ type AppConfig struct {
 	Headers      map[string]string `yaml:"headers,omitempty" toml:"headers"`             // arbitrary response headers
 	KeepReleases int               `yaml:"keep_releases,omitempty" toml:"keep_releases"` // retention count (default 5)
 	CaddyExtra   string            `yaml:"caddy_extra,omitempty" toml:"caddy_extra"`     // raw Caddy directives appended into the site block
+	Firewall     FirewallConfig    `yaml:"firewall,omitempty" toml:"firewall"`           // edge hardening: IP allow/deny, UA block, body-size cap
+}
+
+// FirewallConfig is the per-app Caddy edge hardening (reverse-proxy / load-
+// balanced apps only). It is the lightweight, Caddy-native slice: IP allow/deny,
+// user-agent blocking, and a request-body size cap — not rate limiting (needs a
+// custom Caddy build) or a full WAF (that's Cloudflare's job).
+type FirewallConfig struct {
+	AllowIPs        []string `yaml:"allow_ips,omitempty" toml:"allow_ips"`                 // if set, ONLY these IPs/CIDRs may connect
+	DenyIPs         []string `yaml:"deny_ips,omitempty" toml:"deny_ips"`                   // these IPs/CIDRs are blocked
+	BlockUserAgents []string `yaml:"block_user_agents,omitempty" toml:"block_user_agents"` // block requests whose User-Agent contains any of these (case-insensitive)
+	MaxBodySize     string   `yaml:"max_body_size,omitempty" toml:"max_body_size"`         // request body cap, e.g. "10MB"
+}
+
+// IsZero reports whether no firewall rules are configured.
+func (f FirewallConfig) IsZero() bool {
+	return len(f.AllowIPs) == 0 && len(f.DenyIPs) == 0 &&
+		len(f.BlockUserAgents) == 0 && f.MaxBodySize == ""
+}
+
+var validBodySize = regexp.MustCompile(`(?i)^\d+(\.\d+)?\s*(b|kb|mb|gb|tb)?$`)
+
+// validate checks the firewall rules are well-formed and safe to render into a
+// Caddyfile. IPs must be a bare address or CIDR; user-agent tokens must not
+// contain characters that could break out of the site block.
+func (f FirewallConfig) validate() error {
+	checkIPs := func(field string, ips []string) error {
+		for _, ip := range ips {
+			if strings.Contains(ip, "/") {
+				if _, _, err := net.ParseCIDR(ip); err != nil {
+					return fmt.Errorf("firewall.%s: %q is not a valid CIDR", field, ip)
+				}
+			} else if net.ParseIP(ip) == nil {
+				return fmt.Errorf("firewall.%s: %q is not a valid IP address or CIDR", field, ip)
+			}
+		}
+		return nil
+	}
+	if err := checkIPs("allow_ips", f.AllowIPs); err != nil {
+		return err
+	}
+	if err := checkIPs("deny_ips", f.DenyIPs); err != nil {
+		return err
+	}
+	for _, ua := range f.BlockUserAgents {
+		if ua == "" {
+			return fmt.Errorf("firewall.block_user_agents: entries must be non-empty")
+		}
+		// These would break out of the single-line matcher / site block.
+		if strings.ContainsAny(ua, "\r\n{}\"\\") {
+			return fmt.Errorf("firewall.block_user_agents: %q contains characters not allowed in a matcher", ua)
+		}
+	}
+	if f.MaxBodySize != "" && !validBodySize.MatchString(strings.TrimSpace(f.MaxBodySize)) {
+		return fmt.Errorf("firewall.max_body_size: %q is not a valid size (e.g. 10MB, 1GB, 500KB)", f.MaxBodySize)
+	}
+	return nil
 }
 
 // IsStatic reports whether this app deploys as static files (no container).
@@ -545,6 +602,19 @@ func (c *AppConfig) validate() error {
 		}
 		if c.Dockerfile != "" && !isSafeSubPath(c.Dockerfile) {
 			return fmt.Errorf("'dockerfile' must be a relative path inside the context (no absolute paths, no '..' escaping), got %q", c.Dockerfile)
+		}
+	}
+	// Firewall renders into the Caddy site block, so it needs Caddy ingress and
+	// a routed (non-static) app. Reject misuse loudly rather than silently drop.
+	if !c.Firewall.IsZero() {
+		if err := c.Firewall.validate(); err != nil {
+			return err
+		}
+		if c.Type == TypeStatic {
+			return fmt.Errorf("'firewall' is not supported for type:static (v1 covers reverse-proxied apps)")
+		}
+		if c.Ingress == IngressExternal || c.Ingress == IngressHost {
+			return fmt.Errorf("'firewall' requires Caddy ingress — it has no effect with 'ingress: %s' (apply the rules in your fronting proxy/CDN instead)", c.Ingress)
 		}
 	}
 	return nil

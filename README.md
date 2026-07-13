@@ -142,6 +142,16 @@ ingress: caddy                # "caddy" (default), "external", or "host"
 # container is removed) — redeploy the previous version instead.
 # bind: 0.0.0.0
 
+# Edge hardening for Caddy-fronted apps (reverse-proxied / load-balanced).
+# The lightweight, Caddy-native slice — not rate limiting (needs a custom
+# Caddy build) or a full WAF (front with Cloudflare for that). Blocked
+# requests get a 403. Only with ingress: caddy; rejected on static/external.
+firewall:
+  allow_ips: ["203.0.113.0/24", "198.51.100.7"]  # if set, ONLY these may connect
+  deny_ips: ["9.9.9.9"]                            # blocklist (IPs or CIDRs)
+  block_user_agents: ["masscan", "badbot"]         # case-insensitive substring
+  max_body_size: 10MB                              # request body cap
+
 volumes:
   data: /app/data
 

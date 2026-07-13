@@ -200,7 +200,7 @@ func NewClient(exec ssh.Executor) *Client {
 // If a hand-written (non-Teploy) site block already serves any of these hosts —
 // common when adopting a server that previously ran another proxy — it is
 // replaced, so Teploy's block becomes the single authority for the domain.
-func (c *Client) SetRoute(ctx context.Context, app, domain, upstream string, containerPort int, tls TLS, caddyExtra string) error {
+func (c *Client) SetRoute(ctx context.Context, app, domain, upstream string, containerPort int, tls TLS, caddyExtra string, fw Firewall) error {
 	hosts, err := parseDomains(domain)
 	if err != nil {
 		return err
@@ -208,13 +208,13 @@ func (c *Client) SetRoute(ctx context.Context, app, domain, upstream string, con
 	if len(hosts) == 0 {
 		return fmt.Errorf("SetRoute: domain must be non-empty")
 	}
-	return c.applyManagedBlock(ctx, app, hosts, reverseProxyBlock(hosts, upstream, containerPort, tls, caddyExtra))
+	return c.applyManagedBlock(ctx, app, hosts, reverseProxyBlock(hosts, upstream, containerPort, tls, caddyExtra, fw))
 }
 
 // SetLoadBalancer adds or updates a load-balanced reverse proxy route: traffic
 // for the domain is distributed across upstreams via round-robin with active
 // /up health checks. Replaces any prior route block for the same app.
-func (c *Client) SetLoadBalancer(ctx context.Context, app, domain string, upstreams []Upstream, tls TLS, caddyExtra string) error {
+func (c *Client) SetLoadBalancer(ctx context.Context, app, domain string, upstreams []Upstream, tls TLS, caddyExtra string, fw Firewall) error {
 	hosts, err := parseDomains(domain)
 	if err != nil {
 		return err
@@ -222,7 +222,7 @@ func (c *Client) SetLoadBalancer(ctx context.Context, app, domain string, upstre
 	if len(hosts) == 0 {
 		return fmt.Errorf("SetLoadBalancer: domain must be non-empty")
 	}
-	return c.applyManagedBlock(ctx, app, hosts, loadBalancerBlock(hosts, upstreams, tls, caddyExtra))
+	return c.applyManagedBlock(ctx, app, hosts, loadBalancerBlock(hosts, upstreams, tls, caddyExtra, fw))
 }
 
 // SetStaticRoute upserts a Caddyfile block that serves a static deploy.
@@ -621,12 +621,12 @@ func parseDomains(domain string) ([]string, error) {
 }
 
 // reverseProxyBlock renders a Caddyfile reverse-proxy site block.
-func reverseProxyBlock(hosts []string, upstream string, port int, tls TLS, caddyExtra string) string {
+func reverseProxyBlock(hosts []string, upstream string, port int, tls TLS, caddyExtra string, fw Firewall) string {
 	var b strings.Builder
 	b.WriteString(strings.Join(siteAddresses(hosts, tls), ", "))
 	b.WriteString(" {\n")
 	b.WriteString(tls.directive())
-	fmt.Fprintf(&b, "\treverse_proxy %s:%d\n", upstream, port)
+	b.WriteString(fw.wrapTerminal(fmt.Sprintf("\treverse_proxy %s:%d\n", upstream, port)))
 	if extra := strings.TrimSpace(caddyExtra); extra != "" {
 		b.WriteString("\n\t# user-supplied caddy_extra:\n")
 		for _, line := range strings.Split(extra, "\n") {
@@ -643,7 +643,7 @@ func reverseProxyBlock(hosts []string, upstream string, port int, tls TLS, caddy
 
 // loadBalancerBlock renders a round-robin reverse-proxy block with active /up
 // health checks.
-func loadBalancerBlock(hosts []string, upstreams []Upstream, tls TLS, caddyExtra string) string {
+func loadBalancerBlock(hosts []string, upstreams []Upstream, tls TLS, caddyExtra string, fw Firewall) string {
 	dials := make([]string, len(upstreams))
 	for i, u := range upstreams {
 		dials[i] = u.Dial
@@ -652,7 +652,7 @@ func loadBalancerBlock(hosts []string, upstreams []Upstream, tls TLS, caddyExtra
 	b.WriteString(strings.Join(siteAddresses(hosts, tls), ", "))
 	b.WriteString(" {\n")
 	b.WriteString(tls.directive())
-	fmt.Fprintf(&b, "\treverse_proxy %s {\n\t\tlb_policy round_robin\n\t\thealth_uri /up\n\t\thealth_interval 10s\n\t\thealth_timeout 5s\n\t}\n", strings.Join(dials, " "))
+	b.WriteString(fw.wrapTerminal(fmt.Sprintf("\treverse_proxy %s {\n\t\tlb_policy round_robin\n\t\thealth_uri /up\n\t\thealth_interval 10s\n\t\thealth_timeout 5s\n\t}\n", strings.Join(dials, " "))))
 	if extra := strings.TrimSpace(caddyExtra); extra != "" {
 		b.WriteString("\n\t# user-supplied caddy_extra:\n")
 		for _, line := range strings.Split(extra, "\n") {

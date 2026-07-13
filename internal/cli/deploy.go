@@ -15,6 +15,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/useteploy/teploy/internal/accessories"
 	"github.com/useteploy/teploy/internal/build"
+	"github.com/useteploy/teploy/internal/caddy"
 	"github.com/useteploy/teploy/internal/config"
 	"github.com/useteploy/teploy/internal/deploy"
 	"github.com/useteploy/teploy/internal/dns"
@@ -547,6 +548,7 @@ func deployBuiltImage(ctx context.Context, executor ssh.Executor, appCfg *config
 		TLSKey:        tlsKey,
 		TLSInternal:   tlsInternal,
 		CaddyExtra:    appCfg.CaddyExtra,
+		Firewall:      caddyFirewall(appCfg.Firewall),
 	}
 
 	// Vulnerability gate: scan the image on the server before any container
@@ -808,6 +810,17 @@ func rollbackFailedWave(ctx context.Context, appCfg *config.AppConfig, wave []mu
 
 // buildNotifier creates a MultiNotifier from the app config.
 // Supports both the legacy single-webhook format and the new multi-channel format.
+// caddyFirewall converts the teploy.yml firewall config into the caddy layer's
+// firewall value. Validation happens at config load (AppConfig.validate).
+func caddyFirewall(f config.FirewallConfig) caddy.Firewall {
+	return caddy.Firewall{
+		AllowIPs:        f.AllowIPs,
+		DenyIPs:         f.DenyIPs,
+		BlockUserAgents: f.BlockUserAgents,
+		MaxBodySize:     f.MaxBodySize,
+	}
+}
+
 func buildNotifier(appCfg *config.AppConfig) *notify.MultiNotifier {
 	var channels []notify.Channel
 

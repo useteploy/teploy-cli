@@ -38,7 +38,7 @@ func TestSetRoute_WritesBlockAndReloads(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4", lockCmds("{\n\tadmin 127.0.0.1:2019\n}\n")...)
 
 	client := NewClient(mock)
-	if err := client.SetRoute(context.Background(), "myapp", "myapp.com", "myapp-v1", 80, TLS{}, ""); err != nil {
+	if err := client.SetRoute(context.Background(), "myapp", "myapp.com", "myapp-v1", 80, TLS{}, "", Firewall{}); err != nil {
 		t.Fatalf("SetRoute: %v", err)
 	}
 
@@ -62,7 +62,7 @@ func TestSetRoute_UpdateExisting(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4", lockCmds(existing)...)
 
 	client := NewClient(mock)
-	if err := client.SetRoute(context.Background(), "myapp", "myapp.com", "myapp-v2", 3000, TLS{}, ""); err != nil {
+	if err := client.SetRoute(context.Background(), "myapp", "myapp.com", "myapp-v2", 3000, TLS{}, "", Firewall{}); err != nil {
 		t.Fatalf("SetRoute: %v", err)
 	}
 
@@ -88,7 +88,7 @@ func TestSetRoute_AdoptsForeignBlock(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4", lockCmds(existing)...)
 
 	client := NewClient(mock)
-	if err := client.SetRoute(context.Background(), "myapp", "myapp.com, www.myapp.com", "myapp-v1", 80, TLS{}, ""); err != nil {
+	if err := client.SetRoute(context.Background(), "myapp", "myapp.com, www.myapp.com", "myapp-v1", 80, TLS{}, "", Firewall{}); err != nil {
 		t.Fatalf("SetRoute: %v", err)
 	}
 
@@ -110,7 +110,7 @@ func TestSetRoute_AdoptsForeignBlock(t *testing.T) {
 func TestSetRoute_MultiHost(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4", lockCmds("{\n\tadmin 127.0.0.1:2019\n}\n")...)
 	client := NewClient(mock)
-	if err := client.SetRoute(context.Background(), "myapp", "myapp.com, www.myapp.com", "myapp-v1", 80, TLS{}, ""); err != nil {
+	if err := client.SetRoute(context.Background(), "myapp", "myapp.com, www.myapp.com", "myapp-v1", 80, TLS{}, "", Firewall{}); err != nil {
 		t.Fatalf("SetRoute: %v", err)
 	}
 	if !strings.Contains(string(mock.Files[tmpCaddyfile]), "myapp.com, www.myapp.com {") {
@@ -131,7 +131,7 @@ func TestSetRoute_ReloadFailureRollsBack(t *testing.T) {
 	)
 
 	client := NewClient(mock)
-	err := client.SetRoute(context.Background(), "myapp", "myapp.com", "myapp-v1", 80, TLS{}, "")
+	err := client.SetRoute(context.Background(), "myapp", "myapp.com", "myapp-v1", 80, TLS{}, "", Firewall{})
 	if err == nil {
 		t.Fatal("expected error on reload failure")
 	}
@@ -157,7 +157,7 @@ func TestSetRoute_StaleDeliveryFailsLoudly(t *testing.T) {
 	)
 
 	client := NewClient(mock)
-	err := client.SetRoute(context.Background(), "myapp", "myapp.com", "myapp-v1", 80, TLS{}, "")
+	err := client.SetRoute(context.Background(), "myapp", "myapp.com", "myapp-v1", 80, TLS{}, "", Firewall{})
 	if err == nil {
 		t.Fatal("expected SetRoute to fail when the config did not reach the container")
 	}
@@ -173,7 +173,7 @@ func TestSetLoadBalancer(t *testing.T) {
 	mock := ssh.NewMockExecutor("10.0.0.100", lockCmds("{\n\tadmin 127.0.0.1:2019\n}\n")...)
 	client := NewClient(mock)
 	upstreams := []Upstream{{Dial: "10.0.0.1:80"}, {Dial: "10.0.0.2:80"}, {Dial: "10.0.0.3:80"}}
-	if err := client.SetLoadBalancer(context.Background(), "myapp", "myapp.com", upstreams, TLS{}, ""); err != nil {
+	if err := client.SetLoadBalancer(context.Background(), "myapp", "myapp.com", upstreams, TLS{}, "", Firewall{}); err != nil {
 		t.Fatalf("SetLoadBalancer: %v", err)
 	}
 
@@ -194,7 +194,7 @@ func TestSetRoute_WithCaddyExtra(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4", lockCmds("{\n\tadmin 127.0.0.1:2019\n}\n")...)
 	client := NewClient(mock)
 	extra := "@waitlist path /api/waitlist*\nreverse_proxy @waitlist teploy-waitlist:8080"
-	if err := client.SetRoute(context.Background(), "myapp", "myapp.com", "myapp-v1", 80, TLS{}, extra); err != nil {
+	if err := client.SetRoute(context.Background(), "myapp", "myapp.com", "myapp-v1", 80, TLS{}, extra, Firewall{}); err != nil {
 		t.Fatalf("SetRoute: %v", err)
 	}
 	got := string(mock.Files[tmpCaddyfile])
@@ -215,7 +215,7 @@ func TestSetLoadBalancer_WithCaddyExtra(t *testing.T) {
 	client := NewClient(mock)
 	upstreams := []Upstream{{Dial: "10.0.0.1:80"}, {Dial: "10.0.0.2:80"}}
 	extra := "rate_limit 100r/m"
-	if err := client.SetLoadBalancer(context.Background(), "myapp", "myapp.com", upstreams, TLS{}, extra); err != nil {
+	if err := client.SetLoadBalancer(context.Background(), "myapp", "myapp.com", upstreams, TLS{}, extra, Firewall{}); err != nil {
 		t.Fatalf("SetLoadBalancer: %v", err)
 	}
 	got := string(mock.Files[tmpCaddyfile])
@@ -374,7 +374,7 @@ func TestRemoveCaddyfileBlock(t *testing.T) {
 }
 
 func TestReverseProxyBlock(t *testing.T) {
-	got := reverseProxyBlock([]string{"example.com"}, "myapp-v1", 8080, TLS{}, "")
+	got := reverseProxyBlock([]string{"example.com"}, "myapp-v1", 8080, TLS{}, "", Firewall{})
 	want := "example.com {\n\treverse_proxy myapp-v1:8080\n}"
 	if got != want {
 		t.Errorf("reverseProxyBlock:\nwant: %q\ngot:  %q", want, got)
@@ -382,7 +382,7 @@ func TestReverseProxyBlock(t *testing.T) {
 }
 
 func TestReverseProxyBlockMultiHost(t *testing.T) {
-	got := reverseProxyBlock([]string{"example.com", "www.example.com"}, "myapp", 80, TLS{}, "")
+	got := reverseProxyBlock([]string{"example.com", "www.example.com"}, "myapp", 80, TLS{}, "", Firewall{})
 	want := "example.com, www.example.com {\n\treverse_proxy myapp:80\n}"
 	if got != want {
 		t.Errorf("multi-host:\nwant: %q\ngot:  %q", want, got)
@@ -390,7 +390,7 @@ func TestReverseProxyBlockMultiHost(t *testing.T) {
 }
 
 func TestLoadBalancerBlock(t *testing.T) {
-	got := loadBalancerBlock([]string{"example.com"}, []Upstream{{Dial: "a:80"}, {Dial: "b:80"}}, TLS{}, "")
+	got := loadBalancerBlock([]string{"example.com"}, []Upstream{{Dial: "a:80"}, {Dial: "b:80"}}, TLS{}, "", Firewall{})
 	for _, want := range []string{"example.com {", "reverse_proxy a:80 b:80 {", "lb_policy round_robin", "health_uri /up", "health_interval 10s", "health_timeout 5s"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("loadBalancerBlock missing %q\nfull:\n%s", want, got)
@@ -400,7 +400,7 @@ func TestLoadBalancerBlock(t *testing.T) {
 
 func TestReverseProxyBlock_WithTLS(t *testing.T) {
 	got := reverseProxyBlock([]string{"fylun.ai"}, "fylun-web-v1", 3000,
-		TLS{Cert: "/etc/caddy/tls/fylun-web.crt", Key: "/etc/caddy/tls/fylun-web.key"}, "")
+		TLS{Cert: "/etc/caddy/tls/fylun-web.crt", Key: "/etc/caddy/tls/fylun-web.key"}, "", Firewall{})
 	want := "fylun.ai {\n\ttls /etc/caddy/tls/fylun-web.crt /etc/caddy/tls/fylun-web.key\n\treverse_proxy fylun-web-v1:3000\n}"
 	if got != want {
 		t.Errorf("reverseProxyBlock with TLS:\nwant: %q\ngot:  %q", want, got)
@@ -409,7 +409,7 @@ func TestReverseProxyBlock_WithTLS(t *testing.T) {
 
 func TestLoadBalancerBlock_WithTLS(t *testing.T) {
 	got := loadBalancerBlock([]string{"fylun.ai"}, []Upstream{{Dial: "a:3000"}, {Dial: "b:3000"}},
-		TLS{Cert: "/etc/caddy/tls/fylun-web.crt", Key: "/etc/caddy/tls/fylun-web.key"}, "")
+		TLS{Cert: "/etc/caddy/tls/fylun-web.crt", Key: "/etc/caddy/tls/fylun-web.key"}, "", Firewall{})
 	if !strings.Contains(got, "\ttls /etc/caddy/tls/fylun-web.crt /etc/caddy/tls/fylun-web.key\n") {
 		t.Errorf("loadBalancerBlock with TLS missing tls directive\nfull:\n%s", got)
 	}
@@ -453,7 +453,7 @@ func TestIsPubliclyRoutable(t *testing.T) {
 // finishes). It must now get an explicit http:// scheme instead, which
 // tells Caddy not to manage TLS for that address.
 func TestReverseProxyBlock_NonPublicDomainGetsPlainHTTP(t *testing.T) {
-	got := reverseProxyBlock([]string{"192.168.1.114"}, "investment-club-v1", 3000, TLS{}, "")
+	got := reverseProxyBlock([]string{"192.168.1.114"}, "investment-club-v1", 3000, TLS{}, "", Firewall{})
 	want := "http://192.168.1.114 {\n\treverse_proxy investment-club-v1:3000\n}"
 	if got != want {
 		t.Errorf("reverseProxyBlock for a bare IP:\nwant: %q\ngot:  %q", want, got)
@@ -472,7 +472,7 @@ func TestStaticBlock_NonPublicDomainGetsPlainHTTP(t *testing.T) {
 // the http:// fallback — the operator explicitly asked for HTTPS via
 // Caddy's local CA, so automatic-HTTPS avoidance would be wrong here.
 func TestReverseProxyBlock_TLSInternalKeepsRealHost(t *testing.T) {
-	got := reverseProxyBlock([]string{"192.168.1.114"}, "myapp-v1", 3000, TLS{Internal: true}, "")
+	got := reverseProxyBlock([]string{"192.168.1.114"}, "myapp-v1", 3000, TLS{Internal: true}, "", Firewall{})
 	want := "192.168.1.114 {\n\ttls internal\n\treverse_proxy myapp-v1:3000\n}"
 	if got != want {
 		t.Errorf("reverseProxyBlock with tls.internal:\nwant: %q\ngot:  %q", want, got)
@@ -483,7 +483,7 @@ func TestReverseProxyBlock_TLSInternalKeepsRealHost(t *testing.T) {
 // tls.internal — must not get the http:// fallback either.
 func TestReverseProxyBlock_CustomCertKeepsRealHost(t *testing.T) {
 	got := reverseProxyBlock([]string{"192.168.1.114"}, "myapp-v1", 3000,
-		TLS{Cert: "/etc/caddy/tls/myapp.crt", Key: "/etc/caddy/tls/myapp.key"}, "")
+		TLS{Cert: "/etc/caddy/tls/myapp.crt", Key: "/etc/caddy/tls/myapp.key"}, "", Firewall{})
 	if strings.HasPrefix(got, "http://") {
 		t.Errorf("a custom cert should keep the real host, not fall back to http://:\n%s", got)
 	}

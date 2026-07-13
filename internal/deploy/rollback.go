@@ -45,7 +45,8 @@ type RollbackConfig struct {
 	// TLSInternal mirrors Config.TLSInternal — preserves Caddy's local-CA
 	// self-signed TLS across a rollback the same way TLSCert/TLSKey do.
 	TLSInternal bool
-	CaddyExtra  string // mirrors Config.CaddyExtra — preserves user directives across rollback
+	CaddyExtra  string         // mirrors Config.CaddyExtra — preserves user directives across rollback
+	Firewall    caddy.Firewall // mirrors Config.Firewall — preserves firewall rules across rollback
 	// Ingress mirrors Config.Ingress — set to "external" to skip Caddy
 	// route restoration on rollback. With external ingress, the user's
 	// CF Tunnel / nginx / etc. already points at the app-name alias on
@@ -207,7 +208,7 @@ func Rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg Rollbac
 				}
 				upstreams = append(upstreams, caddy.Upstream{Dial: fmt.Sprintf("%s:%d", c.Name, port)})
 			}
-			if err := cd.SetLoadBalancer(ctx, cfg.App, cfg.Domain, upstreams, tls, cfg.CaddyExtra); err != nil {
+			if err := cd.SetLoadBalancer(ctx, cfg.App, cfg.Domain, upstreams, tls, cfg.CaddyExtra, cfg.Firewall); err != nil {
 				return fmt.Errorf("updating load balancer route: %w", err)
 			}
 			fmt.Fprintf(out, "  Traffic load-balanced across %d replicas\n", len(targetWeb))
@@ -216,7 +217,7 @@ func Rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg Rollbac
 			if err != nil {
 				return fmt.Errorf("inspecting target container port: %w", err)
 			}
-			if err := cd.SetRoute(ctx, cfg.App, cfg.Domain, targetWeb[0].Name, port, tls, cfg.CaddyExtra); err != nil {
+			if err := cd.SetRoute(ctx, cfg.App, cfg.Domain, targetWeb[0].Name, port, tls, cfg.CaddyExtra, cfg.Firewall); err != nil {
 				return fmt.Errorf("updating route: %w", err)
 			}
 			fmt.Fprintln(out, "  Traffic routed to target version")
