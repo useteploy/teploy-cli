@@ -239,6 +239,13 @@ func TestHarden_RunsAllSteps_AsRoot(t *testing.T) {
 		ssh.MockCommand{Match: "sed -i", Output: ""},
 		ssh.MockCommand{Match: "sed -i", Output: ""},
 		ssh.MockCommand{Match: "systemctl restart sshd", Output: ""},
+		// audit
+		ssh.MockCommand{Match: "which auditctl", Output: "/usr/sbin/auditctl"},
+		ssh.MockCommand{Match: "mv /tmp/teploy-audit.rules", Output: ""},
+		ssh.MockCommand{Match: "augenrules --load", Output: ""},
+		ssh.MockCommand{Match: "systemctl enable --now auditd", Output: ""},
+		ssh.MockCommand{Match: "visudo -c", Output: "parsed OK"},
+		ssh.MockCommand{Match: "mv /tmp/teploy-audit-sudoers", Output: ""},
 	)
 
 	var buf bytes.Buffer
@@ -281,6 +288,13 @@ func TestHarden_RunsAllSteps_WithSudo(t *testing.T) {
 		ssh.MockCommand{Match: "sudo sed -i", Output: ""},
 		ssh.MockCommand{Match: "sudo sed -i", Output: ""},
 		ssh.MockCommand{Match: "sudo systemctl restart sshd", Output: ""},
+		// audit
+		ssh.MockCommand{Match: "which auditctl", Output: "/usr/sbin/auditctl"},
+		ssh.MockCommand{Match: "sudo mv /tmp/teploy-audit.rules", Output: ""},
+		ssh.MockCommand{Match: "sudo augenrules --load", Output: ""},
+		ssh.MockCommand{Match: "sudo systemctl enable --now auditd", Output: ""},
+		ssh.MockCommand{Match: "visudo -c", Output: "parsed OK"},
+		ssh.MockCommand{Match: "sudo mv /tmp/teploy-audit-sudoers", Output: ""},
 	)
 
 	var buf bytes.Buffer
