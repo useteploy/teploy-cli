@@ -165,7 +165,68 @@ APT::Periodic::Unattended-Upgrade "1";
 	return nil
 }
 
-// Harden runs all hardening steps in order: UFW, fail2ban, SSH.
+// EnableAudit configures host-side session/command auditing: auditd with
+// rules covering privileged execution (execve by root / via sudo) and writes
+// to the paths Teploy manages, plus sudo I/O logging (log_input/log_output —
+// full TTY session recording, replayable with `sudoreplay`). This is the
+// portable answer to "what ran on this box": it works identically over
+// Tailscale, Headscale, or plain SSH, and needs no proxy/bastion in the
+// access path. Idempotent.
+func EnableAudit(ctx context.Context, exec ssh.Executor, w io.Writer, sudo string) error {
+	fmt.Fprintln(w, "Configuring host audit (auditd + sudo session logging)...")
+
+	if _, err := exec.Run(ctx, "which auditctl"); err != nil {
+		if _, err := exec.Run(ctx, sudo+"DEBIAN_FRONTEND=noninteractive apt-get update -qq && "+sudo+"DEBIAN_FRONTEND=noninteractive apt-get install -y -qq auditd"); err != nil {
+			return fmt.Errorf("installing auditd: %w", err)
+		}
+	}
+
+	// Audit rules: root-privilege command execution + mutations of the
+	// Teploy state tree. Key names make `ausearch -k teploy-exec` /
+	// `-k teploy-state` the operator's query surface.
+	rules := `## Managed by teploy setup --harden (audit). Edits are overwritten.
+-a always,exit -F arch=b64 -S execve -F euid=0 -k teploy-exec
+-a always,exit -F arch=b32 -S execve -F euid=0 -k teploy-exec
+-w /deployments -p wa -k teploy-state
+-w /etc/caddy -p wa -k teploy-state
+`
+	if err := exec.Upload(ctx, strings.NewReader(rules), "/tmp/teploy-audit.rules", "0640"); err != nil {
+		return fmt.Errorf("writing audit rules: %w", err)
+	}
+	if _, err := exec.Run(ctx, sudo+"mv /tmp/teploy-audit.rules /etc/audit/rules.d/teploy.rules && "+sudo+"chown root:root /etc/audit/rules.d/teploy.rules"); err != nil {
+		return fmt.Errorf("installing audit rules: %w", err)
+	}
+	// augenrules --load applies rules.d; restart covers first-boot cases.
+	if _, err := exec.Run(ctx, sudo+"augenrules --load || "+sudo+"systemctl restart auditd"); err != nil {
+		return fmt.Errorf("loading audit rules: %w", err)
+	}
+	if _, err := exec.Run(ctx, sudo+"systemctl enable --now auditd"); err != nil {
+		return fmt.Errorf("enabling auditd: %w", err)
+	}
+
+	// sudo session I/O logging: every sudo session's input/output recorded
+	// under /var/log/sudo-io, replayable with `sudoreplay`.
+	sudoers := `## Managed by teploy setup --harden (audit). Edits are overwritten.
+Defaults log_input, log_output
+Defaults iolog_dir="/var/log/sudo-io/%{user}"
+`
+	if err := exec.Upload(ctx, strings.NewReader(sudoers), "/tmp/teploy-audit-sudoers", "0440"); err != nil {
+		return fmt.Errorf("writing sudoers audit config: %w", err)
+	}
+	// visudo -c validates BEFORE install — a broken sudoers drop-in can
+	// lock everyone out of sudo on the box.
+	if _, err := exec.Run(ctx, "visudo -c -f /tmp/teploy-audit-sudoers"); err != nil {
+		return fmt.Errorf("sudoers audit config failed validation: %w", err)
+	}
+	if _, err := exec.Run(ctx, sudo+"mv /tmp/teploy-audit-sudoers /etc/sudoers.d/teploy-audit && "+sudo+"chown root:root /etc/sudoers.d/teploy-audit && "+sudo+"chmod 0440 /etc/sudoers.d/teploy-audit"); err != nil {
+		return fmt.Errorf("installing sudoers audit config: %w", err)
+	}
+
+	fmt.Fprintln(w, "  Audit enabled: ausearch -k teploy-exec | sudoreplay -l")
+	return nil
+}
+
+// Harden runs all hardening steps in order: UFW, fail2ban, SSH, audit.
 // Auto-updates is intentionally excluded — it should run last (after all
 // other apt installs complete) to avoid locking conflicts.
 // Call EnableAutoUpdates separately at the end of setup.
@@ -181,6 +242,9 @@ func Harden(ctx context.Context, exec ssh.Executor, w io.Writer) error {
 		return err
 	}
 	if err := HardenSSH(ctx, exec, w, sudo); err != nil {
+		return err
+	}
+	if err := EnableAudit(ctx, exec, w, sudo); err != nil {
 		return err
 	}
 	return nil
