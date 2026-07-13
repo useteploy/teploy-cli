@@ -366,6 +366,14 @@ teploy deploy -d staging
 
 The overlay merges on top of base config — override only what differs per environment.
 
+## Surviving server loss
+
+Teploy has no scheduler by design — resilience comes from topology: N+1
+active servers for the stateless tier, state that outlives any one box
+(managed/replicated DB, or scheduled + `verify-backup`-proven backups off
+the server), and a five-command human-confirmed rebuild runbook. Read
+[docs/resilience.md](docs/resilience.md) before you need it.
+
 ## Requirements
 
 - A server with SSH access (any Linux VPS — Hetzner, DigitalOcean, Linode, etc.)
