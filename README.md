@@ -151,6 +151,10 @@ firewall:
   deny_ips: ["9.9.9.9"]                            # blocklist (IPs or CIDRs)
   block_user_agents: ["masscan", "badbot"]         # case-insensitive substring
   max_body_size: 10MB                              # request body cap
+# IP rules match the DIRECT connection (Caddy's remote_ip). That's the real
+# client when Teploy's Caddy faces the internet (the default). If you front it
+# with Cloudflare/another proxy, remote_ip is the PROXY's IP — use that proxy's
+# own IP rules instead, or set trusted_proxies via caddy_extra.
 
 volumes:
   data: /app/data
