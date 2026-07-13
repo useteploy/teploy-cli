@@ -325,9 +325,10 @@ teploy backup prune   --bucket b --accessory db --keep-last 5
 ```
 `--keep-last N` is a floor (the newest N are always kept, even if old);
 `--max-age-days D` deletes older backups but never below that floor. A failed
-backup never triggers a prune. `backup create` alerts on failure via the app's
-`notifications` config; scheduled cron backups run headless (retention is baked
-into the cron job, but alerting needs the create path).
+backup never triggers a prune. Both `backup create` and scheduled cron backups
+alert on failure via the app's `notifications` config — `create` uses all
+channels; the headless cron job posts to the first **webhook** channel (SMTP and
+other channels need the CLI, which isn't on the server).
 
 ### Auto-deploy
 ```

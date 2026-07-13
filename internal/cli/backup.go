@@ -10,6 +10,7 @@ import (
 	"github.com/useteploy/teploy/internal/backup"
 	"github.com/useteploy/teploy/internal/config"
 	"github.com/useteploy/teploy/internal/notify"
+	"github.com/useteploy/teploy/internal/ssh"
 )
 
 func newBackupCmd(flags *Flags) *cobra.Command {
@@ -294,30 +295,8 @@ func runBackupSchedule(flags *Flags, schedule, bucket, region, endpoint string, 
 	}
 	defer executor.Close()
 
-	// Build the backup command that cron will run.
-	backupCmd := fmt.Sprintf(
-		"tar -czf /tmp/%s-backup-$(date +%%Y%%m%%d-%%H%%M%%S).tar.gz -C /deployments/%s/volumes . && "+
-			"aws s3 cp /tmp/%s-backup-*.tar.gz s3://%s/%s/volumes/ --region %s && "+
-			"rm -f /tmp/%s-backup-*.tar.gz",
-		appCfg.App, appCfg.App,
-		appCfg.App, bucket, appCfg.App, region,
-		appCfg.App,
-	)
-
-	// Bake keep-last retention into the same cron job: after the fresh upload,
-	// list the timestamped keys, keep the newest N, delete the rest. The names
-	// sort chronologically (20060102-150405), so `head -n -N` yields exactly the
-	// stale ones. No `%` in this clause, so no cron %-escaping concerns. Only
-	// keep-last is supported in the scheduled shell path; --max-age-days lives on
-	// `backup create`/`backup prune` (shell date math is fragile).
-	if keepLast > 0 {
-		backupCmd += fmt.Sprintf(
-			" && for f in $(aws s3 ls s3://%s/%s/volumes/ --region %s | sed 's/.* //' | grep -E '[0-9]{8}-[0-9]{6}' | sort | head -n -%d); do "+
-				"[ -n \"$f\" ] && aws s3 rm s3://%s/%s/volumes/$f --region %s; done",
-			bucket, appCfg.App, region, keepLast,
-			bucket, appCfg.App, region,
-		)
-	}
+	webhook := firstWebhookURL(appCfg.Notifications)
+	backupCmd := buildScheduledBackupCmd(appCfg.App, executor.Host(), bucket, region, keepLast, webhook)
 
 	client := backup.NewClient(executor, os.Stdout)
 	if err := client.SetSchedule(ctx, schedule, backupCmd, "teploy-backup:"+appCfg.App); err != nil {
@@ -330,7 +309,75 @@ func runBackupSchedule(flags *Flags, schedule, bucket, region, endpoint string, 
 	if keepLast > 0 {
 		fmt.Printf("  Retention: keep last %d\n", keepLast)
 	}
+	if webhook != "" {
+		fmt.Println("  Alerts: webhook notified on failure")
+	}
 	return nil
+}
+
+// firstWebhookURL returns the first usable webhook URL from the app's
+// notifications config (legacy single webhook, else the first webhook channel),
+// or "" if none. Only webhook channels work from the headless cron path — SMTP
+// and other channels need the CLI's notifier, which isn't present server-side.
+func firstWebhookURL(n config.NotificationsConfig) string {
+	if n.Webhook != "" {
+		return n.Webhook
+	}
+	for _, ch := range n.Channels {
+		if ch.Type == "webhook" && ch.URL != "" {
+			return ch.URL
+		}
+	}
+	return ""
+}
+
+// buildScheduledBackupCmd assembles the shell command cron runs for a scheduled
+// backup: archive → upload → clean up, then optional keep-last retention, and
+// (if a webhook is set) a failure alert wrapping the whole chain.
+func buildScheduledBackupCmd(app, server, bucket, region string, keepLast int, webhook string) string {
+	cmd := fmt.Sprintf(
+		"tar -czf /tmp/%s-backup-$(date +%%Y%%m%%d-%%H%%M%%S).tar.gz -C /deployments/%s/volumes . && "+
+			"aws s3 cp /tmp/%s-backup-*.tar.gz s3://%s/%s/volumes/ --region %s && "+
+			"rm -f /tmp/%s-backup-*.tar.gz",
+		app, app,
+		app, bucket, app, region,
+		app,
+	)
+
+	// Bake keep-last retention into the same cron job: after the fresh upload,
+	// list the timestamped keys, keep the newest N, delete the rest. The names
+	// sort chronologically (20060102-150405), so `head -n -N` yields exactly the
+	// stale ones. No `%` in this clause, so no cron %-escaping concerns. Only
+	// keep-last is supported in the scheduled shell path; --max-age-days lives on
+	// `backup create`/`backup prune` (shell date math is fragile).
+	if keepLast > 0 {
+		cmd += fmt.Sprintf(
+			" && for f in $(aws s3 ls s3://%s/%s/volumes/ --region %s | sed 's/.* //' | grep -E '[0-9]{8}-[0-9]{6}' | sort | head -n -%d); do "+
+				"[ -n \"$f\" ] && aws s3 rm s3://%s/%s/volumes/$f --region %s; done",
+			bucket, app, region, keepLast,
+			bucket, app, region,
+		)
+	}
+
+	// Failure alerting: a scheduled backup runs headless, so it can't use the
+	// CLI notifier (teploy.yml + its config aren't on the server). If a webhook
+	// is configured, POST a failure payload — matching notify.Payload's schema —
+	// when any step of the chain fails. Deliberately `%`-free (no $(date) with a
+	// format) so it can't trip cron's %-escaping; the receiver stamps its own
+	// receipt time. `; false` preserves the non-zero exit so cron still logs it.
+	if webhook != "" {
+		payload := fmt.Sprintf(
+			`{"app":%q,"server":%q,"type":"backup","success":false,"message":"Scheduled backup failed","duration_ms":0,"timestamp":""}`,
+			app, server,
+		)
+		alert := fmt.Sprintf(
+			"curl -sf -m 10 -X POST -H 'Content-Type: application/json' -d %s %s",
+			ssh.ShellQuote(payload), ssh.ShellQuote(webhook),
+		)
+		cmd = "( " + cmd + " ) || { " + alert + "; false; }"
+	}
+
+	return cmd
 }
 
 func runBackupRestore(flags *Flags, date, bucket, region, endpoint string) error {
