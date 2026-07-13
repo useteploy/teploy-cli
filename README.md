@@ -199,6 +199,14 @@ assets:
 
 notifications:
   webhook: https://hooks.slack.com/services/xxx
+  # Or multiple channels with per-event filters. type: ntfy posts
+  # push-notification-shaped messages to an ntfy topic — pair it with the
+  # self-hosted ntfy accessory above (http://<app>-ntfy/<topic> from other
+  # containers, or your public ntfy.sh topic) for deploy alerts on your phone.
+  # channels:
+  #   - type: ntfy
+  #     url: https://ntfy.sh/my-deploys
+  #     events: [deploy, rollback, health_failure]
 
 # GitOps secrets: local env files merged into the container env at deploy.
 # Encrypted files decrypt on YOUR machine (never plaintext in the repo or

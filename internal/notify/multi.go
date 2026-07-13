@@ -11,8 +11,8 @@ import (
 
 // Channel represents a single notification destination.
 type Channel struct {
-	Type   string   // "webhook" or "email"
-	URL    string   // webhook URL
+	Type   string   // "webhook", "slack", "ntfy", or "email"
+	URL    string   // webhook / ntfy topic URL
 	To     string   // email address
 	Events []string // empty = all events
 }
@@ -55,6 +55,10 @@ func (n *MultiNotifier) Send(ctx context.Context, p Payload) []error {
 		case "slack":
 			if err := sendSlack(ctx, n.client, ch.URL, p); err != nil {
 				errs = append(errs, fmt.Errorf("slack %s: %w", ch.URL, err))
+			}
+		case "ntfy":
+			if err := sendNtfy(ctx, n.client, ch.URL, p); err != nil {
+				errs = append(errs, fmt.Errorf("ntfy %s: %w", ch.URL, err))
 			}
 		case "email":
 			// Email not yet implemented — log warning silently.
@@ -116,6 +120,46 @@ func sendSlack(ctx context.Context, client *http.Client, url string, p Payload) 
 
 	if resp.StatusCode >= 400 {
 		return fmt.Errorf("slack webhook returned status %d", resp.StatusCode)
+	}
+	return nil
+}
+
+// sendNtfy publishes to an ntfy topic URL (https://docs.ntfy.sh/publish/):
+// the message is the raw request body, metadata rides in headers. Works with
+// ntfy.sh or a self-hosted ntfy accessory (`http://<app>-ntfy`). The generic
+// webhook JSON would arrive as an unreadable blob, hence the dedicated type.
+func sendNtfy(ctx context.Context, client *http.Client, url string, p Payload) error {
+	status := "succeeded"
+	if !p.Success {
+		status = "failed"
+	}
+	msg := fmt.Sprintf("%s %s on %s: %s", p.App, p.Type, p.Server, status)
+	if p.Message != "" {
+		msg += "\n" + p.Message
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader([]byte(msg)))
+	if err != nil {
+		return fmt.Errorf("creating request: %w", err)
+	}
+	req.Header.Set("User-Agent", "teploy/1.0")
+	req.Header.Set("Title", fmt.Sprintf("teploy: %s %s", p.App, p.Type))
+	if p.Success {
+		req.Header.Set("Tags", "white_check_mark")
+		req.Header.Set("Priority", "default")
+	} else {
+		req.Header.Set("Tags", "rotating_light")
+		req.Header.Set("Priority", "high")
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("sending ntfy message: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("ntfy returned status %d", resp.StatusCode)
 	}
 	return nil
 }

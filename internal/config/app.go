@@ -490,9 +490,9 @@ func (c *AppConfig) validate() error {
 	}
 	for _, ch := range c.Notifications.Channels {
 		switch ch.Type {
-		case "", "webhook", "slack", "email":
+		case "", "webhook", "slack", "ntfy", "email":
 		default:
-			return fmt.Errorf("'notifications.channels[].type' must be one of: webhook, slack, email (got %q) — an unrecognized type silently never fires", ch.Type)
+			return fmt.Errorf("'notifications.channels[].type' must be one of: webhook, slack, ntfy, email (got %q) — an unrecognized type silently never fires", ch.Type)
 		}
 	}
 	if c.Health.TimeoutSeconds < 0 {
