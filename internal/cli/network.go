@@ -22,6 +22,9 @@ func newNetworkCmd(flags *Flags) *cobra.Command {
 	cmd.AddCommand(newNetworkSetupCmd(flags))
 	cmd.AddCommand(newNetworkStatusCmd(flags))
 	cmd.AddCommand(newNetworkJoinCmd(flags))
+	cmd.AddCommand(newNetworkGrantCmd(flags))
+	cmd.AddCommand(newNetworkGrantsCmd(flags))
+	cmd.AddCommand(newNetworkRevokeCmd(flags))
 
 	return cmd
 }

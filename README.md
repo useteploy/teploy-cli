@@ -311,6 +311,16 @@ teploy autodeploy setup            # webhook-triggered auto-deploys
 teploy autodeploy status / remove
 ```
 
+### Mesh access (JIT grants)
+```
+teploy network grant --ttl 2h --tag tag:contractor   # time-boxed key, auto-revokes
+teploy network grants                                # list active keys
+teploy network revoke <key-id>                       # cut a grant early
+```
+Mints ephemeral, tagged pre-auth keys via the Tailscale or Headscale API —
+"give the contractor two hours" without permanent credentials. What a tag
+can reach is your ACL policy's call; teploy never edits ACLs.
+
 ### Registry and templates
 ```
 teploy registry login / list / remove   # manage container registry credentials
