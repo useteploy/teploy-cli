@@ -305,7 +305,19 @@ teploy preview prune               # remove expired previews
 teploy backup create               # backup volumes to S3
 teploy backup list / restore <id>
 teploy backup schedule             # cron-driven backups
+teploy backup prune                # apply a retention policy
+
+# Retention: keep only the newest N, and/or drop anything older than D days.
+teploy backup create  --bucket b --keep-last 7             # auto-prune after backup
+teploy backup schedule "0 3 * * *" --bucket b --keep-last 7 # nightly, keep 7
+teploy backup prune   --bucket b --keep-last 3 --max-age-days 30
+teploy backup prune   --bucket b --accessory db --keep-last 5
 ```
+`--keep-last N` is a floor (the newest N are always kept, even if old);
+`--max-age-days D` deletes older backups but never below that floor. A failed
+backup never triggers a prune. `backup create` alerts on failure via the app's
+`notifications` config; scheduled cron backups run headless (retention is baked
+into the cron job, but alerting needs the create path).
 
 ### Auto-deploy
 ```
@@ -377,6 +389,14 @@ teploy deploy -d staging
 ```
 
 The overlay merges on top of base config — override only what differs per environment.
+
+## Keeping secrets out of git
+
+Teploy doesn't bundle a CI runner — it integrates with the one you run. For
+secrets scanning (catching a committed API key before it's in history forever),
+drop the Gitleaks recipe into your Forgejo/GitHub Actions or a pre-commit hook —
+see [docs/secrets-scanning.md](docs/secrets-scanning.md). For runtime secrets,
+use `teploy secret set` or SOPS/age `env_files:`, never plaintext in the repo.
 
 ## Surviving server loss
 

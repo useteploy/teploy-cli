@@ -21,16 +21,25 @@ func newBackupCmd(flags *Flags) *cobra.Command {
 	cmd.AddCommand(newBackupCreateCmd(flags))
 	cmd.AddCommand(newBackupListCmd(flags))
 	cmd.AddCommand(newBackupRestoreCmd(flags))
+	cmd.AddCommand(newBackupPruneCmd(flags))
 	cmd.AddCommand(newBackupScheduleCmd(flags))
 
 	return cmd
 }
 
+// addRetentionFlags registers the shared --keep-last / --max-age-days flags.
+func addRetentionFlags(cmd *cobra.Command, keepLast, maxAgeDays *int) {
+	cmd.Flags().IntVar(keepLast, "keep-last", 0, "Keep only the N most recent backups (0 = keep all)")
+	cmd.Flags().IntVar(maxAgeDays, "max-age-days", 0, "Delete backups older than N days (0 = no age limit; pair with --keep-last as a floor)")
+}
+
 func newBackupCreateCmd(flags *Flags) *cobra.Command {
 	var (
-		bucket   string
-		region   string
-		endpoint string
+		bucket     string
+		region     string
+		endpoint   string
+		keepLast   int
+		maxAgeDays int
 	)
 
 	cmd := &cobra.Command{
@@ -38,13 +47,14 @@ func newBackupCreateCmd(flags *Flags) *cobra.Command {
 		Short: "Create a volume backup",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runBackupCreate(flags, bucket, region, endpoint)
+			return runBackupCreate(flags, bucket, region, endpoint, keepLast, maxAgeDays)
 		},
 	}
 
 	cmd.Flags().StringVar(&bucket, "bucket", "", "S3 bucket name")
 	cmd.Flags().StringVar(&region, "region", "us-east-1", "AWS region")
 	cmd.Flags().StringVar(&endpoint, "endpoint", "", "S3-compatible endpoint URL (MinIO/B2/R2); creds from TEPLOY_S3_ACCESS_KEY/SECRET_KEY or AWS_* env")
+	addRetentionFlags(cmd, &keepLast, &maxAgeDays)
 
 	return cmd
 }
@@ -73,7 +83,7 @@ func s3Config(bucket, region, endpoint string) backup.S3Config {
 	return backup.S3Config{Bucket: bucket, Region: region, Endpoint: endpoint, AccessKey: access, SecretKey: secret}
 }
 
-func runBackupCreate(flags *Flags, bucket, region, endpoint string) error {
+func runBackupCreate(flags *Flags, bucket, region, endpoint string, keepLast, maxAgeDays int) error {
 	appCfg, err := config.LoadApp(".")
 	if err != nil {
 		return err
@@ -99,13 +109,30 @@ func runBackupCreate(flags *Flags, bucket, region, endpoint string) error {
 	defer executor.Close()
 
 	client := backup.NewClient(executor, os.Stdout)
-	err = client.BackupVolumes(ctx, appCfg.App, s3Config(bucket, region, endpoint))
+	cfg := s3Config(bucket, region, endpoint)
+	err = client.BackupVolumes(ctx, appCfg.App, cfg)
 
-	// Fire notification (fire-and-forget).
+	// Enforce retention only after a successful backup — never prune when the
+	// fresh backup failed (that could leave zero good copies).
+	var pruned []string
+	var pruneErr error
+	policy := backup.RetentionPolicy{KeepLast: keepLast, MaxAgeDays: maxAgeDays}
+	if err == nil && !policy.IsZero() {
+		pruned, pruneErr = client.PruneBackups(ctx, appCfg.App, "volumes", cfg, policy)
+	}
+
+	// Fire notification (fire-and-forget). The backup itself succeeding is what
+	// Success reflects; a prune failure is surfaced in the message + exit code
+	// but does not flip the backup to "failed" (the data is safely stored).
 	if n := buildNotifier(appCfg); n != nil {
 		msg := fmt.Sprintf("Backup created for %s", appCfg.App)
-		if err != nil {
+		switch {
+		case err != nil:
 			msg = fmt.Sprintf("Backup failed for %s: %s", appCfg.App, err)
+		case pruneErr != nil:
+			msg = fmt.Sprintf("Backup created for %s, but prune failed: %s", appCfg.App, pruneErr)
+		case len(pruned) > 0:
+			msg = fmt.Sprintf("Backup created for %s (pruned %d old backup(s))", appCfg.App, len(pruned))
 		}
 		n.Send(ctx, notify.Payload{
 			App:     appCfg.App,
@@ -116,7 +143,10 @@ func runBackupCreate(flags *Flags, bucket, region, endpoint string) error {
 		})
 	}
 
-	return err
+	if err != nil {
+		return err
+	}
+	return pruneErr
 }
 
 func newBackupListCmd(flags *Flags) *cobra.Command {
@@ -212,26 +242,28 @@ func newBackupScheduleCmd(flags *Flags) *cobra.Command {
 		bucket   string
 		region   string
 		endpoint string
+		keepLast int
 	)
 
 	cmd := &cobra.Command{
 		Use:   "schedule <cron>",
 		Short: "Set up automated backups on a cron schedule",
-		Long:  "Creates a cron job on the server to run backups automatically.\nExample: teploy backup schedule \"0 3 * * *\" --bucket my-backups",
+		Long:  "Creates a cron job on the server to run backups automatically.\nExample: teploy backup schedule \"0 3 * * *\" --bucket my-backups --keep-last 7",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runBackupSchedule(flags, args[0], bucket, region, endpoint)
+			return runBackupSchedule(flags, args[0], bucket, region, endpoint, keepLast)
 		},
 	}
 
 	cmd.Flags().StringVar(&bucket, "bucket", "", "S3 bucket name")
 	cmd.Flags().StringVar(&region, "region", "us-east-1", "AWS region")
 	cmd.Flags().StringVar(&endpoint, "endpoint", "", "S3-compatible endpoint URL (MinIO/B2/R2); creds from TEPLOY_S3_ACCESS_KEY/SECRET_KEY or AWS_* env")
+	cmd.Flags().IntVar(&keepLast, "keep-last", 0, "Keep only the N most recent backups on each run (0 = keep all)")
 
 	return cmd
 }
 
-func runBackupSchedule(flags *Flags, schedule, bucket, region, endpoint string) error {
+func runBackupSchedule(flags *Flags, schedule, bucket, region, endpoint string, keepLast int) error {
 	appCfg, err := config.LoadApp(".")
 	if err != nil {
 		return err
@@ -248,6 +280,9 @@ func runBackupSchedule(flags *Flags, schedule, bucket, region, endpoint string) 
 	}
 	if err := backup.ValidateSchedule(schedule); err != nil {
 		return err
+	}
+	if keepLast < 0 {
+		return fmt.Errorf("--keep-last must be >= 0")
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
@@ -269,6 +304,21 @@ func runBackupSchedule(flags *Flags, schedule, bucket, region, endpoint string) 
 		appCfg.App,
 	)
 
+	// Bake keep-last retention into the same cron job: after the fresh upload,
+	// list the timestamped keys, keep the newest N, delete the rest. The names
+	// sort chronologically (20060102-150405), so `head -n -N` yields exactly the
+	// stale ones. No `%` in this clause, so no cron %-escaping concerns. Only
+	// keep-last is supported in the scheduled shell path; --max-age-days lives on
+	// `backup create`/`backup prune` (shell date math is fragile).
+	if keepLast > 0 {
+		backupCmd += fmt.Sprintf(
+			" && for f in $(aws s3 ls s3://%s/%s/volumes/ --region %s | sed 's/.* //' | grep -E '[0-9]{8}-[0-9]{6}' | sort | head -n -%d); do "+
+				"[ -n \"$f\" ] && aws s3 rm s3://%s/%s/volumes/$f --region %s; done",
+			bucket, appCfg.App, region, keepLast,
+			bucket, appCfg.App, region,
+		)
+	}
+
 	client := backup.NewClient(executor, os.Stdout)
 	if err := client.SetSchedule(ctx, schedule, backupCmd, "teploy-backup:"+appCfg.App); err != nil {
 		return err
@@ -277,6 +327,9 @@ func runBackupSchedule(flags *Flags, schedule, bucket, region, endpoint string) 
 	fmt.Printf("Backup scheduled: %s\n", schedule)
 	fmt.Printf("  App: %s\n", appCfg.App)
 	fmt.Printf("  Bucket: s3://%s/%s/volumes/\n", bucket, appCfg.App)
+	if keepLast > 0 {
+		fmt.Printf("  Retention: keep last %d\n", keepLast)
+	}
 	return nil
 }
 
@@ -310,4 +363,87 @@ func runBackupRestore(flags *Flags, date, bucket, region, endpoint string) error
 
 	client := backup.NewClient(executor, os.Stdout)
 	return client.RestoreVolumes(ctx, appCfg.App, date, s3Config(bucket, region, endpoint))
+}
+
+func newBackupPruneCmd(flags *Flags) *cobra.Command {
+	var (
+		bucket     string
+		region     string
+		endpoint   string
+		accessory  string
+		keepLast   int
+		maxAgeDays int
+	)
+
+	cmd := &cobra.Command{
+		Use:   "prune",
+		Short: "Delete old backups per a retention policy",
+		Long:  "Removes backups outside the retention policy.\nExample: teploy backup prune --bucket my-backups --keep-last 7\n         teploy backup prune --bucket my-backups --max-age-days 30 --keep-last 3",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runBackupPrune(flags, bucket, region, endpoint, accessory, keepLast, maxAgeDays)
+		},
+	}
+
+	cmd.Flags().StringVar(&bucket, "bucket", "", "S3 bucket name")
+	cmd.Flags().StringVar(&region, "region", "us-east-1", "AWS region")
+	cmd.Flags().StringVar(&endpoint, "endpoint", "", "S3-compatible endpoint URL (MinIO/B2/R2); creds from TEPLOY_S3_ACCESS_KEY/SECRET_KEY or AWS_* env")
+	cmd.Flags().StringVar(&accessory, "accessory", "", "Prune an accessory's backups instead of volumes (accessory name)")
+	addRetentionFlags(cmd, &keepLast, &maxAgeDays)
+
+	return cmd
+}
+
+func runBackupPrune(flags *Flags, bucket, region, endpoint, accessory string, keepLast, maxAgeDays int) error {
+	appCfg, err := config.LoadApp(".")
+	if err != nil {
+		return err
+	}
+
+	if bucket == "" {
+		return fmt.Errorf("--bucket is required")
+	}
+	if err := backup.ValidateBucket(bucket); err != nil {
+		return err
+	}
+	if err := backup.ValidateRegion(region); err != nil {
+		return err
+	}
+
+	policy := backup.RetentionPolicy{KeepLast: keepLast, MaxAgeDays: maxAgeDays}
+	if policy.IsZero() {
+		return fmt.Errorf("nothing to prune: set --keep-last and/or --max-age-days")
+	}
+
+	prefix := "volumes"
+	if accessory != "" {
+		// Accessory name lands in an unquoted S3 path (ListBackups) — reuse the
+		// same safe-name check as buckets to keep it shell-safe.
+		if err := backup.ValidateBucket(accessory); err != nil {
+			return fmt.Errorf("invalid accessory name %q: %w", accessory, err)
+		}
+		prefix = "accessories/" + accessory
+	}
+
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer cancel()
+
+	executor, err := connectForApp(ctx, flags, appCfg)
+	if err != nil {
+		return err
+	}
+	defer executor.Close()
+
+	client := backup.NewClient(executor, os.Stdout)
+	deleted, err := client.PruneBackups(ctx, appCfg.App, prefix, s3Config(bucket, region, endpoint), policy)
+	if err != nil {
+		return err
+	}
+
+	if len(deleted) == 0 {
+		fmt.Println("No backups pruned (all within retention policy)")
+	} else {
+		fmt.Printf("Pruned %d backup(s)\n", len(deleted))
+	}
+	return nil
 }
