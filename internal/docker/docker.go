@@ -491,6 +491,32 @@ func (c *Client) Restart(ctx context.Context, name string, avoidPorts map[int]bo
 }
 
 // Pull pulls a Docker image from a registry.
+// ScanImage runs a Trivy vulnerability scan against an image already
+// present on the server, streaming findings to out. Two passes because
+// trivy's --exit-code applies to every severity in --severity: a
+// report-only HIGH+CRITICAL pass informs the operator, then a --quiet
+// CRITICAL-only pass with --exit-code 1 decides — fixable CRITICALs block
+// the deploy before the image ever serves traffic. --ignore-unfixed keeps
+// unfixable base-image CVEs from wedging every deploy. The vulnerability
+// DB caches under /deployments/.trivy-cache so only the first scan pays
+// the download.
+func (c *Client) ScanImage(ctx context.Context, image string, out io.Writer) error {
+	const trivyBase = "docker run --rm" +
+		" -v /var/run/docker.sock:/var/run/docker.sock" +
+		" -v /deployments/.trivy-cache:/root/.cache" +
+		" aquasec/trivy:latest image --scanners vuln --ignore-unfixed "
+	reportCmd := trivyBase + "--severity HIGH,CRITICAL " + ssh.ShellQuote(image)
+	blockCmd := trivyBase + "--severity CRITICAL --exit-code 1 --quiet " + ssh.ShellQuote(image)
+
+	if err := c.exec.RunStream(ctx, reportCmd, out, out); err != nil {
+		return fmt.Errorf("trivy scan failed to run: %w", err)
+	}
+	if err := c.exec.RunStream(ctx, blockCmd, io.Discard, out); err != nil {
+		return fmt.Errorf("image %s has fixable CRITICAL vulnerabilities — deploy blocked (patch the base image, or remove scan: true to bypass): %w", image, err)
+	}
+	return nil
+}
+
 func (c *Client) Pull(ctx context.Context, image string) error {
 	if _, err := c.exec.Run(ctx, "docker pull "+ssh.ShellQuote(image)); err != nil {
 		return fmt.Errorf("pulling image %s: %w", image, err)

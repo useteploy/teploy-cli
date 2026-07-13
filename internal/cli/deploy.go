@@ -549,6 +549,15 @@ func deployBuiltImage(ctx context.Context, executor ssh.Executor, appCfg *config
 		CaddyExtra:    appCfg.CaddyExtra,
 	}
 
+	// Vulnerability gate: scan the image on the server before any container
+	// starts — fixable CRITICALs block the deploy.
+	if appCfg.Scan {
+		fmt.Println("Scanning image for vulnerabilities (trivy)...")
+		if err := docker.NewClient(executor).ScanImage(ctx, image, os.Stdout); err != nil {
+			return err
+		}
+	}
+
 	multiNotifier := buildNotifier(appCfg)
 	deployErr := deployer.Deploy(ctx, deployCfg)
 

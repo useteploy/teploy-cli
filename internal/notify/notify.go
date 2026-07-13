@@ -13,7 +13,7 @@ import (
 type Payload struct {
 	App        string `json:"app"`
 	Server     string `json:"server"`
-	Type       string `json:"type"`    // deploy, rollback, restart, backup, health_failure
+	Type       string `json:"type"` // deploy, rollback, restart, backup, health_failure
 	Success    bool   `json:"success"`
 	Hash       string `json:"hash,omitempty"`
 	Message    string `json:"message,omitempty"`

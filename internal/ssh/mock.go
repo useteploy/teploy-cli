@@ -18,8 +18,8 @@ type MockExecutor struct {
 	commands []MockCommand
 
 	mu    sync.Mutex
-	Calls []string            // records every command executed
-	Files map[string][]byte   // records uploaded file contents by path
+	Calls []string          // records every command executed
+	Files map[string][]byte // records uploaded file contents by path
 }
 
 // MockCommand maps a command prefix to a response.

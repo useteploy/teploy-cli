@@ -112,8 +112,8 @@ func TestUpdateDNS(t *testing.T) {
 	)
 
 	entries := map[string]string{
-		"myapp":    "100.64.0.1",
-		"mydb":     "100.64.0.2",
+		"myapp": "100.64.0.1",
+		"mydb":  "100.64.0.2",
 	}
 
 	if err := UpdateDNS(context.Background(), mock, entries); err != nil {

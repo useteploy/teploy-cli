@@ -15,13 +15,13 @@ type composeFile struct {
 }
 
 type composeService struct {
-	Image       string            `yaml:"image"`
-	Build       interface{}       `yaml:"build"` // string or struct
-	Ports       []string          `yaml:"ports"`
-	Command     interface{}       `yaml:"command"` // string or []string
-	Environment interface{}       `yaml:"environment"` // map or list
-	Volumes     []string          `yaml:"volumes"`
-	DependsOn   interface{}       `yaml:"depends_on"` // list or map
+	Image       string      `yaml:"image"`
+	Build       interface{} `yaml:"build"` // string or struct
+	Ports       []string    `yaml:"ports"`
+	Command     interface{} `yaml:"command"`     // string or []string
+	Environment interface{} `yaml:"environment"` // map or list
+	Volumes     []string    `yaml:"volumes"`
+	DependsOn   interface{} `yaml:"depends_on"` // list or map
 }
 
 // knownAccessoryImages maps image prefixes to default ports.

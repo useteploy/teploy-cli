@@ -103,10 +103,10 @@ func TestHealthConfig_CustomValues(t *testing.T) {
 
 func TestSortedProcessNames(t *testing.T) {
 	procs := map[string]string{
-		"worker":  "npm run worker",
-		"web":     "npm start",
-		"cron":    "npm run cron",
-		"mailer":  "npm run mailer",
+		"worker": "npm run worker",
+		"web":    "npm start",
+		"cron":   "npm run cron",
+		"mailer": "npm run mailer",
 	}
 
 	names := sortedProcessNames(procs)

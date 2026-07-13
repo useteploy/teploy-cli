@@ -3,8 +3,8 @@ package env
 import (
 	"os"
 	"os/exec"
-	"strings"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 

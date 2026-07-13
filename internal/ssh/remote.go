@@ -32,11 +32,11 @@ type RemoteExecutor struct {
 
 // ConnectConfig holds the parameters for establishing an SSH connection.
 type ConnectConfig struct {
-	Host           string // IP or hostname (with optional :port)
-	User           string // SSH user (default: root)
-	KeyPath        string // Path to SSH private key (optional, tries defaults)
-	Password       string // if set, use password auth instead of/in addition to key auth
-	AcceptNewHost  bool   // if true, auto-accept unknown host keys and save to known_hosts
+	Host          string // IP or hostname (with optional :port)
+	User          string // SSH user (default: root)
+	KeyPath       string // Path to SSH private key (optional, tries defaults)
+	Password      string // if set, use password auth instead of/in addition to key auth
+	AcceptNewHost bool   // if true, auto-accept unknown host keys and save to known_hosts
 }
 
 // Connect establishes an SSH connection and returns a RemoteExecutor.

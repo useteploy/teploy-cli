@@ -227,5 +227,15 @@ func (s *singleServerDeployer) deployApp(ctx context.Context, appCfg *config.App
 		TLSInternal:   tlsInternal,
 	}
 
+	// Vulnerability gate (see deploy.go): fixable CRITICALs block before
+	// containers start. Per-server, so every box in a multi-server deploy
+	// gates on its own copy of the image.
+	if appCfg.Scan {
+		fmt.Fprintln(s.out, "Scanning image for vulnerabilities (trivy)...")
+		if err := docker.NewClient(s.exec).ScanImage(ctx, image, s.out); err != nil {
+			return err
+		}
+	}
+
 	return deployer.Deploy(ctx, deployCfg)
 }

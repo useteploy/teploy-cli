@@ -251,6 +251,10 @@ type AppConfig struct {
 	// for the main wave. Absent (nil) = existing behavior (parallel batches,
 	// fail-fast + full-fleet rollback on any failure).
 	Rollout *RolloutConfig `yaml:"rollout,omitempty" toml:"rollout"`
+	// Scan runs a Trivy vulnerability scan on the image server-side before
+	// containers start: HIGH+CRITICAL findings are reported, and fixable
+	// CRITICALs block the deploy.
+	Scan bool `yaml:"scan,omitempty" toml:"scan"`
 	// EnvFiles are local dotenv/YAML files merged into the container env at
 	// deploy, resolved relative to teploy.yml. Encrypted files are decrypted
 	// on the operator's machine: *.age via the age identity, *.sops.*/*.enc.*
@@ -687,6 +691,9 @@ func mergeConfigs(base, overlay *AppConfig) {
 	}
 	if len(overlay.EnvFiles) > 0 {
 		base.EnvFiles = append(base.EnvFiles, overlay.EnvFiles...)
+	}
+	if overlay.Scan {
+		base.Scan = true
 	}
 	if overlay.KeepVersions != 0 {
 		base.KeepVersions = overlay.KeepVersions

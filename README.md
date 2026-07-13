@@ -90,6 +90,7 @@ teploy deploy
 | **Backups** | `teploy backup` — volumes to S3 |
 | **Templates** | One-command deploys for common self-hosted apps |
 | **Deploy locking** | `teploy lock` — freeze deploys during incidents |
+| **Vulnerability gate** | `scan: true` — Trivy scan blocks deploys on fixable CRITICALs |
 
 ## Config
 
@@ -156,6 +157,11 @@ healthcheck:
 hooks:
   pre_deploy: "npm run migrate"
   post_deploy: "npm run seed"
+
+# Vulnerability gate: trivy-scan the image on the server before containers
+# start. HIGH+CRITICAL findings are reported; fixable CRITICALs block the
+# deploy (unfixable base-image CVEs don't wedge you). DB caches server-side.
+scan: true
 
 accessories:
   postgres:
