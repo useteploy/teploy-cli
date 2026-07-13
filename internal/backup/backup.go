@@ -235,11 +235,17 @@ func (c *Client) AccessoryBackup(ctx context.Context, app, name, image string, e
 
 	fmt.Fprintf(c.out, "Backing up %s...\n", containerName)
 	if _, err := c.exec.Run(ctx, dumpCmd); err != nil {
+		// A failed dump can leave a partial archive (and the uncompressed
+		// intermediate) in /tmp — found live as a 200 MB orphan after a
+		// mid-tar failure. Never leave partial backups around: they're
+		// disk-fillers at best, restore-bait at worst.
+		c.exec.Run(context.WithoutCancel(ctx), fmt.Sprintf("rm -f %s %s", dumpPath, dumpTmp))
 		return fmt.Errorf("dumping %s: %w", name, err)
 	}
 
 	fmt.Fprintf(c.out, "Uploading to %s...\n", s3Key)
 	if _, err := c.exec.Run(ctx, s3.AWS(fmt.Sprintf("s3 cp %s %s", dumpPath, s3Key))); err != nil {
+		c.exec.Run(context.WithoutCancel(ctx), "rm -f "+dumpPath)
 		return fmt.Errorf("uploading to S3: %w", err)
 	}
 

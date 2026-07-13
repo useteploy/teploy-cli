@@ -132,11 +132,16 @@ func (c *Client) VerifyBackup(ctx context.Context, app, name, date string, s3 S3
 	tmpBase := fmt.Sprintf("/tmp/teploy-verify-%s-%s", app, name)
 
 	// Always clean up, pass or fail — a leftover scratch container must never
-	// survive a verification run.
+	// survive a verification run. Covers every per-type artifact: the
+	// downloaded dump (tmpBase.sql.gz/.rdb.gz/.archive.gz/.tar.gz) and the
+	// extract dir (tmpBase.d) — a 597 MB .tar.gz was found orphaned in /tmp
+	// on a prod box because only tmpBase and tmpBase.d were removed.
 	defer func() {
 		_, _ = c.exec.Run(context.WithoutCancel(ctx), fmt.Sprintf(
-			"docker rm -f %s >/dev/null 2>&1; rm -rf %s %s.d",
-			ssh.ShellQuote(scratch), ssh.ShellQuote(tmpBase), ssh.ShellQuote(tmpBase)))
+			"docker rm -f %s >/dev/null 2>&1; rm -rf %s %s.d %s.sql.gz %s.rdb.gz %s.archive.gz %s.tar.gz",
+			ssh.ShellQuote(scratch), ssh.ShellQuote(tmpBase), ssh.ShellQuote(tmpBase),
+			ssh.ShellQuote(tmpBase), ssh.ShellQuote(tmpBase), ssh.ShellQuote(tmpBase),
+			ssh.ShellQuote(tmpBase)))
 	}()
 	// Remove any stale scratch from a previous interrupted run.
 	_, _ = c.exec.Run(ctx, fmt.Sprintf("docker rm -f %s >/dev/null 2>&1 || true", ssh.ShellQuote(scratch)))
