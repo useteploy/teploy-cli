@@ -85,6 +85,95 @@ func (c *Client) EnableDatabaseSecrets(ctx context.Context, opts DBSetupOptions)
 	return nil
 }
 
+// StaticRoleOptions configures a static database role: OpenBao takes over an
+// EXISTING database user's password and rotates it on a schedule (vs. dynamic
+// roles, which mint a new short-lived user per request).
+type StaticRoleOptions struct {
+	App            string
+	Accessory      string
+	DBAccessory    string
+	DBName         string
+	AdminUser      string
+	AdminPass      string
+	Username       string // the existing DB user OpenBao will manage
+	RotationPeriod string // e.g. "24h"
+}
+
+// staticRoleName namespaces the static role by app to avoid cross-app collision.
+func staticRoleName(app, username string) string { return app + "-" + username }
+
+// EnableStaticRole registers a static role that rotates an existing DB user's
+// password every RotationPeriod. Ensures the connection exists (allowed_roles
+// "*", so both dynamic and static roles work), then writes the static role and
+// extends the app policy to read its rotating credentials. Idempotent.
+func (c *Client) EnableStaticRole(ctx context.Context, opts StaticRoleOptions) error {
+	if opts.Accessory == "" {
+		opts.Accessory = defaultAccessory
+	}
+	if opts.DBName == "" {
+		opts.DBName = opts.DBAccessory
+	}
+	if opts.AdminUser == "" {
+		opts.AdminUser = "postgres"
+	}
+	if opts.RotationPeriod == "" {
+		opts.RotationPeriod = "24h"
+	}
+	if opts.Username == "" {
+		return fmt.Errorf("static role requires --username (an existing DB user)")
+	}
+	root, err := c.rootToken(ctx, opts.App)
+	if err != nil {
+		return err
+	}
+	container := accessories.ContainerName(opts.App, opts.Accessory)
+	dbHost := accessories.ContainerName(opts.App, opts.DBAccessory)
+
+	if out, err := c.bao(ctx, container, root, "secrets enable -path=database database"); err != nil &&
+		!strings.Contains(out, "already in use") && !strings.Contains(out, "already enabled") {
+		return fmt.Errorf("enabling database engine: %s", truncate(out, 160))
+	}
+	// Connection with allowed_roles "*" so dynamic + static roles both work.
+	connURL := fmt.Sprintf("postgresql://{{username}}:{{password}}@%s:5432/%s?sslmode=disable", dbHost, opts.DBName)
+	cfg := fmt.Sprintf("write database/config/%s plugin_name=postgresql-database-plugin allowed_roles=* connection_url=%s username=%s password=%s",
+		dbConnName(opts.App), shellSingleQuote(connURL), shellSingleQuote(opts.AdminUser), shellSingleQuote(opts.AdminPass))
+	if out, err := c.bao(ctx, container, root, cfg); err != nil {
+		return fmt.Errorf("configuring db connection: %s", truncate(out, 200))
+	}
+	// Static role: OpenBao rotates opts.Username's password every RotationPeriod.
+	role := fmt.Sprintf("write database/static-roles/%s db_name=%s username=%s rotation_period=%s",
+		staticRoleName(opts.App, opts.Username), dbConnName(opts.App),
+		shellSingleQuote(opts.Username), opts.RotationPeriod)
+	if out, err := c.bao(ctx, container, root, role); err != nil {
+		return fmt.Errorf("creating static role: %s", truncate(out, 200))
+	}
+	// Grant the app read on its rotating static creds.
+	return c.writeAppPolicy(ctx, container, root, opts.App, true)
+}
+
+// StaticCreds reads the current (OpenBao-managed) credentials for a static role.
+func (c *Client) StaticCreds(ctx context.Context, app, accessory, username string) (map[string]any, error) {
+	if accessory == "" {
+		accessory = defaultAccessory
+	}
+	root, err := c.rootToken(ctx, app)
+	if err != nil {
+		return nil, err
+	}
+	container := accessories.ContainerName(app, accessory)
+	out, err := c.bao(ctx, container, root, "read -format=json database/static-creds/"+staticRoleName(app, username))
+	if err != nil {
+		return nil, fmt.Errorf("reading static creds: %s", truncate(out, 160))
+	}
+	var res struct {
+		Data map[string]any `json:"data"`
+	}
+	if err := json.Unmarshal([]byte(extractJSON(out)), &res); err != nil {
+		return nil, fmt.Errorf("parsing static creds: %w", err)
+	}
+	return res.Data, nil
+}
+
 // DBCreds reads a fresh set of dynamic database credentials.
 func (c *Client) DBCreds(ctx context.Context, app, accessory string) (map[string]any, error) {
 	if accessory == "" {
@@ -142,6 +231,8 @@ func AppReadPolicy(app string, withDB bool) string {
 	fmt.Fprintf(&b, "path \"%s/metadata/%s/*\" { capabilities = [\"read\", \"list\"] }\n", kvMount, app)
 	if withDB {
 		fmt.Fprintf(&b, "path \"database/creds/%s\" { capabilities = [\"read\"] }\n", dbRoleName(app))
+		// Static roles are namespaced by app prefix; scope the grant to them.
+		fmt.Fprintf(&b, "path \"database/static-creds/%s-*\" { capabilities = [\"read\"] }\n", app)
 	}
 	return b.String()
 }

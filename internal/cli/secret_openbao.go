@@ -32,6 +32,71 @@ func newVaultDBCmd(flags *Flags) *cobra.Command {
 	}
 	cmd.AddCommand(newVaultDBSetupCmd(flags))
 	cmd.AddCommand(newVaultDBCredsCmd(flags))
+	cmd.AddCommand(newVaultDBStaticRoleCmd(flags))
+	cmd.AddCommand(newVaultDBStaticCredsCmd(flags))
+	return cmd
+}
+
+func newVaultDBStaticRoleCmd(flags *Flags) *cobra.Command {
+	var accessory, dbAccessory, dbName, adminUser, username, rotation string
+	cmd := &cobra.Command{
+		Use:   "static-role",
+		Short: "Manage an existing DB user's password with scheduled rotation",
+		Long: `Registers a static role: OpenBao takes over an EXISTING database user's
+password and rotates it every --rotation-period (vs dynamic creds, which mint
+a new user per request). Use for a fixed app account whose password should
+rotate automatically. Idempotent.`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			adminPass, _ := cmd.Flags().GetString("admin-pass")
+			return runOpenbaoKV(flags, accessory, func(ctx context.Context, c *openbao.Client, app string) error {
+				if adminPass == "" {
+					return fmt.Errorf("--admin-pass is required (the DB accessory's superuser password)")
+				}
+				if err := c.EnableStaticRole(ctx, openbao.StaticRoleOptions{
+					App: app, Accessory: resolveVaultAccessory(accessory),
+					DBAccessory: dbAccessory, DBName: dbName, AdminUser: adminUser,
+					AdminPass: adminPass, Username: username, RotationPeriod: rotation,
+				}); err != nil {
+					return err
+				}
+				fmt.Printf("Static role enabled for %s: %s rotates every %s\n", app, username, rotation)
+				return nil
+			})
+		},
+	}
+	cmd.Flags().StringVar(&accessory, "accessory", "openbao", "OpenBao accessory name")
+	cmd.Flags().StringVar(&dbAccessory, "db-accessory", "postgres", "the database accessory")
+	cmd.Flags().StringVar(&dbName, "db-name", "", "logical database name (default: the db accessory name)")
+	cmd.Flags().StringVar(&adminUser, "admin-user", "postgres", "DB superuser OpenBao uses to rotate")
+	cmd.Flags().String("admin-pass", "", "DB superuser password")
+	cmd.Flags().StringVar(&username, "username", "", "the existing DB user to manage (required)")
+	cmd.Flags().StringVar(&rotation, "rotation-period", "24h", "how often to rotate the password")
+	return cmd
+}
+
+func newVaultDBStaticCredsCmd(flags *Flags) *cobra.Command {
+	var accessory, username string
+	cmd := &cobra.Command{
+		Use:   "static-creds",
+		Short: "Read the current rotating credentials for a static role",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runOpenbaoKV(flags, accessory, func(ctx context.Context, c *openbao.Client, app string) error {
+				if username == "" {
+					return fmt.Errorf("--username is required")
+				}
+				creds, err := c.StaticCreds(ctx, app, resolveVaultAccessory(accessory), username)
+				if err != nil {
+					return err
+				}
+				fmt.Printf("username=%v\npassword=%v\nttl=%v\n", creds["username"], creds["password"], creds["ttl"])
+				return nil
+			})
+		},
+	}
+	cmd.Flags().StringVar(&accessory, "accessory", "openbao", "OpenBao accessory name")
+	cmd.Flags().StringVar(&username, "username", "", "the DB user (required)")
 	return cmd
 }
 

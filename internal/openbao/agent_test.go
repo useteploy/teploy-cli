@@ -55,6 +55,9 @@ func TestAppReadPolicy(t *testing.T) {
 	if !strings.Contains(withDB, `path "database/creds/myapp-role" { capabilities = ["read"] }`) {
 		t.Errorf("withDB policy must grant db creds read: %s", withDB)
 	}
+	if !strings.Contains(withDB, `path "database/static-creds/myapp-*" { capabilities = ["read"] }`) {
+		t.Errorf("withDB policy must grant static-creds read (app-scoped): %s", withDB)
+	}
 }
 
 func TestSecretsVolumeAndMount(t *testing.T) {
