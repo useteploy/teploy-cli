@@ -368,8 +368,10 @@ teploy secret set KEY=value --provider openbao
 teploy secret get / list --provider openbao # same verbs, managed backend
 
 teploy secret setup                          # provision + auto-unseal OpenBao (idempotent)
+teploy secret setup --replicas 3             # HA: a 3-node Raft quorum
+teploy secret setup --seal transit --transit-address ... --transit-token ...  # off-box key
 teploy secret put db password=s3cr3t host=pg # multi-field secret (openbao)
-teploy secret status                         # seal/init status
+teploy secret status                         # seal/init status (+ Raft cluster in HA)
 
 # Reference a secret from teploy.yml — fetched + injected at deploy:
 #   env: { DB_PASSWORD: "secret:db#password" }   # multi-field
@@ -379,20 +381,32 @@ teploy secret status                         # seal/init status
 teploy secret db setup --db-accessory postgres --admin-pass <pw>
 teploy secret db creds                       # on-demand ephemeral credentials
 
+# Rotate an EXISTING db user's password on a schedule (static role):
+teploy secret db static-role --username appuser --rotation-period 24h --admin-pass <pw>
+teploy secret db static-creds --username appuser
+
 # Ship secret-access events into the observe tamper-evident audit trail:
-teploy secret audit-ship                     # run on a schedule to stream continuously
+teploy secret audit ship                     # one-shot forward
+teploy secret audit enable --interval 300    # timer: stream continuously
 ```
 
 - **Auto-unseal**: a static-env-key seal (key held in the app's encrypted local
   store) means OpenBao unseals itself on every restart — no manual ceremony.
-  Cloud KMS / Transit seals are first-class upgrades for off-box keys.
+  `--seal awskms|transit` hold the key off-box (KMS / a second OpenBao) for
+  disk-theft/root-compromise protection; the credentials ride a 0600 env-file,
+  never the config.
+- **High availability**: `--replicas 3` (or 5) runs a Raft quorum. Nodes
+  auto-unseal + auto-join; the cluster tolerates losing a node (reads *and*
+  writes keep working), and a recovered node auto-rejoins.
 - **Least privilege**: each app gets a scoped AppRole (read-only on its own
   secrets); cross-app reads and writes are denied.
-- **Dynamic secrets + rotation**: set `secret: { provider: openbao, agent: true }`
-  to run an OpenBao Agent sidecar that renders auto-rotating dynamic DB
-  credentials to `/vault/secrets/db.env` in the app — the app just re-reads it.
-- **Tamper-evident audit**: `secret audit-ship` forwards every secret access into
-  observe's hash-chained audit trail, so access is cryptographically verifiable.
+- **Dynamic + static rotation**: dynamic creds mint a new short-lived DB user
+  per request; static roles rotate an existing account's password on a schedule.
+  Set `secret: { provider: openbao, agent: true }` to run an OpenBao Agent
+  sidecar that renders auto-rotating creds to `/vault/secrets/db.env` in the app.
+- **Tamper-evident audit**: `secret audit ship/enable` forwards every secret
+  access into observe's hash-chained audit trail — access is cryptographically
+  verifiable, and can't be silently altered.
 
 ### Auto-deploy
 ```
