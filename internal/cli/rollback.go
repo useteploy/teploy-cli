@@ -110,6 +110,13 @@ func runRollback(flags *Flags, toHash string) error {
 		}
 	}
 
+	// Audit the rollback (fire-and-forget; no-op unless `audit:` is configured).
+	target := toHash
+	if target == "" {
+		target = "previous"
+	}
+	emitDeployAudit(ctx, appCfg, "deploy.rollback", target, executor.Host(), rollbackErr)
+
 	return rollbackErr
 }
 

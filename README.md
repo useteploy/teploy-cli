@@ -156,6 +156,14 @@ firewall:
 # with Cloudflare/another proxy, remote_ip is the PROXY's IP — use that proxy's
 # own IP rules instead, or set trusted_proxies via caddy_extra.
 
+# Record deploys/rollbacks in a teploy-observe audit trail (compliance).
+# Fire-and-forget; a failed emit never fails a deploy. token is an observe
+# editor+ credential. Omit the block to disable.
+audit:
+  endpoint: https://observe.example.com
+  token: ${OBSERVE_AUDIT_TOKEN}
+  site: default
+
 volumes:
   data: /app/data
 

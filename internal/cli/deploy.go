@@ -14,6 +14,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/useteploy/teploy/internal/accessories"
+	"github.com/useteploy/teploy/internal/audit"
 	"github.com/useteploy/teploy/internal/build"
 	"github.com/useteploy/teploy/internal/caddy"
 	"github.com/useteploy/teploy/internal/config"
@@ -583,6 +584,10 @@ func deployBuiltImage(ctx context.Context, executor ssh.Executor, appCfg *config
 		}
 	}
 
+	// Emit a deploy audit event to observe (fire-and-forget; no-op unless
+	// `audit:` is configured). Captures who shipped what version where.
+	emitDeployAudit(ctx, appCfg, "deploy.run", version, serverDisplay, deployErr)
+
 	if deployErr != nil {
 		return deployErr
 	}
@@ -818,6 +823,26 @@ func caddyFirewall(f config.FirewallConfig) caddy.Firewall {
 		DenyIPs:         f.DenyIPs,
 		BlockUserAgents: f.BlockUserAgents,
 		MaxBodySize:     f.MaxBodySize,
+	}
+}
+
+// emitDeployAudit records a deploy/rollback/scale event to observe if the app
+// configures `audit:`. Fire-and-forget — a failed emit only warns.
+func emitDeployAudit(ctx context.Context, appCfg *config.AppConfig, action, version, server string, actionErr error) {
+	if appCfg.Audit.Endpoint == "" {
+		return
+	}
+	result := "success"
+	if actionErr != nil {
+		result = "failure"
+	}
+	if err := audit.Emit(ctx, appCfg.Audit.Endpoint, appCfg.Audit.Token, appCfg.Audit.Site, audit.Event{
+		Action:   action,
+		Target:   appCfg.App + "@" + version,
+		Result:   result,
+		Metadata: map[string]any{"server": server, "version": version},
+	}); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: audit emit failed: %v\n", err)
 	}
 }
 

@@ -301,6 +301,16 @@ type AppConfig struct {
 	KeepReleases int               `yaml:"keep_releases,omitempty" toml:"keep_releases"` // retention count (default 5)
 	CaddyExtra   string            `yaml:"caddy_extra,omitempty" toml:"caddy_extra"`     // raw Caddy directives appended into the site block
 	Firewall     FirewallConfig    `yaml:"firewall,omitempty" toml:"firewall"`           // edge hardening: IP allow/deny, UA block, body-size cap
+	Audit        AuditConfig       `yaml:"audit,omitempty" toml:"audit"`                 // emit deploy/rollback events to teploy-observe
+}
+
+// AuditConfig points the CLI at a teploy-observe instance so deploy/rollback/
+// scale actions are recorded in the compliance/audit trail. Blank endpoint =
+// disabled. The token is an observe editor+ credential.
+type AuditConfig struct {
+	Endpoint string `yaml:"endpoint,omitempty" toml:"endpoint"`
+	Token    string `yaml:"token,omitempty" toml:"token"`
+	Site     string `yaml:"site,omitempty" toml:"site"`
 }
 
 // FirewallConfig is the per-app Caddy edge hardening (reverse-proxy / load-
