@@ -21,6 +21,9 @@ and wired for per-app least-privilege secret access.`,
 	}
 	cmd.AddCommand(newVaultSetupCmd(flags))
 	cmd.AddCommand(newVaultStatusCmd(flags))
+	cmd.AddCommand(newVaultPutCmd(flags))
+	cmd.AddCommand(newVaultGetCmd(flags))
+	cmd.AddCommand(newVaultListCmd(flags))
 	return cmd
 }
 
@@ -71,7 +74,109 @@ func runVaultSetup(flags *Flags, accessory, image string) error {
 	defer executor.Close()
 
 	client := vault.NewClient(executor, os.Stdout)
-	return client.Setup(ctx, vault.SetupOptions{App: appCfg.App, Accessory: accessory, Image: image})
+	if err := client.Setup(ctx, vault.SetupOptions{App: appCfg.App, Accessory: accessory, Image: image}); err != nil {
+		return err
+	}
+	// Provision the per-app least-privilege AppRole so deploys can fetch secrets
+	// with a scoped identity (not the root token).
+	if _, err := client.EnsureAppRole(ctx, appCfg.App, resolveVaultAccessory(accessory)); err != nil {
+		return fmt.Errorf("provisioning app AppRole: %w", err)
+	}
+	fmt.Println("Provisioned least-privilege AppRole for", appCfg.App)
+	return nil
+}
+
+// resolveVaultAccessory mirrors the client's default so command wiring can pass
+// a concrete accessory name.
+func resolveVaultAccessory(accessory string) string {
+	if accessory == "" {
+		return "openbao"
+	}
+	return accessory
+}
+
+func newVaultPutCmd(flags *Flags) *cobra.Command {
+	var accessory string
+	cmd := &cobra.Command{
+		Use:   "put <name> <key=value>...",
+		Short: "Write secret values under secret/<app>/<name>",
+		Args:  cobra.MinimumNArgs(2),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runVaultKV(flags, accessory, func(ctx context.Context, c *vault.Client, app string) error {
+				return c.Put(ctx, app, resolveVaultAccessory(accessory), args[0], args[1:])
+			})
+		},
+	}
+	cmd.Flags().StringVar(&accessory, "accessory", "openbao", "accessory/container name for OpenBao")
+	return cmd
+}
+
+func newVaultGetCmd(flags *Flags) *cobra.Command {
+	var accessory string
+	cmd := &cobra.Command{
+		Use:   "get <name>",
+		Short: "Read secret values at secret/<app>/<name>",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runVaultKV(flags, accessory, func(ctx context.Context, c *vault.Client, app string) error {
+				data, err := c.Get(ctx, app, resolveVaultAccessory(accessory), args[0])
+				if err != nil {
+					return err
+				}
+				for k, v := range data {
+					fmt.Printf("%s=%v\n", k, v)
+				}
+				return nil
+			})
+		},
+	}
+	cmd.Flags().StringVar(&accessory, "accessory", "openbao", "accessory/container name for OpenBao")
+	return cmd
+}
+
+func newVaultListCmd(flags *Flags) *cobra.Command {
+	var accessory string
+	cmd := &cobra.Command{
+		Use:   "list",
+		Short: "List secret names under secret/<app>/",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runVaultKV(flags, accessory, func(ctx context.Context, c *vault.Client, app string) error {
+				names, err := c.List(ctx, app, resolveVaultAccessory(accessory))
+				if err != nil {
+					return err
+				}
+				if len(names) == 0 {
+					fmt.Println("No secrets stored")
+					return nil
+				}
+				for _, n := range names {
+					fmt.Println(n)
+				}
+				return nil
+			})
+		},
+	}
+	cmd.Flags().StringVar(&accessory, "accessory", "openbao", "accessory/container name for OpenBao")
+	return cmd
+}
+
+// runVaultKV loads the app, connects, and runs fn with a vault client.
+func runVaultKV(flags *Flags, accessory string, fn func(ctx context.Context, c *vault.Client, app string) error) error {
+	appCfg, err := config.LoadApp(".")
+	if err != nil {
+		return err
+	}
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer cancel()
+
+	executor, err := connectForApp(ctx, flags, appCfg)
+	if err != nil {
+		return err
+	}
+	defer executor.Close()
+
+	return fn(ctx, vault.NewClient(executor, os.Stdout), appCfg.App)
 }
 
 func runVaultStatus(flags *Flags, accessory string) error {
