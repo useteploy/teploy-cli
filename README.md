@@ -405,11 +405,14 @@ teploy deploy -d staging
 
 The overlay merges on top of base config — override only what differs per environment.
 
-## Keeping secrets out of git
+## CI/CD
 
-Teploy doesn't bundle a CI runner — it integrates with the one you run. For
-secrets scanning (catching a committed API key before it's in history forever),
-drop the Gitleaks recipe into your Forgejo/GitHub Actions or a pre-commit hook —
+Teploy doesn't bundle a CI runner — it integrates with the one you run. To wire
+push-to-deploy into Forgejo or GitHub Actions (build → test → `teploy deploy`),
+or the no-secrets webhook alternative, see [docs/ci-deploy.md](docs/ci-deploy.md).
+
+For **secrets scanning** (catching a committed API key before it's in history
+forever), drop the Gitleaks recipe into your Actions or a pre-commit hook —
 see [docs/secrets-scanning.md](docs/secrets-scanning.md). For runtime secrets,
 use `teploy secret set` or SOPS/age `env_files:`, never plaintext in the repo.
 
