@@ -470,6 +470,11 @@ func deployBuiltImage(ctx context.Context, executor ssh.Executor, appCfg *config
 	if err != nil {
 		return fmt.Errorf("decrypting secrets: %w", err)
 	}
+	// Resolve any `vault:<name>#<key>` references in env: from OpenBao and merge
+	// them in (they win over plaintext env, same as decrypted secrets).
+	if err := mergeVaultRefs(ctx, executor, appCfg, deploySecrets); err != nil {
+		return err
+	}
 
 	// 10. Resolve persistent volumes.
 	var volumes map[string]string

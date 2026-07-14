@@ -191,6 +191,11 @@ func (s *singleServerDeployer) deployApp(ctx context.Context, appCfg *config.App
 	if err != nil {
 		return fmt.Errorf("decrypting secrets: %w", err)
 	}
+	// Resolve `vault:<name>#<key>` env references from OpenBao (both deploy
+	// paths must do this — see the multi-server-secrets bug noted above).
+	if err := mergeVaultRefs(ctx, s.exec, appCfg, deploySecrets); err != nil {
+		return err
+	}
 
 	// Container env: teploy.yml's `env:` block, per-host tags (from
 	// servers.yml), and decrypted secrets, uploaded to a fresh env file

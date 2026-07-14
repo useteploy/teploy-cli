@@ -8,6 +8,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/useteploy/teploy/internal/config"
+	"github.com/useteploy/teploy/internal/ssh"
 	"github.com/useteploy/teploy/internal/vault"
 )
 
@@ -159,6 +160,24 @@ func newVaultListCmd(flags *Flags) *cobra.Command {
 	}
 	cmd.Flags().StringVar(&accessory, "accessory", "openbao", "accessory/container name for OpenBao")
 	return cmd
+}
+
+// mergeVaultRefs resolves any `vault:<name>#<key>` references in the app's env:
+// block from OpenBao and merges them into dst (the deploy secrets map). A no-op
+// when the app has no vault references, so it's safe to call on every deploy.
+// Uses the given executor (works for both the single- and multi-server paths).
+func mergeVaultRefs(ctx context.Context, exec ssh.Executor, appCfg *config.AppConfig, dst map[string]string) error {
+	if len(vault.CollectRefs(appCfg.Env)) == 0 {
+		return nil
+	}
+	resolved, err := vault.NewClient(exec, os.Stderr).ResolveEnvRefs(ctx, appCfg.App, appCfg.Vault.Accessory, appCfg.Env)
+	if err != nil {
+		return fmt.Errorf("resolving vault references: %w", err)
+	}
+	for k, v := range resolved {
+		dst[k] = v
+	}
+	return nil
 }
 
 // runVaultKV loads the app, connects, and runs fn with a vault client.

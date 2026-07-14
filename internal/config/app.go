@@ -303,6 +303,14 @@ type AppConfig struct {
 	Firewall     FirewallConfig    `yaml:"firewall,omitempty" toml:"firewall"`           // edge hardening: IP allow/deny, UA block, body-size cap
 	Audit        AuditConfig       `yaml:"audit,omitempty" toml:"audit"`                 // emit deploy/rollback events to teploy-observe
 	Access       AccessConfig      `yaml:"access,omitempty" toml:"access"`               // inbound access gate: basic auth / forward auth
+	Vault        VaultConfig       `yaml:"vault,omitempty" toml:"vault"`                 // OpenBao secrets integration
+}
+
+// VaultConfig configures the OpenBao secrets integration for an app. Env values
+// of the form `vault:<name>#<key>` are resolved from OpenBao at deploy time.
+type VaultConfig struct {
+	// Accessory is the OpenBao accessory/container name (default "openbao").
+	Accessory string `yaml:"accessory,omitempty" toml:"accessory"`
 }
 
 // AccessConfig is the per-app inbound access gate (the self-hostable half of
