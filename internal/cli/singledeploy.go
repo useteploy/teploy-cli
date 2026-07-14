@@ -148,6 +148,13 @@ func (s *singleServerDeployer) deployApp(ctx context.Context, appCfg *config.App
 		}
 	}
 
+	// If the OpenBao Agent sidecar is enabled, (re)deploy it and mount the
+	// shared secrets volume into the app (both deploy paths must do this).
+	volumes, err = ensureVaultAgent(ctx, s.exec, appCfg, volumes)
+	if err != nil {
+		return err
+	}
+
 	// Detect any existing container whose volume mount source doesn't match
 	// what teploy resolved above — same guard as the single-server path
 	// (deployAppConfig). Without it, redeploying an app first launched with a

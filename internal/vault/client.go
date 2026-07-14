@@ -221,7 +221,15 @@ func (c *Client) bao(ctx context.Context, container, token, args string) (string
 		env += " BAO_TOKEN=" + token
 	}
 	// docker.Exec wraps `docker exec <c> sh -c <cmd>`; we build the inner cmd.
-	return c.docker.Exec(ctx, container, env+" bao "+args)
+	out, err := c.docker.Exec(ctx, container, env+" bao "+args)
+	if err != nil {
+		// The SSH executor discards stdout on a non-zero exit and folds bao's
+		// stderr into the error. Return that text as the "output" so callers can
+		// inspect one string for messages / idempotency markers ("already in
+		// use"). On success, out is the real stdout (e.g. JSON).
+		return err.Error(), err
+	}
+	return out, nil
 }
 
 func (c *Client) status(ctx context.Context, container string) (*Status, error) {

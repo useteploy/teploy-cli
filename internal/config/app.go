@@ -311,6 +311,9 @@ type AppConfig struct {
 type VaultConfig struct {
 	// Accessory is the OpenBao accessory/container name (default "openbao").
 	Accessory string `yaml:"accessory,omitempty" toml:"accessory"`
+	// Agent enables the OpenBao Agent sidecar: dynamic secrets are rendered to
+	// a shared volume mounted at /vault/secrets in the app, and auto-rotated.
+	Agent bool `yaml:"agent,omitempty" toml:"agent"`
 }
 
 // AccessConfig is the per-app inbound access gate (the self-hostable half of

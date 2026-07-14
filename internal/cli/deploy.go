@@ -489,6 +489,13 @@ func deployBuiltImage(ctx context.Context, executor ssh.Executor, appCfg *config
 		}
 	}
 
+	// 10-vault. If the OpenBao Agent sidecar is enabled, (re)deploy it and mount
+	// the shared secrets volume into the app.
+	volumes, err = ensureVaultAgent(ctx, executor, appCfg, volumes)
+	if err != nil {
+		return err
+	}
+
 	// 10a. Detect any existing container whose volume mount source doesn't match
 	// what teploy resolved above. Without this check, redeploying an app that
 	// was originally launched with a Docker named volume (or any non-teploy

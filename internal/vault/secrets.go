@@ -120,13 +120,13 @@ func (c *Client) EnsureAppRole(ctx context.Context, app, accessory string) (*App
 	policyName := app + "-read"
 	roleName := app
 
-	// 1. Least-privilege policy: read only this app's secrets.
-	policy := fmt.Sprintf(`path "%s/data/%s/*" { capabilities = ["read"] }
-path "%s/metadata/%s/*" { capabilities = ["read", "list"] }
-`, kvMount, app, kvMount, app)
-	if out, err := c.bao(ctx, container, root, "policy write "+policyName+" - <<'EOF'\n"+policy+"EOF"); err != nil {
-		return nil, fmt.Errorf("writing policy: %s", truncate(out, 160))
+	// 1. Least-privilege policy: read only this app's secrets. Shared with
+	// EnableDatabaseSecrets via AppReadPolicy. Detect an already-configured DB
+	// role so re-running setup after `vault db setup` preserves the DB grant.
+	if err := c.writeAppPolicy(ctx, container, root, app, c.hasDBRole(ctx, container, root, app)); err != nil {
+		return nil, err
 	}
+	_ = policyName
 
 	// 2. Enable approle auth (idempotent).
 	if out, err := c.bao(ctx, container, root, "auth enable approle"); err != nil &&

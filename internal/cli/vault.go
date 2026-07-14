@@ -25,6 +25,77 @@ and wired for per-app least-privilege secret access.`,
 	cmd.AddCommand(newVaultPutCmd(flags))
 	cmd.AddCommand(newVaultGetCmd(flags))
 	cmd.AddCommand(newVaultListCmd(flags))
+	cmd.AddCommand(newVaultDBCmd(flags))
+	return cmd
+}
+
+func newVaultDBCmd(flags *Flags) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "db",
+		Short: "Dynamic database credentials (short-lived, auto-revoked)",
+	}
+	cmd.AddCommand(newVaultDBSetupCmd(flags))
+	cmd.AddCommand(newVaultDBCredsCmd(flags))
+	return cmd
+}
+
+func newVaultDBSetupCmd(flags *Flags) *cobra.Command {
+	var accessory, dbAccessory, dbName, adminUser, ttl, maxTTL string
+	cmd := &cobra.Command{
+		Use:   "setup",
+		Short: "Wire OpenBao to issue short-lived credentials for a database accessory",
+		Long: `Configures OpenBao's database secrets engine against a Postgres accessory so
+apps get short-lived, auto-revoked credentials instead of a static password.
+The admin password is read from the accessory's stored credentials unless
+--admin-pass is given. Extends the app's AppRole policy to read the dynamic
+creds. Idempotent.`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			adminPass, _ := cmd.Flags().GetString("admin-pass")
+			return runVaultKV(flags, accessory, func(ctx context.Context, c *vault.Client, app string) error {
+				if adminPass == "" {
+					return fmt.Errorf("--admin-pass is required (the DB accessory's superuser password)")
+				}
+				if err := c.EnableDatabaseSecrets(ctx, vault.DBSetupOptions{
+					App: app, Accessory: resolveVaultAccessory(accessory),
+					DBAccessory: dbAccessory, DBName: dbName, AdminUser: adminUser,
+					AdminPass: adminPass, TTL: ttl, MaxTTL: maxTTL,
+				}); err != nil {
+					return err
+				}
+				fmt.Printf("Dynamic DB credentials enabled for %s (db accessory: %s, TTL: %s)\n", app, dbAccessory, ttl)
+				return nil
+			})
+		},
+	}
+	cmd.Flags().StringVar(&accessory, "accessory", "openbao", "OpenBao accessory name")
+	cmd.Flags().StringVar(&dbAccessory, "db-accessory", "postgres", "the database accessory to issue creds for")
+	cmd.Flags().StringVar(&dbName, "db-name", "", "logical database name (default: the db accessory name)")
+	cmd.Flags().StringVar(&adminUser, "admin-user", "postgres", "DB superuser OpenBao uses to create roles")
+	cmd.Flags().String("admin-pass", "", "DB superuser password")
+	cmd.Flags().StringVar(&ttl, "ttl", "1h", "default credential lease TTL")
+	cmd.Flags().StringVar(&maxTTL, "max-ttl", "24h", "maximum credential lease TTL")
+	return cmd
+}
+
+func newVaultDBCredsCmd(flags *Flags) *cobra.Command {
+	var accessory string
+	cmd := &cobra.Command{
+		Use:   "creds",
+		Short: "Request a fresh set of dynamic database credentials",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runVaultKV(flags, accessory, func(ctx context.Context, c *vault.Client, app string) error {
+				creds, err := c.DBCreds(ctx, app, resolveVaultAccessory(accessory))
+				if err != nil {
+					return err
+				}
+				fmt.Printf("username=%v\npassword=%v\n", creds["username"], creds["password"])
+				return nil
+			})
+		},
+	}
+	cmd.Flags().StringVar(&accessory, "accessory", "openbao", "OpenBao accessory name")
 	return cmd
 }
 
@@ -178,6 +249,28 @@ func mergeVaultRefs(ctx context.Context, exec ssh.Executor, appCfg *config.AppCo
 		dst[k] = v
 	}
 	return nil
+}
+
+// ensureVaultAgent, when the app enables the OpenBao Agent sidecar
+// (vault.agent: true), (re)deploys the agent and mounts the shared secrets
+// volume into the app so it can read /vault/secrets/db.env (auto-rotating
+// dynamic credentials). Returns the (possibly newly-allocated) volumes map. A
+// no-op when the agent is disabled.
+func ensureVaultAgent(ctx context.Context, exec ssh.Executor, appCfg *config.AppConfig, volumes map[string]string) (map[string]string, error) {
+	if !appCfg.Vault.Agent {
+		return volumes, nil
+	}
+	client := vault.NewClient(exec, os.Stderr)
+	if err := client.DeployAgent(ctx, appCfg.App, appCfg.Vault.Accessory, []vault.AgentTemplate{vault.DBEnvTemplate(appCfg.App)}); err != nil {
+		return nil, fmt.Errorf("deploying vault agent: %w", err)
+	}
+	if volumes == nil {
+		volumes = make(map[string]string, 1)
+	}
+	// Named volume shared with the agent; docker accepts a volume name as a
+	// mount source. Mounted read-only into the app — it only consumes secrets.
+	volumes[vault.SecretsVolume(appCfg.App)] = vault.AgentMountPath + ":ro"
+	return volumes, nil
 }
 
 // runVaultKV loads the app, connects, and runs fn with a vault client.
