@@ -354,36 +354,44 @@ alert on failure via the app's `notifications` config — `create` uses all
 channels; the headless cron job posts to the first **webhook** channel (SMTP and
 other channels need the CLI, which isn't on the server).
 
-### Secrets (OpenBao)
+### Managed secrets (OpenBao provider)
 
-First-class OpenBao (a Vault-compatible secrets manager) as a Teploy accessory —
-provisioned, auto-unsealed, and wired for least-privilege access in one command.
+`teploy secret` is provider-abstracted (like `teploy network`): the default
+**`local`** provider is the built-in age store; **`openbao`** is a managed
+OpenBao secrets manager — provisioned, auto-unsealed, and wired for
+least-privilege access in one command. Select it with `--provider openbao` or
+`secret.provider: openbao` in teploy.yml.
 
 ```
-teploy vault setup                 # deploy + init + auto-unseal OpenBao (idempotent)
-teploy vault put db password=s3cr3t host=pg.internal
-teploy vault get db / list / status
+teploy secret set KEY=value                 # local (age) — the default provider
+teploy secret set KEY=value --provider openbao
+teploy secret get / list --provider openbao # same verbs, managed backend
+
+teploy secret setup                          # provision + auto-unseal OpenBao (idempotent)
+teploy secret put db password=s3cr3t host=pg # multi-field secret (openbao)
+teploy secret status                         # seal/init status
 
 # Reference a secret from teploy.yml — fetched + injected at deploy:
-#   env: { DB_PASSWORD: "vault:db#password" }
+#   env: { DB_PASSWORD: "secret:db#password" }   # multi-field
+#   env: { API_KEY: "secret:API_KEY" }           # flat (defaults to the value field)
 
 # Dynamic, short-lived, auto-revoked database credentials:
-teploy vault db setup --db-accessory postgres --admin-pass <pw>
-teploy vault db creds              # on-demand ephemeral credentials
+teploy secret db setup --db-accessory postgres --admin-pass <pw>
+teploy secret db creds                       # on-demand ephemeral credentials
 
 # Ship secret-access events into the observe tamper-evident audit trail:
-teploy vault audit-ship            # run on a schedule to stream continuously
+teploy secret audit-ship                     # run on a schedule to stream continuously
 ```
 
-- **Auto-unseal**: a static-env-key seal (key held in the app's encrypted
-  secret store) means OpenBao unseals itself on every restart — no manual
-  ceremony. Cloud KMS / Transit seals are first-class upgrades for off-box keys.
+- **Auto-unseal**: a static-env-key seal (key held in the app's encrypted local
+  store) means OpenBao unseals itself on every restart — no manual ceremony.
+  Cloud KMS / Transit seals are first-class upgrades for off-box keys.
 - **Least privilege**: each app gets a scoped AppRole (read-only on its own
   secrets); cross-app reads and writes are denied.
-- **Dynamic secrets + rotation**: set `vault: { agent: true }` to run an OpenBao
-  Agent sidecar that renders auto-rotating dynamic DB credentials to
-  `/vault/secrets/db.env` in the app — the app just re-reads the file.
-- **Tamper-evident audit**: `vault audit-ship` forwards every secret access into
+- **Dynamic secrets + rotation**: set `secret: { provider: openbao, agent: true }`
+  to run an OpenBao Agent sidecar that renders auto-rotating dynamic DB
+  credentials to `/vault/secrets/db.env` in the app — the app just re-reads it.
+- **Tamper-evident audit**: `secret audit-ship` forwards every secret access into
   observe's hash-chained audit trail, so access is cryptographically verifiable.
 
 ### Auto-deploy

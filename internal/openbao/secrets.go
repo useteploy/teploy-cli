@@ -1,4 +1,4 @@
-package vault
+package openbao
 
 import (
 	"context"
@@ -37,6 +37,9 @@ func appPath(app, name string) string {
 // Put writes key=value pairs to secret/<app>/<name>. Values are shell-quoted
 // for the inner container shell.
 func (c *Client) Put(ctx context.Context, app, accessory, name string, kvs []string) error {
+	if accessory == "" {
+		accessory = defaultAccessory
+	}
 	root, err := c.rootToken(ctx, app)
 	if err != nil {
 		return err
@@ -59,6 +62,9 @@ func (c *Client) Put(ctx context.Context, app, accessory, name string, kvs []str
 
 // Get returns the key/value data at secret/<app>/<name>.
 func (c *Client) Get(ctx context.Context, app, accessory, name string) (map[string]any, error) {
+	if accessory == "" {
+		accessory = defaultAccessory
+	}
 	root, err := c.rootToken(ctx, app)
 	if err != nil {
 		return nil, err
@@ -81,6 +87,9 @@ func (c *Client) Get(ctx context.Context, app, accessory, name string) (map[stri
 
 // List returns the secret names under secret/<app>/.
 func (c *Client) List(ctx context.Context, app, accessory string) ([]string, error) {
+	if accessory == "" {
+		accessory = defaultAccessory
+	}
 	root, err := c.rootToken(ctx, app)
 	if err != nil {
 		return nil, err

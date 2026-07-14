@@ -3,7 +3,7 @@
 // per-app least-privilege secret access. It reuses the accessory container
 // plumbing for run/network/volume/restart and the age secret store for the
 // seal key, root token, and AppRole credentials.
-package vault
+package openbao
 
 import (
 	"crypto/rand"

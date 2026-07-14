@@ -1,4 +1,4 @@
-package vault
+package openbao
 
 import (
 	"context"
@@ -6,22 +6,30 @@ import (
 	"strings"
 )
 
-// VaultRefPrefix marks a teploy.yml env value that should be resolved from
-// OpenBao at deploy time, e.g.  env: { DB_PASS: "vault:db#password" } fetches
-// key `password` from secret/<app>/db.
-const VaultRefPrefix = "vault:"
+// SecretRefPrefix marks a teploy.yml env value that should be resolved from the
+// managed secrets provider at deploy time, e.g. env: { DB_PASS: "secret:db#password" }
+// fetches field `password` from secret/<app>/db. The "#field" is optional and
+// defaults to "value" — so a flat secret set via `teploy secret set DB_PASS=…`
+// (stored as a single "value" field) is referenced simply as "secret:DB_PASS".
+const SecretRefPrefix = "secret:"
 
-// ParseRef splits a "vault:<name>#<key>" reference into (name, key). A missing
-// "#key" fetches the whole secret's sole/first field is NOT assumed — key is
-// required so resolution is unambiguous.
+// defaultSecretField is the field a flat `secret set KEY=value` stores under.
+const defaultSecretField = "value"
+
+// ParseRef splits a "secret:<name>[#<field>]" reference into (name, field). A
+// missing "#field" defaults to "value" (the flat-secret field). Returns
+// ok=false for non-references or an empty name.
 func ParseRef(value string) (name, key string, ok bool) {
-	if !strings.HasPrefix(value, VaultRefPrefix) {
+	if !strings.HasPrefix(value, SecretRefPrefix) {
 		return "", "", false
 	}
-	rest := strings.TrimPrefix(value, VaultRefPrefix)
+	rest := strings.TrimPrefix(value, SecretRefPrefix)
 	name, key, found := strings.Cut(rest, "#")
-	if !found || name == "" || key == "" {
+	if name == "" {
 		return "", "", false
+	}
+	if !found || key == "" {
+		key = defaultSecretField
 	}
 	return name, key, true
 }

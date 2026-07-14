@@ -9,25 +9,19 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/useteploy/teploy/internal/config"
 	"github.com/useteploy/teploy/internal/ssh"
-	"github.com/useteploy/teploy/internal/vault"
+	"github.com/useteploy/teploy/internal/openbao"
 )
 
-func newVaultCmd(flags *Flags) *cobra.Command {
-	cmd := &cobra.Command{
-		Use:   "vault",
-		Short: "Manage the OpenBao secrets manager accessory",
-		Long: `Provision and operate OpenBao (a Vault-compatible secrets manager) as a
-first-class Teploy accessory: deployed on the private network, auto-unsealed,
-and wired for per-app least-privilege secret access.`,
-	}
+// addOpenbaoSecretCommands attaches the managed-provider (OpenBao) operations
+// to the `teploy secret` command. The universal set/get/list live on the parent
+// (provider-aware); these are the OpenBao-specific lifecycle + advanced ops
+// (provision, status, multi-field put, dynamic DB creds, audit shipping).
+func addOpenbaoSecretCommands(cmd *cobra.Command, flags *Flags, provider *string) {
 	cmd.AddCommand(newVaultSetupCmd(flags))
 	cmd.AddCommand(newVaultStatusCmd(flags))
 	cmd.AddCommand(newVaultPutCmd(flags))
-	cmd.AddCommand(newVaultGetCmd(flags))
-	cmd.AddCommand(newVaultListCmd(flags))
 	cmd.AddCommand(newVaultDBCmd(flags))
 	cmd.AddCommand(newVaultAuditShipCmd(flags))
-	return cmd
 }
 
 func newVaultAuditShipCmd(flags *Flags) *cobra.Command {
@@ -41,7 +35,7 @@ into the teploy-observe tamper-evident audit trail (using the app's audit:
 shipped. Run on a schedule (cron / systemd timer) to stream access continuously.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runVaultKV(flags, accessory, func(ctx context.Context, c *vault.Client, app string) error {
+			return runOpenbaoKV(flags, accessory, func(ctx context.Context, c *openbao.Client, app string) error {
 				appCfg, _ := config.LoadApp(".")
 				n, err := c.ShipAudit(ctx, app, resolveVaultAccessory(accessory),
 					appCfg.Audit.Endpoint, appCfg.Audit.Token, appCfg.Audit.Site)
@@ -80,11 +74,11 @@ creds. Idempotent.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			adminPass, _ := cmd.Flags().GetString("admin-pass")
-			return runVaultKV(flags, accessory, func(ctx context.Context, c *vault.Client, app string) error {
+			return runOpenbaoKV(flags, accessory, func(ctx context.Context, c *openbao.Client, app string) error {
 				if adminPass == "" {
 					return fmt.Errorf("--admin-pass is required (the DB accessory's superuser password)")
 				}
-				if err := c.EnableDatabaseSecrets(ctx, vault.DBSetupOptions{
+				if err := c.EnableDatabaseSecrets(ctx, openbao.DBSetupOptions{
 					App: app, Accessory: resolveVaultAccessory(accessory),
 					DBAccessory: dbAccessory, DBName: dbName, AdminUser: adminUser,
 					AdminPass: adminPass, TTL: ttl, MaxTTL: maxTTL,
@@ -113,7 +107,7 @@ func newVaultDBCredsCmd(flags *Flags) *cobra.Command {
 		Short: "Request a fresh set of dynamic database credentials",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runVaultKV(flags, accessory, func(ctx context.Context, c *vault.Client, app string) error {
+			return runOpenbaoKV(flags, accessory, func(ctx context.Context, c *openbao.Client, app string) error {
 				creds, err := c.DBCreds(ctx, app, resolveVaultAccessory(accessory))
 				if err != nil {
 					return err
@@ -173,8 +167,8 @@ func runVaultSetup(flags *Flags, accessory, image string) error {
 	}
 	defer executor.Close()
 
-	client := vault.NewClient(executor, os.Stdout)
-	if err := client.Setup(ctx, vault.SetupOptions{App: appCfg.App, Accessory: accessory, Image: image}); err != nil {
+	client := openbao.NewClient(executor, os.Stdout)
+	if err := client.Setup(ctx, openbao.SetupOptions{App: appCfg.App, Accessory: accessory, Image: image}); err != nil {
 		return err
 	}
 	// Provision the per-app least-privilege AppRole so deploys can fetch secrets
@@ -202,7 +196,7 @@ func newVaultPutCmd(flags *Flags) *cobra.Command {
 		Short: "Write secret values under secret/<app>/<name>",
 		Args:  cobra.MinimumNArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runVaultKV(flags, accessory, func(ctx context.Context, c *vault.Client, app string) error {
+			return runOpenbaoKV(flags, accessory, func(ctx context.Context, c *openbao.Client, app string) error {
 				return c.Put(ctx, app, resolveVaultAccessory(accessory), args[0], args[1:])
 			})
 		},
@@ -211,65 +205,17 @@ func newVaultPutCmd(flags *Flags) *cobra.Command {
 	return cmd
 }
 
-func newVaultGetCmd(flags *Flags) *cobra.Command {
-	var accessory string
-	cmd := &cobra.Command{
-		Use:   "get <name>",
-		Short: "Read secret values at secret/<app>/<name>",
-		Args:  cobra.ExactArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			return runVaultKV(flags, accessory, func(ctx context.Context, c *vault.Client, app string) error {
-				data, err := c.Get(ctx, app, resolveVaultAccessory(accessory), args[0])
-				if err != nil {
-					return err
-				}
-				for k, v := range data {
-					fmt.Printf("%s=%v\n", k, v)
-				}
-				return nil
-			})
-		},
-	}
-	cmd.Flags().StringVar(&accessory, "accessory", "openbao", "accessory/container name for OpenBao")
-	return cmd
-}
 
-func newVaultListCmd(flags *Flags) *cobra.Command {
-	var accessory string
-	cmd := &cobra.Command{
-		Use:   "list",
-		Short: "List secret names under secret/<app>/",
-		Args:  cobra.NoArgs,
-		RunE: func(cmd *cobra.Command, args []string) error {
-			return runVaultKV(flags, accessory, func(ctx context.Context, c *vault.Client, app string) error {
-				names, err := c.List(ctx, app, resolveVaultAccessory(accessory))
-				if err != nil {
-					return err
-				}
-				if len(names) == 0 {
-					fmt.Println("No secrets stored")
-					return nil
-				}
-				for _, n := range names {
-					fmt.Println(n)
-				}
-				return nil
-			})
-		},
-	}
-	cmd.Flags().StringVar(&accessory, "accessory", "openbao", "accessory/container name for OpenBao")
-	return cmd
-}
 
-// mergeVaultRefs resolves any `vault:<name>#<key>` references in the app's env:
+// mergeSecretVaultRefs resolves any `vault:<name>#<key>` references in the app's env:
 // block from OpenBao and merges them into dst (the deploy secrets map). A no-op
 // when the app has no vault references, so it's safe to call on every deploy.
 // Uses the given executor (works for both the single- and multi-server paths).
-func mergeVaultRefs(ctx context.Context, exec ssh.Executor, appCfg *config.AppConfig, dst map[string]string) error {
-	if len(vault.CollectRefs(appCfg.Env)) == 0 {
+func mergeSecretVaultRefs(ctx context.Context, exec ssh.Executor, appCfg *config.AppConfig, dst map[string]string) error {
+	if len(openbao.CollectRefs(appCfg.Env)) == 0 {
 		return nil
 	}
-	resolved, err := vault.NewClient(exec, os.Stderr).ResolveEnvRefs(ctx, appCfg.App, appCfg.Vault.Accessory, appCfg.Env)
+	resolved, err := openbao.NewClient(exec, os.Stderr).ResolveEnvRefs(ctx, appCfg.App, appCfg.Secret.Accessory, appCfg.Env)
 	if err != nil {
 		return fmt.Errorf("resolving vault references: %w", err)
 	}
@@ -279,17 +225,17 @@ func mergeVaultRefs(ctx context.Context, exec ssh.Executor, appCfg *config.AppCo
 	return nil
 }
 
-// ensureVaultAgent, when the app enables the OpenBao Agent sidecar
-// (vault.agent: true), (re)deploys the agent and mounts the shared secrets
+// ensureSecretAgent, when the app enables the OpenBao Agent sidecar
+// (secret.provider openbao + agent), , (re)deploys the agent and mounts the shared secrets
 // volume into the app so it can read /vault/secrets/db.env (auto-rotating
 // dynamic credentials). Returns the (possibly newly-allocated) volumes map. A
 // no-op when the agent is disabled.
-func ensureVaultAgent(ctx context.Context, exec ssh.Executor, appCfg *config.AppConfig, volumes map[string]string) (map[string]string, error) {
-	if !appCfg.Vault.Agent {
+func ensureSecretAgent(ctx context.Context, exec ssh.Executor, appCfg *config.AppConfig, volumes map[string]string) (map[string]string, error) {
+	if !appCfg.Secret.Agent {
 		return volumes, nil
 	}
-	client := vault.NewClient(exec, os.Stderr)
-	if err := client.DeployAgent(ctx, appCfg.App, appCfg.Vault.Accessory, []vault.AgentTemplate{vault.DBEnvTemplate(appCfg.App)}); err != nil {
+	client := openbao.NewClient(exec, os.Stderr)
+	if err := client.DeployAgent(ctx, appCfg.App, appCfg.Secret.Accessory, []openbao.AgentTemplate{openbao.DBEnvTemplate(appCfg.App)}); err != nil {
 		return nil, fmt.Errorf("deploying vault agent: %w", err)
 	}
 	if volumes == nil {
@@ -297,12 +243,12 @@ func ensureVaultAgent(ctx context.Context, exec ssh.Executor, appCfg *config.App
 	}
 	// Named volume shared with the agent; docker accepts a volume name as a
 	// mount source. Mounted read-only into the app — it only consumes secrets.
-	volumes[vault.SecretsVolume(appCfg.App)] = vault.AgentMountPath + ":ro"
+	volumes[openbao.SecretsVolume(appCfg.App)] = openbao.AgentMountPath + ":ro"
 	return volumes, nil
 }
 
-// runVaultKV loads the app, connects, and runs fn with a vault client.
-func runVaultKV(flags *Flags, accessory string, fn func(ctx context.Context, c *vault.Client, app string) error) error {
+// runOpenbaoKV loads the app, connects, and runs fn with a vault client.
+func runOpenbaoKV(flags *Flags, accessory string, fn func(ctx context.Context, c *openbao.Client, app string) error) error {
 	appCfg, err := config.LoadApp(".")
 	if err != nil {
 		return err
@@ -316,7 +262,7 @@ func runVaultKV(flags *Flags, accessory string, fn func(ctx context.Context, c *
 	}
 	defer executor.Close()
 
-	return fn(ctx, vault.NewClient(executor, os.Stdout), appCfg.App)
+	return fn(ctx, openbao.NewClient(executor, os.Stdout), appCfg.App)
 }
 
 func runVaultStatus(flags *Flags, accessory string) error {
@@ -333,7 +279,7 @@ func runVaultStatus(flags *Flags, accessory string) error {
 	}
 	defer executor.Close()
 
-	st, err := vault.NewClient(executor, os.Stdout).Status(ctx, appCfg.App, accessory)
+	st, err := openbao.NewClient(executor, os.Stdout).Status(ctx, appCfg.App, accessory)
 	if err != nil {
 		return err
 	}

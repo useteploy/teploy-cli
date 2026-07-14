@@ -150,7 +150,7 @@ func (s *singleServerDeployer) deployApp(ctx context.Context, appCfg *config.App
 
 	// If the OpenBao Agent sidecar is enabled, (re)deploy it and mount the
 	// shared secrets volume into the app (both deploy paths must do this).
-	volumes, err = ensureVaultAgent(ctx, s.exec, appCfg, volumes)
+	volumes, err = ensureSecretAgent(ctx, s.exec, appCfg, volumes)
 	if err != nil {
 		return err
 	}
@@ -200,7 +200,7 @@ func (s *singleServerDeployer) deployApp(ctx context.Context, appCfg *config.App
 	}
 	// Resolve `vault:<name>#<key>` env references from OpenBao (both deploy
 	// paths must do this — see the multi-server-secrets bug noted above).
-	if err := mergeVaultRefs(ctx, s.exec, appCfg, deploySecrets); err != nil {
+	if err := mergeSecretVaultRefs(ctx, s.exec, appCfg, deploySecrets); err != nil {
 		return err
 	}
 

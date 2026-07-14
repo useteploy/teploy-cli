@@ -303,16 +303,21 @@ type AppConfig struct {
 	Firewall     FirewallConfig    `yaml:"firewall,omitempty" toml:"firewall"`           // edge hardening: IP allow/deny, UA block, body-size cap
 	Audit        AuditConfig       `yaml:"audit,omitempty" toml:"audit"`                 // emit deploy/rollback events to teploy-observe
 	Access       AccessConfig      `yaml:"access,omitempty" toml:"access"`               // inbound access gate: basic auth / forward auth
-	Vault        VaultConfig       `yaml:"vault,omitempty" toml:"vault"`                 // OpenBao secrets integration
+	Secret       SecretConfig      `yaml:"secret,omitempty" toml:"secret"`               // managed secrets provider (e.g. openbao)
 }
 
-// VaultConfig configures the OpenBao secrets integration for an app. Env values
-// of the form `vault:<name>#<key>` are resolved from OpenBao at deploy time.
-type VaultConfig struct {
-	// Accessory is the OpenBao accessory/container name (default "openbao").
+// SecretConfig configures the managed secrets provider for an app (the same
+// `teploy secret` concept, provider-abstracted — mirrors network's provider
+// model). Env values of the form `secret:<name>#<key>` are resolved from the
+// provider at deploy time. When Provider is empty, only the built-in local
+// (age) store is used and this block is inert.
+type SecretConfig struct {
+	// Provider selects the managed backend: "openbao" (or empty for local-only).
+	Provider string `yaml:"provider,omitempty" toml:"provider"`
+	// Accessory is the provider's accessory/container name (default "openbao").
 	Accessory string `yaml:"accessory,omitempty" toml:"accessory"`
-	// Agent enables the OpenBao Agent sidecar: dynamic secrets are rendered to
-	// a shared volume mounted at /vault/secrets in the app, and auto-rotated.
+	// Agent enables the provider's Agent sidecar: dynamic secrets are rendered
+	// to a shared volume mounted at /vault/secrets in the app, and auto-rotated.
 	Agent bool `yaml:"agent,omitempty" toml:"agent"`
 }
 

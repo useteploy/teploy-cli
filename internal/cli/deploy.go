@@ -472,7 +472,7 @@ func deployBuiltImage(ctx context.Context, executor ssh.Executor, appCfg *config
 	}
 	// Resolve any `vault:<name>#<key>` references in env: from OpenBao and merge
 	// them in (they win over plaintext env, same as decrypted secrets).
-	if err := mergeVaultRefs(ctx, executor, appCfg, deploySecrets); err != nil {
+	if err := mergeSecretVaultRefs(ctx, executor, appCfg, deploySecrets); err != nil {
 		return err
 	}
 
@@ -489,9 +489,9 @@ func deployBuiltImage(ctx context.Context, executor ssh.Executor, appCfg *config
 		}
 	}
 
-	// 10-vault. If the OpenBao Agent sidecar is enabled, (re)deploy it and mount
+	// 10-secret. If the OpenBao Agent sidecar is enabled, (re)deploy it and mount
 	// the shared secrets volume into the app.
-	volumes, err = ensureVaultAgent(ctx, executor, appCfg, volumes)
+	volumes, err = ensureSecretAgent(ctx, executor, appCfg, volumes)
 	if err != nil {
 		return err
 	}
