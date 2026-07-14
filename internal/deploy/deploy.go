@@ -74,6 +74,7 @@ type Config struct {
 	TLSInternal bool
 	CaddyExtra  string          // raw Caddy directives appended into the site block
 	Firewall    caddy.Firewall  // edge hardening (IP allow/deny, UA block, body cap)
+	Access      caddy.Access    // inbound access gate (basic auth / forward auth)
 }
 
 // Deployer orchestrates zero-downtime deploys.
@@ -377,12 +378,12 @@ func (d *Deployer) Deploy(ctx context.Context, cfg Config) error {
 			for i := range replicas {
 				upstreams[i] = caddy.Upstream{Dial: fmt.Sprintf("%s:%d", webContainerNames[i], cfg.ContainerPort)}
 			}
-			if err := d.caddy.SetLoadBalancer(ctx, cfg.App, cfg.Domain, upstreams, tls, cfg.CaddyExtra, cfg.Firewall); err != nil {
+			if err := d.caddy.SetLoadBalancer(ctx, cfg.App, cfg.Domain, upstreams, tls, cfg.CaddyExtra, cfg.Firewall, cfg.Access); err != nil {
 				return fail(fmt.Errorf("updating load balancer route: %w", err))
 			}
 			fmt.Fprintf(d.out, "  Traffic load-balanced across %d replicas\n", replicas)
 		} else {
-			if err := d.caddy.SetRoute(ctx, cfg.App, cfg.Domain, webContainerName, cfg.ContainerPort, tls, cfg.CaddyExtra, cfg.Firewall); err != nil {
+			if err := d.caddy.SetRoute(ctx, cfg.App, cfg.Domain, webContainerName, cfg.ContainerPort, tls, cfg.CaddyExtra, cfg.Firewall, cfg.Access); err != nil {
 				return fail(fmt.Errorf("updating route: %w", err))
 			}
 			fmt.Fprintln(d.out, "  Traffic routed to new container")

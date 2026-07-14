@@ -550,6 +550,7 @@ func deployBuiltImage(ctx context.Context, executor ssh.Executor, appCfg *config
 		TLSInternal:   tlsInternal,
 		CaddyExtra:    appCfg.CaddyExtra,
 		Firewall:      caddyFirewall(appCfg.Firewall),
+		Access:        caddyAccess(appCfg.Access),
 	}
 
 	// Vulnerability gate: scan the image on the server before any container
@@ -824,6 +825,17 @@ func caddyFirewall(f config.FirewallConfig) caddy.Firewall {
 		BlockUserAgents: f.BlockUserAgents,
 		MaxBodySize:     f.MaxBodySize,
 	}
+}
+
+// caddyAccess converts the teploy.yml access gate into the caddy layer's value.
+func caddyAccess(a config.AccessConfig) caddy.Access {
+	out := caddy.Access{BasicAuthUsers: a.BasicAuth}
+	if a.ForwardAuth != nil {
+		out.ForwardAuthURL = a.ForwardAuth.URL
+		out.ForwardAuthURI = a.ForwardAuth.URI
+		out.ForwardAuthCopyHeaders = a.ForwardAuth.CopyHeaders
+	}
+	return out
 }
 
 // emitDeployAudit records a deploy/rollback/scale event to observe if the app

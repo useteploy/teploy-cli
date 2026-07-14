@@ -156,6 +156,18 @@ firewall:
 # with Cloudflare/another proxy, remote_ip is the PROXY's IP — use that proxy's
 # own IP rules instead, or set trusted_proxies via caddy_extra.
 
+# Put the app behind a login — the self-hostable "deployment protection".
+# Caddy ingress + reverse-proxy only. Use basic_auth (bcrypt hashes; generate
+# with `caddy hash-password`) and/or forward_auth to your own identity proxy
+# (Authelia, oauth2-proxy, OIDC gateway).
+access:
+  basic_auth:
+    alice: "$2a$14$...bcrypt-hash..."
+  # forward_auth:
+  #   url: authelia:9091
+  #   uri: /api/authz/forward-auth
+  #   copy_headers: [Remote-User, Remote-Email, Remote-Groups]
+
 # Record deploys/rollbacks in a teploy-observe audit trail (compliance).
 # Fire-and-forget; a failed emit never fails a deploy. token is an observe
 # editor+ credential. Omit the block to disable.

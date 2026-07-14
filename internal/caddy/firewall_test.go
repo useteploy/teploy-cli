@@ -10,7 +10,7 @@ func TestFirewall_EmptyIsNoOp(t *testing.T) {
 		t.Fatal("zero Firewall should be Empty")
 	}
 	// A block with no firewall must be byte-identical to the pre-firewall form.
-	got := reverseProxyBlock([]string{"example.com"}, "app-v1", 8080, TLS{}, "", Firewall{})
+	got := reverseProxyBlock([]string{"example.com"}, "app-v1", 8080, TLS{}, "", Firewall{}, Access{})
 	want := "example.com {\n\treverse_proxy app-v1:8080\n}"
 	if got != want {
 		t.Errorf("empty firewall changed the block:\nwant %q\ngot  %q", want, got)
@@ -24,7 +24,7 @@ func TestReverseProxyBlock_WithFirewall(t *testing.T) {
 		BlockUserAgents: []string{"badbot", "masscan"},
 		MaxBodySize:     "10MB",
 	}
-	got := reverseProxyBlock([]string{"example.com"}, "app-v1", 8080, TLS{}, "", fw)
+	got := reverseProxyBlock([]string{"example.com"}, "app-v1", 8080, TLS{}, "", fw, Access{})
 
 	// reverse_proxy must be inside the catch-all handle (runs AFTER the blocks).
 	if !strings.Contains(got, "\thandle {\n\t\treverse_proxy app-v1:8080\n\t}\n") {
@@ -59,7 +59,7 @@ func TestFirewall_UserAgentRegexEscaped(t *testing.T) {
 func TestLoadBalancerBlock_WithFirewall(t *testing.T) {
 	fw := Firewall{DenyIPs: []string{"9.9.9.9"}}
 	got := loadBalancerBlock([]string{"example.com"},
-		[]Upstream{{Dial: "a:80"}, {Dial: "b:80"}}, TLS{}, "", fw)
+		[]Upstream{{Dial: "a:80"}, {Dial: "b:80"}}, TLS{}, "", fw, Access{})
 	if !strings.Contains(got, "\thandle {\n\t\treverse_proxy a:80 b:80 {") {
 		t.Errorf("LB reverse_proxy not wrapped in handle:\n%s", got)
 	}

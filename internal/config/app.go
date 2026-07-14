@@ -302,6 +302,49 @@ type AppConfig struct {
 	CaddyExtra   string            `yaml:"caddy_extra,omitempty" toml:"caddy_extra"`     // raw Caddy directives appended into the site block
 	Firewall     FirewallConfig    `yaml:"firewall,omitempty" toml:"firewall"`           // edge hardening: IP allow/deny, UA block, body-size cap
 	Audit        AuditConfig       `yaml:"audit,omitempty" toml:"audit"`                 // emit deploy/rollback events to teploy-observe
+	Access       AccessConfig      `yaml:"access,omitempty" toml:"access"`               // inbound access gate: basic auth / forward auth
+}
+
+// AccessConfig is the per-app inbound access gate (the self-hostable half of
+// "deployment protection"): put the app behind HTTP basic auth and/or delegate
+// authn to an external identity proxy. Caddy ingress + reverse-proxy only.
+type AccessConfig struct {
+	// BasicAuth maps username -> bcrypt hash (Caddy requires bcrypt hashes).
+	BasicAuth map[string]string `yaml:"basic_auth,omitempty" toml:"basic_auth"`
+	// ForwardAuth delegates authn to an external proxy (Authelia, oauth2-proxy,
+	// an OIDC gateway).
+	ForwardAuth *ForwardAuthConfig `yaml:"forward_auth,omitempty" toml:"forward_auth"`
+}
+
+// ForwardAuthConfig configures Caddy forward_auth to an external authn proxy.
+type ForwardAuthConfig struct {
+	URL         string   `yaml:"url" toml:"url"`                                   // upstream, e.g. authelia:9091
+	URI         string   `yaml:"uri,omitempty" toml:"uri"`                        // verify path, e.g. /api/authz/forward-auth
+	CopyHeaders []string `yaml:"copy_headers,omitempty" toml:"copy_headers"`      // identity headers to copy upstream
+}
+
+// IsZero reports whether no access gate is configured.
+func (a AccessConfig) IsZero() bool {
+	return len(a.BasicAuth) == 0 && (a.ForwardAuth == nil || a.ForwardAuth.URL == "")
+}
+
+var bcryptHash = regexp.MustCompile(`^\$2[aby]\$\d{2}\$`)
+
+func (a AccessConfig) validate() error {
+	for user, hash := range a.BasicAuth {
+		if strings.ContainsAny(user, " \t\r\n{}\"") {
+			return fmt.Errorf("access.basic_auth: username %q contains characters not allowed in a Caddyfile", user)
+		}
+		if !bcryptHash.MatchString(hash) {
+			return fmt.Errorf("access.basic_auth[%s]: value must be a bcrypt hash ($2a$/$2b$/$2y$…); Caddy does not accept plaintext", user)
+		}
+	}
+	if a.ForwardAuth != nil && a.ForwardAuth.URL != "" {
+		if strings.ContainsAny(a.ForwardAuth.URL, " \t\r\n{}\"") {
+			return fmt.Errorf("access.forward_auth.url %q contains characters not allowed in a Caddyfile", a.ForwardAuth.URL)
+		}
+	}
+	return nil
 }
 
 // AuditConfig points the CLI at a teploy-observe instance so deploy/rollback/
@@ -625,6 +668,18 @@ func (c *AppConfig) validate() error {
 		}
 		if c.Ingress == IngressExternal || c.Ingress == IngressHost {
 			return fmt.Errorf("'firewall' requires Caddy ingress — it has no effect with 'ingress: %s' (apply the rules in your fronting proxy/CDN instead)", c.Ingress)
+		}
+	}
+	// Access gate renders into the Caddy site block — same constraints.
+	if !c.Access.IsZero() {
+		if err := c.Access.validate(); err != nil {
+			return err
+		}
+		if c.Type == TypeStatic {
+			return fmt.Errorf("'access' is not supported for type:static (v1 covers reverse-proxied apps)")
+		}
+		if c.Ingress == IngressExternal || c.Ingress == IngressHost {
+			return fmt.Errorf("'access' requires Caddy ingress — it has no effect with 'ingress: %s' (gate access in your fronting proxy instead)", c.Ingress)
 		}
 	}
 	return nil

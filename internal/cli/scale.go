@@ -204,6 +204,7 @@ func rollbackSingleServer(ctx context.Context, appCfg *config.AppConfig, target 
 		TLSInternal: tlsInternal,
 		CaddyExtra:  appCfg.CaddyExtra,
 		Firewall:    caddyFirewall(appCfg.Firewall),
+		Access:      caddyAccess(appCfg.Access),
 		Ingress:     appCfg.Ingress,
 	})
 }
@@ -259,7 +260,7 @@ func updateLoadBalancer(ctx context.Context, flags *Flags, appCfg *config.AppCon
 		tls := caddy.TLS{Cert: cert, Key: key, Internal: internal}
 
 		client := caddy.NewClient(executor)
-		err = client.SetLoadBalancer(ctx, appCfg.App, appCfg.Domain, upstreams, tls, appCfg.CaddyExtra, caddyFirewall(appCfg.Firewall))
+		err = client.SetLoadBalancer(ctx, appCfg.App, appCfg.Domain, upstreams, tls, appCfg.CaddyExtra, caddyFirewall(appCfg.Firewall), caddyAccess(appCfg.Access))
 		executor.Close()
 		if err != nil {
 			return fmt.Errorf("updating LB %s: %w", name, err)
