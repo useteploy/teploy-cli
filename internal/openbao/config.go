@@ -43,8 +43,9 @@ type SealSpec struct {
 
 // ServerConfig is the input to the OpenBao server config.hcl.
 type ServerConfig struct {
-	StoragePath string   // container path for file storage, e.g. /openbao/data
+	StoragePath string   // container path for storage, e.g. /openbao/data
 	ListenAddr  string   // e.g. 0.0.0.0:8200
+	ClusterAddr string   // node's own cluster_addr, e.g. http://<node>:8201 (raft HA)
 	TLSDisable  bool     // true only for private-mesh/dev; production terminates TLS
 	TLSCertFile string   // container path (when TLSDisable is false)
 	TLSKeyFile  string
@@ -53,18 +54,34 @@ type ServerConfig struct {
 	// AuditFilePath, when set, declares a file audit device (OpenBao 2.6+
 	// manages audit devices declaratively in config, not via the API).
 	AuditFilePath string
+	// Raft: when NodeID is set, storage is integrated-Raft HA (a multi-node
+	// quorum) instead of single-node file storage. RetryJoin lists peer API
+	// addresses this node auto-joins on boot.
+	NodeID    string
+	RetryJoin []string
 }
 
 // RenderServerConfig produces the OpenBao config.hcl. disable_mlock is set
-// because containers rarely grant IPC_LOCK; file storage keeps it single-binary
-// with no external dependency (HA is a multi-container Raft upgrade, not here).
+// because containers rarely grant IPC_LOCK. Storage is single-node file by
+// default, or integrated Raft (HA quorum) when NodeID is set.
 func RenderServerConfig(c ServerConfig) string {
 	var b strings.Builder
 
-	fmt.Fprintf(&b, "storage \"file\" {\n  path = %q\n}\n\n", c.StoragePath)
+	if c.NodeID != "" {
+		fmt.Fprintf(&b, "storage \"raft\" {\n  path    = %q\n  node_id = %q\n", c.StoragePath, c.NodeID)
+		for _, peer := range c.RetryJoin {
+			fmt.Fprintf(&b, "  retry_join {\n    leader_api_addr = %q\n  }\n", peer)
+		}
+		b.WriteString("}\n\n")
+	} else {
+		fmt.Fprintf(&b, "storage \"file\" {\n  path = %q\n}\n\n", c.StoragePath)
+	}
 
 	b.WriteString("listener \"tcp\" {\n")
 	fmt.Fprintf(&b, "  address = %q\n", c.ListenAddr)
+	if c.ClusterAddr != "" {
+		b.WriteString("  cluster_address = \"0.0.0.0:8201\"\n")
+	}
 	if c.TLSDisable {
 		b.WriteString("  tls_disable = true\n")
 	} else {
@@ -83,6 +100,9 @@ func RenderServerConfig(c ServerConfig) string {
 	}
 
 	fmt.Fprintf(&b, "\napi_addr      = %q\n", c.APIAddr)
+	if c.ClusterAddr != "" {
+		fmt.Fprintf(&b, "cluster_addr  = %q\n", c.ClusterAddr)
+	}
 	b.WriteString("disable_mlock = true\n")
 	return b.String()
 }

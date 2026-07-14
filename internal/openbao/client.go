@@ -57,6 +57,9 @@ type SetupOptions struct {
 	// disk in the config (AWS creds, transit token, …). Passed via the 0600
 	// env-file like the static key.
 	SealEnv map[string]string
+	// Replicas > 1 provisions a Raft HA quorum of that many OpenBao nodes
+	// instead of a single file-storage node. Use an odd number (3 or 5).
+	Replicas int
 }
 
 func (o *SetupOptions) defaults() {
@@ -84,49 +87,35 @@ func (c *Client) Setup(ctx context.Context, opts SetupOptions) error {
 	opts.defaults()
 	container := accessories.ContainerName(opts.App, opts.Accessory)
 
-	// 1. Resolve the seal. Default (empty Type) = static-env-key: Teploy
-	// generates + manages the 32-byte key in the age store. For awskms/transit
-	// the caller supplies the seal params + credentials (nothing to generate).
-	seal := opts.Seal
-	sealEnv := map[string]string{}
-	for k, v := range opts.SealEnv {
-		sealEnv[k] = v
-	}
-	if seal.Type == "" || seal.Type == SealStatic {
-		sealKey, err := c.ensureSecret(ctx, opts.App, secretSealKey, GenerateSealKey)
-		if err != nil {
-			return err
-		}
-		keyID, err := c.ensureSecret(ctx, opts.App, secretSealKeyID, GenerateKeyID)
-		if err != nil {
-			return err
-		}
-		seal = SealSpec{Type: SealStatic, KeyID: keyID}
-		sealEnv["BAO_SEAL_KEY"] = sealKey
-	}
-
-	// 2. Render + upload the server config (file storage, private-mesh TCP,
-	// the selected auto-unseal). Secrets (static key, AWS creds, transit token)
-	// are NOT in the config — they ride the 0600 seal env-file.
-	cfg := RenderServerConfig(ServerConfig{
-		StoragePath: "/openbao/data",
-		ListenAddr:  "0.0.0.0:8200",
-		TLSDisable:  true, // reachable only on the private teploy network
-		APIAddr:     "http://0.0.0.0:8200",
-		Seal:        seal,
-		// Audit device on from day one (declarative). Every secret access is
-		// logged (values HMAC'd); `teploy secret audit ship` forwards these into
-		// the observe tamper-evident trail.
-		AuditFilePath: "/openbao/data/audit.log",
-	})
-	confPath := fmt.Sprintf("/deployments/%s/accessories/%s/config.hcl", opts.App, opts.Accessory)
-	if err := c.exec.Upload(ctx, strings.NewReader(cfg), confPath, "0644"); err != nil {
-		return fmt.Errorf("uploading openbao config: %w", err)
-	}
-
-	// 3. Run the container if not already running.
-	if err := c.ensureContainer(ctx, opts, container, confPath, sealEnv); err != nil {
+	// 1. Resolve the seal (shared across nodes in HA). Default = static-env-key:
+	// Teploy generates + manages the key; awskms/transit come from opts.
+	seal, sealEnv, err := c.resolveSeal(ctx, opts)
+	if err != nil {
 		return err
+	}
+
+	// 2-3. Provision the node(s). HA (Replicas>1) is a Raft quorum; the primary
+	// node keeps the base container name so all downstream ops target it.
+	if opts.Replicas > 1 {
+		if err := c.provisionHANodes(ctx, opts, seal, sealEnv); err != nil {
+			return err
+		}
+	} else {
+		cfg := RenderServerConfig(ServerConfig{
+			StoragePath:   "/openbao/data",
+			ListenAddr:    "0.0.0.0:8200",
+			TLSDisable:    true, // reachable only on the private teploy network
+			APIAddr:       "http://0.0.0.0:8200",
+			Seal:          seal,
+			AuditFilePath: "/openbao/data/audit.log",
+		})
+		confPath := fmt.Sprintf("/deployments/%s/accessories/%s/config.hcl", opts.App, opts.Accessory)
+		if err := c.exec.Upload(ctx, strings.NewReader(cfg), confPath, "0644"); err != nil {
+			return fmt.Errorf("uploading openbao config: %w", err)
+		}
+		if err := c.ensureContainer(ctx, opts, container, confPath, sealEnv); err != nil {
+			return err
+		}
 	}
 
 	// 4. Wait for the API to answer.
@@ -148,6 +137,13 @@ func (c *Client) Setup(ctx context.Context, opts SetupOptions) error {
 			return err
 		}
 		fmt.Fprintln(c.out, "OpenBao initialized; KV enabled. Root token + recovery keys stored in the app secret store.")
+		// HA: the followers auto-join the leader via retry_join once it's
+		// initialized. Wait for the quorum to form.
+		if opts.Replicas > 1 {
+			if err := c.waitForPeers(ctx, container, root, opts.Replicas, 60*time.Second); err != nil {
+				return err
+			}
+		}
 	} else if st.Sealed {
 		return fmt.Errorf("openbao is initialized but sealed — the seal key may have changed; check %s", secretSealKey)
 	} else {

@@ -80,3 +80,32 @@ func TestGenerateKeyID(t *testing.T) {
 		t.Errorf("key id is not a v4 UUID: %q", id)
 	}
 }
+
+func TestRenderServerConfig_Raft(t *testing.T) {
+	got := RenderServerConfig(ServerConfig{
+		StoragePath: "/openbao/data",
+		ListenAddr:  "0.0.0.0:8200",
+		ClusterAddr: "http://node0:8201",
+		TLSDisable:  true,
+		APIAddr:     "http://node0:8200",
+		Seal:        SealSpec{Type: SealStatic, KeyID: "k"},
+		NodeID:      "node0",
+		RetryJoin:   []string{"http://node1:8200", "http://node2:8200"},
+	})
+	for _, want := range []string{
+		`storage "raft" {`,
+		`node_id = "node0"`,
+		`retry_join {`,
+		`leader_api_addr = "http://node1:8200"`,
+		`leader_api_addr = "http://node2:8200"`,
+		"cluster_address = \"0.0.0.0:8201\"",
+		`cluster_addr  = "http://node0:8201"`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("raft config missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, `storage "file"`) {
+		t.Errorf("raft config must not use file storage:\n%s", got)
+	}
+}

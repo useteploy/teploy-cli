@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 
 	"github.com/spf13/cobra"
 	"github.com/useteploy/teploy/internal/config"
@@ -161,6 +162,7 @@ func newVaultDBCredsCmd(flags *Flags) *cobra.Command {
 
 func newVaultSetupCmd(flags *Flags) *cobra.Command {
 	var accessory, image, seal string
+	var replicas int
 	var kmsKeyID, kmsRegion, kmsAccessKey, kmsSecretKey string
 	var transitAddr, transitToken, transitKey, transitMount string
 	cmd := &cobra.Command{
@@ -183,11 +185,12 @@ ride a 0600 env-file, never the config.`,
 			if err != nil {
 				return err
 			}
-			return runVaultSetup(flags, accessory, image, spec, env)
+			return runVaultSetup(flags, accessory, image, spec, env, replicas)
 		},
 	}
 	cmd.Flags().StringVar(&accessory, "accessory", "openbao", "accessory/container name for OpenBao")
 	cmd.Flags().StringVar(&image, "image", "", "OpenBao image (default openbao/openbao:latest)")
+	cmd.Flags().IntVar(&replicas, "replicas", 1, "number of OpenBao nodes (>1 = Raft HA quorum; use 3 or 5)")
 	cmd.Flags().StringVar(&seal, "seal", "static", "auto-unseal: static | awskms | transit")
 	cmd.Flags().StringVar(&kmsKeyID, "kms-key-id", "", "AWS KMS key id (awskms seal)")
 	cmd.Flags().StringVar(&kmsRegion, "kms-region", "", "AWS region (awskms seal)")
@@ -248,7 +251,7 @@ func newVaultStatusCmd(flags *Flags) *cobra.Command {
 	return cmd
 }
 
-func runVaultSetup(flags *Flags, accessory, image string, seal openbao.SealSpec, sealEnv map[string]string) error {
+func runVaultSetup(flags *Flags, accessory, image string, seal openbao.SealSpec, sealEnv map[string]string, replicas int) error {
 	appCfg, err := config.LoadApp(".")
 	if err != nil {
 		return err
@@ -263,7 +266,7 @@ func runVaultSetup(flags *Flags, accessory, image string, seal openbao.SealSpec,
 	defer executor.Close()
 
 	client := openbao.NewClient(executor, os.Stdout)
-	if err := client.Setup(ctx, openbao.SetupOptions{App: appCfg.App, Accessory: accessory, Image: image, Seal: seal, SealEnv: sealEnv}); err != nil {
+	if err := client.Setup(ctx, openbao.SetupOptions{App: appCfg.App, Accessory: accessory, Image: image, Seal: seal, SealEnv: sealEnv, Replicas: replicas}); err != nil {
 		return err
 	}
 	// Provision the per-app least-privilege AppRole so deploys can fetch secrets
@@ -372,7 +375,8 @@ func runVaultStatus(flags *Flags, accessory string) error {
 	}
 	defer executor.Close()
 
-	st, err := openbao.NewClient(executor, os.Stdout).Status(ctx, appCfg.App, accessory)
+	client := openbao.NewClient(executor, os.Stdout)
+	st, err := client.Status(ctx, appCfg.App, accessory)
 	if err != nil {
 		return err
 	}
@@ -381,5 +385,10 @@ func runVaultStatus(flags *Flags, accessory string) error {
 		sealed = "SEALED"
 	}
 	fmt.Printf("OpenBao %s  seal=%s  initialized=%t  %s\n", st.Version, st.SealType, st.Initialized, sealed)
+	// Show the Raft quorum when this is an HA cluster (best-effort; single-node
+	// file storage has no peers and is silently skipped).
+	if peers, err := client.ListPeers(ctx, appCfg.App, accessory); err == nil && len(peers) > 1 {
+		fmt.Printf("Raft cluster (%d nodes): %s\n", len(peers), strings.Join(peers, ", "))
+	}
 	return nil
 }
