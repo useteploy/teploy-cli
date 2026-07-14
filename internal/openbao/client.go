@@ -49,6 +49,14 @@ type SetupOptions struct {
 	App       string
 	Accessory string // default "openbao"
 	Image     string // default openbao/openbao:latest
+	// Seal selects the unseal mechanism. A zero-value (empty Type) means the
+	// static-env-key default (Teploy generates + manages the key). For awskms/
+	// transit, the caller fills the seal params + SealEnv credentials.
+	Seal SealSpec
+	// SealEnv is extra container env for the seal backend — never written to
+	// disk in the config (AWS creds, transit token, …). Passed via the 0600
+	// env-file like the static key.
+	SealEnv map[string]string
 }
 
 func (o *SetupOptions) defaults() {
@@ -76,27 +84,38 @@ func (c *Client) Setup(ctx context.Context, opts SetupOptions) error {
 	opts.defaults()
 	container := accessories.ContainerName(opts.App, opts.Accessory)
 
-	// 1. Seal key + id, generated once and kept in the age store (never on
-	// disk in the clear). Reused on every setup so the seal stays stable.
-	sealKey, err := c.ensureSecret(ctx, opts.App, secretSealKey, GenerateSealKey)
-	if err != nil {
-		return err
+	// 1. Resolve the seal. Default (empty Type) = static-env-key: Teploy
+	// generates + manages the 32-byte key in the age store. For awskms/transit
+	// the caller supplies the seal params + credentials (nothing to generate).
+	seal := opts.Seal
+	sealEnv := map[string]string{}
+	for k, v := range opts.SealEnv {
+		sealEnv[k] = v
 	}
-	keyID, err := c.ensureSecret(ctx, opts.App, secretSealKeyID, GenerateKeyID)
-	if err != nil {
-		return err
+	if seal.Type == "" || seal.Type == SealStatic {
+		sealKey, err := c.ensureSecret(ctx, opts.App, secretSealKey, GenerateSealKey)
+		if err != nil {
+			return err
+		}
+		keyID, err := c.ensureSecret(ctx, opts.App, secretSealKeyID, GenerateKeyID)
+		if err != nil {
+			return err
+		}
+		seal = SealSpec{Type: SealStatic, KeyID: keyID}
+		sealEnv["BAO_SEAL_KEY"] = sealKey
 	}
 
 	// 2. Render + upload the server config (file storage, private-mesh TCP,
-	// static auto-unseal referencing env://BAO_SEAL_KEY).
+	// the selected auto-unseal). Secrets (static key, AWS creds, transit token)
+	// are NOT in the config — they ride the 0600 seal env-file.
 	cfg := RenderServerConfig(ServerConfig{
 		StoragePath: "/openbao/data",
 		ListenAddr:  "0.0.0.0:8200",
 		TLSDisable:  true, // reachable only on the private teploy network
 		APIAddr:     "http://0.0.0.0:8200",
-		Seal:        SealSpec{Type: SealStatic, KeyID: keyID},
+		Seal:        seal,
 		// Audit device on from day one (declarative). Every secret access is
-		// logged (values HMAC'd); `teploy vault audit ship` forwards these into
+		// logged (values HMAC'd); `teploy secret audit ship` forwards these into
 		// the observe tamper-evident trail.
 		AuditFilePath: "/openbao/data/audit.log",
 	})
@@ -106,7 +125,7 @@ func (c *Client) Setup(ctx context.Context, opts SetupOptions) error {
 	}
 
 	// 3. Run the container if not already running.
-	if err := c.ensureContainer(ctx, opts, container, confPath, sealKey); err != nil {
+	if err := c.ensureContainer(ctx, opts, container, confPath, sealEnv); err != nil {
 		return err
 	}
 
@@ -163,7 +182,7 @@ func (c *Client) ensureSecret(ctx context.Context, app, key string, gen func() (
 	return v, nil
 }
 
-func (c *Client) ensureContainer(ctx context.Context, opts SetupOptions, container, confPath, sealKey string) error {
+func (c *Client) ensureContainer(ctx context.Context, opts SetupOptions, container, confPath string, sealEnv map[string]string) error {
 	// Idempotent: skip if already running.
 	if out, err := c.exec.Run(ctx, fmt.Sprintf("docker inspect -f '{{.State.Status}}' %s 2>/dev/null", ssh.ShellQuote(container))); err == nil && strings.TrimSpace(out) == "running" {
 		return nil
@@ -174,10 +193,15 @@ func (c *Client) ensureContainer(ctx context.Context, opts SetupOptions, contain
 	// Remove any stopped remnant so the run doesn't name-collide.
 	c.exec.Run(ctx, "docker rm -f "+ssh.ShellQuote(container)+" >/dev/null 2>&1 || true")
 
-	// The seal key rides in an env-file (mode 0600) rather than argv so it
-	// isn't exposed in the process list during `docker run`.
+	// The seal credentials ride in an env-file (mode 0600) rather than argv so
+	// they aren't exposed in the process list during `docker run`, and never in
+	// the (world-readable) config.hcl.
+	var envBuf strings.Builder
+	for k, v := range sealEnv {
+		fmt.Fprintf(&envBuf, "%s=%s\n", k, v)
+	}
 	envFile := fmt.Sprintf("/deployments/%s/accessories/%s/.seal-env", opts.App, opts.Accessory)
-	if err := c.exec.Upload(ctx, strings.NewReader("BAO_SEAL_KEY="+sealKey+"\n"), envFile, "0600"); err != nil {
+	if err := c.exec.Upload(ctx, strings.NewReader(envBuf.String()), envFile, "0600"); err != nil {
 		return fmt.Errorf("writing seal env: %w", err)
 	}
 

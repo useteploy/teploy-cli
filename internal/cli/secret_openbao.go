@@ -8,8 +8,8 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/useteploy/teploy/internal/config"
-	"github.com/useteploy/teploy/internal/ssh"
 	"github.com/useteploy/teploy/internal/openbao"
+	"github.com/useteploy/teploy/internal/ssh"
 )
 
 // addOpenbaoSecretCommands attaches the managed-provider (OpenBao) operations
@@ -23,7 +23,6 @@ func addOpenbaoSecretCommands(cmd *cobra.Command, flags *Flags, provider *string
 	cmd.AddCommand(newVaultDBCmd(flags))
 	cmd.AddCommand(newSecretAuditCmd(flags))
 }
-
 
 func newVaultDBCmd(flags *Flags) *cobra.Command {
 	cmd := &cobra.Command{
@@ -161,21 +160,78 @@ func newVaultDBCredsCmd(flags *Flags) *cobra.Command {
 }
 
 func newVaultSetupCmd(flags *Flags) *cobra.Command {
-	var accessory, image string
+	var accessory, image, seal string
+	var kmsKeyID, kmsRegion, kmsAccessKey, kmsSecretKey string
+	var transitAddr, transitToken, transitKey, transitMount string
 	cmd := &cobra.Command{
 		Use:   "setup",
 		Short: "Provision + initialize OpenBao for this app (idempotent)",
 		Long: `Deploys OpenBao on the private teploy network, initializes it, and
-auto-unseals it — no manual unseal ceremony. The seal key, root token, and
-recovery keys are stored in the app's encrypted secret store. Safe to re-run.`,
+auto-unseals it — no manual unseal ceremony. Root + recovery keys are stored in
+the app's encrypted local store. Safe to re-run.
+
+Seal (--seal): the default 'static' seal generates + manages the key in the
+local store (universal, no cloud needed). 'awskms' and 'transit' hold the key
+off-box for stronger disk-theft/root-compromise protection — the credentials
+ride a 0600 env-file, never the config.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runVaultSetup(flags, accessory, image)
+			spec, env, err := buildSealSpec(seal, sealFlags{
+				kmsKeyID: kmsKeyID, kmsRegion: kmsRegion, kmsAccessKey: kmsAccessKey, kmsSecretKey: kmsSecretKey,
+				transitAddr: transitAddr, transitToken: transitToken, transitKey: transitKey, transitMount: transitMount,
+			})
+			if err != nil {
+				return err
+			}
+			return runVaultSetup(flags, accessory, image, spec, env)
 		},
 	}
 	cmd.Flags().StringVar(&accessory, "accessory", "openbao", "accessory/container name for OpenBao")
 	cmd.Flags().StringVar(&image, "image", "", "OpenBao image (default openbao/openbao:latest)")
+	cmd.Flags().StringVar(&seal, "seal", "static", "auto-unseal: static | awskms | transit")
+	cmd.Flags().StringVar(&kmsKeyID, "kms-key-id", "", "AWS KMS key id (awskms seal)")
+	cmd.Flags().StringVar(&kmsRegion, "kms-region", "", "AWS region (awskms seal)")
+	cmd.Flags().StringVar(&kmsAccessKey, "kms-access-key", "", "AWS access key id (awskms; omit to use the box's IAM role)")
+	cmd.Flags().StringVar(&kmsSecretKey, "kms-secret-key", "", "AWS secret access key (awskms)")
+	cmd.Flags().StringVar(&transitAddr, "transit-address", "", "unsealer OpenBao address (transit seal)")
+	cmd.Flags().StringVar(&transitToken, "transit-token", "", "token for the unsealer (transit seal)")
+	cmd.Flags().StringVar(&transitKey, "transit-key", "", "transit key name (transit seal)")
+	cmd.Flags().StringVar(&transitMount, "transit-mount", "transit/", "transit mount path (transit seal)")
 	return cmd
+}
+
+type sealFlags struct {
+	kmsKeyID, kmsRegion, kmsAccessKey, kmsSecretKey     string
+	transitAddr, transitToken, transitKey, transitMount string
+}
+
+// buildSealSpec turns the seal flags into a SealSpec + the credential env that
+// rides the 0600 seal env-file (never the config). Secret material (AWS creds,
+// transit token) is deliberately env-only.
+func buildSealSpec(seal string, f sealFlags) (openbao.SealSpec, map[string]string, error) {
+	switch seal {
+	case "", "static":
+		return openbao.SealSpec{Type: openbao.SealStatic}, nil, nil
+	case "awskms":
+		if f.kmsKeyID == "" || f.kmsRegion == "" {
+			return openbao.SealSpec{}, nil, fmt.Errorf("awskms seal requires --kms-key-id and --kms-region")
+		}
+		env := map[string]string{"AWS_REGION": f.kmsRegion}
+		if f.kmsAccessKey != "" { // else rely on the box's IAM role / ambient creds
+			env["AWS_ACCESS_KEY_ID"] = f.kmsAccessKey
+			env["AWS_SECRET_ACCESS_KEY"] = f.kmsSecretKey
+		}
+		return openbao.SealSpec{Type: openbao.SealAWSKMS, KMSKeyID: f.kmsKeyID, KMSRegion: f.kmsRegion}, env, nil
+	case "transit":
+		if f.transitAddr == "" || f.transitToken == "" || f.transitKey == "" {
+			return openbao.SealSpec{}, nil, fmt.Errorf("transit seal requires --transit-address, --transit-token and --transit-key")
+		}
+		// Per OpenBao docs, pass the token via env (VAULT_TOKEN) — never config.
+		env := map[string]string{"VAULT_TOKEN": f.transitToken}
+		return openbao.SealSpec{Type: openbao.SealTransit, TransitAddress: f.transitAddr, TransitKeyName: f.transitKey, TransitMount: f.transitMount}, env, nil
+	default:
+		return openbao.SealSpec{}, nil, fmt.Errorf("unknown --seal %q (use static, awskms, or transit)", seal)
+	}
 }
 
 func newVaultStatusCmd(flags *Flags) *cobra.Command {
@@ -192,7 +248,7 @@ func newVaultStatusCmd(flags *Flags) *cobra.Command {
 	return cmd
 }
 
-func runVaultSetup(flags *Flags, accessory, image string) error {
+func runVaultSetup(flags *Flags, accessory, image string, seal openbao.SealSpec, sealEnv map[string]string) error {
 	appCfg, err := config.LoadApp(".")
 	if err != nil {
 		return err
@@ -207,7 +263,7 @@ func runVaultSetup(flags *Flags, accessory, image string) error {
 	defer executor.Close()
 
 	client := openbao.NewClient(executor, os.Stdout)
-	if err := client.Setup(ctx, openbao.SetupOptions{App: appCfg.App, Accessory: accessory, Image: image}); err != nil {
+	if err := client.Setup(ctx, openbao.SetupOptions{App: appCfg.App, Accessory: accessory, Image: image, Seal: seal, SealEnv: sealEnv}); err != nil {
 		return err
 	}
 	// Provision the per-app least-privilege AppRole so deploys can fetch secrets
@@ -243,8 +299,6 @@ func newVaultPutCmd(flags *Flags) *cobra.Command {
 	cmd.Flags().StringVar(&accessory, "accessory", "openbao", "accessory/container name for OpenBao")
 	return cmd
 }
-
-
 
 // mergeSecretVaultRefs resolves any `vault:<name>#<key>` references in the app's env:
 // block from OpenBao and merges them into dst (the deploy secrets map). A no-op
