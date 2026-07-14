@@ -95,9 +95,10 @@ func (c *Client) Setup(ctx context.Context, opts SetupOptions) error {
 		TLSDisable:  true, // reachable only on the private teploy network
 		APIAddr:     "http://0.0.0.0:8200",
 		Seal:        SealSpec{Type: SealStatic, KeyID: keyID},
-		// Audit device (declarative, OpenBao 2.6+) is wired in Stage 5, where the
-		// device log is shipped into the observe tamper-evident trail. Config.go
-		// already renders the stanza when AuditFilePath is set.
+		// Audit device on from day one (declarative). Every secret access is
+		// logged (values HMAC'd); `teploy vault audit ship` forwards these into
+		// the observe tamper-evident trail.
+		AuditFilePath: "/openbao/data/audit.log",
 	})
 	confPath := fmt.Sprintf("/deployments/%s/accessories/%s/config.hcl", opts.App, opts.Accessory)
 	if err := c.exec.Upload(ctx, strings.NewReader(cfg), confPath, "0644"); err != nil {

@@ -26,6 +26,34 @@ and wired for per-app least-privilege secret access.`,
 	cmd.AddCommand(newVaultGetCmd(flags))
 	cmd.AddCommand(newVaultListCmd(flags))
 	cmd.AddCommand(newVaultDBCmd(flags))
+	cmd.AddCommand(newVaultAuditShipCmd(flags))
+	return cmd
+}
+
+func newVaultAuditShipCmd(flags *Flags) *cobra.Command {
+	var accessory string
+	cmd := &cobra.Command{
+		Use:   "audit-ship",
+		Short: "Forward OpenBao secret-access audit events into the observe tamper-evident trail",
+		Long: `Reads new OpenBao audit-log entries and forwards each secret/database access
+into the teploy-observe tamper-evident audit trail (using the app's audit:
+{ endpoint, token } config). Idempotent — tracks how many entries were already
+shipped. Run on a schedule (cron / systemd timer) to stream access continuously.`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runVaultKV(flags, accessory, func(ctx context.Context, c *vault.Client, app string) error {
+				appCfg, _ := config.LoadApp(".")
+				n, err := c.ShipAudit(ctx, app, resolveVaultAccessory(accessory),
+					appCfg.Audit.Endpoint, appCfg.Audit.Token, appCfg.Audit.Site)
+				if err != nil {
+					return err
+				}
+				fmt.Printf("Shipped %d audit event(s) to observe\n", n)
+				return nil
+			})
+		},
+	}
+	cmd.Flags().StringVar(&accessory, "accessory", "openbao", "OpenBao accessory name")
 	return cmd
 }
 

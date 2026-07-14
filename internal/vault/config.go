@@ -76,7 +76,10 @@ func RenderServerConfig(c ServerConfig) string {
 	b.WriteString(renderSeal(c.Seal))
 
 	if c.AuditFilePath != "" {
-		fmt.Fprintf(&b, "\naudit \"file\" {\n  type      = \"file\"\n  file_path = %q\n}\n", c.AuditFilePath)
+		// Declarative file audit device (OpenBao 2.6+): audit "<type>" "<name>"
+		// with an options block. log_raw=false keeps secret values HMAC'd in the
+		// log (the default), so shipping it to observe never leaks plaintext.
+		fmt.Fprintf(&b, "\naudit \"file\" \"teploy\" {\n  options {\n    file_path = %q\n  }\n}\n", c.AuditFilePath)
 	}
 
 	fmt.Fprintf(&b, "\napi_addr      = %q\n", c.APIAddr)
