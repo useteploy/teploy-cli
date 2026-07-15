@@ -4,6 +4,39 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [0.1.20] - 2026-07-15
+
+### Added
+- `teploy plan` / `teploy drift` / `teploy heal` — read-only deploy dry-run diff, live-vs-declared drift detection (`--exit-code` for CI), and bounded self-heal (host-side probe, restart-in-place with backoff, systemd timer, opt-in `heal.conf`). Web processes only; accessories excluded.
+- `teploy kv` — shared Nucleus-backed KV store (`get`/`set --ttl`/`del`/`exists`/`incr --by`/`list <glob>`) for cross-app config and flags. Trusted-domain only: one global keyspace, prefixes are hygiene, not isolation.
+- `rollout:` — staged multi-server deploys. A `canary: "N"` or `"P%"` wave deploys first and rolls back on failure without touching the rest of the fleet; `max_failures` sets a tolerance budget for the main wave, with a named-straggler exit (never a silent mixed-version fleet) when the budget is exceeded.
+- `teploy secret` — full OpenBao integration under the existing secret command (`--provider local|openbao`): setup with auto-unseal (static-env, KMS, or Transit seals), per-app AppRole least-privilege policy, `put`/`get`/`list`, deploy-time `secret:name#field` env injection, dynamic DB credentials with an Agent-sidecar for auto-rotation, static-role rotation of an existing DB user, multi-node Raft HA (`--replicas`), and continuous audit streaming into Observe's tamper-evident trail (`secret audit enable/disable`). Replaces the earlier standalone `teploy vault` command — OpenBao is not HashiCorp Vault, and the naming now matches every other provider-abstracted command (`network --provider`, etc.).
+- `teploy network grant/grants/revoke` — just-in-time mesh access: ephemeral, tagged, TTL-bound pre-auth keys for Tailscale or Headscale, no permanent credentials to leak or revoke by hand.
+- `setup --harden` now also installs auditd (root/sudo execve plus writes under the Teploy-managed tree) and enables sudo I/O logging for `sudoreplay`-replayable sessions. The sudoers drop-in is visudo-validated before install so a malformed rule can't lock sudo on the box.
+- `env_files:` — SOPS+age encrypted dotenv/YAML files merged into the container env at deploy time. File-based, at-rest secrets with no daemon required.
+- `scan: true` — server-side Trivy vulnerability gate; blocks a deploy on fixable CRITICAL findings (`--ignore-unfixed` keeps unpatchable base-image CVEs from wedging every release).
+- `firewall:` — per-app IP allow/deny lists, user-agent blocking, and a request-body size cap, rendered as Caddy directives that execute before the reverse proxy.
+- `access:` — self-hosted inbound gate: `basic_auth` (bcrypt-hashed) or `forward_auth` delegation to an external identity proxy (Authelia, oauth2-proxy, any OIDC gateway).
+- S3-compatible backup endpoints (MinIO, B2, R2) via `--endpoint`; accessory `command:` override (the missing primitive for MinIO/ntfy accessories) and `publish:` port mappings; backup retention (`teploy backup prune`, `--keep-last`/`--max-age-days`, also usable on the scheduled cron path); self-contained scheduled accessory backups (`--local --app`, no `teploy.yml` needed server-side); `teploy accessory verify-backup` restores the latest backup into a throwaway scratch container and proves it's actually usable (real restore + row/key counts, not just "the archive exists").
+- `type: ntfy` notification channel; deploy and rollback events now emit to Observe's audit trail via a new `audit:` config block.
+- `--role`/`--tag` deploy targeting; best-effort (non-fail-fast) fleet rollback so one server's rollback failure can't strand the rest of the fleet.
+
+### Security
+- The rsync channel used for static-site uploads now mirrors the control connection's host-key policy instead of unconditionally accepting new keys, closing a downgrade relative to the stricter default.
+- `setup --harden`'s fail2ban no longer bans the operator's own SSH source — loopback, the Tailscale CGNAT range, and the live setup session's own IP are always exempted. Closes a real lockout seen in the wild (a management IP banned for 24h after two failed pubkey attempts).
+
+### Fixed
+- Image pull is now skipped when the image already exists on the server, unblocking locally-built or `docker load`-ed images with no registry.
+- Backups and `verify-backup` no longer leave partial archives in `/tmp` after a failed dump or upload.
+- Generic volume backups no longer fail on a live-file tar warning from a WAL rotating mid-read — the archive is a crash-consistent snapshot, and `verify-backup`'s scratch-container boot remains the actual correctness gate.
+
+### Docs
+- Resilience guide: N+1 topology, durable-state rules, and a human-confirmed dead-server rebuild runbook.
+- CI/CD deploy recipe for Forgejo Actions and GitHub Actions, plus the no-secrets autodeploy-webhook alternative.
+- OpenBao/secret feature docs (HA, seals, static-role rotation, audit streaming) and a Cloudflare caveat note for `firewall:`'s `remote_ip` matching.
+
+## [0.1.19] - 2026-07-07
+
 ### Removed
 - The embedded `teploy ui` web dashboard (`internal/ui/`) has been removed. It was an unauthenticated, localhost HTTP/WebSocket server that duplicated a strict subset of **teploy-dash** — the dedicated dashboard product (separate repo, real auth, monitoring, its own releases). Maintaining a second, weaker dashboard inside a CLI whose identity is "single binary, no management server" was a standing security surface (no auth/CSRF/Origin checks) and a maintenance/drift tax. The CLI is now a pure deploy engine; use teploy-dash for a dashboard (it runs as a single binary too, including locally).
 
