@@ -4,6 +4,21 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+### Added
+- Zero-config first run: `teploy deploy` with no config offers the init flow
+  inline on a TTY, writes the resulting `teploy.yml`, and continues deploying.
+  Non-TTY behavior is unchanged (hard error, now with a `teploy init` hint).
+- Deploy failure diagnosis: failed deploys now print a rule-based
+  `Likely cause` + `Try:` under the container logs — OOM kills, missing env
+  vars, database connection failures, wrong `port:` vs what the app actually
+  listens on, 127.0.0.1-only binds, slow boots, disk-full, and bad
+  entrypoints. Deterministic and local; no AI, no network calls.
+
+### Changed
+- `teploy init` no longer pre-fills an `app.example.com` domain. An empty
+  domain now generates a valid `ingress: host` config (prompting for the
+  port), and the server prompt lists known `servers.yml` names.
+
 ## [0.1.20] - 2026-07-15
 
 ### Added

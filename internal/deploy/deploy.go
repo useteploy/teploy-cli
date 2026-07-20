@@ -290,6 +290,7 @@ func (d *Deployer) Deploy(ctx context.Context, cfg Config) error {
 		if logs != "" {
 			fmt.Fprintf(d.out, "\n--- Container logs ---\n%s\n--- End logs ---\n", logs)
 		}
+		d.printDiagnosis(ctx, webContainerName, cfg.ContainerPort, reason, logs)
 		for _, n := range started {
 			d.docker.Stop(ctx, n, 5)
 			d.docker.Remove(ctx, n)
