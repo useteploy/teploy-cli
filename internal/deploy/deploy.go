@@ -498,7 +498,14 @@ func (d *Deployer) Deploy(ctx context.Context, cfg Config) error {
 		if current != nil {
 			prevHash = current.CurrentHash
 		}
-		pruned, err := d.docker.PruneVersions(ctx, cfg.App, cfg.KeepVersions, cfg.Version, prevHash)
+		// Pinned versions are protected from pruning regardless of the keep
+		// window (teploy pin). Read them off the server so terminal, dash,
+		// and autodeploy all honor the same set.
+		protected := []string{cfg.Version, prevHash}
+		if pins, err := state.ReadPins(ctx, d.exec, cfg.App); err == nil {
+			protected = append(protected, pins...)
+		}
+		pruned, err := d.docker.PruneVersions(ctx, cfg.App, cfg.KeepVersions, protected...)
 		if err != nil {
 			fmt.Fprintf(d.out, "Warning: version prune failed: %v\n", err)
 		} else if len(pruned) > 0 {

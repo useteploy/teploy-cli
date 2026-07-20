@@ -50,6 +50,17 @@ type RolloutConfig struct {
 	MaxFailures int    `yaml:"max_failures,omitempty" toml:"max_failures"`
 }
 
+// AutodeployConfig configures the webhook auto-deploy listener (the
+// `autodeploy:` block). Paths, when non-empty, restrict which pushes trigger
+// a deploy: a push redeploys only if it touched a file matching one of the
+// patterns — the monorepo case where one repo holds several apps. Declarative
+// on purpose (a checked-in record, diffable, not inferred at deploy time).
+// Patterns support a trailing `/**` (everything under a directory) and
+// path.Match globs (`*` within a path segment, `?`, exact paths).
+type AutodeployConfig struct {
+	Paths []string `yaml:"paths,omitempty" toml:"paths"`
+}
+
 // CanaryCount resolves the canary spec against the fleet size: integer count
 // or "N%" (rounded up, so a nonzero percent of a small fleet is never zero),
 // clamped to [1, total-1] — a canary that is the whole fleet is not a canary.
@@ -251,6 +262,10 @@ type AppConfig struct {
 	// for the main wave. Absent (nil) = existing behavior (parallel batches,
 	// fail-fast + full-fleet rollback on any failure).
 	Rollout *RolloutConfig `yaml:"rollout,omitempty" toml:"rollout"`
+	// Autodeploy configures the webhook listener. Currently only `paths`
+	// (monorepo change filtering); absent (nil) = every push on the watched
+	// branch deploys, the historical behavior.
+	Autodeploy *AutodeployConfig `yaml:"autodeploy,omitempty" toml:"autodeploy"`
 	// Scan runs a Trivy vulnerability scan on the image server-side before
 	// containers start: HIGH+CRITICAL findings are reported, and fixable
 	// CRITICALs block the deploy.
@@ -841,6 +856,9 @@ func mergeConfigs(base, overlay *AppConfig) {
 	}
 	if overlay.Parallel != 0 {
 		base.Parallel = overlay.Parallel
+	}
+	if overlay.Autodeploy != nil {
+		base.Autodeploy = overlay.Autodeploy
 	}
 	if overlay.Rollout != nil {
 		base.Rollout = overlay.Rollout

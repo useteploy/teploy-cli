@@ -111,6 +111,7 @@ build_local: true
 platform: linux/amd64
 stop_timeout: 30
 keep_versions: 3              # auto-prune older versions after deploy (0 = keep all, default)
+                              # `teploy pin <version>` protects a version from this prune
 
 # Build a Dockerfile that lives in a subdirectory (monorepos). Omit both
 # to use ./Dockerfile with the project root as context (the default).
@@ -288,6 +289,9 @@ teploy version / update                   # version info and self-update
 teploy lock [--message "..."]   # freeze deploys (incident/maintenance)
 teploy unlock                   # release deploy lock
 teploy maintenance on / off     # toggle 503 maintenance page
+teploy pin [version]            # protect a version from keep_versions pruning (default: current)
+teploy unpin <version>          # remove a pin
+teploy pins                     # list pinned versions
 ```
 
 ### Secrets and env
@@ -417,6 +421,23 @@ teploy secret audit enable --interval 300    # timer: stream continuously
 teploy autodeploy setup            # webhook-triggered auto-deploys
 teploy autodeploy status / remove
 ```
+
+For a monorepo where one repo holds several apps, restrict which pushes
+redeploy this app with an `autodeploy:` block in `teploy.yml`:
+
+```yaml
+autodeploy:
+  paths:
+    - "apps/web/**"          # everything under apps/web/
+    - "packages/common/**"   # a shared package this app depends on
+```
+
+A push redeploys only if it touched a matching file. Patterns support a
+trailing `/**` and `path.Match` globs (`*` within a segment, `?`, exact
+paths); shared code must be listed explicitly. When a push payload doesn't
+carry a reliable file list (a large/truncated push, or a provider whose
+shape we can't read), teploy deploys anyway rather than risk skipping a real
+change.
 
 ### Mesh access (JIT grants)
 ```

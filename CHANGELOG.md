@@ -14,6 +14,17 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
   listens on, 127.0.0.1-only binds, slow boots, disk-full, and bad
   entrypoints. Deterministic and local; no AI, no network calls.
 
+- Release pinning: `teploy pin [version]` / `teploy unpin <version>` /
+  `teploy pins`. A pinned version is never removed by `keep_versions`
+  auto-pruning, so a known-good rollback target survives outside the
+  retention window. Pins are stored server-side, so the CLI, dashboard, and
+  auto-deploy all honor the same set.
+- Monorepo path filtering for auto-deploy: an `autodeploy.paths` block in
+  `teploy.yml` restricts which pushes redeploy an app — a push deploys only
+  if it touched a matching file (trailing `/**` and `path.Match` globs).
+  Declarative, and fail-open when a push payload has no reliable file list
+  (never silently skips a real change).
+
 ### Changed
 - `teploy init` no longer pre-fills an `app.example.com` domain. An empty
   domain now generates a valid `ingress: host` config (prompting for the

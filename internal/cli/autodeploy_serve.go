@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -94,7 +95,7 @@ func runAutoDeployServe(app, branch string, port int) error {
 				_ = os.WriteFile(dedupPath, snap, 0600)
 			}
 		},
-		trigger: func() {
+		trigger: func(changedFiles []string, filesKnown bool) {
 			// Deploy asynchronously so the webhook response isn't held
 			// open for a potentially multi-minute build — matches
 			// providers' expectation of a prompt response, without
@@ -103,7 +104,7 @@ func runAutoDeployServe(app, branch string, port int) error {
 			go func() {
 				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 				defer cancel()
-				if err := triggerAutoDeploy(ctx, executor, app, branch, buildDir, out); err != nil {
+				if err := triggerAutoDeploy(ctx, executor, app, branch, buildDir, out, changedFiles, filesKnown); err != nil {
 					logf("deploy failed: %v", err)
 				} else {
 					logf("deploy complete")
@@ -141,8 +142,10 @@ type webhookHandlerConfig struct {
 	onDedupChanged func()
 	// trigger is called exactly once per accepted, non-replayed webhook —
 	// the actual deploy kickoff. Never called for a rejected or replayed
-	// request.
-	trigger func()
+	// request. It receives the files the push touched and whether that set
+	// is reliable (see autodeploy.ChangedFiles); the deploy step uses them
+	// for monorepo path filtering.
+	trigger func(changedFiles []string, filesKnown bool)
 }
 
 // newWebhookHandler returns the HTTP handler for the webhook endpoint:
@@ -207,7 +210,11 @@ func newWebhookHandler(cfg webhookHandlerConfig) http.HandlerFunc {
 			cfg.logf("accepted webhook, triggering deploy")
 		}
 		if cfg.trigger != nil {
-			cfg.trigger()
+			// Parse the changed-file set from the push body for monorepo
+			// path filtering. filesKnown=false (unknown provider, truncated
+			// or tag/ping payload) means the deploy step must not skip.
+			changedFiles, filesKnown := autodeploy.ChangedFiles(body)
+			cfg.trigger(changedFiles, filesKnown)
 		}
 	}
 }
@@ -225,7 +232,7 @@ func newWebhookHandler(cfg webhookHandlerConfig) http.HandlerFunc {
 // needs credentials already configured for the server's user, or it's
 // skipped with a warning), so this can still fail on a server that was
 // never successfully cloned.
-func triggerAutoDeploy(ctx context.Context, executor ssh.Executor, app, branch, buildDir string, out io.Writer) error {
+func triggerAutoDeploy(ctx context.Context, executor ssh.Executor, app, branch, buildDir string, out io.Writer, changedFiles []string, filesKnown bool) error {
 	if err := state.AcquireLock(ctx, executor, app); err != nil {
 		return fmt.Errorf("acquiring deploy lock: %w", err)
 	}
@@ -248,6 +255,20 @@ func triggerAutoDeploy(ctx context.Context, executor ssh.Executor, app, branch, 
 	if appCfg.App != app {
 		return fmt.Errorf("teploy.yml in %s declares app %q, expected %q — refusing to deploy the wrong app", buildDir, appCfg.App, app)
 	}
+
+	// Monorepo path filter: if autodeploy.paths is set and we have a
+	// reliable changed-file list, skip the deploy when nothing under those
+	// paths changed. Fail open (deploy) whenever the file set is unknown —
+	// we never want to silently skip a real change.
+	if appCfg.Autodeploy != nil && len(appCfg.Autodeploy.Paths) > 0 {
+		if !filesKnown {
+			fmt.Fprintln(out, "autodeploy.paths set, but the push payload had no reliable file list — deploying to be safe.")
+		} else if !autodeploy.PathMatches(appCfg.Autodeploy.Paths, changedFiles) {
+			fmt.Fprintf(out, "Skipping deploy: no changed files match autodeploy.paths (%s).\n", strings.Join(appCfg.Autodeploy.Paths, ", "))
+			return nil
+		}
+	}
+
 	if appCfg.IsStatic() {
 		return fmt.Errorf("type:static apps are not supported by `teploy autodeploy serve` yet — use a scheduled/manual deploy")
 	}

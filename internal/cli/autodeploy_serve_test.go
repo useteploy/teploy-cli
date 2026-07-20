@@ -32,7 +32,7 @@ func TestWebhookHandler_ValidSignatureTriggersDeployOnce(t *testing.T) {
 	handler := newWebhookHandler(webhookHandlerConfig{
 		secret:  secret,
 		dedup:   autodeploy.NewDeliveryDedup(),
-		trigger: func() { triggerCount++ },
+		trigger: func(_ []string, _ bool) { triggerCount++ },
 	})
 
 	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(string(body)))
@@ -55,7 +55,7 @@ func TestWebhookHandler_InvalidSignatureNeverTriggers(t *testing.T) {
 	handler := newWebhookHandler(webhookHandlerConfig{
 		secret:  "s3cret",
 		dedup:   autodeploy.NewDeliveryDedup(),
-		trigger: func() { triggered = true },
+		trigger: func(_ []string, _ bool) { triggered = true },
 	})
 
 	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"ref":"refs/heads/main"}`))
@@ -77,7 +77,7 @@ func TestWebhookHandler_NoSignatureNeverTriggers(t *testing.T) {
 	handler := newWebhookHandler(webhookHandlerConfig{
 		secret:  "s3cret",
 		dedup:   autodeploy.NewDeliveryDedup(),
-		trigger: func() { triggered = true },
+		trigger: func(_ []string, _ bool) { triggered = true },
 	})
 
 	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{}`))
@@ -106,7 +106,7 @@ func TestWebhookHandler_ReplayedDeliveryIgnored(t *testing.T) {
 	handler := newWebhookHandler(webhookHandlerConfig{
 		secret:  secret,
 		dedup:   dedup,
-		trigger: func() { triggerCount++ },
+		trigger: func(_ []string, _ bool) { triggerCount++ },
 	})
 
 	makeReq := func() *http.Request {
@@ -135,7 +135,7 @@ func TestWebhookHandler_GitLabToken(t *testing.T) {
 	handler := newWebhookHandler(webhookHandlerConfig{
 		secret:  secret,
 		dedup:   autodeploy.NewDeliveryDedup(),
-		trigger: func() { triggerCount++ },
+		trigger: func(_ []string, _ bool) { triggerCount++ },
 	})
 
 	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"ref":"refs/heads/main"}`))
@@ -157,7 +157,7 @@ func TestWebhookHandler_GitLabWrongToken(t *testing.T) {
 	handler := newWebhookHandler(webhookHandlerConfig{
 		secret:  "s3cret",
 		dedup:   autodeploy.NewDeliveryDedup(),
-		trigger: func() { triggered = true },
+		trigger: func(_ []string, _ bool) { triggered = true },
 	})
 
 	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{}`))
@@ -179,7 +179,7 @@ func TestWebhookHandler_RejectsNonPOST(t *testing.T) {
 	handler := newWebhookHandler(webhookHandlerConfig{
 		secret:  "s3cret",
 		dedup:   autodeploy.NewDeliveryDedup(),
-		trigger: func() { triggered = true },
+		trigger: func(_ []string, _ bool) { triggered = true },
 	})
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
@@ -203,7 +203,7 @@ func TestWebhookHandler_OnDedupChangedCalledOnNewDelivery(t *testing.T) {
 	handler := newWebhookHandler(webhookHandlerConfig{
 		secret:         secret,
 		dedup:          autodeploy.NewDeliveryDedup(),
-		trigger:        func() {},
+		trigger:        func(_ []string, _ bool) {},
 		onDedupChanged: func() { changedCount++ },
 	})
 
