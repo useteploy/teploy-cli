@@ -49,15 +49,19 @@ go install github.com/useteploy/teploy/cmd/teploy@latest
 ## Quickstart
 
 ```bash
-# 1. Generate config
-teploy init
-
-# 2. Provision your server (installs Docker + Caddy)
+# 1. Provision your server (installs Docker + Caddy)
 teploy setup <your-server-ip>
 
-# 3. Deploy
+# 2. Deploy
 teploy deploy
 ```
+
+No config file needed to start: running `teploy deploy` in a fresh project
+offers a short interactive setup (app name, domain or raw port, server) and
+writes the resulting 3-line `teploy.yml` before deploying — so your config is
+always a real file you can read, diff, and check in, never hidden state.
+Prefer to answer the questions up front? `teploy init` runs the same flow
+standalone.
 
 ## How it works
 

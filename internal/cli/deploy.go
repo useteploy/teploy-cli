@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
@@ -137,7 +138,22 @@ func runDeploy(flags *Flags, serverName, image, version string, skipDNSCheck boo
 		appCfg, err = config.LoadApp(".")
 	}
 	if err != nil {
-		return err
+		// Zero-config first run: nothing here at all (not a malformed file —
+		// those keep erroring as-is), plain deploy, and a human at the
+		// terminal. Offer to create the config inline, then continue.
+		if destination == "" && errors.Is(err, config.ErrNoConfig) {
+			if !stdinIsTerminal() {
+				return fmt.Errorf("%w (run `teploy init` to create a config)", err)
+			}
+			fmt.Println("No teploy config found in this directory — let's create one.")
+			if _, ierr := initFlow(bufio.NewReader(os.Stdin), ".", false, false); ierr != nil {
+				return ierr
+			}
+			appCfg, err = config.LoadApp(".")
+		}
+		if err != nil {
+			return err
+		}
 	}
 
 	// Narrow the target list by --role/--tag (no-op if neither is set). Only

@@ -722,6 +722,11 @@ func unmarshalAppYAML(data []byte, out *AppConfig) error {
 }
 
 // LoadApp reads and parses teploy config (yml, yaml, or toml) from the given directory.
+// ErrNoConfig is returned by LoadApp when the directory has no teploy or
+// docker-compose config at all (as opposed to a present-but-invalid file).
+// Callers match it with errors.Is to offer interactive first-run setup.
+var ErrNoConfig = errors.New("no teploy.yml, teploy.toml, or docker-compose file found")
+
 func LoadApp(dir string) (*AppConfig, error) {
 	for _, name := range []string{"teploy.yml", "teploy.yaml", "teploy.toml"} {
 		path := filepath.Join(dir, name)
@@ -755,7 +760,7 @@ func LoadApp(dir string) (*AppConfig, error) {
 		return composeCfg, nil
 	}
 
-	return nil, fmt.Errorf("no teploy.yml, teploy.toml, or docker-compose file found in %s", dir)
+	return nil, fmt.Errorf("%w in %s", ErrNoConfig, dir)
 }
 
 // LoadAppWithDestination loads the base config and merges a destination overlay on top.
