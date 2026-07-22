@@ -243,6 +243,31 @@ func (c *Client) RemoveRoute(ctx context.Context, app string) error {
 	return c.applyManagedBlock(ctx, app, nil, "")
 }
 
+// HasCaddyfile reports whether the server has a Teploy-managed Caddyfile at
+// all. Servers running only ingress:host apps never get one — callers use
+// this to skip route edits instead of failing on the missing file.
+func (c *Client) HasCaddyfile(ctx context.Context) bool {
+	_, err := c.exec.Run(ctx, "[ -f "+caddyfilePath+" ]")
+	return err == nil
+}
+
+// AppendRedirect replaces an app's route with a plain, UNMANAGED permanent
+// redirect for its domains. Used by `teploy remove --redirect`: the app is
+// gone, so the block deliberately carries no TEPLOY markers — future deploys
+// and removals will never rewrite or delete it. The app's managed block and
+// any other block already serving these hosts are dropped in the same atomic
+// edit, so the redirect can't be shadowed.
+func (c *Client) AppendRedirect(ctx context.Context, app string, hosts []string, target string) error {
+	if len(hosts) == 0 {
+		return fmt.Errorf("no domains recorded for app %q — cannot write a redirect", app)
+	}
+	return c.mutate(ctx, func(prev string) (string, error) {
+		updated := renderUpdated(prev, app, hosts, "")
+		block := strings.Join(hosts, ", ") + " {\n\tredir " + target + " permanent\n}"
+		return strings.TrimRight(updated, "\n") + "\n\n" + block + "\n", nil
+	})
+}
+
 // maintenancePage is the HTML returned during maintenance mode.
 const maintenancePage = `<!DOCTYPE html>
 <html><head>

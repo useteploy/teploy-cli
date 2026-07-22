@@ -42,6 +42,7 @@ func NewRootCmd(version string) *cobra.Command {
 	root.AddCommand(newStartCmd(flags))
 	root.AddCommand(newRestartCmd(flags))
 	root.AddCommand(newRollbackCmd(flags))
+	root.AddCommand(newRemoveCmd(flags))
 	root.AddCommand(newReleasesCmd(flags))
 	root.AddCommand(newPinCmd(flags))
 	root.AddCommand(newUnpinCmd(flags))
