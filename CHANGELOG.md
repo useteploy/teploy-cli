@@ -4,7 +4,16 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [0.1.21] - 2026-07-22
+
 ### Added
+- `teploy remove` (alias `destroy`) — deploy's inverse, completing the app
+  lifecycle. Stops and removes the app's containers, removes its Caddy route,
+  and deletes its deploy state. Volumes, accessory data, and running accessory
+  containers are preserved unless `--purge`. `--redirect <url>` leaves a
+  permanent redirect for the app's domains as a plain unmanaged Caddy block
+  that later teploy operations never touch. Idempotent; `--yes` and `--json`
+  for automation; skips the route step on `ingress: host` servers.
 - Zero-config first run: `teploy deploy` with no config offers the init flow
   inline on a TTY, writes the resulting `teploy.yml`, and continues deploying.
   Non-TTY behavior is unchanged (hard error, now with a `teploy init` hint).
