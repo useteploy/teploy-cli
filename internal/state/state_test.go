@@ -38,6 +38,44 @@ func TestRead(t *testing.T) {
 	if s.PreviousHash != "6ef8a6a8" {
 		t.Errorf("expected previous_hash 6ef8a6a8, got %s", s.PreviousHash)
 	}
+	if s.SchemaVersion != 1 {
+		t.Errorf("expected imported legacy schema 1, got %d", s.SchemaVersion)
+	}
+}
+
+func TestRead_CanonicalV2TakesPrecedenceOverLegacy(t *testing.T) {
+	v2 := `{"schema_version":2,"deployment_type":"container","ingress_mode":"external","updated_at":"2026-07-22T10:00:00Z","operation_id":"op-2","generation":4,"current_hash":"v2"}`
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "cat -- /deployments/myapp/state.json", Output: v2},
+		ssh.MockCommand{Match: "cat /deployments/myapp/state", Output: "current_hash=stale\n"},
+	)
+
+	s, err := Read(context.Background(), mock, "myapp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.CurrentHash != "v2" || s.Generation != 4 || s.IngressMode != "external" {
+		t.Fatalf("canonical state was not authoritative: %+v", s)
+	}
+	for _, call := range mock.Calls {
+		if strings.HasPrefix(call, "cat /deployments/myapp/state 2>") {
+			t.Fatalf("legacy state was read despite canonical state: %v", mock.Calls)
+		}
+	}
+}
+
+func TestRead_MalformedCanonicalDoesNotFallBack(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "cat -- /deployments/myapp/state.json", Output: "{not-json"},
+		ssh.MockCommand{Match: "cat /deployments/myapp/state", Output: "current_hash=stale\n"},
+	)
+
+	if _, err := Read(context.Background(), mock, "myapp"); err == nil {
+		t.Fatal("expected malformed canonical state error")
+	}
+	if len(mock.Calls) != 1 {
+		t.Fatalf("malformed canonical state fell back to legacy: %v", mock.Calls)
+	}
 }
 
 func TestRead_NoState(t *testing.T) {
@@ -68,24 +106,92 @@ func TestWrite(t *testing.T) {
 		t.Fatalf("Write: %v", err)
 	}
 
-	data, ok := mock.Files["/deployments/myapp/state"]
+	data, ok := mock.Files["/deployments/myapp/state.json"]
 	if !ok {
 		t.Fatal("state file not uploaded")
 	}
 
-	content := string(data)
-	if !strings.Contains(content, "current_port=49153") {
-		t.Errorf("missing current_port in state: %s", content)
+	var written AppState
+	if err := json.Unmarshal(data, &written); err != nil {
+		t.Fatalf("invalid state JSON: %v", err)
 	}
-	if !strings.Contains(content, "current_hash=b2c4d6e8") {
-		t.Errorf("missing current_hash in state: %s", content)
+	if written.SchemaVersion != SchemaVersionV2 || written.CurrentPort != 49153 || written.CurrentHash != "b2c4d6e8" || written.PreviousPort != 49152 || written.PreviousHash != "6ef8a6a8" {
+		t.Fatalf("unexpected state: %+v", written)
 	}
-	if !strings.Contains(content, "previous_port=49152") {
-		t.Errorf("missing previous_port in state: %s", content)
+}
+
+func TestWrite_LegacyImportMigratesToCanonicalAuthority(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "cat /deployments/myapp/state", Output: "current_hash=old\ndomain=old.example.com\n"},
+	)
+	mock.Files["/deployments/myapp/state"] = []byte("current_hash=old\ndomain=old.example.com\n")
+	legacy, err := Read(context.Background(), mock, "myapp")
+	if err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(content, "previous_hash=6ef8a6a8") {
-		t.Errorf("missing previous_hash in state: %s", content)
+	next := NewAppliedState(legacy, "container", "caddy", "new.example.com")
+	next.CurrentHash = "new"
+	if err := Write(context.Background(), mock, "myapp", next); err != nil {
+		t.Fatal(err)
 	}
+
+	if got := string(mock.Files["/deployments/myapp/state"]); got != "current_hash=old\ndomain=old.example.com\n" {
+		t.Fatalf("legacy authority was modified: %q", got)
+	}
+	var written AppState
+	if err := json.Unmarshal(mock.Files["/deployments/myapp/state.json"], &written); err != nil {
+		t.Fatal(err)
+	}
+	if written.Migration == nil || written.Migration.Source != "legacy-key-value" || written.Generation != 1 {
+		t.Fatalf("migration was not recorded explicitly: %+v", written)
+	}
+}
+
+func TestWrite_UploadFailurePreservesExistingStateAndCleansTemp(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "UPLOAD:/deployments/myapp/state.json.tmp-", Err: fmt.Errorf("upload failed")},
+	)
+	mock.Files["/deployments/myapp/state.json"] = []byte(`{"schema_version":2,"current_hash":"old"}`)
+
+	err := Write(context.Background(), mock, "myapp", &AppState{CurrentHash: "new"})
+	if err == nil || !strings.Contains(err.Error(), "uploading temporary file") {
+		t.Fatalf("expected temporary upload error, got %v", err)
+	}
+	if got := string(mock.Files["/deployments/myapp/state.json"]); got != `{"schema_version":2,"current_hash":"old"}` {
+		t.Fatalf("existing state changed after failed upload: %q", got)
+	}
+	assertNoStateTempFiles(t, mock)
+}
+
+func TestWrite_RenameFailurePreservesExistingStateAndCleansTemp(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "mv -f -- '/deployments/myapp/state.json.tmp-", Err: fmt.Errorf("rename failed")},
+	)
+	mock.Files["/deployments/myapp/state.json"] = []byte(`{"schema_version":2,"current_hash":"old"}`)
+
+	err := Write(context.Background(), mock, "myapp", &AppState{CurrentHash: "new"})
+	if err == nil || !strings.Contains(err.Error(), "renaming temporary file") {
+		t.Fatalf("expected atomic rename error, got %v", err)
+	}
+	if got := string(mock.Files["/deployments/myapp/state.json"]); got != `{"schema_version":2,"current_hash":"old"}` {
+		t.Fatalf("existing state changed after failed rename: %q", got)
+	}
+	assertNoStateTempFiles(t, mock)
+}
+
+func assertNoStateTempFiles(t *testing.T, mock *ssh.MockExecutor) {
+	t.Helper()
+	for path := range mock.Files {
+		if strings.Contains(path, "/state.json.tmp-") {
+			t.Fatalf("temporary state file was not cleaned up: %s", path)
+		}
+	}
+	for _, call := range mock.Calls {
+		if strings.HasPrefix(call, "rm -f -- '/deployments/myapp/state.json.tmp-") {
+			return
+		}
+	}
+	t.Fatal("temporary state cleanup was not attempted")
 }
 
 func TestAcquireLock(t *testing.T) {

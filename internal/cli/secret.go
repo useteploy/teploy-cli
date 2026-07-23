@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/signal"
@@ -190,6 +191,19 @@ func runSecretList(flags *Flags, providerFlag string) error {
 	}
 	if err != nil {
 		return err
+	}
+	if flags.JSON {
+		type secretDTO struct {
+			Key      string `json:"key"`
+			Value    string `json:"value"`
+			Provider string `json:"provider"`
+		}
+		providerName := resolveProvider(providerFlag, appCfg)
+		result := make([]secretDTO, 0, len(keys))
+		for _, key := range keys {
+			result = append(result, secretDTO{Key: key, Value: "***", Provider: providerName})
+		}
+		return json.NewEncoder(os.Stdout).Encode(result)
 	}
 	if len(keys) == 0 {
 		fmt.Println("No secrets set")

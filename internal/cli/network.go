@@ -2,10 +2,13 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/useteploy/teploy/internal/config"
@@ -336,8 +339,8 @@ func runNetworkStatus(flags *Flags) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
-	fmt.Printf("%-20s  %-16s  %s\n", "SERVER", "VPN IP", "STATUS")
-
+	sort.Slice(servers, func(i, j int) bool { return servers[i].name < servers[j].name })
+	results := make([]networkStatusDTO, 0, len(servers))
 	for _, s := range servers {
 		exec, err := ssh.Connect(ctx, ssh.ConnectConfig{
 			Host:    s.host,
@@ -345,17 +348,15 @@ func runNetworkStatus(flags *Flags) error {
 			KeyPath: flags.Key,
 		})
 		if err != nil {
-			fmt.Printf("%-20s  %-16s  %s\n", s.name, "-", fmt.Sprintf("connection failed: %v", err))
+			results = append(results, networkStatusDTO{Server: s.name, Host: s.host, VPNIP: "-", Status: "unavailable", Error: err.Error(), ObservedAt: time.Now().UTC()})
 			continue
 		}
 
-		// Auto-detect provider.
 		ip, status := detectVPNStatus(ctx, exec)
 		exec.Close()
-		fmt.Printf("%-20s  %-16s  %s\n", s.name, ip, status)
+		results = append(results, networkStatusDTO{Server: s.name, Host: s.host, VPNIP: ip, Status: status, ObservedAt: time.Now().UTC()})
 	}
-
-	return nil
+	return writeNetworkStatus(flags, results)
 }
 
 func runNetworkStatusServer(flags *Flags, serverName string) error {
@@ -378,8 +379,33 @@ func runNetworkStatusServer(flags *Flags, serverName string) error {
 	defer exec.Close()
 
 	ip, status := detectVPNStatus(ctx, exec)
+	return writeNetworkStatus(flags, []networkStatusDTO{{Server: serverName, Host: host, VPNIP: ip, Status: status, ObservedAt: time.Now().UTC()}})
+}
+
+type networkStatusDTO struct {
+	Server     string    `json:"server"`
+	Host       string    `json:"host"`
+	VPNIP      string    `json:"vpn_ip"`
+	Status     string    `json:"status"`
+	Error      string    `json:"error"`
+	ObservedAt time.Time `json:"observed_at"`
+}
+
+func writeNetworkStatus(flags *Flags, results []networkStatusDTO) error {
+	if results == nil {
+		results = []networkStatusDTO{}
+	}
+	if flags.JSON {
+		return json.NewEncoder(os.Stdout).Encode(results)
+	}
 	fmt.Printf("%-20s  %-16s  %s\n", "SERVER", "VPN IP", "STATUS")
-	fmt.Printf("%-20s  %-16s  %s\n", serverName, ip, status)
+	for _, result := range results {
+		status := result.Status
+		if result.Error != "" {
+			status = "connection failed: " + result.Error
+		}
+		fmt.Printf("%-20s  %-16s  %s\n", result.Server, result.VPNIP, status)
+	}
 	return nil
 }
 

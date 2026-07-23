@@ -2,7 +2,9 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"strings"
@@ -111,7 +113,7 @@ func newEnvListCmd(flags *Flags) *cobra.Command {
 		Short: "List all environment variables",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runEnvList(flags, appName, reveal)
+			return runEnvList(flags, appName, reveal, cmd.OutOrStdout())
 		},
 	}
 
@@ -121,7 +123,7 @@ func newEnvListCmd(flags *Flags) *cobra.Command {
 	return cmd
 }
 
-func runEnvList(flags *Flags, appName string, reveal bool) error {
+func runEnvList(flags *Flags, appName string, reveal bool, out io.Writer) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
@@ -137,16 +139,31 @@ func runEnvList(flags *Flags, appName string, reveal bool) error {
 		return err
 	}
 
+	return writeEnvList(out, entries, reveal, flags.JSON)
+}
+
+func writeEnvList(out io.Writer, entries []env.Entry, reveal, jsonOutput bool) error {
+	if jsonOutput {
+		result := make([]env.Entry, len(entries))
+		copy(result, entries)
+		if !reveal {
+			for i := range result {
+				result[i].Value = "***"
+			}
+		}
+		return json.NewEncoder(out).Encode(result)
+	}
+
 	if len(entries) == 0 {
-		fmt.Println("No environment variables set")
+		fmt.Fprintln(out, "No environment variables set")
 		return nil
 	}
 
 	for _, e := range entries {
 		if reveal {
-			fmt.Printf("%s=%s\n", e.Key, e.Value)
+			fmt.Fprintf(out, "%s=%s\n", e.Key, e.Value)
 		} else {
-			fmt.Printf("%s=***\n", e.Key)
+			fmt.Fprintf(out, "%s=***\n", e.Key)
 		}
 	}
 	return nil

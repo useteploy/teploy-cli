@@ -2,7 +2,9 @@ package cli
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"sort"
 	"text/tabwriter"
@@ -21,6 +23,7 @@ func newServerCmd(flags *Flags) *cobra.Command {
 	cmd.AddCommand(newServerAddCmd(flags))
 	cmd.AddCommand(newServerRemoveCmd(flags))
 	cmd.AddCommand(newServerListCmd(flags))
+	cmd.AddCommand(newServerStatusCmd(flags))
 
 	return cmd
 }
@@ -103,49 +106,58 @@ func newServerListCmd(flags *Flags) *cobra.Command {
 		Short: "List all configured servers",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			path, err := config.DefaultServersPath()
-			if err != nil {
-				return fmt.Errorf("determining servers path: %w", err)
-			}
-
-			servers, err := config.ListServers(path)
-			if err != nil {
-				return fmt.Errorf("listing servers: %w", err)
-			}
-
-			if len(servers) == 0 {
-				fmt.Println("No servers configured. Use 'teploy server add' to add one.")
-				return nil
-			}
-
-			if flags.JSON {
-				return json.NewEncoder(os.Stdout).Encode(servers)
-			}
-
-			// Sort names for deterministic output.
-			names := make([]string, 0, len(servers))
-			for name := range servers {
-				names = append(names, name)
-			}
-			sort.Strings(names)
-
-			w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-			fmt.Fprintln(w, "NAME\tHOST\tUSER\tROLE")
-			for _, name := range names {
-				srv := servers[name]
-				role := srv.Role
-				if role == "" {
-					role = "app"
-				}
-				user := srv.User
-				if user == "" {
-					user = "root"
-				}
-				fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", name, srv.Host, user, role)
-			}
-			w.Flush()
-
-			return nil
+			return runServerList(flags, cmd.OutOrStdout())
 		},
 	}
+}
+
+func runServerList(flags *Flags, out io.Writer) error {
+	path, err := config.DefaultServersPath()
+	if err != nil {
+		return fmt.Errorf("determining servers path: %w", err)
+	}
+
+	servers, err := config.ListServers(path)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("listing servers: %w", err)
+		}
+		servers = map[string]config.Server{}
+	}
+	return writeServerList(out, servers, flags.JSON)
+}
+
+func writeServerList(out io.Writer, servers map[string]config.Server, jsonOutput bool) error {
+	if jsonOutput {
+		if servers == nil {
+			servers = map[string]config.Server{}
+		}
+		return json.NewEncoder(out).Encode(servers)
+	}
+	if len(servers) == 0 {
+		fmt.Fprintln(out, "No servers configured. Use 'teploy server add' to add one.")
+		return nil
+	}
+
+	names := make([]string, 0, len(servers))
+	for name := range servers {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	w := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "NAME\tHOST\tUSER\tROLE")
+	for _, name := range names {
+		srv := servers[name]
+		role := srv.Role
+		if role == "" {
+			role = "app"
+		}
+		user := srv.User
+		if user == "" {
+			user = "root"
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", name, srv.Host, user, role)
+	}
+	return w.Flush()
 }

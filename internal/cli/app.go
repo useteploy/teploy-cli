@@ -19,6 +19,7 @@ func newAppCmd(flags *Flags) *cobra.Command {
 		Short: "Operate on a deployed app's running container",
 	}
 	cmd.AddCommand(newAppExecCmd(flags))
+	cmd.AddCommand(newAppListCmd(flags))
 	return cmd
 }
 

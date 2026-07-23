@@ -80,8 +80,8 @@ func (m *Manager) Unset(ctx context.Context, app, key string) error {
 
 // Entry represents a single key-value pair for display.
 type Entry struct {
-	Key   string
-	Value string
+	Key   string `json:"key"`
+	Value string `json:"value"`
 }
 
 // List returns all env vars sorted by key.

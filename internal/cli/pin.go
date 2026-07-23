@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/signal"
@@ -96,8 +97,10 @@ func runPin(flags *Flags, version string) error {
 	if err := state.AddPin(ctx, executor, appCfg.App, version); err != nil {
 		return err
 	}
-	fmt.Printf("Pinned %s\n", version)
-	return printPins(ctx, executor, appCfg.App)
+	if !flags.JSON {
+		fmt.Printf("Pinned %s\n", version)
+	}
+	return printPins(ctx, executor, appCfg.App, flags.JSON)
 }
 
 func runUnpin(flags *Flags, version string) error {
@@ -111,8 +114,10 @@ func runUnpin(flags *Flags, version string) error {
 	if err := state.RemovePin(ctx, executor, appCfg.App, version); err != nil {
 		return err
 	}
-	fmt.Printf("Unpinned %s\n", version)
-	return printPins(ctx, executor, appCfg.App)
+	if !flags.JSON {
+		fmt.Printf("Unpinned %s\n", version)
+	}
+	return printPins(ctx, executor, appCfg.App, flags.JSON)
 }
 
 func runPins(flags *Flags) error {
@@ -122,13 +127,23 @@ func runPins(flags *Flags) error {
 	}
 	defer cancel()
 	defer executor.Close()
-	return printPins(ctx, executor, appCfg.App)
+	return printPins(ctx, executor, appCfg.App, flags.JSON)
 }
 
-func printPins(ctx context.Context, executor ssh.Executor, app string) error {
+func printPins(ctx context.Context, executor ssh.Executor, app string, jsonOutput bool) error {
 	pins, err := state.ReadPins(ctx, executor, app)
 	if err != nil {
 		return err
+	}
+	if jsonOutput {
+		type pinDTO struct {
+			Version string `json:"version"`
+		}
+		result := make([]pinDTO, 0, len(pins))
+		for _, pin := range pins {
+			result = append(result, pinDTO{Version: pin})
+		}
+		return json.NewEncoder(os.Stdout).Encode(result)
 	}
 	if len(pins) == 0 {
 		fmt.Println("No pinned versions.")

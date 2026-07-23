@@ -83,6 +83,30 @@ func TestClient_ImageExists_TransportError(t *testing.T) {
 	}
 }
 
+func TestClient_ContainerImageDigest(t *testing.T) {
+	want := "sha256:" + strings.Repeat("a", 64)
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "docker inspect -f '{{.Image}}'", Output: want + "\n"},
+	)
+
+	got, err := NewClient(mock).ContainerImageDigest(context.Background(), "myapp-web-v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
+
+func TestClient_ContainerImageDigestRejectsUnprovenValue(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "docker inspect -f '{{.Image}}'", Output: "nginx:latest\n"},
+	)
+	if _, err := NewClient(mock).ContainerImageDigest(context.Background(), "web"); err == nil {
+		t.Fatal("expected a non-content-addressed value to be rejected")
+	}
+}
+
 func TestClient_Run(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "docker run", Output: "abc123def456"},

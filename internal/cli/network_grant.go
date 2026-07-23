@@ -7,6 +7,7 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/signal"
@@ -111,13 +112,38 @@ func newNetworkGrantsCmd(flags *Flags) *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 			defer cancel()
-			client, _, err := resolveGrantClient(provider)
+			client, providerName, err := resolveGrantClient(provider)
 			if err != nil {
 				return err
 			}
 			grants, err := client.ListGrants(ctx)
 			if err != nil {
 				return err
+			}
+			if flags.JSON {
+				type grantDTO struct {
+					ID        string    `json:"id"`
+					Provider  string    `json:"provider"`
+					ExpiresAt time.Time `json:"expires_at"`
+					Tags      []string  `json:"tags"`
+					Ephemeral bool      `json:"ephemeral"`
+					Used      bool      `json:"used"`
+					Status    string    `json:"status"`
+				}
+				now := time.Now()
+				result := make([]grantDTO, 0, len(grants))
+				for _, grant := range grants {
+					status := "active"
+					if !grant.Expires.IsZero() && grant.Expires.Before(now) {
+						status = "expired"
+					}
+					tags := grant.Tags
+					if tags == nil {
+						tags = []string{}
+					}
+					result = append(result, grantDTO{ID: grant.ID, Provider: providerName, ExpiresAt: grant.Expires, Tags: tags, Ephemeral: grant.Ephemeral, Used: grant.Used, Status: status})
+				}
+				return json.NewEncoder(os.Stdout).Encode(result)
 			}
 			if len(grants) == 0 {
 				fmt.Println("No pre-auth keys.")

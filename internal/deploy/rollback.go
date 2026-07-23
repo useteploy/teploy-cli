@@ -81,6 +81,9 @@ func Rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg Rollbac
 	if err != nil || current == nil {
 		return fmt.Errorf("no deploy state found for %s — deploy first", cfg.App)
 	}
+	if current.IngressMode != "" {
+		cfg.Ingress = current.IngressMode
+	}
 	target := cfg.ToHash
 	if target == "" {
 		target = current.PreviousHash
@@ -227,32 +230,62 @@ func Rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg Rollbac
 		fmt.Fprintf(out, "Skipping Caddy route restore (ingress: %s)\n", cfg.Ingress)
 	}
 
-	// 5. Stop current containers (match by version label — see step 2).
-	for _, c := range containers {
-		if c.Labels["teploy.version"] == current.CurrentHash && c.State == "running" {
-			fmt.Fprintf(out, "Stopping %s...\n", c.Name)
-			dk.Stop(ctx, c.Name, stopTimeout)
-		}
-	}
-
-	// 6. Swap state: target becomes current, the version rolled back from
+	// 5. Commit state before stopping the current workload. If the commit
+	// fails, route back to the still-running current containers and stop only
+	// the uncommitted rollback target.
+	//
+	// Swap state: target becomes current, the version rolled back from
 	// becomes previous — mirrors type:static's Rollback (a plain 1-level
 	// swap, not a deeper history stack: a --to rollback several versions
 	// back still only remembers "the version just abandoned" as
 	// PreviousHash, same as a normal rollback would). Carry the durable
 	// Domain through (state.Write omits an empty domain, so dropping it
 	// here blanked the persisted domain and broke the next rollback).
-	newState := &state.AppState{
-		CurrentPort:   healthPorts[0],
-		CurrentHash:   target,
-		PreviousPort:  current.CurrentPort,
-		PreviousHash:  current.CurrentHash,
-		Domain:        current.Domain,
-		CurrentPorts:  healthPorts,
-		PreviousPorts: current.CurrentPorts,
+	deploymentType := current.DeploymentType
+	if deploymentType == "" {
+		deploymentType = "container"
+	}
+	ingress := cfg.Ingress
+	if ingress == "" && current.IngressMode != "" {
+		ingress = current.IngressMode
+	}
+	domain := current.Domain
+	if domain == "" {
+		domain = cfg.Domain
+	}
+	newState := state.NewAppliedState(current, deploymentType, ingress, domain)
+	newState.CurrentPort = healthPorts[0]
+	newState.CurrentHash = target
+	newState.PreviousPort = current.CurrentPort
+	newState.PreviousHash = current.CurrentHash
+	newState.CurrentPorts = healthPorts
+	newState.PreviousPorts = current.CurrentPorts
+	if current.PreviousRelease != nil && current.PreviousRelease.Hash == target {
+		newState.ApplyRelease(current.PreviousRelease)
+	}
+	newState.ImageRef = targetWeb[0].Image
+	if digest, digestErr := dk.ContainerImageDigest(ctx, targetWeb[0].Name); digestErr == nil {
+		newState.ImageDigest = digest
 	}
 	if err := state.Write(ctx, exec, cfg.App, newState); err != nil {
-		return fmt.Errorf("writing state: %w", err)
+		if cfg.usesCaddy() {
+			if restoreErr := restoreRollbackRoute(ctx, cd, dk, cfg, current, containers); restoreErr != nil {
+				return fmt.Errorf("committing authoritative applied state after rollback route switch: %w; restoring the original route failed: %v; original and target workloads were left running to avoid routing to a stopped container", err, restoreErr)
+			}
+		}
+		for _, name := range started {
+			dk.Stop(ctx, name, 5)
+		}
+		return fmt.Errorf("committing authoritative applied state after rollback route switch: %w; the original route was restored, the original workload was left running, and the uncommitted target was stopped", err)
+	}
+
+	// 6. The authoritative commit succeeded; the prior current workload can
+	// now be stopped (match by version label — see step 2).
+	for _, c := range containers {
+		if c.Labels["teploy.version"] == current.CurrentHash && c.State == "running" {
+			fmt.Fprintf(out, "Stopping %s...\n", c.Name)
+			dk.Stop(ctx, c.Name, stopTimeout)
+		}
 	}
 
 	// 7. Log.
@@ -268,4 +301,40 @@ func Rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg Rollbac
 	duration := time.Since(start)
 	fmt.Fprintf(out, "\nRolled back %s to version %s in %s\n", cfg.App, target, duration.Round(time.Millisecond))
 	return nil
+}
+
+func restoreRollbackRoute(ctx context.Context, cd *caddy.Client, dk *docker.Client, cfg RollbackConfig, current *state.AppState, containers []docker.Container) error {
+	var currentWeb []docker.Container
+	for _, container := range containers {
+		if container.Labels["teploy.version"] == current.CurrentHash && container.Labels["teploy.process"] == "web" && container.State == "running" {
+			currentWeb = append(currentWeb, container)
+		}
+	}
+	if len(currentWeb) == 0 {
+		return fmt.Errorf("no running web containers found for original version %s", current.CurrentHash)
+	}
+	sort.Slice(currentWeb, func(i, j int) bool { return currentWeb[i].Name < currentWeb[j].Name })
+
+	domain := current.Domain
+	if domain == "" {
+		domain = cfg.Domain
+	}
+	tls := caddy.TLS{Cert: cfg.TLSCert, Key: cfg.TLSKey, Internal: cfg.TLSInternal}
+	if len(currentWeb) == 1 {
+		port, err := dk.InternalPort(ctx, currentWeb[0].Name)
+		if err != nil {
+			return err
+		}
+		return cd.SetRoute(ctx, cfg.App, domain, currentWeb[0].Name, port, tls, cfg.CaddyExtra, cfg.Firewall, cfg.Access)
+	}
+
+	upstreams := make([]caddy.Upstream, len(currentWeb))
+	for i, container := range currentWeb {
+		port, err := dk.InternalPort(ctx, container.Name)
+		if err != nil {
+			return err
+		}
+		upstreams[i] = caddy.Upstream{Dial: fmt.Sprintf("%s:%d", container.Name, port)}
+	}
+	return cd.SetLoadBalancer(ctx, cfg.App, domain, upstreams, tls, cfg.CaddyExtra, cfg.Firewall, cfg.Access)
 }

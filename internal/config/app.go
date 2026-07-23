@@ -319,6 +319,11 @@ type AppConfig struct {
 	Audit        AuditConfig       `yaml:"audit,omitempty" toml:"audit"`                 // emit deploy/rollback events to teploy-observe
 	Access       AccessConfig      `yaml:"access,omitempty" toml:"access"`               // inbound access gate: basic auth / forward auth
 	Secret       SecretConfig      `yaml:"secret,omitempty" toml:"secret"`               // managed secrets provider (e.g. openbao)
+
+	// SourceRevision is runtime release metadata populated by deploy entry
+	// points when a full git revision is provable. It is never parsed from or
+	// emitted into the user manifest.
+	SourceRevision string `yaml:"-" toml:"-"`
 }
 
 // SecretConfig configures the managed secrets provider for an app (the same
@@ -349,9 +354,9 @@ type AccessConfig struct {
 
 // ForwardAuthConfig configures Caddy forward_auth to an external authn proxy.
 type ForwardAuthConfig struct {
-	URL         string   `yaml:"url" toml:"url"`                                   // upstream, e.g. authelia:9091
-	URI         string   `yaml:"uri,omitempty" toml:"uri"`                        // verify path, e.g. /api/authz/forward-auth
-	CopyHeaders []string `yaml:"copy_headers,omitempty" toml:"copy_headers"`      // identity headers to copy upstream
+	URL         string   `yaml:"url" toml:"url"`                             // upstream, e.g. authelia:9091
+	URI         string   `yaml:"uri,omitempty" toml:"uri"`                   // verify path, e.g. /api/authz/forward-auth
+	CopyHeaders []string `yaml:"copy_headers,omitempty" toml:"copy_headers"` // identity headers to copy upstream
 }
 
 // IsZero reports whether no access gate is configured.

@@ -3,6 +3,7 @@ package deploy
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -20,7 +21,23 @@ LISTEN  0       128     0.0.0.0:22           0.0.0.0:*
 LISTEN  0       128     0.0.0.0:80           0.0.0.0:*
 LISTEN  0       128     0.0.0.0:443          0.0.0.0:*`
 
+func writtenState(t *testing.T, mock *ssh.MockExecutor, app string) state.AppState {
+	t.Helper()
+	data, ok := mock.Files["/deployments/"+app+"/state.json"]
+	if !ok {
+		t.Fatalf("state.json not written for %s", app)
+	}
+	var got state.AppState
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatalf("invalid state.json for %s: %v", app, err)
+	}
+	return got
+}
+
 func TestDeploy_FirstDeploy(t *testing.T) {
+	manifest := json.RawMessage(`{"app":"myapp","env_keys":["TOKEN"]}`)
+	manifestSHA := fmt.Sprintf("%x", sha256.Sum256(manifest))
+	imageDigest := "sha256:" + strings.Repeat("a", 64)
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		// 1. Ensure app dir.
 		ssh.MockCommand{Match: "mkdir -p /deployments/myapp", Output: ""},
@@ -33,6 +50,7 @@ func TestDeploy_FirstDeploy(t *testing.T) {
 		// 5. Start container.
 		ssh.MockCommand{Match: "docker run", Output: "abc123def456"},
 		// 6. Verify running.
+		ssh.MockCommand{Match: "docker inspect -f '{{.Image}}'", Output: imageDigest},
 		ssh.MockCommand{Match: "docker inspect", Output: "running"},
 		// 7. Health check.
 		ssh.MockCommand{Match: "curl -s -o /dev/null", Output: "200"},
@@ -58,11 +76,14 @@ func TestDeploy_FirstDeploy(t *testing.T) {
 	deployer := NewDeployer(mock, &buf)
 
 	err := deployer.Deploy(context.Background(), Config{
-		App:     "myapp",
-		Domain:  "myapp.com",
-		Image:   "myapp:latest",
-		Version: "abc123",
-		Health:  HealthConfig{Timeout: 5 * time.Second, Interval: 10 * time.Millisecond},
+		App:             "myapp",
+		Domain:          "myapp.com",
+		Image:           "myapp:latest",
+		Version:         "abc123",
+		Health:          HealthConfig{Timeout: 5 * time.Second, Interval: 10 * time.Millisecond},
+		ManifestSHA256:  manifestSHA,
+		AppliedManifest: manifest,
+		SourceRevision:  strings.Repeat("b", 40),
 	})
 	if err != nil {
 		t.Fatalf("Deploy: %v", err)
@@ -83,15 +104,19 @@ func TestDeploy_FirstDeploy(t *testing.T) {
 	}
 
 	// Verify state was written.
-	stateData, ok := mock.Files["/deployments/myapp/state"]
+	stateData, ok := mock.Files["/deployments/myapp/state.json"]
 	if !ok {
 		t.Fatal("state file not written")
 	}
-	if !strings.Contains(string(stateData), "current_port=49152") {
-		t.Errorf("expected current_port=49152 in state, got: %s", string(stateData))
+	var applied state.AppState
+	if err := json.Unmarshal(stateData, &applied); err != nil {
+		t.Fatalf("invalid state JSON: %v", err)
 	}
-	if !strings.Contains(string(stateData), "current_hash=abc123") {
-		t.Errorf("expected current_hash=abc123 in state, got: %s", string(stateData))
+	if applied.CurrentPort != 49152 || applied.CurrentHash != "abc123" || applied.DeploymentType != "container" || applied.IngressMode != "caddy" || applied.Domain != "myapp.com" {
+		t.Errorf("unexpected applied state: %+v", applied)
+	}
+	if applied.ManifestSHA256 != manifestSHA || !bytes.Equal(applied.AppliedManifest, manifest) || applied.SourceRevision != strings.Repeat("b", 40) || applied.ImageRef != "myapp:latest" || applied.ImageDigest != imageDigest || applied.OperationID == "" || applied.Generation != 1 {
+		t.Errorf("incomplete applied identity: %+v", applied)
 	}
 
 	// Verify deploy log was written.
@@ -133,7 +158,7 @@ func TestDeploy_HostIngress(t *testing.T) {
 		ssh.MockCommand{Match: "mkdir /deployments/web/.lock", Output: ""},
 		ssh.MockCommand{Match: "cat /deployments/web/state", Err: fmt.Errorf("no such file")},
 		// Recreate pre-step: query existing web containers to free the port.
-		ssh.MockCommand{Match: "docker ps -aq --filter label=teploy.app=web", Output: ""},
+		ssh.MockCommand{Match: "docker ps --filter label=teploy.app=web", Output: ""},
 		ssh.MockCommand{Match: "docker run", Output: "abc123def456"},
 		ssh.MockCommand{Match: "docker inspect", Output: "running"},
 		ssh.MockCommand{Match: "curl -s -o /dev/null", Output: "200"},
@@ -167,7 +192,7 @@ func TestDeploy_HostIngress(t *testing.T) {
 	// any prior container (the filter query must have run before run).
 	var sawFilter, sawRun bool
 	for _, call := range mock.Calls {
-		if strings.HasPrefix(call, "docker ps -aq --filter label=teploy.app=web") {
+		if strings.HasPrefix(call, "docker ps --filter label=teploy.app=web") {
 			sawFilter = true
 		}
 		if strings.HasPrefix(call, "docker run") {
@@ -191,12 +216,60 @@ func TestDeploy_HostIngress(t *testing.T) {
 	}
 
 	// Fixed port recorded in state.
-	stateData, ok := mock.Files["/deployments/web/state"]
+	stateData, ok := mock.Files["/deployments/web/state.json"]
 	if !ok {
 		t.Fatal("state file not written")
 	}
-	if !strings.Contains(string(stateData), "current_port=3000") {
-		t.Errorf("expected current_port=3000 in state, got: %s", string(stateData))
+	var hostState state.AppState
+	if err := json.Unmarshal(stateData, &hostState); err != nil {
+		t.Fatal(err)
+	}
+	if hostState.CurrentPort != 3000 || hostState.IngressMode != "host" {
+		t.Errorf("unexpected host state: %+v", hostState)
+	}
+}
+
+func TestDeploy_HostIngressStateCommitFailureRestoresOldWorkload(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "mkdir -p /deployments/web", Output: ""},
+		ssh.MockCommand{Match: "mkdir /deployments/web/.lock", Output: ""},
+		ssh.MockCommand{Match: "cat /deployments/web/state", Output: "current_port=3000\ncurrent_hash=old123\n"},
+		ssh.MockCommand{Match: "docker ps --filter label=teploy.app=web", Output: "web-web-old123"},
+		ssh.MockCommand{Match: "docker stop", Output: ""},
+		ssh.MockCommand{Match: "docker run", Output: "container-id"},
+		ssh.MockCommand{Match: "docker inspect -f '{{.State.Status}}'", Output: "running"},
+		ssh.MockCommand{Match: "docker inspect 'web-web-old123'", Output: `[{"Config":{"Image":"web:old","Labels":{"teploy.app":"web","teploy.process":"web","teploy.version":"old123"}},"HostConfig":{"NetworkMode":"teploy","PortBindings":{"3000/tcp":[{"HostIp":"0.0.0.0","HostPort":"3000"}]},"RestartPolicy":{"Name":"no"}},"NetworkSettings":{"Networks":{"teploy":{"Aliases":["web"]}}}}]`},
+		ssh.MockCommand{Match: "docker rm -f 'web-web-old123'", Output: ""},
+		ssh.MockCommand{Match: "docker rm", Output: ""},
+		ssh.MockCommand{Match: "curl -s -o /dev/null", Output: "200"},
+		ssh.MockCommand{Match: "UPLOAD:/deployments/web/state.json.tmp-", Err: fmt.Errorf("disk full")},
+		ssh.MockCommand{Match: "printf %s", Output: ""},
+		ssh.MockCommand{Match: "rm -rf /deployments/web/.lock", Output: ""},
+	)
+	var out bytes.Buffer
+
+	err := NewDeployer(mock, &out).Deploy(context.Background(), Config{
+		App:           "web",
+		Image:         "web:new",
+		Version:       "new456",
+		Ingress:       "host",
+		ContainerPort: 3000,
+		Health:        HealthConfig{Timeout: 5 * time.Second, Interval: 10 * time.Millisecond},
+	})
+	if err == nil || !strings.Contains(err.Error(), "original workload was restored") {
+		t.Fatalf("expected restored host workload error, got %v", err)
+	}
+	if strings.Contains(out.String(), "Deployed web version") {
+		t.Fatalf("failed deploy reported success: %s", out.String())
+	}
+	var restored bool
+	for _, call := range mock.Calls {
+		if strings.HasPrefix(call, "docker run") && strings.Contains(call, "--name 'web-web-old123'") {
+			restored = true
+		}
+	}
+	if !restored {
+		t.Fatalf("old fixed-port workload was not recreated: %v", mock.Calls)
 	}
 }
 
@@ -249,15 +322,60 @@ func TestDeploy_UpdateExisting(t *testing.T) {
 	}
 
 	// Verify state includes previous info.
-	stateData := string(mock.Files["/deployments/myapp/state"])
-	if !strings.Contains(stateData, "current_hash=new456") {
-		t.Errorf("expected current_hash=new456, got: %s", stateData)
+	updated := writtenState(t, mock, "myapp")
+	if updated.CurrentHash != "new456" || updated.PreviousHash != "old123" || updated.PreviousPort != 49152 || updated.Generation != 1 {
+		t.Errorf("unexpected updated state: %+v", updated)
 	}
-	if !strings.Contains(stateData, "previous_hash=old123") {
-		t.Errorf("expected previous_hash=old123, got: %s", stateData)
+	if updated.Migration == nil || updated.Migration.Source != "legacy-key-value" {
+		t.Errorf("legacy migration not recorded: %+v", updated)
 	}
-	if !strings.Contains(stateData, "previous_port=49152") {
-		t.Errorf("expected previous_port=49152, got: %s", stateData)
+}
+
+func TestDeploy_StateCommitFailureRestoresRouteWithoutStoppingOldWorkload(t *testing.T) {
+	existingState := "current_port=49152\ncurrent_hash=old123\nprevious_port=0\nprevious_hash=\ndomain=myapp.com\n"
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "mkdir -p /deployments/myapp", Output: ""},
+		ssh.MockCommand{Match: "mkdir /deployments/myapp/.lock", Output: ""},
+		ssh.MockCommand{Match: "cat /deployments/myapp/state", Output: existingState},
+		ssh.MockCommand{Match: "ss -tln", Output: ssOutput},
+		ssh.MockCommand{Match: "docker run", Output: "newcontainer123"},
+		ssh.MockCommand{Match: "docker inspect -f '{{.State.Status}}'", Output: "running"},
+		ssh.MockCommand{Match: "docker inspect -f '{{range $p, $_ := .NetworkSettings.Ports}}", Output: "80/tcp"},
+		ssh.MockCommand{Match: "curl -s -o /dev/null", Output: "200"},
+		ssh.MockCommand{Match: "cat /deployments/caddy/Caddyfile", Output: "{\n\tadmin 0.0.0.0:2019\n}\n"},
+		ssh.MockCommand{Match: "mv /tmp/teploy_caddyfile.tmp", Output: ""},
+		ssh.MockCommand{Match: "mkdir /deployments/caddy/.lock", Output: ""},
+		ssh.MockCommand{Match: "docker exec caddy caddy reload", Output: ""},
+		ssh.MockCommand{Match: "rmdir /deployments/caddy/.lock", Output: ""},
+		ssh.MockCommand{Match: "UPLOAD:/deployments/myapp/state.json.tmp-", Err: fmt.Errorf("disk full")},
+		ssh.MockCommand{Match: "docker stop", Output: ""},
+		ssh.MockCommand{Match: "docker rm", Output: ""},
+		ssh.MockCommand{Match: "printf %s", Output: ""},
+		ssh.MockCommand{Match: "rm -rf /deployments/myapp/.lock", Output: ""},
+	)
+
+	err := NewDeployer(mock, &bytes.Buffer{}).Deploy(context.Background(), Config{
+		App:     "myapp",
+		Domain:  "myapp.com",
+		Image:   "myapp:v2",
+		Version: "new456",
+		Health:  HealthConfig{Timeout: 5 * time.Second, Interval: 10 * time.Millisecond},
+	})
+	if err == nil || !strings.Contains(err.Error(), "previous route was restored") {
+		t.Fatalf("expected fail-closed state commit error, got %v", err)
+	}
+
+	for _, call := range mock.Calls {
+		if strings.HasPrefix(call, "docker stop") && strings.Contains(call, "old123") {
+			t.Fatalf("old workload was stopped after failed state commit: %s", call)
+		}
+	}
+	restoredCaddyfile := string(mock.Files["/tmp/teploy_caddyfile.tmp"])
+	if !strings.Contains(restoredCaddyfile, "myapp-web-old123:80") {
+		t.Fatalf("previous route was not restored: %s", restoredCaddyfile)
+	}
+	if strings.Contains(restoredCaddyfile, "myapp-web-new456") {
+		t.Fatalf("uncommitted route remained active: %s", restoredCaddyfile)
 	}
 }
 
@@ -315,7 +433,7 @@ func TestDeploy_HealthCheckFailure(t *testing.T) {
 	}
 
 	// Verify state was NOT written (no state file uploaded for deploy failure).
-	if _, ok := mock.Files["/deployments/myapp/state"]; ok {
+	if _, ok := mock.Files["/deployments/myapp/state.json"]; ok {
 		t.Error("state should not be written on failed deploy")
 	}
 }
@@ -723,7 +841,7 @@ func TestDeploy_PreDeployHookFailure(t *testing.T) {
 	}
 
 	// Verify state was NOT written.
-	if _, ok := mock.Files["/deployments/myapp/state"]; ok {
+	if _, ok := mock.Files["/deployments/myapp/state.json"]; ok {
 		t.Error("state should not be written on failed pre-deploy hook")
 	}
 
@@ -785,7 +903,7 @@ func TestDeploy_PostDeployHookFailure(t *testing.T) {
 	}
 
 	// Verify state WAS written (deploy succeeded).
-	if _, ok := mock.Files["/deployments/myapp/state"]; !ok {
+	if _, ok := mock.Files["/deployments/myapp/state.json"]; !ok {
 		t.Error("state should be written on successful deploy")
 	}
 

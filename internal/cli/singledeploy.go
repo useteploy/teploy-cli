@@ -214,29 +214,36 @@ func (s *singleServerDeployer) deployApp(ctx context.Context, appCfg *config.App
 	}
 
 	// Deploy.
+	appliedManifest, manifestSHA256, err := config.NormalizeAndDigest(appCfg, image)
+	if err != nil {
+		return fmt.Errorf("normalizing applied manifest: %w", err)
+	}
 	deployer := deploy.NewDeployer(s.exec, s.out)
 	deployCfg := deploy.Config{
-		App:           appCfg.App,
-		Domain:        appCfg.Domain,
-		Image:         image,
-		Version:       version,
-		EnvFiles:      envFiles,
-		Volumes:       volumes,
-		Processes:     appCfg.Processes,
-		NoHealthcheck: disabledHealthchecks(appCfg.Healthcheck),
-		Health:        healthConfigFrom(appCfg.Health),
-		KeepVersions:  appCfg.KeepVersions,
-		Ingress:       appCfg.Ingress,
-		ContainerPort: appCfg.Port,
-		StopTimeout:   appCfg.StopTimeout,
-		Replicas:      appCfg.Replicas,
-		PreDeploy:     appCfg.Hooks.PreDeploy,
-		PostDeploy:    appCfg.Hooks.PostDeploy,
-		AssetPath:     appCfg.Assets.Path,
-		AssetKeepDays: appCfg.Assets.KeepDays,
-		TLSCert:       tlsCert,
-		TLSKey:        tlsKey,
-		TLSInternal:   tlsInternal,
+		App:             appCfg.App,
+		Domain:          appCfg.Domain,
+		Image:           image,
+		Version:         version,
+		EnvFiles:        envFiles,
+		Volumes:         volumes,
+		Processes:       appCfg.Processes,
+		NoHealthcheck:   disabledHealthchecks(appCfg.Healthcheck),
+		Health:          healthConfigFrom(appCfg.Health),
+		KeepVersions:    appCfg.KeepVersions,
+		Ingress:         appCfg.Ingress,
+		ContainerPort:   appCfg.Port,
+		StopTimeout:     appCfg.StopTimeout,
+		Replicas:        appCfg.Replicas,
+		PreDeploy:       appCfg.Hooks.PreDeploy,
+		PostDeploy:      appCfg.Hooks.PostDeploy,
+		AssetPath:       appCfg.Assets.Path,
+		AssetKeepDays:   appCfg.Assets.KeepDays,
+		TLSCert:         tlsCert,
+		TLSKey:          tlsKey,
+		TLSInternal:     tlsInternal,
+		ManifestSHA256:  manifestSHA256,
+		AppliedManifest: appliedManifest,
+		SourceRevision:  appCfg.SourceRevision,
 	}
 
 	// Vulnerability gate (see deploy.go): fixable CRITICALs block before

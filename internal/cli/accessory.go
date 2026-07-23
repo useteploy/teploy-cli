@@ -148,7 +148,7 @@ func newAccessoryListCmd(flags *Flags) *cobra.Command {
 		Short: "List accessory containers",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runAccessoryList(flags, appName)
+			return runAccessoryList(flags, appName, cmd.OutOrStdout())
 		},
 	}
 	// `list` only needs the app name (read-only container listing), so it
@@ -159,7 +159,7 @@ func newAccessoryListCmd(flags *Flags) *cobra.Command {
 	return cmd
 }
 
-func runAccessoryList(flags *Flags, appName string) error {
+func runAccessoryList(flags *Flags, appName string, out io.Writer) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
@@ -169,19 +169,48 @@ func runAccessoryList(flags *Flags, appName string) error {
 	}
 	defer executor.Close()
 
-	mgr := accessories.NewManager(executor, os.Stdout)
+	mgr := accessories.NewManager(executor, out)
 	containers, err := mgr.List(ctx, appCfg.App)
 	if err != nil {
 		return err
 	}
+	return writeAccessoryList(out, containers, flags.JSON)
+}
+
+type accessoryContainer struct {
+	ID        string            `json:"id"`
+	Name      string            `json:"name"`
+	Image     string            `json:"image"`
+	State     string            `json:"state"`
+	Status    string            `json:"status"`
+	CreatedAt string            `json:"created_at"`
+	Labels    map[string]string `json:"labels,omitempty"`
+}
+
+func writeAccessoryList(out io.Writer, containers []docker.Container, jsonOutput bool) error {
+	if jsonOutput {
+		result := make([]accessoryContainer, len(containers))
+		for i, container := range containers {
+			result[i] = accessoryContainer{
+				ID:        container.ID,
+				Name:      container.Name,
+				Image:     container.Image,
+				State:     container.State,
+				Status:    container.Status,
+				CreatedAt: container.CreatedAt,
+				Labels:    container.Labels,
+			}
+		}
+		return json.NewEncoder(out).Encode(result)
+	}
 
 	if len(containers) == 0 {
-		fmt.Println("No accessories running")
+		fmt.Fprintln(out, "No accessories running")
 		return nil
 	}
 
 	for _, c := range containers {
-		fmt.Printf("%-30s %-20s %-10s %s\n", c.Name, c.Image, c.State, c.Status)
+		fmt.Fprintf(out, "%-30s %-20s %-10s %s\n", c.Name, c.Image, c.State, c.Status)
 	}
 	return nil
 }

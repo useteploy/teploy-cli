@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"strings"
@@ -86,14 +87,32 @@ func newStatsCmd(flags *Flags) *cobra.Command {
 		Short: "Show CPU/RAM per container",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runStats(flags, appName)
+			return runStats(flags, appName, cmd.OutOrStdout())
 		},
 	}
 	cmd.Flags().StringVar(&appName, "app", "", "app name — act on server state instead of teploy.yml (requires --host)")
 	return cmd
 }
 
-func runStats(flags *Flags, appName string) error {
+type containerStats struct {
+	Name          string `json:"name"`
+	CPUPercent    string `json:"cpu_percent"`
+	MemoryUsage   string `json:"memory_usage"`
+	MemoryPercent string `json:"memory_percent"`
+	NetworkIO     string `json:"network_io"`
+	BlockIO       string `json:"block_io"`
+}
+
+type dockerStatsEntry struct {
+	Name     string `json:"Name"`
+	CPUPerc  string `json:"CPUPerc"`
+	MemUsage string `json:"MemUsage"`
+	MemPerc  string `json:"MemPerc"`
+	NetIO    string `json:"NetIO"`
+	BlockIO  string `json:"BlockIO"`
+}
+
+func runStats(flags *Flags, appName string, out io.Writer) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
@@ -110,7 +129,10 @@ func runStats(flags *Flags, appName string) error {
 		return err
 	}
 	if len(containers) == 0 {
-		fmt.Println("No containers running")
+		if flags.JSON {
+			return writeContainerStats(out, nil)
+		}
+		fmt.Fprintln(out, "No containers running")
 		return nil
 	}
 
@@ -119,11 +141,50 @@ func runStats(flags *Flags, appName string) error {
 		names[i] = c.Name
 	}
 
-	format := "'table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.MemPerc}}\t{{.NetIO}}\t{{.BlockIO}}'"
 	if flags.JSON {
-		format = "'{{json .}}'"
+		cmd := fmt.Sprintf("docker stats --no-stream --format '{{json .}}' %s", strings.Join(names, " "))
+		output, err := executor.Run(ctx, cmd)
+		if err != nil {
+			return err
+		}
+		stats, err := parseContainerStats(output)
+		if err != nil {
+			return err
+		}
+		return writeContainerStats(out, stats)
 	}
 
+	format := "'table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.MemPerc}}\t{{.NetIO}}\t{{.BlockIO}}'"
 	cmd := fmt.Sprintf("docker stats --no-stream --format %s %s", format, strings.Join(names, " "))
-	return executor.RunStream(ctx, cmd, os.Stdout, os.Stderr)
+	return executor.RunStream(ctx, cmd, out, os.Stderr)
+}
+
+func writeContainerStats(out io.Writer, stats []containerStats) error {
+	if stats == nil {
+		stats = []containerStats{}
+	}
+	return json.NewEncoder(out).Encode(stats)
+}
+
+func parseContainerStats(output string) ([]containerStats, error) {
+	stats := []containerStats{}
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var entry dockerStatsEntry
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			return nil, fmt.Errorf("parsing container stats: %w", err)
+		}
+		stats = append(stats, containerStats{
+			Name:          entry.Name,
+			CPUPercent:    entry.CPUPerc,
+			MemoryUsage:   entry.MemUsage,
+			MemoryPercent: entry.MemPerc,
+			NetworkIO:     entry.NetIO,
+			BlockIO:       entry.BlockIO,
+		})
+	}
+	return stats, nil
 }

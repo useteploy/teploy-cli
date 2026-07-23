@@ -3,6 +3,8 @@ package deploy
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -21,9 +23,12 @@ func rollbackCfg() RollbackConfig {
 }
 
 func TestRollback(t *testing.T) {
-	stateContent := "current_port=49153\ncurrent_hash=v2\nprevious_port=49152\nprevious_hash=v1\n"
+	currentManifest := json.RawMessage(`{"release":"v2"}`)
+	previousManifest := json.RawMessage(`{"release":"v1"}`)
+	stateContent := fmt.Sprintf(`{"schema_version":2,"deployment_type":"container","ingress_mode":"caddy","domain":"myapp.com","updated_at":"2026-07-22T10:00:00Z","manifest_sha256":"%x","source_revision":"rev-v2","image_ref":"myapp:v2","operation_id":"deploy-v2","generation":7,"applied_manifest":%s,"previous_release":{"hash":"v1","manifest_sha256":"%x","source_revision":"rev-v1","image_ref":"myapp:v1","applied_manifest":%s},"current_port":49153,"current_hash":"v2","previous_port":49152,"previous_hash":"v1"}`,
+		sha256.Sum256(currentManifest), currentManifest, sha256.Sum256(previousManifest), previousManifest)
 	mock := ssh.NewMockExecutor("1.2.3.4",
-		ssh.MockCommand{Match: "cat /deployments/myapp/state", Output: stateContent},
+		ssh.MockCommand{Match: "cat -- /deployments/myapp/state.json", Output: stateContent},
 		ssh.MockCommand{Match: "docker ps --all --filter label=teploy.app='myapp'",
 			Output: `{"ID":"aaa","Names":"myapp-web-v1","Image":"myapp:latest","State":"exited","Status":"Exited","Labels":"teploy.app=myapp,teploy.version=v1,teploy.process=web"}` + "\n" +
 				`{"ID":"bbb","Names":"myapp-web-v2","Image":"myapp:latest","State":"running","Status":"Up 1h","Labels":"teploy.app=myapp,teploy.version=v2,teploy.process=web"}`,
@@ -114,12 +119,54 @@ func TestRollback(t *testing.T) {
 	}
 
 	// Verify state was swapped.
-	stateData := string(mock.Files["/deployments/myapp/state"])
-	if !strings.Contains(stateData, "current_hash=v1") {
-		t.Errorf("expected state current_hash=v1, got: %s", stateData)
+	stateData := writtenState(t, mock, "myapp")
+	if stateData.CurrentHash != "v1" || stateData.PreviousHash != "v2" || stateData.DeploymentType != "container" || stateData.IngressMode != "caddy" || stateData.Generation != 8 || stateData.OperationID == "" {
+		t.Errorf("unexpected rollback state: %+v", stateData)
 	}
-	if !strings.Contains(stateData, "previous_hash=v2") {
-		t.Errorf("expected state previous_hash=v2, got: %s", stateData)
+	if stateData.SourceRevision != "rev-v1" || !bytes.Equal(stateData.AppliedManifest, previousManifest) || stateData.PreviousRelease == nil || stateData.PreviousRelease.Hash != "v2" || !bytes.Equal(stateData.PreviousRelease.AppliedManifest, currentManifest) {
+		t.Errorf("rollback did not swap release metadata: %+v", stateData)
+	}
+}
+
+func TestRollback_StateCommitFailureRestoresOriginalRouteAndWorkload(t *testing.T) {
+	stateContent := "current_port=49153\ncurrent_hash=v2\nprevious_port=49152\nprevious_hash=v1\ndomain=myapp.com\n"
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "cat /deployments/myapp/state", Output: stateContent},
+		ssh.MockCommand{Match: "docker ps --all --filter label=teploy.app='myapp'",
+			Output: `{"ID":"aaa","Names":"myapp-web-v1","Image":"myapp:latest","State":"exited","Status":"Exited","Labels":"teploy.app=myapp,teploy.version=v1,teploy.process=web"}` + "\n" +
+				`{"ID":"bbb","Names":"myapp-web-v2","Image":"myapp:latest","State":"running","Status":"Up 1h","Labels":"teploy.app=myapp,teploy.version=v2,teploy.process=web"}`,
+		},
+		ssh.MockCommand{Match: "docker inspect 'myapp-web-v1'", Output: `[{"Config":{"Image":"myapp:latest","Labels":{"teploy.app":"myapp"}},"HostConfig":{"NetworkMode":"teploy","PortBindings":{"3000/tcp":[{"HostIp":"127.0.0.1","HostPort":"49152"}]},"RestartPolicy":{"Name":"no"}},"NetworkSettings":{"Networks":{"teploy":{"Aliases":["myapp"]}}}}]`},
+		ssh.MockCommand{Match: "docker rm -f 'myapp-web-v1'", Output: ""},
+		ssh.MockCommand{Match: "docker run", Output: ""},
+		ssh.MockCommand{Match: "docker inspect -f '{{range $p, $b := .NetworkSettings.Ports}}", Output: "49152"},
+		ssh.MockCommand{Match: "docker inspect -f '{{range $p, $_ := .NetworkSettings.Ports}}", Output: "3000/tcp"},
+		ssh.MockCommand{Match: "curl", Output: "200"},
+		ssh.MockCommand{Match: "cat /deployments/caddy/Caddyfile", Output: "{\n\tadmin 0.0.0.0:2019\n}\n"},
+		ssh.MockCommand{Match: "mv /tmp/teploy_caddyfile.tmp", Output: ""},
+		ssh.MockCommand{Match: "mkdir /deployments/caddy/.lock", Output: ""},
+		ssh.MockCommand{Match: "docker exec caddy caddy reload", Output: ""},
+		ssh.MockCommand{Match: "rmdir /deployments/caddy/.lock", Output: ""},
+		ssh.MockCommand{Match: "UPLOAD:/deployments/myapp/state.json.tmp-", Err: fmt.Errorf("disk full")},
+		ssh.MockCommand{Match: "docker stop", Output: ""},
+	)
+	var out bytes.Buffer
+
+	err := Rollback(context.Background(), mock, &out, rollbackCfg())
+	if err == nil || !strings.Contains(err.Error(), "original route was restored") {
+		t.Fatalf("expected fail-closed rollback state error, got %v", err)
+	}
+	if strings.Contains(out.String(), "Rolled back") {
+		t.Fatalf("failed rollback reported success: %s", out.String())
+	}
+	for _, call := range mock.Calls {
+		if strings.HasPrefix(call, "docker stop") && strings.Contains(call, "myapp-web-v2") {
+			t.Fatalf("original workload was stopped after failed state commit: %s", call)
+		}
+	}
+	restoredCaddyfile := string(mock.Files["/tmp/teploy_caddyfile.tmp"])
+	if !strings.Contains(restoredCaddyfile, "myapp-web-v2:3000") {
+		t.Fatalf("original route was not restored: %s", restoredCaddyfile)
 	}
 }
 
@@ -334,12 +381,9 @@ func TestRollback_ToSpecificHash(t *testing.T) {
 
 	// State: v1 becomes current, v3 (what we just rolled back from) becomes
 	// previous — a plain 1-level swap, not a deeper history stack.
-	stateData := string(mock.Files["/deployments/myapp/state"])
-	if !strings.Contains(stateData, "current_hash=v1") {
-		t.Errorf("expected current_hash=v1, got: %s", stateData)
-	}
-	if !strings.Contains(stateData, "previous_hash=v3") {
-		t.Errorf("expected previous_hash=v3 (the version rolled back from), got: %s", stateData)
+	stateData := writtenState(t, mock, "myapp")
+	if stateData.CurrentHash != "v1" || stateData.PreviousHash != "v3" {
+		t.Errorf("unexpected --to rollback state: %+v", stateData)
 	}
 }
 
@@ -412,13 +456,13 @@ func TestRollback_ToHash_PortCollisionReallocates(t *testing.T) {
 		}
 	}
 
-	stateData := string(mock.Files["/deployments/myapp/state"])
-	if !strings.Contains(stateData, "current_hash=v1") {
-		t.Errorf("expected current_hash=v1, got: %s", stateData)
+	stateData := writtenState(t, mock, "myapp")
+	if stateData.CurrentHash != "v1" {
+		t.Errorf("expected current_hash=v1, got: %+v", stateData)
 	}
 	// Port written to state must be the freshly allocated one (from
 	// HostPort() inspection), never the stale, now-colliding 49152.
-	if strings.Contains(stateData, "current_port=49152\n") {
-		t.Errorf("state still recorded the colliding port: %s", stateData)
+	if stateData.CurrentPort == 49152 {
+		t.Errorf("state still recorded the colliding port: %+v", stateData)
 	}
 }

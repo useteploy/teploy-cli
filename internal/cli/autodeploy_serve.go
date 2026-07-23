@@ -277,6 +277,9 @@ func triggerAutoDeploy(ctx context.Context, executor ssh.Executor, app, branch, 
 	if err != nil {
 		return fmt.Errorf("resolving version: %w", err)
 	}
+	if revision, revisionErr := gitRevisionIn(buildDir); revisionErr == nil {
+		appCfg.SourceRevision = revision
+	}
 
 	var image string
 	needsBuild := appCfg.Image == ""

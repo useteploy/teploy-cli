@@ -155,6 +155,9 @@ func runDeploy(flags *Flags, serverName, image, version string, skipDNSCheck boo
 			return err
 		}
 	}
+	if revision, revisionErr := gitRevisionIn("."); revisionErr == nil {
+		appCfg.SourceRevision = revision
+	}
 
 	// Narrow the target list by --role/--tag (no-op if neither is set). Only
 	// affects the multi-server list; an explicit `deploy <server>` arg wins.
@@ -448,6 +451,11 @@ func deployAppConfig(flags *Flags, appCfg *config.AppConfig, serverName, image, 
 // string for the notification payload (a hostname for the SSH path,
 // "localhost" for the resident-server path).
 func deployBuiltImage(ctx context.Context, executor ssh.Executor, appCfg *config.AppConfig, image, version, serverDisplay string, migrateVolumes, needsBuild bool) error {
+	appliedManifest, manifestSHA256, err := config.NormalizeAndDigest(appCfg, image)
+	if err != nil {
+		return fmt.Errorf("normalizing applied manifest: %w", err)
+	}
+
 	// 9. Ensure accessories are running.
 	var envFile string
 	if len(appCfg.Accessories) > 0 {
@@ -554,31 +562,34 @@ func deployBuiltImage(ctx context.Context, executor ssh.Executor, appCfg *config
 	// 11. Deploy.
 	deployer := deploy.NewDeployer(executor, os.Stdout)
 	deployCfg := deploy.Config{
-		App:           appCfg.App,
-		Domain:        appCfg.Domain,
-		Image:         image,
-		Version:       version,
-		EnvFiles:      envFiles,
-		Volumes:       volumes,
-		Processes:     appCfg.Processes,
-		NoHealthcheck: disabledHealthchecks(appCfg.Healthcheck),
-		Health:        healthConfigFrom(appCfg.Health),
-		KeepVersions:  appCfg.KeepVersions,
-		Ingress:       appCfg.Ingress,
-		Bind:          appCfg.Bind,
-		ContainerPort: appCfg.Port,
-		StopTimeout:   appCfg.StopTimeout,
-		Replicas:      appCfg.Replicas,
-		PreDeploy:     appCfg.Hooks.PreDeploy,
-		PostDeploy:    appCfg.Hooks.PostDeploy,
-		AssetPath:     appCfg.Assets.Path,
-		AssetKeepDays: appCfg.Assets.KeepDays,
-		TLSCert:       tlsCert,
-		TLSKey:        tlsKey,
-		TLSInternal:   tlsInternal,
-		CaddyExtra:    appCfg.CaddyExtra,
-		Firewall:      caddyFirewall(appCfg.Firewall),
-		Access:        caddyAccess(appCfg.Access),
+		App:             appCfg.App,
+		Domain:          appCfg.Domain,
+		Image:           image,
+		Version:         version,
+		EnvFiles:        envFiles,
+		Volumes:         volumes,
+		Processes:       appCfg.Processes,
+		NoHealthcheck:   disabledHealthchecks(appCfg.Healthcheck),
+		Health:          healthConfigFrom(appCfg.Health),
+		KeepVersions:    appCfg.KeepVersions,
+		Ingress:         appCfg.Ingress,
+		Bind:            appCfg.Bind,
+		ContainerPort:   appCfg.Port,
+		StopTimeout:     appCfg.StopTimeout,
+		Replicas:        appCfg.Replicas,
+		PreDeploy:       appCfg.Hooks.PreDeploy,
+		PostDeploy:      appCfg.Hooks.PostDeploy,
+		AssetPath:       appCfg.Assets.Path,
+		AssetKeepDays:   appCfg.Assets.KeepDays,
+		TLSCert:         tlsCert,
+		TLSKey:          tlsKey,
+		TLSInternal:     tlsInternal,
+		CaddyExtra:      appCfg.CaddyExtra,
+		Firewall:        caddyFirewall(appCfg.Firewall),
+		Access:          caddyAccess(appCfg.Access),
+		ManifestSHA256:  manifestSHA256,
+		AppliedManifest: appliedManifest,
+		SourceRevision:  appCfg.SourceRevision,
 	}
 
 	// Vulnerability gate: scan the image on the server before any container
@@ -930,6 +941,14 @@ func gitShortHashIn(dir string) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
+func gitRevisionIn(dir string) (string, error) {
+	out, err := exec.Command("git", "-C", dir, "rev-parse", "HEAD").Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
 // runStaticDeploy handles the type:static deploy path: build (locally) →
 // rsync → symlink → Caddyfile mirror. Container build/run/health-check
 // machinery is intentionally bypassed.
@@ -948,18 +967,25 @@ func runStaticDeploy(cfg *config.AppConfig, host, user, key string) error {
 	}
 	defer executor.Close()
 
+	appliedManifest, manifestSHA256, err := config.NormalizeAndDigest(cfg, "")
+	if err != nil {
+		return fmt.Errorf("normalizing applied manifest: %w", err)
+	}
 	staticCfg := deploy.StaticConfig{
-		App:          cfg.App,
-		Domain:       cfg.Domain,
-		Source:       cfg.Source,
-		Build:        cfg.Build,
-		BuildRemote:  cfg.BuildRemote,
-		SPA:          cfg.SPA,
-		SPAFallback:  cfg.SPAFallback,
-		Cache:        cfg.Cache,
-		Headers:      cfg.Headers,
-		KeepReleases: cfg.KeepReleases,
-		CaddyExtra:   cfg.CaddyExtra,
+		App:             cfg.App,
+		Domain:          cfg.Domain,
+		Source:          cfg.Source,
+		Build:           cfg.Build,
+		BuildRemote:     cfg.BuildRemote,
+		SPA:             cfg.SPA,
+		SPAFallback:     cfg.SPAFallback,
+		Cache:           cfg.Cache,
+		Headers:         cfg.Headers,
+		KeepReleases:    cfg.KeepReleases,
+		CaddyExtra:      cfg.CaddyExtra,
+		ManifestSHA256:  manifestSHA256,
+		AppliedManifest: appliedManifest,
+		SourceRevision:  cfg.SourceRevision,
 	}
 
 	d := deploy.NewStaticDeployer(executor, os.Stdout)

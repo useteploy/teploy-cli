@@ -14,9 +14,10 @@ import (
 
 func newLogsCmd(flags *Flags) *cobra.Command {
 	var (
-		process string
-		lines   int
-		appName string
+		process  string
+		lines    int
+		appName  string
+		noFollow bool
 	)
 
 	cmd := &cobra.Command{
@@ -25,12 +26,13 @@ func newLogsCmd(flags *Flags) *cobra.Command {
 		Long:  "Stream Docker logs from the running container. Defaults to the web process.",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runLogs(flags, appName, process, lines)
+			return runLogs(flags, appName, process, lines, !noFollow)
 		},
 	}
 
 	cmd.Flags().StringVar(&process, "process", "web", "process type to view logs for")
 	cmd.Flags().IntVar(&lines, "lines", 50, "number of historical log lines (--tail is an alias)")
+	cmd.Flags().BoolVar(&noFollow, "no-follow", false, "print the requested lines and exit")
 	cmd.Flags().StringVar(&appName, "app", "", "app name — act on server state instead of teploy.yml (requires --host)")
 	cmd.Flags().SetNormalizeFunc(tailToLines)
 
@@ -46,7 +48,7 @@ func tailToLines(_ *pflag.FlagSet, name string) pflag.NormalizedName {
 	return pflag.NormalizedName(name)
 }
 
-func runLogs(flags *Flags, appName, process string, lines int) error {
+func runLogs(flags *Flags, appName, process string, lines int, follow bool) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
@@ -63,6 +65,14 @@ func runLogs(flags *Flags, appName, process string, lines int) error {
 	}
 
 	containerName := docker.ContainerName(appCfg.App, process, current.CurrentHash)
-	cmd := fmt.Sprintf("docker logs -f --tail %d %s", lines, containerName)
+	cmd := logsCommand(containerName, lines, follow)
 	return executor.RunStream(ctx, cmd, os.Stdout, os.Stderr)
+}
+
+func logsCommand(containerName string, lines int, follow bool) string {
+	followFlag := ""
+	if follow {
+		followFlag = " -f"
+	}
+	return fmt.Sprintf("docker logs%s --tail %d %s", followFlag, lines, containerName)
 }

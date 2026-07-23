@@ -19,6 +19,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -55,6 +56,10 @@ type StaticConfig struct {
 	// from, inside the Caddy container. See DefaultStaticMount.
 	MountBase string // default: /deployments
 	StateDir  string // default: /deployments
+
+	ManifestSHA256  string
+	AppliedManifest json.RawMessage
+	SourceRevision  string
 }
 
 // DefaultKeepReleases is applied when StaticConfig.KeepReleases is 0.
@@ -208,19 +213,27 @@ func (d *StaticDeployer) Deploy(ctx context.Context, cfg StaticConfig) error {
 		Headers:     cfg.Headers,
 		CaddyExtra:  cfg.CaddyExtra,
 	}); err != nil {
-		return fmt.Errorf("caddy route: %w", err)
+		if restoreErr := d.restoreStaticLink(ctx, currentLink, prior); restoreErr != nil {
+			return fmt.Errorf("caddy route: %w; restoring the prior static release failed: %v", err, restoreErr)
+		}
+		return fmt.Errorf("caddy route: %w; the prior static release was restored", err)
 	}
 	// SetStaticRoute writes the Caddyfile block and reloads Caddy itself.
 
 	// 10. Write new app state. Reuse the container state file format so the
 	//     same `state.AppState` works for both deploy types — only the hash
 	//     fields are populated for static.
-	newState := &state.AppState{
-		CurrentHash:  shortHash,
-		PreviousHash: priorHashOrEmpty(prior, shortHash),
+	newState := state.NewAppliedState(prior, "static", "caddy", cfg.Domain)
+	newState.CurrentHash = shortHash
+	newState.PreviousHash = priorHashOrEmpty(prior, shortHash)
+	newState.ManifestSHA256 = cfg.ManifestSHA256
+	newState.AppliedManifest = append(json.RawMessage(nil), cfg.AppliedManifest...)
+	newState.SourceRevision = cfg.SourceRevision
+	if prior != nil && prior.CurrentHash == shortHash {
+		newState.PreviousRelease = prior.PreviousRelease
 	}
 	if err := state.Write(ctx, d.exec, cfg.App, newState); err != nil {
-		return fmt.Errorf("write state: %w", err)
+		return d.abortStaticStateCommit(ctx, cfg.App, currentLink, prior, err)
 	}
 
 	// 11. Prune old releases (keep the most recent KeepReleases including
@@ -241,6 +254,34 @@ func (d *StaticDeployer) Deploy(ctx context.Context, cfg StaticConfig) error {
 
 	fmt.Fprintf(d.out, "Deployed %s in %dms\n", cfg.App, time.Since(start).Milliseconds())
 	return nil
+}
+
+func (d *StaticDeployer) restoreStaticLink(ctx context.Context, currentLink string, prior *state.AppState) error {
+	if prior == nil || prior.CurrentHash == "" {
+		if _, err := d.exec.Run(ctx, "rm -f "+currentLink); err != nil {
+			return fmt.Errorf("removing uncommitted current symlink: %w", err)
+		}
+		return nil
+	}
+	if _, err := d.exec.Run(ctx, fmt.Sprintf("ln -sfn releases/%s %s", prior.CurrentHash, currentLink)); err != nil {
+		return fmt.Errorf("restoring current symlink to %s: %w", prior.CurrentHash, err)
+	}
+	return nil
+}
+
+func (d *StaticDeployer) abortStaticStateCommit(ctx context.Context, app, currentLink string, prior *state.AppState, commitErr error) error {
+	if prior == nil || prior.CurrentHash == "" {
+		if err := d.caddy.RemoveRoute(ctx, app); err != nil {
+			return fmt.Errorf("committing authoritative applied state after static route switch: %w; removing the uncommitted route failed: %v; the new release was left active to avoid a broken route", commitErr, err)
+		}
+	}
+	if err := d.restoreStaticLink(ctx, currentLink, prior); err != nil {
+		return fmt.Errorf("committing authoritative applied state after static route switch: %w; %v; the new release was left active", commitErr, err)
+	}
+	if prior == nil || prior.CurrentHash == "" {
+		return fmt.Errorf("committing authoritative applied state after static route switch: %w; the uncommitted route and current symlink were removed", commitErr)
+	}
+	return fmt.Errorf("committing authoritative applied state after static route switch: %w; release %s was restored and state remains unchanged", commitErr, prior.CurrentHash)
 }
 
 // runLocalBuild runs cfg.Build commands sequentially in the user's shell, with
@@ -451,17 +492,29 @@ func (d *StaticDeployer) Rollback(ctx context.Context, cfg StaticRollbackConfig)
 		Headers:     cfg.Headers,
 		CaddyExtra:  cfg.CaddyExtra,
 	}); err != nil {
-		return fmt.Errorf("caddy route: %w", err)
+		if restoreErr := d.restoreStaticLink(ctx, currentLink, prior); restoreErr != nil {
+			return fmt.Errorf("caddy route: %w; restoring release %s failed: %v", err, prior.CurrentHash, restoreErr)
+		}
+		return fmt.Errorf("caddy route: %w; release %s was restored", err, prior.CurrentHash)
 	}
 	// SetStaticRoute writes the Caddyfile block and reloads Caddy itself.
 
 	// Swap state: previous becomes current, current becomes previous.
-	newState := &state.AppState{
-		CurrentHash:  target,
-		PreviousHash: prior.CurrentHash,
+	domain := prior.Domain
+	if domain == "" {
+		domain = cfg.Domain
+	}
+	newState := state.NewAppliedState(prior, "static", "caddy", domain)
+	newState.CurrentHash = target
+	newState.PreviousHash = prior.CurrentHash
+	if prior.PreviousRelease != nil && prior.PreviousRelease.Hash == target {
+		newState.ApplyRelease(prior.PreviousRelease)
 	}
 	if err := state.Write(ctx, d.exec, cfg.App, newState); err != nil {
-		return fmt.Errorf("write state: %w", err)
+		if restoreErr := d.restoreStaticLink(ctx, currentLink, prior); restoreErr != nil {
+			return fmt.Errorf("committing authoritative applied state after static rollback route switch: %w; restoring release %s failed: %v; the target release was left active", err, prior.CurrentHash, restoreErr)
+		}
+		return fmt.Errorf("committing authoritative applied state after static rollback route switch: %w; release %s was restored and state remains unchanged", err, prior.CurrentHash)
 	}
 	state.AppendLog(ctx, d.exec, state.LogEntry{
 		Timestamp: time.Now().UTC(),

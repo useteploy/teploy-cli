@@ -9,10 +9,11 @@ import (
 
 // Flags holds the global CLI flags, passed to subcommands explicitly.
 type Flags struct {
-	Host string
-	User string
-	Key  string
-	JSON bool
+	Host       string
+	User       string
+	Key        string
+	ProjectDir string
+	JSON       bool
 }
 
 func NewRootCmd(version string) *cobra.Command {
@@ -24,11 +25,21 @@ func NewRootCmd(version string) *cobra.Command {
 		Long:          "A single binary that deploys Docker containers to any server with SSH access. No management server, no hosted dependencies.",
 		SilenceUsage:  true,
 		SilenceErrors: true,
+		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+			if flags.ProjectDir == "" {
+				return nil
+			}
+			if err := os.Chdir(flags.ProjectDir); err != nil {
+				return fmt.Errorf("changing to project directory %q: %w", flags.ProjectDir, err)
+			}
+			return nil
+		},
 	}
 
 	root.PersistentFlags().StringVar(&flags.Host, "host", "", "server host (overrides servers.yml)")
 	root.PersistentFlags().StringVar(&flags.User, "user", "", "SSH user (default: root)")
 	root.PersistentFlags().StringVar(&flags.Key, "key", "", "path to SSH private key")
+	root.PersistentFlags().StringVar(&flags.ProjectDir, "project-dir", "", "run as if teploy was started in this directory")
 	root.PersistentFlags().BoolVar(&flags.JSON, "json", false, "output in JSON format")
 
 	root.AddCommand(newDeployCmd(flags))

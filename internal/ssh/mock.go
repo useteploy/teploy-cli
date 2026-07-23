@@ -44,16 +44,49 @@ func (m *MockExecutor) Run(ctx context.Context, cmd string) (string, error) {
 	m.Calls = append(m.Calls, cmd)
 
 	for i, c := range m.commands {
-		if strings.HasPrefix(cmd, c.Match) {
+		if mockCommandMatches(cmd, c.Match) {
 			if c.Once {
 				m.commands = append(m.commands[:i], m.commands[i+1:]...)
+			}
+			if c.Err == nil {
+				m.applyFileCommand(cmd)
 			}
 			m.mu.Unlock()
 			return c.Output, c.Err
 		}
 	}
+	if strings.HasPrefix(cmd, "mv -f -- ") || strings.HasPrefix(cmd, "rm -f -- ") {
+		m.applyFileCommand(cmd)
+		m.mu.Unlock()
+		return "", nil
+	}
 	m.mu.Unlock()
 	return "", fmt.Errorf("mock: unexpected command: %s", cmd)
+}
+
+func mockCommandMatches(cmd, match string) bool {
+	if !strings.HasPrefix(cmd, match) {
+		return false
+	}
+	// A path match for ".../state" must not also consume ".../state.json".
+	// Prefix matching remains available for command arguments and shell suffixes.
+	return len(cmd) == len(match) || cmd[len(match)] != '.'
+}
+
+func (m *MockExecutor) applyFileCommand(cmd string) {
+	fields := strings.Fields(cmd)
+	for i := range fields {
+		fields[i] = strings.Trim(fields[i], "'")
+	}
+	if len(fields) == 5 && fields[0] == "mv" && fields[1] == "-f" && fields[2] == "--" {
+		if data, ok := m.Files[fields[3]]; ok {
+			m.Files[fields[4]] = data
+			delete(m.Files, fields[3])
+		}
+	}
+	if len(fields) == 4 && fields[0] == "rm" && fields[1] == "-f" && fields[2] == "--" {
+		delete(m.Files, fields[3])
+	}
 }
 
 func (m *MockExecutor) RunStream(ctx context.Context, cmd string, stdout, stderr io.Writer) error {
@@ -71,7 +104,20 @@ func (m *MockExecutor) Upload(ctx context.Context, content io.Reader, remotePath
 	}
 
 	m.mu.Lock()
-	m.Calls = append(m.Calls, fmt.Sprintf("UPLOAD:%s (mode %s)", remotePath, mode))
+	call := fmt.Sprintf("UPLOAD:%s (mode %s)", remotePath, mode)
+	m.Calls = append(m.Calls, call)
+	for i, c := range m.commands {
+		if strings.HasPrefix(call, c.Match) {
+			if c.Once {
+				m.commands = append(m.commands[:i], m.commands[i+1:]...)
+			}
+			if c.Err != nil {
+				m.mu.Unlock()
+				return c.Err
+			}
+			break
+		}
+	}
 	m.Files[remotePath] = data
 	m.mu.Unlock()
 

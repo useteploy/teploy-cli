@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -221,6 +222,27 @@ func runAutoDeployStatus(flags *Flags) error {
 		return err
 	}
 
+	schedule, err := mgr.ScheduleStatus(ctx, appCfg.App)
+	if err != nil {
+		return err
+	}
+	if flags.JSON {
+		return json.NewEncoder(os.Stdout).Encode(struct {
+			App           string `json:"app"`
+			Host          string `json:"host"`
+			WebhookActive bool   `json:"webhook_active"`
+			WebhookStatus string `json:"webhook_status"`
+			WebhookURL    string `json:"webhook_url"`
+			Scheduled     bool   `json:"scheduled"`
+			Cron          string `json:"cron"`
+			Log           string `json:"log"`
+		}{
+			App: appCfg.App, Host: executor.Host(), WebhookActive: active, WebhookStatus: status,
+			WebhookURL: "https://" + appCfg.Domain + "/teploy-webhook/" + appCfg.App,
+			Scheduled:  schedule != "", Cron: schedule,
+			Log: "/deployments/" + appCfg.App + "/scheduled-redeploy.log",
+		})
+	}
 	fmt.Println("Webhook auto-deploy:")
 	if active {
 		fmt.Printf("  status:      active (%s)\n", status)
@@ -228,11 +250,6 @@ func runAutoDeployStatus(flags *Flags) error {
 	} else {
 		fmt.Println("  status:      not configured")
 		fmt.Println("  enable with: teploy autodeploy setup")
-	}
-
-	schedule, err := mgr.ScheduleStatus(ctx, appCfg.App)
-	if err != nil {
-		return err
 	}
 	fmt.Println("Scheduled redeploy:")
 	if schedule != "" {

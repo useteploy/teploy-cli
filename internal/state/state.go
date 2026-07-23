@@ -3,7 +3,10 @@ package state
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"strconv"
@@ -13,7 +16,10 @@ import (
 	"github.com/useteploy/teploy/internal/ssh"
 )
 
-const deploymentsDir = "/deployments"
+const (
+	deploymentsDir  = "/deployments"
+	SchemaVersionV2 = 2
+)
 
 // staleLockTTL is how long an "auto" deploy lock (see LockInfo.Type) is
 // honored before AcquireLock treats it as abandoned and breaks it. Deploys
@@ -37,18 +43,55 @@ const staleLockTTL = 30 * time.Minute
 // breakable by heal, at any age; heal only ever breaks its OWN stale lock.
 const staleHealLockTTL = 2 * time.Minute
 
-// AppState represents the deploy state for an app on the server.
-// Stored at /deployments/<app>/state as key=value pairs.
+// ReleaseMetadata identifies an applied release. PreviousRelease retains the
+// one-level rollback target's identity without creating a second state store.
+type ReleaseMetadata struct {
+	Hash            string          `json:"hash,omitempty"`
+	ManifestSHA256  string          `json:"manifest_sha256,omitempty"`
+	SourceRevision  string          `json:"source_revision,omitempty"`
+	ImageRef        string          `json:"image_ref,omitempty"`
+	ImageDigest     string          `json:"image_digest,omitempty"`
+	UpdatedAt       time.Time       `json:"updated_at,omitempty"`
+	OperationID     string          `json:"operation_id,omitempty"`
+	Generation      uint64          `json:"generation,omitempty"`
+	AppliedManifest json.RawMessage `json:"applied_manifest,omitempty"`
+}
+
+// MigrationMetadata records the first import from the legacy key=value file.
+type MigrationMetadata struct {
+	Source string `json:"source"`
+}
+
+// AppState represents the authoritative applied state for an app. V2 is
+// stored at /deployments/<app>/state.json; the old key=value state file is
+// read only when state.json does not yet exist.
 type AppState struct {
-	CurrentPort  int // primary port (first replica or single instance)
-	CurrentHash  string
-	PreviousPort int
-	PreviousHash string
-	Domain       string
+	SchemaVersion  int       `json:"schema_version"`
+	DeploymentType string    `json:"deployment_type"`
+	IngressMode    string    `json:"ingress_mode"`
+	Domain         string    `json:"domain,omitempty"`
+	UpdatedAt      time.Time `json:"updated_at"`
+	ManifestSHA256 string    `json:"manifest_sha256,omitempty"`
+	SourceRevision string    `json:"source_revision,omitempty"`
+	ImageRef       string    `json:"image_ref,omitempty"`
+	ImageDigest    string    `json:"image_digest,omitempty"`
+	OperationID    string    `json:"operation_id"`
+	Generation     uint64    `json:"generation"`
+
+	AppliedManifest json.RawMessage    `json:"applied_manifest,omitempty"`
+	PreviousRelease *ReleaseMetadata   `json:"previous_release,omitempty"`
+	Migration       *MigrationMetadata `json:"migration,omitempty"`
+
+	CurrentPort  int    `json:"current_port,omitempty"` // primary port (first replica or single instance)
+	CurrentHash  string `json:"current_hash"`
+	PreviousPort int    `json:"previous_port,omitempty"`
+	PreviousHash string `json:"previous_hash,omitempty"`
 	// Replica ports. When len > 1, the app has multiple replicas on this server.
 	// CurrentPort is always CurrentPorts[0] for backwards compatibility.
-	CurrentPorts  []int
-	PreviousPorts []int
+	CurrentPorts  []int `json:"current_ports,omitempty"`
+	PreviousPorts []int `json:"previous_ports,omitempty"`
+
+	legacyImported bool
 }
 
 // LogEntry represents a single entry in /deployments/teploy.log.
@@ -62,10 +105,32 @@ type LogEntry struct {
 	Message    string    `json:"message,omitempty"`
 }
 
-// Read reads the app state from the server. Returns nil if no state exists.
+// Read reads canonical v2 state first. A missing v2 file falls back to the
+// legacy key=value file; malformed canonical JSON is an error and never falls
+// back to potentially stale legacy state.
 func Read(ctx context.Context, exec ssh.Executor, app string) (*AppState, error) {
+	v2Path := fmt.Sprintf("%s/%s/state.json", deploymentsDir, app)
+	output, err := exec.Run(ctx, fmt.Sprintf("cat -- %s 2>/dev/null", v2Path))
+	if err == nil && strings.TrimSpace(output) != "" {
+		var s AppState
+		if err := json.Unmarshal([]byte(output), &s); err != nil {
+			return nil, fmt.Errorf("parsing canonical state for %s: %w", app, err)
+		}
+		if s.SchemaVersion != SchemaVersionV2 {
+			return nil, fmt.Errorf("unsupported state schema version %d for %s", s.SchemaVersion, app)
+		}
+		if err := validateManifestDigest(&s); err != nil {
+			return nil, fmt.Errorf("validating canonical state for %s: %w", app, err)
+		}
+		if err := validateReleaseDigest(s.PreviousRelease); err != nil {
+			return nil, fmt.Errorf("validating previous release for %s: %w", app, err)
+		}
+		normalizePorts(&s)
+		return &s, nil
+	}
+
 	path := fmt.Sprintf("%s/%s/state", deploymentsDir, app)
-	output, err := exec.Run(ctx, fmt.Sprintf("cat %s 2>/dev/null", path))
+	output, err = exec.Run(ctx, fmt.Sprintf("cat %s 2>/dev/null", path))
 	if err != nil || strings.TrimSpace(output) == "" {
 		return nil, nil
 	}
@@ -97,14 +162,21 @@ func Read(ctx context.Context, exec ssh.Executor, app string) (*AppState, error)
 			s.PreviousPorts = parsePorts(parts[1])
 		}
 	}
-	// Backwards compat: if CurrentPorts not set, derive from CurrentPort.
+	s.SchemaVersion = 1
+	s.legacyImported = true
+	normalizePorts(s)
+	return s, nil
+}
+
+func normalizePorts(s *AppState) {
+	// Backwards compat: if replica lists are absent, derive them from the
+	// primary ports used by legacy state and early v2 writers.
 	if len(s.CurrentPorts) == 0 && s.CurrentPort > 0 {
 		s.CurrentPorts = []int{s.CurrentPort}
 	}
 	if len(s.PreviousPorts) == 0 && s.PreviousPort > 0 {
 		s.PreviousPorts = []int{s.PreviousPort}
 	}
-	return s, nil
 }
 
 // parsePorts parses a comma-separated list of ports.
@@ -128,24 +200,162 @@ func formatPorts(ports []int) string {
 	return strings.Join(parts, ",")
 }
 
-// Write writes the app state to the server atomically via upload.
+// NewAppliedState creates the identity envelope for the next successful
+// operation. Callers fill workload-specific ports, hashes, and release fields.
+func NewAppliedState(current *AppState, deploymentType, ingressMode, domain string) *AppState {
+	if deploymentType == "" {
+		deploymentType = "container"
+	}
+	if ingressMode == "" {
+		ingressMode = "caddy"
+	}
+
+	s := &AppState{
+		SchemaVersion:  SchemaVersionV2,
+		DeploymentType: deploymentType,
+		IngressMode:    ingressMode,
+		Domain:         domain,
+		UpdatedAt:      time.Now().UTC(),
+		OperationID:    newOperationID(),
+		Generation:     1,
+	}
+	if current == nil {
+		return s
+	}
+	s.Generation = current.Generation + 1
+	if current.legacyImported {
+		s.Migration = &MigrationMetadata{Source: "legacy-key-value"}
+	} else if current.Migration != nil {
+		migration := *current.Migration
+		s.Migration = &migration
+	}
+	s.PreviousRelease = current.ReleaseMetadata()
+	return s
+}
+
+// ReleaseMetadata returns a copy of the current release identity.
+func (s *AppState) ReleaseMetadata() *ReleaseMetadata {
+	if s == nil || s.CurrentHash == "" {
+		return nil
+	}
+	return &ReleaseMetadata{
+		Hash:            s.CurrentHash,
+		ManifestSHA256:  s.ManifestSHA256,
+		SourceRevision:  s.SourceRevision,
+		ImageRef:        s.ImageRef,
+		ImageDigest:     s.ImageDigest,
+		UpdatedAt:       s.UpdatedAt,
+		OperationID:     s.OperationID,
+		Generation:      s.Generation,
+		AppliedManifest: cloneRawMessage(s.AppliedManifest),
+	}
+}
+
+// ApplyRelease copies retained release identity onto the current state.
+func (s *AppState) ApplyRelease(release *ReleaseMetadata) {
+	if release == nil {
+		return
+	}
+	s.ManifestSHA256 = release.ManifestSHA256
+	s.SourceRevision = release.SourceRevision
+	s.ImageRef = release.ImageRef
+	s.ImageDigest = release.ImageDigest
+	s.AppliedManifest = cloneRawMessage(release.AppliedManifest)
+}
+
+func cloneRawMessage(in json.RawMessage) json.RawMessage {
+	return append(json.RawMessage(nil), in...)
+}
+
+func newOperationID() string {
+	var id [16]byte
+	if _, err := rand.Read(id[:]); err == nil {
+		return hex.EncodeToString(id[:])
+	}
+	fallback := sha256.Sum256([]byte(strconv.FormatInt(time.Now().UnixNano(), 10)))
+	return hex.EncodeToString(fallback[:16])
+}
+
+func validateManifestDigest(s *AppState) error {
+	if len(s.AppliedManifest) == 0 {
+		return nil
+	}
+	if !json.Valid(s.AppliedManifest) {
+		return fmt.Errorf("applied_manifest is not valid JSON")
+	}
+	digest := sha256.Sum256(s.AppliedManifest)
+	want := hex.EncodeToString(digest[:])
+	if s.ManifestSHA256 == "" {
+		s.ManifestSHA256 = want
+		return nil
+	}
+	if s.ManifestSHA256 != want {
+		return fmt.Errorf("manifest_sha256 does not match applied_manifest")
+	}
+	return nil
+}
+
+func validateReleaseDigest(release *ReleaseMetadata) error {
+	if release == nil || len(release.AppliedManifest) == 0 {
+		return nil
+	}
+	if !json.Valid(release.AppliedManifest) {
+		return fmt.Errorf("applied_manifest is not valid JSON")
+	}
+	digest := sha256.Sum256(release.AppliedManifest)
+	want := hex.EncodeToString(digest[:])
+	if release.ManifestSHA256 == "" {
+		release.ManifestSHA256 = want
+		return nil
+	}
+	if release.ManifestSHA256 != want {
+		return fmt.Errorf("manifest_sha256 does not match applied_manifest")
+	}
+	return nil
+}
+
+// Write atomically writes canonical v2 JSON. It never updates the legacy
+// key=value file, making that file an import-only migration source rather than
+// a second writable authority.
 func Write(ctx context.Context, exec ssh.Executor, app string, s *AppState) error {
-	var buf bytes.Buffer
-	fmt.Fprintf(&buf, "current_port=%d\n", s.CurrentPort)
-	fmt.Fprintf(&buf, "current_hash=%s\n", s.CurrentHash)
-	fmt.Fprintf(&buf, "previous_port=%d\n", s.PreviousPort)
-	fmt.Fprintf(&buf, "previous_hash=%s\n", s.PreviousHash)
-	if s.Domain != "" {
-		fmt.Fprintf(&buf, "domain=%s\n", s.Domain)
+	if s == nil {
+		return fmt.Errorf("state is required")
 	}
-	if len(s.CurrentPorts) > 1 {
-		fmt.Fprintf(&buf, "current_ports=%s\n", formatPorts(s.CurrentPorts))
+	if s.SchemaVersion == 0 {
+		s.SchemaVersion = SchemaVersionV2
 	}
-	if len(s.PreviousPorts) > 1 {
-		fmt.Fprintf(&buf, "previous_ports=%s\n", formatPorts(s.PreviousPorts))
+	if s.SchemaVersion != SchemaVersionV2 {
+		return fmt.Errorf("cannot write state schema version %d", s.SchemaVersion)
 	}
-	path := fmt.Sprintf("%s/%s/state", deploymentsDir, app)
-	return exec.Upload(ctx, &buf, path, "0644")
+	if s.DeploymentType == "" {
+		s.DeploymentType = "container"
+	}
+	if s.IngressMode == "" {
+		s.IngressMode = "caddy"
+	}
+	if s.UpdatedAt.IsZero() {
+		s.UpdatedAt = time.Now().UTC()
+	}
+	if s.OperationID == "" {
+		s.OperationID = newOperationID()
+	}
+	if s.Generation == 0 {
+		s.Generation = 1
+	}
+	if err := validateManifestDigest(s); err != nil {
+		return err
+	}
+	if err := validateReleaseDigest(s.PreviousRelease); err != nil {
+		return fmt.Errorf("validating previous release: %w", err)
+	}
+
+	data, err := json.Marshal(s)
+	if err != nil {
+		return fmt.Errorf("marshaling state: %w", err)
+	}
+	data = append(data, '\n')
+	path := fmt.Sprintf("%s/%s/state.json", deploymentsDir, app)
+	return ssh.UploadAtomic(ctx, exec, bytes.NewReader(data), path, "0644")
 }
 
 // LockInfo represents the metadata stored in a .lock directory.

@@ -2,6 +2,7 @@ package deploy
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"sort"
@@ -71,10 +72,13 @@ type Config struct {
 	// TLSInternal requests Caddy's own local CA (self-signed) instead of a
 	// custom cert or ACME — see config.TLSConfig.Internal. Mutually
 	// exclusive with TLSCert/TLSKey (enforced at config.validate() time).
-	TLSInternal bool
-	CaddyExtra  string          // raw Caddy directives appended into the site block
-	Firewall    caddy.Firewall  // edge hardening (IP allow/deny, UA block, body cap)
-	Access      caddy.Access    // inbound access gate (basic auth / forward auth)
+	TLSInternal     bool
+	CaddyExtra      string         // raw Caddy directives appended into the site block
+	Firewall        caddy.Firewall // edge hardening (IP allow/deny, UA block, body cap)
+	Access          caddy.Access   // inbound access gate (basic auth / forward auth)
+	ManifestSHA256  string
+	AppliedManifest json.RawMessage
+	SourceRevision  string
 }
 
 // Deployer orchestrates zero-downtime deploys.
@@ -236,15 +240,18 @@ func (d *Deployer) Deploy(ctx context.Context, cfg Config) error {
 	}
 
 	// Host ingress recreates rather than blue/greens: the new container reuses
-	// the old one's fixed host port, so remove existing web containers for this
-	// app first to free it. This is the ~few-seconds downtime window inherent
-	// to a stable single host port.
+	// the old one's fixed host port, so stop the running web container first to
+	// free it. Keep the stopped container until state commits so a failed commit
+	// can recreate it with its original configuration and fixed port.
+	var displacedHostWeb []string
 	if cfg.ingressHost() {
-		ids, _ := d.exec.Run(ctx, fmt.Sprintf(
-			"docker ps -aq --filter label=teploy.app=%s --filter label=teploy.process=web", cfg.App))
-		for _, id := range strings.Fields(ids) {
-			d.docker.Stop(ctx, id, stopTimeout)
-			d.docker.Remove(ctx, id)
+		names, _ := d.exec.Run(ctx, fmt.Sprintf(
+			"docker ps --filter label=teploy.app=%s --filter label=teploy.process=web --format '{{.Names}}'", cfg.App))
+		for _, name := range strings.Fields(names) {
+			if err := d.docker.Stop(ctx, name, stopTimeout); err != nil {
+				return fmt.Errorf("stopping current host-ingress container %s: %w", name, err)
+			}
+			displacedHostWeb = append(displacedHostWeb, name)
 		}
 	}
 
@@ -407,20 +414,25 @@ func (d *Deployer) Deploy(ctx context.Context, cfg Config) error {
 	}
 
 	// 13. Write new state.
-	newState := &state.AppState{
-		CurrentPort:  port,
-		CurrentPorts: ports,
-		CurrentHash:  cfg.Version,
-		Domain:       cfg.Domain,
+	newState := state.NewAppliedState(current, "container", cfg.Ingress, cfg.Domain)
+	newState.CurrentPort = port
+	newState.CurrentPorts = ports
+	newState.CurrentHash = cfg.Version
+	newState.ManifestSHA256 = cfg.ManifestSHA256
+	newState.AppliedManifest = append(json.RawMessage(nil), cfg.AppliedManifest...)
+	newState.SourceRevision = cfg.SourceRevision
+	newState.ImageRef = cfg.Image
+	newState.ImageDigest = imageDigestFromRef(cfg.Image)
+	if newState.ImageDigest == "" {
+		newState.ImageDigest, _ = d.docker.ContainerImageDigest(ctx, webContainerName)
 	}
 	if current != nil {
 		newState.PreviousPort = current.CurrentPort
 		newState.PreviousPorts = current.CurrentPorts
 		newState.PreviousHash = current.CurrentHash
 	}
-	stateErr := state.Write(ctx, d.exec, cfg.App, newState)
-	if stateErr != nil {
-		fmt.Fprintf(d.out, "Warning: writing state failed: %v\n", stateErr)
+	if err := state.Write(ctx, d.exec, cfg.App, newState); err != nil {
+		return d.abortStateCommit(ctx, cfg, current, started, displacedHostWeb, start, err)
 	}
 
 	// 14. Stop old containers (all processes + all replicas).
@@ -472,10 +484,6 @@ func (d *Deployer) Deploy(ctx context.Context, cfg Config) error {
 		}
 	}
 
-	if stateErr != nil {
-		return fmt.Errorf("writing state: %w", stateErr)
-	}
-
 	// 15. Clean up old bridged assets.
 	if cfg.AssetPath != "" {
 		keepDays := cfg.AssetKeepDays
@@ -521,6 +529,88 @@ func (d *Deployer) Deploy(ctx context.Context, cfg Config) error {
 	return nil
 }
 
+func (d *Deployer) abortStateCommit(ctx context.Context, cfg Config, current *state.AppState, started, displacedHostWeb []string, start time.Time, commitErr error) error {
+	d.logDeploy(ctx, cfg, false, start)
+
+	if cfg.ingressHost() {
+		for _, name := range started {
+			d.docker.Stop(ctx, name, 5)
+		}
+		for _, old := range displacedHostWeb {
+			if err := d.docker.Restart(ctx, old, nil); err != nil {
+				for _, name := range started {
+					d.docker.Start(ctx, name)
+				}
+				return fmt.Errorf("committing authoritative applied state after replacing the fixed-port host workload: %w; restoring the original workload failed: %v; Teploy attempted to restart the new workload to avoid an outage", commitErr, err)
+			}
+		}
+		for _, name := range started {
+			d.docker.Remove(ctx, name)
+		}
+		if len(displacedHostWeb) == 0 {
+			return fmt.Errorf("committing authoritative applied state after starting the first host-ingress workload: %w; the uncommitted workload was stopped and removed", commitErr)
+		}
+		return fmt.Errorf("committing authoritative applied state after replacing the fixed-port host workload: %w; the original workload was restored and the uncommitted workload was removed", commitErr)
+	}
+
+	if cfg.usesCaddy() {
+		if err := d.restorePreviousRoute(ctx, cfg, current); err != nil {
+			return fmt.Errorf("committing authoritative applied state after route switch: %w; restoring the previous route failed: %v; old and new workloads were left running to avoid routing to a stopped container", commitErr, err)
+		}
+	}
+
+	for _, name := range started {
+		d.docker.Stop(ctx, name, 5)
+		d.docker.Remove(ctx, name)
+	}
+	if current == nil {
+		return fmt.Errorf("committing authoritative applied state after route switch: %w; the new route was removed and the uncommitted workload was stopped", commitErr)
+	}
+	return fmt.Errorf("committing authoritative applied state after route switch: %w; the previous route was restored, the old workload was left running, and the uncommitted workload was stopped", commitErr)
+}
+
+func (d *Deployer) restorePreviousRoute(ctx context.Context, cfg Config, current *state.AppState) error {
+	if current == nil || current.CurrentHash == "" {
+		return d.caddy.RemoveRoute(ctx, cfg.App)
+	}
+	if current.IngressMode != "" && current.IngressMode != "caddy" {
+		return d.caddy.RemoveRoute(ctx, cfg.App)
+	}
+
+	replicas := len(current.CurrentPorts)
+	if replicas == 0 {
+		replicas = 1
+	}
+	names := make([]string, replicas)
+	upstreams := make([]caddy.Upstream, replicas)
+	primaryPort := 0
+	for i := range replicas {
+		name := docker.ReplicaContainerName(cfg.App, "web", current.CurrentHash, i+1, replicas)
+		if current.CurrentHash == cfg.Version {
+			name += "_replaced"
+		}
+		port, err := d.docker.InternalPort(ctx, name)
+		if err != nil {
+			return err
+		}
+		names[i] = name
+		upstreams[i] = caddy.Upstream{Dial: fmt.Sprintf("%s:%d", name, port)}
+		if i == 0 {
+			primaryPort = port
+		}
+	}
+
+	domain := current.Domain
+	if domain == "" {
+		domain = cfg.Domain
+	}
+	tls := caddy.TLS{Cert: cfg.TLSCert, Key: cfg.TLSKey, Internal: cfg.TLSInternal}
+	if replicas > 1 {
+		return d.caddy.SetLoadBalancer(ctx, cfg.App, domain, upstreams, tls, cfg.CaddyExtra, cfg.Firewall, cfg.Access)
+	}
+	return d.caddy.SetRoute(ctx, cfg.App, domain, names[0], primaryPort, tls, cfg.CaddyExtra, cfg.Firewall, cfg.Access)
+}
+
 func (d *Deployer) logDeploy(ctx context.Context, cfg Config, success bool, start time.Time) {
 	state.AppendLog(ctx, d.exec, state.LogEntry{
 		Timestamp:  time.Now().UTC(),
@@ -555,4 +645,11 @@ func (c Config) usesCaddy() bool {
 // port (no Caddy, recreate instead of blue/green). See config.IngressHost.
 func (c Config) ingressHost() bool {
 	return c.Ingress == "host"
+}
+
+func imageDigestFromRef(image string) string {
+	if _, digest, ok := strings.Cut(image, "@"); ok && strings.HasPrefix(digest, "sha256:") && len(digest) == len("sha256:")+64 {
+		return digest
+	}
+	return ""
 }

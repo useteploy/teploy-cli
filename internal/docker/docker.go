@@ -539,6 +539,21 @@ func (c *Client) ImageExists(ctx context.Context, image string) (bool, error) {
 	return strings.TrimSpace(out) == "exists", nil
 }
 
+// ContainerImageDigest returns Docker's content-addressed image ID for a
+// running or stopped container. A value is returned only when Docker proves a
+// sha256 identity; callers should leave release metadata empty otherwise.
+func (c *Client) ContainerImageDigest(ctx context.Context, container string) (string, error) {
+	out, err := c.exec.Run(ctx, "docker inspect -f '{{.Image}}' "+ssh.ShellQuote(container))
+	if err != nil {
+		return "", fmt.Errorf("inspecting container image digest: %w", err)
+	}
+	digest := strings.TrimSpace(out)
+	if !strings.HasPrefix(digest, "sha256:") || len(digest) != len("sha256:")+64 {
+		return "", fmt.Errorf("docker returned no content-addressed image digest")
+	}
+	return digest, nil
+}
+
 // Remove removes a stopped container.
 func (c *Client) Remove(ctx context.Context, name string) error {
 	if _, err := c.exec.Run(ctx, "docker rm "+ssh.ShellQuote(name)); err != nil {

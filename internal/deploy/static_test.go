@@ -3,6 +3,8 @@ package deploy
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -35,6 +37,8 @@ func staticTestSource(t *testing.T) string {
 
 func TestStaticDeploy_FreshFirstDeploy(t *testing.T) {
 	src := staticTestSource(t)
+	manifest := json.RawMessage(`{"app":"myapp","deployment_type":"static"}`)
+	manifestSHA := fmt.Sprintf("%x", sha256.Sum256(manifest))
 
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		// EnsureAppDir
@@ -114,11 +118,14 @@ func TestStaticDeploy_FreshFirstDeploy(t *testing.T) {
 	d = NewStaticDeployer(mock, &bytes.Buffer{})
 
 	cfg := StaticConfig{
-		App:     "myapp",
-		Domain:  "myapp.com, www.myapp.com",
-		Source:  src,
-		SPA:     false,
-		Headers: map[string]string{"Strict-Transport-Security": "max-age=31536000"},
+		App:             "myapp",
+		Domain:          "myapp.com, www.myapp.com",
+		Source:          src,
+		SPA:             false,
+		Headers:         map[string]string{"Strict-Transport-Security": "max-age=31536000"},
+		ManifestSHA256:  manifestSHA,
+		AppliedManifest: manifest,
+		SourceRevision:  strings.Repeat("c", 40),
 	}
 
 	if err := d.Deploy(context.Background(), cfg); err != nil {
@@ -142,6 +149,88 @@ func TestStaticDeploy_FreshFirstDeploy(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Errorf("mirror missing %q\nfull:\n%s", want, got)
 		}
+	}
+	applied := writtenState(t, mock, "myapp")
+	if applied.DeploymentType != "static" || applied.IngressMode != "caddy" || applied.Domain != cfg.Domain || applied.ManifestSHA256 != manifestSHA || !bytes.Equal(applied.AppliedManifest, manifest) || applied.SourceRevision != strings.Repeat("c", 40) {
+		t.Errorf("unexpected static applied state: %+v", applied)
+	}
+}
+
+func TestStaticDeploy_StateCommitFailureRestoresPreviousRelease(t *testing.T) {
+	src := staticTestSource(t)
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "mkdir -p /deployments/myapp", Output: ""},
+		ssh.MockCommand{Match: "mkdir /deployments/myapp/.lock", Output: ""},
+		ssh.MockCommand{Match: "cat /deployments/myapp/state", Output: "current_hash=old123\nprevious_hash=older456\n"},
+		ssh.MockCommand{Match: "mkdir -p /deployments/myapp/releases", Output: ""},
+		ssh.MockCommand{Match: "test -d /deployments/myapp/releases/", Output: "yes"},
+		ssh.MockCommand{Match: "ln -sfn releases/", Output: ""},
+		ssh.MockCommand{Match: "cat /deployments/caddy/Caddyfile", Output: "{\n\tadmin 0.0.0.0:2019\n}\n"},
+		ssh.MockCommand{Match: "mv /tmp/teploy_caddyfile.tmp", Output: ""},
+		ssh.MockCommand{Match: "mkdir /deployments/caddy/.lock", Output: ""},
+		ssh.MockCommand{Match: "docker exec caddy caddy reload", Output: ""},
+		ssh.MockCommand{Match: "rmdir /deployments/caddy/.lock", Output: ""},
+		ssh.MockCommand{Match: "UPLOAD:/deployments/myapp/state.json.tmp-", Err: fmt.Errorf("disk full")},
+		ssh.MockCommand{Match: "rm -rf /deployments/myapp/.lock", Output: ""},
+	)
+	var out bytes.Buffer
+
+	err := NewStaticDeployer(mock, &out).Deploy(context.Background(), StaticConfig{
+		App: "myapp", Domain: "myapp.com", Source: src,
+	})
+	if err == nil || !strings.Contains(err.Error(), "release old123 was restored") {
+		t.Fatalf("expected restored-release state commit error, got %v", err)
+	}
+	if strings.Contains(out.String(), "Deployed myapp") {
+		t.Fatalf("failed deploy reported success: %s", out.String())
+	}
+	var lastSwap string
+	for _, call := range mock.Calls {
+		if strings.HasPrefix(call, "ln -sfn releases/") {
+			lastSwap = call
+		}
+		if strings.HasPrefix(call, "ls -1t /deployments/myapp/releases") {
+			t.Fatalf("releases were pruned after failed state commit: %s", call)
+		}
+	}
+	if !strings.Contains(lastSwap, "releases/old123") {
+		t.Fatalf("last symlink swap did not restore old123: %s", lastSwap)
+	}
+}
+
+func TestStaticRollback_StateCommitFailureRestoresOriginalRelease(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "mkdir /deployments/myapp/.lock", Output: ""},
+		ssh.MockCommand{Match: "cat /deployments/myapp/state", Output: "current_hash=v2\nprevious_hash=v1\n"},
+		ssh.MockCommand{Match: "test -d /deployments/myapp/releases/v1", Output: "yes"},
+		ssh.MockCommand{Match: "ln -sfn releases/", Output: ""},
+		ssh.MockCommand{Match: "cat /deployments/caddy/Caddyfile", Output: "{\n\tadmin 0.0.0.0:2019\n}\n"},
+		ssh.MockCommand{Match: "mv /tmp/teploy_caddyfile.tmp", Output: ""},
+		ssh.MockCommand{Match: "mkdir /deployments/caddy/.lock", Output: ""},
+		ssh.MockCommand{Match: "docker exec caddy caddy reload", Output: ""},
+		ssh.MockCommand{Match: "rmdir /deployments/caddy/.lock", Output: ""},
+		ssh.MockCommand{Match: "UPLOAD:/deployments/myapp/state.json.tmp-", Err: fmt.Errorf("disk full")},
+		ssh.MockCommand{Match: "rm -rf /deployments/myapp/.lock", Output: ""},
+	)
+	var out bytes.Buffer
+
+	err := NewStaticDeployer(mock, &out).Rollback(context.Background(), StaticRollbackConfig{
+		App: "myapp", Domain: "myapp.com",
+	})
+	if err == nil || !strings.Contains(err.Error(), "release v2 was restored") {
+		t.Fatalf("expected restored-release rollback error, got %v", err)
+	}
+	if strings.Contains(out.String(), "Rolled back") {
+		t.Fatalf("failed rollback reported success: %s", out.String())
+	}
+	var lastSwap string
+	for _, call := range mock.Calls {
+		if strings.HasPrefix(call, "ln -sfn releases/") {
+			lastSwap = call
+		}
+	}
+	if !strings.Contains(lastSwap, "releases/v2") {
+		t.Fatalf("last symlink swap did not restore v2: %s", lastSwap)
 	}
 }
 

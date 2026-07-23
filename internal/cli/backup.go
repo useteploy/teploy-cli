@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/signal"
@@ -202,6 +203,16 @@ func runBackupList(flags *Flags, bucket, region, endpoint string) error {
 	backups, err := client.ListBackups(ctx, appCfg.App, "volumes", s3Config(bucket, region, endpoint))
 	if err != nil {
 		return err
+	}
+	if flags.JSON {
+		type backupDTO struct {
+			Name string `json:"name"`
+		}
+		result := make([]backupDTO, 0, len(backups))
+		for _, item := range backups {
+			result = append(result, backupDTO{Name: item})
+		}
+		return json.NewEncoder(os.Stdout).Encode(result)
 	}
 
 	if len(backups) == 0 {

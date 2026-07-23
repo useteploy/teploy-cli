@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/signal"
@@ -170,6 +171,12 @@ func runPreviewList(flags *Flags) error {
 	previews, err := mgr.List(ctx, appCfg.App)
 	if err != nil {
 		return err
+	}
+	if flags.JSON {
+		if previews == nil {
+			previews = []preview.State{}
+		}
+		return json.NewEncoder(os.Stdout).Encode(previews)
 	}
 
 	if len(previews) == 0 {

@@ -2,6 +2,7 @@ package state
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 
 	"github.com/useteploy/teploy/internal/ssh"
@@ -9,7 +10,7 @@ import (
 
 func TestRead_MalformedPort(t *testing.T) {
 	mock := ssh.NewMockExecutor("server1",
-		ssh.MockCommand{Match: "cat", Output: "current_port=notanumber\ncurrent_hash=abc123\n"},
+		ssh.MockCommand{Match: "cat /deployments/myapp/state", Output: "current_port=notanumber\ncurrent_hash=abc123\n"},
 	)
 
 	s, err := Read(context.Background(), mock, "myapp")
@@ -30,7 +31,7 @@ func TestRead_MalformedPort(t *testing.T) {
 
 func TestRead_ExtraFields(t *testing.T) {
 	mock := ssh.NewMockExecutor("server1",
-		ssh.MockCommand{Match: "cat", Output: "current_port=49152\ncurrent_hash=abc123\nunknown_field=value\n"},
+		ssh.MockCommand{Match: "cat /deployments/myapp/state", Output: "current_port=49152\ncurrent_hash=abc123\nunknown_field=value\n"},
 	)
 
 	s, err := Read(context.Background(), mock, "myapp")
@@ -44,7 +45,7 @@ func TestRead_ExtraFields(t *testing.T) {
 
 func TestRead_EmptyLines(t *testing.T) {
 	mock := ssh.NewMockExecutor("server1",
-		ssh.MockCommand{Match: "cat", Output: "\n\ncurrent_port=49152\n\ncurrent_hash=abc123\n\n"},
+		ssh.MockCommand{Match: "cat /deployments/myapp/state", Output: "\n\ncurrent_port=49152\n\ncurrent_hash=abc123\n\n"},
 	)
 
 	s, err := Read(context.Background(), mock, "myapp")
@@ -58,7 +59,7 @@ func TestRead_EmptyLines(t *testing.T) {
 
 func TestRead_MalformedLines(t *testing.T) {
 	mock := ssh.NewMockExecutor("server1",
-		ssh.MockCommand{Match: "cat", Output: "garbage\nno-equals-sign\ncurrent_port=49152\n"},
+		ssh.MockCommand{Match: "cat /deployments/myapp/state", Output: "garbage\nno-equals-sign\ncurrent_port=49152\n"},
 	)
 
 	s, err := Read(context.Background(), mock, "myapp")
@@ -88,14 +89,17 @@ func TestWrite_RoundTrip(t *testing.T) {
 	}
 
 	// Verify the uploaded content.
-	content, ok := mock.Files["/deployments/myapp/state"]
+	content, ok := mock.Files["/deployments/myapp/state.json"]
 	if !ok {
 		t.Fatal("state file not uploaded")
 	}
 
-	expected := "current_port=49152\ncurrent_hash=abc123\nprevious_port=49153\nprevious_hash=def456\n"
-	if string(content) != expected {
-		t.Errorf("state content mismatch:\ngot:  %q\nwant: %q", string(content), expected)
+	var got AppState
+	if err := json.Unmarshal(content, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.CurrentPort != 49152 || got.CurrentHash != "abc123" || got.PreviousPort != 49153 || got.PreviousHash != "def456" {
+		t.Errorf("state content mismatch: %+v", got)
 	}
 }
 

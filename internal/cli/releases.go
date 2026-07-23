@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/signal"
@@ -53,14 +54,25 @@ func runReleases(flags *Flags) error {
 	if err != nil {
 		return fmt.Errorf("listing releases: %w", err)
 	}
-	if len(releases) == 0 {
-		fmt.Println("No releases yet — run 'teploy deploy' first.")
-		return nil
-	}
 
 	current := ""
 	if s, _ := state.Read(ctx, executor, appCfg.App); s != nil {
 		current = s.CurrentHash
+	}
+	if flags.JSON {
+		type releaseDTO struct {
+			Version string `json:"version"`
+			Current bool   `json:"current"`
+		}
+		result := make([]releaseDTO, 0, len(releases))
+		for _, release := range releases {
+			result = append(result, releaseDTO{Version: release, Current: release == current})
+		}
+		return json.NewEncoder(os.Stdout).Encode(result)
+	}
+	if len(releases) == 0 {
+		fmt.Println("No releases yet — run 'teploy deploy' first.")
+		return nil
 	}
 
 	for _, r := range releases {
