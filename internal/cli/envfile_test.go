@@ -101,3 +101,35 @@ func TestBuildContainerEnvFiles_SecretWinsOverPlaintextDefault(t *testing.T) {
 		t.Errorf("plaintext default should have been overridden, got: %s", data)
 	}
 }
+
+// A multi-line env value cannot be represented in docker's --env-file format:
+// docker reads the continuation lines as further variables and fails with a
+// confusing complaint about a variable name containing whitespace. Catch it at
+// the source and name the offending variable instead.
+func TestBuildContainerEnvFiles_RejectsMultilineValues(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4")
+
+	appEnv := map[string]string{
+		"APP_CONFIG": "port: 7880\nrtc:\n  tcp_port: 7881\n",
+	}
+	_, err := buildContainerEnvFiles(context.Background(), mock, "myapp", "", appEnv, nil, nil)
+	if err == nil {
+		t.Fatal("a multi-line env value must be rejected, not written into the env file")
+	}
+	if !strings.Contains(err.Error(), "APP_CONFIG") {
+		t.Fatalf("error should name the offending variable, got: %v", err)
+	}
+
+	// A carriage return alone breaks the format just the same.
+	_, err = buildContainerEnvFiles(context.Background(), mock, "myapp", "",
+		map[string]string{"OTHER": "a\rb"}, nil, nil)
+	if err == nil {
+		t.Fatal("a value containing a carriage return must also be rejected")
+	}
+
+	// Ordinary single-line values are unaffected.
+	if _, err := buildContainerEnvFiles(context.Background(), mock, "myapp", "",
+		map[string]string{"FINE": "{a: 1, b: 2}"}, nil, nil); err != nil {
+		t.Fatalf("single-line values must still be accepted: %v", err)
+	}
+}
