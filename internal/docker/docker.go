@@ -46,6 +46,7 @@ type RunConfig struct {
 	Port          int               // host port for external access
 	BindHost      string            // host IP to publish the port on (default 127.0.0.1)
 	ContainerPort int               // port the app listens on inside the container (default 80)
+	Publish       []string          // extra verbatim docker -p specs (e.g. "0.0.0.0:3001:3001") for apps with a second listener; no PORT env is derived from these
 	EnvFiles      []string          // paths to env files on the server, applied in order (later files' keys win)
 	Env           map[string]string // additional env vars — plaintext only; secrets belong in EnvFiles (see deploy.go), not here, since -e values are visible in this host's `ps aux`/`/proc/<pid>/cmdline` for the life of this docker run invocation
 	Volumes       map[string]string // host_path -> container_path
@@ -138,6 +139,13 @@ func (c *Client) Run(ctx context.Context, cfg RunConfig) (string, error) {
 			bindHost = "127.0.0.1"
 		}
 		args = append(args, "-p", bindHost+":"+hostPort+":"+cPortStr, "-e", "PORT="+cPortStr)
+	}
+
+	// Extra host port mappings (AppConfig.Publish), kept separate from the
+	// block above: these are verbatim -p specs and no PORT env is derived
+	// from them. Used by apps that serve a second listener on its own port.
+	for _, pub := range cfg.Publish {
+		args = append(args, "-p", q(pub))
 	}
 
 	// Env files on server, in order — docker merges --env-file flags with

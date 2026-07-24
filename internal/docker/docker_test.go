@@ -148,6 +148,41 @@ func TestClient_Run(t *testing.T) {
 	}
 }
 
+func TestClient_Run_Publish(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "docker run", Output: "abc123def456"},
+	)
+	client := NewClient(mock)
+
+	_, err := client.Run(context.Background(), RunConfig{
+		App:     "observe",
+		Process: "web",
+		Version: "abc123",
+		Image:   "observe:latest",
+		Port:    3000,
+		Publish: []string{"0.0.0.0:3001:3001"},
+	})
+	if err != nil {
+		t.Fatalf("Run failed: %v", err)
+	}
+
+	cmd := mock.Calls[0]
+	for _, want := range []string{
+		"-p 127.0.0.1:3000:80",
+		"-e PORT=80",
+		"-p '0.0.0.0:3001:3001'",
+	} {
+		if !strings.Contains(cmd, want) {
+			t.Errorf("command missing %q\ngot: %s", want, cmd)
+		}
+	}
+	// Publish entries are verbatim -p specs, not container-port bindings — no
+	// PORT env should be derived from the 3001 side of the mapping.
+	if strings.Contains(cmd, "PORT=3001") {
+		t.Errorf("Publish must not derive a PORT env var, got: %s", cmd)
+	}
+}
+
 func TestClient_Run_Worker(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "docker run", Output: "worker123"},

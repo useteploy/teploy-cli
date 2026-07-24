@@ -234,12 +234,21 @@ type AppConfig struct {
 	Ingress string `yaml:"ingress,omitempty" toml:"ingress"`
 	// Bind is the host IP that `ingress: host` publishes the fixed port on
 	// (default 0.0.0.0 — all interfaces). Only valid with ingress: host.
-	Bind       string   `yaml:"bind,omitempty" toml:"bind"`
-	Server     string   `yaml:"server,omitempty" toml:"server"`
-	User       string   `yaml:"user,omitempty" toml:"user"`
-	Servers    []string `yaml:"servers,omitempty" toml:"servers"`
-	Image      string   `yaml:"image,omitempty" toml:"image"`
-	Port       int      `yaml:"port,omitempty" toml:"port"`
+	Bind    string   `yaml:"bind,omitempty" toml:"bind"`
+	Server  string   `yaml:"server,omitempty" toml:"server"`
+	User    string   `yaml:"user,omitempty" toml:"user"`
+	Servers []string `yaml:"servers,omitempty" toml:"servers"`
+	Image   string   `yaml:"image,omitempty" toml:"image"`
+	Port    int      `yaml:"port,omitempty" toml:"port"`
+	// Publish adds extra docker -p mappings (e.g. "0.0.0.0:3001:3001") beyond
+	// the single `port` above, for an app that serves more than one listener
+	// and needs them reachable on different host ports. The motivating case is
+	// an app that splits a public surface from a private one — e.g. Observe's
+	// ingest-only listener, which is published while its dashboard port stays
+	// bound to loopback/tailnet. Prefer an explicit bind address; a bare
+	// "3001:3001" publishes on 0.0.0.0, and Docker's port mappings bypass UFW.
+	// Single-replica only (see Validate) — a fixed host port can't be shared.
+	Publish    []string `yaml:"publish,omitempty" toml:"publish"`
 	Platform   string   `yaml:"platform,omitempty" toml:"platform"`
 	BuildLocal bool     `yaml:"build_local,omitempty" toml:"build_local"`
 	// Dockerfile names the Dockerfile to build from, resolved relative to
@@ -578,6 +587,19 @@ func (c *AppConfig) validate() error {
 			return fmt.Errorf("'tls' has no effect with 'ingress: host' — terminate TLS in front of the published port")
 		}
 	}
+	// Extra published ports. Fixed host ports can't be load-balanced, so they
+	// collide the moment a second replica starts — reject it up front rather
+	// than failing partway through a rollout.
+	if len(c.Publish) > 0 {
+		if c.Replicas > 1 {
+			return fmt.Errorf("'publish' supports a single replica (a fixed host port can't be shared across containers)")
+		}
+		for _, p := range c.Publish {
+			if strings.TrimSpace(p) == "" {
+				return fmt.Errorf("'publish' entries must be non-empty (e.g. \"127.0.0.1:3001:3001\")")
+			}
+		}
+	}
 	// Validate deploy type and its required fields. Empty type means container.
 	switch c.Type {
 	case "", TypeContainer:
@@ -879,6 +901,9 @@ func mergeConfigs(base, overlay *AppConfig) {
 	}
 	if overlay.Replicas != 0 {
 		base.Replicas = overlay.Replicas
+	}
+	if len(overlay.Publish) > 0 {
+		base.Publish = overlay.Publish
 	}
 	if overlay.Hooks.PreDeploy != "" {
 		base.Hooks.PreDeploy = overlay.Hooks.PreDeploy

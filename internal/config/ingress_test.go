@@ -241,6 +241,91 @@ replicas: 2
 	}
 }
 
+func TestLoadApp_PublishMultiReplicaRejected(t *testing.T) {
+	dir := t.TempDir()
+	content := `app: myapp
+domain: myapp.com
+port: 3000
+replicas: 2
+publish:
+  - "0.0.0.0:3001:3001"
+`
+	if err := os.WriteFile(filepath.Join(dir, "teploy.yml"), []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := LoadApp(dir)
+	if err == nil {
+		t.Fatal("expected error: publish single replica only")
+	}
+	if !strings.Contains(err.Error(), "replica") {
+		t.Errorf("error should mention replica, got: %v", err)
+	}
+}
+
+func TestLoadApp_PublishRejectsEmptyEntry(t *testing.T) {
+	dir := t.TempDir()
+	content := `app: myapp
+domain: myapp.com
+port: 3000
+publish:
+  - ""
+`
+	if err := os.WriteFile(filepath.Join(dir, "teploy.yml"), []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := LoadApp(dir)
+	if err == nil {
+		t.Fatal("expected error: empty publish entry")
+	}
+	if !strings.Contains(err.Error(), "publish") {
+		t.Errorf("error should mention publish, got: %v", err)
+	}
+}
+
+func TestLoadApp_PublishValid(t *testing.T) {
+	dir := t.TempDir()
+	content := `app: myapp
+domain: myapp.com
+port: 3000
+publish:
+  - "0.0.0.0:3001:3001"
+`
+	if err := os.WriteFile(filepath.Join(dir, "teploy.yml"), []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadApp(dir)
+	if err != nil {
+		t.Fatalf("expected valid config, got: %v", err)
+	}
+	if len(cfg.Publish) != 1 || cfg.Publish[0] != "0.0.0.0:3001:3001" {
+		t.Errorf("expected Publish=[0.0.0.0:3001:3001], got %v", cfg.Publish)
+	}
+}
+
+func TestLoadApp_PublishOverlayMerge(t *testing.T) {
+	dir := t.TempDir()
+	base := `app: myapp
+domain: myapp.com
+port: 3000
+`
+	overlay := `publish:
+  - "0.0.0.0:3001:3001"
+`
+	if err := os.WriteFile(filepath.Join(dir, "teploy.yml"), []byte(base), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "teploy.home.yml"), []byte(overlay), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadAppWithDestination(dir, "home")
+	if err != nil {
+		t.Fatalf("LoadAppWithDestination: %v", err)
+	}
+	if len(cfg.Publish) != 1 || cfg.Publish[0] != "0.0.0.0:3001:3001" {
+		t.Errorf("expected overlay Publish=[0.0.0.0:3001:3001], got %v", cfg.Publish)
+	}
+}
+
 func TestLoadApp_IngressOverlayMerge(t *testing.T) {
 	dir := t.TempDir()
 	base := `app: myapp

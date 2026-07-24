@@ -56,6 +56,10 @@ type Config struct {
 	Memory        string
 	CPU           string
 	ContainerPort int // internal container port (default 80)
+	// Publish adds extra verbatim docker -p mappings beyond ContainerPort's own
+	// (e.g. "0.0.0.0:3001:3001"), for an app with a second listener that needs
+	// its own host port. See AppConfig.Publish.
+	Publish       []string
 	StopTimeout   int // graceful shutdown seconds (default 10)
 	Replicas      int // web process replicas per server (default 1)
 	Health        HealthConfig
@@ -272,6 +276,7 @@ func (d *Deployer) Deploy(ctx context.Context, cfg Config) error {
 			Port:          ports[i],
 			BindHost:      webBindHost,
 			ContainerPort: cfg.ContainerPort,
+			Publish:       cfg.Publish,
 			EnvFiles:      cfg.EnvFiles,
 			Env:           cfg.Env,
 			Volumes:       cfg.Volumes,

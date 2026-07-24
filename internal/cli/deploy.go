@@ -575,6 +575,7 @@ func deployBuiltImage(ctx context.Context, executor ssh.Executor, appCfg *config
 		Ingress:         appCfg.Ingress,
 		Bind:            appCfg.Bind,
 		ContainerPort:   appCfg.Port,
+		Publish:         appCfg.Publish,
 		StopTimeout:     appCfg.StopTimeout,
 		Replicas:        appCfg.Replicas,
 		PreDeploy:       appCfg.Hooks.PreDeploy,
