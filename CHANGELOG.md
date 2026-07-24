@@ -4,6 +4,25 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [0.1.22] - 2026-07-23
+
+### Added
+- Machine-readable observation commands for automation and the dashboard:
+  `teploy app list` (every app deployed on a server, with per-process
+  container detail) and `teploy server status <server-or-host>` (resources,
+  Docker inventory, and parsed Caddy routes). Both emit stable JSON under
+  `--json`, contract-tested so consumers can pin to the shape.
+- `teploy deploy [server]` accepts the server as a positional argument, so a
+  delegating caller can target a server without a `teploy.yml` in scope.
+- `--project-dir` global flag: run as if teploy had started in that
+  directory, so a caller never depends on its own working directory.
+- Canonical manifest model with revision semantics, the shared vocabulary
+  for desired/applied/observed reconciliation.
+
+### Changed
+- Server-side state writes are atomic (write-temp then rename), so
+  concurrent operations can never observe or leave a half-written state file.
+
 ## [0.1.21] - 2026-07-22
 
 ### Added
