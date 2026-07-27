@@ -4,6 +4,19 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [0.1.23] - 2026-07-24
+
+### Added
+- `teploy drift --app <name> --host <server>`: drift detection without a
+  `teploy.yml`. With no manifest to compare against, drift is derived from
+  what the server itself records — containers of the deployed version that
+  are no longer running, and containers of other versions still running.
+  That covers manual stops and stale versions left behind, and it lets the
+  dashboard report drift for apps it has no config for. JSON output carries
+  `mode` (`manifest` or `state`) so consumers know which comparison ran;
+  state mode also states its limitation, since replica-count drift is only
+  visible to the manifest.
+
 ## [0.1.22] - 2026-07-23
 
 ### Added

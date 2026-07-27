@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 
 	"github.com/spf13/cobra"
 	"github.com/useteploy/teploy/internal/backup"
@@ -307,6 +308,19 @@ func runBackupSchedule(flags *Flags, schedule, bucket, region, endpoint string, 
 	defer executor.Close()
 
 	webhook := firstWebhookURL(appCfg.Notifications)
+
+	// The alert script goes up before the cron entry that calls it, so a
+	// schedule is never installed pointing at a script that is not there yet.
+	signed := false
+	if webhook != "" {
+		secret := appCfg.Notifications.SigningSecret()
+		script := buildBackupAlertScript(appCfg.App, executor.Host(), webhook, secret)
+		if err := executor.Upload(ctx, strings.NewReader(script), backupAlertScriptPath(appCfg.App), "0700"); err != nil {
+			return fmt.Errorf("uploading the backup alert script: %w", err)
+		}
+		signed = secret != ""
+	}
+
 	backupCmd := buildScheduledBackupCmd(appCfg.App, executor.Host(), bucket, region, keepLast, webhook)
 
 	client := backup.NewClient(executor, os.Stdout)
@@ -321,7 +335,13 @@ func runBackupSchedule(flags *Flags, schedule, bucket, region, endpoint string, 
 		fmt.Printf("  Retention: keep last %d\n", keepLast)
 	}
 	if webhook != "" {
-		fmt.Println("  Alerts: webhook notified on failure")
+		if signed {
+			fmt.Println("  Alerts: webhook notified on failure (signed)")
+		} else {
+			// Said plainly, because a receiver that verifies signatures will
+			// reject this and the rejection looks like a wrong secret.
+			fmt.Printf("  Alerts: webhook notified on failure (UNSIGNED — set %s to sign)\n", config.WebhookSecretEnv)
+		}
 	}
 	return nil
 }
@@ -370,22 +390,14 @@ func buildScheduledBackupCmd(app, server, bucket, region string, keepLast int, w
 		)
 	}
 
-	// Failure alerting: a scheduled backup runs headless, so it can't use the
-	// CLI notifier (teploy.yml + its config aren't on the server). If a webhook
-	// is configured, POST a failure payload — matching notify.Payload's schema —
-	// when any step of the chain fails. Deliberately `%`-free (no $(date) with a
-	// format) so it can't trip cron's %-escaping; the receiver stamps its own
-	// receipt time. `; false` preserves the non-zero exit so cron still logs it.
+	// Failure alerting: a scheduled backup runs headless, so it can't use the CLI
+	// notifier (teploy.yml + its config aren't on the server). The alert lives in
+	// a script uploaded beside the app — see backup_alert.go for why it is a file
+	// rather than an inline curl: signing needs a timestamp, `date +%s` contains
+	// a `%`, and crontab treats `%` as a newline escape. `; false` preserves the
+	// non-zero exit so cron still logs the failure.
 	if webhook != "" {
-		payload := fmt.Sprintf(
-			`{"app":%q,"server":%q,"type":"backup","success":false,"message":"Scheduled backup failed","duration_ms":0,"timestamp":""}`,
-			app, server,
-		)
-		alert := fmt.Sprintf(
-			"curl -sf -m 10 -X POST -H 'Content-Type: application/json' -d %s %s",
-			ssh.ShellQuote(payload), ssh.ShellQuote(webhook),
-		)
-		cmd = "( " + cmd + " ) || { " + alert + "; false; }"
+		cmd = "( " + cmd + " ) || { " + ssh.ShellQuote(backupAlertScriptPath(app)) + "; false; }"
 	}
 
 	return cmd

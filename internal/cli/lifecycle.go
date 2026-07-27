@@ -79,19 +79,21 @@ func runLifecycle(flags *Flags, appName, action string) error {
 		err = lc.Restart(ctx, appCfg.App, stopTimeout)
 	}
 
-	// Fire notification (best-effort).
-	if notifier := notify.NewNotifier(appCfg.Notifications.Webhook); notifier != nil {
+	// Fire notification (best-effort). buildNotifier, not NewNotifier — see the
+	// note in rollback.go: reading only the legacy `notifications.webhook` key
+	// meant a channels-configured install never heard about stop/start/restart.
+	if notifier := buildNotifier(appCfg); notifier != nil {
 		msg := fmt.Sprintf("%s %s", action, appCfg.App)
 		if err != nil {
 			msg = fmt.Sprintf("%s failed for %s: %s", action, appCfg.App, err)
 		}
-		if nErr := notifier.Send(ctx, notify.Payload{
+		for _, nErr := range notifier.Send(ctx, notify.Payload{
 			App:     appCfg.App,
 			Server:  executor.Host(),
 			Type:    action,
 			Success: err == nil,
 			Message: msg,
-		}); nErr != nil {
+		}) {
 			fmt.Fprintf(os.Stderr, "Warning: notification failed: %v\n", nErr)
 		}
 	}

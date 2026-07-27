@@ -25,17 +25,27 @@ type Payload struct {
 // but should be logged as warnings, never blocking the operation.
 type Notifier struct {
 	webhookURL string
+	secret     string
 	client     *http.Client
 }
 
-// NewNotifier creates a notifier for the given webhook URL.
+// NewNotifier creates a notifier for the given webhook URL, signing deliveries
+// with secret (see sign.go). An empty secret sends unsigned, which is what an
+// install that has not configured one has always done.
 // Returns nil if the URL is empty (no notifications configured).
-func NewNotifier(webhookURL string) *Notifier {
+//
+// Command code should use cli.buildNotifier instead, which honours BOTH
+// `notifications.webhook` and `notifications.channels`. Reaching for this
+// constructor from a command is how rollback and stop/start/restart ended up
+// silently ignoring every channels-configured receiver: only the legacy key was
+// read, so those installs got deploy events and nothing else.
+func NewNotifier(webhookURL, secret string) *Notifier {
 	if webhookURL == "" {
 		return nil
 	}
 	return &Notifier{
 		webhookURL: webhookURL,
+		secret:     secret,
 		client: &http.Client{
 			Timeout: 10 * time.Second,
 		},
@@ -59,6 +69,7 @@ func (n *Notifier) Send(ctx context.Context, p Payload) error {
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", "teploy/1.0")
+	signRequest(req, n.secret, body)
 
 	resp, err := n.client.Do(req)
 	if err != nil {

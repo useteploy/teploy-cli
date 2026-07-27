@@ -127,7 +127,7 @@ func TestReportDrift(t *testing.T) {
 			)
 			appCfg := &config.AppConfig{App: "blog"}
 
-			got, err := reportDrift(context.Background(), &Flags{JSON: true}, appCfg, mock)
+			got, err := reportDrift(context.Background(), &Flags{JSON: true}, appCfg, mock, false)
 			if err != nil {
 				t.Fatalf("reportDrift() error: %v", err)
 			}
@@ -135,5 +135,81 @@ func TestReportDrift(t *testing.T) {
 				t.Errorf("reportDrift() drift = %v, want %v", got, tt.wantDrift)
 			}
 		})
+	}
+}
+
+// ── state-derived drift (--app mode, no teploy.yml) ──
+
+func verCtr(name, version, state string, extra map[string]string) docker.Container {
+	labels := map[string]string{"teploy.app": "shop", "teploy.process": "web", "teploy.version": version}
+	for k, v := range extra {
+		labels[k] = v
+	}
+	return docker.Container{Name: name, State: state, Labels: labels}
+}
+
+func TestDriftItemsFromStateInSync(t *testing.T) {
+	items := driftItemsFromState("v2", []docker.Container{
+		verCtr("shop-web-v2", "v2", "running", nil),
+		// An old container that is already stopped is the normal post-deploy
+		// resting state, not drift.
+		verCtr("shop-web-v1", "v1", "exited", nil),
+	})
+	if len(items) != 0 {
+		t.Fatalf("expected no drift, got %+v", items)
+	}
+}
+
+func TestDriftItemsFromStateDetectsStoppedAndStale(t *testing.T) {
+	items := driftItemsFromState("v2", []docker.Container{
+		verCtr("shop-web-v2", "v2", "exited", nil),  // manually stopped
+		verCtr("shop-web-v1", "v1", "running", nil), // old version still up
+	})
+	if len(items) != 2 {
+		t.Fatalf("expected 2 drift items, got %+v", items)
+	}
+	if items[0].Kind != "missing" || items[0].Name != "shop-web-v2" {
+		t.Errorf("first item = %+v, want missing shop-web-v2", items[0])
+	}
+	if items[1].Kind != "unexpected" || items[1].Name != "shop-web-v1" {
+		t.Errorf("second item = %+v, want unexpected shop-web-v1", items[1])
+	}
+}
+
+// Accessories and previews share the teploy.app label but are not part of the
+// app-process set — counting them would report drift on every app that has a
+// database or an open preview.
+func TestDriftItemsFromStateIgnoresAccessoriesAndPreviews(t *testing.T) {
+	items := driftItemsFromState("v2", []docker.Container{
+		verCtr("shop-web-v2", "v2", "running", nil),
+		verCtr("shop-db", "", "running", map[string]string{"teploy.role": "accessory"}),
+		verCtr("shop-preview-pr7", "pr7", "running", map[string]string{"teploy.process": "preview-pr7"}),
+	})
+	if len(items) != 0 {
+		t.Fatalf("expected accessories/previews to be ignored, got %+v", items)
+	}
+}
+
+// Multiple replicas of the deployed version are all legitimate; state mode must
+// not invent a declared count and report the extras as drift.
+func TestDriftItemsFromStateAllowsReplicas(t *testing.T) {
+	items := driftItemsFromState("v2", []docker.Container{
+		verCtr("shop-web-v2-1", "v2", "running", nil),
+		verCtr("shop-web-v2-2", "v2", "running", nil),
+		verCtr("shop-web-v2-3", "v2", "running", nil),
+	})
+	if len(items) != 0 {
+		t.Fatalf("replicas of the deployed version are not drift, got %+v", items)
+	}
+}
+
+// Containers from before version labels existed can't be classified; guessing
+// would produce phantom drift on long-lived servers.
+func TestDriftItemsFromStateSkipsUnlabeled(t *testing.T) {
+	items := driftItemsFromState("v2", []docker.Container{
+		verCtr("shop-web-legacy", "", "running", nil),
+	})
+	if len(items) != 0 {
+		t.Fatalf("unlabeled containers must be skipped, got %+v", items)
 	}
 }

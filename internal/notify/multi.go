@@ -15,6 +15,11 @@ type Channel struct {
 	URL    string   // webhook / ntfy topic URL
 	To     string   // email address
 	Events []string // empty = all events
+	// Secret signs deliveries to this channel (see sign.go). Only meaningful
+	// for type "webhook": Slack and ntfy define their own request shapes and
+	// would reject or ignore the headers, so signing them would be a promise
+	// the receiver never checks.
+	Secret string
 }
 
 // MultiNotifier sends notifications to multiple channels filtered by event type.
@@ -49,7 +54,7 @@ func (n *MultiNotifier) Send(ctx context.Context, p Payload) []error {
 
 		switch ch.Type {
 		case "webhook", "":
-			if err := sendWebhook(ctx, n.client, ch.URL, p); err != nil {
+			if err := sendWebhook(ctx, n.client, ch.URL, ch.Secret, p); err != nil {
 				errs = append(errs, fmt.Errorf("webhook %s: %w", ch.URL, err))
 			}
 		case "slack":
@@ -164,7 +169,7 @@ func sendNtfy(ctx context.Context, client *http.Client, url string, p Payload) e
 	return nil
 }
 
-func sendWebhook(ctx context.Context, client *http.Client, url string, p Payload) error {
+func sendWebhook(ctx context.Context, client *http.Client, url, secret string, p Payload) error {
 	body, err := json.Marshal(p)
 	if err != nil {
 		return fmt.Errorf("marshaling notification: %w", err)
@@ -176,6 +181,7 @@ func sendWebhook(ctx context.Context, client *http.Client, url string, p Payload
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", "teploy/1.0")
+	signRequest(req, secret, body)
 
 	resp, err := client.Do(req)
 	if err != nil {

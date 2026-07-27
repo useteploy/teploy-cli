@@ -58,6 +58,22 @@ func buildContainerEnvFiles(ctx context.Context, executor ssh.Executor, app, per
 	}
 	sort.Strings(keys)
 
+	// docker's --env-file format is strictly one KEY=value per line, so a value
+	// containing a newline does not round-trip: docker reads the continuation
+	// lines as further variables and fails with a confusing complaint about a
+	// variable name "containing whitespaces". Catch it here and name the
+	// culprit instead.
+	//
+	// Routing just these values through `-e` is deliberately not the fallback:
+	// that is the ps-aux/proc-cmdline exposure this whole file exists to avoid,
+	// and a multi-line value is as likely to be a private key as a config blob.
+	for _, k := range keys {
+		if strings.ContainsAny(merged[k], "\n\r") {
+			return nil, fmt.Errorf("env value for %s spans multiple lines, which docker's --env-file cannot represent; "+
+				"use a single-line form (YAML flow style, e.g. \"{a: 1, b: 2}\") or mount the content as a file", k)
+		}
+	}
+
 	var sb strings.Builder
 	for _, k := range keys {
 		fmt.Fprintf(&sb, "%s=%s\n", k, merged[k])
