@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -466,3 +467,90 @@ func TestRollback_ToHash_PortCollisionReallocates(t *testing.T) {
 		t.Errorf("state still recorded the colliding port: %+v", stateData)
 	}
 }
+
+// Rolling back a host-ingress app must republish on the SAME fixed port.
+//
+// It did not. Under host ingress every version shares one config-fixed port, so
+// current.CurrentPort always equals the target's port; adding it to avoidPorts
+// made Restart reallocate on every rollback and the app came back on a random
+// ephemeral port. Found live: a rollback on smoke moved ship from 7460 to 49152,
+// so the dashboard was simply gone from where it was published.
+func TestRollback_HostIngressKeepsTheFixedPort(t *testing.T) {
+	// Both versions bound 0.0.0.0:7460 — that is what host ingress means.
+	stateContent := `{"schema_version":2,"deployment_type":"container","ingress_mode":"host","updated_at":"2026-07-27T10:00:00Z","current_port":7460,"current_hash":"v2","previous_port":7460,"previous_hash":"v1"}`
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "cat -- /deployments/myapp/state.json", Output: stateContent},
+		ssh.MockCommand{Match: "docker ps --all --filter label=teploy.app='myapp'",
+			Output: `{"ID":"aaa","Names":"myapp-web-v1","Image":"myapp:latest","State":"exited","Status":"Exited","Labels":"teploy.app=myapp,teploy.version=v1,teploy.process=web"}` + "\n" +
+				`{"ID":"bbb","Names":"myapp-web-v2","Image":"myapp:latest","State":"running","Status":"Up 1h","Labels":"teploy.app=myapp,teploy.version=v2,teploy.process=web"}`,
+		},
+		ssh.MockCommand{Match: "docker inspect 'myapp-web-v1'", Output: `[{"Config":{"Image":"myapp:latest","Labels":{"teploy.app":"myapp"}},"HostConfig":{"NetworkMode":"teploy","PortBindings":{"7460/tcp":[{"HostIp":"0.0.0.0","HostPort":"7460"}]},"RestartPolicy":{"Name":"no"}},"NetworkSettings":{"Networks":{"teploy":{"Aliases":["myapp"]}}}}]`},
+		ssh.MockCommand{Match: "docker rm -f 'myapp-web-v1'", Output: ""},
+		ssh.MockCommand{Match: "docker run", Output: ""},
+		ssh.MockCommand{Match: "curl", Output: "200"},
+		ssh.MockCommand{Match: "docker inspect -f '{{range $p, $b := .NetworkSettings.Ports}}", Output: "7460"},
+		ssh.MockCommand{Match: "docker stop", Output: ""},
+		ssh.MockCommand{Match: "mkdir -p", Output: ""},
+		ssh.MockCommand{Match: "cat /tmp", Output: ""},
+		ssh.MockCommand{Match: "UPLOAD:", Output: ""},
+	)
+
+	var buf bytes.Buffer
+	cfg := rollbackCfg()
+	cfg.Domain = "" // host ingress publishes a raw port, not a domain
+	if err := Rollback(context.Background(), mock, &buf, cfg); err != nil {
+		t.Fatalf("Rollback: %v\n%s", err, buf.String())
+	}
+
+	// The recreated container must be published on the fixed port, unchanged.
+	var runCmd string
+	for _, c := range mock.Calls {
+		if strings.Contains(c, "docker run") {
+			runCmd = c
+			break
+		}
+	}
+	if runCmd == "" {
+		t.Fatalf("no docker run issued\n%s", buf.String())
+	}
+	if !strings.Contains(runCmd, "-p 0.0.0.0:7460:7460/tcp") {
+		t.Errorf("the fixed port was not preserved.\n  run: %s", runCmd)
+	}
+	// A reallocated ephemeral port is the specific regression.
+	if strings.Contains(runCmd, ":491") {
+		t.Errorf("the port was reallocated to an ephemeral one.\n  run: %s", runCmd)
+	}
+
+	// And the live container must be stopped BEFORE the target starts, or both
+	// would try to bind the same fixed port.
+	stopIdx, runIdx := -1, -1
+	for i, c := range mock.Calls {
+		if stopIdx < 0 && strings.Contains(c, "docker stop") && strings.Contains(c, "myapp-web-v2") {
+			stopIdx = i
+		}
+		if runIdx < 0 && strings.Contains(c, "docker run") {
+			runIdx = i
+		}
+	}
+	if stopIdx < 0 {
+		t.Fatalf("the current host-ingress container was never stopped\ncalls: %v", mock.Calls)
+	}
+	if stopIdx > runIdx {
+		t.Errorf("stopped the current container (idx %d) AFTER starting the target (idx %d) — both would bind the fixed port", stopIdx, runIdx)
+	}
+}
+
+// Caddy ingress keeps blue/green: the current version's port must still be
+// avoided there, since two versions genuinely do run at once.
+func TestRollback_CaddyIngressStillAvoidsTheLivePort(t *testing.T) {
+	body, err := osReadFile("rollback.go")
+	if err != nil {
+		t.Fatalf("read rollback.go: %v", err)
+	}
+	src := string(body)
+	if !strings.Contains(src, "if !cfg.ingressHost() {") {
+		t.Error("the avoidPorts guard is not conditioned on host ingress; caddy rollbacks need the live port avoided")
+	}
+}
+
+func osReadFile(name string) ([]byte, error) { return os.ReadFile(name) }

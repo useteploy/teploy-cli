@@ -60,6 +60,13 @@ func (c RollbackConfig) usesCaddy() bool {
 	return c.Ingress == "" || c.Ingress == "caddy"
 }
 
+// ingressHost reports whether this app publishes a FIXED host port. That single
+// fact changes the whole shape of a rollback: with a fixed port there is only
+// one port, every version shares it, and two containers cannot hold it at once —
+// so the blue/green order used below (start target, health check, stop current)
+// is impossible and the port must never be reallocated.
+func (c RollbackConfig) ingressHost() bool { return c.Ingress == "host" }
+
 // Rollback reverts to a previous deploy version — the immediately previous
 // one by default, or cfg.ToHash if set (mirroring type:static's --to).
 // Starts the target version's containers, health checks, re-routes
@@ -112,12 +119,22 @@ func Rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg Rollbac
 	// original port may since have been reassigned to what's now the live
 	// container. See docker.Client.Restart's doc comment for how this is
 	// resolved (fresh port allocated instead of reusing a colliding one).
+	//
+	// EXCEPT under host ingress, where this reasoning inverts. There the port is
+	// fixed by config, so every version shares it and current.CurrentPort ALWAYS
+	// equals the target's port — avoiding it would reallocate on every single
+	// rollback, silently republishing the app on a random ephemeral port. That is
+	// not a rare collision case, it is guaranteed, and it made `teploy rollback`
+	// unusable for any host-ingress app. The fixed port is freed instead, by
+	// stopping the current web containers before the target starts (below).
 	avoidPorts := make(map[int]bool, len(current.CurrentPorts)+1)
-	for _, p := range current.CurrentPorts {
-		avoidPorts[p] = true
-	}
-	if current.CurrentPort != 0 {
-		avoidPorts[current.CurrentPort] = true
+	if !cfg.ingressHost() {
+		for _, p := range current.CurrentPorts {
+			avoidPorts[p] = true
+		}
+		if current.CurrentPort != 0 {
+			avoidPorts[current.CurrentPort] = true
+		}
 	}
 
 	// Match by the teploy.version label, not a name suffix: replica web
@@ -125,6 +142,28 @@ func Rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg Rollbac
 	// not "-<version>" — a suffix match silently skips every replica (leaving
 	// them stopped on rollback / orphaned on the next deploy). Every teploy
 	// container carries the version label.
+	// Host ingress recreates rather than blue/greens — the target reuses the same
+	// fixed host port, so the current web containers must stop before it starts.
+	// Deploy does exactly this (see deploy.go's displacedHostWeb); rollback did
+	// not, which is why it only ever "worked" by reallocating the port.
+	//
+	// Recorded so a failed health check can bring them back: with a fixed port
+	// there is no moment where both versions are live, so the window between
+	// stopping the current one and proving the target healthy is unavoidable.
+	var displacedHostWeb []string
+	if cfg.ingressHost() {
+		for _, c := range containers {
+			if c.Labels["teploy.process"] != "web" || c.Labels["teploy.version"] == target {
+				continue
+			}
+			if err := dk.Stop(ctx, c.Name, 10); err != nil {
+				return fmt.Errorf("stopping current host-ingress container %s to free its fixed port: %w", c.Name, err)
+			}
+			fmt.Fprintf(out, "Freed the fixed port from %s\n", c.Name)
+			displacedHostWeb = append(displacedHostWeb, c.Name)
+		}
+	}
+
 	var started []string
 	var targetWeb []docker.Container
 	for _, c := range containers {
@@ -182,6 +221,17 @@ func Rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg Rollbac
 			// Stop what we started and bail.
 			for _, name := range started {
 				dk.Stop(ctx, name, 5)
+			}
+			// Under host ingress the current version was stopped to free the
+			// fixed port. Put it back, or a failed rollback leaves the app down
+			// rather than where it started. Best-effort: there is nothing better
+			// to do if this also fails, and the original error is the useful one.
+			for _, name := range displacedHostWeb {
+				if rerr := dk.Restart(ctx, name, nil); rerr != nil {
+					fmt.Fprintf(out, "  WARNING: could not restore %s after the failed rollback: %v\n", name, rerr)
+				} else {
+					fmt.Fprintf(out, "  Restored %s\n", name)
+				}
 			}
 			return fmt.Errorf("health check failed on target version: %w", err)
 		}
