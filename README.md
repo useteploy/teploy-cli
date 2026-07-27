@@ -240,10 +240,23 @@ assets:
 
 notifications:
   webhook: https://hooks.slack.com/services/xxx
+  # Sign webhook deliveries so the receiver can tell a real one from anyone who
+  # learned the URL. Sent as:
+  #   X-Teploy-Timestamp: <unix seconds>
+  #   X-Teploy-Signature: sha256=hex(HMAC-SHA256(secret, timestamp + "." + body))
+  # Identical to teploy-observe's scheme, so one verifier handles both. Signing
+  # the timestamp with the body lets a receiver bound replay. Applies to
+  # type: webhook only — Slack and ntfy never check these headers.
+  #
+  # Prefer `export TEPLOY_WEBHOOK_SECRET=...` over setting it here: teploy.yml
+  # is committed, and a signing secret in version control is not a secret. The
+  # config field below wins if both are set; neither means unsigned, as before.
+  # secret: ""
   # Or multiple channels with per-event filters. type: ntfy posts
   # push-notification-shaped messages to an ntfy topic — pair it with the
   # self-hosted ntfy accessory above (http://<app>-ntfy/<topic> from other
   # containers, or your public ntfy.sh topic) for deploy alerts on your phone.
+  # A channel without its own `secret` inherits the one above.
   # channels:
   #   - type: ntfy
   #     url: https://ntfy.sh/my-deploys
@@ -361,6 +374,16 @@ backup never triggers a prune. Both `backup create` and scheduled cron backups
 alert on failure via the app's `notifications` config — `create` uses all
 channels; the headless cron job posts to the first **webhook** channel (SMTP and
 other channels need the CLI, which isn't on the server).
+
+`backup schedule` uploads a small alert script to
+`/deployments/<app>/backup-alert.sh` (mode 0700) and points cron at it, rather
+than inlining a `curl` in the crontab line. That is what lets the alert be
+signed: the signature covers a timestamp, `date +%s` contains a `%`, and crontab
+treats `%` as a newline escape. If a signing secret is configured (see
+`notifications.secret` / `TEPLOY_WEBHOOK_SECRET`) the alert carries the same
+`X-Teploy-Signature` headers as every other delivery; otherwise it goes
+unsigned, and `backup schedule` says so on its output so a verifying receiver
+rejecting it doesn't look like a wrong secret.
 
 ### Managed secrets (OpenBao provider)
 

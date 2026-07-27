@@ -94,19 +94,23 @@ func runRollback(flags *Flags, toHash string) error {
 		Ingress:     appCfg.Ingress,
 	})
 
-	// Fire notification (best-effort).
-	if notifier := notify.NewNotifier(appCfg.Notifications.Webhook); notifier != nil {
+	// Fire notification (best-effort). buildNotifier, not NewNotifier: this path
+	// used to read only the legacy `notifications.webhook` key, so an install
+	// configured with `notifications.channels` received deploy events (which go
+	// through buildNotifier) but never rollback events — the one event you most
+	// want to hear about.
+	if notifier := buildNotifier(appCfg); notifier != nil {
 		msg := fmt.Sprintf("Rolled back %s", appCfg.App)
 		if rollbackErr != nil {
 			msg = fmt.Sprintf("Rollback failed for %s: %s", appCfg.App, rollbackErr)
 		}
-		if nErr := notifier.Send(ctx, notify.Payload{
+		for _, nErr := range notifier.Send(ctx, notify.Payload{
 			App:     appCfg.App,
 			Server:  executor.Host(),
 			Type:    "rollback",
 			Success: rollbackErr == nil,
 			Message: msg,
-		}); nErr != nil {
+		}) {
 			fmt.Fprintf(os.Stderr, "Warning: notification failed: %v\n", nErr)
 		}
 	}

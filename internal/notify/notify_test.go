@@ -10,7 +10,7 @@ import (
 )
 
 func TestNewNotifier_EmptyURL(t *testing.T) {
-	n := NewNotifier("")
+	n := NewNotifier("", "")
 	if n != nil {
 		t.Error("expected nil notifier for empty URL")
 	}
@@ -36,7 +36,7 @@ func TestSend_Success(t *testing.T) {
 	}))
 	defer server.Close()
 
-	n := NewNotifier(server.URL)
+	n := NewNotifier(server.URL, "")
 	err := n.Send(context.Background(), Payload{
 		App:        "myapp",
 		Server:     "1.2.3.4",
@@ -77,7 +77,7 @@ func TestSend_DefaultTimestamp(t *testing.T) {
 	}))
 	defer server.Close()
 
-	n := NewNotifier(server.URL)
+	n := NewNotifier(server.URL, "")
 	n.Send(context.Background(), Payload{App: "myapp", Type: "deploy"})
 
 	if received.Timestamp == "" {
@@ -91,7 +91,7 @@ func TestSend_ServerError(t *testing.T) {
 	}))
 	defer server.Close()
 
-	n := NewNotifier(server.URL)
+	n := NewNotifier(server.URL, "")
 	err := n.Send(context.Background(), Payload{App: "myapp", Type: "deploy"})
 	if err == nil {
 		t.Fatal("expected error for 500 response")
@@ -99,7 +99,7 @@ func TestSend_ServerError(t *testing.T) {
 }
 
 func TestSend_UnreachableServer(t *testing.T) {
-	n := NewNotifier("http://127.0.0.1:1") // port 1 is never listening
+	n := NewNotifier("http://127.0.0.1:1", "") // port 1 is never listening
 	err := n.Send(context.Background(), Payload{App: "myapp", Type: "deploy"})
 	if err == nil {
 		t.Fatal("expected error for unreachable server")
@@ -116,7 +116,7 @@ func TestSend_FailurePayload(t *testing.T) {
 	}))
 	defer server.Close()
 
-	n := NewNotifier(server.URL)
+	n := NewNotifier(server.URL, "")
 	n.Send(context.Background(), Payload{
 		App:     "myapp",
 		Type:    "health_failure",

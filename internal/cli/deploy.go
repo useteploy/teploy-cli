@@ -904,8 +904,9 @@ func buildNotifier(appCfg *config.AppConfig) *notify.MultiNotifier {
 	// Legacy single-webhook format.
 	if appCfg.Notifications.Webhook != "" {
 		channels = append(channels, notify.Channel{
-			Type: "webhook",
-			URL:  appCfg.Notifications.Webhook,
+			Type:   "webhook",
+			URL:    appCfg.Notifications.Webhook,
+			Secret: appCfg.Notifications.SigningSecret(),
 		})
 	}
 
@@ -916,6 +917,7 @@ func buildNotifier(appCfg *config.AppConfig) *notify.MultiNotifier {
 			URL:    ch.URL,
 			To:     ch.To,
 			Events: ch.Events,
+			Secret: appCfg.Notifications.ChannelSigningSecret(ch),
 		})
 	}
 

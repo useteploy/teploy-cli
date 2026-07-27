@@ -170,13 +170,50 @@ type NotificationChannelConfig struct {
 	URL    string   `yaml:"url,omitempty" toml:"url"`
 	To     string   `yaml:"to,omitempty" toml:"to"`
 	Events []string `yaml:"events,omitempty" toml:"events"`
+	// Secret signs deliveries so the receiver can verify they came from this
+	// install rather than anyone who learned the URL. Applies to type
+	// "webhook" only. Falls back to Notifications.Secret when unset, so an
+	// install with one receiver configures the secret once.
+	Secret string `yaml:"secret,omitempty" toml:"secret"`
 }
 
 // NotificationsConfig holds notification settings.
 // Supports both simple (single webhook) and multi-channel formats.
 type NotificationsConfig struct {
-	Webhook  string                      `yaml:"webhook,omitempty" toml:"webhook"`
+	Webhook string `yaml:"webhook,omitempty" toml:"webhook"`
+	// Secret is the default signing secret for webhook channels, and the
+	// secret for the simple single-webhook form above. Prefer leaving it unset
+	// and exporting WebhookSecretEnv — see SigningSecret.
+	Secret   string                      `yaml:"secret,omitempty" toml:"secret"`
 	Channels []NotificationChannelConfig `yaml:"channels,omitempty" toml:"channels"`
+}
+
+// WebhookSecretEnv is the environment variable consulted when no signing secret
+// is set in config. Credentials in this CLI come from the environment rather
+// than the config file (the same choice as TEPLOY_AGE_IDENTITY /
+// SOPS_AGE_KEY_FILE), because teploy.yml is committed and a signing secret in
+// version control is not a secret.
+const WebhookSecretEnv = "TEPLOY_WEBHOOK_SECRET"
+
+// SigningSecret resolves the secret used to sign webhook deliveries: the
+// configured value if present, otherwise WebhookSecretEnv. Returns "" when
+// neither is set, which sends unsigned — the behavior of every install that
+// has not opted in.
+func (n NotificationsConfig) SigningSecret() string {
+	if n.Secret != "" {
+		return n.Secret
+	}
+	return os.Getenv(WebhookSecretEnv)
+}
+
+// ChannelSigningSecret resolves the secret for one channel: its own value, else
+// whatever SigningSecret resolves to. One receiver therefore needs the secret
+// configured once, not repeated per channel.
+func (n NotificationsConfig) ChannelSigningSecret(ch NotificationChannelConfig) string {
+	if ch.Secret != "" {
+		return ch.Secret
+	}
+	return n.SigningSecret()
 }
 
 // AssetsConfig holds asset bridging settings for zero-downtime static asset serving.
@@ -963,6 +1000,9 @@ func mergeConfigs(base, overlay *AppConfig) {
 	}
 	if overlay.Notifications.Webhook != "" {
 		base.Notifications.Webhook = overlay.Notifications.Webhook
+	}
+	if overlay.Notifications.Secret != "" {
+		base.Notifications.Secret = overlay.Notifications.Secret
 	}
 	if len(overlay.Notifications.Channels) > 0 {
 		base.Notifications.Channels = overlay.Notifications.Channels
