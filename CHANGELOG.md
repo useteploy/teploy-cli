@@ -4,6 +4,27 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [0.1.25] - 2026-07-27
+
+### Fixed
+- `teploy rollback` moved a `ingress: host` app to a random ephemeral port. The
+  host port is fixed by config, so every version shares it and the current
+  version's port always equals the target's — avoiding it made the recreate
+  reallocate on *every* rollback rather than only on a genuine collision. A
+  rollback that was supposed to restore service was what broke it. The fixed port
+  is now preserved, and freed the way `deploy` already does it: the current web
+  containers stop before the target starts, because two containers cannot bind
+  one fixed port. That ordering was the other half of the bug — rollback used
+  blue/green order and only appeared to work because the port was being
+  reallocated. A failed health check now restores the containers it displaced,
+  so a failed rollback leaves the app where it started rather than down.
+- Redeploying a version that `rollback` left stopped failed with docker's raw
+  "name is already in use". Rollback deliberately keeps superseded containers, so
+  the ordinary roll-back-then-fix-forward sequence hit this every time. A stopped
+  container holding the name is now removed and the run retried once; a running
+  one is refused with a clear message, since that means the exact version is
+  already live.
+
 ## [0.1.24] - 2026-07-26
 
 ### Added
