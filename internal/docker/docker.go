@@ -204,12 +204,43 @@ func (c *Client) Run(ctx context.Context, cfg RunConfig) (string, error) {
 		args = append(args, cfg.Cmd)
 	}
 
-	output, err := c.exec.Run(ctx, strings.Join(args, " "))
+	cmd := strings.Join(args, " ")
+	output, err := c.exec.Run(ctx, cmd)
+	if err != nil && nameAlreadyInUse(output, err) {
+		// A container already holds this exact name. That happens routinely after
+		// a rollback: rollback stops the superseded version's containers but
+		// deliberately keeps them, so redeploying that same version — the normal
+		// "roll back, fix forward, deploy again" sequence — failed with docker's
+		// raw "name is already in use" and left the operator to clean up by hand.
+		//
+		// Handled reactively rather than with a pre-flight inspect so the normal
+		// path costs nothing: this only runs when docker has actually complained.
+		// A STOPPED container is dead weight and is removed, then the run is
+		// retried once. A RUNNING one is refused — that means this exact version
+		// is already live, and tearing it down mid-deploy to replace it with
+		// itself is not something to do silently.
+		if clearErr := c.clearStoppedContainer(ctx, name); clearErr != nil {
+			return "", clearErr
+		}
+		output, err = c.exec.Run(ctx, cmd)
+	}
 	if err != nil {
 		return "", fmt.Errorf("starting container %s: %w", name, err)
 	}
 
 	return strings.TrimSpace(output), nil
+}
+
+// nameAlreadyInUse reports whether a failed `docker run` failed specifically
+// because the container name is taken. Matched on the message because that is
+// all docker gives us over a shell; deliberately narrow, so any other failure
+// falls through untouched rather than triggering a removal.
+func nameAlreadyInUse(output string, err error) bool {
+	haystack := strings.ToLower(output)
+	if err != nil {
+		haystack += " " + strings.ToLower(err.Error())
+	}
+	return strings.Contains(haystack, "already in use")
 }
 
 // Stop stops a container by name. Sends SIGTERM, then SIGKILL after timeout seconds.
@@ -875,4 +906,33 @@ func sortedKeys(m map[string]string) []string {
 	}
 	sort.Strings(keys)
 	return keys
+}
+
+// clearStoppedContainer removes a container occupying name when it is stopped,
+// and refuses when it is running.
+//
+// Named separately from Run so the distinction is testable: "there is nothing
+// there", "there is a corpse — clear it", and "there is a live workload — stop"
+// are three different answers, and the third must never be silently treated as
+// the second.
+func (c *Client) clearStoppedContainer(ctx context.Context, name string) error {
+	out, err := c.exec.Run(ctx, "docker inspect -f '{{.State.Running}}' "+ssh.ShellQuote(name))
+	if err != nil {
+		// No such container — the common case, and nothing to do.
+		return nil
+	}
+	switch strings.TrimSpace(out) {
+	case "true":
+		return fmt.Errorf("container %s is already running — this exact version is live; "+
+			"stop it first, or deploy a different version", name)
+	case "false":
+		if _, err := c.exec.Run(ctx, "docker rm "+ssh.ShellQuote(name)); err != nil {
+			return fmt.Errorf("removing the stopped container occupying the name %s: %w", name, err)
+		}
+		return nil
+	default:
+		// Inspect returned something unexpected. Leave it alone and let
+		// `docker run` produce its own error rather than removing on a guess.
+		return nil
+	}
 }
