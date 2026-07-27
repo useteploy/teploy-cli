@@ -4,6 +4,38 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [0.1.24] - 2026-07-26
+
+### Added
+- Webhook deliveries are now signed. Each carries
+  `X-Teploy-Timestamp` and
+  `X-Teploy-Signature: sha256=hex(HMAC-SHA256(secret, timestamp + "." + body))`,
+  byte-identical to teploy-observe's and teploy-dash's scheme, so a receiver of
+  all three writes one verifier. Signing the timestamp together with the body is
+  what lets a receiver bound replay. Configure via `notifications.secret` or,
+  preferably, `TEPLOY_WEBHOOK_SECRET` — `teploy.yml` is committed, and a signing
+  secret in version control is not a secret. An unset secret sends unsigned,
+  exactly as before.
+- `backup schedule` reports whether its failure alert will be signed, so a
+  verifying receiver rejecting an unsigned alert doesn't look like a wrong
+  secret.
+
+### Fixed
+- `rollback` and `stop`/`start`/`restart` read only the legacy
+  `notifications.webhook` key while `deploy`/`backup`/`preview` went through the
+  multi-channel notifier. An install configured entirely with
+  `notifications.channels` therefore received deploy events and silently never
+  received a rollback — the one event you most want to hear about. All paths now
+  use the same notifier, and event filters still apply, so this does not widen
+  what existing channels receive.
+- Scheduled-backup failure alerts were the one delivery path that could not be
+  signed: the signature covers a timestamp, `date +%s` contains a `%`, and
+  crontab treats `%` as a newline escape. The alert now lives in a script at
+  `/deployments/<app>/backup-alert.sh` (mode 0700) that cron invokes, where `%`
+  has no special meaning. Falls back to an unsigned delivery if `openssl` is
+  absent, because a delivery that arrives and is rejected tells you something
+  and silence tells you nothing.
+
 ## [0.1.23] - 2026-07-24
 
 ### Added
