@@ -55,10 +55,14 @@ jobs:
           docker push "$TAG"
           echo "TAG=$TAG" >> "$GITHUB_ENV"
 
-      # 2. Install the teploy CLI.
+      # 2. Install the teploy CLI, verifying the release checksum first.
       - name: Install teploy
         run: |
-          curl -fsSL https://github.com/useteploy/teploy-cli/releases/latest/download/teploy_linux_amd64.tar.gz | tar xz
+          curl -fsSLO https://github.com/useteploy/teploy-cli/releases/latest/download/teploy_linux_amd64.tar.gz
+          curl -fsSLO https://github.com/useteploy/teploy-cli/releases/latest/download/checksums.txt
+          grep " teploy_linux_amd64.tar.gz\$" checksums.txt > checksum.txt
+          sha256sum -c checksum.txt
+          tar xzf teploy_linux_amd64.tar.gz
           sudo mv teploy /usr/local/bin/
 
       # 3. Deploy over SSH (zero-downtime). teploy.yml supplies app config.

@@ -76,7 +76,7 @@ func (s3 S3Config) AWS(args string) string {
 	if s3.SecretKey != "" {
 		b.WriteString("AWS_SECRET_ACCESS_KEY=" + ssh.ShellQuote(s3.SecretKey) + " ")
 	}
-	b.WriteString("aws " + args + " --region " + s3.Region)
+	b.WriteString("aws " + args + " --region " + ssh.ShellQuote(s3.Region))
 	if s3.Endpoint != "" {
 		b.WriteString(" --endpoint-url " + ssh.ShellQuote(s3.Endpoint))
 	}
@@ -110,7 +110,8 @@ func (c *Client) BackupVolumes(ctx context.Context, app string, s3 S3Config) err
 	fmt.Fprintf(c.out, "Archiving volumes for %s...\n", app)
 	cmd := fmt.Sprintf(
 		"tar -czf %s -C %s . %s 2>/dev/null || tar -czf %s -C %s .",
-		archivePath, volumesDir, envFile, archivePath, volumesDir,
+		ssh.ShellQuote(archivePath), ssh.ShellQuote(volumesDir), ssh.ShellQuote(envFile),
+		ssh.ShellQuote(archivePath), ssh.ShellQuote(volumesDir),
 	)
 	if _, err := c.exec.Run(ctx, cmd); err != nil {
 		return fmt.Errorf("creating archive: %w", err)
@@ -118,13 +119,13 @@ func (c *Client) BackupVolumes(ctx context.Context, app string, s3 S3Config) err
 
 	// Upload to S3.
 	fmt.Fprintf(c.out, "Uploading to %s...\n", s3Key)
-	uploadCmd := s3.AWS(fmt.Sprintf("s3 cp %s %s", archivePath, s3Key))
+	uploadCmd := s3.AWS(fmt.Sprintf("s3 cp %s %s", ssh.ShellQuote(archivePath), ssh.ShellQuote(s3Key)))
 	if _, err := c.exec.Run(ctx, uploadCmd); err != nil {
 		return fmt.Errorf("uploading to S3: %w", err)
 	}
 
 	// Clean up local archive.
-	c.exec.Run(ctx, "rm -f "+archivePath)
+	c.exec.Run(ctx, "rm -f "+ssh.ShellQuote(archivePath))
 	fmt.Fprintf(c.out, "Backup complete: %s\n", s3Key)
 	return nil
 }
@@ -138,19 +139,60 @@ func (c *Client) RestoreVolumes(ctx context.Context, app, date string, s3 S3Conf
 	volumesDir := fmt.Sprintf("%s/%s/volumes", deploymentsDir, app)
 	s3Key := fmt.Sprintf("s3://%s/%s/volumes/%s.tar.gz", s3.Bucket, app, date)
 	archivePath := fmt.Sprintf("/tmp/%s-volumes-restore.tar.gz", app)
+	stageDir := fmt.Sprintf("/tmp/%s-volumes-restore-stage", app)
 
 	fmt.Fprintf(c.out, "Downloading %s...\n", s3Key)
-	if _, err := c.exec.Run(ctx, s3.AWS(fmt.Sprintf("s3 cp %s %s", s3Key, archivePath))); err != nil {
+	if _, err := c.exec.Run(ctx, s3.AWS(fmt.Sprintf("s3 cp %s %s", ssh.ShellQuote(s3Key), ssh.ShellQuote(archivePath)))); err != nil {
 		return fmt.Errorf("downloading from S3: %w", err)
 	}
 
-	fmt.Fprintf(c.out, "Restoring to %s...\n", volumesDir)
-	if _, err := c.exec.Run(ctx, fmt.Sprintf("mkdir -p %s && tar -xzf %s -C %s", volumesDir, archivePath, volumesDir)); err != nil {
-		return fmt.Errorf("extracting archive: %w", err)
+	if err := extractToStagingThenPromote(ctx, c.exec, archivePath, stageDir, volumesDir, c.out); err != nil {
+		return err
+	}
+	fmt.Fprintln(c.out, "Restore complete")
+	return nil
+}
+
+// extractToStagingThenPromote extracts archivePath into a fresh, isolated
+// staging directory (wiped first, in case a prior interrupted restore left it
+// behind), and only replaces liveDir's contents once that extraction
+// succeeds. A truncated, corrupt, or otherwise malformed archive therefore
+// fails without ever touching the live directory — previously `tar -xzf`
+// extracted directly into it, so a failure partway through could leave a
+// half-old/half-new mix of files with no way to tell which is which.
+//
+// This does not make restore fully atomic or safe against every hostile
+// archive: extraction still runs the remote host's own `tar`, so a symlink
+// planted early in the archive can still be written through by a later entry
+// in the SAME tar invocation, before staging can intervene — that class of
+// attack needs either a remote validation helper or downloading the archive
+// locally and inspecting entries with Go's archive/tar before ever invoking
+// a shell tar. What this DOES close is the truncated/corrupt-archive case and
+// the "partially overwrites a live, in-use directory" failure mode.
+func extractToStagingThenPromote(ctx context.Context, exec ssh.Executor, archivePath, stageDir, liveDir string, out io.Writer) error {
+	cleanup := func() {
+		exec.Run(context.WithoutCancel(ctx), "rm -rf "+ssh.ShellQuote(stageDir)+" "+ssh.ShellQuote(archivePath))
 	}
 
-	c.exec.Run(ctx, "rm -f "+archivePath)
-	fmt.Fprintln(c.out, "Restore complete")
+	fmt.Fprintln(out, "Extracting to staging area...")
+	extractCmd := fmt.Sprintf("rm -rf %s && mkdir -p %s && tar -xzf %s -C %s",
+		ssh.ShellQuote(stageDir), ssh.ShellQuote(stageDir), ssh.ShellQuote(archivePath), ssh.ShellQuote(stageDir))
+	if _, err := exec.Run(ctx, extractCmd); err != nil {
+		cleanup()
+		return fmt.Errorf("extracting archive to staging (live directory untouched): %w", err)
+	}
+
+	fmt.Fprintf(out, "Restoring to %s...\n", liveDir)
+	// find -mindepth 1 -delete clears liveDir's contents without removing
+	// liveDir itself, which matters when it's a docker bind-mount target.
+	promoteCmd := fmt.Sprintf("mkdir -p %s && find %s -mindepth 1 -delete && cp -a %s/. %s/",
+		ssh.ShellQuote(liveDir), ssh.ShellQuote(liveDir), ssh.ShellQuote(stageDir), ssh.ShellQuote(liveDir))
+	if _, err := exec.Run(ctx, promoteCmd); err != nil {
+		cleanup()
+		return fmt.Errorf("promoting staged restore into %s: %w", liveDir, err)
+	}
+
+	cleanup()
 	return nil
 }
 
@@ -161,7 +203,7 @@ func (c *Client) ListBackups(ctx context.Context, app, prefix string, s3 S3Confi
 	}
 
 	s3Path := fmt.Sprintf("s3://%s/%s/%s/", s3.Bucket, app, prefix)
-	output, err := c.exec.Run(ctx, s3.AWS(fmt.Sprintf("s3 ls %s", s3Path)))
+	output, err := c.exec.Run(ctx, s3.AWS(fmt.Sprintf("s3 ls %s", ssh.ShellQuote(s3Path))))
 	if err != nil {
 		return nil, fmt.Errorf("listing backups: %w", err)
 	}
@@ -185,6 +227,7 @@ func (c *Client) AccessoryBackup(ctx context.Context, app, name, image string, e
 
 	timestamp := time.Now().UTC().Format("20060102-150405")
 	containerName := app + "-" + name
+	qContainer := ssh.ShellQuote(containerName)
 	dumpPath := fmt.Sprintf("/tmp/%s-%s-%s.sql.gz", app, name, timestamp)
 	s3Key := fmt.Sprintf("s3://%s/%s/accessories/%s/%s.sql.gz", s3.Bucket, app, name, timestamp)
 
@@ -203,19 +246,20 @@ func (c *Client) AccessoryBackup(ctx context.Context, app, name, image string, e
 	case isDBType(image, "postgres"):
 		db, user := postgresDBAndUser(app, env)
 		dumpCmd = fmt.Sprintf("docker exec %s pg_dump -U %s %s > %s && gzip -c %s > %s && rm -f %s",
-			containerName, ssh.ShellQuote(user), ssh.ShellQuote(db), dumpTmp, dumpTmp, dumpPath, dumpTmp)
+			qContainer, ssh.ShellQuote(user), ssh.ShellQuote(db), ssh.ShellQuote(dumpTmp), ssh.ShellQuote(dumpTmp), ssh.ShellQuote(dumpPath), ssh.ShellQuote(dumpTmp))
 	case isDBType(image, "mysql"), isDBType(image, "mariadb"):
 		db := mysqlDB(app, env)
 		dumpCmd = fmt.Sprintf("docker exec %s mysqldump -u root %s > %s && gzip -c %s > %s && rm -f %s",
-			containerName, ssh.ShellQuote(db), dumpTmp, dumpTmp, dumpPath, dumpTmp)
+			qContainer, ssh.ShellQuote(db), ssh.ShellQuote(dumpTmp), ssh.ShellQuote(dumpTmp), ssh.ShellQuote(dumpPath), ssh.ShellQuote(dumpTmp))
 	case isDBType(image, "mongo"):
-		dumpCmd = fmt.Sprintf("docker exec %s mongodump --archive --gzip > %s", containerName, dumpPath)
+		dumpCmd = fmt.Sprintf("docker exec %s mongodump --archive --gzip > %s", qContainer, ssh.ShellQuote(dumpPath))
 		s3Key = fmt.Sprintf("s3://%s/%s/accessories/%s/%s.archive.gz", s3.Bucket, app, name, timestamp)
 	case isDBType(image, "redis"):
 		// Redis: trigger bgsave then copy dump.rdb.
+		redisTmp := fmt.Sprintf("/tmp/%s-redis.rdb", app)
 		dumpCmd = fmt.Sprintf(
-			"docker exec %s redis-cli bgsave && sleep 2 && docker cp %s:/data/dump.rdb /tmp/%s-redis.rdb && gzip -c /tmp/%s-redis.rdb > %s && rm -f /tmp/%s-redis.rdb",
-			containerName, containerName, app, app, dumpPath, app,
+			"docker exec %s redis-cli bgsave && sleep 2 && docker cp %s:/data/dump.rdb %s && gzip -c %s > %s && rm -f %s",
+			qContainer, qContainer, ssh.ShellQuote(redisTmp), ssh.ShellQuote(redisTmp), ssh.ShellQuote(dumpPath), ssh.ShellQuote(redisTmp),
 		)
 		s3Key = fmt.Sprintf("s3://%s/%s/accessories/%s/%s.rdb.gz", s3.Bucket, app, name, timestamp)
 	default:
@@ -229,7 +273,7 @@ func (c *Client) AccessoryBackup(ctx context.Context, app, name, image string, e
 		// correctness gate: it boots the archive in a scratch container.
 		accDir := fmt.Sprintf("%s/%s/accessories/%s", deploymentsDir, app, name)
 		dumpPath = fmt.Sprintf("/tmp/%s-%s-%s.tar.gz", app, name, timestamp)
-		dumpCmd = fmt.Sprintf("tar -czf %s -C %s . || [ $? -eq 1 ]", dumpPath, accDir)
+		dumpCmd = fmt.Sprintf("tar -czf %s -C %s . || [ $? -eq 1 ]", ssh.ShellQuote(dumpPath), ssh.ShellQuote(accDir))
 		s3Key = fmt.Sprintf("s3://%s/%s/accessories/%s/%s.tar.gz", s3.Bucket, app, name, timestamp)
 	}
 
@@ -239,17 +283,17 @@ func (c *Client) AccessoryBackup(ctx context.Context, app, name, image string, e
 		// intermediate) in /tmp — found live as a 200 MB orphan after a
 		// mid-tar failure. Never leave partial backups around: they're
 		// disk-fillers at best, restore-bait at worst.
-		c.exec.Run(context.WithoutCancel(ctx), fmt.Sprintf("rm -f %s %s", dumpPath, dumpTmp))
+		c.exec.Run(context.WithoutCancel(ctx), fmt.Sprintf("rm -f %s %s", ssh.ShellQuote(dumpPath), ssh.ShellQuote(dumpTmp)))
 		return fmt.Errorf("dumping %s: %w", name, err)
 	}
 
 	fmt.Fprintf(c.out, "Uploading to %s...\n", s3Key)
-	if _, err := c.exec.Run(ctx, s3.AWS(fmt.Sprintf("s3 cp %s %s", dumpPath, s3Key))); err != nil {
-		c.exec.Run(context.WithoutCancel(ctx), "rm -f "+dumpPath)
+	if _, err := c.exec.Run(ctx, s3.AWS(fmt.Sprintf("s3 cp %s %s", ssh.ShellQuote(dumpPath), ssh.ShellQuote(s3Key)))); err != nil {
+		c.exec.Run(context.WithoutCancel(ctx), "rm -f "+ssh.ShellQuote(dumpPath))
 		return fmt.Errorf("uploading to S3: %w", err)
 	}
 
-	c.exec.Run(ctx, "rm -f "+dumpPath)
+	c.exec.Run(ctx, "rm -f "+ssh.ShellQuote(dumpPath))
 	fmt.Fprintf(c.out, "Backup complete: %s\n", s3Key)
 	return nil
 }
@@ -261,9 +305,12 @@ func (c *Client) AccessoryRestore(ctx context.Context, app, name, image, date st
 	}
 
 	containerName := app + "-" + name
+	qContainer := ssh.ShellQuote(containerName)
 
-	// Determine file type and restore command based on DB type.
-	var s3Key, restorePath, restoreCmd string
+	// Determine file type and restore command based on DB type. The generic
+	// (tar) branch leaves restoreCmd empty and instead sets accDir, since it
+	// goes through the staging helper below rather than a single shell command.
+	var s3Key, restorePath, restoreCmd, accDir string
 
 	switch {
 	case isDBType(image, "postgres"):
@@ -271,17 +318,17 @@ func (c *Client) AccessoryRestore(ctx context.Context, app, name, image, date st
 		s3Key = fmt.Sprintf("s3://%s/%s/accessories/%s/%s.sql.gz", s3.Bucket, app, name, date)
 		restorePath = "/tmp/restore.sql.gz"
 		restoreCmd = fmt.Sprintf("gunzip -c %s | docker exec -i %s psql -U %s %s",
-			restorePath, containerName, ssh.ShellQuote(user), ssh.ShellQuote(db))
+			ssh.ShellQuote(restorePath), qContainer, ssh.ShellQuote(user), ssh.ShellQuote(db))
 	case isDBType(image, "mysql"), isDBType(image, "mariadb"):
 		db := mysqlDB(app, env)
 		s3Key = fmt.Sprintf("s3://%s/%s/accessories/%s/%s.sql.gz", s3.Bucket, app, name, date)
 		restorePath = "/tmp/restore.sql.gz"
 		restoreCmd = fmt.Sprintf("gunzip -c %s | docker exec -i %s mysql -u root %s",
-			restorePath, containerName, ssh.ShellQuote(db))
+			ssh.ShellQuote(restorePath), qContainer, ssh.ShellQuote(db))
 	case isDBType(image, "mongo"):
 		s3Key = fmt.Sprintf("s3://%s/%s/accessories/%s/%s.archive.gz", s3.Bucket, app, name, date)
 		restorePath = "/tmp/restore.archive.gz"
-		restoreCmd = fmt.Sprintf("cat %s | docker exec -i %s mongorestore --archive --gzip --drop", restorePath, containerName)
+		restoreCmd = fmt.Sprintf("cat %s | docker exec -i %s mongorestore --archive --gzip --drop", ssh.ShellQuote(restorePath), qContainer)
 	case isDBType(image, "redis"):
 		// AccessoryBackup stores redis as <date>.rdb.gz; without this case the
 		// default branch looked for a .tar.gz that doesn't exist, so redis
@@ -291,27 +338,34 @@ func (c *Client) AccessoryRestore(ctx context.Context, app, name, image, date st
 		restorePath = "/tmp/restore.rdb.gz"
 		restoreCmd = fmt.Sprintf(
 			"gunzip -c %s > /tmp/restore.rdb && docker stop %s && docker cp /tmp/restore.rdb %s:/data/dump.rdb && docker start %s && rm -f /tmp/restore.rdb",
-			restorePath, containerName, containerName, containerName,
+			ssh.ShellQuote(restorePath), qContainer, qContainer, qContainer,
 		)
 	default:
-		// Generic: extract tar to volume directory.
+		// Generic: extract tar to accessory directory.
 		s3Key = fmt.Sprintf("s3://%s/%s/accessories/%s/%s.tar.gz", s3.Bucket, app, name, date)
 		restorePath = "/tmp/restore.tar.gz"
-		accDir := fmt.Sprintf("%s/%s/accessories/%s", deploymentsDir, app, name)
-		restoreCmd = fmt.Sprintf("tar -xzf %s -C %s", restorePath, accDir)
+		accDir = fmt.Sprintf("%s/%s/accessories/%s", deploymentsDir, app, name)
 	}
 
 	fmt.Fprintf(c.out, "Downloading %s...\n", s3Key)
-	if _, err := c.exec.Run(ctx, s3.AWS(fmt.Sprintf("s3 cp %s %s", s3Key, restorePath))); err != nil {
+	if _, err := c.exec.Run(ctx, s3.AWS(fmt.Sprintf("s3 cp %s %s", ssh.ShellQuote(s3Key), ssh.ShellQuote(restorePath)))); err != nil {
 		return fmt.Errorf("downloading backup: %w", err)
 	}
 
 	fmt.Fprintf(c.out, "Restoring %s...\n", name)
+	if accDir != "" {
+		stageDir := fmt.Sprintf("/tmp/%s-%s-restore-stage", app, name)
+		if err := extractToStagingThenPromote(ctx, c.exec, restorePath, stageDir, accDir, c.out); err != nil {
+			return fmt.Errorf("restoring %s: %w", name, err)
+		}
+		fmt.Fprintln(c.out, "Restore complete")
+		return nil
+	}
 	if _, err := c.exec.Run(ctx, restoreCmd); err != nil {
 		return fmt.Errorf("restoring %s: %w", name, err)
 	}
 
-	c.exec.Run(ctx, "rm -f "+restorePath)
+	c.exec.Run(ctx, "rm -f "+ssh.ShellQuote(restorePath))
 	fmt.Fprintln(c.out, "Restore complete")
 	return nil
 }

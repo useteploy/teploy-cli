@@ -1153,8 +1153,8 @@ func TestDeploy_AssetBridging(t *testing.T) {
 		// 4. Find port.
 		ssh.MockCommand{Match: "ss -tln", Output: ssOutput},
 		// 5. Asset bridging: create dir + extract.
-		ssh.MockCommand{Match: "mkdir -p /deployments/myapp/assets", Output: ""},
-		ssh.MockCommand{Match: "docker run --rm --user 0 -v /deployments/myapp/assets:/bridge", Output: "ok-bridge\n"},
+		ssh.MockCommand{Match: "mkdir -p '/deployments/myapp/assets'", Output: ""},
+		ssh.MockCommand{Match: "docker run --rm --user 0 -v '/deployments/myapp/assets':/bridge", Output: "ok-bridge\n"},
 		// 6. Start container.
 		ssh.MockCommand{Match: "docker run --detach", Output: "abc123container"},
 		// 7. Verify running.
@@ -1172,7 +1172,7 @@ func TestDeploy_AssetBridging(t *testing.T) {
 		ssh.MockCommand{Match: "docker exec caddy caddy reload", Output: ""},
 		ssh.MockCommand{Match: "rmdir /deployments/caddy/.lock", Output: ""},
 		// 10. Asset cleanup.
-		ssh.MockCommand{Match: "find /deployments/myapp/assets", Output: ""},
+		ssh.MockCommand{Match: "find '/deployments/myapp/assets'", Output: ""},
 		// 11. Log and lock.
 		ssh.MockCommand{Match: "printf %s", Output: ""},
 		ssh.MockCommand{Match: "rm -rf /deployments/myapp/.lock", Output: ""},
@@ -1225,7 +1225,7 @@ func TestDeploy_AssetBridging(t *testing.T) {
 	// Verify asset cleanup was run.
 	foundCleanup := false
 	for _, call := range mock.Calls {
-		if strings.Contains(call, "find /deployments/myapp/assets") && strings.Contains(call, "-mtime +7") {
+		if strings.Contains(call, "find '/deployments/myapp/assets'") && strings.Contains(call, "-mtime +7") {
 			foundCleanup = true
 		}
 	}
@@ -1240,7 +1240,7 @@ func TestDeploy_AssetBridgingCustomKeepDays(t *testing.T) {
 		ssh.MockCommand{Match: "mkdir /deployments/myapp/.lock", Output: ""},
 		ssh.MockCommand{Match: "cat /deployments/myapp/state", Err: fmt.Errorf("no state")},
 		ssh.MockCommand{Match: "ss -tln", Output: ssOutput},
-		ssh.MockCommand{Match: "mkdir -p /deployments/myapp/assets", Output: ""},
+		ssh.MockCommand{Match: "mkdir -p '/deployments/myapp/assets'", Output: ""},
 		ssh.MockCommand{Match: "docker run --rm --user 0", Output: "ok-bridge\n"},
 		ssh.MockCommand{Match: "docker run --detach", Output: "abc123"},
 		ssh.MockCommand{Match: "docker inspect", Output: "running"},
@@ -1254,7 +1254,7 @@ func TestDeploy_AssetBridgingCustomKeepDays(t *testing.T) {
 		ssh.MockCommand{Match: "mkdir /deployments/caddy/.lock", Output: ""},
 		ssh.MockCommand{Match: "docker exec caddy caddy reload", Output: ""},
 		ssh.MockCommand{Match: "rmdir /deployments/caddy/.lock", Output: ""},
-		ssh.MockCommand{Match: "find /deployments/myapp/assets", Output: ""},
+		ssh.MockCommand{Match: "find '/deployments/myapp/assets'", Output: ""},
 		ssh.MockCommand{Match: "printf %s", Output: ""},
 		ssh.MockCommand{Match: "rm -rf /deployments/myapp/.lock", Output: ""},
 	)
@@ -1277,7 +1277,7 @@ func TestDeploy_AssetBridgingCustomKeepDays(t *testing.T) {
 
 	// Verify cleanup uses custom keep days.
 	for _, call := range mock.Calls {
-		if strings.Contains(call, "find /deployments/myapp/assets") {
+		if strings.Contains(call, "find '/deployments/myapp/assets'") {
 			if !strings.Contains(call, "-mtime +30") {
 				t.Errorf("expected -mtime +30, got: %s", call)
 			}

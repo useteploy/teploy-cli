@@ -65,7 +65,7 @@ func (c *Client) InspectAccessory(ctx context.Context, app, name string) (image 
 // arg) and the object's size in bytes.
 func (c *Client) LatestBackupDate(ctx context.Context, app, name string, s3 S3Config) (date string, size int64, err error) {
 	prefix := fmt.Sprintf("s3://%s/%s/accessories/%s/", s3.Bucket, app, name)
-	out, err := c.exec.Run(ctx, s3.AWS(fmt.Sprintf("s3 ls %s", prefix)))
+	out, err := c.exec.Run(ctx, s3.AWS(fmt.Sprintf("s3 ls %s", ssh.ShellQuote(prefix))))
 	if err != nil {
 		return "", 0, fmt.Errorf("listing backups at %s: %w", prefix, err)
 	}

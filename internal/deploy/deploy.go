@@ -195,7 +195,7 @@ func (d *Deployer) Deploy(ctx context.Context, cfg Config) error {
 	if cfg.AssetPath != "" {
 		hostAssetDir := fmt.Sprintf("/deployments/%s/assets", cfg.App)
 		fmt.Fprintln(d.out, "Bridging assets...")
-		if _, err := d.exec.Run(ctx, "mkdir -p "+hostAssetDir); err != nil {
+		if _, err := d.exec.Run(ctx, "mkdir -p "+ssh.ShellQuote(hostAssetDir)); err != nil {
 			return fmt.Errorf("creating asset bridge directory: %w", err)
 		}
 
@@ -207,9 +207,10 @@ func (d *Deployer) Deploy(ctx context.Context, cfg Config) error {
 		// the previous silent-fail mode meant an empty host volume
 		// was bind-mounted over the in-image static dir, hiding all
 		// files and serving 404 for every static asset.
+		copyCmd := fmt.Sprintf("cp -r %s/. /bridge/ && echo ok-bridge", ssh.ShellQuote(cfg.AssetPath))
 		extractCmd := fmt.Sprintf(
-			"docker run --rm --user 0 -v %s:/bridge %s sh -c 'cp -r %s/. /bridge/ && echo ok-bridge'",
-			hostAssetDir, cfg.Image, cfg.AssetPath,
+			"docker run --rm --user 0 -v %s:/bridge %s sh -c %s",
+			ssh.ShellQuote(hostAssetDir), ssh.ShellQuote(cfg.Image), ssh.ShellQuote(copyCmd),
 		)
 		out, err := d.exec.Run(ctx, extractCmd)
 		if err != nil || !strings.Contains(out, "ok-bridge") {
@@ -496,8 +497,8 @@ func (d *Deployer) Deploy(ctx context.Context, cfg Config) error {
 			keepDays = 7
 		}
 		cleanCmd := fmt.Sprintf(
-			"find /deployments/%s/assets -type f -mtime +%d -delete 2>/dev/null || true",
-			cfg.App, keepDays,
+			"find %s -type f -mtime +%d -delete 2>/dev/null || true",
+			ssh.ShellQuote(fmt.Sprintf("/deployments/%s/assets", cfg.App)), keepDays,
 		)
 		d.exec.Run(ctx, cleanCmd)
 	}

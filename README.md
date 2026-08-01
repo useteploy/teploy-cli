@@ -38,9 +38,21 @@ brew install useteploy/tap/teploy
 scoop bucket add teploy https://github.com/useteploy/scoop-bucket
 scoop install teploy
 
-# Download binary (macOS/Linux)
-curl -fsSL https://github.com/useteploy/teploy-cli/releases/latest/download/teploy_$(uname -s | tr '[:upper:]' '[:lower:]')_$(uname -m | sed 's/x86_64/amd64/').tar.gz | tar xz
-sudo mv teploy /usr/local/bin/
+# Download binary (macOS/Linux) — verifies the release SHA-256 before install
+(
+  set -e
+  os=$(uname -s | tr '[:upper:]' '[:lower:]')
+  arch=$(uname -m); case "$arch" in x86_64) arch=amd64 ;; aarch64) arch=arm64 ;; esac
+  file="teploy_${os}_${arch}.tar.gz"
+  tmp=$(mktemp -d); cd "$tmp"
+  curl -fsSLO "https://github.com/useteploy/teploy-cli/releases/latest/download/$file"
+  curl -fsSLO "https://github.com/useteploy/teploy-cli/releases/latest/download/checksums.txt"
+  grep " $file\$" checksums.txt > checksum.txt
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum -c checksum.txt || exit 1; else shasum -a 256 -c checksum.txt || exit 1; fi
+  tar xzf "$file"
+  sudo mv teploy /usr/local/bin/teploy
+  cd - >/dev/null; rm -rf "$tmp"
+)
 
 # From source
 go install github.com/useteploy/teploy/cmd/teploy@latest

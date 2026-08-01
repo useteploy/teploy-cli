@@ -463,7 +463,14 @@ func AcquireManualLock(ctx context.Context, exec ssh.Executor, app, user, messag
 		Message: message,
 		TS:      time.Now().UTC().Format(time.RFC3339),
 	})
-	return exec.Upload(ctx, bytes.NewReader(info), lockPath+"/info", "0644")
+	if err := exec.Upload(ctx, bytes.NewReader(info), lockPath+"/info", "0644"); err != nil {
+		// Lock directory was created but info file failed — release it rather
+		// than leaving an orphaned, non-expiring manual lock that blocks every
+		// future deploy until an operator notices and manually unlocks it.
+		ReleaseLock(ctx, exec, app)
+		return fmt.Errorf("writing lock info: %w", err)
+	}
+	return nil
 }
 
 // AcquireHealLock acquires a short-lived "heal" lock for an app so a heal

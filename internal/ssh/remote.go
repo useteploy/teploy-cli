@@ -68,7 +68,10 @@ func Connect(ctx context.Context, cfg ConnectConfig) (*RemoteExecutor, error) {
 
 	var hostKeyCallback ssh.HostKeyCallback
 	if cfg.AcceptNewHost {
-		home, _ := os.UserHomeDir()
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return nil, fmt.Errorf("cannot determine home directory for known_hosts (%w) — set $HOME so host-key verification can record trusted hosts", err)
+		}
 		knownHostsPath := filepath.Join(home, ".ssh", "known_hosts")
 		hostKeyCallback = acceptNewHostKeyCallback(knownHostsPath)
 	} else {
@@ -185,12 +188,20 @@ func (e *RemoteExecutor) User() string {
 	return e.user
 }
 
-// defaultHostKeyCallback returns a known_hosts-based callback, falling back
-// to accept-all only if ~/.ssh/known_hosts does not exist.
+// defaultHostKeyCallback returns a known_hosts-based callback. When
+// known_hosts doesn't exist yet it falls back to trust-on-first-use (see
+// acceptNewHostKeyCallback) rather than accepting every key.
 func defaultHostKeyCallback() (ssh.HostKeyCallback, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return ssh.InsecureIgnoreHostKey(), nil
+		// Previously fell through to ssh.InsecureIgnoreHostKey() here — silently
+		// disabling host-key verification entirely on any box where $HOME can't
+		// be resolved (some containers, CI runners, restricted shells), with no
+		// indication to the user that MITM protection was off. Fail closed: an
+		// unresolvable home directory is rare and the caller can set $HOME or
+		// pass --accept-new (which threads its own known_hosts path through
+		// Connect, so it hits the same check there, not this one).
+		return nil, fmt.Errorf("cannot determine home directory for known_hosts (%w) — set $HOME, or use --accept-new for trust-on-first-use", err)
 	}
 
 	knownHostsPath := filepath.Join(home, ".ssh", "known_hosts")
@@ -303,11 +314,22 @@ func acceptNewHostKeyCallback(knownHostsPath string) ssh.HostKeyCallback {
 			}
 			// Unknown key — fall through to accept and save.
 		}
-		// Append to known_hosts.
+		// Append to known_hosts. Ensure the parent directory exists first (a
+		// fresh box may have no ~/.ssh at all) so a merely-missing directory
+		// doesn't get treated the same as a genuine write failure below.
+		if err := os.MkdirAll(filepath.Dir(knownHostsPath), 0700); err != nil {
+			return fmt.Errorf("creating %s: %w", filepath.Dir(knownHostsPath), err)
+		}
 		line := knownhosts.Line([]string{knownhosts.Normalize(hostname)}, key)
 		f, err := os.OpenFile(knownHostsPath, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0644)
 		if err != nil {
-			return nil // accept anyway, just can't save
+			// Previously returned nil here — accepting the key anyway when it
+			// couldn't be recorded. That silently disables TOFU protection: every
+			// later connection looks like another first connection, so a key
+			// change (MITM) is never detected. Fail the connection instead; a
+			// read-only home or full disk is rare enough that failing loudly
+			// beats a permanently-unprotected connection.
+			return fmt.Errorf("recording host key in %s: %w", knownHostsPath, err)
 		}
 		defer f.Close()
 		fmt.Fprintln(f, line)

@@ -362,6 +362,29 @@ func TestAcquireManualLock(t *testing.T) {
 	}
 }
 
+func TestAcquireManualLock_UploadFailureReleasesLock(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "mkdir /deployments/myapp/.lock", Output: ""},
+		ssh.MockCommand{Match: "UPLOAD:/deployments/myapp/.lock/info", Err: fmt.Errorf("upload failed")},
+		ssh.MockCommand{Match: "rm -rf /deployments/myapp/.lock", Output: ""},
+	)
+
+	err := AcquireManualLock(context.Background(), mock, "myapp", "tyler", "deploying hotfix")
+	if err == nil {
+		t.Fatal("expected error when metadata upload fails")
+	}
+
+	foundRelease := false
+	for _, call := range mock.Calls {
+		if strings.HasPrefix(call, "rm -rf /deployments/myapp/.lock") {
+			foundRelease = true
+		}
+	}
+	if !foundRelease {
+		t.Error("expected the lock directory to be released after a failed metadata upload, leaving no orphaned lock")
+	}
+}
+
 func TestAcquireManualLock_AlreadyLocked(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "mkdir /deployments/myapp/.lock", Err: fmt.Errorf("exists")},
