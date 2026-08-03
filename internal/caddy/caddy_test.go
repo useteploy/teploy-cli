@@ -38,7 +38,7 @@ func TestSetRoute_WritesBlockAndReloads(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4", lockCmds("{\n\tadmin 127.0.0.1:2019\n}\n")...)
 
 	client := NewClient(mock)
-	if err := client.SetRoute(context.Background(), "myapp", "myapp.com", "myapp-v1", 80, TLS{}, "", Firewall{}, Access{}); err != nil {
+	if err := client.SetRoute(context.Background(), "myapp", "myapp.com", "myapp-v1", 80, TLS{}, "", nil, Firewall{}, Access{}); err != nil {
 		t.Fatalf("SetRoute: %v", err)
 	}
 
@@ -62,7 +62,7 @@ func TestSetRoute_UpdateExisting(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4", lockCmds(existing)...)
 
 	client := NewClient(mock)
-	if err := client.SetRoute(context.Background(), "myapp", "myapp.com", "myapp-v2", 3000, TLS{}, "", Firewall{}, Access{}); err != nil {
+	if err := client.SetRoute(context.Background(), "myapp", "myapp.com", "myapp-v2", 3000, TLS{}, "", nil, Firewall{}, Access{}); err != nil {
 		t.Fatalf("SetRoute: %v", err)
 	}
 
@@ -88,7 +88,7 @@ func TestSetRoute_AdoptsForeignBlock(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4", lockCmds(existing)...)
 
 	client := NewClient(mock)
-	if err := client.SetRoute(context.Background(), "myapp", "myapp.com, www.myapp.com", "myapp-v1", 80, TLS{}, "", Firewall{}, Access{}); err != nil {
+	if err := client.SetRoute(context.Background(), "myapp", "myapp.com, www.myapp.com", "myapp-v1", 80, TLS{}, "", nil, Firewall{}, Access{}); err != nil {
 		t.Fatalf("SetRoute: %v", err)
 	}
 
@@ -110,7 +110,7 @@ func TestSetRoute_AdoptsForeignBlock(t *testing.T) {
 func TestSetRoute_MultiHost(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4", lockCmds("{\n\tadmin 127.0.0.1:2019\n}\n")...)
 	client := NewClient(mock)
-	if err := client.SetRoute(context.Background(), "myapp", "myapp.com, www.myapp.com", "myapp-v1", 80, TLS{}, "", Firewall{}, Access{}); err != nil {
+	if err := client.SetRoute(context.Background(), "myapp", "myapp.com, www.myapp.com", "myapp-v1", 80, TLS{}, "", nil, Firewall{}, Access{}); err != nil {
 		t.Fatalf("SetRoute: %v", err)
 	}
 	if !strings.Contains(string(mock.Files[tmpCaddyfile]), "myapp.com, www.myapp.com {") {
@@ -131,7 +131,7 @@ func TestSetRoute_ReloadFailureRollsBack(t *testing.T) {
 	)
 
 	client := NewClient(mock)
-	err := client.SetRoute(context.Background(), "myapp", "myapp.com", "myapp-v1", 80, TLS{}, "", Firewall{}, Access{})
+	err := client.SetRoute(context.Background(), "myapp", "myapp.com", "myapp-v1", 80, TLS{}, "", nil, Firewall{}, Access{})
 	if err == nil {
 		t.Fatal("expected error on reload failure")
 	}
@@ -157,7 +157,7 @@ func TestSetRoute_StaleDeliveryFailsLoudly(t *testing.T) {
 	)
 
 	client := NewClient(mock)
-	err := client.SetRoute(context.Background(), "myapp", "myapp.com", "myapp-v1", 80, TLS{}, "", Firewall{}, Access{})
+	err := client.SetRoute(context.Background(), "myapp", "myapp.com", "myapp-v1", 80, TLS{}, "", nil, Firewall{}, Access{})
 	if err == nil {
 		t.Fatal("expected SetRoute to fail when the config did not reach the container")
 	}
@@ -173,7 +173,7 @@ func TestSetLoadBalancer(t *testing.T) {
 	mock := ssh.NewMockExecutor("10.0.0.100", lockCmds("{\n\tadmin 127.0.0.1:2019\n}\n")...)
 	client := NewClient(mock)
 	upstreams := []Upstream{{Dial: "10.0.0.1:80"}, {Dial: "10.0.0.2:80"}, {Dial: "10.0.0.3:80"}}
-	if err := client.SetLoadBalancer(context.Background(), "myapp", "myapp.com", upstreams, TLS{}, "", Firewall{}, Access{}); err != nil {
+	if err := client.SetLoadBalancer(context.Background(), "myapp", "myapp.com", upstreams, TLS{}, "", nil, Firewall{}, Access{}); err != nil {
 		t.Fatalf("SetLoadBalancer: %v", err)
 	}
 
@@ -194,7 +194,7 @@ func TestSetRoute_WithCaddyExtra(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4", lockCmds("{\n\tadmin 127.0.0.1:2019\n}\n")...)
 	client := NewClient(mock)
 	extra := "@waitlist path /api/waitlist*\nreverse_proxy @waitlist teploy-waitlist:8080"
-	if err := client.SetRoute(context.Background(), "myapp", "myapp.com", "myapp-v1", 80, TLS{}, extra, Firewall{}, Access{}); err != nil {
+	if err := client.SetRoute(context.Background(), "myapp", "myapp.com", "myapp-v1", 80, TLS{}, extra, nil, Firewall{}, Access{}); err != nil {
 		t.Fatalf("SetRoute: %v", err)
 	}
 	got := string(mock.Files[tmpCaddyfile])
@@ -215,7 +215,7 @@ func TestSetLoadBalancer_WithCaddyExtra(t *testing.T) {
 	client := NewClient(mock)
 	upstreams := []Upstream{{Dial: "10.0.0.1:80"}, {Dial: "10.0.0.2:80"}}
 	extra := "rate_limit 100r/m"
-	if err := client.SetLoadBalancer(context.Background(), "myapp", "myapp.com", upstreams, TLS{}, extra, Firewall{}, Access{}); err != nil {
+	if err := client.SetLoadBalancer(context.Background(), "myapp", "myapp.com", upstreams, TLS{}, extra, nil, Firewall{}, Access{}); err != nil {
 		t.Fatalf("SetLoadBalancer: %v", err)
 	}
 	got := string(mock.Files[tmpCaddyfile])
@@ -374,7 +374,7 @@ func TestRemoveCaddyfileBlock(t *testing.T) {
 }
 
 func TestReverseProxyBlock(t *testing.T) {
-	got := reverseProxyBlock([]string{"example.com"}, "myapp-v1", 8080, TLS{}, "", Firewall{}, Access{})
+	got := reverseProxyBlock([]string{"example.com"}, "myapp-v1", 8080, TLS{}, "", nil, Firewall{}, Access{})
 	want := "example.com {\n\treverse_proxy myapp-v1:8080\n}"
 	if got != want {
 		t.Errorf("reverseProxyBlock:\nwant: %q\ngot:  %q", want, got)
@@ -382,7 +382,7 @@ func TestReverseProxyBlock(t *testing.T) {
 }
 
 func TestReverseProxyBlockMultiHost(t *testing.T) {
-	got := reverseProxyBlock([]string{"example.com", "www.example.com"}, "myapp", 80, TLS{}, "", Firewall{}, Access{})
+	got := reverseProxyBlock([]string{"example.com", "www.example.com"}, "myapp", 80, TLS{}, "", nil, Firewall{}, Access{})
 	want := "example.com, www.example.com {\n\treverse_proxy myapp:80\n}"
 	if got != want {
 		t.Errorf("multi-host:\nwant: %q\ngot:  %q", want, got)
@@ -390,7 +390,7 @@ func TestReverseProxyBlockMultiHost(t *testing.T) {
 }
 
 func TestLoadBalancerBlock(t *testing.T) {
-	got := loadBalancerBlock([]string{"example.com"}, []Upstream{{Dial: "a:80"}, {Dial: "b:80"}}, TLS{}, "", Firewall{}, Access{})
+	got := loadBalancerBlock([]string{"example.com"}, []Upstream{{Dial: "a:80"}, {Dial: "b:80"}}, TLS{}, "", nil, Firewall{}, Access{})
 	for _, want := range []string{"example.com {", "reverse_proxy a:80 b:80 {", "lb_policy round_robin", "health_uri /up", "health_interval 10s", "health_timeout 5s"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("loadBalancerBlock missing %q\nfull:\n%s", want, got)
@@ -400,7 +400,7 @@ func TestLoadBalancerBlock(t *testing.T) {
 
 func TestReverseProxyBlock_WithTLS(t *testing.T) {
 	got := reverseProxyBlock([]string{"fylun.ai"}, "fylun-web-v1", 3000,
-		TLS{Cert: "/etc/caddy/tls/fylun-web.crt", Key: "/etc/caddy/tls/fylun-web.key"}, "", Firewall{}, Access{})
+		TLS{Cert: "/etc/caddy/tls/fylun-web.crt", Key: "/etc/caddy/tls/fylun-web.key"}, "", nil, Firewall{}, Access{})
 	want := "fylun.ai {\n\ttls /etc/caddy/tls/fylun-web.crt /etc/caddy/tls/fylun-web.key\n\treverse_proxy fylun-web-v1:3000\n}"
 	if got != want {
 		t.Errorf("reverseProxyBlock with TLS:\nwant: %q\ngot:  %q", want, got)
@@ -409,7 +409,7 @@ func TestReverseProxyBlock_WithTLS(t *testing.T) {
 
 func TestLoadBalancerBlock_WithTLS(t *testing.T) {
 	got := loadBalancerBlock([]string{"fylun.ai"}, []Upstream{{Dial: "a:3000"}, {Dial: "b:3000"}},
-		TLS{Cert: "/etc/caddy/tls/fylun-web.crt", Key: "/etc/caddy/tls/fylun-web.key"}, "", Firewall{}, Access{})
+		TLS{Cert: "/etc/caddy/tls/fylun-web.crt", Key: "/etc/caddy/tls/fylun-web.key"}, "", nil, Firewall{}, Access{})
 	if !strings.Contains(got, "\ttls /etc/caddy/tls/fylun-web.crt /etc/caddy/tls/fylun-web.key\n") {
 		t.Errorf("loadBalancerBlock with TLS missing tls directive\nfull:\n%s", got)
 	}
@@ -453,7 +453,7 @@ func TestIsPubliclyRoutable(t *testing.T) {
 // finishes). It must now get an explicit http:// scheme instead, which
 // tells Caddy not to manage TLS for that address.
 func TestReverseProxyBlock_NonPublicDomainGetsPlainHTTP(t *testing.T) {
-	got := reverseProxyBlock([]string{"192.168.1.114"}, "investment-club-v1", 3000, TLS{}, "", Firewall{}, Access{})
+	got := reverseProxyBlock([]string{"192.168.1.114"}, "investment-club-v1", 3000, TLS{}, "", nil, Firewall{}, Access{})
 	want := "http://192.168.1.114 {\n\treverse_proxy investment-club-v1:3000\n}"
 	if got != want {
 		t.Errorf("reverseProxyBlock for a bare IP:\nwant: %q\ngot:  %q", want, got)
@@ -472,7 +472,7 @@ func TestStaticBlock_NonPublicDomainGetsPlainHTTP(t *testing.T) {
 // the http:// fallback — the operator explicitly asked for HTTPS via
 // Caddy's local CA, so automatic-HTTPS avoidance would be wrong here.
 func TestReverseProxyBlock_TLSInternalKeepsRealHost(t *testing.T) {
-	got := reverseProxyBlock([]string{"192.168.1.114"}, "myapp-v1", 3000, TLS{Internal: true}, "", Firewall{}, Access{})
+	got := reverseProxyBlock([]string{"192.168.1.114"}, "myapp-v1", 3000, TLS{Internal: true}, "", nil, Firewall{}, Access{})
 	want := "192.168.1.114 {\n\ttls internal\n\treverse_proxy myapp-v1:3000\n}"
 	if got != want {
 		t.Errorf("reverseProxyBlock with tls.internal:\nwant: %q\ngot:  %q", want, got)
@@ -483,7 +483,7 @@ func TestReverseProxyBlock_TLSInternalKeepsRealHost(t *testing.T) {
 // tls.internal — must not get the http:// fallback either.
 func TestReverseProxyBlock_CustomCertKeepsRealHost(t *testing.T) {
 	got := reverseProxyBlock([]string{"192.168.1.114"}, "myapp-v1", 3000,
-		TLS{Cert: "/etc/caddy/tls/myapp.crt", Key: "/etc/caddy/tls/myapp.key"}, "", Firewall{}, Access{})
+		TLS{Cert: "/etc/caddy/tls/myapp.crt", Key: "/etc/caddy/tls/myapp.key"}, "", nil, Firewall{}, Access{})
 	if strings.HasPrefix(got, "http://") {
 		t.Errorf("a custom cert should keep the real host, not fall back to http://:\n%s", got)
 	}
@@ -557,5 +557,68 @@ func TestParseDomains(t *testing.T) {
 		if _, err := parseDomains(bad); err == nil {
 			t.Errorf("parseDomains(%q) should have rejected a Caddyfile-breaking character", bad)
 		}
+	}
+}
+
+// A container app declaring `cache:` got nothing: only StaticBlock consumed
+// opts.Cache, so reverse-proxy and load-balanced apps silently dropped every
+// rule. Observed on covely.io, which declared an immutable rule for /assets/*
+// and served its HTML, CSS and JS with no Cache-Control at all — every
+// navigation refetched the whole page.
+func TestReverseProxyBlockRendersCacheRules(t *testing.T) {
+	block := reverseProxyBlock(
+		[]string{"example.com"}, "app-v1", 3000, TLS{}, "",
+		map[string]string{"/assets/*": "public, max-age=31536000, immutable"},
+		Firewall{}, Access{},
+	)
+	if !strings.Contains(block, "@cache1 path /assets/*") {
+		t.Fatalf("cache matcher missing from reverse-proxy block:\n%s", block)
+	}
+	if !strings.Contains(block, `header @cache1 Cache-Control "public, max-age=31536000, immutable"`) {
+		t.Fatalf("Cache-Control header missing from reverse-proxy block:\n%s", block)
+	}
+}
+
+func TestLoadBalancerBlockRendersCacheRules(t *testing.T) {
+	block := loadBalancerBlock(
+		[]string{"example.com"}, []Upstream{{Dial: "app-v1:3000"}}, TLS{}, "",
+		map[string]string{"*.css": "public, max-age=600"},
+		Firewall{}, Access{},
+	)
+	if !strings.Contains(block, `header @cache1 Cache-Control "public, max-age=600"`) {
+		t.Fatalf("Cache-Control header missing from load-balancer block:\n%s", block)
+	}
+}
+
+// Go randomises map iteration, so the original inline loop emitted the rules in
+// a different order on every run. The managed block then differed between
+// deploys that changed nothing, which makes a Caddyfile diff useless for
+// spotting real drift.
+func TestCacheRulesAreDeterministic(t *testing.T) {
+	cache := map[string]string{
+		"/z/*":     "public, max-age=1",
+		"/a/*":     "public, max-age=2",
+		"/m/*":     "public, max-age=3",
+		"*.css":    "public, max-age=4",
+		"/assets/": "public, max-age=5",
+	}
+	first := renderCacheRules(cache)
+	for i := 0; i < 50; i++ {
+		if got := renderCacheRules(cache); got != first {
+			t.Fatalf("render is not stable across calls:\n%s\n---\n%s", first, got)
+		}
+	}
+	// Sorted by pattern, so the numbering follows a predictable order.
+	if !strings.Contains(first, "@cache1 path *.css") {
+		t.Fatalf("expected sorted output to start with *.css:\n%s", first)
+	}
+}
+
+func TestNoCacheRulesRendersNothing(t *testing.T) {
+	if got := renderCacheRules(nil); got != "" {
+		t.Fatalf("expected empty output for nil cache, got %q", got)
+	}
+	if got := renderCacheRules(map[string]string{}); got != "" {
+		t.Fatalf("expected empty output for empty cache, got %q", got)
 	}
 }

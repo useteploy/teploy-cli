@@ -89,6 +89,7 @@ func runRollback(flags *Flags, toHash string) error {
 		TLSKey:      tlsKey,
 		TLSInternal: tlsInternal,
 		CaddyExtra:  appCfg.CaddyExtra,
+		Cache:       appCfg.Cache,
 		Firewall:    caddyFirewall(appCfg.Firewall),
 		Access:      caddyAccess(appCfg.Access),
 		Ingress:     appCfg.Ingress,

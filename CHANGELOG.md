@@ -4,6 +4,28 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+### Fixed
+- `cache:` was silently ignored for container apps. Only `StaticBlock` consumed
+  `opts.Cache`, so a static-site deploy honoured the rules while every
+  reverse-proxied and load-balanced app dropped them — `reverseProxyBlock` and
+  `loadBalancerBlock` did not take a cache argument at all. The config parsed,
+  validated and merged cleanly, and then produced nothing in the Caddyfile.
+
+  The failure mode is the bad kind: no error, no warning, and a `teploy.yml` that
+  reads as if caching is configured. Found on a real deploy that declared
+  `"/assets/*": "public, max-age=31536000, immutable"` and was serving its HTML,
+  stylesheet and JS with no `Cache-Control`, no `ETag` and no `Last-Modified` —
+  so every navigation refetched the entire page. It presented as a slow app, and
+  the app was not slow: it rendered in ~2 ms and spent the rest on the wire.
+
+  Cache rules now render for all three block types.
+
+- Cache rules are emitted in a stable order. The original loop ranged over a Go
+  map, whose iteration order is randomised, so consecutive deploys that changed
+  nothing still produced a different managed block. That made a Caddyfile diff
+  useless for spotting genuine drift — which matters here, because a diff of that
+  file is the tool for catching exactly this class of bug.
+
 ## [0.1.25] - 2026-07-27
 
 ### Fixed

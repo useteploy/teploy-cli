@@ -77,9 +77,10 @@ type Config struct {
 	// custom cert or ACME — see config.TLSConfig.Internal. Mutually
 	// exclusive with TLSCert/TLSKey (enforced at config.validate() time).
 	TLSInternal     bool
-	CaddyExtra      string         // raw Caddy directives appended into the site block
-	Firewall        caddy.Firewall // edge hardening (IP allow/deny, UA block, body cap)
-	Access          caddy.Access   // inbound access gate (basic auth / forward auth)
+	CaddyExtra      string            // raw Caddy directives appended into the site block
+	Cache           map[string]string // path glob -> Cache-Control, rendered into the site block
+	Firewall        caddy.Firewall    // edge hardening (IP allow/deny, UA block, body cap)
+	Access          caddy.Access      // inbound access gate (basic auth / forward auth)
 	ManifestSHA256  string
 	AppliedManifest json.RawMessage
 	SourceRevision  string
@@ -392,12 +393,12 @@ func (d *Deployer) Deploy(ctx context.Context, cfg Config) error {
 			for i := range replicas {
 				upstreams[i] = caddy.Upstream{Dial: fmt.Sprintf("%s:%d", webContainerNames[i], cfg.ContainerPort)}
 			}
-			if err := d.caddy.SetLoadBalancer(ctx, cfg.App, cfg.Domain, upstreams, tls, cfg.CaddyExtra, cfg.Firewall, cfg.Access); err != nil {
+			if err := d.caddy.SetLoadBalancer(ctx, cfg.App, cfg.Domain, upstreams, tls, cfg.CaddyExtra, cfg.Cache, cfg.Firewall, cfg.Access); err != nil {
 				return fail(fmt.Errorf("updating load balancer route: %w", err))
 			}
 			fmt.Fprintf(d.out, "  Traffic load-balanced across %d replicas\n", replicas)
 		} else {
-			if err := d.caddy.SetRoute(ctx, cfg.App, cfg.Domain, webContainerName, cfg.ContainerPort, tls, cfg.CaddyExtra, cfg.Firewall, cfg.Access); err != nil {
+			if err := d.caddy.SetRoute(ctx, cfg.App, cfg.Domain, webContainerName, cfg.ContainerPort, tls, cfg.CaddyExtra, cfg.Cache, cfg.Firewall, cfg.Access); err != nil {
 				return fail(fmt.Errorf("updating route: %w", err))
 			}
 			fmt.Fprintln(d.out, "  Traffic routed to new container")
@@ -612,9 +613,9 @@ func (d *Deployer) restorePreviousRoute(ctx context.Context, cfg Config, current
 	}
 	tls := caddy.TLS{Cert: cfg.TLSCert, Key: cfg.TLSKey, Internal: cfg.TLSInternal}
 	if replicas > 1 {
-		return d.caddy.SetLoadBalancer(ctx, cfg.App, domain, upstreams, tls, cfg.CaddyExtra, cfg.Firewall, cfg.Access)
+		return d.caddy.SetLoadBalancer(ctx, cfg.App, domain, upstreams, tls, cfg.CaddyExtra, cfg.Cache, cfg.Firewall, cfg.Access)
 	}
-	return d.caddy.SetRoute(ctx, cfg.App, domain, names[0], primaryPort, tls, cfg.CaddyExtra, cfg.Firewall, cfg.Access)
+	return d.caddy.SetRoute(ctx, cfg.App, domain, names[0], primaryPort, tls, cfg.CaddyExtra, cfg.Cache, cfg.Firewall, cfg.Access)
 }
 
 func (d *Deployer) logDeploy(ctx context.Context, cfg Config, success bool, start time.Time) {

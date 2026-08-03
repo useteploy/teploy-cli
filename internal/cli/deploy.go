@@ -586,6 +586,7 @@ func deployBuiltImage(ctx context.Context, executor ssh.Executor, appCfg *config
 		TLSKey:          tlsKey,
 		TLSInternal:     tlsInternal,
 		CaddyExtra:      appCfg.CaddyExtra,
+		Cache:           appCfg.Cache,
 		Firewall:        caddyFirewall(appCfg.Firewall),
 		Access:          caddyAccess(appCfg.Access),
 		ManifestSHA256:  manifestSHA256,
