@@ -671,3 +671,255 @@ func TestEnsureRunning_SecretReferenceEmptyKey(t *testing.T) {
 		t.Fatalf("expected empty-reference error, got: %v", err)
 	}
 }
+
+// A leaky accessory with no cgroup cap can OOM its host and take unrelated
+// containers down with it — an engine's own advisory memory budget does not
+// prevent that. These cover the limits actually reaching docker run.
+func TestEnsureRunning_ResourceLimits(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "docker inspect", Err: fmt.Errorf("not found")},
+		ssh.MockCommand{Match: "mkdir -p", Output: ""},
+		ssh.MockCommand{Match: "docker run", Output: "abc123"},
+	)
+	var buf bytes.Buffer
+	mgr := NewManager(mock, &buf)
+
+	if _, err := mgr.EnsureRunning(context.Background(), "myapp", "nucleus", config.AccessoryConfig{
+		Image:  "ghcr.io/neutron-build/nucleus:v0.1.5",
+		Port:   5432,
+		Memory: "8g",
+		CPU:    "2",
+	}); err != nil {
+		t.Fatalf("EnsureRunning: %v", err)
+	}
+
+	var runCmd string
+	for _, c := range mock.Calls {
+		if strings.HasPrefix(c, "docker run") {
+			runCmd = c
+		}
+	}
+	if !strings.Contains(runCmd, "--memory") || !strings.Contains(runCmd, "8g") {
+		t.Errorf("docker run missing --memory 8g: %s", runCmd)
+	}
+	if !strings.Contains(runCmd, "--cpus") || !strings.Contains(runCmd, "2") {
+		t.Errorf("docker run missing --cpus 2: %s", runCmd)
+	}
+}
+
+func TestEnsureRunning_NoLimitsWhenUnset(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "docker inspect", Err: fmt.Errorf("not found")},
+		ssh.MockCommand{Match: "mkdir -p", Output: ""},
+		ssh.MockCommand{Match: "docker run", Output: "abc123"},
+	)
+	var buf bytes.Buffer
+	mgr := NewManager(mock, &buf)
+
+	if _, err := mgr.EnsureRunning(context.Background(), "myapp", "redis", config.AccessoryConfig{
+		Image: "redis:7-alpine",
+	}); err != nil {
+		t.Fatalf("EnsureRunning: %v", err)
+	}
+	for _, c := range mock.Calls {
+		if strings.HasPrefix(c, "docker run") && (strings.Contains(c, "--memory") || strings.Contains(c, "--cpus")) {
+			t.Errorf("unset limits must not appear in docker run: %s", c)
+		}
+	}
+}
+
+// Docker fixes limits at creation, so adding memory: to an accessory that is
+// already up does nothing until it is recreated. Silence there would leave the
+// operator believing in a cap that does not exist.
+func TestEnsureRunning_WarnsWhenRunningContainerLacksLimit(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "docker inspect -f '{{.State.Status}}'", Output: "running"},
+		// HostConfig.Memory / NanoCpus: both unset on the running container.
+		ssh.MockCommand{Match: "docker inspect -f '{{.HostConfig.Memory}}", Output: "0 0"},
+	)
+	var buf bytes.Buffer
+	mgr := NewManager(mock, &buf)
+
+	if _, err := mgr.EnsureRunning(context.Background(), "myapp", "nucleus", config.AccessoryConfig{
+		Image:  "ghcr.io/neutron-build/nucleus:v0.1.5",
+		Memory: "8g",
+	}); err != nil {
+		t.Fatalf("EnsureRunning: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "WARNING") || !strings.Contains(out, "no memory limit") {
+		t.Errorf("expected a drift warning, got: %s", out)
+	}
+	if !strings.Contains(out, "teploy accessory stop nucleus") {
+		t.Errorf("warning should name the command that applies it, got: %s", out)
+	}
+}
+
+func TestEnsureRunning_NoWarningWhenLimitAlreadyApplied(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "docker inspect -f '{{.State.Status}}'", Output: "running"},
+		ssh.MockCommand{Match: "docker inspect -f '{{.HostConfig.Memory}}", Output: "8589934592 0"},
+	)
+	var buf bytes.Buffer
+	mgr := NewManager(mock, &buf)
+
+	if _, err := mgr.EnsureRunning(context.Background(), "myapp", "nucleus", config.AccessoryConfig{
+		Image:  "ghcr.io/neutron-build/nucleus:v0.1.5",
+		Memory: "8g",
+	}); err != nil {
+		t.Fatalf("EnsureRunning: %v", err)
+	}
+	if strings.Contains(buf.String(), "WARNING") {
+		t.Errorf("no warning expected when the limit is already applied: %s", buf.String())
+	}
+}
+
+// An image that changes its runtime UID between versions (nucleus went from
+// root to 10001) leaves the data dir owned by the old user, and the upgraded
+// container crash-loops on a permission error that names nothing useful.
+func TestUpgrade_ReconcilesDataOwnershipOnUIDChange(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "docker pull", Output: ""},
+		ssh.MockCommand{Match: "docker stop", Output: ""},
+		ssh.MockCommand{Match: "docker rm", Output: ""},
+		ssh.MockCommand{Match: "docker image inspect -f '{{.Config.User}}'", Output: "10001:10001"},
+		// On-disk owner is root — the old image's user.
+		ssh.MockCommand{Match: "stat -c", Output: "0"},
+		ssh.MockCommand{Match: "chown -R", Output: ""},
+		ssh.MockCommand{Match: "docker inspect", Err: fmt.Errorf("not found")},
+		ssh.MockCommand{Match: "mkdir -p", Output: ""},
+		ssh.MockCommand{Match: "docker run", Output: "abc123"},
+	)
+	var buf bytes.Buffer
+	mgr := NewManager(mock, &buf)
+
+	err := mgr.Upgrade(context.Background(), "ship", "nucleus", "ghcr.io/neutron-build/nucleus:v0.1.5",
+		config.AccessoryConfig{
+			Image:   "ghcr.io/neutron-build/nucleus:v0.1.2",
+			Volumes: map[string]string{"nucleus-data": "/data"},
+		})
+	if err != nil {
+		t.Fatalf("Upgrade: %v", err)
+	}
+
+	var chowned bool
+	for _, c := range mock.Calls {
+		if strings.HasPrefix(c, "chown -R 10001:10001") &&
+			strings.Contains(c, "/deployments/ship/accessories/nucleus/nucleus-data") {
+			chowned = true
+		}
+	}
+	if !chowned {
+		t.Errorf("expected the data dir to be chowned to the new image's uid; calls: %v", mock.Calls)
+	}
+}
+
+func TestUpgrade_LeavesOwnershipAloneWhenUIDMatches(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "docker pull", Output: ""},
+		ssh.MockCommand{Match: "docker stop", Output: ""},
+		ssh.MockCommand{Match: "docker rm", Output: ""},
+		ssh.MockCommand{Match: "docker image inspect -f '{{.Config.User}}'", Output: "10001:10001"},
+		ssh.MockCommand{Match: "stat -c", Output: "10001"},
+		ssh.MockCommand{Match: "docker inspect", Err: fmt.Errorf("not found")},
+		ssh.MockCommand{Match: "mkdir -p", Output: ""},
+		ssh.MockCommand{Match: "docker run", Output: "abc123"},
+	)
+	var buf bytes.Buffer
+	mgr := NewManager(mock, &buf)
+
+	if err := mgr.Upgrade(context.Background(), "ship", "nucleus", "ghcr.io/neutron-build/nucleus:v0.1.5",
+		config.AccessoryConfig{Volumes: map[string]string{"nucleus-data": "/data"}}); err != nil {
+		t.Fatalf("Upgrade: %v", err)
+	}
+	for _, c := range mock.Calls {
+		if strings.HasPrefix(c, "chown") {
+			t.Errorf("no chown expected when the uid already matches: %s", c)
+		}
+	}
+}
+
+// A root-running image must not trigger a chown — that would be teploy
+// rewriting ownership on every upgrade of an ordinary image.
+func TestUpgrade_SkipsReconcileForRootImage(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "docker pull", Output: ""},
+		ssh.MockCommand{Match: "docker stop", Output: ""},
+		ssh.MockCommand{Match: "docker rm", Output: ""},
+		ssh.MockCommand{Match: "docker image inspect -f '{{.Config.User}}'", Output: ""},
+		ssh.MockCommand{Match: "docker inspect", Err: fmt.Errorf("not found")},
+		ssh.MockCommand{Match: "mkdir -p", Output: ""},
+		ssh.MockCommand{Match: "docker run", Output: "abc123"},
+	)
+	var buf bytes.Buffer
+	mgr := NewManager(mock, &buf)
+
+	if err := mgr.Upgrade(context.Background(), "myapp", "postgres", "postgres:17-alpine",
+		config.AccessoryConfig{Volumes: map[string]string{"data": "/var/lib/postgresql/data"}}); err != nil {
+		t.Fatalf("Upgrade: %v", err)
+	}
+	for _, c := range mock.Calls {
+		if strings.HasPrefix(c, "chown") || strings.HasPrefix(c, "stat") {
+			t.Errorf("root image needs no ownership reconcile: %s", c)
+		}
+	}
+}
+
+// A stopped accessory used to abort the whole deploy: EnsureRunning only
+// returned early for "running", then `docker run` hit a name conflict and
+// surfaced a raw daemon error naming no accessory. Recreate it instead — the
+// data is on a bind mount, so the container is disposable.
+func TestEnsureRunning_RecreatesStoppedContainer(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "docker inspect -f '{{.State.Status}}'", Output: "exited"},
+		ssh.MockCommand{Match: "docker rm -f", Output: ""},
+		ssh.MockCommand{Match: "mkdir -p", Output: ""},
+		ssh.MockCommand{Match: "docker run", Output: "abc123"},
+	)
+	var buf bytes.Buffer
+	mgr := NewManager(mock, &buf)
+
+	if _, err := mgr.EnsureRunning(context.Background(), "ship", "nucleus", config.AccessoryConfig{
+		Image:  "ghcr.io/neutron-build/nucleus:v0.1.5",
+		Memory: "1500m",
+	}); err != nil {
+		t.Fatalf("EnsureRunning on a stopped accessory: %v", err)
+	}
+
+	var removed, ran bool
+	for _, c := range mock.Calls {
+		if strings.HasPrefix(c, "docker rm -f") {
+			removed = true
+		}
+		if strings.HasPrefix(c, "docker run") {
+			ran = true
+			if !strings.Contains(c, "--memory") {
+				t.Errorf("recreate should apply the configured limit: %s", c)
+			}
+		}
+	}
+	if !removed || !ran {
+		t.Errorf("stopped container should be removed then recreated (removed=%v ran=%v)", removed, ran)
+	}
+}
+
+// A running accessory must never be torn down as a side effect of a deploy.
+func TestEnsureRunning_NeverRemovesARunningContainer(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "docker inspect -f '{{.State.Status}}'", Output: "running"},
+		ssh.MockCommand{Match: "docker inspect -f '{{.HostConfig.Memory}}", Output: "0 0"},
+	)
+	var buf bytes.Buffer
+	mgr := NewManager(mock, &buf)
+
+	if _, err := mgr.EnsureRunning(context.Background(), "ship", "nucleus", config.AccessoryConfig{
+		Image: "ghcr.io/neutron-build/nucleus:v0.1.5",
+	}); err != nil {
+		t.Fatalf("EnsureRunning: %v", err)
+	}
+	for _, c := range mock.Calls {
+		if strings.HasPrefix(c, "docker rm") || strings.HasPrefix(c, "docker run") {
+			t.Errorf("a running accessory must be left alone, got: %s", c)
+		}
+	}
+}

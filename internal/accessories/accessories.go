@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/useteploy/teploy/internal/config"
@@ -55,7 +56,25 @@ func (m *Manager) EnsureRunning(ctx context.Context, app, name string, cfg confi
 	))
 	if err == nil && strings.TrimSpace(status) == "running" {
 		fmt.Fprintf(m.out, "  %s already running\n", containerName)
+		m.warnResourceDrift(ctx, name, containerName, cfg)
 		return connectionEnvVars(app, name, cfg.Image, cfg.Port, env), nil
+	}
+
+	// The container exists but is not running — stopped by an operator, exited,
+	// or crash-looping. `docker run` below would fail on the name conflict with
+	// a raw daemon error that says nothing about accessories, and the whole
+	// deploy would abort. Remove the dead container and recreate it from the
+	// config, which is the authoritative description of how it should run.
+	//
+	// Non-destructive: an accessory's state lives in bind mounts under
+	// /deployments/{app}/accessories/{name}, not in the container's writable
+	// layer, so the data outlives the container. Recreating is also what lets a
+	// changed memory/cpu limit take effect at all.
+	if err == nil && strings.TrimSpace(status) != "" {
+		fmt.Fprintf(m.out, "  %s exists but is %s — recreating from config\n", containerName, strings.TrimSpace(status))
+		if _, rmErr := m.exec.Run(ctx, fmt.Sprintf("docker rm -f %s", ssh.ShellQuote(containerName))); rmErr != nil {
+			return nil, fmt.Errorf("removing stopped accessory %s before recreate: %w", containerName, rmErr)
+		}
 	}
 
 	// Ensure directory structure.
@@ -101,6 +120,15 @@ func (m *Manager) EnsureRunning(ctx context.Context, app, name string, cfg confi
 		args = append(args, "-p", ssh.ShellQuote(pub))
 	}
 
+	// Resource limits. A cgroup cap is the only enforced bound on an
+	// accessory's memory — an engine's own budget setting is advisory.
+	if cfg.Memory != "" {
+		args = append(args, "--memory", ssh.ShellQuote(cfg.Memory))
+	}
+	if cfg.CPU != "" {
+		args = append(args, "--cpus", ssh.ShellQuote(cfg.CPU))
+	}
+
 	args = append(args, "--log-opt", "max-size=10m")
 	args = append(args, ssh.ShellQuote(cfg.Image))
 
@@ -118,6 +146,46 @@ func (m *Manager) EnsureRunning(ctx context.Context, app, name string, cfg confi
 
 	fmt.Fprintf(m.out, "  %s started\n", containerName)
 	return connectionEnvVars(app, name, cfg.Image, cfg.Port, env), nil
+}
+
+// warnResourceDrift reports a memory/cpu limit in teploy.yml that the RUNNING
+// container does not have.
+//
+// Docker fixes resource limits at container creation, and an already-running
+// accessory is left alone by design (recreating a database because a config
+// value moved is exactly the kind of surprise teploy exists to avoid). But
+// silently ignoring the setting is worse than either choice: the operator adds
+// `memory: 8g` to bound a leaky engine, teploy prints nothing, and the cap they
+// think is protecting the host does not exist. Say so, and name the command
+// that applies it.
+//
+// Best-effort: a failed inspect is not worth failing a deploy over.
+func (m *Manager) warnResourceDrift(ctx context.Context, name, containerName string, cfg config.AccessoryConfig) {
+	if cfg.Memory == "" && cfg.CPU == "" {
+		return
+	}
+	out, err := m.exec.Run(ctx, fmt.Sprintf(
+		"docker inspect -f '{{.HostConfig.Memory}} {{.HostConfig.NanoCpus}}' %s 2>/dev/null",
+		ssh.ShellQuote(containerName),
+	))
+	if err != nil {
+		return
+	}
+	fields := strings.Fields(strings.TrimSpace(out))
+	if len(fields) != 2 {
+		return
+	}
+	if cfg.Memory != "" && fields[0] == "0" {
+		fmt.Fprintf(m.out, "  WARNING: %s has no memory limit, but teploy.yml sets memory: %s\n", containerName, cfg.Memory)
+	}
+	if cfg.CPU != "" && fields[1] == "0" {
+		fmt.Fprintf(m.out, "  WARNING: %s has no cpu limit, but teploy.yml sets cpu: %s\n", containerName, cfg.CPU)
+	}
+	if (cfg.Memory != "" && fields[0] == "0") || (cfg.CPU != "" && fields[1] == "0") {
+		fmt.Fprintf(m.out, "           Limits apply at container creation. To apply them now (data is on a\n")
+		fmt.Fprintf(m.out, "           bind mount and survives; expect brief downtime for this accessory):\n")
+		fmt.Fprintf(m.out, "             teploy accessory stop %s && teploy deploy\n", name)
+	}
 }
 
 // resolveEnv processes env vars, replacing "auto" values with generated
@@ -308,8 +376,61 @@ func (m *Manager) Upgrade(ctx context.Context, app, name, newImage string, cfg c
 	m.docker.Remove(ctx, containerName)
 
 	cfg.Image = newImage
+	if err := m.reconcileDataOwnership(ctx, app, name, cfg); err != nil {
+		return err
+	}
 	_, err := m.EnsureRunning(ctx, app, name, cfg)
 	return err
+}
+
+// reconcileDataOwnership chowns an accessory's data directories to the UID the
+// NEW image runs as, when the two disagree.
+//
+// An image that changes its runtime user between versions leaves every existing
+// deployment's data directory owned by the old UID, and the upgraded container
+// cannot open its own files. The failure is loud but uninformative — the
+// container crash-loops on a permission error from inside the engine, with
+// nothing connecting it to the upgrade — and the data is fine the whole time.
+// Nucleus did exactly this going from root to 10001.
+//
+// Only the accessory's own volume directories are touched, and only when the
+// image declares a numeric non-root user that differs from what is on disk.
+// Best-effort: if anything here cannot be determined, the upgrade proceeds as
+// before rather than blocking on a guess.
+func (m *Manager) reconcileDataOwnership(ctx context.Context, app, name string, cfg config.AccessoryConfig) error {
+	if len(cfg.Volumes) == 0 {
+		return nil
+	}
+	// The user the new image declares, e.g. "10001:10001" or "10001". A named
+	// user (or empty) means root or an unknown mapping — nothing to reconcile.
+	imageUser, err := m.exec.Run(ctx, fmt.Sprintf(
+		"docker image inspect -f '{{.Config.User}}' %s 2>/dev/null", ssh.ShellQuote(cfg.Image),
+	))
+	if err != nil {
+		return nil
+	}
+	uid, _, _ := strings.Cut(strings.TrimSpace(imageUser), ":")
+	if uid == "" || uid == "0" {
+		return nil
+	}
+	if _, convErr := strconv.Atoi(uid); convErr != nil {
+		return nil
+	}
+
+	accDir := fmt.Sprintf("%s/%s/accessories/%s", deploymentsDir, app, name)
+	for _, volName := range sortedKeys(cfg.Volumes) {
+		dir := fmt.Sprintf("%s/%s", accDir, volName)
+		owner, ownErr := m.exec.Run(ctx, fmt.Sprintf("stat -c '%%u' %s 2>/dev/null", ssh.ShellQuote(dir)))
+		if ownErr != nil || strings.TrimSpace(owner) == "" || strings.TrimSpace(owner) == uid {
+			continue
+		}
+		fmt.Fprintf(m.out, "  %s runs as uid %s; %s is owned by uid %s — reconciling\n",
+			cfg.Image, uid, dir, strings.TrimSpace(owner))
+		if _, chErr := m.exec.Run(ctx, fmt.Sprintf("chown -R %s:%s %s", uid, uid, ssh.ShellQuote(dir))); chErr != nil {
+			return fmt.Errorf("chowning %s to uid %s (the new image's user): %w", dir, uid, chErr)
+		}
+	}
+	return nil
 }
 
 // connectionEnvVars generates app env vars based on the accessory image type.

@@ -15,6 +15,9 @@ import (
 func TestEnsureRunningAppendsCommand(t *testing.T) {
 	mock := ssh.NewMockExecutor("h",
 		ssh.MockCommand{Match: "docker inspect", Output: "exited"},
+		// "exited" = the container exists but is stopped, so EnsureRunning
+		// removes it before recreating (docker run would hit a name conflict).
+		ssh.MockCommand{Match: "docker rm -f", Output: ""},
 		ssh.MockCommand{Match: "mkdir -p", Output: ""},
 		ssh.MockCommand{Match: "docker run", Output: "abc"},
 	)
@@ -42,6 +45,9 @@ func TestEnsureRunningAppendsCommand(t *testing.T) {
 func TestEnsureRunningNoCommandUnchanged(t *testing.T) {
 	mock := ssh.NewMockExecutor("h",
 		ssh.MockCommand{Match: "docker inspect", Output: "exited"},
+		// "exited" = the container exists but is stopped, so EnsureRunning
+		// removes it before recreating (docker run would hit a name conflict).
+		ssh.MockCommand{Match: "docker rm -f", Output: ""},
 		ssh.MockCommand{Match: "mkdir -p", Output: ""},
 		ssh.MockCommand{Match: "docker run", Output: "abc"},
 	)

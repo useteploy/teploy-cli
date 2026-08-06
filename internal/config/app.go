@@ -5,10 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net"
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -24,6 +26,28 @@ var validDomain = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9.-]+[a-zA-Z0-9]$`)
 
 // validPlatform matches Docker platform strings like linux/amd64, linux/arm64, linux/arm/v7.
 var validPlatform = regexp.MustCompile(`^[a-z]+/[a-z0-9]+(/v[0-9]+)?$`)
+
+// validMemory matches Docker's memory-limit syntax: a positive number with an
+// optional b/k/m/g suffix ("512m", "8g", "1.5g", "536870912"). Docker rejects
+// anything else, and it does so when the container starts — i.e. mid-deploy,
+// after the old one is gone. Catching it at parse time keeps a typo like "8gb"
+// from becoming an outage.
+var validMemory = regexp.MustCompile(`(?i)^\d+(\.\d+)?[bkmg]?$`)
+
+// validCPU matches a --cpus value: a positive decimal core count ("0.5", "2").
+var validCPU = regexp.MustCompile(`^\d+(\.\d+)?$`)
+
+// validateResources checks a memory/CPU pair from either an app or an accessory.
+// which names the offending block for the error message.
+func validateResources(which, memory, cpu string) error {
+	if memory != "" && !validMemory.MatchString(memory) {
+		return fmt.Errorf("%s'memory' must be a size like 512m, 2g, or a plain byte count (got %q)", which, memory)
+	}
+	if cpu != "" && !validCPU.MatchString(cpu) {
+		return fmt.Errorf("%s'cpu' must be a number of cores like 0.5 or 2 (got %q)", which, cpu)
+	}
+	return nil
+}
 
 // HooksConfig holds pre/post deploy hook commands.
 type HooksConfig struct {
@@ -111,6 +135,19 @@ type AccessoryConfig struct {
 	// runs the aws CLI on the host where container DNS doesn't resolve.
 	// Prefer loopback binds; a bare port exposes the accessory publicly.
 	Publish []string `yaml:"publish,omitempty" toml:"publish"`
+	// Memory caps the accessory's RAM ("512m", "8g"); CPU caps its cores
+	// ("0.5", "2"). Empty (default) means unlimited.
+	//
+	// Worth setting on any database or engine that keeps a working set in
+	// memory. A storage engine's own budget knob is advisory — it is the
+	// engine's accounting of its own allocations, so an engine that
+	// under-counts (or a leak in a path it does not account for) grows past
+	// it unchecked. Only the cgroup limit is enforced by the kernel, and
+	// without one the OOM killer picks a victim host-wide: an accessory that
+	// runs away can take down unrelated containers on the same box before
+	// anything kills the accessory itself.
+	Memory string `yaml:"memory,omitempty" toml:"memory"`
+	CPU    string `yaml:"cpu,omitempty" toml:"cpu"`
 }
 
 // TLSConfig declares a custom certificate for terminating TLS on the app's
@@ -299,7 +336,17 @@ type AppConfig struct {
 	// teploy.yml location (default "."). Dockerfile is resolved relative to
 	// it. Use it to build a subdirectory of a monorepo, or to hand a
 	// subdir Dockerfile a wider context (the repo root).
-	Context     string `yaml:"context,omitempty" toml:"context"`
+	Context string `yaml:"context,omitempty" toml:"context"`
+	// Memory caps the app container's RAM, in Docker's own units ("512m",
+	// "2g"). Empty (default) means unlimited — a container that leaks takes
+	// the whole host down with it, including every unrelated app on the box.
+	// An engine's own advisory budget is not a substitute: a process that
+	// mis-accounts its usage sails past a self-imposed cap, and only the
+	// cgroup limit is enforced by the kernel.
+	Memory string `yaml:"memory,omitempty" toml:"memory"`
+	// CPU caps the app container's CPU, in cores ("0.5", "2"). Empty means
+	// unlimited.
+	CPU         string `yaml:"cpu,omitempty" toml:"cpu"`
 	StopTimeout int    `yaml:"stop_timeout,omitempty" toml:"stop_timeout"`
 	Parallel    int    `yaml:"parallel,omitempty" toml:"parallel"`
 	Replicas    int    `yaml:"replicas,omitempty" toml:"replicas"`
@@ -593,6 +640,16 @@ func (c *AppConfig) validate() error {
 	}
 	if c.Platform != "" && !validPlatform.MatchString(c.Platform) {
 		return fmt.Errorf("'platform' must be os/arch (e.g. linux/amd64, linux/arm64), got %q", c.Platform)
+	}
+	if err := validateResources("", c.Memory, c.CPU); err != nil {
+		return err
+	}
+	// Sorted so a config with two bad accessories always reports the same one.
+	for _, name := range slices.Sorted(maps.Keys(c.Accessories)) {
+		acc := c.Accessories[name]
+		if err := validateResources(fmt.Sprintf("accessory %q: ", name), acc.Memory, acc.CPU); err != nil {
+			return err
+		}
 	}
 	// Validate ingress. Empty defaults to "caddy" at consumption time.
 	switch c.Ingress {
@@ -915,6 +972,12 @@ func mergeConfigs(base, overlay *AppConfig) {
 	if overlay.BuildLocal {
 		base.BuildLocal = overlay.BuildLocal
 	}
+	if overlay.Memory != "" {
+		base.Memory = overlay.Memory
+	}
+	if overlay.CPU != "" {
+		base.CPU = overlay.CPU
+	}
 	if overlay.StopTimeout != 0 {
 		base.StopTimeout = overlay.StopTimeout
 	}
@@ -1073,6 +1136,14 @@ func mergeAccessory(base, overlay AccessoryConfig) AccessoryConfig {
 	}
 	if len(overlay.Publish) > 0 {
 		out.Publish = overlay.Publish
+	}
+	// Per-destination resource limits are the common case: the same accessory
+	// wants a different cap on a 4 GB test box than on a 32 GB production host.
+	if overlay.Memory != "" {
+		out.Memory = overlay.Memory
+	}
+	if overlay.CPU != "" {
+		out.CPU = overlay.CPU
 	}
 	if len(overlay.Env) > 0 {
 		if out.Env == nil {

@@ -122,6 +122,8 @@ port: 3000
 build_local: true
 platform: linux/amd64
 stop_timeout: 30
+memory: 2g                    # cgroup RAM cap (docker units: 512m, 2g). Unset = unlimited.
+cpu: "1.5"                    # CPU cap in cores. Unset = unlimited.
 keep_versions: 3              # auto-prune older versions after deploy (0 = keep all, default)
                               # `teploy pin <version>` protects a version from this prune
 
@@ -220,6 +222,15 @@ accessories:
   postgres:
     image: postgres:16
     port: 5432
+    # Cap what this container can take from the host. Worth setting on any
+    # database or engine that holds a working set in memory: an engine's own
+    # memory-budget setting is its accounting of its own allocations, so a
+    # leak in a path it doesn't count grows past it. Only the cgroup limit is
+    # enforced by the kernel — and without one, an accessory that runs away
+    # gets the OOM killer picking victims host-wide, taking unrelated
+    # containers with it.
+    memory: 2g
+    cpu: "2"
     env:
       POSTGRES_PASSWORD: auto                  # generated once, persisted server-side
       # or reference an encrypted secret (set with `teploy secret set DB_PASSWORD=...`);
