@@ -340,7 +340,7 @@ func (d *Deployer) Deploy(ctx context.Context, cfg Config) error {
 	fmt.Fprintln(d.out, "Running health check...")
 	healthCfg := cfg.Health.withDefaults()
 	for i, p := range ports {
-		if err := d.healthCheck(ctx, p, healthCfg); err != nil {
+		if err := d.healthCheck(ctx, p, healthCfg, webBindHost); err != nil {
 			fmt.Fprintf(d.out, "  Health check failed for replica %d (port %d): %v\n", i+1, p, err)
 			return fail(fmt.Errorf("health check failed for replica %d: %w", i+1, err))
 		}

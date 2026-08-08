@@ -210,15 +210,22 @@ func Rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg Rollbac
 	fmt.Fprintln(out, "Running health check...")
 	deployer := &Deployer{exec: exec, out: out}
 	healthPorts := make([]int, 0, len(targetWeb))
+	// Probe the address docker actually bound, not localhost: a container
+	// published on a specific IP is unreachable there, which would fail every
+	// rollback of a host-ingress app with a bind address.
+	healthBindHost := ""
 	for _, c := range targetWeb {
 		p, err := dk.HostPort(ctx, c.Name)
 		if err != nil {
 			return fmt.Errorf("inspecting target container host port: %w", err)
 		}
 		healthPorts = append(healthPorts, p)
+		if healthBindHost == "" {
+			healthBindHost = dk.HostBindIP(ctx, c.Name)
+		}
 	}
 	for _, p := range healthPorts {
-		if err := deployer.healthCheck(ctx, p, healthCfg); err != nil {
+		if err := deployer.healthCheck(ctx, p, healthCfg, healthBindHost); err != nil {
 			// Stop what we started and bail.
 			for _, name := range started {
 				dk.Stop(ctx, name, 5)

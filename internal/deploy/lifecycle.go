@@ -75,7 +75,9 @@ func (l *Lifecycle) Start(ctx context.Context, app string) error {
 	if current.CurrentPort > 0 {
 		fmt.Fprintln(l.out, "Running health check...")
 		deployer := &Deployer{exec: l.exec, out: l.out}
-		if err := deployer.healthCheck(ctx, current.CurrentPort, defaultHealthConfig()); err != nil {
+		// Probe the bound address, not localhost — see healthProbeHost.
+		bindHost := l.docker.HostBindIP(ctx, containers[0].Name)
+		if err := deployer.healthCheck(ctx, current.CurrentPort, defaultHealthConfig(), bindHost); err != nil {
 			return fmt.Errorf("health check failed after start: %w", err)
 		}
 		fmt.Fprintln(l.out, "  Health check passed")
@@ -121,7 +123,9 @@ func (l *Lifecycle) Restart(ctx context.Context, app string, timeout int) error 
 	if current.CurrentPort > 0 {
 		fmt.Fprintln(l.out, "Running health check...")
 		deployer := &Deployer{exec: l.exec, out: l.out}
-		if err := deployer.healthCheck(ctx, current.CurrentPort, defaultHealthConfig()); err != nil {
+		// Probe the bound address, not localhost — see healthProbeHost.
+		bindHost := l.docker.HostBindIP(ctx, containers[0].Name)
+		if err := deployer.healthCheck(ctx, current.CurrentPort, defaultHealthConfig(), bindHost); err != nil {
 			return fmt.Errorf("health check failed after restart: %w", err)
 		}
 		fmt.Fprintln(l.out, "  Health check passed")

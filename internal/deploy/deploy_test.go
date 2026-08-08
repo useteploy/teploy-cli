@@ -533,7 +533,7 @@ func TestHealthCheck_Pass(t *testing.T) {
 		Interval: 10 * time.Millisecond,
 	}
 
-	if err := d.healthCheck(context.Background(), 49152, cfg); err != nil {
+	if err := d.healthCheck(context.Background(), 49152, cfg, ""); err != nil {
 		t.Fatalf("healthCheck: %v", err)
 	}
 }
@@ -553,7 +553,7 @@ func TestHealthCheck_TCPFallback(t *testing.T) {
 		Interval: 10 * time.Millisecond,
 	}
 
-	if err := d.healthCheck(context.Background(), 49152, cfg); err != nil {
+	if err := d.healthCheck(context.Background(), 49152, cfg, ""); err != nil {
 		t.Fatalf("healthCheck with TCP fallback: %v", err)
 	}
 }
@@ -573,7 +573,7 @@ func TestHealthCheck_RedirectFallback(t *testing.T) {
 		Interval: 10 * time.Millisecond,
 	}
 
-	if err := d.healthCheck(context.Background(), 49152, cfg); err != nil {
+	if err := d.healthCheck(context.Background(), 49152, cfg, ""); err != nil {
 		t.Fatalf("healthCheck with redirect TCP fallback: %v", err)
 	}
 }
@@ -590,7 +590,7 @@ func TestHealthCheck_Timeout(t *testing.T) {
 		Interval: 10 * time.Millisecond,
 	}
 
-	err := d.healthCheck(context.Background(), 49152, cfg)
+	err := d.healthCheck(context.Background(), 49152, cfg, "")
 	if err == nil {
 		t.Fatal("expected timeout error")
 	}

@@ -628,6 +628,29 @@ func (c *Client) HostPort(ctx context.Context, name string) (int, error) {
 	return port, nil
 }
 
+// HostBindIP returns the host IP a container's first published port is bound
+// to ("0.0.0.0" for all interfaces, or a specific address).
+//
+// Needed because a container published on a specific IP is not reachable at
+// localhost, so anything probing it — health checks on rollback and restart —
+// must dial the address docker actually bound. Returns "" when it cannot be
+// determined, which callers treat as "assume localhost", the historical
+// behavior.
+func (c *Client) HostBindIP(ctx context.Context, name string) string {
+	out, err := c.exec.Run(ctx, fmt.Sprintf(
+		"docker inspect -f '{{range $p, $b := .NetworkSettings.Ports}}{{range $b}}{{.HostIp}} {{end}}{{end}}' %s",
+		ssh.ShellQuote(name),
+	))
+	if err != nil {
+		return ""
+	}
+	fields := strings.Fields(out)
+	if len(fields) == 0 {
+		return ""
+	}
+	return fields[0]
+}
+
 // InternalPort returns the container's internal listening port — the port
 // the app speaks HTTP on inside the Docker network, not the host-mapped
 // port. Caddy dials this port when reverse-proxying over the teploy

@@ -32,24 +32,45 @@ func (h HealthConfig) withDefaults() HealthConfig {
 	return h
 }
 
+// healthProbeHost is the address the server-side probe dials for a container
+// published on bindHost.
+//
+// Docker publishes on exactly the address it was given, so a container bound to
+// a specific IP is NOT reachable at localhost — probing there gets a connection
+// refused for the life of the timeout. Since `ingress: host` deploys by
+// recreate (the old container is stopped first), that turned every deploy of a
+// specifically-bound app into a full outage: the new container is healthy, the
+// probe cannot see it, the deploy fails, and nothing is left running.
+//
+// An empty bindHost is caddy/external ingress, which publishes on 127.0.0.1.
+func healthProbeHost(bindHost string) string {
+	switch bindHost {
+	case "", "0.0.0.0", "::", "[::]":
+		return "localhost"
+	default:
+		return bindHost
+	}
+}
+
 // healthCheck polls the container until it responds healthy or the timeout expires.
 //
 // Strategy:
-//  1. HTTP GET to localhost:{port}{path} — 200 means healthy.
+//  1. HTTP GET to {host}:{port}{path} — 200 means healthy.
 //  2. If the endpoint returns 404, fall back to a TCP port check.
 //  3. Connection refused means the app hasn't started yet — retry.
-func (d *Deployer) healthCheck(ctx context.Context, port int, cfg HealthConfig) error {
+func (d *Deployer) healthCheck(ctx context.Context, port int, cfg HealthConfig, bindHost string) error {
 	ctx, cancel := context.WithTimeout(ctx, cfg.Timeout)
 	defer cancel()
 
+	host := healthProbeHost(bindHost)
 	for {
-		if d.checkHealth(ctx, port, cfg.Path) {
+		if d.checkHealth(ctx, host, port, cfg.Path) {
 			return nil
 		}
 
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("timeout after %s waiting for health check on port %d", cfg.Timeout, port)
+			return fmt.Errorf("timeout after %s waiting for health check on %s:%d", cfg.Timeout, host, port)
 		case <-time.After(cfg.Interval):
 			// retry
 		}
@@ -59,14 +80,14 @@ func (d *Deployer) healthCheck(ctx context.Context, port int, cfg HealthConfig) 
 // HealthCheckPublic runs a health check against the given port using default settings.
 // This is the public entry point for on-demand health checks.
 func (d *Deployer) HealthCheckPublic(ctx context.Context, port int) error {
-	return d.healthCheck(ctx, port, defaultHealthConfig())
+	return d.healthCheck(ctx, port, defaultHealthConfig(), "")
 }
 
 // checkHealth performs a single health check attempt.
-func (d *Deployer) checkHealth(ctx context.Context, port int, path string) bool {
+func (d *Deployer) checkHealth(ctx context.Context, host string, port int, path string) bool {
 	cmd := fmt.Sprintf(
-		"curl -s -o /dev/null -w '%%{http_code}' http://localhost:%d%s",
-		port, path,
+		"curl -s -o /dev/null -w '%%{http_code}' http://%s:%d%s",
+		host, port, path,
 	)
 	output, err := d.exec.Run(ctx, cmd)
 	if err == nil {
@@ -80,15 +101,15 @@ func (d *Deployer) checkHealth(ctx context.Context, port int, path string) bool 
 		// check rather than failing the deploy. A 5xx or "000" (no response)
 		// falls through and is retried until the timeout.
 		if code == "404" || strings.HasPrefix(code, "3") {
-			return d.checkTCP(ctx, port)
+			return d.checkTCP(ctx, host, port)
 		}
 	}
 	return false
 }
 
 // checkTCP verifies that a TCP connection can be established to the port.
-func (d *Deployer) checkTCP(ctx context.Context, port int) bool {
-	cmd := fmt.Sprintf("bash -c '</dev/tcp/localhost/%d' 2>/dev/null", port)
+func (d *Deployer) checkTCP(ctx context.Context, host string, port int) bool {
+	cmd := fmt.Sprintf("bash -c '</dev/tcp/%s/%d' 2>/dev/null", host, port)
 	_, err := d.exec.Run(ctx, cmd)
 	return err == nil
 }
