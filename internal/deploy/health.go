@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/useteploy/teploy/internal/docker"
 )
 
 // HealthConfig configures health check behavior.
@@ -79,8 +81,23 @@ func (d *Deployer) healthCheck(ctx context.Context, port int, cfg HealthConfig, 
 
 // HealthCheckPublic runs a health check against the given port using default settings.
 // This is the public entry point for on-demand health checks.
+//
+// It assumes the container is reachable at localhost. Prefer HealthCheckAt when
+// a container name is available: an app deployed with a `bind:` address is NOT
+// reachable at localhost, and this will report it unhealthy when it is fine.
 func (d *Deployer) HealthCheckPublic(ctx context.Context, port int) error {
 	return d.healthCheck(ctx, port, defaultHealthConfig(), "")
+}
+
+// HealthCheckAt health-checks a named container, probing whatever address it is
+// actually published on rather than assuming localhost. Falls back to the
+// localhost behavior when the address cannot be read.
+func (d *Deployer) HealthCheckAt(ctx context.Context, port int, containerName string) error {
+	bindHost := ""
+	if containerName != "" {
+		bindHost = docker.NewClient(d.exec).HostBindIP(ctx, containerName)
+	}
+	return d.healthCheck(ctx, port, defaultHealthConfig(), bindHost)
 }
 
 // checkHealth performs a single health check attempt.

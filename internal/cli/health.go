@@ -10,8 +10,8 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
-	"github.com/useteploy/teploy/internal/config"
 	"github.com/useteploy/teploy/internal/deploy"
+	"github.com/useteploy/teploy/internal/docker"
 	"github.com/useteploy/teploy/internal/state"
 )
 
@@ -25,26 +25,24 @@ type healthDTO struct {
 }
 
 func newHealthCmd(flags *Flags) *cobra.Command {
-	return &cobra.Command{
+	var appName string
+	cmd := &cobra.Command{
 		Use:   "health",
 		Short: "Run health check on the running app",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runHealth(flags)
+			return runHealth(flags, appName)
 		},
 	}
+	cmd.Flags().StringVar(&appName, "app", "", "app name — act on server state instead of teploy.yml (requires --host)")
+	return cmd
 }
 
-func runHealth(flags *Flags) error {
-	appCfg, err := config.LoadApp(".")
-	if err != nil {
-		return err
-	}
-
+func runHealth(flags *Flags, appName string) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
-	executor, err := connectForApp(ctx, flags, appCfg)
+	appCfg, executor, err := resolveApp(ctx, flags, appName)
 	if err != nil {
 		return err
 	}
@@ -70,7 +68,11 @@ func runHealth(flags *Flags) error {
 		deployerOut = io.Discard
 	}
 	deployer := deploy.NewDeployer(executor, deployerOut)
-	if err := deployer.HealthCheckPublic(ctx, current.CurrentPort); err != nil {
+	// Probe the address the container is actually published on. An app with a
+	// `bind:` is not reachable at localhost, so a localhost-only probe reports
+	// a perfectly healthy app as failed — the same trap that made every deploy
+	// of a bound app an outage until the deployer learned to read the bind.
+	if err := deployer.HealthCheckAt(ctx, current.CurrentPort, docker.ContainerName(appCfg.App, "web", current.CurrentHash)); err != nil {
 		if flags.JSON {
 			if encodeErr := json.NewEncoder(os.Stdout).Encode(healthDTO{App: appCfg.App, Host: executor.Host(), Port: current.CurrentPort, Healthy: false, Error: err.Error(), ObservedAt: time.Now().UTC()}); encodeErr != nil {
 				return encodeErr
