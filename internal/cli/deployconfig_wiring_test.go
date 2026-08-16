@@ -25,6 +25,8 @@ import (
 // This guards the seam: any field present on BOTH structs under the same name
 // must actually be assigned from appCfg in the deploy.Config literal. Add a
 // deliberate exception below with a reason rather than deleting the check.
+var commentPattern = regexp.MustCompile(`(?m)//.*$`)
+
 func TestDeployConfigCopiesEveryMatchingAppConfigField(t *testing.T) {
 	// Fields that exist on both but are deliberately NOT a straight copy.
 	intentional := map[string]string{
@@ -46,7 +48,11 @@ func TestDeployConfigCopiesEveryMatchingAppConfigField(t *testing.T) {
 	if literal == nil {
 		t.Fatal("could not find the `deployCfg := deploy.Config{...}` literal in deploy.go")
 	}
-	body := string(literal[1])
+	// Strip line comments before matching. `strings.Contains(body, "Memory:")`
+	// is otherwise satisfied by `// Memory: appCfg.Memory,` — verified: deleting
+	// the assignment fails this test correctly, but commenting it out did not,
+	// which is exactly how a field gets parked "temporarily" and never restored.
+	body := commentPattern.ReplaceAllString(string(literal[1]), "")
 
 	appFields := map[string]bool{}
 	appType := reflect.TypeOf(config.AppConfig{})
