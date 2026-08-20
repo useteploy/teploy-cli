@@ -4,6 +4,23 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+### Added
+- `teploy build` — build the app's image and stop there. No container is
+  replaced, no route changes, no state is written; the single postcondition is
+  that the image named on the last line exists on the server. `--json` prints
+  `{image, version, built}` and nothing else on stdout.
+
+  It closes a real hole. `teploy preview deploy` runs an image that must ALREADY
+  exist at the current git hash — it falls back to `<app>-build-<hash>` and never
+  builds one. The only thing that produced such an image was `teploy deploy`,
+  which also replaces the running production containers, so "build this branch
+  and look at it on a preview URL" was impossible without shipping the branch to
+  production first. The command's own help said to do exactly that.
+- `teploy preview deploy --image` — run a specific tag instead of re-deriving
+  `<app>-build-<git hash>`. Without it, a build and the preview that consumes it
+  agreed only because both read the same working directory, which fails silently
+  the moment they run from different checkouts or at different commits.
+
 ### Fixed
 - `cache:` was silently ignored for container apps. Only `StaticBlock` consumed
   `opts.Cache`, so a static-site deploy honoured the rules while every

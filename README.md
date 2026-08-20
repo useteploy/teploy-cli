@@ -372,11 +372,26 @@ other, and give untrusted apps their own instance.
 
 ### Previews
 ```
+teploy build                       # build the image, deploy nothing
 teploy preview deploy <branch>     # route subdomain to a pre-built image
 teploy preview list                # list active previews
 teploy preview destroy <branch>    # tear down a preview
 teploy preview prune               # remove expired previews
 ```
+
+`preview deploy` runs an image that already exists; it does not build one.
+`teploy build` is how you get that image without touching production — it
+syncs the working directory, builds on the server, prints the tag, and stops.
+Pass the tag through so the two do not have to re-derive it independently:
+
+```
+git checkout fix/login-500
+teploy build --json                                    # {"image":"app-build-abc1234",...}
+teploy preview deploy fix/login-500 --image app-build-abc1234 --ttl 24h
+```
+
+Requires Teploy-managed Caddy: previews provision a `preview-<branch>.<domain>`
+route on demand, which an external ingress cannot do.
 
 ### Backups
 ```

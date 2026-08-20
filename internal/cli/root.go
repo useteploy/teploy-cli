@@ -43,6 +43,7 @@ func NewRootCmd(version string) *cobra.Command {
 	root.PersistentFlags().BoolVar(&flags.JSON, "json", false, "output in JSON format")
 
 	root.AddCommand(newDeployCmd(flags))
+	root.AddCommand(newBuildCmd(flags))
 	root.AddCommand(newExecCmd(flags))
 	root.AddCommand(newAppCmd(flags))
 	root.AddCommand(newSetupCmd(flags))

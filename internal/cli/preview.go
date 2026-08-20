@@ -30,33 +30,34 @@ func newPreviewCmd(flags *Flags) *cobra.Command {
 
 func newPreviewDeployCmd(flags *Flags) *cobra.Command {
 	var ttl string
+	var image string
 
 	cmd := &cobra.Command{
 		Use:   "deploy <branch>",
 		Short: "Deploy a preview environment for a branch",
 		Long: `Deploy a preview environment on a temporary <branch>.<domain> subdomain.
 
-Uses the current working directory's code (whatever branch is checked out
-locally) and the image already configured in teploy.yml. To preview a
-different branch, check it out first and build the image — preview deploy
-does not run its own build or git checkout.
+Runs an image that already exists on the server; it does not build one and
+does not check out a branch. Use "teploy build" for that — it builds without
+touching production, which "teploy deploy" cannot do.
 
 Example:
   git checkout feat/new-landing
-  teploy deploy --image registry/myapp:feat-new-landing
-  teploy preview deploy feat-new-landing --ttl 24h`,
+  teploy build --json          # prints the image tag
+  teploy preview deploy feat-new-landing --ttl 24h --image <tag>`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runPreviewDeploy(flags, args[0], ttl)
+			return runPreviewDeploy(flags, args[0], ttl, image)
 		},
 	}
 
 	cmd.Flags().StringVar(&ttl, "ttl", "72h", "time-to-live before auto-expiry")
+	cmd.Flags().StringVar(&image, "image", "", "image to run (default: teploy.yml's image, else <app>-build-<git hash>)")
 
 	return cmd
 }
 
-func runPreviewDeploy(flags *Flags, branch, ttlStr string) error {
+func runPreviewDeploy(flags *Flags, branch, ttlStr, image string) error {
 	appCfg, err := config.LoadApp(".")
 	if err != nil {
 		return err
@@ -90,8 +91,14 @@ func runPreviewDeploy(flags *Flags, branch, ttlStr string) error {
 		return fmt.Errorf("could not determine version from git: %w", err)
 	}
 
-	// Use the app's current image or build tag.
-	image := appCfg.Image
+	// Which image the preview runs. An explicit --image is what `teploy build`
+	// prints, passed straight through: without it, build and preview agree only
+	// because both happen to re-derive the same `<app>-build-<git hash>` from
+	// the same working directory, which silently produces "image not found" the
+	// moment they are run from different checkouts or at different commits.
+	if image == "" {
+		image = appCfg.Image
+	}
 	if image == "" {
 		image = appCfg.App + "-build-" + version
 	}
