@@ -4,6 +4,8 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [0.1.27] - 2026-08-20
+
 ### Added
 - `teploy build` — build the app's image and stop there. No container is
   replaced, no route changes, no state is written; the single postcondition is
@@ -21,7 +23,53 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
   agreed only because both read the same working directory, which fails silently
   the moment they run from different checkouts or at different commits.
 
+## [0.1.26] - 2026-08-15
+
+### Added
+- `memory:` and `cpu:` limits for apps and each accessory, validated at parse
+  time against docker's own syntax. The plumbing was complete and unreachable:
+  `docker.RunConfig` carried the values and `deploy.go` passed them, but no yaml
+  key ever set them, so no user could cap any container. Validating at parse
+  time matters because docker rejects a malformed limit when the container
+  *starts* — during a deploy that is after the old container is gone, so a typo
+  like `8gb` was an outage. It is now a config error that names the offending
+  accessory.
+
+  This matters most for accessories. A storage engine's own memory budget is its
+  accounting of its own allocations, so an engine that under-counts grows
+  straight past it — one reached 30 GB RSS with a 16 GB budget set and the host
+  OOM killer took an unrelated service down with it. Only the cgroup limit is
+  enforced by the kernel. Limits are also fixed at container creation, so setting
+  `memory:` on an already-running accessory warns and names the command that
+  applies it rather than silently doing nothing.
+- `teploy health --app <name> --host <server>` — the last read-only command that
+  still required a `teploy.yml` in the working directory now reads server state
+  like `status`, `stats` and `logs`, which is what lets teploy-dash drive it.
+
 ### Fixed
+- Health checks probed `localhost` regardless of the `bind:` address. Docker
+  publishes a container on exactly the address it is given, so an app with a
+  specific bind is not reachable at localhost — the probe never connected,
+  retried to the timeout, and failed a deploy whose container was perfectly
+  healthy. Because `ingress: host` deploys by recreate, stopping the old
+  container first, the failure was not a no-op: the deploy tore down the new
+  container and left **nothing running**. Setting a bind address turned every
+  deploy into a full outage.
+
+  The same defect sat on the rollback and start/restart paths, where it is
+  worse — a rollback that cannot health-check its target aborts, so the escape
+  hatch failed exactly when it was needed. Fixed at all four call sites; the
+  probe now resolves the address from the bind host, and the paths with no
+  config in hand read it back from the running container.
+- App-level `memory:`/`cpu:` never reached the container. `deploy.Config` is a
+  separate struct the CLI populates field by field and nothing copied the two
+  across, so both ends were correct, every unit test on either side passed, and
+  a user setting `memory: 1g` got a container with no limit and no warning.
+  Accessories were unaffected — they pass their config straight through, which
+  is why verifying the accessory path live looked like proof the whole feature
+  worked. The regression test guards the seam rather than either end: every
+  `deploy.Config` field with an identically-named `AppConfig` field must
+  actually be assigned.
 - `cache:` was silently ignored for container apps. Only `StaticBlock` consumed
   `opts.Cache`, so a static-site deploy honoured the rules while every
   reverse-proxied and load-balanced app dropped them — `reverseProxyBlock` and
@@ -42,6 +90,16 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
   nothing still produced a different managed block. That made a Caddyfile diff
   useless for spotting genuine drift — which matters here, because a diff of that
   file is the tool for catching exactly this class of bug.
+
+- Deploy and backup shell commands were interpolated unquoted, SSH host-key
+  verification silently fell back to `InsecureIgnoreHostKey` on a missing
+  `$HOME` or an unwritable `known_hosts`, and volume/accessory tar restores
+  extracted straight into a live path. Commands are now consistently
+  shell-quoted, both host-key paths fail closed, and a restore extracts to a
+  staging directory and only promotes on success. `AcquireManualLock` no longer
+  leaves an orphaned non-expiring lock when the metadata upload fails, and the
+  documented install commands map `aarch64` -> `arm64` and verify the release
+  SHA-256 against `checksums.txt` before extracting.
 
 ## [0.1.25] - 2026-07-27
 
