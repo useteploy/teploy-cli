@@ -95,26 +95,29 @@ func newTemplateInfoCmd(_ *Flags) *cobra.Command {
 
 func newTemplateDeployCmd(flags *Flags) *cobra.Command {
 	var domain, server string
+	var port int
 
 	cmd := &cobra.Command{
 		Use:   "deploy <name>",
 		Short: "Deploy from a template",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if domain == "" {
-				return fmt.Errorf("--domain is required")
-			}
-			return runTemplateDeploy(flags, args[0], domain, server)
+			return runTemplateDeploy(flags, args[0], domain, server, port)
 		},
 	}
 
-	cmd.Flags().StringVar(&domain, "domain", "", "domain for the app (required)")
+	// --domain is optional for host-ingress templates (they publish on
+	// bind:port, not a domain); the pairing is validated after render in
+	// applyTemplateOverrides, so the error names the template's actual ingress
+	// mode rather than demanding a flag the template may not use.
+	cmd.Flags().StringVar(&domain, "domain", "", "domain for the app (required unless the template uses ingress: host)")
 	cmd.Flags().StringVar(&server, "server", "", "server to deploy to")
+	cmd.Flags().IntVar(&port, "port", 0, "host port override for ingress: host templates")
 
 	return cmd
 }
 
-func runTemplateDeploy(flags *Flags, name, domain, server string) error {
+func runTemplateDeploy(flags *Flags, name, domain, server string, port int) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
@@ -133,10 +136,16 @@ func runTemplateDeploy(flags *Flags, name, domain, server string) error {
 		return fmt.Errorf("invalid template: %w", err)
 	}
 
-	// Override domain and server.
-	appCfg.Domain = domain
-	if server != "" {
-		appCfg.Server = server
+	if err := applyTemplateOverrides(appCfg, domain, server, port); err != nil {
+		return err
+	}
+
+	// The written teploy.yml is what `teploy deploy` re-reads, so a --port
+	// override must land in the FILE, not just the in-memory config (there is
+	// no AppConfig serializer; a targeted top-level line patch is the same
+	// shape GenerateSecrets uses for its substitutions).
+	if port != 0 {
+		content = replaceTopLevelPort(content, port)
 	}
 
 	// Write to teploy.yml in current directory.
@@ -146,7 +155,11 @@ func runTemplateDeploy(flags *Flags, name, domain, server string) error {
 
 	fmt.Printf("Template %q written to teploy.yml\n", name)
 	fmt.Printf("  App: %s\n", appCfg.App)
-	fmt.Printf("  Domain: %s\n", domain)
+	if appCfg.Domain != "" {
+		fmt.Printf("  Domain: %s\n", appCfg.Domain)
+	} else {
+		fmt.Printf("  Ingress: host (port %d)\n", appCfg.Port)
+	}
 	if len(appCfg.Accessories) > 0 {
 		fmt.Println("  Accessories:")
 		for accName, acc := range appCfg.Accessories {
@@ -158,8 +171,33 @@ func runTemplateDeploy(flags *Flags, name, domain, server string) error {
 	return nil
 }
 
+// applyTemplateOverrides sets the operator's flags on the rendered config and
+// validates the ingress/domain pairing: an `ingress: host` template publishes
+// on bind:port and needs no domain (the port comes from the template or
+// --port); every other ingress mode routes by domain and requires one.
+func applyTemplateOverrides(appCfg *config.AppConfig, domain, server string, port int) error {
+	if appCfg.Ingress == config.IngressHost {
+		if domain == "" && port == 0 && appCfg.Port == 0 {
+			return fmt.Errorf("template uses ingress: host but declares no port; pass --port")
+		}
+	} else if domain == "" {
+		return fmt.Errorf("--domain is required (only ingress: host templates may omit it)")
+	}
+	if domain != "" {
+		appCfg.Domain = domain
+	}
+	if server != "" {
+		appCfg.Server = server
+	}
+	if port != 0 {
+		appCfg.Port = port
+	}
+	return nil
+}
+
 func newTemplateInstallCmd(flags *Flags) *cobra.Command {
 	var domain, server string
+	var port int
 	var vars []string
 
 	cmd := &cobra.Command{
@@ -167,24 +205,22 @@ func newTemplateInstallCmd(flags *Flags) *cobra.Command {
 		Short: "Fetch a template and deploy it in one step",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if domain == "" {
-				return fmt.Errorf("--domain is required")
-			}
 			if server == "" {
 				return fmt.Errorf("--server is required")
 			}
-			return runTemplateInstall(flags, args[0], domain, server, vars)
+			return runTemplateInstall(flags, args[0], domain, server, port, vars)
 		},
 	}
 
-	cmd.Flags().StringVar(&domain, "domain", "", "domain for the app (required)")
+	cmd.Flags().StringVar(&domain, "domain", "", "domain for the app (required unless the template uses ingress: host)")
 	cmd.Flags().StringVar(&server, "server", "", "server to deploy to (required)")
+	cmd.Flags().IntVar(&port, "port", 0, "host port override for ingress: host templates")
 	cmd.Flags().StringArrayVar(&vars, "var", nil, "extra template variables as key=value")
 
 	return cmd
 }
 
-func runTemplateInstall(flags *Flags, name, domain, server string, extraVars []string) error {
+func runTemplateInstall(flags *Flags, name, domain, server string, port int, extraVars []string) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
@@ -207,12 +243,17 @@ func runTemplateInstall(flags *Flags, name, domain, server string, extraVars []s
 		return fmt.Errorf("invalid template: %w", err)
 	}
 
-	appCfg.Domain = domain
-	appCfg.Server = server
+	if err := applyTemplateOverrides(appCfg, domain, server, port); err != nil {
+		return err
+	}
 
 	fmt.Printf("Installing template %q\n", name)
 	fmt.Printf("  App:    %s\n", appCfg.App)
-	fmt.Printf("  Domain: %s\n", domain)
+	if appCfg.Domain != "" {
+		fmt.Printf("  Domain: %s\n", appCfg.Domain)
+	} else {
+		fmt.Printf("  Ingress: host (port %d)\n", appCfg.Port)
+	}
 	fmt.Printf("  Server: %s\n", server)
 
 	// Templates are first-deploys by definition, so volume mismatch can't apply yet.
@@ -227,6 +268,25 @@ func runTemplateInstall(flags *Flags, name, domain, server string, extraVars []s
 	// permanently lost, locking the operator out of their own database.
 	printGeneratedSecrets(generated)
 	return nil
+}
+
+// replaceTopLevelPort rewrites (or appends) the top-level `port:` line in a
+// rendered teploy.yml. Indented `port:` lines belong to accessories and are
+// left alone.
+func replaceTopLevelPort(content string, port int) string {
+	lines := strings.Split(content, "\n")
+	replaced := false
+	for i, line := range lines {
+		if strings.HasPrefix(line, "port:") {
+			lines[i] = fmt.Sprintf("port: %d", port)
+			replaced = true
+			break
+		}
+	}
+	if !replaced {
+		lines = append(lines, fmt.Sprintf("port: %d", port))
+	}
+	return strings.Join(lines, "\n")
 }
 
 // printGeneratedSecrets shows the operator any "generate" sentinel values

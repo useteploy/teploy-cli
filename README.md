@@ -512,9 +512,12 @@ can reach is your ACL policy's call; teploy never edits ACLs.
 
 ### Registry and templates
 ```
-teploy registry login / list / remove   # manage container registry credentials
-teploy template list / info / deploy    # community app templates
+teploy registry login / list / remove        # manage container registry credentials
+teploy template list / info / deploy         # community app templates
+teploy template install <name> --server S    # fetch a template and deploy it in one step
 ```
+Templates that route by domain take `--domain`; `ingress: host` templates
+(like teploy-ship) publish on `bind:port` instead and take `--port`.
 
 ## Multi-server deploys
 
