@@ -839,8 +839,8 @@ func (c *AppConfig) validate() error {
 
 // unmarshalAppYAML strictly decodes a teploy.yml/teploy.<dest>.yml document.
 // KnownFields(true) rejects unrecognized top-level (and nested struct) keys
-// instead of silently dropping them. Teploy is Kamal-inspired but not
-// schema-compatible, and copy-pasted Kamal fields (service, proxy, builder,
+// instead of silently dropping them. teploy.yml is its own schema, and
+// copy-pasted Kamal fields (service, proxy, builder,
 // registry, services, ...) are a common source of configs that parse clean
 // but produce an empty/wrong AppConfig otherwise. On any decode error —
 // unknown field or type mismatch alike — append a pointer at the schema
@@ -852,7 +852,7 @@ func unmarshalAppYAML(data []byte, out *AppConfig) error {
 		if errors.Is(err, io.EOF) {
 			return nil // empty document — same as yaml.Unmarshal's no-op
 		}
-		return fmt.Errorf("%w\nnote: teploy.yml is Kamal-inspired but has its own schema (not Kamal's deploy.yml) — see https://teploy.com/docs/reference/config. Common mismatches: 'app' not 'service'; 'build' is a list of shell commands, not a {command, output} map; no 'proxy'/'builder'/'services' blocks", err)
+		return fmt.Errorf("%w\nnote: teploy.yml is its own schema (not Kamal's deploy.yml) — see https://teploy.com/docs/reference/config. Common mismatches: 'app' not 'service'; 'build' is a list of shell commands, not a {command, output} map; no 'proxy'/'builder'/'services' blocks", err)
 	}
 	return nil
 }
