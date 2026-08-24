@@ -4,6 +4,18 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [0.1.28] - 2026-08-24
+
+### Changed
+- `teploy template deploy|install` — `--domain` is now optional for
+  `ingress: host` templates, which publish on `bind:port` and have no domain to
+  give (teploy-ship is the first such template). The pairing is validated after
+  render against the template's actual ingress mode, so the error names the
+  rule instead of demanding a flag the template cannot use. New `--port` flag
+  overrides the template's host port; on `template deploy` it also patches the
+  written teploy.yml, because the file is what `teploy deploy` re-reads — an
+  override that lived only in memory was silently ignored on the next step.
+
 ## [0.1.27] - 2026-08-20
 
 ### Added
