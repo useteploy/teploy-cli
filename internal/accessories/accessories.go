@@ -90,6 +90,22 @@ func (m *Manager) EnsureRunning(ctx context.Context, app, name string, cfg confi
 		volumes[hostPath] = containerPath
 	}
 
+	// Create the volume directories here and hand them to the UID the image
+	// runs as. Left to docker, a missing bind-mount source is created
+	// root-owned, and an image that drops privileges (Nucleus runs as 10001)
+	// crash-loops on its very first start with a permission error from inside
+	// the engine. That is the upgrade failure reconcileDataOwnership already
+	// covers, hit on a fresh install by every deploy — `template install`
+	// included.
+	for _, hostPath := range sortedKeys(volumes) {
+		if _, err := m.exec.Run(ctx, "mkdir -p "+hostPath); err != nil {
+			return nil, fmt.Errorf("creating accessory volume directory %s: %w", hostPath, err)
+		}
+	}
+	if err := m.reconcileDataOwnership(ctx, app, name, cfg); err != nil {
+		return nil, err
+	}
+
 	// Build docker run command.
 	fmt.Fprintf(m.out, "  Starting %s...\n", containerName)
 	args := []string{
@@ -376,9 +392,7 @@ func (m *Manager) Upgrade(ctx context.Context, app, name, newImage string, cfg c
 	m.docker.Remove(ctx, containerName)
 
 	cfg.Image = newImage
-	if err := m.reconcileDataOwnership(ctx, app, name, cfg); err != nil {
-		return err
-	}
+	// EnsureRunning reconciles data-directory ownership against the new image.
 	_, err := m.EnsureRunning(ctx, app, name, cfg)
 	return err
 }
@@ -403,8 +417,12 @@ func (m *Manager) reconcileDataOwnership(ctx context.Context, app, name string, 
 	}
 	// The user the new image declares, e.g. "10001:10001" or "10001". A named
 	// user (or empty) means root or an unknown mapping — nothing to reconcile.
+	// On a first start the image is not local yet; pull it so the answer is
+	// real rather than "unknown, skip" (`docker run` would pull it anyway).
+	img := ssh.ShellQuote(cfg.Image)
 	imageUser, err := m.exec.Run(ctx, fmt.Sprintf(
-		"docker image inspect -f '{{.Config.User}}' %s 2>/dev/null", ssh.ShellQuote(cfg.Image),
+		"docker image inspect -f '{{.Config.User}}' %s 2>/dev/null || (docker pull %s >/dev/null 2>&1 && docker image inspect -f '{{.Config.User}}' %s 2>/dev/null)",
+		img, img, img,
 	))
 	if err != nil {
 		return nil
@@ -426,8 +444,17 @@ func (m *Manager) reconcileDataOwnership(ctx context.Context, app, name string, 
 		}
 		fmt.Fprintf(m.out, "  %s runs as uid %s; %s is owned by uid %s — reconciling\n",
 			cfg.Image, uid, dir, strings.TrimSpace(owner))
-		if _, chErr := m.exec.Run(ctx, fmt.Sprintf("chown -R %s:%s %s", uid, uid, ssh.ShellQuote(dir))); chErr != nil {
-			return fmt.Errorf("chowning %s to uid %s (the new image's user): %w", dir, uid, chErr)
+		// chown from inside a throwaway container, as root, so this works for
+		// a non-root deploy user too (host-side chown of a root-owned directory
+		// needs sudo, which teploy never assumes). Fall back to the host chown
+		// for images without a chown binary.
+		if _, chErr := m.exec.Run(ctx, fmt.Sprintf(
+			"docker run --rm --user 0 --entrypoint chown -v %s %s -R %s:%s /teploy-data",
+			ssh.ShellQuote(dir+":/teploy-data"), img, uid, uid,
+		)); chErr != nil {
+			if _, hostErr := m.exec.Run(ctx, fmt.Sprintf("chown -R %s:%s %s", uid, uid, ssh.ShellQuote(dir))); hostErr != nil {
+				return fmt.Errorf("chowning %s to uid %s (the image's user): %w", dir, uid, hostErr)
+			}
 		}
 	}
 	return nil

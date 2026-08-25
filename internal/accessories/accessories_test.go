@@ -121,6 +121,55 @@ func TestEnsureRunning_New(t *testing.T) {
 	}
 }
 
+func TestEnsureRunning_ReconcilesFreshVolumeOwnership(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "cat /deployments/myapp/accessories/nucleus/credentials", Err: fmt.Errorf("not found")},
+		ssh.MockCommand{Match: "docker inspect", Err: fmt.Errorf("not found")},
+		ssh.MockCommand{Match: "mkdir -p /deployments/myapp/accessories/nucleus", Output: ""},
+		// The image drops to a non-root user; the fresh directory is not his.
+		ssh.MockCommand{Match: "docker image inspect -f '{{.Config.User}}' 'ghcr.io/neutron-build/nucleus:v0.1.8'", Output: "10001:10001\n"},
+		ssh.MockCommand{Match: "stat -c '%u' '/deployments/myapp/accessories/nucleus/data'", Output: "1000\n"},
+		ssh.MockCommand{Match: "docker run --rm --user 0 --entrypoint chown", Output: ""},
+		ssh.MockCommand{Match: "docker run", Output: "abc123"},
+	)
+
+	var buf bytes.Buffer
+	mgr := NewManager(mock, &buf)
+
+	_, err := mgr.EnsureRunning(context.Background(), "myapp", "nucleus", config.AccessoryConfig{
+		Image:   "ghcr.io/neutron-build/nucleus:v0.1.8",
+		Port:    5432,
+		Volumes: map[string]string{"data": "/data"},
+	})
+	if err != nil {
+		t.Fatalf("EnsureRunning: %v", err)
+	}
+
+	var mkdir, chown, run int = -1, -1, -1
+	for i, call := range mock.Calls {
+		switch {
+		case call == "mkdir -p /deployments/myapp/accessories/nucleus/data":
+			mkdir = i
+		case strings.HasPrefix(call, "docker run --rm --user 0 --entrypoint chown"):
+			chown = i
+			if !strings.Contains(call, "'/deployments/myapp/accessories/nucleus/data:/teploy-data'") || !strings.Contains(call, "-R 10001:10001 /teploy-data") {
+				t.Errorf("chown container command wrong: %s", call)
+			}
+		case strings.HasPrefix(call, "docker run --detach"):
+			run = i
+		}
+	}
+	if mkdir < 0 || chown < 0 || run < 0 {
+		t.Fatalf("expected mkdir, chown and run calls, got: %v", mock.Calls)
+	}
+	if !(mkdir < chown && chown < run) {
+		t.Errorf("expected volume mkdir, then chown, then the accessory start; got order mkdir=%d chown=%d run=%d", mkdir, chown, run)
+	}
+	if !strings.Contains(buf.String(), "is owned by uid 1000 — reconciling") {
+		t.Errorf("expected reconcile message, got: %s", buf.String())
+	}
+}
+
 func TestEnsureRunning_AlreadyRunning(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		// Stored credentials exist (needed for connection string).
@@ -804,8 +853,9 @@ func TestUpgrade_ReconcilesDataOwnershipOnUIDChange(t *testing.T) {
 
 	var chowned bool
 	for _, c := range mock.Calls {
-		if strings.HasPrefix(c, "chown -R 10001:10001") &&
-			strings.Contains(c, "/deployments/ship/accessories/nucleus/nucleus-data") {
+		if strings.HasPrefix(c, "docker run --rm --user 0 --entrypoint chown") &&
+			strings.Contains(c, "-R 10001:10001 /teploy-data") &&
+			strings.Contains(c, "/deployments/ship/accessories/nucleus/nucleus-data:/teploy-data") {
 			chowned = true
 		}
 	}

@@ -4,6 +4,18 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [0.1.29] - 2026-08-24
+
+### Fixed
+- Accessories whose image runs as a non-root user (Nucleus runs as uid 10001)
+  crash-looped on their FIRST start: docker created the missing bind-mount
+  directory root-owned and the engine could not open it. The ownership
+  reconcile that already covered upgrades now runs on every start — teploy
+  creates the volume directories itself and chowns them to the image's user
+  from inside a throwaway container, so it works for a non-root deploy user
+  without sudo. Found by `teploy template install teploy-ship` on a fresh
+  server.
+
 ## [0.1.28] - 2026-08-24
 
 ### Changed
