@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"strings"
 	"testing"
@@ -38,6 +39,61 @@ func removeTestContainers() ssh.MockCommand {
 		Match: "docker ps --all --filter label=teploy.app=",
 		Output: `{"ID":"aaa111","Names":"scratch-web-aaa","Image":"scratch-build-aaa","State":"running","Status":"Up 2 days","Labels":"teploy.app=scratch,teploy.process=web"}
 {"ID":"bbb222","Names":"scratch-db","Image":"postgres:16","State":"running","Status":"Up 2 days","Labels":"teploy.app=scratch,teploy.role=accessory"}`,
+	}
+}
+
+func TestExecuteRemoveStopsRestartingContainer(t *testing.T) {
+	cmds := append([]ssh.MockCommand{
+		{
+			Match:  "docker ps --all --filter label=teploy.app=",
+			Output: `{"ID":"ccc333","Names":"scratch-worker-ccc","Image":"scratch-build-ccc","State":"restarting","Status":"Restarting (1) 2 seconds ago","Labels":"teploy.app=scratch,teploy.process=worker"}`,
+		},
+		{Match: "docker stop -t 10 'scratch-worker-ccc'", Output: ""},
+		{Match: "docker rm 'scratch-worker-ccc'", Output: ""},
+		{Match: "find '/deployments/scratch'", Output: ""},
+		{Match: "rmdir '/deployments/scratch'", Output: ""},
+		{Match: "ls '/deployments/scratch'", Output: ""},
+	}, caddyMocks()...)
+	exec := ssh.NewMockExecutor("test-host", cmds...)
+
+	if _, err := executeRemove(context.Background(), exec, "scratch",
+		[]string{"scratch.com"}, removeOptions{}, io.Discard); err != nil {
+		t.Fatalf("executeRemove: %v", err)
+	}
+	var stopped bool
+	for _, call := range exec.Calls {
+		if call == "docker stop -t 10 'scratch-worker-ccc'" {
+			stopped = true
+		}
+	}
+	if !stopped {
+		t.Errorf("expected a restarting container to be stopped before rm; calls: %v", exec.Calls)
+	}
+}
+
+func TestExecuteRemovePurgeFallsBackToContainerForForeignOwnedData(t *testing.T) {
+	cmds := append([]ssh.MockCommand{
+		removeTestContainers(),
+		{Match: "docker stop -t 10", Output: ""},
+		{Match: "docker rm ", Output: ""},
+		{Match: "rm -rf '/deployments/scratch'", Err: fmt.Errorf("rm: cannot remove: Permission denied")},
+		{Match: "docker run --rm --user 0 -v '/deployments/scratch:/teploy-data' alpine:3 sh -c 'rm -rf /teploy-data/* /teploy-data/.[!.]*'", Output: ""},
+		{Match: "rmdir '/deployments/scratch'", Output: ""},
+	}, caddyMocks()...)
+	exec := ssh.NewMockExecutor("test-host", cmds...)
+
+	if _, err := executeRemove(context.Background(), exec, "scratch",
+		[]string{"scratch.com"}, removeOptions{Purge: true}, io.Discard); err != nil {
+		t.Fatalf("executeRemove: %v", err)
+	}
+	var viaContainer bool
+	for _, call := range exec.Calls {
+		if strings.HasPrefix(call, "docker run --rm --user 0 -v '/deployments/scratch:/teploy-data'") {
+			viaContainer = true
+		}
+	}
+	if !viaContainer {
+		t.Errorf("expected the purge to fall back to an in-container rm; calls: %v", exec.Calls)
 	}
 }
 

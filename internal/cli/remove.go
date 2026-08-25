@@ -147,7 +147,9 @@ func executeRemove(ctx context.Context, exec ssh.Executor, app string, domains [
 			continue
 		}
 		fmt.Fprintf(out, "Removing container %s...\n", c.Name)
-		if c.State == "running" {
+		// A crash-looping process reports "restarting", and `docker rm` refuses
+		// it just as it refuses "running" — stop both.
+		if c.State == "running" || c.State == "restarting" {
 			if err := dk.Stop(ctx, c.Name, 10); err != nil {
 				return nil, err
 			}
@@ -185,7 +187,17 @@ func executeRemove(ctx context.Context, exec ssh.Executor, app string, domains [
 	if opts.Purge {
 		fmt.Fprintln(out, "Purging deploy state and data...")
 		if _, err := exec.Run(ctx, "rm -rf "+ssh.ShellQuote(appDir)); err != nil {
-			return nil, fmt.Errorf("purging %s: %w", appDir, err)
+			// Accessory data is owned by whatever uid the engine ran as (Nucleus:
+			// 10001), which a non-root deploy user cannot delete. Finish the job
+			// as root inside a throwaway container, the same way the directories
+			// were handed over on start — no host sudo assumed.
+			if _, cErr := exec.Run(ctx, "docker run --rm --user 0 -v "+ssh.ShellQuote(appDir+":/teploy-data")+
+				" alpine:3 sh -c 'rm -rf /teploy-data/* /teploy-data/.[!.]*'"); cErr != nil {
+				return nil, fmt.Errorf("purging %s: %w", appDir, err)
+			}
+			if _, rmErr := exec.Run(ctx, "rmdir "+ssh.ShellQuote(appDir)); rmErr != nil {
+				return nil, fmt.Errorf("purging %s: %w", appDir, rmErr)
+			}
 		}
 	} else {
 		fmt.Fprintln(out, "Removing deploy state (preserving volumes and accessory data)...")

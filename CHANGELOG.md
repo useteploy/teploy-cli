@@ -4,6 +4,17 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [0.1.30] - 2026-08-24
+
+### Fixed
+- `teploy remove` — a crash-looping process (`restarting`) is now stopped
+  before removal instead of aborting the whole remove with docker's "container
+  is restarting" error.
+- `teploy remove --purge` — accessory data owned by the engine's uid (Nucleus:
+  10001) could not be deleted by a non-root deploy user; the purge now falls
+  back to an in-container `rm` as root, matching how the directories were
+  handed over on start.
+
 ## [0.1.29] - 2026-08-24
 
 ### Fixed
