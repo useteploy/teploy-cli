@@ -3,6 +3,8 @@
   <p align="center">Zero-downtime Docker deploys to any server via SSH.<br>Single binary. No management server. No dependencies.</p>
 </p>
 
+teploy-ship opened this pull request as a deployment proof.
+
 <p align="center">
   <a href="https://github.com/useteploy/teploy-cli/releases"><img src="https://img.shields.io/github/v/release/useteploy/teploy-cli" alt="Release"></a>
   <a href="https://github.com/useteploy/teploy-cli/actions"><img src="https://github.com/useteploy/teploy-cli/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
