@@ -11,7 +11,7 @@ type Resolver func(host string) ([]string, error)
 // Validate checks that the domain's DNS A record points at the server IP.
 // Returns nil if any resolved IP matches, or an error with the expected IP.
 // It also returns an error when either name resolves to no addresses.
-// Pass nil for resolve to use the default net.LookupHost.
+// Passing nil for resolve uses the default net.LookupHost.
 func Validate(domain, serverHost string, resolve Resolver) error {
 	if resolve == nil {
 		resolve = net.LookupHost
