@@ -104,3 +104,47 @@ func TestValidate_IPv6Match(t *testing.T) {
 		t.Errorf("expected IPv6 match, got: %v", err)
 	}
 }
+
+func TestValidate_DomainResolvesToNoAddresses(t *testing.T) {
+	resolve := mockResolver(map[string][]string{
+		"1.2.3.4": {"1.2.3.4"},
+	})
+
+	err := Validate("myapp.com", "1.2.3.4", func(host string) ([]string, error) {
+		if host == "1.2.3.4" {
+			return resolve(host)
+		}
+		return nil, nil
+	})
+	if err == nil {
+		t.Fatal("expected error for domain resolving to no addresses")
+	}
+	if !strings.Contains(err.Error(), "could not resolve domain") {
+		t.Errorf("expected resolve error, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "no addresses returned") {
+		t.Errorf("expected no addresses returned message, got: %v", err)
+	}
+}
+
+func TestValidate_ServerResolvesToNoAddresses(t *testing.T) {
+	resolve := mockResolver(map[string][]string{
+		"myapp.com": {"1.2.3.4"},
+	})
+
+	err := Validate("myapp.com", "bad-server.example.com", func(host string) ([]string, error) {
+		if host == "myapp.com" {
+			return resolve(host)
+		}
+		return nil, nil
+	})
+	if err == nil {
+		t.Fatal("expected error for server resolving to no addresses")
+	}
+	if !strings.Contains(err.Error(), "could not resolve server") {
+		t.Errorf("expected resolve error, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "no addresses returned") {
+		t.Errorf("expected no addresses returned message, got: %v", err)
+	}
+}

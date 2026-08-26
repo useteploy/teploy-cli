@@ -20,10 +20,16 @@ func Validate(domain, serverHost string, resolve Resolver) error {
 	if err != nil {
 		return fmt.Errorf("could not resolve domain %s: %w", domain, err)
 	}
+	if len(domainIPs) == 0 {
+		return fmt.Errorf("could not resolve domain %s: no addresses returned", domain)
+	}
 
 	serverIPs, err := resolve(serverHost)
 	if err != nil {
 		return fmt.Errorf("could not resolve server %s: %w", serverHost, err)
+	}
+	if len(serverIPs) == 0 {
+		return fmt.Errorf("could not resolve server %s: no addresses returned", serverHost)
 	}
 
 	for _, dip := range domainIPs {
