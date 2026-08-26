@@ -10,6 +10,20 @@ import (
 	"github.com/useteploy/teploy/internal/ssh"
 )
 
+// The README used to document a `setup --harden` flag that does not exist:
+// hardening is on by default and is skipped with --no-harden. This pins the
+// actual flag surface so the docs and the command cannot drift apart again.
+func TestSetupCmd_HardenFlagNaming(t *testing.T) {
+	cmd := newSetupCmd(&Flags{})
+
+	if cmd.Flags().Lookup("no-harden") == nil {
+		t.Error("setup must register --no-harden (hardening is on by default)")
+	}
+	if cmd.Flags().Lookup("harden") != nil {
+		t.Error("setup must not register --harden; hardening is on by default and skipped with --no-harden")
+	}
+}
+
 func TestSetupServer(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "whoami", Output: "root"},

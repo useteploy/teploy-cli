@@ -107,7 +107,7 @@ standalone.
 | **Templates** | One-command deploys for common self-hosted apps |
 | **Deploy locking** | `teploy lock` — freeze deploys during incidents |
 | **Vulnerability gate** | `scan: true` — Trivy scan blocks deploys on fixable CRITICALs |
-| **Host audit** | `setup --harden` wires auditd + sudo session recording (`ausearch -k teploy-exec`, `sudoreplay`) |
+| **Host audit** | `setup` wires auditd + sudo session recording by default (`ausearch -k teploy-exec`, `sudoreplay`); skip with `--no-harden` |
 | **JIT mesh access** | `teploy network grant --ttl 2h` — time-boxed keys that auto-revoke |
 
 ## Config
