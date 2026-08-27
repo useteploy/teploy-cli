@@ -320,6 +320,16 @@ teploy scale <count>                      # multi-server deploy + LB update
 teploy version / update                   # version info and self-update
 ```
 
+### Environment variables
+
+Server resolution precedence is flags → env vars → `servers.yml`.
+
+| Variable | Description |
+|---|---|
+| `TEPLOY_HOST` | server host used when no server argument or `--host` is given |
+| `TEPLOY_USER` | SSH user; defaults to `root` |
+| `TEPLOY_SSH_KEY` | path to the SSH private key |
+
 ### App lifecycle
 ```
 teploy lock [--message "..."]   # freeze deploys (incident/maintenance)
