@@ -567,6 +567,7 @@ func newAccessoryVerifyBackupCmd(flags *Flags) *cobra.Command {
 		region   string
 		date     string
 		endpoint string
+		local    bool
 	)
 
 	cmd := &cobra.Command{
@@ -581,10 +582,11 @@ func newAccessoryVerifyBackupCmd(flags *Flags) *cobra.Command {
 			"teploy-dash and cron use).\n\n" +
 			"Examples:\n" +
 			"  teploy accessory verify-backup postgres --bucket my-backups\n" +
-			"  teploy accessory verify-backup db --app myapp --host 1.2.3.4 --bucket b --json",
+			"  teploy accessory verify-backup db --app myapp --host 1.2.3.4 --bucket b --json\n" +
+			"  teploy accessory verify-backup nucleus --local --app ship --bucket b --endpoint http://127.0.0.1:9100",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runAccessoryVerifyBackup(flags, appName, args[0], bucket, region, date, endpoint)
+			return runAccessoryVerifyBackup(flags, appName, args[0], bucket, region, date, endpoint, local)
 		},
 	}
 	cmd.Flags().StringVar(&appName, "app", "", "app name — act on server state instead of teploy.yml (requires --host)")
@@ -592,10 +594,11 @@ func newAccessoryVerifyBackupCmd(flags *Flags) *cobra.Command {
 	cmd.Flags().StringVar(&region, "region", "us-east-1", "AWS region")
 	cmd.Flags().StringVar(&endpoint, "endpoint", "", "S3-compatible endpoint URL (MinIO/B2/R2); creds from TEPLOY_S3_ACCESS_KEY/SECRET_KEY or AWS_* env")
 	cmd.Flags().StringVar(&date, "date", "", "backup timestamp to verify (default: latest)")
+	cmd.Flags().BoolVar(&local, "local", false, "run against the local docker host (the mode scheduled cron jobs use; requires --app)")
 	return cmd
 }
 
-func runAccessoryVerifyBackup(flags *Flags, appName, name, bucket, region, date, endpoint string) error {
+func runAccessoryVerifyBackup(flags *Flags, appName, name, bucket, region, date, endpoint string, local bool) error {
 	if bucket == "" {
 		return fmt.Errorf("--bucket is required")
 	}
@@ -614,9 +617,26 @@ func runAccessoryVerifyBackup(flags *Flags, appName, name, bucket, region, date,
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
-	appCfg, executor, err := resolveAppForAccessory(ctx, flags, appName)
-	if err != nil {
-		return err
+	// --local runs on the server itself, exactly as `accessory backup --local`
+	// does. Without it this command was unreachable in the deployment that
+	// needs it most: the backups are taken by a local cron job, and the bucket
+	// they go to is a MinIO bound to 127.0.0.1 — so there is no host for the
+	// SSH path to connect to, and the correctness gate this command exists to
+	// be could not be run against the backups it was meant to check.
+	var appCfg *config.AppConfig
+	var executor ssh.Executor
+	var err error
+	if local {
+		if appName == "" {
+			return fmt.Errorf("--local requires --app (no teploy.yml exists on the server)")
+		}
+		appCfg = &config.AppConfig{App: appName}
+		executor = ssh.NewLocalExecutor()
+	} else {
+		appCfg, executor, err = resolveAppForAccessory(ctx, flags, appName)
+		if err != nil {
+			return err
+		}
 	}
 	defer executor.Close()
 
