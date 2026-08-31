@@ -103,6 +103,14 @@ type LogEntry struct {
 	Success    bool      `json:"success"`
 	DurationMs int64     `json:"duration_ms"`
 	Message    string    `json:"message,omitempty"`
+	// Image the deploy actually ran, when one was known.
+	//
+	// The version alone was not enough: a deploy labelled with a version that
+	// did not come from the image it ran could not be told apart afterwards,
+	// and `teploy log` is exactly where a rollback target gets chosen. Omitted
+	// for entries with no image (heal, lifecycle, static), so old log lines
+	// parse unchanged.
+	Image string `json:"image,omitempty"`
 }
 
 // Read reads canonical v2 state first. A missing v2 file falls back to the

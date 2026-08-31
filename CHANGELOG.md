@@ -4,6 +4,36 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+### Fixed
+
+- `deploy` labelled the deploy with the local git HEAD even when deploying a
+  prebuilt image, so the container name, `teploy log` and the operator's screen
+  all named a commit whose code was not running. Observed as "Deployed version
+  fe82bf0" while running the image tagged `462d7a7`. The version now comes from
+  the image when one is given; `--version` still wins over everything.
+
+  This was never specific to the `--image` flag — a `teploy.yml` pinning a
+  prebuilt image hit the identical problem with no flag passed.
+
+  **Behaviour change:** with an image that carries no usable version (untagged,
+  or `:latest`), `deploy` now labels with a timestamp rather than the git hash.
+  A git hash there asserts a commit that may not be what `:latest` resolves to;
+  a timestamp asserts nothing except uniqueness, which is the honest answer when
+  the reference genuinely does not identify a build. `:latest` is refused
+  outright as a version: reused, it gives every deploy the same container name
+  and leaves `CurrentHash == PreviousHash`, disabling rollback.
+
+- `plan` resolved the target version by the old rule, so it predicted container
+  names `deploy` would not create. It now uses the same resolution.
+
+### Added
+
+- `LogEntry.image`, so `teploy log` records the image a deploy actually ran.
+  The version alone could not be checked against anything, and the log is
+  precisely where a rollback target gets chosen. Omitted for entries with no
+  image (heal, lifecycle, static); old log lines parse unchanged.
+
+
 ### Added
 - `teploy lock status` — report the current deploy lock without touching it.
   Locks were writable from both ends (`deploy` takes an auto lock, `lock` takes

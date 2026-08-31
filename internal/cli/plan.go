@@ -128,18 +128,23 @@ func runPlan(flags *Flags, version string) error {
 		return planStatic(ctx, flags, appCfg, executor)
 	}
 
-	// Resolve the target version exactly as `deploy` does: --version wins, else
-	// the local git short hash. When neither is available (no git repo) but a
-	// pre-built image is configured, deploy falls back to a timestamp — a
-	// non-deterministic version — so we fall back to an indicative diff.
+	// Resolve the target version exactly as `deploy` does — and it has to stay
+	// exactly, or plan predicts container names the deploy will not create.
+	// --version wins; else a prebuilt image supplies it; else the git hash.
+	// A floating tag (:latest, untagged) yields a timestamp at deploy time,
+	// which is non-deterministic, so the diff can only be indicative.
 	versionKnown := true
 	if version == "" {
-		version, err = gitShortHash()
-		if err != nil {
-			if appCfg.Image == "" {
+		if appCfg.Image != "" {
+			version = versionFromImage(appCfg.Image)
+			if version == "" {
+				versionKnown = false
+			}
+		} else {
+			version, err = gitShortHash()
+			if err != nil {
 				return fmt.Errorf("could not determine target version from git: %w (pass --version)", err)
 			}
-			versionKnown = false
 		}
 	}
 

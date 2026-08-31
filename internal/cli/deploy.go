@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"regexp"
 	"strings"
 	"time"
 
@@ -305,13 +306,24 @@ func deployAppConfig(flags *Flags, appCfg *config.AppConfig, serverName, image, 
 	}
 
 	// 4. Resolve version.
+	//
+	// Order matters. An explicit --version always wins. Otherwise, when a
+	// prebuilt image is being deployed, the version comes from THE IMAGE, not
+	// from git: the image is what actually runs, and git HEAD is merely
+	// whatever the operator's working directory happened to be on. Only a
+	// build-from-source deploy falls through to the git hash, which is correct
+	// there because the source and the artifact are the same thing.
 	if version == "" {
-		version, err = gitShortHash()
-		if err != nil {
-			if image != "" {
-				// Pre-built image with no git repo — use a timestamp.
+		if image != "" {
+			version = versionFromImage(image)
+			if version == "" {
+				// A floating or digest-less reference carries no usable
+				// version; a timestamp is at least unique per deploy.
 				version = fmt.Sprintf("%d", time.Now().Unix())
-			} else {
+			}
+		} else {
+			version, err = gitShortHash()
+			if err != nil {
 				return fmt.Errorf("could not determine version from git: %w (use --version flag)", err)
 			}
 		}
@@ -643,6 +655,58 @@ func deployBuiltImage(ctx context.Context, executor ssh.Executor, appCfg *config
 	}
 
 	return nil
+}
+
+// imageTagPattern is Docker's tag grammar. Version strings are interpolated
+// UNQUOTED into remote shell commands via ContainerName (docker rename, docker
+// rm -f), and until now a version could only come from git output or an
+// operator's own --version. Deriving it from an image reference introduces a
+// less-trusted source, so it is gated here rather than trusted.
+var imageTagPattern = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$`)
+
+// versionFromImage derives a deploy version from an image reference, or ""
+// when the reference carries no meaningful one.
+//
+// Why this exists: `teploy deploy --image repo/app:462d7a7` used to label the
+// deploy with the local git HEAD instead — so the container name, `teploy log`
+// and the operator's screen all asserted a commit whose code was not running.
+// Observed in production as "Deployed version fe82bf0" while running the image
+// tagged 462d7a7. During a rollback that is worse than cosmetic: the version
+// someone picks out of the log never corresponded to that image.
+//
+// Note this is NOT specific to the --image flag. The caller resolves
+// `image = appCfg.Image` first, so a teploy.yml pinning a prebuilt image hit
+// the identical problem with no flag passed.
+func versionFromImage(image string) string {
+	// A digest pins exact content, so it is the most truthful label available,
+	// and it wins over any tag beside it: Docker resolves the digest and
+	// ignores the tag, so labelling `repo:1.2.3@sha256:...` as 1.2.3 would be
+	// the same class of lie this function exists to remove.
+	if _, digest, ok := strings.Cut(image, "@"); ok {
+		const prefix = "sha256:"
+		if strings.HasPrefix(digest, prefix) && len(digest) == len(prefix)+64 {
+			// Colons are invalid in a container name, so the prefix is dashed.
+			return "sha256-" + digest[len(prefix):len(prefix)+12]
+		}
+		return ""
+	}
+
+	// The tag follows the last ':', but only when that colon comes after the
+	// last '/' — otherwise a registry port (100.108.123.49:49152/tyler/app)
+	// parses as the tag.
+	tag := ""
+	if i := strings.LastIndex(image, ":"); i > strings.LastIndex(image, "/") {
+		tag = image[i+1:]
+	}
+
+	// "" and "latest" are refused deliberately. A floating tag reused as the
+	// version gives every deploy the same container name AND leaves
+	// CurrentHash == PreviousHash, which disables rollback entirely. The
+	// caller's timestamp fallback is at least unique per deploy.
+	if tag == "" || tag == "latest" || !imageTagPattern.MatchString(tag) {
+		return ""
+	}
+	return tag
 }
 
 // runMultiDeploy handles deploying to multiple servers in parallel.
