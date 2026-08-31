@@ -3,6 +3,7 @@ package backup
 import (
 	"context"
 	"fmt"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -103,6 +104,15 @@ func (c *Client) LatestBackupDate(ctx context.Context, app, name string, s3 S3Co
 // Image and env come from the running container (InspectAccessory), so this
 // works from server state alone — no teploy.yml required, which makes it
 // callable from teploy-dash and from cron.
+// verifyTmpDir is where a verification stages the archive and its extract.
+// Disk-backed by default; see the note at its use site for why /tmp is wrong.
+func verifyTmpDir() string {
+	if d := strings.TrimSpace(os.Getenv("TEPLOY_VERIFY_TMPDIR")); d != "" {
+		return strings.TrimRight(d, "/")
+	}
+	return "/var/tmp"
+}
+
 func (c *Client) VerifyBackup(ctx context.Context, app, name, date string, s3 S3Config) (*VerifyResult, error) {
 	if err := c.ensureAWSCLI(ctx); err != nil {
 		return nil, err
@@ -129,7 +139,16 @@ func (c *Client) VerifyBackup(ctx context.Context, app, name, date string, s3 S3
 	}
 
 	scratch := app + "-" + name + "-verify"
-	tmpBase := fmt.Sprintf("/tmp/teploy-verify-%s-%s", app, name)
+	// /var/tmp, not /tmp. Verifying a backup means writing the whole dataset
+	// to disk twice (the archive, then the extract), and /tmp is a tmpfs on
+	// many distributions — RAM-sized. A 28 GB Nucleus accessory against a
+	// 15 GB tmpfs failed here with "tar: Wrote only 2560 of 10240 bytes",
+	// which reads like a corrupt archive and is not: the archive was fine and
+	// the target was full. /var/tmp is disk-backed by convention and survives
+	// the cleanup semantics we want. TEPLOY_VERIFY_TMPDIR overrides it for
+	// hosts that keep their space somewhere else.
+	tmpDir := verifyTmpDir()
+	tmpBase := fmt.Sprintf("%s/teploy-verify-%s-%s", tmpDir, app, name)
 
 	// Always clean up, pass or fail — a leftover scratch container must never
 	// survive a verification run. Covers every per-type artifact: the
