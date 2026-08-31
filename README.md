@@ -105,7 +105,7 @@ standalone.
 | **Notifications** | Webhook notifications on deploy/rollback/failure |
 | **Backups** | `teploy backup` — volumes to S3 |
 | **Templates** | One-command deploys for common self-hosted apps |
-| **Deploy locking** | `teploy lock` — freeze deploys during incidents |
+| **Deploy locking** | `teploy lock` — freeze deploys during incidents; `teploy lock status --json` reports who holds the lock |
 | **Vulnerability gate** | `scan: true` — Trivy scan blocks deploys on fixable CRITICALs |
 | **Host audit** | `setup` wires auditd + sudo session recording by default (`ausearch -k teploy-exec`, `sudoreplay`); skip with `--no-harden` |
 | **JIT mesh access** | `teploy network grant --ttl 2h` — time-boxed keys that auto-revoke |
@@ -323,6 +323,7 @@ teploy version / update                   # version info and self-update
 ### App lifecycle
 ```
 teploy lock [--message "..."]   # freeze deploys (incident/maintenance)
+teploy lock status [--json]     # report the current lock, read-only (deploy running? frozen? stale?)
 teploy unlock                   # release deploy lock
 teploy maintenance on / off     # toggle 503 maintenance page
 teploy pin [version]            # protect a version from keep_versions pruning (default: current)

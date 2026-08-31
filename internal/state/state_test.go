@@ -550,3 +550,36 @@ func TestEnsureAppDir(t *testing.T) {
 		t.Errorf("expected mkdir -p command, got: %s", mock.Calls[0])
 	}
 }
+
+// TestLockInfoIsStale pins the staleness judgement `teploy lock status`
+// reports to the same TTLs AcquireLock breaks locks by — a manual freeze is
+// never stale at any age, and heal's ceiling is minutes, not the auto
+// half-hour.
+func TestLockInfoIsStale(t *testing.T) {
+	ts := func(age time.Duration) string {
+		return time.Now().UTC().Add(-age).Format(time.RFC3339)
+	}
+
+	tests := []struct {
+		name string
+		info *LockInfo
+		want bool
+	}{
+		{"no lock", nil, false},
+		{"fresh auto", &LockInfo{Type: "auto", TS: ts(time.Minute)}, false},
+		{"stale auto", &LockInfo{Type: "auto", TS: ts(2 * staleLockTTL)}, true},
+		{"fresh heal", &LockInfo{Type: "heal", TS: ts(10 * time.Second)}, false},
+		{"stale heal", &LockInfo{Type: "heal", TS: ts(2 * staleHealLockTTL)}, true},
+		{"heal older than its TTL but younger than auto's", &LockInfo{Type: "heal", TS: ts(10 * time.Minute)}, true},
+		{"manual is never stale", &LockInfo{Type: "manual", TS: ts(100 * staleLockTTL)}, false},
+		{"unparseable timestamp", &LockInfo{Type: "auto", TS: "not-a-time"}, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.info.IsStale(); got != tt.want {
+				t.Errorf("IsStale() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}

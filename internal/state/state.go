@@ -380,6 +380,25 @@ func ReadLock(ctx context.Context, exec ssh.Executor, app string) (*LockInfo, er
 	return &info, nil
 }
 
+// IsStale reports whether a lock is old enough that whatever took it is
+// presumed dead — the same judgement AcquireLock makes before breaking one,
+// exported so readers (`teploy lock status`) can report staleness without
+// restating the TTLs. Manual locks are never stale: they are an explicit
+// freeze with no expiry, and are never auto-broken at any age.
+func (l *LockInfo) IsStale() bool {
+	if l == nil {
+		return false
+	}
+	switch l.Type {
+	case "manual":
+		return false
+	case "heal":
+		return isHealStale(l.TS)
+	default:
+		return isStale(l.TS)
+	}
+}
+
 // AcquireLock acquires the deploy lock for an app using atomic mkdir.
 // Returns an error if a lock already exists (another deploy in progress or
 // manual freeze) and isn't stale (see staleLockTTL).

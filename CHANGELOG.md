@@ -4,6 +4,27 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+### Added
+- `teploy lock status` — report the current deploy lock without touching it.
+  Locks were writable from both ends (`deploy` takes an auto lock, `lock` takes
+  a manual one, `unlock` releases) but readable from neither: nothing could ask
+  whether one was held. So "a deploy is running", "a human froze deploys" and
+  "a deploy crashed and left its lock behind" were indistinguishable from the
+  outside — the last of which self-heals on the next deploy and needs no
+  intervention at all, while the middle one needs a person.
+
+  Read-only: it never creates, refreshes or releases a lock, not even the app
+  directory (`teploy lock` calls `EnsureAppDir` first; this doesn't). Staleness
+  comes from the same TTLs `AcquireLock` breaks locks by — 30 minutes for auto,
+  2 minutes for heal, never for manual — via a new exported
+  `state.LockInfo.IsStale`, so the report can't drift from the behaviour it
+  describes. Exits 0 whether or not a lock is held; a held lock is a state to
+  report, not a command failure. `--json` emits
+  `{app, server, locked, type, user, message, since, stale}` with `locked` and
+  `stale` always present, which is what lets CI ask "is a deploy running?"
+  without parsing prose or shelling out to `pgrep`. Supports `--app`/`--host`
+  like `lock` and `unlock`, so it works with no `teploy.yml` on disk.
+
 ## [0.1.30] - 2026-08-24
 
 ### Fixed
