@@ -359,6 +359,11 @@ func runAccessoryUpgrade(flags *Flags, name, newImage string) error {
 	return mgr.Upgrade(ctx, appCfg.App, name, newImage, accCfg)
 }
 
+// serverTeployPath is where the CLI installs itself on a server for scheduled
+// jobs, and therefore the path any generated cron line must invoke. cron's
+// default PATH is /usr/bin:/bin, which does not include /usr/local/bin.
+const serverTeployPath = "/usr/local/bin/teploy"
+
 func newAccessoryBackupCmd(flags *Flags) *cobra.Command {
 	var (
 		bucket   string
@@ -463,8 +468,15 @@ func runAccessoryBackup(flags *Flags, appName, name, bucket, region, endpoint, s
 		// The scheduled job runs ON the server: --local --app makes it
 		// self-contained (no teploy.yml server-side), reading accessory
 		// config from the running container.
-		backupCmd := fmt.Sprintf("teploy accessory backup %s --local --app %s --bucket %s --region %s",
-			name, app, bucket, region)
+		// serverTeployPath, not a bare "teploy": cron runs with PATH=/usr/bin:/bin
+		// and the binary is installed to /usr/local/bin (below), so a bare name
+		// resolves to nothing. That failed silently every night — the job has no
+		// output redirect, so "command not found" went to a mailbox nobody reads.
+		// Found live 2026-08-31: a nightly accessory backup scheduled on 2026-07-12
+		// had produced its last artifact on 2026-07-13, and the two that existed
+		// were made by hand at setup. The schedule had never once run.
+		backupCmd := fmt.Sprintf("%s accessory backup %s --local --app %s --bucket %s --region %s",
+			serverTeployPath, name, app, bucket, region)
 		if endpoint != "" {
 			// Cron has no TEPLOY_S3_* env — embed endpoint + creds in the
 			// crontab line (root-only readable, same trust class as
@@ -474,7 +486,7 @@ func runAccessoryBackup(flags *Flags, appName, name, bucket, region, endpoint, s
 		}
 		// The cron job needs the teploy binary on the server; ship it via
 		// the existing checksum-verified pipeline (same as heal/autodeploy).
-		if _, err := deployTeployBinaryToServer(ctx, executor, "/usr/local/bin/teploy"); err != nil {
+		if _, err := deployTeployBinaryToServer(ctx, executor, serverTeployPath); err != nil {
 			return fmt.Errorf("installing teploy binary for the scheduled job: %w", err)
 		}
 		if err := client.SetSchedule(ctx, schedule, backupCmd, "teploy-accessory-backup:"+app+":"+name); err != nil {
