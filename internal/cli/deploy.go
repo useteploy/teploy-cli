@@ -1156,22 +1156,60 @@ func healthConfigFrom(h config.AppHealthConfig) deploy.HealthConfig {
 	}
 }
 
+// isDigestPinned reports whether an image reference is content-addressed
+// (`repo@sha256:...`). Such a reference names exactly one set of bytes forever,
+// so a local copy of it can never be out of date. Everything else — every tag,
+// and a bare repo (which Docker resolves to `:latest`) — is mutable: the
+// registry can move it under us at any time, and "looks like a git sha" is a
+// convention nothing enforces, so tags are not special-cased here.
+func isDigestPinned(image string) bool {
+	i := strings.LastIndex(image, "@")
+	if i < 0 {
+		return false
+	}
+	digest := image[i+1:]
+	sep := strings.Index(digest, ":")
+	return sep > 0 && sep < len(digest)-1
+}
+
 // ensureImage makes a pre-built image available on the server before it's used
-// to run containers. If the image is already in the server's local cache
-// (built or `docker load`ed out of band — including images that exist in no
-// registry) the pull is skipped; otherwise it's pulled from its registry,
-// preserving the original pull-on-miss behavior for real registry images.
+// to run containers.
+//
+// A digest-pinned reference already on the server is used as-is. Anything else
+// is pulled every deploy, even when a copy is already cached locally.
+//
+// DO NOT "optimise" that pull back out. Skipping it whenever the image existed
+// locally is exactly what shipped five-day-old code to production: an app whose
+// teploy.yml named an untagged registry image (so `:latest`) had a `:latest`
+// already on the host, CI kept pushing newer ones, and teploy never pulled —
+// every deploy started a container named after the new commit, passed its health
+// check and reported success while serving the 28 Aug build. Nothing could see
+// it: the container name is a label we write, so `docker ps` agrees with us, and
+// `teploy drift` compares live state to deploy state by name, so it agrees too.
+// A `docker pull` on an already-current tag is a manifest check, not a
+// re-download — the cost is one round trip, not a layer transfer.
+//
+// The local cache still covers the out-of-band case the skip was added for
+// (images built or `docker load`ed on the server that exist in no registry):
+// when the pull fails and a copy is present we fall back to it, but say so, so
+// "pulled fresh" is never confused with "registry unreachable, using what's
+// already here".
 func ensureImage(ctx context.Context, dk *docker.Client, image string, out io.Writer) error {
 	exists, err := dk.ImageExists(ctx, image)
 	if err != nil {
 		return err
 	}
-	if exists {
-		fmt.Fprintf(out, "  Using local image %s\n", image)
+	if exists && isDigestPinned(image) {
+		fmt.Fprintf(out, "  Using local image %s (digest-pinned, cannot be stale)\n", image)
 		return nil
 	}
 	fmt.Fprintf(out, "Pulling image %s...\n", image)
 	if err := dk.Pull(ctx, image); err != nil {
+		if exists {
+			fmt.Fprintf(out, "  WARNING: pull failed (%v)\n", err)
+			fmt.Fprintf(out, "  Falling back to the local copy of %s — it may be older than the registry\n", image)
+			return nil
+		}
 		return fmt.Errorf("image not found or registry auth failed: %w", err)
 	}
 	fmt.Fprintln(out, "  Image pulled")
