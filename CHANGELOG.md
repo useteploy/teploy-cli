@@ -2,7 +2,69 @@
 
 All notable changes to teploy are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [0.1.33] - 2026-09-01
+
+### Fixed
+
+- **`deploy` served a stale image whenever one was already on the server.**
+  `ensureImage` skipped `docker pull` any time the image existed in the host's
+  local cache, which treated a mutable tag exactly like an immutable one.
+  Observed live: an app whose `teploy.yml` named a registry image with no tag
+  (so `:latest`) had a `:latest` already on the host; CI pushed a fresh
+  `:latest` for five days and teploy never pulled one of them. Every deploy
+  started a container named after the newer commit, passed its health check and
+  reported success while production served the build from five days earlier.
+  Nothing could catch it from the outside — the container name is a label teploy
+  writes, so `docker ps` agreed, and `teploy drift` compares live state to deploy
+  state by name, so it agreed too. A later manual `docker pull` reported
+  "Downloaded newer image".
+
+  Now only a **digest-pinned** reference (`repo@sha256:...`) is served from the
+  local cache, because it is content-addressed and cannot move. Every tag, and a
+  bare repo, is pulled on every deploy. A tag that looks like a git sha is still
+  mutable by convention only, so it is not special-cased. The cost is a manifest
+  check, not a re-download.
+
+  The out-of-band case the skip was added for — an image built or `docker
+  load`ed on the server that exists in no registry — still works: when the pull
+  fails and a copy is present, the deploy falls back to it and says so
+  (`WARNING: pull failed ...` / `Falling back to the local copy ... it may be
+  older than the registry`), so "pulled fresh" can never be mistaken for
+  "registry unreachable, using what was already here". A failed pull with
+  nothing cached is still an error. Only `ensureImage` had this shape; the
+  other pull sites (`singledeploy`, `autodeploy serve`, `accessory upgrade`)
+  already pulled unconditionally.
+
+- `accessory backup --schedule` generated a cron line calling a bare `teploy`
+  while installing the binary to `/usr/local/bin`, which is not on cron's
+  `PATH=/usr/bin:/bin`. The job was listed by `crontab -l`, cron was running,
+  and it had never executed once in 48 days. The generated line carries no
+  output redirect, so the failure went nowhere. The cron entry now uses the
+  absolute path.
+
+- `accessory verify-backup` had no `--local`, so it could not be pointed at the
+  backups it exists to prove — the nightly jobs run as a local cron job writing
+  to a MinIO on `127.0.0.1`, where there is no host for the SSH path to reach.
+
+- `accessory verify-backup` staged both the downloaded archive and its extract
+  in `/tmp`, a tmpfs on most distributions and therefore sized by RAM. A 28 GB
+  dataset on a host with a 15 GB `/tmp` failed with `tar: Wrote only 2560 of
+  10240 bytes`, which reads as a corrupt archive and was not. Staging moved to
+  the disk-backed `/var/tmp`; `TEPLOY_VERIFY_TMPDIR` overrides it.
+
+### Added
+
+- `teploy secret rm KEY [KEY...]` — delete secrets from the local age store.
+  `secret` had get/list/put/rotate/set/setup/status/audit/db and no way to
+  remove anything, so a key that had to go away (a revoked vendor credential, a
+  retired integration) could only be overwritten with a dummy value and stayed
+  injected into every container. Reports each key as removed or as never set;
+  a key that is not set is not an error, so re-running a revocation is safe.
+  Local store only — `--provider openbao` is refused with a clear message
+  rather than silently removing nothing, since versioned-KV delete/destroy is
+  not the local store's unlink.
+
+## [0.1.32] - 2026-08-31
 
 ### Fixed
 
@@ -33,8 +95,10 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
   precisely where a rollback target gets chosen. Omitted for entries with no
   image (heal, lifecycle, static); old log lines parse unchanged.
 
+## [0.1.31] - 2026-08-31
 
 ### Added
+
 - `teploy lock status` — report the current deploy lock without touching it.
   Locks were writable from both ends (`deploy` takes an auto lock, `lock` takes
   a manual one, `unlock` releases) but readable from neither: nothing could ask
