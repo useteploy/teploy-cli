@@ -338,6 +338,7 @@ teploy env get KEY                 # read env var
 teploy env list [--reveal]         # list env vars (masked by default)
 teploy env unset KEY               # remove env var
 teploy secret set KEY <value>      # encrypted secret
+teploy secret rm KEY               # delete an encrypted secret (local store)
 teploy secret get / list / rotate  # secret management
 ```
 
@@ -436,6 +437,7 @@ least-privilege access in one command. Select it with `--provider openbao` or
 teploy secret set KEY=value                 # local (age) — the default provider
 teploy secret set KEY=value --provider openbao
 teploy secret get / list --provider openbao # same verbs, managed backend
+teploy secret rm KEY                        # local store only; openbao is refused
 
 teploy secret setup                          # provision + auto-unseal OpenBao (idempotent)
 teploy secret setup --replicas 3             # HA: a 3-node Raft quorum

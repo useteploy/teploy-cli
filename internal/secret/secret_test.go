@@ -3,6 +3,7 @@ package secret
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/useteploy/teploy/internal/ssh"
@@ -127,5 +128,51 @@ func TestEnsureAge_AlreadyInstalled(t *testing.T) {
 
 	if len(mock.Calls) != 1 {
 		t.Errorf("expected 1 call (which age), got %d", len(mock.Calls))
+	}
+}
+
+func TestRemove(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "test -f '/deployments/myapp/secrets/DB_PASS.age'", Output: ""},
+		ssh.MockCommand{Match: "rm -f '/deployments/myapp/secrets/DB_PASS.age'", Output: ""},
+	)
+
+	mgr := NewManager(mock)
+	removed, err := mgr.Remove(context.Background(), "myapp", "DB_PASS")
+	if err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+	if !removed {
+		t.Error("Remove reported nothing removed for an existing secret")
+	}
+
+	found := false
+	for _, call := range mock.Calls {
+		if strings.HasPrefix(call, "rm -f ") {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("expected the secret file to be deleted")
+	}
+}
+
+func TestRemove_NotSet(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "test -f '/deployments/myapp/secrets/GONE.age'", Err: fmt.Errorf("exit status 1")},
+	)
+
+	mgr := NewManager(mock)
+	removed, err := mgr.Remove(context.Background(), "myapp", "GONE")
+	if err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+	if removed {
+		t.Error("Remove reported a removal for a secret that was never set")
+	}
+	for _, call := range mock.Calls {
+		if strings.HasPrefix(call, "rm -f ") {
+			t.Errorf("unexpected delete for a missing secret: %q", call)
+		}
 	}
 }

@@ -156,6 +156,21 @@ func (m *Manager) List(ctx context.Context, app string) ([]string, error) {
 	return keys, nil
 }
 
+// Remove deletes a secret from the server. The bool reports whether a secret
+// was actually there to delete, so callers can tell "removed" from "was never
+// set" — deleting a revoked credential that turns out not to exist is worth
+// saying out loud rather than reporting a removal that did nothing.
+func (m *Manager) Remove(ctx context.Context, app, key string) (bool, error) {
+	path := secretPath(app, key)
+	if _, err := m.exec.Run(ctx, "test -f "+ssh.ShellQuote(path)); err != nil {
+		return false, nil
+	}
+	if _, err := m.exec.Run(ctx, "rm -f "+ssh.ShellQuote(path)); err != nil {
+		return false, fmt.Errorf("removing secret %s: %w", key, err)
+	}
+	return true, nil
+}
+
 // Rotate generates a new random value for a key and re-encrypts it.
 // Returns the new value.
 func (m *Manager) Rotate(ctx context.Context, app, key string) (string, error) {

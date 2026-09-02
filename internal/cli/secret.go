@@ -37,6 +37,7 @@ tamper-evident audit trail.`,
 	cmd.AddCommand(newSecretSetCmd(flags, &provider))
 	cmd.AddCommand(newSecretGetCmd(flags, &provider))
 	cmd.AddCommand(newSecretListCmd(flags, &provider))
+	cmd.AddCommand(newSecretRmCmd(flags, &provider))
 	cmd.AddCommand(newSecretRotateCmd(flags))
 	// Managed-provider (OpenBao) operations live under `secret` too.
 	addOpenbaoSecretCommands(cmd, flags, &provider)
@@ -211,6 +212,65 @@ func runSecretList(flags *Flags, providerFlag string) error {
 	}
 	for _, k := range keys {
 		fmt.Printf("%s=***\n", k)
+	}
+	return nil
+}
+
+func newSecretRmCmd(flags *Flags, provider *string) *cobra.Command {
+	return &cobra.Command{
+		Use:   "rm KEY [KEY...]",
+		Short: "Delete one or more secrets",
+		Long: `Delete secrets from the local age-encrypted store. Until this existed a key
+that had to go away — a revoked vendor credential, a retired integration — could
+only be overwritten with a dummy value, leaving it still injected into every
+container.
+
+A key that is not set is reported as such and is not an error, so re-running the
+removal of an already-revoked credential is safe. Containers keep the old value
+in their environment until they are restarted.`,
+		Args: cobra.MinimumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runSecretRm(flags, *provider, args)
+		},
+	}
+}
+
+func runSecretRm(flags *Flags, providerFlag string, keys []string) error {
+	appCfg, err := config.LoadApp(".")
+	if err != nil {
+		return err
+	}
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer cancel()
+	executor, err := connectForApp(ctx, flags, appCfg)
+	if err != nil {
+		return err
+	}
+	defer executor.Close()
+
+	// OpenBao deletion is a versioned-KV operation with its own destroy/undelete
+	// semantics and needs the accessory's root token; it isn't the local store's
+	// unlink. Refuse it outright rather than silently removing nothing.
+	if resolveProvider(providerFlag, appCfg) == providerOpenbao {
+		return fmt.Errorf("secret rm is not supported for provider openbao — delete the path with the bao CLI against the %s accessory", resolveVaultAccessory(appCfg.Secret.Accessory))
+	}
+
+	mgr := secret.NewManager(executor)
+	removed := 0
+	for _, key := range keys {
+		ok, err := mgr.Remove(ctx, appCfg.App, key)
+		if err != nil {
+			return err
+		}
+		if ok {
+			removed++
+			fmt.Printf("  Removed secret %s\n", key)
+			continue
+		}
+		fmt.Printf("  No secret %s set — nothing to remove\n", key)
+	}
+	if removed > 0 {
+		fmt.Println("  (Restart containers to drop the value from their environment)")
 	}
 	return nil
 }
