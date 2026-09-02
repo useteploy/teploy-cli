@@ -160,8 +160,7 @@ func (s *singleServerDeployer) deployApp(ctx context.Context, appCfg *config.App
 	// (deployAppConfig). Without it, redeploying an app first launched with a
 	// Docker named volume / foreign bind mount would silently create empty
 	// mounts and orphan the data. This runs on EVERY server of a multi-server
-	// deploy (previously it only ran on the single-server path — see the old
-	// TODO(autodeploy/multideploy)).
+	// deploy; it used to run only on the single-server path.
 	if len(volumes) > 0 {
 		dockerClient := docker.NewClient(s.exec)
 		mismatches, err := dockerClient.DetectVolumeMismatches(ctx, appCfg.App, volumes)
