@@ -54,7 +54,7 @@ scoop install teploy
   cd - >/dev/null; rm -rf "$tmp"
 )
 
-# From source
+# From source (needs Go 1.25 or newer)
 go install github.com/useteploy/teploy/cmd/teploy@latest
 ```
 
