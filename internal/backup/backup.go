@@ -183,15 +183,38 @@ func extractToStagingThenPromote(ctx context.Context, exec ssh.Executor, archive
 	}
 
 	fmt.Fprintf(out, "Restoring to %s...\n", liveDir)
-	// find -mindepth 1 -delete clears liveDir's contents without removing
-	// liveDir itself, which matters when it's a docker bind-mount target.
-	promoteCmd := fmt.Sprintf("mkdir -p %s && find %s -mindepth 1 -delete && cp -a %s/. %s/",
-		ssh.ShellQuote(liveDir), ssh.ShellQuote(liveDir), ssh.ShellQuote(stageDir), ssh.ShellQuote(liveDir))
+	// The promote used to clear liveDir (find -mindepth 1 -delete) before the
+	// fallible cp -a, so a mid-copy failure destroyed the live data — and
+	// cleanup() then rm -rf'd the staging dir, the only remaining copy of
+	// either version. Instead: move the current contents aside to a sibling
+	// recovery dir, copy the staged contents in, and only delete the recovery
+	// dir once the copy fully succeeded. On copy failure the old contents are
+	// moved back; if that rollback fails too, both the recovery dir and the
+	// staging dir are kept and named in the error. liveDir itself is never
+	// removed or moved, which matters when it's a docker bind-mount target.
+	if _, err := exec.Run(ctx, "mkdir -p "+ssh.ShellQuote(liveDir)); err != nil {
+		return fmt.Errorf("preparing %s: %w", liveDir, err)
+	}
+	recoveryOut, err := exec.Run(ctx, "mktemp -d "+ssh.ShellQuote(liveDir)+".restore-old.XXXXXX")
+	if err != nil {
+		return fmt.Errorf("creating recovery directory for %s: %w", liveDir, err)
+	}
+	recoveryDir := strings.TrimSpace(recoveryOut)
+	promoteCmd := fmt.Sprintf("find %s -mindepth 1 -maxdepth 1 -exec mv -t %s -- {} + && cp -a %s/. %s/",
+		ssh.ShellQuote(liveDir), ssh.ShellQuote(recoveryDir), ssh.ShellQuote(stageDir), ssh.ShellQuote(liveDir))
 	if _, err := exec.Run(ctx, promoteCmd); err != nil {
-		cleanup()
-		return fmt.Errorf("promoting staged restore into %s: %w", liveDir, err)
+		rollbackCmd := fmt.Sprintf("find %s -mindepth 1 -delete && find %s -mindepth 1 -maxdepth 1 -exec mv -t %s -- {} +",
+			ssh.ShellQuote(liveDir), ssh.ShellQuote(recoveryDir), ssh.ShellQuote(liveDir))
+		if _, rbErr := exec.Run(context.WithoutCancel(ctx), rollbackCmd); rbErr != nil {
+			return fmt.Errorf("promoting staged restore into %s: %w — rollback failed too; previous contents kept in %s, staged restore kept in %s",
+				liveDir, err, recoveryDir, stageDir)
+		}
+		exec.Run(context.WithoutCancel(ctx), "rm -rf "+ssh.ShellQuote(recoveryDir))
+		return fmt.Errorf("promoting staged restore into %s: %w — previous contents restored, staged restore kept in %s",
+			liveDir, err, stageDir)
 	}
 
+	exec.Run(ctx, "rm -rf "+ssh.ShellQuote(recoveryDir))
 	cleanup()
 	return nil
 }

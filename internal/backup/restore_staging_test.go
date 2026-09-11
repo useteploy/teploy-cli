@@ -21,6 +21,8 @@ func TestRestoreVolumes_StagesBeforePromoting(t *testing.T) {
 		ssh.MockCommand{Match: "aws s3 cp", Output: "download: done\n"},
 		ssh.MockCommand{Match: "rm -rf", Output: ""},
 		ssh.MockCommand{Match: "mkdir -p", Output: ""},
+		ssh.MockCommand{Match: "mktemp -d", Output: "/deployments/myapp/volumes.restore-old.abc123\n"},
+		ssh.MockCommand{Match: "find ", Output: ""},
 	)
 
 	var buf bytes.Buffer
@@ -37,7 +39,7 @@ func TestRestoreVolumes_StagesBeforePromoting(t *testing.T) {
 		if strings.Contains(call, "tar -xzf") {
 			stageExtract = call
 		}
-		if strings.Contains(call, "-mindepth 1 -delete") {
+		if strings.Contains(call, "cp -a") && strings.Contains(call, "mv -t") {
 			promote = call
 		}
 	}
@@ -47,8 +49,11 @@ func TestRestoreVolumes_StagesBeforePromoting(t *testing.T) {
 	if strings.Contains(stageExtract, "/deployments/myapp/volumes") {
 		t.Errorf("extraction must not target the live volumes directory directly: %s", stageExtract)
 	}
-	if promote == "" || !strings.Contains(promote, "cp -a") || !strings.Contains(promote, "/deployments/myapp/volumes") {
-		t.Errorf("expected a promote step (clear + copy) into the live volumes directory, got calls: %v", mock.Calls)
+	if promote == "" || !strings.Contains(promote, "/deployments/myapp/volumes") {
+		t.Errorf("expected a promote step (aside + copy) into the live volumes directory, got calls: %v", mock.Calls)
+	}
+	if !strings.Contains(promote, "restore-old.abc123") {
+		t.Errorf("promote must move live contents aside to the recovery directory: %s", promote)
 	}
 }
 
@@ -80,6 +85,8 @@ func TestAccessoryRestore_GenericStagesBeforePromoting(t *testing.T) {
 		ssh.MockCommand{Match: "aws s3 cp", Output: "download: done\n"},
 		ssh.MockCommand{Match: "rm -rf", Output: ""},
 		ssh.MockCommand{Match: "mkdir -p", Output: ""},
+		ssh.MockCommand{Match: "mktemp -d", Output: "/deployments/myapp/accessories/cache.restore-old.abc123\n"},
+		ssh.MockCommand{Match: "find ", Output: ""},
 	)
 
 	var buf bytes.Buffer
@@ -97,7 +104,7 @@ func TestAccessoryRestore_GenericStagesBeforePromoting(t *testing.T) {
 		if strings.Contains(call, "tar -xzf") {
 			stageExtract = call
 		}
-		if strings.Contains(call, "-mindepth 1 -delete") {
+		if strings.Contains(call, "cp -a") && strings.Contains(call, "mv -t") {
 			promote = call
 		}
 	}
