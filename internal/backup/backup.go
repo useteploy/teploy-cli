@@ -440,7 +440,12 @@ func (c *Client) SetSchedule(ctx context.Context, schedule, command, marker stri
 	// brackets make the token uniquely terminable: `[teploy-backup:web]` is not
 	// a substring of `[teploy-backup:web-staging]`.
 	tag := "[" + marker + "]"
-	line := fmt.Sprintf("%s %s # %s", schedule, command, tag)
+	// cron treats the first unescaped % in the command as the start of the
+	// job's stdin (effectively a newline): a command containing
+	// `$(date +%Y%m%d-…)` was truncated at the first % and never ran past
+	// it. Escape every % in the COMMAND portion — the schedule and the
+	// marker are % free — so cron passes them through literally.
+	line := fmt.Sprintf("%s %s # %s", schedule, strings.ReplaceAll(command, "%", "\\%"), tag)
 	cmd := fmt.Sprintf(
 		`(crontab -l 2>/dev/null | grep -vF %s; printf '%%s\n' %s) | crontab -`,
 		ssh.ShellQuote(tag), ssh.ShellQuote(line),

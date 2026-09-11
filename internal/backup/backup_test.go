@@ -325,6 +325,47 @@ func TestAccessoryBackup_Generic(t *testing.T) {
 	}
 }
 
+// teploy-cli-10: cron treats the first unescaped % in a command as a
+// newline/stdin marker, so the scheduled backup's `$(date +%Y%m%d-…)`
+// truncated the job at the %. The installed line must escape the command's
+// % signs while leaving the marker comment (and its grep -vF dedup) intact.
+func TestSetSchedule_EscapesPercentForCron(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "(crontab -l", Output: ""},
+	)
+
+	var buf bytes.Buffer
+	client := NewClient(mock, &buf)
+	command := "tar -czf /tmp/app-backup-$(date +%Y%m%d-%H%M%S).tar.gz -C /deployments/app/volumes . && aws s3 cp /tmp/app-backup-*.tar.gz s3://b/app/volumes/"
+	if err := client.SetSchedule(context.Background(), "0 3 * * *", command, "teploy-backup:myapp"); err != nil {
+		t.Fatalf("SetSchedule: %v", err)
+	}
+
+	var installed string
+	for _, call := range mock.Calls {
+		if strings.Contains(call, "crontab -") {
+			installed = call
+		}
+	}
+	if installed == "" {
+		t.Fatal("expected a crontab install command")
+	}
+	if !strings.Contains(installed, `$(date +\%Y\%m\%d-\%H\%M\%S)`) {
+		t.Errorf("installed line must escape %% in the command portion:\n%s", installed)
+	}
+	if !strings.Contains(installed, "grep -vF '[teploy-backup:myapp]'") {
+		t.Errorf("marker dedup must survive escaping:\n%s", installed)
+	}
+	if !strings.Contains(installed, `# [teploy-backup:myapp]'`) {
+		t.Errorf("marker comment must stay intact:\n%s", installed)
+	}
+	// No raw, unescaped % may remain in the command portion of the line.
+	if unquoted := strings.ReplaceAll(installed, `\%`, ""); strings.Count(unquoted, `%`) != 1 {
+		// exactly one % left: the printf format itself
+		t.Errorf("line contains raw %% outside the printf format:\n%s", installed)
+	}
+}
+
 func TestListBackups(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
