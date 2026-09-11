@@ -194,6 +194,47 @@ func TestAccessoryBackup_MySQL(t *testing.T) {
 	}
 }
 
+// teploy-cli-06: the redis backup assumed BGSAVE finishes within a fixed
+// `sleep 2`; a slow snapshot copied the previous dump.rdb instead. The dump
+// command must capture LASTSAVE before bgsave and poll until it changes.
+func TestAccessoryBackup_RedisWaitsForBgsave(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
+		ssh.MockCommand{Match: "ls=$(docker exec", Output: ""},
+		ssh.MockCommand{Match: "aws s3 cp", Output: "done\n"},
+		ssh.MockCommand{Match: "rm -f", Output: ""},
+	)
+
+	var buf bytes.Buffer
+	client := NewClient(mock, &buf)
+	err := client.AccessoryBackup(context.Background(), "myapp", "redis", "redis:7", nil, S3Config{
+		Bucket: "my-bucket",
+		Region: "us-east-1",
+	})
+	if err != nil {
+		t.Fatalf("AccessoryBackup: %v", err)
+	}
+
+	var dumpCmd string
+	for _, call := range mock.Calls {
+		if strings.Contains(call, "bgsave") {
+			dumpCmd = call
+		}
+	}
+	if dumpCmd == "" {
+		t.Fatal("expected a redis dump command")
+	}
+	if i, j := strings.Index(dumpCmd, "lastsave"), strings.Index(dumpCmd, "bgsave"); i < 0 || j < 0 || i > j {
+		t.Errorf("LASTSAVE must be captured before bgsave:\n%s", dumpCmd)
+	}
+	if !strings.Contains(dumpCmd, `lastsave)" != "$ls"`) || !strings.Contains(dumpCmd, "seq 1 60") {
+		t.Errorf("expected a LASTSAVE poll loop (up to 60s) before docker cp:\n%s", dumpCmd)
+	}
+	if strings.Contains(dumpCmd, "sleep 2") {
+		t.Errorf("fixed sleep assumes bgsave finishes in 2s:\n%s", dumpCmd)
+	}
+}
+
 // teploy-cli-04: the restore pipelines (`gunzip -c X | docker exec -i ...
 // psql ...`) only reported the LAST command's exit status — psql without
 // ON_ERROR_STOP exits 0 on SQL errors, and a failed gunzip alone fed the

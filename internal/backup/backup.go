@@ -278,11 +278,19 @@ func (c *Client) AccessoryBackup(ctx context.Context, app, name, image string, e
 		dumpCmd = fmt.Sprintf("docker exec %s mongodump --archive --gzip > %s", qContainer, ssh.ShellQuote(dumpPath))
 		s3Key = fmt.Sprintf("s3://%s/%s/accessories/%s/%s.archive.gz", s3.Bucket, app, name, timestamp)
 	case isDBType(image, "redis"):
-		// Redis: trigger bgsave then copy dump.rdb.
+		// Redis: trigger bgsave, wait for it to finish, then copy
+		// dump.rdb. The old fixed `sleep 2` assumed every snapshot
+		// completes in two seconds; on a slow one docker cp grabbed the
+		// PREVIOUS dump. LASTSAVE changes exactly when a save completes,
+		// so capture it before bgsave and poll (up to 60s) until it
+		// moves.
 		redisTmp := fmt.Sprintf("/tmp/%s-redis.rdb", app)
 		dumpCmd = fmt.Sprintf(
-			"docker exec %s redis-cli bgsave && sleep 2 && docker cp %s:/data/dump.rdb %s && gzip -c %s > %s && rm -f %s",
-			qContainer, qContainer, ssh.ShellQuote(redisTmp), ssh.ShellQuote(redisTmp), ssh.ShellQuote(dumpPath), ssh.ShellQuote(redisTmp),
+			"ls=$(docker exec %s redis-cli lastsave); docker exec %s redis-cli bgsave; "+
+				"for i in $(seq 1 60); do [ \"$(docker exec %s redis-cli lastsave)\" != \"$ls\" ] && break; sleep 1; done && "+
+				"docker cp %s:/data/dump.rdb %s && gzip -c %s > %s && rm -f %s",
+			qContainer, qContainer, qContainer,
+			qContainer, ssh.ShellQuote(redisTmp), ssh.ShellQuote(redisTmp), ssh.ShellQuote(dumpPath), ssh.ShellQuote(redisTmp),
 		)
 		s3Key = fmt.Sprintf("s3://%s/%s/accessories/%s/%s.rdb.gz", s3.Bucket, app, name, timestamp)
 	default:
