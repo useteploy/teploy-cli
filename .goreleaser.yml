@@ -55,6 +55,12 @@ brews:
     license: MIT
     install: |
       bin.install "teploy"
+    # Carried into the generated tap formula so `brew test teploy` (and the
+    # tap's CI) verifies the installed binary reports the formula's own
+    # version — the generated formulas previously shipped with no test
+    # block at all (audit useteploy__homebrew-tap-01).
+    test: |
+      assert_match version.to_s, shell_output("#{bin}/teploy version")
 
 scoops:
   - name: teploy
