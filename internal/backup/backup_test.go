@@ -235,6 +235,161 @@ func TestAccessoryBackup_RedisWaitsForBgsave(t *testing.T) {
 	}
 }
 
+// teploy-cli-13: mysqldump/mysql ran as `-u root` with no credentials, so
+// any accessory that sets a root password failed (or dumped nothing). The
+// password must come from the app env (MYSQL_ROOT_PASSWORD, falling back to
+// MYSQL_PASSWORD) and reach the container as MYSQL_PWD env — never argv,
+// which `ps` inside the container would show.
+func TestAccessoryBackup_MySQL_UsesRootPasswordEnv(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
+		ssh.MockCommand{Match: "docker exec", Output: ""},
+		ssh.MockCommand{Match: "aws s3 cp", Output: "done\n"},
+		ssh.MockCommand{Match: "rm -f", Output: ""},
+	)
+
+	var buf bytes.Buffer
+	client := NewClient(mock, &buf)
+	env := map[string]string{"MYSQL_ROOT_PASSWORD": "sekret"}
+	err := client.AccessoryBackup(context.Background(), "myapp", "mysql", "mysql:8", env, S3Config{
+		Bucket: "my-bucket",
+		Region: "us-east-1",
+	})
+	if err != nil {
+		t.Fatalf("AccessoryBackup: %v", err)
+	}
+
+	var dumpCmd string
+	for _, call := range mock.Calls {
+		if strings.Contains(call, "mysqldump") {
+			dumpCmd = call
+		}
+	}
+	if dumpCmd == "" {
+		t.Fatal("expected a mysqldump command")
+	}
+	if !strings.Contains(dumpCmd, "docker exec -e MYSQL_PWD='sekret' 'myapp-mysql' mysqldump -u root 'myapp'") {
+		t.Errorf("password must ride as MYSQL_PWD env on docker exec, got: %s", dumpCmd)
+	}
+	if dump := dumpCmd[strings.Index(dumpCmd, "mysqldump"):]; strings.Contains(dump, "sekret") {
+		t.Errorf("password must not appear on the mysqldump argv: %s", dumpCmd)
+	}
+}
+
+func TestAccessoryBackup_MySQL_PasswordFallbackAndAbsence(t *testing.T) {
+	var buf bytes.Buffer
+
+	// MYSQL_PASSWORD is the fallback when MYSQL_ROOT_PASSWORD is unset.
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
+		ssh.MockCommand{Match: "docker exec", Output: ""},
+		ssh.MockCommand{Match: "aws s3 cp", Output: "done\n"},
+		ssh.MockCommand{Match: "rm -f", Output: ""},
+	)
+	client := NewClient(mock, &buf)
+	err := client.AccessoryBackup(context.Background(), "myapp", "mysql", "mysql:8",
+		map[string]string{"MYSQL_PASSWORD": "fall"}, S3Config{Bucket: "my-bucket", Region: "us-east-1"})
+	if err != nil {
+		t.Fatalf("AccessoryBackup: %v", err)
+	}
+	found := false
+	for _, call := range mock.Calls {
+		if strings.Contains(call, "-e MYSQL_PWD='fall'") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("MYSQL_PASSWORD must be used when MYSQL_ROOT_PASSWORD is absent, calls: %v", mock.Calls)
+	}
+
+	// No password configured: keep the bare command (passwordless root).
+	mock = ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
+		ssh.MockCommand{Match: "docker exec", Output: ""},
+		ssh.MockCommand{Match: "aws s3 cp", Output: "done\n"},
+		ssh.MockCommand{Match: "rm -f", Output: ""},
+	)
+	client = NewClient(mock, &buf)
+	err = client.AccessoryBackup(context.Background(), "myapp", "mysql", "mysql:8", nil,
+		S3Config{Bucket: "my-bucket", Region: "us-east-1"})
+	if err != nil {
+		t.Fatalf("AccessoryBackup: %v", err)
+	}
+	for _, call := range mock.Calls {
+		if strings.Contains(call, "MYSQL_PWD") {
+			t.Errorf("no password configured, so no MYSQL_PWD expected: %s", call)
+		}
+	}
+}
+
+// The password lands inside a shell command string: it must be single-quote
+// wrapped (ShellQuote), so values with spaces or quotes neither break the
+// command nor escape into something executable.
+func TestAccessoryBackup_MySQL_QuotesHostilePassword(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
+		ssh.MockCommand{Match: "docker exec", Output: ""},
+		ssh.MockCommand{Match: "aws s3 cp", Output: "done\n"},
+		ssh.MockCommand{Match: "rm -f", Output: ""},
+	)
+
+	var buf bytes.Buffer
+	client := NewClient(mock, &buf)
+	env := map[string]string{"MYSQL_ROOT_PASSWORD": "p@'ss word; id"}
+	err := client.AccessoryBackup(context.Background(), "myapp", "mysql", "mysql:8", env, S3Config{
+		Bucket: "my-bucket",
+		Region: "us-east-1",
+	})
+	if err != nil {
+		t.Fatalf("AccessoryBackup: %v", err)
+	}
+
+	var dumpCmd string
+	for _, call := range mock.Calls {
+		if strings.Contains(call, "mysqldump") {
+			dumpCmd = call
+		}
+	}
+	if !strings.Contains(dumpCmd, "-e MYSQL_PWD='p@'\"'\"'ss word; id'") {
+		t.Errorf("password must be ShellQuote-wrapped, got: %s", dumpCmd)
+	}
+}
+
+func TestAccessoryRestore_MySQL_UsesRootPasswordEnv(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
+		ssh.MockCommand{Match: "aws s3 cp", Output: "download: done\n"},
+		ssh.MockCommand{Match: "mktemp -d '/tmp/teploy-restore.XXXXXX'", Output: "/tmp/teploy-restore.abc123\n"},
+		ssh.MockCommand{Match: "gunzip -c", Output: ""},
+		ssh.MockCommand{Match: "rm -rf", Output: ""},
+	)
+
+	var buf bytes.Buffer
+	client := NewClient(mock, &buf)
+	env := map[string]string{"MYSQL_ROOT_PASSWORD": "sekret"}
+	err := client.AccessoryRestore(context.Background(), "myapp", "mysql", "mysql:8",
+		"20260101-000000", env, S3Config{Bucket: "my-bucket", Region: "us-east-1"})
+	if err != nil {
+		t.Fatalf("AccessoryRestore: %v", err)
+	}
+
+	var restoreCmd string
+	for _, call := range mock.Calls {
+		if strings.Contains(call, "mysql -u root") {
+			restoreCmd = call
+		}
+	}
+	if restoreCmd == "" {
+		t.Fatal("expected a mysql restore command")
+	}
+	if !strings.Contains(restoreCmd, "docker exec -i -e MYSQL_PWD='sekret' 'myapp-mysql' mysql -u root 'myapp'") {
+		t.Errorf("password must ride as MYSQL_PWD env on docker exec, got: %s", restoreCmd)
+	}
+	if mysql := restoreCmd[strings.Index(restoreCmd, "mysql -u root"):]; strings.Contains(mysql, "sekret") {
+		t.Errorf("password must not appear on the mysql argv: %s", restoreCmd)
+	}
+}
+
 // teploy-cli-04: the restore pipelines (`gunzip -c X | docker exec -i ...
 // psql ...`) only reported the LAST command's exit status — psql without
 // ON_ERROR_STOP exits 0 on SQL errors, and a failed gunzip alone fed the

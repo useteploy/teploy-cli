@@ -272,8 +272,15 @@ func (c *Client) AccessoryBackup(ctx context.Context, app, name, image string, e
 			qContainer, ssh.ShellQuote(user), ssh.ShellQuote(db), ssh.ShellQuote(dumpTmp), ssh.ShellQuote(dumpTmp), ssh.ShellQuote(dumpPath), ssh.ShellQuote(dumpTmp))
 	case isDBType(image, "mysql"), isDBType(image, "mariadb"):
 		db := mysqlDB(app, env)
-		dumpCmd = fmt.Sprintf("docker exec %s mysqldump -u root %s > %s && gzip -c %s > %s && rm -f %s",
-			qContainer, ssh.ShellQuote(db), ssh.ShellQuote(dumpTmp), ssh.ShellQuote(dumpTmp), ssh.ShellQuote(dumpPath), ssh.ShellQuote(dumpTmp))
+		// Root password via MYSQL_PWD container env, never a command-line
+		// flag: mysqldump/mysql argv is visible in `ps` inside the
+		// container. Absent = current behavior (passwordless root).
+		execEnv := ""
+		if pwd := mysqlRootPassword(env); pwd != "" {
+			execEnv = " -e MYSQL_PWD=" + ssh.ShellQuote(pwd)
+		}
+		dumpCmd = fmt.Sprintf("docker exec%s %s mysqldump -u root %s > %s && gzip -c %s > %s && rm -f %s",
+			execEnv, qContainer, ssh.ShellQuote(db), ssh.ShellQuote(dumpTmp), ssh.ShellQuote(dumpTmp), ssh.ShellQuote(dumpPath), ssh.ShellQuote(dumpTmp))
 	case isDBType(image, "mongo"):
 		dumpCmd = fmt.Sprintf("docker exec %s mongodump --archive --gzip > %s", qContainer, ssh.ShellQuote(dumpPath))
 		s3Key = fmt.Sprintf("s3://%s/%s/accessories/%s/%s.archive.gz", s3.Bucket, app, name, timestamp)
@@ -372,14 +379,17 @@ func (c *Client) AccessoryRestore(ctx context.Context, app, name, image, date st
 			ssh.ShellQuote(restorePath), ssh.ShellQuote(sqlPath), qContainer, ssh.ShellQuote(user), ssh.ShellQuote(db), ssh.ShellQuote(sqlPath))
 	case isDBType(image, "mysql"), isDBType(image, "mariadb"):
 		db := mysqlDB(app, env)
-		s3Key = fmt.Sprintf("s3://%s/%s/accessories/%s/%s.sql.gz", s3.Bucket, app, name, date)
-		restorePath = tmpdir + "/restore.sql.gz"
+		// Same MYSQL_PWD env injection as the backup path (see there).
+		execEnv := ""
+		if pwd := mysqlRootPassword(env); pwd != "" {
+			execEnv = " -e MYSQL_PWD=" + ssh.ShellQuote(pwd)
+		}
 		// Same pipeline-to-redirect shape as postgres (mysql itself exits
 		// nonzero on SQL errors when reading a script, but gunzip's failure
 		// must not be masked either).
 		sqlPath := tmpdir + "/restore.sql"
-		restoreCmd = fmt.Sprintf("gunzip -c %s > %s && docker exec -i %s mysql -u root %s < %s",
-			ssh.ShellQuote(restorePath), ssh.ShellQuote(sqlPath), qContainer, ssh.ShellQuote(db), ssh.ShellQuote(sqlPath))
+		restoreCmd = fmt.Sprintf("gunzip -c %s > %s && docker exec -i%s %s mysql -u root %s < %s",
+			ssh.ShellQuote(restorePath), ssh.ShellQuote(sqlPath), execEnv, qContainer, ssh.ShellQuote(db), ssh.ShellQuote(sqlPath))
 	case isDBType(image, "mongo"):
 		s3Key = fmt.Sprintf("s3://%s/%s/accessories/%s/%s.archive.gz", s3.Bucket, app, name, date)
 		restorePath = tmpdir + "/restore.archive.gz"
@@ -499,4 +509,16 @@ func mysqlDB(app string, env map[string]string) string {
 		db = app
 	}
 	return db
+}
+
+// mysqlRootPassword resolves the root password the mysql/mariadb containers
+// themselves honor (MYSQL_ROOT_PASSWORD, falling back to MYSQL_PASSWORD).
+// Used to inject MYSQL_PWD into docker exec as container env — never as a
+// command-line argument, which would expose the password in `ps` output.
+// Empty means no password configured; callers keep the bare command.
+func mysqlRootPassword(env map[string]string) string {
+	if pwd := env["MYSQL_ROOT_PASSWORD"]; pwd != "" {
+		return pwd
+	}
+	return env["MYSQL_PASSWORD"]
 }
