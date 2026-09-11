@@ -338,6 +338,21 @@ func (c *Client) AccessoryRestore(ctx context.Context, app, name, image, date st
 	containerName := app + "-" + name
 	qContainer := ssh.ShellQuote(containerName)
 
+	// All restore scratch files live under one per-invocation temp dir. The
+	// old fixed names (/tmp/restore.sql.gz, …, and the generic branch's
+	// /tmp/<app>-<name>-restore-stage) were shared by every restore: two
+	// concurrent restores (or a crash mid-restore followed by a retry)
+	// could read or stage the previous run's files. On failure the dir is
+	// kept and named in the error for inspection; on success it is removed.
+	tmpOut, err := c.exec.Run(ctx, "mktemp -d "+ssh.ShellQuote("/tmp/teploy-restore.XXXXXX"))
+	if err != nil {
+		return fmt.Errorf("creating restore temp dir: %w", err)
+	}
+	tmpdir := strings.TrimSpace(tmpOut)
+	keepTmp := func(err error) error {
+		return fmt.Errorf("%w — restore files kept in %s", err, tmpdir)
+	}
+
 	// Determine file type and restore command based on DB type. The generic
 	// (tar) branch leaves restoreCmd empty and instead sets accDir, since it
 	// goes through the staging helper below rather than a single shell command.
@@ -347,27 +362,27 @@ func (c *Client) AccessoryRestore(ctx context.Context, app, name, image, date st
 	case isDBType(image, "postgres"):
 		db, user := postgresDBAndUser(app, env)
 		s3Key = fmt.Sprintf("s3://%s/%s/accessories/%s/%s.sql.gz", s3.Bucket, app, name, date)
-		restorePath = "/tmp/restore.sql.gz"
+		restorePath = tmpdir + "/restore.sql.gz"
 		// Decompress to a file first and feed psql via stdin redirect: a
 		// pipeline reports only the LAST command's status, so `gunzip | psql`
 		// succeeded on a corrupt archive (empty stdin) and — without
 		// ON_ERROR_STOP — on SQL errors too. Same convention as verify.go.
-		sqlPath := "/tmp/restore.sql"
+		sqlPath := tmpdir + "/restore.sql"
 		restoreCmd = fmt.Sprintf("gunzip -c %s > %s && docker exec -i %s psql -v ON_ERROR_STOP=1 -U %s %s < %s",
 			ssh.ShellQuote(restorePath), ssh.ShellQuote(sqlPath), qContainer, ssh.ShellQuote(user), ssh.ShellQuote(db), ssh.ShellQuote(sqlPath))
 	case isDBType(image, "mysql"), isDBType(image, "mariadb"):
 		db := mysqlDB(app, env)
 		s3Key = fmt.Sprintf("s3://%s/%s/accessories/%s/%s.sql.gz", s3.Bucket, app, name, date)
-		restorePath = "/tmp/restore.sql.gz"
+		restorePath = tmpdir + "/restore.sql.gz"
 		// Same pipeline-to-redirect shape as postgres (mysql itself exits
 		// nonzero on SQL errors when reading a script, but gunzip's failure
 		// must not be masked either).
-		sqlPath := "/tmp/restore.sql"
+		sqlPath := tmpdir + "/restore.sql"
 		restoreCmd = fmt.Sprintf("gunzip -c %s > %s && docker exec -i %s mysql -u root %s < %s",
 			ssh.ShellQuote(restorePath), ssh.ShellQuote(sqlPath), qContainer, ssh.ShellQuote(db), ssh.ShellQuote(sqlPath))
 	case isDBType(image, "mongo"):
 		s3Key = fmt.Sprintf("s3://%s/%s/accessories/%s/%s.archive.gz", s3.Bucket, app, name, date)
-		restorePath = "/tmp/restore.archive.gz"
+		restorePath = tmpdir + "/restore.archive.gz"
 		restoreCmd = fmt.Sprintf("docker exec -i %s mongorestore --archive --gzip --drop < %s", qContainer, ssh.ShellQuote(restorePath))
 	case isDBType(image, "redis"):
 		// AccessoryBackup stores redis as <date>.rdb.gz; without this case the
@@ -375,37 +390,35 @@ func (c *Client) AccessoryRestore(ctx context.Context, app, name, image, date st
 		// restores always failed. Stop redis first so its shutdown save can't
 		// overwrite the snapshot we copy in, then start so it loads dump.rdb.
 		s3Key = fmt.Sprintf("s3://%s/%s/accessories/%s/%s.rdb.gz", s3.Bucket, app, name, date)
-		restorePath = "/tmp/restore.rdb.gz"
+		restorePath = tmpdir + "/restore.rdb.gz"
+		rdbPath := tmpdir + "/restore.rdb"
 		restoreCmd = fmt.Sprintf(
-			"gunzip -c %s > /tmp/restore.rdb && docker stop %s && docker cp /tmp/restore.rdb %s:/data/dump.rdb && docker start %s && rm -f /tmp/restore.rdb",
-			ssh.ShellQuote(restorePath), qContainer, qContainer, qContainer,
+			"gunzip -c %s > %s && docker stop %s && docker cp %s %s:/data/dump.rdb && docker start %s && rm -f %s",
+			ssh.ShellQuote(restorePath), ssh.ShellQuote(rdbPath), qContainer, ssh.ShellQuote(rdbPath), qContainer, qContainer, ssh.ShellQuote(rdbPath),
 		)
 	default:
 		// Generic: extract tar to accessory directory.
 		s3Key = fmt.Sprintf("s3://%s/%s/accessories/%s/%s.tar.gz", s3.Bucket, app, name, date)
-		restorePath = "/tmp/restore.tar.gz"
+		restorePath = tmpdir + "/restore.tar.gz"
 		accDir = fmt.Sprintf("%s/%s/accessories/%s", deploymentsDir, app, name)
 	}
 
 	fmt.Fprintf(c.out, "Downloading %s...\n", s3Key)
 	if _, err := c.exec.Run(ctx, s3.AWS(fmt.Sprintf("s3 cp %s %s", ssh.ShellQuote(s3Key), ssh.ShellQuote(restorePath)))); err != nil {
-		return fmt.Errorf("downloading backup: %w", err)
+		return keepTmp(fmt.Errorf("downloading backup: %w", err))
 	}
 
 	fmt.Fprintf(c.out, "Restoring %s...\n", name)
 	if accDir != "" {
-		stageDir := fmt.Sprintf("/tmp/%s-%s-restore-stage", app, name)
+		stageDir := tmpdir + "/restore-stage"
 		if err := extractToStagingThenPromote(ctx, c.exec, restorePath, stageDir, accDir, c.out); err != nil {
-			return fmt.Errorf("restoring %s: %w", name, err)
+			return keepTmp(fmt.Errorf("restoring %s: %w", name, err))
 		}
-		fmt.Fprintln(c.out, "Restore complete")
-		return nil
-	}
-	if _, err := c.exec.Run(ctx, restoreCmd); err != nil {
-		return fmt.Errorf("restoring %s: %w", name, err)
+	} else if _, err := c.exec.Run(ctx, restoreCmd); err != nil {
+		return keepTmp(fmt.Errorf("restoring %s: %w", name, err))
 	}
 
-	c.exec.Run(ctx, "rm -f "+ssh.ShellQuote(restorePath))
+	c.exec.Run(ctx, "rm -rf "+ssh.ShellQuote(tmpdir))
 	fmt.Fprintln(c.out, "Restore complete")
 	return nil
 }

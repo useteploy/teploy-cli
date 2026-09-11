@@ -85,6 +85,7 @@ func TestAccessoryRestore_GenericStagesBeforePromoting(t *testing.T) {
 		ssh.MockCommand{Match: "aws s3 cp", Output: "download: done\n"},
 		ssh.MockCommand{Match: "rm -rf", Output: ""},
 		ssh.MockCommand{Match: "mkdir -p", Output: ""},
+		ssh.MockCommand{Match: "mktemp -d '/tmp/teploy-restore.XXXXXX'", Output: "/tmp/teploy-restore.abc123\n"},
 		ssh.MockCommand{Match: "mktemp -d", Output: "/deployments/myapp/accessories/cache.restore-old.abc123\n"},
 		ssh.MockCommand{Match: "find ", Output: ""},
 	)
@@ -108,10 +109,80 @@ func TestAccessoryRestore_GenericStagesBeforePromoting(t *testing.T) {
 			promote = call
 		}
 	}
-	if stageExtract == "" || !strings.Contains(stageExtract, "restore-stage") {
-		t.Errorf("expected extraction into a staging directory, got calls: %v", mock.Calls)
+	if stageExtract == "" || !strings.Contains(stageExtract, "/tmp/teploy-restore.abc123/restore-stage") {
+		t.Errorf("expected extraction into a staging dir under the per-invocation temp dir, got calls: %v", mock.Calls)
 	}
 	if promote == "" || !strings.Contains(promote, "/deployments/myapp/accessories/cache") {
 		t.Errorf("expected a promote step into the live accessory directory, got calls: %v", mock.Calls)
+	}
+}
+
+// teploy-cli-07: restore scratch files used fixed paths (/tmp/restore.sql.gz
+// etc.), shared by every restore — concurrent restores or a crash followed by
+// a retry could pick up the previous run's files. Each restore must allocate
+// its own temp dir, remove it on success, and keep (and name) it on failure.
+func TestAccessoryRestore_UsesPerInvocationTempDir(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
+		ssh.MockCommand{Match: "aws s3 cp", Output: "download: done\n"},
+		ssh.MockCommand{Match: "mktemp -d '/tmp/teploy-restore.XXXXXX'", Output: "/tmp/teploy-restore.abc123\n"},
+		ssh.MockCommand{Match: "gunzip -c", Output: ""},
+		ssh.MockCommand{Match: "docker exec", Output: ""},
+		ssh.MockCommand{Match: "rm -rf", Output: ""},
+	)
+
+	var buf bytes.Buffer
+	client := NewClient(mock, &buf)
+	err := client.AccessoryRestore(context.Background(), "myapp", "postgres", "postgres:16",
+		"20260101-000000", nil, S3Config{Bucket: "my-bucket", Region: "us-east-1"})
+	if err != nil {
+		t.Fatalf("AccessoryRestore: %v", err)
+	}
+
+	var restoreCmd, cleanup string
+	for _, call := range mock.Calls {
+		if strings.Contains(call, "psql") {
+			restoreCmd = call
+		}
+		if strings.HasPrefix(call, "rm -rf '/tmp/teploy-restore.") {
+			cleanup = call
+		}
+	}
+	if restoreCmd == "" {
+		t.Fatal("expected a psql restore command")
+	}
+	if !strings.Contains(restoreCmd, "/tmp/teploy-restore.abc123/restore.sql") {
+		t.Errorf("restore must use a per-invocation temp path, got: %s", restoreCmd)
+	}
+	if strings.Contains(restoreCmd, "'/tmp/restore.sql'") {
+		t.Errorf("restore must not use the shared fixed path /tmp/restore.sql: %s", restoreCmd)
+	}
+	if cleanup == "" {
+		t.Errorf("success must remove the temp dir, got calls: %v", mock.Calls)
+	}
+}
+
+func TestAccessoryRestore_FailureKeepsTempDir(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
+		ssh.MockCommand{Match: "aws s3 cp", Output: "download: done\n"},
+		ssh.MockCommand{Match: "mktemp -d '/tmp/teploy-restore.XXXXXX'", Output: "/tmp/teploy-restore.abc123\n"},
+		ssh.MockCommand{Match: "gunzip -c", Err: fmt.Errorf("exit status 1: gzip: stdin: not in gzip format")},
+	)
+
+	var buf bytes.Buffer
+	client := NewClient(mock, &buf)
+	err := client.AccessoryRestore(context.Background(), "myapp", "postgres", "postgres:16",
+		"20260101-000000", nil, S3Config{Bucket: "my-bucket", Region: "us-east-1"})
+	if err == nil {
+		t.Fatal("expected AccessoryRestore to fail when gunzip fails")
+	}
+	if !strings.Contains(err.Error(), "/tmp/teploy-restore.abc123") {
+		t.Errorf("error must name the kept temp dir for inspection, got: %v", err)
+	}
+	for _, call := range mock.Calls {
+		if strings.HasPrefix(call, "rm -rf '/tmp/teploy-restore.") {
+			t.Errorf("failure must keep the temp dir, got cleanup: %s", call)
+		}
 	}
 }

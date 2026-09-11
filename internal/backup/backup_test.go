@@ -244,9 +244,10 @@ func TestAccessoryRestore_PostgresFailsOnErrors(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
 		ssh.MockCommand{Match: "aws s3 cp", Output: "download: done\n"},
+		ssh.MockCommand{Match: "mktemp -d '/tmp/teploy-restore.XXXXXX'", Output: "/tmp/teploy-restore.abc123\n"},
 		ssh.MockCommand{Match: "gunzip -c", Output: ""},
 		ssh.MockCommand{Match: "docker exec", Output: ""},
-		ssh.MockCommand{Match: "rm -f", Output: ""},
+		ssh.MockCommand{Match: "rm -rf", Output: ""},
 	)
 
 	var buf bytes.Buffer
@@ -278,6 +279,7 @@ func TestAccessoryRestore_CorruptArchiveFails(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
 		ssh.MockCommand{Match: "aws s3 cp", Output: "download: done\n"},
+		ssh.MockCommand{Match: "mktemp -d '/tmp/teploy-restore.XXXXXX'", Output: "/tmp/teploy-restore.abc123\n"},
 		ssh.MockCommand{Match: "gunzip -c", Err: errors.New("exit status 1: gzip: stdin: not in gzip format")},
 	)
 
