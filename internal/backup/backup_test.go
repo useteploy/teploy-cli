@@ -194,6 +194,64 @@ func TestAccessoryBackup_MySQL(t *testing.T) {
 	}
 }
 
+// teploy-cli-04: the restore pipelines (`gunzip -c X | docker exec -i ...
+// psql ...`) only reported the LAST command's exit status — psql without
+// ON_ERROR_STOP exits 0 on SQL errors, and a failed gunzip alone fed the
+// container an empty stdin and still "succeeded". The restore command must
+// check gunzip's exit code itself and make psql stop on SQL errors.
+func TestAccessoryRestore_PostgresFailsOnErrors(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
+		ssh.MockCommand{Match: "aws s3 cp", Output: "download: done\n"},
+		ssh.MockCommand{Match: "gunzip -c", Output: ""},
+		ssh.MockCommand{Match: "docker exec", Output: ""},
+		ssh.MockCommand{Match: "rm -f", Output: ""},
+	)
+
+	var buf bytes.Buffer
+	client := NewClient(mock, &buf)
+	err := client.AccessoryRestore(context.Background(), "myapp", "postgres", "postgres:16",
+		"20260101-000000", nil, S3Config{Bucket: "my-bucket", Region: "us-east-1"})
+	if err != nil {
+		t.Fatalf("AccessoryRestore: %v", err)
+	}
+
+	var restoreCmd string
+	for _, call := range mock.Calls {
+		if strings.Contains(call, "psql") {
+			restoreCmd = call
+		}
+	}
+	if restoreCmd == "" {
+		t.Fatal("expected a psql restore command")
+	}
+	if !strings.Contains(restoreCmd, "-v ON_ERROR_STOP=1") {
+		t.Errorf("psql must run with ON_ERROR_STOP so SQL errors fail the restore:\n%s", restoreCmd)
+	}
+	if strings.Contains(restoreCmd, "|") {
+		t.Errorf("restore must not be a pipeline (last-command exit status masks gunzip failures):\n%s", restoreCmd)
+	}
+}
+
+func TestAccessoryRestore_CorruptArchiveFails(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
+		ssh.MockCommand{Match: "aws s3 cp", Output: "download: done\n"},
+		ssh.MockCommand{Match: "gunzip -c", Err: errors.New("exit status 1: gzip: stdin: not in gzip format")},
+	)
+
+	var buf bytes.Buffer
+	client := NewClient(mock, &buf)
+	err := client.AccessoryRestore(context.Background(), "myapp", "postgres", "postgres:16",
+		"20260101-000000", nil, S3Config{Bucket: "my-bucket", Region: "us-east-1"})
+	if err == nil {
+		t.Fatal("expected AccessoryRestore to fail when gunzip fails, not report success")
+	}
+	if !strings.Contains(err.Error(), "not in gzip format") {
+		t.Errorf("expected the underlying gunzip error to surface, got: %v", err)
+	}
+}
+
 func TestAccessoryBackup_Generic(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},

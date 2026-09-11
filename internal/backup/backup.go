@@ -317,18 +317,27 @@ func (c *Client) AccessoryRestore(ctx context.Context, app, name, image, date st
 		db, user := postgresDBAndUser(app, env)
 		s3Key = fmt.Sprintf("s3://%s/%s/accessories/%s/%s.sql.gz", s3.Bucket, app, name, date)
 		restorePath = "/tmp/restore.sql.gz"
-		restoreCmd = fmt.Sprintf("gunzip -c %s | docker exec -i %s psql -U %s %s",
-			ssh.ShellQuote(restorePath), qContainer, ssh.ShellQuote(user), ssh.ShellQuote(db))
+		// Decompress to a file first and feed psql via stdin redirect: a
+		// pipeline reports only the LAST command's status, so `gunzip | psql`
+		// succeeded on a corrupt archive (empty stdin) and — without
+		// ON_ERROR_STOP — on SQL errors too. Same convention as verify.go.
+		sqlPath := "/tmp/restore.sql"
+		restoreCmd = fmt.Sprintf("gunzip -c %s > %s && docker exec -i %s psql -v ON_ERROR_STOP=1 -U %s %s < %s",
+			ssh.ShellQuote(restorePath), ssh.ShellQuote(sqlPath), qContainer, ssh.ShellQuote(user), ssh.ShellQuote(db), ssh.ShellQuote(sqlPath))
 	case isDBType(image, "mysql"), isDBType(image, "mariadb"):
 		db := mysqlDB(app, env)
 		s3Key = fmt.Sprintf("s3://%s/%s/accessories/%s/%s.sql.gz", s3.Bucket, app, name, date)
 		restorePath = "/tmp/restore.sql.gz"
-		restoreCmd = fmt.Sprintf("gunzip -c %s | docker exec -i %s mysql -u root %s",
-			ssh.ShellQuote(restorePath), qContainer, ssh.ShellQuote(db))
+		// Same pipeline-to-redirect shape as postgres (mysql itself exits
+		// nonzero on SQL errors when reading a script, but gunzip's failure
+		// must not be masked either).
+		sqlPath := "/tmp/restore.sql"
+		restoreCmd = fmt.Sprintf("gunzip -c %s > %s && docker exec -i %s mysql -u root %s < %s",
+			ssh.ShellQuote(restorePath), ssh.ShellQuote(sqlPath), qContainer, ssh.ShellQuote(db), ssh.ShellQuote(sqlPath))
 	case isDBType(image, "mongo"):
 		s3Key = fmt.Sprintf("s3://%s/%s/accessories/%s/%s.archive.gz", s3.Bucket, app, name, date)
 		restorePath = "/tmp/restore.archive.gz"
-		restoreCmd = fmt.Sprintf("cat %s | docker exec -i %s mongorestore --archive --gzip --drop", ssh.ShellQuote(restorePath), qContainer)
+		restoreCmd = fmt.Sprintf("docker exec -i %s mongorestore --archive --gzip --drop < %s", qContainer, ssh.ShellQuote(restorePath))
 	case isDBType(image, "redis"):
 		// AccessoryBackup stores redis as <date>.rdb.gz; without this case the
 		// default branch looked for a .tar.gz that doesn't exist, so redis
