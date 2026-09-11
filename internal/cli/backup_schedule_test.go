@@ -28,7 +28,7 @@ func TestFirstWebhookURL(t *testing.T) {
 
 func TestBuildScheduledBackupCmd(t *testing.T) {
 	// Base: archive + upload + cleanup, no retention, no alert.
-	base := buildScheduledBackupCmd("myapp", "1.2.3.4", "my-bucket", "us-east-1", 0, "")
+	base := buildScheduledBackupCmd("myapp", "1.2.3.4", "my-bucket", "us-east-1", "", 0, "")
 	for _, want := range []string{
 		"tar -czf /tmp/myapp-backup-",
 		"aws s3 cp /tmp/myapp-backup-*.tar.gz s3://my-bucket/myapp/volumes/ --region us-east-1",
@@ -43,9 +43,21 @@ func TestBuildScheduledBackupCmd(t *testing.T) {
 	}
 
 	// Keep-last bakes a prune clause.
-	withKeep := buildScheduledBackupCmd("myapp", "1.2.3.4", "my-bucket", "us-east-1", 7, "")
+	withKeep := buildScheduledBackupCmd("myapp", "1.2.3.4", "my-bucket", "us-east-1", "", 7, "")
 	if !strings.Contains(withKeep, "head -n -7") {
 		t.Errorf("keep-last prune clause missing:\n%s", withKeep)
+	}
+
+	// teploy-cli-11: --endpoint must reach EVERY aws invocation — the
+	// upload AND the keep-last retention loop. The scheduled job runs with
+	// the server's ambient AWS config, which points at real AWS; without
+	// the flag, scheduled backups silently upload to the wrong target.
+	withEndpoint := buildScheduledBackupCmd("myapp", "1.2.3.4", "my-bucket", "us-east-1", "http://minio:9000", 2, "")
+	if n := strings.Count(withEndpoint, " --endpoint-url 'http://minio:9000'"); n != 3 {
+		t.Errorf("endpoint flag must be on all 3 aws invocations (cp, ls, rm), got %d:\n%s", n, withEndpoint)
+	}
+	if strings.Contains(base, "--endpoint-url") {
+		t.Errorf("no endpoint configured, so no endpoint flag expected:\n%s", base)
 	}
 
 	// Webhook wraps the chain in a failure alert. The alert itself is now a
@@ -54,7 +66,7 @@ func TestBuildScheduledBackupCmd(t *testing.T) {
 	// makes signing possible at all, so those assertions live in
 	// TestBuildBackupAlertScript. What the cron line still has to get right is
 	// the wrapping and the exit code.
-	withHook := buildScheduledBackupCmd("myapp", "1.2.3.4", "my-bucket", "us-east-1", 7, "https://hooks.example.com/x")
+	withHook := buildScheduledBackupCmd("myapp", "1.2.3.4", "my-bucket", "us-east-1", "", 7, "https://hooks.example.com/x")
 	if !strings.HasPrefix(withHook, "( ") || !strings.Contains(withHook, ") || {") {
 		t.Errorf("alert wrapping missing:\n%s", withHook)
 	}

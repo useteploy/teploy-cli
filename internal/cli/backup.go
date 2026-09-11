@@ -321,7 +321,7 @@ func runBackupSchedule(flags *Flags, schedule, bucket, region, endpoint string, 
 		signed = secret != ""
 	}
 
-	backupCmd := buildScheduledBackupCmd(appCfg.App, executor.Host(), bucket, region, keepLast, webhook)
+	backupCmd := buildScheduledBackupCmd(appCfg.App, executor.Host(), bucket, region, endpoint, keepLast, webhook)
 
 	client := backup.NewClient(executor, os.Stdout)
 	if err := client.SetSchedule(ctx, schedule, backupCmd, "teploy-backup:"+appCfg.App); err != nil {
@@ -331,6 +331,9 @@ func runBackupSchedule(flags *Flags, schedule, bucket, region, endpoint string, 
 	fmt.Printf("Backup scheduled: %s\n", schedule)
 	fmt.Printf("  App: %s\n", appCfg.App)
 	fmt.Printf("  Bucket: s3://%s/%s/volumes/\n", bucket, appCfg.App)
+	if endpoint != "" {
+		fmt.Printf("  Endpoint: %s\n", endpoint)
+	}
 	if keepLast > 0 {
 		fmt.Printf("  Retention: keep last %d\n", keepLast)
 	}
@@ -365,13 +368,21 @@ func firstWebhookURL(n config.NotificationsConfig) string {
 // buildScheduledBackupCmd assembles the shell command cron runs for a scheduled
 // backup: archive → upload → clean up, then optional keep-last retention, and
 // (if a webhook is set) a failure alert wrapping the whole chain.
-func buildScheduledBackupCmd(app, server, bucket, region string, keepLast int, webhook string) string {
+func buildScheduledBackupCmd(app, server, bucket, region, endpoint string, keepLast int, webhook string) string {
+	// A custom endpoint must reach every aws invocation (upload AND the
+	// retention loop): cron runs with the server's ambient AWS config, which
+	// points at real AWS — without the flag the scheduled backups upload to
+	// the wrong target. Same flag style as S3Config.AWS.
+	awsEndpoint := ""
+	if endpoint != "" {
+		awsEndpoint = " --endpoint-url " + ssh.ShellQuote(endpoint)
+	}
 	cmd := fmt.Sprintf(
 		"tar -czf /tmp/%s-backup-$(date +%%Y%%m%%d-%%H%%M%%S).tar.gz -C /deployments/%s/volumes . && "+
-			"aws s3 cp /tmp/%s-backup-*.tar.gz s3://%s/%s/volumes/ --region %s && "+
+			"aws s3 cp /tmp/%s-backup-*.tar.gz s3://%s/%s/volumes/ --region %s%s && "+
 			"rm -f /tmp/%s-backup-*.tar.gz",
 		app, app,
-		app, bucket, app, region,
+		app, bucket, app, region, awsEndpoint,
 		app,
 	)
 
@@ -383,10 +394,10 @@ func buildScheduledBackupCmd(app, server, bucket, region string, keepLast int, w
 	// `backup create`/`backup prune` (shell date math is fragile).
 	if keepLast > 0 {
 		cmd += fmt.Sprintf(
-			" && for f in $(aws s3 ls s3://%s/%s/volumes/ --region %s | sed 's/.* //' | grep -E '[0-9]{8}-[0-9]{6}' | sort | head -n -%d); do "+
-				"[ -n \"$f\" ] && aws s3 rm s3://%s/%s/volumes/$f --region %s; done",
-			bucket, app, region, keepLast,
-			bucket, app, region,
+			" && for f in $(aws s3 ls s3://%s/%s/volumes/ --region %s%s | sed 's/.* //' | grep -E '[0-9]{8}-[0-9]{6}' | sort | head -n -%d); do "+
+				"[ -n \"$f\" ] && aws s3 rm s3://%s/%s/volumes/$f --region %s%s; done",
+			bucket, app, region, awsEndpoint, keepLast,
+			bucket, app, region, awsEndpoint,
 		)
 	}
 
