@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -227,7 +228,14 @@ func TestIsAccessoryImage(t *testing.T) {
 		{"mongo:latest", true},
 		{"myapp:latest", false},
 		{"ghcr.io/myorg/myapp:v1", false},
-		{"", false},
+		{"", false},		// Registry ports: the colon before the last slash is a registry
+		// host port, not a tag separator (teploy-cli-08 twin — this used
+		// to reduce to "registry.example" and disable classification).
+		{"registry.example:5000/postgres:16", true},
+		{"registry.example:5000/redis", true},
+		{"ghcr.io/registry:5000/namespace/mysql:8", true},
+		{"postgres@sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", true},
+		{"registry.example:5000/myapp:latest", false},
 	}
 
 	for _, tt := range tests {
@@ -252,5 +260,176 @@ func TestParseCommand(t *testing.T) {
 	// Nil command.
 	if got := parseCommand(nil); got != "" {
 		t.Errorf("nil command: got %q", got)
+	}
+
+	// teploy-cli-15: exec-form argument boundaries must survive the later
+	// `sh -c` re-parse. Each argument containing spaces, quotes, empty
+	// strings, or "$" is shell-quoted; safe arguments stay bare.
+	tests := []struct {
+		args []interface{}
+		want string
+	}{
+		{[]interface{}{"sh", "-c", "printf 'hello world'"}, "sh -c 'printf '\"'\"'hello world'\"'\"''"},
+		{[]interface{}{"echo", "a b", ""}, `echo 'a b' ''`},
+		{[]interface{}{"echo", "$HOME"}, `echo '$HOME'`},
+		{[]interface{}{"echo", `say "hi"`}, `echo 'say "hi"'`},
+		{[]interface{}{"node", "worker.js", "--flag=1"}, `node worker.js --flag=1`},
+	}
+	for _, tt := range tests {
+		if got := parseCommand(tt.args); got != tt.want {
+			t.Errorf("parseCommand(%v) = %q, want %q", tt.args, got, tt.want)
+		}
+	}
+
+	// The joined form must re-split (via sh -c semantics) into the exact
+	// original argv: quoting a shell word and re-parsing it yields the
+	// same single argument.
+	original := []interface{}{"sh", "-c", "printf 'hello world'"}
+	joined := parseCommand(original)
+	parts := splitShellWords(t, joined)
+	if len(parts) != len(original) {
+		t.Fatalf("joined command %q re-splits into %d words, want %d", joined, len(parts), len(original))
+	}
+	for i := range parts {
+		if parts[i] != original[i] {
+			t.Errorf("re-split word %d = %q, want %q (joined: %s)", i, parts[i], original[i], joined)
+		}
+	}
+}
+
+// splitShellWords re-splits a `sh -c` command line the way /bin/sh would,
+// honoring single- and double-quoted spans (covers the '"'"' idiom
+// ShellQuote emits).
+func splitShellWords(t *testing.T, s string) []string {
+	t.Helper()
+	var parts []string
+	var cur strings.Builder
+	hasWord := false
+	flush := func() {
+		if hasWord {
+			parts = append(parts, cur.String())
+			cur.Reset()
+			hasWord = false
+		}
+	}
+	for i := 0; i < len(s); {
+		switch c := s[i]; {
+		case c == '\'':
+			j := i + 1
+			for j < len(s) && s[j] != '\'' {
+				j++
+			}
+			cur.WriteString(s[i+1 : j])
+			hasWord = true
+			i = j + 1
+		case c == '"':
+			j := i + 1
+			for j < len(s) && s[j] != '"' {
+				j++
+			}
+			cur.WriteString(s[i+1 : j])
+			hasWord = true
+			i = j + 1
+		case c == ' ' || c == '\t':
+			flush()
+			i++
+		default:
+			cur.WriteByte(c)
+			hasWord = true
+			i++
+		}
+	}
+	flush()
+	return parts
+}
+
+// TestLoadCompose_DatabaseWithPortsIsNeverWeb: a database that publishes
+// ports must classify as an accessory, and the app service must be picked
+// regardless of map insertion order (teploy-cli-14 — the old loop took the
+// first service with ports, so the same file imported differently per run).
+func TestLoadCompose_DatabaseWithPortsIsNeverWeb(t *testing.T) {
+	// db listed FIRST: the order that used to mispick the database as web.
+	compose := `
+services:
+  db:
+    image: postgres:16
+    ports: ["5432:5432"]
+    environment:
+      POSTGRES_PASSWORD: pass
+  web:
+    image: myapp:latest
+    ports: ["3000:3000"]
+`
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "docker-compose.yml"), []byte(compose), 0644)
+
+	cfg, err := LoadCompose(dir)
+	if err != nil {
+		t.Fatalf("LoadCompose: %v", err)
+	}
+	if cfg.Image != "myapp:latest" {
+		t.Errorf("web image = %q, want myapp:latest", cfg.Image)
+	}
+	pg, ok := cfg.Accessories["db"]
+	if !ok {
+		t.Fatal("expected postgres to classify as an accessory despite published ports")
+	}
+	if pg.Image != "postgres:16" {
+		t.Errorf("postgres image = %q", pg.Image)
+	}
+	if _, ok := cfg.Accessories["db"]; !ok {
+		t.Fatal("expected postgres accessory")
+	}
+	if len(cfg.Processes) != 0 {
+		t.Errorf("web with an empty command collapses to no processes entry, got %v", cfg.Processes)
+	}
+}
+
+// TestLoadCompose_AmbiguousPortsFailsClearly: two non-accessory services
+// with published ports have no principled automatic pick — import must
+// fail naming both, deterministically, instead of choosing by map order.
+func TestLoadCompose_AmbiguousPortsFailsClearly(t *testing.T) {
+	compose := `
+services:
+  web:
+    image: myapp:latest
+    ports: ["3000:3000"]
+  api:
+    image: myapi:latest
+    ports: ["8080:8080"]
+`
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "docker-compose.yml"), []byte(compose), 0644)
+
+	_, err := LoadCompose(dir)
+	if err == nil {
+		t.Fatal("expected an ambiguity error")
+	}
+	if !strings.Contains(err.Error(), "ambiguous") ||
+		!strings.Contains(err.Error(), "api") ||
+		!strings.Contains(err.Error(), "web") {
+		t.Errorf("error must name the ambiguity and both candidates, got: %v", err)
+	}
+}
+
+// TestLoadCompose_OnlyAccessoryWithPorts: when every port-publishing
+// service is a known accessory, the error must say so rather than
+// importing the database as the app.
+func TestLoadCompose_OnlyAccessoryWithPorts(t *testing.T) {
+	compose := `
+services:
+  db:
+    image: postgres:16
+    ports: ["5432:5432"]
+`
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "docker-compose.yml"), []byte(compose), 0644)
+
+	_, err := LoadCompose(dir)
+	if err == nil {
+		t.Fatal("expected an error when only an accessory publishes ports")
+	}
+	if !strings.Contains(err.Error(), "accessory") {
+		t.Errorf("error should mention the accessory situation, got: %v", err)
 	}
 }

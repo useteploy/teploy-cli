@@ -4,8 +4,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
+	"sort"
 	"strings"
 
+	"github.com/useteploy/teploy/internal/ssh"
 	"gopkg.in/yaml.v3"
 )
 
@@ -83,23 +86,45 @@ func mapCompose(dir string, compose composeFile) (*AppConfig, error) {
 	cfg.App = strings.ToLower(strings.ReplaceAll(cfg.App, "_", "-"))
 	cfg.App = strings.ReplaceAll(cfg.App, " ", "-")
 
-	// Find the main web service: has ports.
-	var webServiceName string
-	var webService composeService
-	var webBuildContext string
-
+	// Find the main web service: the single non-accessory service that
+	// publishes ports. Known accessory images are excluded even when they
+	// publish ports — previously this loop took the FIRST service with
+	// ports out of Go's map iteration, so the same file could import
+	// differently on every run, and a database with a published port could
+	// be mispicked as the app itself (its known-accessory classification
+	// only ever ran for services AFTER the break). Candidates are sorted,
+	// and with more than one there is no principled automatic choice —
+	// fail and name them rather than guess.
+	var webCandidates []string
 	for name, svc := range compose.Services {
-		if len(svc.Ports) > 0 {
-			webServiceName = name
-			webService = svc
-			webBuildContext = parseBuildContext(svc.Build)
-			break
+		if len(svc.Ports) > 0 && !isAccessoryImage(svc.Image) {
+			webCandidates = append(webCandidates, name)
 		}
 	}
+	sort.Strings(webCandidates)
 
-	if webServiceName == "" {
+	var webServiceName string
+	var webService composeService
+	switch {
+	case len(webCandidates) == 1:
+		webServiceName = webCandidates[0]
+		webService = compose.Services[webServiceName]
+	case len(webCandidates) > 1:
+		return nil, fmt.Errorf("ambiguous compose import: multiple non-accessory services publish ports (%s) — teploy cannot pick the web service automatically; remove ports from the services that are not the app, or write teploy.yml manually", strings.Join(webCandidates, ", "))
+	default:
+		anyPorts := false
+		for _, svc := range compose.Services {
+			if len(svc.Ports) > 0 {
+				anyPorts = true
+				break
+			}
+		}
+		if anyPorts {
+			return nil, fmt.Errorf("no non-accessory service with ports found in compose file (only known accessory images publish ports) — set the app service's ports, or write teploy.yml manually")
+		}
 		return nil, fmt.Errorf("no service with ports found in compose file")
 	}
+	webBuildContext := parseBuildContext(webService.Build)
 
 	// Set domain placeholder — user must set this.
 	cfg.Domain = cfg.App + ".example.com"
@@ -198,6 +223,19 @@ func parseBuildContext(build interface{}) string {
 	return ""
 }
 
+// safeCommandArg matches exec-form command arguments that need no shell
+// quoting (the same character set shlex-style quoters treat as safe).
+var safeCommandArg = regexp.MustCompile(`^[a-zA-Z0-9_@%+=:,./-]+$`)
+
+// parseCommand converts a Compose command to the process command string.
+// String-form commands pass through unchanged. Exec-form (list) commands
+// are joined with each argument shell-quoted when needed: the process
+// command later runs through `sh -c` inside the container, so a plain
+// space-join loses argument boundaries — `["sh","-c","printf 'hello
+// world'"]` came out as three-plus tokens after the shell re-split it,
+// and arguments containing spaces, quotes, or "$" were silently
+// reinterpreted. Safe arguments stay bare, keeping simple commands
+// readable ("npm run worker").
 func parseCommand(cmd interface{}) string {
 	switch v := cmd.(type) {
 	case string:
@@ -205,7 +243,11 @@ func parseCommand(cmd interface{}) string {
 	case []interface{}:
 		parts := make([]string, len(v))
 		for i, p := range v {
-			parts[i] = fmt.Sprintf("%v", p)
+			arg := fmt.Sprintf("%v", p)
+			if !safeCommandArg.MatchString(arg) {
+				arg = ssh.ShellQuote(arg)
+			}
+			parts[i] = arg
 		}
 		return strings.Join(parts, " ")
 	}
@@ -255,11 +297,24 @@ func parseServiceVolumes(vols []string) map[string]string {
 }
 
 // imageBaseName extracts the short name from a Docker image reference.
-// "postgres:16" -> "postgres", "library/postgres:16" -> "postgres"
+// "postgres:16" -> "postgres", "library/postgres:16" -> "postgres",
+// "registry.example:5000/postgres:16" -> "postgres": the tag colon is the
+// one AFTER the last slash, so a registry host's port colon must not be
+// treated as the tag separator (it used to be, which silently disabled
+// accessory classification for any registry-hosted image).
 func imageBaseName(image string) string {
-	base := strings.Split(image, ":")[0]
-	parts := strings.Split(base, "/")
-	return parts[len(parts)-1]
+	if i := strings.Index(image, "@"); i >= 0 {
+		image = image[:i]
+	}
+	lastSlash := strings.LastIndex(image, "/")
+	lastColon := strings.LastIndex(image, ":")
+	if lastColon > lastSlash {
+		image = image[:lastColon]
+	}
+	if i := strings.LastIndex(image, "/"); i >= 0 {
+		image = image[i+1:]
+	}
+	return image
 }
 
 func isAccessoryImage(image string) bool {
