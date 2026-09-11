@@ -13,7 +13,7 @@ import (
 func TestBackupVolumes(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
-		ssh.MockCommand{Match: "tar -czf", Output: ""},
+		ssh.MockCommand{Match: "if [ -f", Output: ""},
 		ssh.MockCommand{Match: "aws s3 cp", Output: "upload: done\n"},
 		ssh.MockCommand{Match: "rm -f", Output: ""},
 	)
@@ -35,22 +35,35 @@ func TestBackupVolumes(t *testing.T) {
 		t.Error("expected completion message")
 	}
 
-	// Verify tar and aws commands were called.
-	foundTar := false
+	// teploy-cli-09: the archive must add the app .env as a top-level
+	// member from the app directory (restored beside volumes/), not as an
+	// absolute host path (which tar stored under a stripped
+	// deployments/<app>/ prefix that restore then buried inside volumes/).
+	var tarCmd string
+	for _, call := range mock.Calls {
+		if strings.Contains(call, "tar -czf") {
+			tarCmd = call
+		}
+	}
 	foundS3 := false
 	for _, call := range mock.Calls {
-		if strings.HasPrefix(call, "tar") {
-			foundTar = true
-		}
 		if strings.HasPrefix(call, "aws s3 cp") {
 			foundS3 = true
 		}
 	}
-	if !foundTar {
-		t.Error("expected tar command")
+	if tarCmd == "" {
+		t.Fatal("expected tar command")
 	}
 	if !foundS3 {
 		t.Error("expected aws s3 cp command")
+	}
+	if !strings.Contains(tarCmd, "-C '/deployments/myapp/volumes' . -C '/deployments/myapp' .env") {
+		t.Errorf("archive must carry .env as a top-level member via -C appdir, got: %s", tarCmd)
+	}
+	if strings.Contains(tarCmd, "'/deployments/myapp/.env' -C") ||
+		strings.Contains(tarCmd, ".env 2>/dev/null") ||
+		strings.Contains(tarCmd, "|| tar") {
+		t.Errorf("archive command must not pass an absolute .env path or mask failures with a fallback tar: %s", tarCmd)
 	}
 }
 
@@ -571,6 +584,18 @@ func TestIsDBType(t *testing.T) {
 		{"mongo:latest", "mongo", true},
 		{"library/postgres:16", "postgres", true},
 		{"myapp:latest", "postgres", false},
+		// A registry host's port colon is not a tag separator — the case
+		// that used to collapse these to the registry hostname and pick
+		// the generic tar branch for a real database (teploy-cli-08).
+		{"registry.example:5000/postgres:16", "postgres", true},
+		{"registry.example:5000/postgres", "postgres", true},
+		{"registry.example:5000/namespace/mysql:8", "mysql", true},
+		{"ghcr.io/registry:5000/redis:7", "redis", true},
+		{"postgres@sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "postgres", true},
+		{"registry.example:5000/myapp:latest", "postgres", false},
+		// Custom aliases do not name-match a known engine — inference
+		// stays conservative by design.
+		{"myorg/my-postgres:16", "postgres", false},
 	}
 
 	for _, tt := range tests {

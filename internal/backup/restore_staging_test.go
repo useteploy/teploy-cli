@@ -23,6 +23,7 @@ func TestRestoreVolumes_StagesBeforePromoting(t *testing.T) {
 		ssh.MockCommand{Match: "mkdir -p", Output: ""},
 		ssh.MockCommand{Match: "mktemp -d", Output: "/deployments/myapp/volumes.restore-old.abc123\n"},
 		ssh.MockCommand{Match: "find ", Output: ""},
+		ssh.MockCommand{Match: "if [ -f", Output: ""},
 	)
 
 	var buf bytes.Buffer
@@ -54,6 +55,39 @@ func TestRestoreVolumes_StagesBeforePromoting(t *testing.T) {
 	}
 	if !strings.Contains(promote, "restore-old.abc123") {
 		t.Errorf("promote must move live contents aside to the recovery directory: %s", promote)
+	}
+
+	// teploy-cli-09: the backup's .env member must be lifted out of the
+	// staging tree BEFORE promotion (it belongs beside volumes/, not inside
+	// them), then installed at /deployments/myapp/.env with the previous
+	// file kept recoverable. The old-format nested member
+	// (deployments/<app>/.env) must be recognized and cleared too.
+	var setAside, envInstall string
+	for _, call := range mock.Calls {
+		if strings.Contains(call, "/tmp/myapp-volumes-restore-stage/.env") {
+			setAside = call
+		}
+		if strings.Contains(call, "/deployments/myapp/.env") {
+			envInstall = call
+		}
+	}
+	if setAside == "" {
+		t.Fatalf("expected a set-aside step for the staged .env, got calls: %v", mock.Calls)
+	}
+	if !strings.Contains(setAside, "/tmp/myapp-volumes-restore-stage.env") {
+		t.Errorf("set-aside must move the .env out of the staging tree, got: %s", setAside)
+	}
+	if !strings.Contains(setAside, "/tmp/myapp-volumes-restore-stage/deployments/myapp/.env") {
+		t.Errorf("set-aside must also recognize the old archive layout (deployments/<app>/.env), got: %s", setAside)
+	}
+	if envInstall == "" {
+		t.Fatalf("expected an .env install step, got calls: %v", mock.Calls)
+	}
+	if !strings.Contains(envInstall, "mv '/tmp/myapp-volumes-restore-stage.env' '/deployments/myapp/.env'") {
+		t.Errorf(".env must be installed beside volumes/ in the app directory, got: %s", envInstall)
+	}
+	if !strings.Contains(envInstall, ".env.pre-restore") || !strings.Contains(envInstall, "chmod 600") {
+		t.Errorf(".env install must keep the previous file recoverable and restrict permissions, got: %s", envInstall)
 	}
 }
 

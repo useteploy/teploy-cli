@@ -95,6 +95,13 @@ func NewClient(exec ssh.Executor, out io.Writer) *Client {
 }
 
 // BackupVolumes creates a tar.gz archive of all app volumes and uploads to S3.
+//
+// The app's .env rides inside the archive as a top-level `.env` member,
+// which RestoreVolumes puts back beside the volumes directory. The old
+// command passed the absolute .env path as a second tar argument: tar
+// strips the leading slash, so restore unpacked it to
+// volumes/deployments/<app>/.env — a nested host-path artifact nobody
+// ever read back, while the live .env stayed stale.
 func (c *Client) BackupVolumes(ctx context.Context, app string, s3 S3Config) error {
 	if err := c.ensureAWSCLI(ctx); err != nil {
 		return err
@@ -102,15 +109,18 @@ func (c *Client) BackupVolumes(ctx context.Context, app string, s3 S3Config) err
 
 	timestamp := time.Now().UTC().Format("20060102-150405")
 	volumesDir := fmt.Sprintf("%s/%s/volumes", deploymentsDir, app)
-	envFile := fmt.Sprintf("%s/%s/.env", deploymentsDir, app)
+	appDir := fmt.Sprintf("%s/%s", deploymentsDir, app)
 	archivePath := fmt.Sprintf("/tmp/%s-volumes-%s.tar.gz", app, timestamp)
 	s3Key := fmt.Sprintf("s3://%s/%s/volumes/%s.tar.gz", s3.Bucket, app, timestamp)
 
-	// Create archive.
+	// An explicit if/else, not `tar ... || tar ...`: the old fallback
+	// re-ran the tar without .env whenever the first tar failed for ANY
+	// reason, masking real archive failures as successes.
 	fmt.Fprintf(c.out, "Archiving volumes for %s...\n", app)
 	cmd := fmt.Sprintf(
-		"tar -czf %s -C %s . %s 2>/dev/null || tar -czf %s -C %s .",
-		ssh.ShellQuote(archivePath), ssh.ShellQuote(volumesDir), ssh.ShellQuote(envFile),
+		"if [ -f %s ]; then tar -czf %s -C %s . -C %s .env; else tar -czf %s -C %s .; fi",
+		ssh.ShellQuote(appDir+"/.env"),
+		ssh.ShellQuote(archivePath), ssh.ShellQuote(volumesDir), ssh.ShellQuote(appDir),
 		ssh.ShellQuote(archivePath), ssh.ShellQuote(volumesDir),
 	)
 	if _, err := c.exec.Run(ctx, cmd); err != nil {
@@ -130,24 +140,62 @@ func (c *Client) BackupVolumes(ctx context.Context, app string, s3 S3Config) err
 	return nil
 }
 
-// RestoreVolumes downloads and extracts a volume backup from S3.
+// RestoreVolumes downloads and extracts a volume backup from S3. If the
+// archive carries the app-level .env (see BackupVolumes), it is restored
+// beside the volumes directory in the app directory — the pre-restore file
+// is kept as .env.pre-restore so overwriting credentials is recoverable.
 func (c *Client) RestoreVolumes(ctx context.Context, app, date string, s3 S3Config) error {
 	if err := c.ensureAWSCLI(ctx); err != nil {
 		return err
 	}
 
 	volumesDir := fmt.Sprintf("%s/%s/volumes", deploymentsDir, app)
+	appDir := fmt.Sprintf("%s/%s", deploymentsDir, app)
+	envPath := appDir + "/.env"
 	s3Key := fmt.Sprintf("s3://%s/%s/volumes/%s.tar.gz", s3.Bucket, app, date)
 	archivePath := fmt.Sprintf("/tmp/%s-volumes-restore.tar.gz", app)
 	stageDir := fmt.Sprintf("/tmp/%s-volumes-restore-stage", app)
+	stagedEnv := stageDir + ".env"
 
 	fmt.Fprintf(c.out, "Downloading %s...\n", s3Key)
 	if _, err := c.exec.Run(ctx, s3.AWS(fmt.Sprintf("s3 cp %s %s", ssh.ShellQuote(s3Key), ssh.ShellQuote(archivePath)))); err != nil {
 		return fmt.Errorf("downloading from S3: %w", err)
 	}
 
-	if err := extractToStagingThenPromote(ctx, c.exec, archivePath, stageDir, volumesDir, c.out); err != nil {
+	// Before the staged tree is promoted into the volumes directory, pull
+	// the backup's .env member out of it (it must land beside volumes/,
+	// not inside). The old archive layout stored it under
+	// deployments/<app>/.env — recognize and clear that artifact too.
+	setAsideEnv := func(stage string) error {
+		cmd := fmt.Sprintf(
+			"if [ -f %s ]; then mv %s %s; elif [ -f %s ]; then mv %s %s 2>/dev/null; rm -rf %s; fi",
+			ssh.ShellQuote(stage+"/.env"), ssh.ShellQuote(stage+"/.env"), ssh.ShellQuote(stagedEnv),
+			ssh.ShellQuote(stage+"/deployments"), ssh.ShellQuote(stage+"/deployments/"+app+"/.env"), ssh.ShellQuote(stagedEnv),
+			ssh.ShellQuote(stage+"/deployments"),
+		)
+		if _, err := c.exec.Run(ctx, cmd); err != nil {
+			return fmt.Errorf("setting aside backed-up .env: %w", err)
+		}
+		return nil
+	}
+
+	if err := extractToStagingThenPromote(ctx, c.exec, archivePath, stageDir, volumesDir, c.out, setAsideEnv); err != nil {
 		return err
+	}
+
+	// Install the backed-up .env (if the archive carried one — older
+	// backups and volumes-only schedules don't) while keeping the previous
+	// file recoverable.
+	envCmd := fmt.Sprintf(
+		"if [ -f %s ]; then if [ -f %s ]; then cp -p %s %s; fi; mv %s %s && chmod 600 %s && echo 'Restored app .env'; fi",
+		ssh.ShellQuote(stagedEnv),
+		ssh.ShellQuote(envPath), ssh.ShellQuote(envPath), ssh.ShellQuote(envPath+".pre-restore"),
+		ssh.ShellQuote(stagedEnv), ssh.ShellQuote(envPath), ssh.ShellQuote(envPath),
+	)
+	if out, err := c.exec.Run(ctx, envCmd); err != nil {
+		return fmt.Errorf("restoring .env: %w — backup kept at %s", err, stagedEnv)
+	} else if strings.TrimSpace(out) != "" {
+		fmt.Fprint(c.out, out+"\n")
 	}
 	fmt.Fprintln(c.out, "Restore complete")
 	return nil
@@ -169,7 +217,12 @@ func (c *Client) RestoreVolumes(ctx context.Context, app, date string, s3 S3Conf
 // locally and inspecting entries with Go's archive/tar before ever invoking
 // a shell tar. What this DOES close is the truncated/corrupt-archive case and
 // the "partially overwrites a live, in-use directory" failure mode.
-func extractToStagingThenPromote(ctx context.Context, exec ssh.Executor, archivePath, stageDir, liveDir string, out io.Writer) error {
+//
+// prePromote, when non-nil, runs against the extracted staging directory
+// between extraction and promotion; a failure there aborts with the live
+// directory untouched. RestoreVolumes uses it to lift the backed-up app
+// .env out of the tree before the volumes promotion copies it in.
+func extractToStagingThenPromote(ctx context.Context, exec ssh.Executor, archivePath, stageDir, liveDir string, out io.Writer, prePromote func(stageDir string) error) error {
 	cleanup := func() {
 		exec.Run(context.WithoutCancel(ctx), "rm -rf "+ssh.ShellQuote(stageDir)+" "+ssh.ShellQuote(archivePath))
 	}
@@ -180,6 +233,13 @@ func extractToStagingThenPromote(ctx context.Context, exec ssh.Executor, archive
 	if _, err := exec.Run(ctx, extractCmd); err != nil {
 		cleanup()
 		return fmt.Errorf("extracting archive to staging (live directory untouched): %w", err)
+	}
+
+	if prePromote != nil {
+		if err := prePromote(stageDir); err != nil {
+			cleanup()
+			return fmt.Errorf("preparing staged restore: %w", err)
+		}
 	}
 
 	fmt.Fprintf(out, "Restoring to %s...\n", liveDir)
@@ -421,7 +481,7 @@ func (c *Client) AccessoryRestore(ctx context.Context, app, name, image, date st
 	fmt.Fprintf(c.out, "Restoring %s...\n", name)
 	if accDir != "" {
 		stageDir := tmpdir + "/restore-stage"
-		if err := extractToStagingThenPromote(ctx, c.exec, restorePath, stageDir, accDir, c.out); err != nil {
+		if err := extractToStagingThenPromote(ctx, c.exec, restorePath, stageDir, accDir, c.out, nil); err != nil {
 			return keepTmp(fmt.Errorf("restoring %s: %w", name, err))
 		}
 	} else if _, err := c.exec.Run(ctx, restoreCmd); err != nil {
@@ -473,11 +533,34 @@ func (c *Client) ensureAWSCLI(ctx context.Context) error {
 	return nil
 }
 
+// isDBType reports whether image refers to the given database engine. The
+// repository's final path component is compared, with tag/digest and
+// registry host stripped — including a registry port: its colon sits
+// BEFORE the last slash, so treating the first colon as the tag separator
+// turned "registry.example:5000/postgres:16" into "registry.example" and
+// silently routed real databases through the generic tar backup/restore
+// branch.
 func isDBType(image, dbType string) bool {
-	base := strings.Split(image, ":")[0]
-	parts := strings.Split(base, "/")
-	name := parts[len(parts)-1]
-	return name == dbType
+	return imageName(image) == dbType
+}
+
+// imageName returns the repository name of an image reference:
+// "postgres:16" → "postgres", "library/postgres" → "postgres",
+// "registry.example:5000/postgres:16" → "postgres",
+// "postgres@sha256:..." → "postgres".
+func imageName(image string) string {
+	if i := strings.Index(image, "@"); i >= 0 {
+		image = image[:i]
+	}
+	lastSlash := strings.LastIndex(image, "/")
+	lastColon := strings.LastIndex(image, ":")
+	if lastColon > lastSlash {
+		image = image[:lastColon]
+	}
+	if i := strings.LastIndex(image, "/"); i >= 0 {
+		image = image[i+1:]
+	}
+	return image
 }
 
 // postgresDBAndUser resolves the actual database name and superuser a
