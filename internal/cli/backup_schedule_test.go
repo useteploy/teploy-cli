@@ -27,16 +27,23 @@ func TestFirstWebhookURL(t *testing.T) {
 }
 
 func TestBuildScheduledBackupCmd(t *testing.T) {
-	// Base: archive + upload + cleanup, no retention, no alert.
+	// Base: archive + upload + cleanup, no retention, no alert. The exact
+	// archive path is captured in $f (teploy-cli-12): re-globbing
+	// /tmp/<app>-backup-*.tar.gz uploaded and deleted leftovers from
+	// interrupted runs alongside the fresh archive.
 	base := buildScheduledBackupCmd("myapp", "1.2.3.4", "my-bucket", "us-east-1", "", 0, "")
 	for _, want := range []string{
-		"tar -czf /tmp/myapp-backup-",
-		"aws s3 cp /tmp/myapp-backup-*.tar.gz s3://my-bucket/myapp/volumes/ --region us-east-1",
-		"rm -f /tmp/myapp-backup-*.tar.gz",
+		`f=/tmp/myapp-backup-$(date +`,
+		`tar -czf "$f" -C /deployments/myapp/volumes .`,
+		`aws s3 cp "$f" s3://my-bucket/myapp/volumes/ --region us-east-1`,
+		`rm -f "$f"`,
 	} {
 		if !strings.Contains(base, want) {
 			t.Errorf("base cmd missing %q:\n%s", want, base)
 		}
+	}
+	if strings.Contains(base, "-backup-*") {
+		t.Errorf("upload/cleanup must target only the captured archive, not a glob:\n%s", base)
 	}
 	if strings.Contains(base, "head -n -") || strings.Contains(base, "curl") {
 		t.Errorf("base cmd should have no retention/alert:\n%s", base)

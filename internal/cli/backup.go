@@ -378,13 +378,17 @@ func buildScheduledBackupCmd(app, server, bucket, region, endpoint string, keepL
 		awsEndpoint = " --endpoint-url " + ssh.ShellQuote(endpoint)
 	}
 	cmd := fmt.Sprintf(
-		"tar -czf /tmp/%s-backup-$(date +%%Y%%m%%d-%%H%%M%%S).tar.gz -C /deployments/%s/volumes . && "+
-			"aws s3 cp /tmp/%s-backup-*.tar.gz s3://%s/%s/volumes/ --region %s%s && "+
-			"rm -f /tmp/%s-backup-*.tar.gz",
+		"f=/tmp/%s-backup-$(date +%%Y%%m%%d-%%H%%M%%S).tar.gz && tar -czf \"$f\" -C /deployments/%s/volumes . && "+
+			"aws s3 cp \"$f\" s3://%s/%s/volumes/ --region %s%s && "+
+			"rm -f \"$f\"",
 		app, app,
-		app, bucket, app, region, awsEndpoint,
-		app,
+		bucket, app, region, awsEndpoint,
 	)
+
+	// The archive path is captured in $f rather than re-globbed: the old
+	// `aws s3 cp /tmp/<app>-backup-*.tar.gz` matched ANY leftover archive
+	// from a previously interrupted run and uploaded (then deleted) it
+	// alongside the fresh one.
 
 	// Bake keep-last retention into the same cron job: after the fresh upload,
 	// list the timestamped keys, keep the newest N, delete the rest. The names
