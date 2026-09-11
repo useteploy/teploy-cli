@@ -96,13 +96,14 @@ func newTemplateInfoCmd(_ *Flags) *cobra.Command {
 func newTemplateDeployCmd(flags *Flags) *cobra.Command {
 	var domain, server string
 	var port int
+	var vars []string
 
 	cmd := &cobra.Command{
 		Use:   "deploy <name>",
 		Short: "Deploy from a template",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runTemplateDeploy(flags, args[0], domain, server, port)
+			return runTemplateDeploy(flags, args[0], domain, server, port, vars)
 		},
 	}
 
@@ -113,19 +114,26 @@ func newTemplateDeployCmd(flags *Flags) *cobra.Command {
 	cmd.Flags().StringVar(&domain, "domain", "", "domain for the app (required unless the template uses ingress: host)")
 	cmd.Flags().StringVar(&server, "server", "", "server to deploy to")
 	cmd.Flags().IntVar(&port, "port", 0, "host port override for ingress: host templates")
+	cmd.Flags().StringArrayVar(&vars, "var", nil, "template variables as key=value (required for every variable the template declares)")
 
 	return cmd
 }
 
-func runTemplateDeploy(flags *Flags, name, domain, server string, port int) error {
+func runTemplateDeploy(flags *Flags, name, domain, server string, port int, extraVars []string) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
 	// Fetch and render template.
+	vars := map[string]string{"domain": domain}
+	for _, v := range extraVars {
+		parts := strings.SplitN(v, "=", 2)
+		if len(parts) == 2 {
+			vars[parts[0]] = parts[1]
+		}
+	}
+
 	reg := tmpl.NewRegistry()
-	content, generated, err := reg.Fetch(ctx, name, map[string]string{
-		"domain": domain,
-	})
+	content, generated, err := reg.Fetch(ctx, name, vars)
 	if err != nil {
 		return err
 	}
