@@ -13,6 +13,7 @@ import (
 func TestBackupVolumes(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
+		ssh.MockCommand{Match: "umask 077", Output: "/tmp/teploy-backup.abc123\n"},
 		ssh.MockCommand{Match: "if [ -f", Output: ""},
 		ssh.MockCommand{Match: "aws s3 cp", Output: "upload: done\n"},
 		ssh.MockCommand{Match: "rm -f", Output: ""},
@@ -70,6 +71,7 @@ func TestBackupVolumes(t *testing.T) {
 func TestAccessoryBackup_Postgres(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
+		ssh.MockCommand{Match: "umask 077", Output: "/tmp/teploy-backup.abc123\n"},
 		ssh.MockCommand{Match: "docker exec", Output: ""},
 		ssh.MockCommand{Match: "aws s3 cp", Output: "done\n"},
 		ssh.MockCommand{Match: "rm -f", Output: ""},
@@ -114,6 +116,7 @@ func TestAccessoryBackup_Postgres(t *testing.T) {
 func TestAccessoryBackup_Postgres_CustomDBName(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
+		ssh.MockCommand{Match: "umask 077", Output: "/tmp/teploy-backup.abc123\n"},
 		ssh.MockCommand{Match: "docker exec", Output: ""},
 		ssh.MockCommand{Match: "aws s3 cp", Output: "done\n"},
 		ssh.MockCommand{Match: "rm -f", Output: ""},
@@ -158,6 +161,7 @@ func TestAccessoryBackup_Postgres_CustomDBName(t *testing.T) {
 func TestAccessoryBackup_Postgres_DumpFailureIsNotSwallowed(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
+		ssh.MockCommand{Match: "umask 077", Output: "/tmp/teploy-backup.abc123\n"},
 		ssh.MockCommand{Match: "docker exec", Err: errors.New(`exit status 1: pg_dump: error: connection to database "myapp" failed: FATAL:  database "myapp" does not exist`)},
 	)
 
@@ -181,6 +185,7 @@ func TestAccessoryBackup_Postgres_DumpFailureIsNotSwallowed(t *testing.T) {
 func TestAccessoryBackup_MySQL(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
+		ssh.MockCommand{Match: "umask 077", Output: "/tmp/teploy-backup.abc123\n"},
 		ssh.MockCommand{Match: "docker exec", Output: ""},
 		ssh.MockCommand{Match: "aws s3 cp", Output: "done\n"},
 		ssh.MockCommand{Match: "rm -f", Output: ""},
@@ -213,7 +218,8 @@ func TestAccessoryBackup_MySQL(t *testing.T) {
 func TestAccessoryBackup_RedisWaitsForBgsave(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
-		ssh.MockCommand{Match: "ls=$(docker exec", Output: ""},
+		ssh.MockCommand{Match: "umask 077", Output: "/tmp/teploy-backup.abc123\n"},
+		ssh.MockCommand{Match: "set -eu", Output: ""},
 		ssh.MockCommand{Match: "aws s3 cp", Output: "done\n"},
 		ssh.MockCommand{Match: "rm -f", Output: ""},
 	)
@@ -240,8 +246,14 @@ func TestAccessoryBackup_RedisWaitsForBgsave(t *testing.T) {
 	if i, j := strings.Index(dumpCmd, "lastsave"), strings.Index(dumpCmd, "bgsave"); i < 0 || j < 0 || i > j {
 		t.Errorf("LASTSAVE must be captured before bgsave:\n%s", dumpCmd)
 	}
-	if !strings.Contains(dumpCmd, `lastsave)" != "$ls"`) || !strings.Contains(dumpCmd, "seq 1 60") {
-		t.Errorf("expected a LASTSAVE poll loop (up to 60s) before docker cp:\n%s", dumpCmd)
+	// audit F36: the poll must be fail-closed — a `saved` flag checked after
+	// the loop, so exhaustion aborts instead of falling through to docker cp
+	// with the previous dump.
+	if !strings.Contains(dumpCmd, `[ "$cur" != "$ls" ]`) || !strings.Contains(dumpCmd, `"$i" -lt 60`) {
+		t.Errorf("expected a bounded LASTSAVE poll loop before docker cp:\n%s", dumpCmd)
+	}
+	if !strings.Contains(dumpCmd, `[ "$saved" != yes ]`) {
+		t.Errorf("poll exhaustion must abort the backup (saved-flag check missing):\n%s", dumpCmd)
 	}
 	if strings.Contains(dumpCmd, "sleep 2") {
 		t.Errorf("fixed sleep assumes bgsave finishes in 2s:\n%s", dumpCmd)
@@ -256,6 +268,7 @@ func TestAccessoryBackup_RedisWaitsForBgsave(t *testing.T) {
 func TestAccessoryBackup_MySQL_UsesRootPasswordEnv(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
+		ssh.MockCommand{Match: "umask 077", Output: "/tmp/teploy-backup.abc123\n"},
 		ssh.MockCommand{Match: "docker exec", Output: ""},
 		ssh.MockCommand{Match: "aws s3 cp", Output: "done\n"},
 		ssh.MockCommand{Match: "rm -f", Output: ""},
@@ -295,6 +308,7 @@ func TestAccessoryBackup_MySQL_PasswordFallbackAndAbsence(t *testing.T) {
 	// MYSQL_PASSWORD is the fallback when MYSQL_ROOT_PASSWORD is unset.
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
+		ssh.MockCommand{Match: "umask 077", Output: "/tmp/teploy-backup.abc123\n"},
 		ssh.MockCommand{Match: "docker exec", Output: ""},
 		ssh.MockCommand{Match: "aws s3 cp", Output: "done\n"},
 		ssh.MockCommand{Match: "rm -f", Output: ""},
@@ -318,6 +332,7 @@ func TestAccessoryBackup_MySQL_PasswordFallbackAndAbsence(t *testing.T) {
 	// No password configured: keep the bare command (passwordless root).
 	mock = ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
+		ssh.MockCommand{Match: "umask 077", Output: "/tmp/teploy-backup.abc123\n"},
 		ssh.MockCommand{Match: "docker exec", Output: ""},
 		ssh.MockCommand{Match: "aws s3 cp", Output: "done\n"},
 		ssh.MockCommand{Match: "rm -f", Output: ""},
@@ -341,6 +356,7 @@ func TestAccessoryBackup_MySQL_PasswordFallbackAndAbsence(t *testing.T) {
 func TestAccessoryBackup_MySQL_QuotesHostilePassword(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
+		ssh.MockCommand{Match: "umask 077", Output: "/tmp/teploy-backup.abc123\n"},
 		ssh.MockCommand{Match: "docker exec", Output: ""},
 		ssh.MockCommand{Match: "aws s3 cp", Output: "done\n"},
 		ssh.MockCommand{Match: "rm -f", Output: ""},
@@ -466,6 +482,7 @@ func TestAccessoryRestore_CorruptArchiveFails(t *testing.T) {
 func TestAccessoryBackup_Generic(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
+		ssh.MockCommand{Match: "umask 077", Output: "/tmp/teploy-backup.abc123\n"},
 		ssh.MockCommand{Match: "tar -czf", Output: ""},
 		ssh.MockCommand{Match: "aws s3 cp", Output: "done\n"},
 		ssh.MockCommand{Match: "rm -f", Output: ""},
@@ -661,7 +678,9 @@ func TestValidateSchedule(t *testing.T) {
 		}
 	}
 
-	invalid := []string{"0 3 * * *; rm -rf /", "$(whoami)", "0 3 * * * && cat /etc/passwd"}
+	invalid := []string{"0 3 * * *; rm -rf /", "$(whoami)", "0 3 * * * && cat /etc/passwd",
+		// audit F39: a character-set-only validator accepted these.
+		"* * * *", "0 3 * * * *", "99 99 * * *", "0 0 32 * *", "0 0 * 13 *", "*/0 * * * *"}
 	for _, s := range invalid {
 		if err := ValidateSchedule(s); err == nil {
 			t.Errorf("ValidateSchedule(%q) = nil, want error", s)
