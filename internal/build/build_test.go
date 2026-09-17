@@ -62,7 +62,7 @@ func TestBuild_Dockerfile(t *testing.T) {
 	if len(mock.Calls) != 1 {
 		t.Fatalf("expected 1 call, got %d", len(mock.Calls))
 	}
-	if !strings.Contains(mock.Calls[0], "docker build -t myapp-build-abc1234 /deployments/myapp/build") {
+	if !strings.Contains(mock.Calls[0], "docker build -t 'myapp-build-abc1234' /deployments/myapp/build") {
 		t.Errorf("unexpected command: %s", mock.Calls[0])
 	}
 }
@@ -89,7 +89,7 @@ func TestBuild_DockerfileWithPlatform(t *testing.T) {
 	if len(mock.Calls) != 1 {
 		t.Fatalf("expected 1 call, got %d", len(mock.Calls))
 	}
-	if !strings.Contains(mock.Calls[0], "--platform linux/arm64") {
+	if !strings.Contains(mock.Calls[0], "--platform 'linux/arm64'") {
 		t.Errorf("expected --platform flag in command: %s", mock.Calls[0])
 	}
 }
@@ -144,10 +144,10 @@ func TestBuild_Nixpacks(t *testing.T) {
 	for _, call := range mock.Calls {
 		if strings.HasPrefix(call, "nixpacks build") {
 			found = true
-			if !strings.Contains(call, "--name myapp-build-abc1234") {
+			if !strings.Contains(call, "--name 'myapp-build-abc1234'") {
 				t.Errorf("missing --name flag: %s", call)
 			}
-			if !strings.Contains(call, "--cache-path /deployments/myapp/cache") {
+			if !strings.Contains(call, "--cache-path '/deployments/myapp/cache'") {
 				t.Errorf("missing --cache-path: %s", call)
 			}
 		}
@@ -472,7 +472,7 @@ func TestBuild_SubdirDockerfileCommand(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	want := "docker build -t myapp-build-abc1234 -f '/deployments/myapp/build/server/monolith/Dockerfile' /deployments/myapp/build"
+	want := "docker build -t 'myapp-build-abc1234' -f '/deployments/myapp/build/server/monolith/Dockerfile' /deployments/myapp/build"
 	if !strings.Contains(mock.Calls[0], want) {
 		t.Errorf("unexpected command:\n got: %s\nwant contains: %s", mock.Calls[0], want)
 	}
@@ -502,7 +502,7 @@ func TestBuild_ContextSubdirNixpacks(t *testing.T) {
 			nixpacksCall = c
 		}
 	}
-	if !strings.Contains(nixpacksCall, "nixpacks build /deployments/myapp/build/api ") {
+	if !strings.Contains(nixpacksCall, "nixpacks build '/deployments/myapp/build/api' ") {
 		t.Errorf("nixpacks should build the context subdir, got: %s", nixpacksCall)
 	}
 }

@@ -112,9 +112,9 @@ func (b *Builder) Build(ctx context.Context, cfg BuildConfig) (string, error) {
 }
 
 func (b *Builder) buildDockerfile(ctx context.Context, tag, buildDir, contextSub, dockerfile, platform string) error {
-	cmd := "docker build -t " + tag
+	cmd := "docker build -t " + ssh.ShellQuote(tag)
 	if platform != "" {
-		cmd += " --platform " + platform
+		cmd += " --platform " + ssh.ShellQuote(platform)
 	}
 	// Remote paths are POSIX; use path.Join and quote for the shell.
 	cmd += remoteBuildTail(buildDir, contextSub, dockerfile)
@@ -129,7 +129,7 @@ func (b *Builder) buildNixpacks(ctx context.Context, tag, app, buildDir, context
 
 	cachePath := fmt.Sprintf("/deployments/%s/cache", app)
 	buildTarget := subDir(path.Join, buildDir, contextSub)
-	cmd := fmt.Sprintf("nixpacks build %s --name %s --cache-path %s", buildTarget, tag, cachePath)
+	cmd := fmt.Sprintf("nixpacks build %s --name %s --cache-path %s", ssh.ShellQuote(buildTarget), ssh.ShellQuote(tag), ssh.ShellQuote(cachePath))
 	return b.exec.RunStream(ctx, cmd, b.stdout, b.stdout)
 }
 

@@ -437,8 +437,16 @@ func (m *Manager) Upgrade(ctx context.Context, app, name, newImage string, cfg c
 	}
 
 	fmt.Fprintf(m.out, "Stopping %s...\n", containerName)
-	m.docker.Stop(ctx, containerName, 10)
-	m.docker.Remove(ctx, containerName)
+	// Stop/remove failures abort BEFORE the old container is gone — the old
+	// code ignored them and barreled into EnsureRunning, leaving a
+	// half-upgraded accessory or an orphaned corpse under the same name
+	// (audit F05).
+	if err := m.docker.Stop(ctx, containerName, 10); err != nil {
+		return fmt.Errorf("stopping %s for upgrade (it was left as-is): %w", containerName, err)
+	}
+	if err := m.docker.Remove(ctx, containerName); err != nil {
+		return fmt.Errorf("removing the stopped %s for upgrade: %w", containerName, err)
+	}
 
 	cfg.Image = newImage
 	// EnsureRunning reconciles data-directory ownership against the new image.
