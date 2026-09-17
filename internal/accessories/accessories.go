@@ -6,6 +6,8 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"net"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -119,10 +121,22 @@ func (m *Manager) EnsureRunning(ctx context.Context, app, name string, cfg confi
 		"--label", "teploy.accessory=" + name,
 	}
 
+	// Env rides a 0600 env-file under the accessory's own directory rather
+	// than `-e KEY=value` argv: resolved credentials (generated passwords,
+	// secret: references) would otherwise sit in the host's process list
+	// for the life of the docker run (audit F22) — same reasoning as
+	// openbao's seal-env and the app deploy env file.
 	if len(env) > 0 {
-		for _, k := range sortedKeys(env) {
-			args = append(args, "-e", ssh.ShellQuote(k+"="+env[k]))
+		keys := sortedKeys(env)
+		var b strings.Builder
+		for _, k := range keys {
+			fmt.Fprintf(&b, "%s=%s\n", k, env[k])
 		}
+		envFile := accDir + "/container.env"
+		if err := m.exec.Upload(ctx, strings.NewReader(b.String()), envFile, "0600"); err != nil {
+			return nil, fmt.Errorf("writing accessory env file: %w", err)
+		}
+		args = append(args, "--env-file", ssh.ShellQuote(envFile))
 	}
 
 	if len(volumes) > 0 {
@@ -148,9 +162,15 @@ func (m *Manager) EnsureRunning(ctx context.Context, app, name string, cfg confi
 	args = append(args, "--log-opt", "max-size=10m")
 	args = append(args, ssh.ShellQuote(cfg.Image))
 
-	// Image command override (docker run trailing args), word-split like a
-	// shell command line and each word quoted for the remote shell.
-	if cfg.Command != "" {
+	// Image command override (docker run trailing args). CommandArgs is
+	// the argv form and is quoted element-wise; the legacy string Command
+	// is word-split (documented limitation — strings.Fields cannot express
+	// an argument containing spaces; audit F72).
+	if len(cfg.CommandArgs) > 0 {
+		for _, w := range cfg.CommandArgs {
+			args = append(args, ssh.ShellQuote(w))
+		}
+	} else if cfg.Command != "" {
 		for _, w := range strings.Fields(cfg.Command) {
 			args = append(args, ssh.ShellQuote(w))
 		}
@@ -220,7 +240,13 @@ func (m *Manager) resolveEnv(ctx context.Context, app, name string, env map[stri
 	}
 
 	credPath := fmt.Sprintf("%s/%s/accessories/%s/credentials", deploymentsDir, app, name)
-	stored := m.loadCredentials(ctx, credPath)
+	stored, err := m.loadCredentials(ctx, credPath)
+	if err != nil {
+		// A failed credential read must not silently become an empty map:
+		// resolveEnv would then REGENERATE 'auto' passwords over a database
+		// that already exists (audit F69).
+		return nil, fmt.Errorf("reading stored credentials for %s (refusing to regenerate over possibly-existing values): %w", name, err)
+	}
 
 	result := make(map[string]string)
 	needsWrite := false
@@ -267,11 +293,17 @@ func (m *Manager) resolveEnv(ctx context.Context, app, name string, env map[stri
 	return result, nil
 }
 
-func (m *Manager) loadCredentials(ctx context.Context, path string) map[string]string {
+// loadCredentials returns the stored credential map. Only a confirmed
+// missing file yields an empty map; an existing-but-unreadable file is an
+// error (audit F69).
+func (m *Manager) loadCredentials(ctx context.Context, path string) (map[string]string, error) {
 	creds := make(map[string]string)
-	output, err := m.exec.Run(ctx, fmt.Sprintf("cat %s 2>/dev/null", path))
-	if err != nil || strings.TrimSpace(output) == "" {
-		return creds
+	if _, statErr := m.exec.Run(ctx, "test -f "+ssh.ShellQuote(path)); statErr != nil {
+		return creds, nil
+	}
+	output, err := m.exec.Run(ctx, "cat -- "+ssh.ShellQuote(path))
+	if err != nil {
+		return nil, fmt.Errorf("reading %s: %w", path, err)
 	}
 	for _, line := range strings.Split(output, "\n") {
 		line = strings.TrimSpace(line)
@@ -283,7 +315,7 @@ func (m *Manager) loadCredentials(ctx context.Context, path string) map[string]s
 			creds[parts[0]] = parts[1]
 		}
 	}
-	return creds
+	return creds, nil
 }
 
 func (m *Manager) writeCredentials(ctx context.Context, path string, creds map[string]string) error {
@@ -296,6 +328,12 @@ func (m *Manager) writeCredentials(ctx context.Context, path string, creds map[s
 
 // InjectEnvVars writes accessory-generated env vars to /deployments/{app}/.env.
 // Existing keys are never overwritten — user values always win.
+//
+// The staging file is per-APP and private (/deployments/<app>/.env.append,
+// mode 0600): the old global /tmp/teploy_env_append was shared by every
+// concurrent deployment, so app B's connection credentials could land in
+// app A's env between A's upload and append (audit F73). A read failure of
+// the EXISTING .env aborts instead of being treated as an empty file.
 func (m *Manager) InjectEnvVars(ctx context.Context, app string, vars map[string]string) error {
 	if len(vars) == 0 {
 		return nil
@@ -303,9 +341,19 @@ func (m *Manager) InjectEnvVars(ctx context.Context, app string, vars map[string
 
 	envPath := fmt.Sprintf("%s/%s/.env", deploymentsDir, app)
 
-	// Read existing .env to find keys already set.
+	// Read existing .env to find keys already set. A missing file is the
+	// normal first-run case; a file that exists but cannot be read must
+	// abort — treating it as empty used to let the write below replace the
+	// app's env wholesale (audit F73).
+	var output string
+	if _, statErr := m.exec.Run(ctx, "test -f "+ssh.ShellQuote(envPath)); statErr == nil {
+		out, catErr := m.exec.Run(ctx, "cat -- "+ssh.ShellQuote(envPath))
+		if catErr != nil {
+			return fmt.Errorf("reading existing %s (refusing to overwrite it as though empty): %w", envPath, catErr)
+		}
+		output = out
+	}
 	existing := make(map[string]bool)
-	output, _ := m.exec.Run(ctx, fmt.Sprintf("cat %s 2>/dev/null", envPath))
 	if output != "" {
 		for _, line := range strings.Split(output, "\n") {
 			line = strings.TrimSpace(line)
@@ -319,29 +367,30 @@ func (m *Manager) InjectEnvVars(ctx context.Context, app string, vars map[string
 		}
 	}
 
-	// Collect vars to add (skip existing keys).
-	var toAdd strings.Builder
-	for _, k := range sortedKeys(vars) {
-		if !existing[k] {
-			fmt.Fprintf(&toAdd, "%s=%s\n", k, vars[k])
-		}
+	// Collect vars to add (skip existing keys), preserving the existing
+	// file's content byte-for-byte. The whole file is then replaced via a
+	// staged sibling + atomic rename — the old append through a staging file
+	// could be interrupted mid-append, and the staging path itself used to
+	// be a GLOBAL /tmp name shared across apps (audit F73).
+	content := output
+	if content != "" && !strings.HasSuffix(content, "\n") {
+		content += "\n"
 	}
-
-	if toAdd.Len() == 0 {
+	added := false
+	for _, k := range sortedKeys(vars) {
+		if existing[k] {
+			continue
+		}
+		content += k + "=" + vars[k] + "\n"
+		added = true
+	}
+	if !added {
 		return nil
 	}
-
-	// Create or append to .env file.
-	if output == "" {
-		return m.exec.Upload(ctx, strings.NewReader(toAdd.String()), envPath, "0600")
+	if err := ssh.UploadAtomic(ctx, m.exec, strings.NewReader(content), envPath, "0600"); err != nil {
+		return fmt.Errorf("writing %s: %w", envPath, err)
 	}
-
-	tmpPath := "/tmp/teploy_env_append"
-	if err := m.exec.Upload(ctx, strings.NewReader(toAdd.String()), tmpPath, "0600"); err != nil {
-		return err
-	}
-	_, err := m.exec.Run(ctx, fmt.Sprintf("cat %s >> %s && rm -f %s", tmpPath, envPath, tmpPath))
-	return err
+	return nil
 }
 
 // List returns all accessory containers for an app.
@@ -427,33 +476,43 @@ func (m *Manager) reconcileDataOwnership(ctx context.Context, app, name string, 
 	if err != nil {
 		return nil
 	}
-	uid, _, _ := strings.Cut(strings.TrimSpace(imageUser), ":")
+	uid, gid, hasGid := strings.Cut(strings.TrimSpace(imageUser), ":")
 	if uid == "" || uid == "0" {
 		return nil
 	}
 	if _, convErr := strconv.Atoi(uid); convErr != nil {
 		return nil
 	}
+	// Honor an explicitly declared GID. When the image declares only a UID,
+	// chown changes the OWNER alone — inventing gid=uid rewrote group
+	// ownership the image never asked for (audit F74).
+	owner := uid
+	if hasGid && gid != "" {
+		if _, gErr := strconv.Atoi(gid); gErr != nil {
+			return nil // named group: not safely reconciled from here
+		}
+		owner = uid + ":" + gid
+	}
 
 	accDir := fmt.Sprintf("%s/%s/accessories/%s", deploymentsDir, app, name)
 	for _, volName := range sortedKeys(cfg.Volumes) {
 		dir := fmt.Sprintf("%s/%s", accDir, volName)
-		owner, ownErr := m.exec.Run(ctx, fmt.Sprintf("stat -c '%%u' %s 2>/dev/null", ssh.ShellQuote(dir)))
-		if ownErr != nil || strings.TrimSpace(owner) == "" || strings.TrimSpace(owner) == uid {
+		dirOwner, ownErr := m.exec.Run(ctx, fmt.Sprintf("stat -c '%%u' %s 2>/dev/null", ssh.ShellQuote(dir)))
+		if ownErr != nil || strings.TrimSpace(dirOwner) == "" || strings.TrimSpace(dirOwner) == uid {
 			continue
 		}
-		fmt.Fprintf(m.out, "  %s runs as uid %s; %s is owned by uid %s — reconciling\n",
-			cfg.Image, uid, dir, strings.TrimSpace(owner))
+		fmt.Fprintf(m.out, "  %s runs as %s; %s is owned by uid %s — reconciling\n",
+			cfg.Image, owner, dir, strings.TrimSpace(dirOwner))
 		// chown from inside a throwaway container, as root, so this works for
 		// a non-root deploy user too (host-side chown of a root-owned directory
 		// needs sudo, which teploy never assumes). Fall back to the host chown
 		// for images without a chown binary.
 		if _, chErr := m.exec.Run(ctx, fmt.Sprintf(
-			"docker run --rm --user 0 --entrypoint chown -v %s %s -R %s:%s /teploy-data",
-			ssh.ShellQuote(dir+":/teploy-data"), img, uid, uid,
+			"docker run --rm --user 0 --entrypoint chown -v %s %s -R %s /teploy-data",
+			ssh.ShellQuote(dir+":/teploy-data"), img, owner,
 		)); chErr != nil {
-			if _, hostErr := m.exec.Run(ctx, fmt.Sprintf("chown -R %s:%s %s", uid, uid, ssh.ShellQuote(dir))); hostErr != nil {
-				return fmt.Errorf("chowning %s to uid %s (the image's user): %w", dir, uid, hostErr)
+			if _, hostErr := m.exec.Run(ctx, "chown -R "+owner+" "+ssh.ShellQuote(dir)); hostErr != nil {
+				return fmt.Errorf("chowning %s to %s (the image's user): %w", dir, owner, hostErr)
 			}
 		}
 	}
@@ -480,7 +539,7 @@ func connectionEnvVars(app, name, image string, port int, env map[string]string)
 		if port == 0 {
 			port = 5432
 		}
-		vars["DATABASE_URL"] = fmt.Sprintf("postgres://%s:%s@%s:%d/%s", user, password, alias, port, db)
+		vars["DATABASE_URL"] = dbURL("postgres", user, password, alias, port, db)
 
 	case isImageType(image, "mysql"), isImageType(image, "mariadb"):
 		password := env["MYSQL_ROOT_PASSWORD"]
@@ -491,7 +550,7 @@ func connectionEnvVars(app, name, image string, port int, env map[string]string)
 		if port == 0 {
 			port = 3306
 		}
-		vars["DATABASE_URL"] = fmt.Sprintf("mysql://root:%s@%s:%d/%s", password, alias, port, db)
+		vars["DATABASE_URL"] = dbURL("mysql", "root", password, alias, port, db)
 
 	case isImageType(image, "redis"):
 		if port == 0 {
@@ -509,11 +568,30 @@ func connectionEnvVars(app, name, image string, port int, env map[string]string)
 	return vars
 }
 
-// isImageType checks if a Docker image name matches a service type.
-// Handles both "postgres:16" and "library/postgres:16" formats.
+// dbURL builds a database URL with net/url so credentials containing URL
+// reserved characters (@, :, /, ?, #, %) cannot change the connection's
+// meaning — raw fmt.Sprintf interpolation used to silently point apps at
+// the wrong host or mangle the password (audit F70).
+func dbURL(scheme, user, password, host string, port int, db string) string {
+	u := url.URL{
+		Scheme: scheme,
+		Host:   net.JoinHostPort(host, strconv.Itoa(port)),
+		Path:   "/" + db,
+	}
+	if user != "" || password != "" {
+		u.User = url.UserPassword(user, password)
+	}
+	return u.String()
+}
+
+// isImageType checks if a Docker image reference's final repository
+// component matches a service type. Delegates to docker.ImageRepository,
+// which strips registry hosts (including their port colons), tags, and
+// digests — the local split-at-first-colon version classified
+// "registry.example:5000/postgres" as "registry.example", so real
+// databases started with no generated connection env at all (audit F71).
 func isImageType(image, serviceType string) bool {
-	image = strings.Split(image, ":")[0]
-	return image == serviceType || strings.HasSuffix(image, "/"+serviceType)
+	return docker.ImageRepository(image) == serviceType
 }
 
 func generatePassword() (string, error) {

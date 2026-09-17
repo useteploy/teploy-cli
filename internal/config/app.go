@@ -128,7 +128,14 @@ type AccessoryConfig struct {
 	// Command overrides the image's default command (docker run trailing
 	// args) — required by images whose entrypoint needs an explicit verb,
 	// e.g. MinIO (`server /data --console-address :9001`) or ntfy (`serve`).
+	// A whitespace-split command line: an argument with quoted spaces could
+	// never survive it. Use CommandArgs for arguments containing spaces,
+	// quotes, or literal dollar signs (audit F72); supplying both is an
+	// error.
 	Command string `yaml:"command,omitempty" toml:"command"`
+	// CommandArgs is the argv form of Command — each element reaches docker
+	// exactly as written, no word-splitting.
+	CommandArgs []string `yaml:"command_args,omitempty" toml:"command_args"`
 	// Publish adds docker -p mappings (e.g. "127.0.0.1:9100:9000") for the
 	// rare accessory that must be reachable from the HOST, not just the
 	// teploy network — e.g. a MinIO backup target, since `teploy backup`
@@ -772,6 +779,9 @@ func (c *AppConfig) validate() error {
 		if !validName.MatchString(name) {
 			return fmt.Errorf("accessory name %q must be lowercase alphanumeric with hyphens", name)
 		}
+		if acc.Command != "" && len(acc.CommandArgs) > 0 {
+			return fmt.Errorf("accessory %s: set either 'command' or 'command_args', not both", name)
+		}
 		for k, v := range acc.Env {
 			if strings.HasPrefix(v, "secret:") && strings.TrimSpace(strings.TrimPrefix(v, "secret:")) == "" {
 				return fmt.Errorf("accessory %s env %s: empty secret reference (expected secret:KEY)", name, k)
@@ -845,6 +855,25 @@ func (c *AppConfig) validate() error {
 // but produce an empty/wrong AppConfig otherwise. On any decode error —
 // unknown field or type mismatch alike — append a pointer at the schema
 // divergence so the fix is discoverable without cross-referencing source.
+// unmarshalAppTOML strictly decodes a teploy.toml document: unknown keys
+// are rejected exactly like YAML KnownFields — the previous Unmarshal call
+// silently ignored them, so a typo errored in one format and not the other
+// (audit F58).
+func unmarshalAppTOML(data []byte, out *AppConfig) error {
+	md, err := toml.Decode(string(data), out)
+	if err != nil {
+		return err
+	}
+	if undecoded := md.Undecoded(); len(undecoded) > 0 {
+		keys := make([]string, 0, len(undecoded))
+		for _, k := range undecoded {
+			keys = append(keys, k.String())
+		}
+		return fmt.Errorf("unknown config key(s): %s", strings.Join(keys, ", "))
+	}
+	return nil
+}
+
 func unmarshalAppYAML(data []byte, out *AppConfig) error {
 	dec := yaml.NewDecoder(bytes.NewReader(data))
 	dec.KnownFields(true)
@@ -853,6 +882,15 @@ func unmarshalAppYAML(data []byte, out *AppConfig) error {
 			return nil // empty document — same as yaml.Unmarshal's no-op
 		}
 		return fmt.Errorf("%w\nnote: teploy.yml is its own schema (not Kamal's deploy.yml) — see https://teploy.com/docs/reference/config. Common mismatches: 'app' not 'service'; 'build' is a list of shell commands, not a {command, output} map; no 'proxy'/'builder'/'services' blocks", err)
+	}
+	// Exactly one document: a second YAML document in the file used to be
+	// silently ignored (audit F58).
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		if err == nil {
+			return errors.New("only one YAML document is supported (found a second '---' document)")
+		}
+		return err
 	}
 	return nil
 }
@@ -867,13 +905,19 @@ func LoadApp(dir string) (*AppConfig, error) {
 	for _, name := range []string{"teploy.yml", "teploy.yaml", "teploy.toml"} {
 		path := filepath.Join(dir, name)
 		data, err := os.ReadFile(path)
+		// Only a genuinely MISSING candidate moves on to the next filename —
+		// an unreadable one (permissions, I/O) used to fall through and could
+		// silently load a different file than the operator wrote (F58).
 		if err != nil {
-			continue
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return nil, fmt.Errorf("reading %s: %w", path, err)
 		}
 
 		var cfg AppConfig
 		if strings.HasSuffix(name, ".toml") {
-			if err := toml.Unmarshal(data, &cfg); err != nil {
+			if err := unmarshalAppTOML(data, &cfg); err != nil {
 				return nil, fmt.Errorf("parsing %s: %w", name, err)
 			}
 		} else {
@@ -907,18 +951,22 @@ func LoadAppWithDestination(dir, dest string) (*AppConfig, error) {
 		return nil, err
 	}
 
-	// Try destination overlay files in order: yml, yaml, toml.
+	// Try destination overlay files in order: yml, yaml, toml. As in
+	// LoadApp, only a confirmed-missing candidate falls through (F58).
 	for _, ext := range []string{".yml", ".yaml", ".toml"} {
 		name := "teploy." + dest + ext
 		path := filepath.Join(dir, name)
 		data, err := os.ReadFile(path)
 		if err != nil {
-			continue
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return nil, fmt.Errorf("reading %s: %w", path, err)
 		}
 
 		var overlay AppConfig
 		if ext == ".toml" {
-			if err := toml.Unmarshal(data, &overlay); err != nil {
+			if err := unmarshalAppTOML(data, &overlay); err != nil {
 				return nil, fmt.Errorf("parsing %s: %w", name, err)
 			}
 		} else {
@@ -1036,8 +1084,28 @@ func mergeConfigs(base, overlay *AppConfig) {
 			base.Env[k] = v
 		}
 	}
-	if overlay.Health.Path != "" {
-		base.Health.Path = overlay.Health.Path
+	// F57: the whole health object, not just Path, and the security/policy
+	// blocks a production-only overlay previously set to silently nothing.
+	if overlay.Health.Path != "" || overlay.Health.TimeoutSeconds != 0 || overlay.Health.IntervalSeconds != 0 {
+		base.Health = overlay.Health
+	}
+	if !overlay.Access.IsZero() {
+		base.Access = overlay.Access
+	}
+	if !overlay.Firewall.IsZero() {
+		base.Firewall = overlay.Firewall
+	}
+	if overlay.Secret.Provider != "" {
+		base.Secret = overlay.Secret
+	}
+	if overlay.Audit.Endpoint != "" {
+		base.Audit = overlay.Audit
+	}
+	if overlay.Context != "" {
+		base.Context = overlay.Context
+	}
+	if overlay.Dockerfile != "" {
+		base.Dockerfile = overlay.Dockerfile
 	}
 	if len(overlay.Healthcheck) > 0 {
 		if base.Healthcheck == nil {
@@ -1113,6 +1181,14 @@ func mergeConfigs(base, overlay *AppConfig) {
 	}
 	if overlay.CaddyExtra != "" {
 		base.CaddyExtra = overlay.CaddyExtra
+	}
+	if len(overlay.Accessories) > 0 {
+		if base.Accessories == nil {
+			base.Accessories = map[string]AccessoryConfig{}
+		}
+		for k, v := range overlay.Accessories {
+			base.Accessories[k] = mergeAccessory(base.Accessories[k], v)
+		}
 	}
 }
 

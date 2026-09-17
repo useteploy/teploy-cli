@@ -14,7 +14,7 @@ import (
 func TestEnsureRunning_New(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		// No stored credentials.
-		ssh.MockCommand{Match: "cat /deployments/myapp/accessories/postgres/credentials", Err: fmt.Errorf("not found")},
+		ssh.MockCommand{Match: "test -f", Err: fmt.Errorf("not found")},
 		// Not running.
 		ssh.MockCommand{Match: "docker inspect", Err: fmt.Errorf("not found")},
 		// Create directory.
@@ -70,8 +70,15 @@ func TestEnsureRunning_New(t *testing.T) {
 	if !strings.Contains(runCmd, "teploy.accessory=postgres") {
 		t.Error("expected accessory name label")
 	}
-	if !strings.Contains(runCmd, "-e 'POSTGRES_DB=myapp'") {
-		t.Error("expected POSTGRES_DB env var")
+	// audit F22: env must ride a 0600 --env-file, never -e argv (the
+	// resolved credentials would sit in the host's process list).
+	if !strings.Contains(runCmd, "--env-file '/deployments/myapp/accessories/postgres/container.env'") {
+		t.Error("expected accessory env via --env-file")
+	}
+	for _, call := range mock.Calls {
+		if strings.HasPrefix(call, "docker run") && strings.Contains(call, " -e ") {
+			t.Errorf("env value exposed on docker run argv: %s", call)
+		}
 	}
 	if !strings.Contains(runCmd, "-v '/deployments/myapp/accessories/postgres/data:/var/lib/postgresql/data'") {
 		t.Error("expected volume mount")
@@ -123,7 +130,7 @@ func TestEnsureRunning_New(t *testing.T) {
 
 func TestEnsureRunning_ReconcilesFreshVolumeOwnership(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
-		ssh.MockCommand{Match: "cat /deployments/myapp/accessories/nucleus/credentials", Err: fmt.Errorf("not found")},
+		ssh.MockCommand{Match: "test -f", Err: fmt.Errorf("not found")},
 		ssh.MockCommand{Match: "docker inspect", Err: fmt.Errorf("not found")},
 		ssh.MockCommand{Match: "mkdir -p /deployments/myapp/accessories/nucleus", Output: ""},
 		// The image drops to a non-root user; the fresh directory is not his.
@@ -173,7 +180,8 @@ func TestEnsureRunning_ReconcilesFreshVolumeOwnership(t *testing.T) {
 func TestEnsureRunning_AlreadyRunning(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		// Stored credentials exist (needed for connection string).
-		ssh.MockCommand{Match: "cat /deployments/myapp/accessories/postgres/credentials", Output: "POSTGRES_PASSWORD=existingpass123\n"},
+		ssh.MockCommand{Match: "test -f", Output: ""},
+		ssh.MockCommand{Match: "cat -- ", Output: "POSTGRES_PASSWORD=existingpass123\n"},
 		// Already running.
 		ssh.MockCommand{Match: "docker inspect", Output: "running"},
 	)
@@ -213,7 +221,8 @@ func TestEnsureRunning_AlreadyRunning(t *testing.T) {
 func TestEnsureRunning_StoredCredentials(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		// Stored credentials exist.
-		ssh.MockCommand{Match: "cat /deployments/myapp/accessories/postgres/credentials", Output: "POSTGRES_PASSWORD=storedpass456\n"},
+		ssh.MockCommand{Match: "test -f", Output: ""},
+		ssh.MockCommand{Match: "cat -- ", Output: "POSTGRES_PASSWORD=storedpass456\n"},
 		// Not running.
 		ssh.MockCommand{Match: "docker inspect", Err: fmt.Errorf("not found")},
 		// Create directory.
@@ -237,14 +246,10 @@ func TestEnsureRunning_StoredCredentials(t *testing.T) {
 	}
 
 	// Verify stored password was used (not a new one generated).
-	var runCmd string
-	for _, call := range mock.Calls {
-		if strings.HasPrefix(call, "docker run") {
-			runCmd = call
-		}
-	}
-	if !strings.Contains(runCmd, "-e 'POSTGRES_PASSWORD=storedpass456'") {
-		t.Error("expected stored password to be used")
+	// F22: the stored password rides the 0600 env-file, not argv.
+	envData := string(mock.Files["/deployments/myapp/accessories/postgres/container.env"])
+	if !strings.Contains(envData, "POSTGRES_PASSWORD=storedpass456") {
+		t.Errorf("expected stored password to be used, env file: %q", envData)
 	}
 
 	// Credentials file should NOT be re-written (no new passwords generated).
@@ -392,7 +397,7 @@ func TestUpgrade(t *testing.T) {
 		// Remove old container.
 		ssh.MockCommand{Match: "docker rm", Output: ""},
 		// EnsureRunning: resolve env (no stored creds).
-		ssh.MockCommand{Match: "cat /deployments/myapp/accessories/postgres/credentials", Err: fmt.Errorf("not found")},
+		ssh.MockCommand{Match: "test -f", Err: fmt.Errorf("not found")},
 		// EnsureRunning: not running (just removed).
 		ssh.MockCommand{Match: "docker inspect", Err: fmt.Errorf("not found")},
 		// EnsureRunning: create directory.
@@ -508,7 +513,8 @@ func TestConnectionEnvVars_Unknown(t *testing.T) {
 func TestInjectEnvVars_NewFile(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		// No existing .env.
-		ssh.MockCommand{Match: "cat /deployments/myapp/.env", Err: fmt.Errorf("not found")},
+		ssh.MockCommand{Match: "test -f", Err: fmt.Errorf("not found")},
+		ssh.MockCommand{Match: "mv -f -- ", Output: ""},
 	)
 
 	var buf bytes.Buffer
@@ -539,9 +545,8 @@ func TestInjectEnvVars_NewFile(t *testing.T) {
 func TestInjectEnvVars_SkipExisting(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		// Existing .env with DATABASE_URL already set.
-		ssh.MockCommand{Match: "cat /deployments/myapp/.env", Output: "DATABASE_URL=postgres://custom/mydb\n"},
-		// Append new vars.
-		ssh.MockCommand{Match: "cat /tmp/teploy_env_append", Output: ""},
+		ssh.MockCommand{Match: "test -f", Output: ""},
+		ssh.MockCommand{Match: "cat -- ", Output: "DATABASE_URL=postgres://custom/mydb\n"},
 	)
 
 	var buf bytes.Buffer
@@ -556,14 +561,12 @@ func TestInjectEnvVars_SkipExisting(t *testing.T) {
 	}
 
 	// Only REDIS_URL should be appended (DATABASE_URL already exists).
-	appendData := mock.Files["/tmp/teploy_env_append"]
-	if appendData == nil {
-		t.Fatal("expected append file to be created")
+	content := string(mock.Files["/deployments/myapp/.env"])
+	if !strings.Contains(content, "DATABASE_URL=postgres://custom/mydb") {
+		t.Errorf("should NOT overwrite existing DATABASE_URL: %q", content)
 	}
-
-	content := string(appendData)
-	if strings.Contains(content, "DATABASE_URL") {
-		t.Error("should NOT overwrite existing DATABASE_URL")
+	if strings.Count(content, "DATABASE_URL") != 1 {
+		t.Errorf("DATABASE_URL duplicated: %q", content)
 	}
 	if !strings.Contains(content, "REDIS_URL=redis://localhost:6379") {
 		t.Error("expected REDIS_URL in append data")
@@ -572,7 +575,8 @@ func TestInjectEnvVars_SkipExisting(t *testing.T) {
 
 func TestInjectEnvVars_AllExist(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
-		ssh.MockCommand{Match: "cat /deployments/myapp/.env", Output: "DATABASE_URL=existing\nREDIS_URL=existing\n"},
+		ssh.MockCommand{Match: "test -f", Output: ""},
+		ssh.MockCommand{Match: "cat -- ", Output: "DATABASE_URL=existing\nREDIS_URL=existing\n"},
 	)
 
 	var buf bytes.Buffer
@@ -624,9 +628,9 @@ func TestIsImageType(t *testing.T) {
 
 func TestEnsureRunning_SecretReference(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
-		// No stored credentials.
-		ssh.MockCommand{Match: "cat /deployments/myapp/accessories/nucleus/credentials", Err: fmt.Errorf("not found")},
-		// Secret exists and decrypts.
+		// No stored credentials (first test -f), then the secret EXISTS
+		// (second test -f) and decrypts.
+		ssh.MockCommand{Match: "test -f", Err: fmt.Errorf("not found"), Once: true},
 		ssh.MockCommand{Match: "test -f", Output: ""},
 		ssh.MockCommand{Match: "age -d", Output: "s3cr3t-pa$$word"},
 		// Not running.
@@ -659,15 +663,20 @@ func TestEnsureRunning_SecretReference(t *testing.T) {
 	if runCmd == "" {
 		t.Fatal("expected docker run command")
 	}
-	// The decrypted value is injected (shell-quoted), not the reference.
-	if !strings.Contains(runCmd, `'NUCLEUS_PASSWORD=s3cr3t-pa$$word'`) {
-		t.Errorf("expected decrypted secret in docker run env, got: %s", runCmd)
+	// F22: the decrypted value rides the env-file (never argv), not the
+	// reference itself.
+	envData := string(mock.Files["/deployments/myapp/accessories/nucleus/container.env"])
+	if !strings.Contains(envData, "NUCLEUS_PASSWORD=s3cr3t-pa$$word") {
+		t.Errorf("expected decrypted secret in the env file, got: %q", envData)
 	}
-	if strings.Contains(runCmd, "secret:NUCLEUS_PASSWORD") {
-		t.Errorf("secret reference leaked into docker run: %s", runCmd)
+	if strings.Contains(envData, "secret:NUCLEUS_PASSWORD") {
+		t.Errorf("secret reference leaked into env file: %q", envData)
 	}
-	if !strings.Contains(runCmd, `'NUCLEUS_PLAIN=literal'`) {
-		t.Errorf("literal env should pass through, got: %s", runCmd)
+	if !strings.Contains(envData, "NUCLEUS_PLAIN=literal") {
+		t.Errorf("literal env should pass through, got: %q", envData)
+	}
+	if strings.Contains(runCmd, " -e ") {
+		t.Errorf("env exposed on docker run argv: %s", runCmd)
 	}
 
 	// The plaintext must never be persisted to the credentials file.
@@ -680,7 +689,7 @@ func TestEnsureRunning_SecretReference(t *testing.T) {
 
 func TestEnsureRunning_SecretReferenceMissing(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
-		ssh.MockCommand{Match: "cat /deployments/myapp/accessories/nucleus/credentials", Err: fmt.Errorf("not found")},
+		ssh.MockCommand{Match: "test -f", Err: fmt.Errorf("not found")},
 		// Secret file does not exist.
 		ssh.MockCommand{Match: "test -f /deployments/myapp/secrets/NUCLEUS_PASSWORD.age", Err: fmt.Errorf("exit 1")},
 	)
@@ -708,7 +717,7 @@ func TestEnsureRunning_SecretReferenceMissing(t *testing.T) {
 
 func TestEnsureRunning_SecretReferenceEmptyKey(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
-		ssh.MockCommand{Match: "cat /deployments/myapp/accessories/nucleus/credentials", Err: fmt.Errorf("not found")},
+		ssh.MockCommand{Match: "test -f", Err: fmt.Errorf("not found")},
 	)
 	var buf bytes.Buffer
 	mgr := NewManager(mock, &buf)
