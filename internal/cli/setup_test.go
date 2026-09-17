@@ -155,6 +155,7 @@ func TestSetupServer_CaddyAlreadyRunning(t *testing.T) {
 		// deploys need. All three checks pass → skip recreation.
 		ssh.MockCommand{Match: "docker inspect -f '{{join .Config.Cmd", Output: "caddy run --config /etc/caddy/Caddyfile --adapter caddyfile"},
 		ssh.MockCommand{Match: "docker inspect -f '{{range .Mounts}}", Output: "/data /config /etc/caddy /deployments "},
+		ssh.MockCommand{Match: "docker inspect -f '{{.State.Running}}'", Output: "true"},
 	)
 
 	var buf bytes.Buffer

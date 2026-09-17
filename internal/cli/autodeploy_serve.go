@@ -14,6 +14,7 @@ import (
 	"github.com/useteploy/teploy/internal/build"
 	"github.com/useteploy/teploy/internal/config"
 	"github.com/useteploy/teploy/internal/docker"
+	"github.com/useteploy/teploy/internal/env"
 	"github.com/useteploy/teploy/internal/ssh"
 	"github.com/useteploy/teploy/internal/state"
 )
@@ -256,6 +257,27 @@ func triggerAutoDeploy(ctx context.Context, executor ssh.Executor, app, branch, 
 		return fmt.Errorf("teploy.yml in %s declares app %q, expected %q — refusing to deploy the wrong app", buildDir, appCfg.App, app)
 	}
 
+	// Resolve env_files from the CHECKOUT, with the same single-pass ${VAR}
+	// expansion rule manual deploys use (audit F59/F66): without this, the
+	// same manifest received different container env depending on whether
+	// the deploy was manual or webhook-triggered — encrypted-file secrets
+	// simply went missing on the webhook path.
+	expandEnvTemplates(appCfg.Env)
+	if len(appCfg.EnvFiles) > 0 {
+		fileVars, err := env.LoadLocalEnvFiles(ctx, buildDir, appCfg.EnvFiles)
+		if err != nil {
+			return fmt.Errorf("resolving env_files from %s: %w", buildDir, err)
+		}
+		if appCfg.Env == nil {
+			appCfg.Env = map[string]string{}
+		}
+		for k, v := range fileVars {
+			if _, explicit := appCfg.Env[k]; !explicit {
+				appCfg.Env[k] = v
+			}
+		}
+	}
+
 	// Monorepo path filter: if autodeploy.paths is set and we have a
 	// reliable changed-file list, skip the deploy when nothing under those
 	// paths changed. Fail open (deploy) whenever the file set is unknown —
@@ -284,27 +306,35 @@ func triggerAutoDeploy(ctx context.Context, executor ssh.Executor, app, branch, 
 	var image string
 	needsBuild := appCfg.Image == ""
 	if needsBuild {
-		buildMode := build.Detect(buildDir)
+		buildMode, detectErr := build.DetectAt(buildDir, appCfg.Dockerfile)
+		if detectErr != nil {
+			return detectErr
+		}
 		fmt.Fprintf(out, "Building image on server (%s)...\n", buildMode)
 		builder := build.NewBuilder(executor, out)
 		image, err = builder.Build(ctx, build.BuildConfig{
-			App:      app,
-			Version:  version,
-			Mode:     buildMode,
-			BuildDir: buildDir,
-			Platform: appCfg.Platform,
+			App:        app,
+			Version:    version,
+			Mode:       buildMode,
+			BuildDir:   buildDir,
+			Context:    appCfg.Context,
+			Dockerfile: appCfg.Dockerfile,
+			Platform:   appCfg.Platform,
 		})
 		if err != nil {
 			return fmt.Errorf("building image: %w", err)
 		}
 	} else {
 		image = appCfg.Image
-		fmt.Fprintf(out, "Pulling image %s...\n", image)
-		dk := docker.NewClient(executor)
-		if err := dk.Pull(ctx, image); err != nil {
-			return fmt.Errorf("pulling image: %w", err)
+		// Same image policy as manual deploys (digest-pinned cache reuse,
+		// fresh pull for mutable tags, warned local fallback).
+		if err := ensureImage(ctx, docker.NewClient(executor), image, out); err != nil {
+			return err
 		}
 	}
 
-	return deployBuiltImage(ctx, executor, appCfg, image, version, "localhost", false, needsBuild)
+	// The outer lock taken at the top of triggerAutoDeploy is still held —
+	// route through the locked entry point so Deploy doesn't deadlock on its
+	// own second acquisition (audit F07).
+	return deployBuiltImageLockMode(ctx, executor, appCfg, image, version, "localhost", false, needsBuild, true)
 }

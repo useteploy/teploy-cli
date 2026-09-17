@@ -12,12 +12,14 @@ package env
 // the standard tools.
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -33,7 +35,7 @@ import (
 //     JSON payloads are supported — YAML/JSON contribute their top-level
 //     scalar keys.
 //   - anything else              — plain dotenv, read as-is.
-func LoadLocalEnvFiles(dir string, paths []string) (map[string]string, error) {
+func LoadLocalEnvFiles(ctx context.Context, dir string, paths []string) (map[string]string, error) {
 	merged := make(map[string]string)
 	for _, p := range paths {
 		full := p
@@ -46,9 +48,9 @@ func LoadLocalEnvFiles(dir string, paths []string) (map[string]string, error) {
 		)
 		switch {
 		case strings.HasSuffix(full, ".age"):
-			content, err = decryptAgeFile(full)
+			content, err = decryptAgeFile(ctx, full)
 		case isSopsName(full):
-			content, err = decryptSopsFile(full)
+			content, err = decryptSopsFile(ctx, full)
 		default:
 			var raw []byte
 			raw, err = os.ReadFile(full)
@@ -91,7 +93,11 @@ func ageIdentityFile() (string, error) {
 	return "", fmt.Errorf("no age identity found — set TEPLOY_AGE_IDENTITY (or SOPS_AGE_KEY_FILE), or put the key at ~/.config/teploy/age.txt")
 }
 
-func decryptAgeFile(path string) (string, error) {
+// decryptAgeFile shells out to the local `age` binary bound to the deploy
+// context (audit F75): a stalled decryptor used to outlive Ctrl-C of the
+// deploy itself. WaitDelay bounds the wait after cancellation so a child
+// holding the pipe open cannot hang teardown either.
+func decryptAgeFile(ctx context.Context, path string) (string, error) {
 	if _, err := exec.LookPath("age"); err != nil {
 		return "", fmt.Errorf("`age` binary not found — install age (https://age-encryption.org) to use .age env files")
 	}
@@ -99,18 +105,22 @@ func decryptAgeFile(path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	out, err := exec.Command("age", "-d", "-i", identity, path).Output()
+	cmd := exec.CommandContext(ctx, "age", "-d", "-i", identity, path)
+	cmd.WaitDelay = 5 * time.Second
+	out, err := cmd.Output()
 	if err != nil {
 		return "", fmt.Errorf("age decrypt failed: %w%s", err, stderrOf(err))
 	}
 	return string(out), nil
 }
 
-func decryptSopsFile(path string) (string, error) {
+func decryptSopsFile(ctx context.Context, path string) (string, error) {
 	if _, err := exec.LookPath("sops"); err != nil {
 		return "", fmt.Errorf("`sops` binary not found — install sops (https://github.com/getsops/sops) to use SOPS env files")
 	}
-	out, err := exec.Command("sops", "-d", path).Output()
+	cmd := exec.CommandContext(ctx, "sops", "-d", path)
+	cmd.WaitDelay = 5 * time.Second
+	out, err := cmd.Output()
 	if err != nil {
 		return "", fmt.Errorf("sops decrypt failed: %w%s", err, stderrOf(err))
 	}

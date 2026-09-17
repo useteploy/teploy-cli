@@ -170,7 +170,12 @@ func reportDrift(ctx context.Context, flags *Flags, appCfg *config.AppConfig, ex
 		return false, nil
 	}
 
-	current, _ := state.Read(ctx, executor, appCfg.App)
+	// A state read failure must surface — treating unreadable state as "not
+	// deployed" turns a monitoring check into a false all-clear (audit F76).
+	current, err := state.Read(ctx, executor, appCfg.App)
+	if err != nil {
+		return false, fmt.Errorf("reading state for %s: %w", appCfg.App, err)
+	}
 	if current == nil || current.CurrentHash == "" {
 		if flags.JSON {
 			return false, json.NewEncoder(os.Stdout).Encode(map[string]interface{}{
@@ -194,6 +199,17 @@ func reportDrift(ctx context.Context, flags *Flags, appCfg *config.AppConfig, ex
 	if fromState {
 		mode = "state"
 		items = driftItemsFromState(current.CurrentHash, containers)
+		// With every managed container GONE there is nothing to iterate, and
+		// the empty loop used to report "in sync" for a fully removed
+		// deployment (audit F76). State says this app IS deployed, so an
+		// empty live inventory is maximal drift.
+		if len(items) == 0 && len(containers) == 0 {
+			items = append(items, driftItem{
+				Kind:   "missing",
+				Name:   appCfg.App,
+				Detail: "state records version " + current.CurrentHash + " as deployed but no managed containers exist at all",
+			})
+		}
 	} else {
 		items = driftItems(appCfg, current, containers)
 	}

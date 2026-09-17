@@ -1,6 +1,7 @@
 package env
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -12,7 +13,7 @@ func TestLoadLocalEnvFilesPlainDotenv(t *testing.T) {
 	dir := t.TempDir()
 	os.WriteFile(filepath.Join(dir, "a.env"), []byte("FOO=1\nBAR=two\n# comment\n"), 0o600)
 	os.WriteFile(filepath.Join(dir, "b.env"), []byte("BAR=three\nBAZ=4\n"), 0o600)
-	got, err := LoadLocalEnvFiles(dir, []string{"a.env", "b.env"})
+	got, err := LoadLocalEnvFiles(context.Background(), dir, []string{"a.env", "b.env"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -25,7 +26,7 @@ func TestLoadLocalEnvFilesPlainDotenv(t *testing.T) {
 func TestLoadLocalEnvFilesYAMLScalars(t *testing.T) {
 	dir := t.TempDir()
 	os.WriteFile(filepath.Join(dir, "vars.yaml"), []byte("KEY: value\nNUM: 7\nFLAG: true\nnested:\n  x: 1\n"), 0o600)
-	got, err := LoadLocalEnvFiles(dir, []string{"vars.yaml"})
+	got, err := LoadLocalEnvFiles(context.Background(), dir, []string{"vars.yaml"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -38,7 +39,7 @@ func TestLoadLocalEnvFilesYAMLScalars(t *testing.T) {
 }
 
 func TestLoadLocalEnvFilesMissingFile(t *testing.T) {
-	if _, err := LoadLocalEnvFiles(t.TempDir(), []string{"nope.env"}); err == nil {
+	if _, err := LoadLocalEnvFiles(context.Background(), t.TempDir(), []string{"nope.env"}); err == nil {
 		t.Fatal("missing file must error, not silently deploy without secrets")
 	}
 }
@@ -89,7 +90,7 @@ func TestLoadLocalEnvFilesAgeRoundTrip(t *testing.T) {
 	os.Remove(plain)
 
 	t.Setenv("TEPLOY_AGE_IDENTITY", identity)
-	got, err := LoadLocalEnvFiles(dir, []string{"secrets.env.age"})
+	got, err := LoadLocalEnvFiles(context.Background(), dir, []string{"secrets.env.age"})
 	if err != nil {
 		t.Fatal(err)
 	}

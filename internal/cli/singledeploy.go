@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"time"
 
 	"github.com/useteploy/teploy/internal/accessories"
 	"github.com/useteploy/teploy/internal/build"
@@ -29,33 +30,65 @@ func newSingleServerDeployer(exec ssh.Executor, out io.Writer, keyPath string, m
 
 // deployApp performs the full deploy flow on a single server using an existing SSH connection.
 // tags are per-host env vars from servers.yml (may be nil).
-func (s *singleServerDeployer) deployApp(ctx context.Context, appCfg *config.AppConfig, tags map[string]string) error {
-	image := appCfg.Image
+//
+// imageOverride/versionOverride carry the CLI's --image/--version flags (or
+// the values already resolved by runDeploy). Empty means "resolve here",
+// with the same semantics as the single-server path: an explicit version
+// wins; a prebuilt image versions itself from the image reference; only a
+// build-from-source falls back to git (audit F10 — this path used to ignore
+// the flags entirely and always take gitShortHash, which failed outside a
+// checkout and mislabeled prebuilt deploys).
+func (s *singleServerDeployer) deployApp(ctx context.Context, appCfg *config.AppConfig, tags map[string]string, imageOverride, versionOverride string) error {
+	image := imageOverride
 
-	// Resolve version.
-	version, err := gitShortHash()
-	if err != nil {
-		return fmt.Errorf("could not determine version from git: %w (use --version flag)", err)
+	// Resolve version (mirrors deployAppConfig's ordering and rationale).
+	var err error
+	if versionOverride != "" {
+		if err := validateVersionArg(versionOverride); err != nil {
+			return err
+		}
+	}
+	version := versionOverride
+	if version == "" {
+		if image != "" {
+			version = versionFromImage(image)
+			if version == "" {
+				version = fmt.Sprintf("%d", time.Now().Unix())
+			}
+		} else {
+			version, err = gitShortHash()
+			if err != nil {
+				return fmt.Errorf("could not determine version from git: %w (use --version flag)", err)
+			}
+		}
 	}
 
 	// Build if needed.
 	needsBuild := image == ""
+	var buildMode build.Mode
 	if needsBuild {
-		buildMode := build.Detect(".")
+		// Honors the optional 'context'/'dockerfile' fields so a monorepo
+		// subdir build works identically on every entry point (audit F10).
+		buildMode, err = build.DetectAt(appCfg.Context, appCfg.Dockerfile)
+		if err != nil {
+			return err
+		}
 		fmt.Fprintf(s.out, "Detected %s build\n", buildMode)
 
 		if appCfg.BuildLocal {
 			fmt.Fprintln(s.out, "Building image locally...")
 			image, err = build.LocalBuild(ctx, build.LocalBuildConfig{
-				App:      appCfg.App,
-				Version:  version,
-				Mode:     buildMode,
-				Dir:      ".",
-				Host:     s.exec.Host(),
-				User:     s.exec.User(),
-				KeyPath:  s.keyPath,
-				Platform: appCfg.Platform,
-				Exec:     s.exec,
+				App:        appCfg.App,
+				Version:    version,
+				Mode:       buildMode,
+				Dir:        ".",
+				Context:    appCfg.Context,
+				Dockerfile: appCfg.Dockerfile,
+				Host:       s.exec.Host(),
+				User:       s.exec.User(),
+				KeyPath:    s.keyPath,
+				Platform:   appCfg.Platform,
+				Exec:       s.exec,
 			}, s.out)
 			if err != nil {
 				return fmt.Errorf("local build: %w", err)
@@ -82,11 +115,13 @@ func (s *singleServerDeployer) deployApp(ctx context.Context, appCfg *config.App
 			fmt.Fprintln(s.out, "Building image on server...")
 			builder := build.NewBuilder(s.exec, s.out)
 			image, err = builder.Build(ctx, build.BuildConfig{
-				App:      appCfg.App,
-				Version:  version,
-				Mode:     buildMode,
-				BuildDir: remoteDir,
-				Platform: appCfg.Platform,
+				App:        appCfg.App,
+				Version:    version,
+				Mode:       buildMode,
+				BuildDir:   remoteDir,
+				Context:    appCfg.Context,
+				Dockerfile: appCfg.Dockerfile,
+				Platform:   appCfg.Platform,
 			})
 			if err != nil {
 				return fmt.Errorf("building image: %w", err)
@@ -94,13 +129,13 @@ func (s *singleServerDeployer) deployApp(ctx context.Context, appCfg *config.App
 		}
 		fmt.Fprintf(s.out, "Built image: %s\n", image)
 	} else {
-		// Pull pre-built image.
-		fmt.Fprintf(s.out, "Pulling image %s...\n", image)
-		dk := docker.NewClient(s.exec)
-		if err := dk.Pull(ctx, image); err != nil {
-			return fmt.Errorf("image not found or registry auth failed: %w", err)
+		// Pull pre-built image with the same policy as the single-server
+		// path: digest-pinned cache reuse, fresh pull for mutable tags, and
+		// an explicit warned fallback to the local copy (audit F10 parity —
+		// this used to be a bare Pull with no cache consideration).
+		if err := ensureImage(ctx, docker.NewClient(s.exec), image, s.out); err != nil {
+			return err
 		}
-		fmt.Fprintln(s.out, "  Image pulled")
 	}
 
 	// Ensure accessories are running. This was previously missing entirely
@@ -230,8 +265,12 @@ func (s *singleServerDeployer) deployApp(ctx context.Context, appCfg *config.App
 		Health:          healthConfigFrom(appCfg.Health),
 		KeepVersions:    appCfg.KeepVersions,
 		Ingress:         appCfg.Ingress,
+		Bind:            appCfg.Bind,
 		ContainerPort:   appCfg.Port,
+		Publish:         appCfg.Publish,
 		StopTimeout:     appCfg.StopTimeout,
+		Memory:          appCfg.Memory,
+		CPU:             appCfg.CPU,
 		Replicas:        appCfg.Replicas,
 		PreDeploy:       appCfg.Hooks.PreDeploy,
 		PostDeploy:      appCfg.Hooks.PostDeploy,
@@ -240,6 +279,10 @@ func (s *singleServerDeployer) deployApp(ctx context.Context, appCfg *config.App
 		TLSCert:         tlsCert,
 		TLSKey:          tlsKey,
 		TLSInternal:     tlsInternal,
+		CaddyExtra:      appCfg.CaddyExtra,
+		Cache:           appCfg.Cache,
+		Firewall:        caddyFirewall(appCfg.Firewall),
+		Access:          caddyAccess(appCfg.Access),
 		ManifestSHA256:  manifestSHA256,
 		AppliedManifest: appliedManifest,
 		SourceRevision:  appCfg.SourceRevision,

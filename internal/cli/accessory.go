@@ -456,12 +456,19 @@ func runAccessoryBackup(flags *Flags, appName, name, bucket, region, endpoint, s
 	client := backup.NewClient(executor, os.Stdout)
 	s3Cfg := s3Config(bucket, region, endpoint)
 
-	if local {
-		image, env, err := client.InspectAccessory(ctx, app, name)
-		if err != nil {
-			return err
-		}
+	// BOTH the manual and the --local (scheduled) path authenticate with the
+	// accessory's REAL credentials. teploy.yml's accessory env can carry
+	// unresolved `auto` and `secret:KEY` references — the resolved values
+	// only exist in the running container — so inspect it; fall back to the
+	// config only when the container is absent AND the config carries no
+	// unresolved references (audit F68).
+	if image, env, inspErr := client.InspectAccessory(ctx, app, name); inspErr == nil {
 		accImage, accEnv = image, env
+	} else {
+		if err := requireResolvedAccessoryEnv(name, accEnv); err != nil {
+			return fmt.Errorf("accessory %s is not inspectable (%v) and its teploy.yml env cannot be used directly: %w", name, inspErr, err)
+		}
+		fmt.Fprintf(os.Stdout, "  Note: %s is not running; using teploy.yml image/env (no auto/secret references present)\n", app+"-"+name)
 	}
 
 	if schedule != "" {
@@ -557,7 +564,32 @@ func runAccessoryRestore(flags *Flags, name, date, bucket, region, endpoint stri
 
 	client := backup.NewClient(executor, os.Stdout)
 	s3Cfg := s3Config(bucket, region, endpoint)
+	// Same credential rule as manual backup: prefer the RUNNING accessory's
+	// env (the config's `auto`/`secret:` references are never what the
+	// database actually runs with) — audit F68.
+	if image, env, inspErr := client.InspectAccessory(ctx, appCfg.App, name); inspErr == nil {
+		accCfg.Image, accCfg.Env = image, env
+	} else {
+		if err := requireResolvedAccessoryEnv(name, accCfg.Env); err != nil {
+			return fmt.Errorf("accessory %s is not inspectable (%v) and its teploy.yml env cannot be used directly: %w", name, inspErr, err)
+		}
+	}
 	return client.AccessoryRestore(ctx, appCfg.App, name, accCfg.Image, date, accCfg.Env, s3Cfg)
+}
+
+// requireResolvedAccessoryEnv rejects config env maps that still contain
+// `auto` or `secret:KEY` markers: those are resolved at container-creation
+// time and only the running container knows the real values.
+func requireResolvedAccessoryEnv(name string, env map[string]string) error {
+	for k, v := range env {
+		if v == "auto" {
+			return fmt.Errorf("env %s is %q (a generated credential; start the accessory so the real value can be read)", k, v)
+		}
+		if strings.HasPrefix(v, "secret:") {
+			return fmt.Errorf("env %s is a %q reference (resolved only in the running container)", k, v)
+		}
+	}
+	return nil
 }
 
 func newAccessoryVerifyBackupCmd(flags *Flags) *cobra.Command {

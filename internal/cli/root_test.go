@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -78,7 +79,7 @@ tls:
 			if mode, err := build.DetectAt(cfg.Context, cfg.Dockerfile); err != nil || mode != build.ModeDockerfile {
 				return fmt.Errorf("resolving build paths: mode=%s err=%v", mode, err)
 			}
-			vars, err := teployenv.LoadLocalEnvFiles(".", cfg.EnvFiles)
+			vars, err := teployenv.LoadLocalEnvFiles(context.Background(), ".", cfg.EnvFiles)
 			if err != nil {
 				return fmt.Errorf("loading env files: %w", err)
 			}

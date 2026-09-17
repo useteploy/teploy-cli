@@ -117,7 +117,7 @@ func runScale(flags *Flags, count, parallel int) error {
 	// 3. Run parallel deploys.
 	results := multideploy.ParallelDeploy(ctx, targets, parallel, func(ctx context.Context, target multideploy.ServerTarget, out io.Writer) error {
 		// scale doesn't expose --migrate-volumes; detect + abort on mismatch (safe default).
-		return deploySingleServer(ctx, appCfg, target, out, false)
+		return deploySingleServer(ctx, appCfg, target, out, false, "", "")
 	}, os.Stdout)
 
 	// 4. Print results summary.
@@ -150,7 +150,7 @@ func runScale(flags *Flags, count, parallel int) error {
 
 // deploySingleServer connects to a single server and runs the existing deploy flow.
 // This is a simplified version that runs the core deploy.Deploy for a single target.
-func deploySingleServer(ctx context.Context, appCfg *config.AppConfig, target multideploy.ServerTarget, out io.Writer, migrateVolumes bool) error {
+func deploySingleServer(ctx context.Context, appCfg *config.AppConfig, target multideploy.ServerTarget, out io.Writer, migrateVolumes bool, imageOverride, versionOverride string) error {
 	fmt.Fprintf(out, "Connecting to %s@%s...\n", target.User, target.Host)
 
 	executor, err := ssh.Connect(ctx, ssh.ConnectConfig{
@@ -167,7 +167,7 @@ func deploySingleServer(ctx context.Context, appCfg *config.AppConfig, target mu
 
 	// Use the existing single-server deploy orchestration.
 	deployer := newSingleServerDeployer(executor, out, target.Key, migrateVolumes)
-	return deployer.deployApp(ctx, appCfg, target.Tags)
+	return deployer.deployApp(ctx, appCfg, target.Tags, imageOverride, versionOverride)
 }
 
 // rollbackSingleServer connects to one server and rolls it back to its

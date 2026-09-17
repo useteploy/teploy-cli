@@ -85,6 +85,7 @@ func runRollback(flags *Flags, toHash string) error {
 		Domain:      appCfg.Domain,
 		StopTimeout: appCfg.StopTimeout,
 		ToHash:      toHash,
+		Health:      healthConfigFrom(appCfg.Health),
 		TLSCert:     tlsCert,
 		TLSKey:      tlsKey,
 		TLSInternal: tlsInternal,
@@ -137,6 +138,14 @@ func runRollback(flags *Flags, toHash string) error {
 // runRollback does. Calling `teploy rollback --app <static-app> --host
 // ...` will fail rather than correctly flip the release symlink.
 func runRollbackByApp(flags *Flags, appName, toHash string) error {
+	if err := config.ValidateName(appName); err != nil {
+		return err
+	}
+	if toHash != "" {
+		if err := validateVersionArg(toHash); err != nil {
+			return fmt.Errorf("invalid --to %q for a container rollback", toHash)
+		}
+	}
 	if flags.Host == "" {
 		return fmt.Errorf("--host is required when using --app")
 	}
@@ -162,13 +171,26 @@ func runRollbackByApp(flags *Flags, appName, toHash string) error {
 	if appState == nil {
 		return fmt.Errorf("no state found for app %q on %s — has it been deployed?", appName, host)
 	}
-	if appState.Domain == "" {
+	if appState.DeploymentType == "static" {
+		// Static rollback needs the release-serving config (SPA, headers,
+		// cache…) which state does not retain — deferred, see AUDIT_OPEN.md
+		// (F13): fail with direction instead of corrupting the route.
+		return fmt.Errorf("app %q is a static deploy; state-only static rollback is not supported yet — run `teploy rollback` from the app directory (teploy.yml provides the serving config)", appName)
+	}
+	ingress := appState.IngressMode
+	if ingress == "" {
+		ingress = config.IngressCaddy
+	}
+	// Only Caddy-managed routing needs a domain: host ingress publishes a
+	// raw port and external ingress is the user's own front.
+	if ingress == config.IngressCaddy && appState.Domain == "" {
 		return fmt.Errorf("no domain in state for %q — redeploy once to update state", appName)
 	}
 
 	return deploy.Rollback(ctx, executor, os.Stdout, deploy.RollbackConfig{
-		App:    appName,
-		Domain: appState.Domain,
-		ToHash: toHash,
+		App:     appName,
+		Domain:  appState.Domain,
+		ToHash:  toHash,
+		Ingress: ingress,
 	})
 }

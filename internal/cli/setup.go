@@ -536,15 +536,28 @@ func setupServer(ctx context.Context, exec ssh.Executor, w io.Writer, yes bool) 
 	// would boot from admin-API autosave and shadow the file). The admin API
 	// binds the container loopback only and is never exposed off-box.
 	fmt.Fprintln(w, "Starting Caddy...")
-	caddyCheck, _ := exec.Run(ctx, dockerCmd+" ps -a --filter name=^caddy$ --format '{{.Names}}'")
+	caddyCheck, err := exec.Run(ctx, dockerCmd+" ps -a --filter name=^caddy$ --format '{{.Names}}'")
+	if err != nil {
+		return fmt.Errorf("checking for an existing caddy container: %w", err)
+	}
 	extraNetworks := []string{}
 	var extraMountFlags []string
 	if strings.TrimSpace(caddyCheck) != "" {
 		// Three legacy conditions require recreating the Caddy container. All
 		// three recreations are destructive (brief outage + re-attaching
 		// non-teploy networks/mounts), so we require explicit confirmation.
-		cmdOut, _ := exec.Run(ctx, dockerCmd+" inspect -f '{{join .Config.Cmd \" \"}}' caddy")
-		mountOut, _ := exec.Run(ctx, dockerCmd+" inspect -f '{{range .Mounts}}{{.Destination}} {{end}}' caddy")
+		// Inventory reads must SUCCEED before any recreate decision: a failed
+		// inspect used to read as an empty set, which both triggered
+		// unnecessary migrations and silently dropped adopted networks/mounts
+		// during a real one (audit F67).
+		cmdOut, cmdErr := exec.Run(ctx, dockerCmd+" inspect -f '{{join .Config.Cmd \" \"}}' caddy")
+		if cmdErr != nil {
+			return fmt.Errorf("cannot safely inventory the existing caddy container (cmd): %w", cmdErr)
+		}
+		mountOut, mountErr := exec.Run(ctx, dockerCmd+" inspect -f '{{range .Mounts}}{{.Destination}} {{end}}' caddy")
+		if mountErr != nil {
+			return fmt.Errorf("cannot safely inventory the existing caddy container (mounts): %w", mountErr)
+		}
 
 		// (1) --resume boots from admin-API autosave, shadowing the Caddyfile.
 		legacyResume := strings.Contains(cmdOut, "--resume")
@@ -574,7 +587,10 @@ func setupServer(ctx context.Context, exec ssh.Executor, w io.Writer, yes bool) 
 			// we can reattach them after recreating. Previously these were
 			// silently dropped, leaving apps on other networks (e.g.
 			// dokploy-network) unreachable.
-			netOut, _ := exec.Run(ctx, dockerCmd+" inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' caddy")
+			netOut, netErr := exec.Run(ctx, dockerCmd+" inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}} {{end}}' caddy")
+			if netErr != nil {
+				return fmt.Errorf("cannot safely inventory the existing caddy container (networks): %w", netErr)
+			}
 			for _, n := range strings.Fields(netOut) {
 				if n != "" && n != "teploy" {
 					extraNetworks = append(extraNetworks, n)
@@ -719,7 +735,25 @@ func setupServer(ctx context.Context, exec ssh.Executor, w io.Writer, yes bool) 
 		}
 		fmt.Fprintln(w, "  Caddy started")
 	} else {
-		fmt.Fprintln(w, "  Caddy already running")
+		// Presence in `docker ps -a` proves nothing about health — an exited
+		// caddy also matches. Report what actually is, and start a stopped
+		// one instead of declaring success by name (audit F67).
+		running, rErr := exec.Run(ctx, dockerCmd+" inspect -f '{{.State.Running}}' caddy")
+		if rErr != nil {
+			return fmt.Errorf("checking the existing caddy container's state: %w", rErr)
+		}
+		switch strings.TrimSpace(running) {
+		case "true":
+			fmt.Fprintln(w, "  Caddy already running")
+		case "false":
+			fmt.Fprintln(w, "  Caddy container exists but is stopped — starting it")
+			if _, sErr := exec.Run(ctx, dockerCmd+" start caddy"); sErr != nil {
+				return fmt.Errorf("starting the stopped caddy container: %w", sErr)
+			}
+			fmt.Fprintln(w, "  Caddy started")
+		default:
+			return fmt.Errorf("could not determine the caddy container's state (inspect said %q)", strings.TrimSpace(running))
+		}
 	}
 
 	fmt.Fprintln(w, "Server provisioned successfully")

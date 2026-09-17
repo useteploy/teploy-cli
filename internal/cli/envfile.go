@@ -4,22 +4,40 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"regexp"
 	"sort"
 	"strings"
 
 	"github.com/useteploy/teploy/internal/ssh"
 )
 
-// buildContainerEnvFiles computes the full container environment — the
-// teploy.yml `env:` block (${VAR}-expanded from the local environment),
-// overlaid with extra per-deploy values (e.g. singledeploy's per-host
-// servers.yml tags), overlaid with decrypted `teploy secret` values so a
-// secret always wins over a plaintext default — and uploads it to a fresh
+// validEnvKey is the grammar docker's --env-file accepts for a KEY: a
+// nonempty identifier. Validating at the serialization boundary catches
+// malformed records from any input path (audit F59).
+var validEnvKey = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+// expandEnvTemplates applies ${VAR} interpolation to the app's EXPLICIT
+// YAML env: values, exactly once, from the operator's local environment.
+// This is the ONLY place expansion happens: decrypted env_files, server
+// secrets, and per-host tags are literal values and must never be handed to
+// os.Expand again — a decrypted password containing a literal $ used to be
+// substituted or emptied according to whatever happened to be in the
+// operator's environment at deploy time (audit F59).
+func expandEnvTemplates(env map[string]string) {
+	for k, v := range env {
+		env[k] = os.Expand(v, os.Getenv)
+	}
+}
+
+// buildContainerEnvFiles computes the full container environment — values
+// already resolved (YAML templates expanded once by expandEnvTemplates,
+// env_files loaded literally, decrypted secrets overlaid last so a secret
+// always wins over a plaintext default) — and uploads it to a fresh
 // per-deploy env file instead of returning it for use as `docker run -e`
 // arguments.
 //
 // This exists because `-e KEY=value` arguments are visible in this host's
-// `ps aux` / `/proc/<pid>/cmdline` output for the life of the `docker run`
+// `ps aux` / /proc/<pid>/cmdline output for the life of the `docker run`
 // invocation — fine for plaintext config, not for decrypted secrets. An
 // `--env-file` is read once at container creation and never appears in
 // argv. (Note this does not hide the resolved values from `docker inspect`
@@ -35,7 +53,7 @@ import (
 func buildContainerEnvFiles(ctx context.Context, executor ssh.Executor, app, persistedEnvFile string, appEnv, extra, secrets map[string]string) ([]string, error) {
 	merged := make(map[string]string, len(appEnv)+len(extra)+len(secrets))
 	for k, v := range appEnv {
-		merged[k] = os.Expand(v, os.Getenv)
+		merged[k] = v
 	}
 	for k, v := range extra {
 		merged[k] = v
@@ -58,17 +76,20 @@ func buildContainerEnvFiles(ctx context.Context, executor ssh.Executor, app, per
 	}
 	sort.Strings(keys)
 
-	// docker's --env-file format is strictly one KEY=value per line, so a value
-	// containing a newline does not round-trip: docker reads the continuation
-	// lines as further variables and fails with a confusing complaint about a
-	// variable name "containing whitespaces". Catch it here and name the
-	// culprit instead.
-	//
-	// Routing just these values through `-e` is deliberately not the fallback:
-	// that is the ps-aux/proc-cmdline exposure this whole file exists to avoid,
-	// and a multi-line value is as likely to be a private key as a config blob.
 	for _, k := range keys {
-		if strings.ContainsAny(merged[k], "\n\r") {
+		if !validEnvKey.MatchString(k) {
+			return nil, fmt.Errorf("invalid environment key %q — keys must be identifiers (letters, digits, underscore; not starting with a digit)", k)
+		}
+		// docker's --env-file format is strictly one KEY=value per line, so a
+		// value containing a newline does not round-trip: docker reads the
+		// continuation lines as further variables and fails with a confusing
+		// complaint about a variable name "containing whitespaces". Catch it
+		// here and name the culprit instead.
+		//
+		// Routing just these values through `-e` is deliberately not the fallback:
+		// that is the ps-aux/proc-cmdline exposure this whole file exists to avoid,
+		// and a multi-line value is as likely to be a private key as a config blob.
+		if strings.ContainsAny(merged[k], "\n\r\x00") {
 			return nil, fmt.Errorf("env value for %s spans multiple lines, which docker's --env-file cannot represent; "+
 				"use a single-line form (YAML flow style, e.g. \"{a: 1, b: 2}\") or mount the content as a file", k)
 		}

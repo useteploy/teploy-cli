@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
@@ -177,8 +178,13 @@ func fetchLatestRelease(ctx context.Context) (*githubRelease, error) {
 	return &release, nil
 }
 
-// downloadToBytes fetches url into memory, following the redirect GitHub issues
-// to its asset CDN.
+// maxUpdateBytes bounds every update download (archive + checksums). The
+// read was previously unbounded, so a hostile or broken CDN response could
+// exhaust memory before any checksum ran (audit F62).
+const maxUpdateBytes = 256 << 20 // 256 MB
+
+// downloadToBytes fetches url into memory (bounded), following the redirect
+// GitHub issues to its asset CDN.
 func downloadToBytes(ctx context.Context, url string) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -195,7 +201,14 @@ func downloadToBytes(ctx context.Context, url string) ([]byte, error) {
 	if resp.StatusCode != 200 {
 		return nil, fmt.Errorf("GET %s returned status %d", url, resp.StatusCode)
 	}
-	return io.ReadAll(resp.Body)
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxUpdateBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > maxUpdateBytes {
+		return nil, fmt.Errorf("download from %s exceeds the %d MB update size limit", url, maxUpdateBytes>>20)
+	}
+	return data, nil
 }
 
 // checksumFor returns the hex sha256 recorded for asset in a goreleaser
@@ -251,16 +264,47 @@ func extractBinary(archive []byte, ext, binName string) ([]byte, error) {
 	return nil, fmt.Errorf("%s not found in archive", binName)
 }
 
+// replaceBinary installs the verified update atomically: a sibling
+// temporary file is written, synced, chmod'd, and renamed over dst.
+//
+// The old os.WriteFile(dst, …) opened the RUNNING executable for a
+// truncating write — on Linux that fails outright with ETXTBSY, and where
+// permitted an interrupted write left a truncated/corrupt binary at dst
+// (audit F61). The rename swap never leaves a partial file: readers of the
+// old inode keep their mapping, new executions get the complete new binary.
 func replaceBinary(src, dst string) error {
-	// Read the new binary.
+	// Resolve a symlinked install to the real file so the rename targets
+	// the binary itself, not the link.
+	if resolved, err := filepath.EvalSymlinks(dst); err == nil {
+		dst = resolved
+	}
 	data, err := os.ReadFile(src)
 	if err != nil {
 		return err
 	}
 
-	// Write to destination (overwrite).
-	if err := os.WriteFile(dst, data, 0755); err != nil {
-		// If permission denied, suggest sudo.
+	tmp, err := os.CreateTemp(filepath.Dir(dst), ".teploy-update-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(0o755); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, dst); err != nil {
 		if os.IsPermission(err) {
 			return fmt.Errorf("permission denied — try: sudo cp %s %s", src, dst)
 		}

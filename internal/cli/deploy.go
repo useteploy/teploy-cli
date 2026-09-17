@@ -130,6 +130,11 @@ func runAdHocDeploy(flags *Flags, serverName, appName, image, domain string, por
 }
 
 func runDeploy(flags *Flags, serverName, image, version string, skipDNSCheck bool, parallel int, destination string, migrateVolumes bool, role string, tags map[string]string) error {
+	// Binds local work (env-file decryption subprocesses) to the operator's
+	// Ctrl-C from the very start of the run (audit F75).
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer cancel()
+
 	// 1. Load teploy.yml from current directory (with optional destination overlay).
 	var appCfg *config.AppConfig
 	var err error
@@ -169,8 +174,15 @@ func runDeploy(flags *Flags, serverName, image, version string, skipDNSCheck boo
 	// Resolve env_files (SOPS/age-encrypted or plain, decrypted locally)
 	// once, before dispatch — both the single- and multi-server paths then
 	// pick them up from appCfg.Env. Explicit env: keys win over file values.
+	//
+	// ${VAR} interpolation applies ONLY to the explicit YAML env: templates,
+	// expanded exactly once HERE — before file values merge in. Decrypting a
+	// file whose password contains a literal $ used to hand it to
+	// os.Expand at serialization time and silently alter it based on the
+	// operator's environment (audit F59); file/secret values are literal.
+	expandEnvTemplates(appCfg.Env)
 	if len(appCfg.EnvFiles) > 0 {
-		fileVars, err := env.LoadLocalEnvFiles(".", appCfg.EnvFiles)
+		fileVars, err := env.LoadLocalEnvFiles(ctx, ".", appCfg.EnvFiles)
 		if err != nil {
 			return err
 		}
@@ -307,7 +319,9 @@ func deployAppConfig(flags *Flags, appCfg *config.AppConfig, serverName, image, 
 
 	// 4. Resolve version.
 	//
-	// Order matters. An explicit --version always wins. Otherwise, when a
+	// Order matters. An explicit --version always wins (validated first —
+	// it is interpolated unquoted into remote commands, audit F18).
+	// Otherwise, when a
 	// prebuilt image is being deployed, the version comes from THE IMAGE, not
 	// from git: the image is what actually runs, and git HEAD is merely
 	// whatever the operator's working directory happened to be on. Only a
@@ -327,6 +341,8 @@ func deployAppConfig(flags *Flags, appCfg *config.AppConfig, serverName, image, 
 				return fmt.Errorf("could not determine version from git: %w (use --version flag)", err)
 			}
 		}
+	} else if err := validateVersionArg(version); err != nil {
+		return err
 	}
 
 	// 5. Detect build mode (when no pre-built image). Honors the optional
@@ -463,6 +479,14 @@ func deployAppConfig(flags *Flags, appCfg *config.AppConfig, serverName, image, 
 // string for the notification payload (a hostname for the SSH path,
 // "localhost" for the resident-server path).
 func deployBuiltImage(ctx context.Context, executor ssh.Executor, appCfg *config.AppConfig, image, version, serverDisplay string, migrateVolumes, needsBuild bool) error {
+	return deployBuiltImageLockMode(ctx, executor, appCfg, image, version, serverDisplay, migrateVolumes, needsBuild, false)
+}
+
+// deployBuiltImageLockMode is deployBuiltImage with an explicit lock mode:
+// lockHeld=true when the caller already owns the app lock (the resident
+// autodeploy path, which locks before fetching) and must not let
+// Deployer.Deploy acquire it a second time (audit F07).
+func deployBuiltImageLockMode(ctx context.Context, executor ssh.Executor, appCfg *config.AppConfig, image, version, serverDisplay string, migrateVolumes, needsBuild, lockHeld bool) error {
 	appliedManifest, manifestSHA256, err := config.NormalizeAndDigest(appCfg, image)
 	if err != nil {
 		return fmt.Errorf("normalizing applied manifest: %w", err)
@@ -618,7 +642,12 @@ func deployBuiltImage(ctx context.Context, executor ssh.Executor, appCfg *config
 	}
 
 	multiNotifier := buildNotifier(appCfg)
-	deployErr := deployer.Deploy(ctx, deployCfg)
+	var deployErr error
+	if lockHeld {
+		deployErr = deployer.DeployLocked(ctx, deployCfg)
+	} else {
+		deployErr = deployer.Deploy(ctx, deployCfg)
+	}
 
 	// 12. Send notification (fire-and-forget).
 	if multiNotifier != nil {
@@ -677,6 +706,16 @@ var imageTagPattern = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$`)
 // Note this is NOT specific to the --image flag. The caller resolves
 // `image = appCfg.Image` first, so a teploy.yml pinning a prebuilt image hit
 // the identical problem with no flag passed.
+// validateVersionArg constrains an operator-supplied --version before it
+// reaches container names and remote shell commands (audit F18). Same
+// grammar versionFromImage already enforces for image-derived tags.
+func validateVersionArg(v string) error {
+	if !imageTagPattern.MatchString(v) {
+		return fmt.Errorf("invalid --version %q — letters, digits, underscore, dot and hyphen only; must start with a letter, digit or underscore (max 128 chars)", v)
+	}
+	return nil
+}
+
 func versionFromImage(image string) string {
 	// A digest pins exact content, so it is the most truthful label available,
 	// and it wins over any tag beside it: Docker resolves the digest and
@@ -753,7 +792,7 @@ func runMultiDeploy(flags *Flags, appCfg *config.AppConfig, image, version strin
 	defer cancel()
 
 	deployFn := func(ctx context.Context, target multideploy.ServerTarget, out io.Writer) error {
-		return deploySingleServer(ctx, appCfg, target, out, migrateVolumes)
+		return deploySingleServer(ctx, appCfg, target, out, migrateVolumes, image, version)
 	}
 
 	// Staged rollout: canary wave first, gated, then the rest of the fleet.
