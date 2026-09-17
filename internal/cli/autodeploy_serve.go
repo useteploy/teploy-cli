@@ -2,6 +2,9 @@ package cli
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -63,7 +66,12 @@ func runAutoDeployServe(app, branch string, port int) error {
 	if err != nil {
 		return fmt.Errorf("reading webhook secret from %s (run `teploy autodeploy setup` first): %w", autodeploy.SecretPath(app), err)
 	}
-	secret := string(secretBytes)
+	secret := strings.TrimSpace(string(secretBytes))
+	if secret == "" {
+		// An empty secret authenticates nothing (any unsigned request would
+		// compare equal) — fail closed at startup (audit F43).
+		return fmt.Errorf("webhook secret at %s is empty — every request would be unauthenticated; re-run `teploy autodeploy setup`", autodeploy.SecretPath(app))
+	}
 
 	logPath := fmt.Sprintf("/deployments/%s/autodeploy.log", app)
 	logFile, err := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
@@ -89,6 +97,7 @@ func runAutoDeployServe(app, branch string, port int) error {
 
 	handler := newWebhookHandler(webhookHandlerConfig{
 		secret: secret,
+		branch: branch,
 		dedup:  dedup,
 		logf:   logf,
 		onDedupChanged: func() {
@@ -126,7 +135,19 @@ func runAutoDeployServe(app, branch string, port int) error {
 	// of source, which is the actual security boundary here.
 	addr := fmt.Sprintf("0.0.0.0:%d", port)
 	logf("teploy autodeploy serve listening on %s for app %s (branch %s)", addr, app, branch)
-	return http.ListenAndServe(addr, mux)
+	// Explicit limits (audit F43): the default server has no read/header/
+	// write/idle timeouts, so slow-loris style connections could hold
+	// sockets open indefinitely. Every request remains HMAC-verified.
+	server := &http.Server{
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    32 << 10,
+	}
+	return server.ListenAndServe()
 }
 
 // webhookHandlerConfig holds newWebhookHandler's dependencies, injected
@@ -136,6 +157,9 @@ func runAutoDeployServe(app, branch string, port int) error {
 // real deploy.
 type webhookHandlerConfig struct {
 	secret string
+	// branch is the ref this listener watches; only push events for it may
+	// trigger a deploy (audit F40). Empty accepts any push (tests).
+	branch string
 	dedup  *autodeploy.DeliveryDedup
 	logf   func(format string, args ...any)
 	// onDedupChanged is called after a new (non-replayed) delivery ID is
@@ -160,10 +184,17 @@ func newWebhookHandler(cfg webhookHandlerConfig) http.HandlerFunc {
 			return
 		}
 
-		// Cap body size — this is a webhook payload (a git push event),
-		// not a file upload; nothing legitimate is anywhere near this size.
-		body, err := io.ReadAll(io.LimitReader(r.Body, 10<<20))
+		// Cap body size with MaxBytesReader so an oversized body gets a
+		// real 413 instead of a silently TRUNCATED read that then failed
+		// HMAC verification (audit F43).
+		r.Body = http.MaxBytesReader(w, r.Body, 10<<20)
+		body, err := io.ReadAll(r.Body)
 		if err != nil {
+			var tooLarge *http.MaxBytesError
+			if errors.As(err, &tooLarge) {
+				http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+				return
+			}
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
@@ -192,6 +223,20 @@ func newWebhookHandler(cfg webhookHandlerConfig) http.HandlerFunc {
 			return
 		}
 
+		// Replay protection is keyed on the AUTHENTICATED CONTENT, not the
+		// unauthenticated delivery-ID header: a captured signed body could
+		// be replayed under a fresh (or absent) delivery ID and bypass an
+		// ID-only dedup (audit F41). The delivery ID is kept as a second
+		// key so provider retries of the same delivery are also no-ops.
+		contentSum := sha256.Sum256(body)
+		contentID := "content:" + hex.EncodeToString(contentSum[:])
+		if cfg.dedup.SeenAndRecord(contentID) {
+			w.WriteHeader(http.StatusOK)
+			if cfg.logf != nil {
+				cfg.logf("ignored replayed webhook content")
+			}
+			return
+		}
 		if deliveryID != "" && cfg.dedup.SeenAndRecord(deliveryID) {
 			// 200, not an error status — this is a provider retry/replay
 			// of a delivery we already handled, an intentional no-op, not
@@ -202,8 +247,19 @@ func newWebhookHandler(cfg webhookHandlerConfig) http.HandlerFunc {
 			}
 			return
 		}
-		if deliveryID != "" && cfg.onDedupChanged != nil {
+		if cfg.onDedupChanged != nil {
 			cfg.onDedupChanged()
+		}
+
+		// Bind the deploy to THIS event: only a push to the watched branch
+		// may trigger it; pings, tags, other branches, and branch deletions
+		// are acknowledged no-ops (audit F40).
+		if !autodeploy.PushEvent(body, cfg.branch) {
+			w.WriteHeader(http.StatusAccepted)
+			if cfg.logf != nil {
+				cfg.logf("accepted webhook (not a push to %s) — no deploy", cfg.branch)
+			}
+			return
 		}
 
 		w.WriteHeader(http.StatusOK)

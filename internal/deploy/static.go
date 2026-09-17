@@ -99,6 +99,11 @@ type StaticDeployer struct {
 	exec  ssh.Executor
 	caddy *caddy.Client
 	out   io.Writer
+	// SSHKeyPath is the local identity the CONTROL connection used; rsync
+	// needs it explicitly or it falls back to default keys — the control
+	// channel could authenticate while the rsync upload failed (or used a
+	// different identity) (audit F29). Set by callers that resolved a key.
+	SSHKeyPath string
 }
 
 // NewStaticDeployer wires the SSH executor + caddy client + output stream.
@@ -357,11 +362,11 @@ func (d *StaticDeployer) rsyncTo(ctx context.Context, srcDir, remoteDest string)
 		hostKeyPolicy = "accept-new"
 	}
 	src := strings.TrimRight(srcDir, "/") + "/"
-	target := fmt.Sprintf("%s@%s:%s/", d.exec.User(), d.exec.Host(), remoteDest)
+	target := ssh.RsyncTarget(d.exec.User(), d.exec.Host(), remoteDest) + "/"
+	sshArgs := ssh.ExternalSSHArgs(d.exec.Host(), d.SSHKeyPath, hostKeyPolicy == "accept-new")
+	sshCmdParts := append([]string{"ssh"}, sshArgs...)
 	cmd := exec.CommandContext(ctx, "rsync",
-		"-az", "--delete",
-		"-e", "ssh -o BatchMode=yes -o StrictHostKeyChecking="+hostKeyPolicy,
-		src, target,
+		append([]string{"-az", "--delete", "-e", strings.Join(sshCmdParts, " ")}, src, target)...,
 	)
 	cmd.Stdout = d.out
 	cmd.Stderr = d.out

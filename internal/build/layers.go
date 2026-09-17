@@ -48,15 +48,41 @@ func findPreviousImage(ctx context.Context, exec ssh.Executor, app string) strin
 	return strings.TrimSpace(out)
 }
 
+// localImageID returns the local image's immutable content ID.
+func localImageID(ctx context.Context, tag string) (string, error) {
+	out, err := osexec.CommandContext(ctx, "docker", "image", "inspect", "--format", "{{.Id}}", tag).Output()
+	if err != nil {
+		return "", fmt.Errorf("inspecting local image: %w", err)
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+// remoteImageID returns the server-side image's immutable content ID.
+func remoteImageID(ctx context.Context, exec ssh.Executor, tag string) (string, error) {
+	out, err := exec.Run(ctx, fmt.Sprintf("docker image inspect --format '{{.Id}}' %s", ssh.ShellQuote(tag)))
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(out), nil
+}
+
 // LayerOptimizedTransfer compresses the image with gzip before streaming.
-// Also checks if the exact image already exists on the server (skip transfer).
 // Reports layer statistics for user feedback.
 // Returns an error if optimization isn't applicable (caller falls back to full transfer).
+//
+// The skip-transfer check compares the local and remote images' immutable
+// IDs (`docker image inspect`, not the broader `docker inspect` namespace):
+// the old "docker inspect <tag> succeeded means it's there" check treated
+// the mutable TAG as identity, so rebuilding the same version after a
+// working-tree or base-image change skipped the transfer and deployed the
+// stale remote bytes under the new build's name (audit F55).
 func LayerOptimizedTransfer(ctx context.Context, tag, app, host, user, keyPath string, exec ssh.Executor, stdout io.Writer) error {
-	// 1. Check if exact image already exists on server.
-	if _, err := exec.Run(ctx, fmt.Sprintf("docker inspect %s >/dev/null 2>&1", tag)); err == nil {
-		fmt.Fprintln(stdout, "  Image already exists on server — skipping transfer")
-		return nil
+	// 1. Skip only when the server provably has the EXACT same bytes.
+	if localID, err := localImageID(ctx, tag); err == nil {
+		if remoteID, rErr := remoteImageID(ctx, exec, tag); rErr == nil && remoteID != "" && remoteID == localID {
+			fmt.Fprintln(stdout, "  Image already on server with identical content — skipping transfer")
+			return nil
+		}
 	}
 
 	// 2. Find previous image and report layer stats.
@@ -78,11 +104,17 @@ func LayerOptimizedTransfer(ctx context.Context, tag, app, host, user, keyPath s
 	// 3. Use gzip-compressed transfer: docker save | gzip | ssh "gunzip | docker load"
 	fmt.Fprintln(stdout, "  Streaming compressed image to server...")
 
-	sshArgs := []string{"-o", "StrictHostKeyChecking=no"}
-	if keyPath != "" {
-		sshArgs = append(sshArgs, "-i", keyPath)
+	// Strict host-key verification for the transfer channel (audit F27):
+	// a securely verified control connection does not authenticate this
+	// separate ssh(1) process. accept-new mirrors the control connection's
+	// policy; by transfer time it has already recorded the host key.
+	acceptNew := false
+	if a, ok := exec.(interface{ AcceptNewHost() bool }); ok && a.AcceptNewHost() {
+		acceptNew = true
 	}
-	sshTarget := fmt.Sprintf("%s@%s", user, host)
+	sshArgs := ssh.ExternalSSHArgs(host, keyPath, acceptNew)
+	sshTarget := ssh.RsyncTarget(user, host, "")
+	sshTarget = strings.TrimSuffix(sshTarget, ":") // this channel dials a command, not rsync
 	sshArgs = append(sshArgs, sshTarget, "gunzip | docker load")
 
 	save := osexec.CommandContext(ctx, "docker", "save", tag)

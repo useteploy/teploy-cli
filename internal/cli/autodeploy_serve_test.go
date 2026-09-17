@@ -216,3 +216,82 @@ func TestWebhookHandler_OnDedupChangedCalledOnNewDelivery(t *testing.T) {
 		t.Errorf("onDedupChanged called %d times, want 1", changedCount)
 	}
 }
+
+// audit F40: only a push to the WATCHED branch may trigger a deploy. A ping,
+// a tag push, a push to another branch, and a branch deletion are
+// acknowledged no-ops — each used to deploy the watched branch's current
+// state with an unrelated changed-file list.
+func TestWebhookHandler_OnlyWatchedBranchPushes(t *testing.T) {
+	secret := "s3cret"
+	cases := []struct {
+		name string
+		body string
+		want bool
+	}{
+		{"watched branch", `{"ref":"refs/heads/main","commits":[{"added":["a"]}]}`, true},
+		{"other branch", `{"ref":"refs/heads/develop","commits":[{"added":["a"]}]}`, false},
+		{"tag push", `{"ref":"refs/tags/v1.0.0"}`, false},
+		{"ping", `{}`, false},
+		{"branch deletion", `{"ref":"refs/heads/main","deleted":true}`, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			triggered := false
+			handler := newWebhookHandler(webhookHandlerConfig{
+				secret:  secret,
+				branch:  "main",
+				dedup:   autodeploy.NewDeliveryDedup(),
+				trigger: func(_ []string, _ bool) { triggered = true },
+			})
+			body := []byte(tc.body)
+			req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(tc.body))
+			req.Header.Set("X-Hub-Signature-256", githubSign(secret, body))
+			rec := httptest.NewRecorder()
+			handler(rec, req)
+			if triggered != tc.want {
+				t.Errorf("triggered = %v, want %v (status %d)", triggered, tc.want, rec.Code)
+			}
+		})
+	}
+}
+
+// audit F41: the delivery-ID header is unauthenticated, so replaying a
+// captured signed body under a FRESH delivery ID used to bypass the dedup.
+// Dedup must be keyed on the authenticated content digest.
+func TestWebhookHandler_ContentReplayRejected(t *testing.T) {
+	secret := "s3cret"
+	body := []byte(`{"ref":"refs/heads/main"}`)
+	triggerCount := 0
+	handler := newWebhookHandler(webhookHandlerConfig{
+		secret: secret,
+		branch: "main",
+		dedup:  autodeploy.NewDeliveryDedup(),
+		trigger: func(_ []string, _ bool) {
+			triggerCount++
+		},
+	})
+
+	send := func(delivery string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(string(body)))
+		req.Header.Set("X-Hub-Signature-256", githubSign(secret, body))
+		if delivery != "" {
+			req.Header.Set("X-GitHub-Delivery", delivery)
+		}
+		rec := httptest.NewRecorder()
+		handler(rec, req)
+		return rec
+	}
+
+	send("delivery-1")
+	// Same signed body, different delivery ID → replay, no second deploy.
+	if rec := send("delivery-2"); rec.Code != http.StatusOK {
+		t.Errorf("content replay should be a 200 no-op, got %d", rec.Code)
+	}
+	// Same signed body, NO delivery header at all → still a replay.
+	if rec := send(""); rec.Code != http.StatusOK {
+		t.Errorf("headerless content replay should be a 200 no-op, got %d", rec.Code)
+	}
+	if triggerCount != 1 {
+		t.Errorf("trigger called %d times for one unique signed body, want 1", triggerCount)
+	}
+}

@@ -9,6 +9,7 @@ import (
 	"path"
 	"path/filepath"
 	"runtime"
+	"strings"
 
 	"github.com/useteploy/teploy/internal/ssh"
 )
@@ -282,11 +283,11 @@ func localBuildNixpacks(ctx context.Context, tag, dir string, stdout io.Writer) 
 }
 
 func streamImage(ctx context.Context, tag, host, user, keyPath string, stdout io.Writer) error {
-	sshArgs := []string{"-o", "StrictHostKeyChecking=no"}
-	if keyPath != "" {
-		sshArgs = append(sshArgs, "-i", keyPath)
-	}
-	sshTarget := fmt.Sprintf("%s@%s", user, host)
+	// Strict verification (audit F27) — the `-o StrictHostKeyChecking=no`
+	// here disabled host-key checking entirely for the image channel.
+	sshArgs := ssh.ExternalSSHArgs(host, keyPath, false)
+	sshTarget := ssh.RsyncTarget(user, host, "")
+	sshTarget = strings.TrimSuffix(sshTarget, ":")
 	sshArgs = append(sshArgs, sshTarget, "docker", "load")
 
 	// docker save <tag> | ssh <host> docker load

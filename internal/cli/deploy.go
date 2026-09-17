@@ -962,6 +962,14 @@ func rollbackFailedWave(ctx context.Context, appCfg *config.AppConfig, wave []mu
 
 // buildNotifier creates a MultiNotifier from the app config.
 // Supports both the legacy single-webhook format and the new multi-channel format.
+// executorAcceptsNew reports whether an executor was created with the
+// --accept-new host-key policy (transfer channels mirror it; see
+// ssh.ExternalSSHArgs).
+func executorAcceptsNew(exec ssh.Executor) bool {
+	a, ok := exec.(interface{ AcceptNewHost() bool })
+	return ok && a.AcceptNewHost()
+}
+
 // caddyFirewall converts the teploy.yml firewall config into the caddy layer's
 // firewall value. Validation happens at config load (AppConfig.validate).
 func caddyFirewall(f config.FirewallConfig) caddy.Firewall {
@@ -1098,6 +1106,7 @@ func runStaticDeploy(cfg *config.AppConfig, host, user, key string) error {
 	}
 
 	d := deploy.NewStaticDeployer(executor, os.Stdout)
+	d.SSHKeyPath = key
 	if err := d.Deploy(ctx, staticCfg); err != nil {
 		state.AppendLog(ctx, executor, state.LogEntry{
 			Timestamp: time.Now().UTC(),

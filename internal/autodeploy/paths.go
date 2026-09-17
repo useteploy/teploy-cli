@@ -23,7 +23,37 @@ type pushPayload struct {
 		Modified []string `json:"modified"`
 		Removed  []string `json:"removed"`
 	} `json:"commits"`
-	TotalCommitsCount int `json:"total_commits_count"`
+	TotalCommitsCount int    `json:"total_commits_count"`
+	Ref               string `json:"ref"`
+	Deleted           *bool  `json:"deleted"`
+	After             string `json:"after"`
+}
+
+// PushEvent classifies an authenticated webhook body against the branch this
+// listener watches (audit F40): a push to the watched branch returns ok=true
+// (even when the changed-file set is unknown — fail-open on files, never on
+// event identity); anything else — ping, tag push, a DIFFERENT branch, a
+// branch deletion — returns ok=false so the caller acknowledges without
+// deploying. An event for another branch used to trigger a deploy of the
+// watched branch's current state with that event's (unrelated) changed-file
+// list.
+func PushEvent(body []byte, branch string) (ok bool) {
+	var p pushPayload
+	if err := json.Unmarshal(body, &p); err != nil {
+		// Unparseable + no usable push markers: treat as non-push (ping or
+		// unknown event) rather than deploying on it.
+		return false
+	}
+	if p.Deleted != nil && *p.Deleted {
+		return false
+	}
+	if p.Ref == "" {
+		return false // ping / non-push event
+	}
+	if branch == "" {
+		return true // caller did not pin a branch: any push event qualifies
+	}
+	return p.Ref == "refs/heads/"+branch || strings.TrimPrefix(p.Ref, "refs/heads/") == branch
 }
 
 // githubCommitCap is the number of commits GitHub includes in a push event
