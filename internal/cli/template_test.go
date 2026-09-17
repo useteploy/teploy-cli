@@ -77,3 +77,42 @@ func TestReplaceTopLevelPort(t *testing.T) {
 		t.Errorf("port should be appended at the end:\n%s", out)
 	}
 }
+
+// TestTemplateVars covers the variable merge order for template deploy and
+// install: the built-in domain entry, --var flag pairs, then --var-stdin on
+// top. The stdin layer is the UPSTREAM-1 contract — secret values arrive
+// over a pipe and override any --var pair with the same name.
+func TestTemplateVars(t *testing.T) {
+	vars := templateVars("app.example.com", []string{"REGION=eu", "EMPTY="}, map[string]string{
+		"API_KEY": "s3cr3t",
+		"REGION":  "us", // stdin wins over the --var flag
+	})
+	if vars["domain"] != "app.example.com" {
+		t.Errorf("domain = %q", vars["domain"])
+	}
+	if vars["REGION"] != "us" {
+		t.Errorf("stdin must override --var: REGION = %q", vars["REGION"])
+	}
+	if vars["API_KEY"] != "s3cr3t" {
+		t.Errorf("API_KEY = %q", vars["API_KEY"])
+	}
+	if vars["EMPTY"] != "" {
+		t.Errorf("EMPTY = %q, want empty-string --var value", vars["EMPTY"])
+	}
+
+	// --var pairs without "=" are skipped, matching the historical
+	// behavior; they are caller mistakes, not secrets.
+	vars = templateVars("", []string{"NOEQUALS", "OK=1"}, nil)
+	if _, present := vars["NOEQUALS"]; present {
+		t.Errorf("malformed --var should be skipped: %v", vars)
+	}
+	if vars["OK"] != "1" {
+		t.Errorf("OK = %q", vars["OK"])
+	}
+
+	// A nil stdin map (flag not passed) changes nothing.
+	vars = templateVars("d.io", []string{"A=1"}, nil)
+	if len(vars) != 2 || vars["A"] != "1" || vars["domain"] != "d.io" {
+		t.Errorf("nil stdin vars: %v", vars)
+	}
+}

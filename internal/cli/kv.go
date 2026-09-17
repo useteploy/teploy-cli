@@ -19,6 +19,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"strings"
@@ -100,25 +101,67 @@ func newKvGetCmd(flags *Flags) *cobra.Command {
 func newKvSetCmd(flags *Flags) *cobra.Command {
 	t := &kvTarget{}
 	var ttl int64
+	var valueStdin bool
 	cmd := &cobra.Command{
-		Use:   "set <key> <value>",
+		Use:   "set <key> <value> | <key> --stdin",
 		Short: "Set a key to a value (optionally with a TTL)",
-		Args:  cobra.ExactArgs(2),
+		Long: "Set a key to a value (optionally with a TTL).\n\n" +
+			"With --stdin, pass only the key and pipe the value in; stdin is taken\n" +
+			"verbatim (no trailing-newline trim). This keeps secret values out of the\n" +
+			"process list, where argv is visible to every local process. The value is\n" +
+			"never echoed back on this path.",
+		Args: cobra.RangeArgs(1, 2),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			sql := fmt.Sprintf("SELECT KV_SET(%s, %s)", kvQuote(args[0]), kvQuote(args[1]))
-			if ttl > 0 {
-				sql = fmt.Sprintf("SELECT KV_SET(%s, %s, %d)", kvQuote(args[0]), kvQuote(args[1]), ttl)
-			}
-			if _, err := runKvQuery(flags, t, sql); err != nil {
+			key, value, err := parseKvSetArgs(cmd.InOrStdin(), args, valueStdin)
+			if err != nil {
 				return err
 			}
-			fmt.Printf("%s = %s\n", args[0], args[1])
+			if _, err := runKvQuery(flags, t, buildKvSetSQL(key, value, ttl)); err != nil {
+				return err
+			}
+			if valueStdin {
+				// Never echo a stdin-supplied value: it is a secret by
+				// assumption, and stdout can be logged.
+				fmt.Printf("set %s\n", key)
+			} else {
+				fmt.Printf("%s = %s\n", args[0], args[1])
+			}
 			return nil
 		},
 	}
 	cmd.Flags().Int64Var(&ttl, "ttl", 0, "expiry in seconds (0 = no expiry)")
+	cmd.Flags().BoolVar(&valueStdin, "stdin", false, "read the value from stdin instead of argv (pass only the key; stdin is verbatim — use for secret values)")
 	addKvTargetFlags(cmd, t)
 	return cmd
+}
+
+// parseKvSetArgs splits `kv set` input into key and value. With valueStdin
+// set, args holds the key alone and the value is read verbatim from r
+// (audit UPSTREAM-1: secret values must be able to avoid argv).
+func parseKvSetArgs(r io.Reader, args []string, valueStdin bool) (key, value string, err error) {
+	if valueStdin {
+		if len(args) != 1 {
+			return "", "", fmt.Errorf("--stdin takes only the key, got %d arguments", len(args))
+		}
+		val, err := readSecretValue(r)
+		if err != nil {
+			return "", "", err
+		}
+		return args[0], val, nil
+	}
+	if len(args) != 2 {
+		return "", "", fmt.Errorf("set takes <key> <value> (or <key> --stdin)")
+	}
+	return args[0], args[1], nil
+}
+
+// buildKvSetSQL renders the KV_SET statement for a key/value pair, with the
+// optional TTL variant.
+func buildKvSetSQL(key, value string, ttl int64) string {
+	if ttl > 0 {
+		return fmt.Sprintf("SELECT KV_SET(%s, %s, %d)", kvQuote(key), kvQuote(value), ttl)
+	}
+	return fmt.Sprintf("SELECT KV_SET(%s, %s)", kvQuote(key), kvQuote(value))
 }
 
 func newKvDelCmd(flags *Flags) *cobra.Command {

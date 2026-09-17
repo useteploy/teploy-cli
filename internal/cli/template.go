@@ -97,13 +97,18 @@ func newTemplateDeployCmd(flags *Flags) *cobra.Command {
 	var domain, server string
 	var port int
 	var vars []string
+	var varStdin bool
 
 	cmd := &cobra.Command{
 		Use:   "deploy <name>",
 		Short: "Deploy from a template",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runTemplateDeploy(flags, args[0], domain, server, port, vars)
+			stdinVars, err := stdinVarMap(cmd, varStdin)
+			if err != nil {
+				return err
+			}
+			return runTemplateDeploy(flags, args[0], domain, server, port, vars, stdinVars)
 		},
 	}
 
@@ -115,22 +120,16 @@ func newTemplateDeployCmd(flags *Flags) *cobra.Command {
 	cmd.Flags().StringVar(&server, "server", "", "server to deploy to")
 	cmd.Flags().IntVar(&port, "port", 0, "host port override for ingress: host templates")
 	cmd.Flags().StringArrayVar(&vars, "var", nil, "template variables as key=value (required for every variable the template declares)")
+	cmd.Flags().BoolVar(&varStdin, "var-stdin", false, "read variable values as a JSON object from stdin (e.g. '{\"API_KEY\":\"...\"}'); overrides --var entries with the same name — use for secret values")
 
 	return cmd
 }
 
-func runTemplateDeploy(flags *Flags, name, domain, server string, port int, extraVars []string) error {
+func runTemplateDeploy(flags *Flags, name, domain, server string, port int, extraVars []string, stdinVars map[string]string) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
-	// Fetch and render template.
-	vars := map[string]string{"domain": domain}
-	for _, v := range extraVars {
-		parts := strings.SplitN(v, "=", 2)
-		if len(parts) == 2 {
-			vars[parts[0]] = parts[1]
-		}
-	}
+	vars := templateVars(domain, extraVars, stdinVars)
 
 	reg := tmpl.NewRegistry()
 	content, generated, err := reg.Fetch(ctx, name, vars)
@@ -179,6 +178,34 @@ func runTemplateDeploy(flags *Flags, name, domain, server string, port int, extr
 	return nil
 }
 
+// stdinVarMap reads the --var-stdin JSON object when the flag is set, else
+// returns nil. Shared by template deploy and install (audit UPSTREAM-1:
+// secret variable values must be able to avoid argv).
+func stdinVarMap(cmd *cobra.Command, varStdin bool) (map[string]string, error) {
+	if !varStdin {
+		return nil, nil
+	}
+	return readVarMapStdin(cmd.InOrStdin())
+}
+
+// templateVars builds the variable map handed to the registry: the built-in
+// domain entry, then --var flag pairs, then the --var-stdin object on top
+// (stdin entries override --var pairs with the same name). Malformed --var
+// pairs (no "=") are skipped, matching the historical behavior.
+func templateVars(domain string, extraVars []string, stdinVars map[string]string) map[string]string {
+	vars := map[string]string{"domain": domain}
+	for _, v := range extraVars {
+		parts := strings.SplitN(v, "=", 2)
+		if len(parts) == 2 {
+			vars[parts[0]] = parts[1]
+		}
+	}
+	for k, v := range stdinVars {
+		vars[k] = v
+	}
+	return vars
+}
+
 // applyTemplateOverrides sets the operator's flags on the rendered config and
 // validates the ingress/domain pairing: an `ingress: host` template publishes
 // on bind:port and needs no domain (the port comes from the template or
@@ -207,6 +234,7 @@ func newTemplateInstallCmd(flags *Flags) *cobra.Command {
 	var domain, server string
 	var port int
 	var vars []string
+	var varStdin bool
 
 	cmd := &cobra.Command{
 		Use:   "install <name>",
@@ -216,7 +244,11 @@ func newTemplateInstallCmd(flags *Flags) *cobra.Command {
 			if server == "" {
 				return fmt.Errorf("--server is required")
 			}
-			return runTemplateInstall(flags, args[0], domain, server, port, vars)
+			stdinVars, err := stdinVarMap(cmd, varStdin)
+			if err != nil {
+				return err
+			}
+			return runTemplateInstall(flags, args[0], domain, server, port, vars, stdinVars)
 		},
 	}
 
@@ -224,21 +256,16 @@ func newTemplateInstallCmd(flags *Flags) *cobra.Command {
 	cmd.Flags().StringVar(&server, "server", "", "server to deploy to (required)")
 	cmd.Flags().IntVar(&port, "port", 0, "host port override for ingress: host templates")
 	cmd.Flags().StringArrayVar(&vars, "var", nil, "extra template variables as key=value")
+	cmd.Flags().BoolVar(&varStdin, "var-stdin", false, "read variable values as a JSON object from stdin (e.g. '{\"API_KEY\":\"...\"}'); overrides --var entries with the same name — use for secret values")
 
 	return cmd
 }
 
-func runTemplateInstall(flags *Flags, name, domain, server string, port int, extraVars []string) error {
+func runTemplateInstall(flags *Flags, name, domain, server string, port int, extraVars []string, stdinVars map[string]string) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
-	vars := map[string]string{"domain": domain}
-	for _, v := range extraVars {
-		parts := strings.SplitN(v, "=", 2)
-		if len(parts) == 2 {
-			vars[parts[0]] = parts[1]
-		}
-	}
+	vars := templateVars(domain, extraVars, stdinVars)
 
 	reg := tmpl.NewRegistry()
 	content, generated, err := reg.Fetch(ctx, name, vars)
