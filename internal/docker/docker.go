@@ -337,7 +337,7 @@ type containerInspect struct {
 	// preserve: after a newer image is pulled under the same tag,
 	// recreating from Config.Image silently runs the NEW bytes while
 	// reporting the old version (audit F19).
-	Image string
+	Image  string
 	Config struct {
 		Image       string
 		Env         []string
