@@ -8,7 +8,14 @@ permissions:
   contents: write
 
 jobs:
+  verify:
+    # The exact commit being released must pass the same gates CI runs —
+    # previously the tag pipeline published without running a single test
+    # (audit F64).
+    uses: ./.github/workflows/ci.yml
+
   release:
+    needs: verify
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
