@@ -113,15 +113,49 @@ type LogEntry struct {
 	Image string `json:"image,omitempty"`
 }
 
-// Read reads canonical v2 state first. A missing v2 file falls back to the
-// legacy key=value file; malformed canonical JSON is an error and never falls
-// back to potentially stale legacy state.
+// readRemoteFile returns the file's contents and whether it exists. Absence
+// is CONFIRMED by the remote test — the old `cat path 2>/dev/null` shape
+// folded "missing", "unreadable", and "transport failed" into one silent
+// empty result, so a permission failure was indistinguishable from a first
+// deploy (audit F15).
+func readRemoteFile(ctx context.Context, exec ssh.Executor, path string) ([]byte, bool, error) {
+	cmd := fmt.Sprintf("if [ ! -e %s ]; then printf 'absent\\n'; else printf 'present\\n'; cat -- %s; fi",
+		ssh.ShellQuote(path), ssh.ShellQuote(path))
+	out, err := exec.Run(ctx, cmd)
+	if err != nil {
+		return nil, false, fmt.Errorf("reading %s: %w", path, err)
+	}
+	out = strings.TrimRight(out, "\n")
+	if out == "absent" || strings.HasPrefix(out, "absent\n") {
+		return nil, false, nil
+	}
+	if out == "present" {
+		return nil, true, nil
+	}
+	if !strings.HasPrefix(out, "present\n") {
+		return nil, false, fmt.Errorf("reading %s: unrecognized output framing", path)
+	}
+	return []byte(strings.TrimPrefix(out, "present\n")), true, nil
+}
+
+// Read reads canonical v2 state first; a CONFIRMED-MISSING v2 file falls
+// back to the legacy key=value file. Every other failure — transport,
+// permission, an existing-but-empty canonical file, malformed canonical
+// JSON — is an error and never silently treated as "no state", which would
+// lose rollback bookkeeping and let a mutation proceed as a first deploy
+// (audit F15).
 func Read(ctx context.Context, exec ssh.Executor, app string) (*AppState, error) {
 	v2Path := fmt.Sprintf("%s/%s/state.json", deploymentsDir, app)
-	output, err := exec.Run(ctx, fmt.Sprintf("cat -- %s 2>/dev/null", v2Path))
-	if err == nil && strings.TrimSpace(output) != "" {
+	data, present, err := readRemoteFile(ctx, exec, v2Path)
+	if err != nil {
+		return nil, fmt.Errorf("reading canonical state for %s: %w", app, err)
+	}
+	if present {
+		if len(bytes.TrimSpace(data)) == 0 {
+			return nil, fmt.Errorf("canonical state %s exists but is empty — refusing to treat an existing state file as absent; inspect and repair it before deploying", v2Path)
+		}
 		var s AppState
-		if err := json.Unmarshal([]byte(output), &s); err != nil {
+		if err := json.Unmarshal(data, &s); err != nil {
 			return nil, fmt.Errorf("parsing canonical state for %s: %w", app, err)
 		}
 		if s.SchemaVersion != SchemaVersionV2 {
@@ -137,14 +171,18 @@ func Read(ctx context.Context, exec ssh.Executor, app string) (*AppState, error)
 		return &s, nil
 	}
 
+	// Only a confirmed-missing canonical file reaches the legacy migration.
 	path := fmt.Sprintf("%s/%s/state", deploymentsDir, app)
-	output, err = exec.Run(ctx, fmt.Sprintf("cat %s 2>/dev/null", path))
-	if err != nil || strings.TrimSpace(output) == "" {
+	data, present, err = readRemoteFile(ctx, exec, path)
+	if err != nil {
+		return nil, fmt.Errorf("reading legacy state for %s: %w", app, err)
+	}
+	if !present || len(bytes.TrimSpace(data)) == 0 {
 		return nil, nil
 	}
 
 	s := &AppState{}
-	for _, line := range strings.Split(output, "\n") {
+	for _, line := range strings.Split(string(data), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue

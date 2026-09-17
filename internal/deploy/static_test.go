@@ -46,7 +46,8 @@ func TestStaticDeploy_FreshFirstDeploy(t *testing.T) {
 		// AcquireLock — start clean (no lock).
 		ssh.MockCommand{Match: "mkdir /deployments/myapp/.lock", Output: ""},
 		// state.Read — no prior state.
-		ssh.MockCommand{Match: "cat /deployments/myapp/state", Output: ""},
+		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state.json' ]", Output: "absent"},
+		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state' ]", Output: "present\n" + ""},
 		// mkdir releases dir
 		ssh.MockCommand{Match: "mkdir -p /deployments/myapp/releases", Output: ""},
 		// release exists check — say "no", forcing rsync path
@@ -95,7 +96,8 @@ func TestStaticDeploy_FreshFirstDeploy(t *testing.T) {
 	mock = ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "mkdir -p /deployments/myapp", Output: ""},
 		ssh.MockCommand{Match: "mkdir /deployments/myapp/.lock", Output: ""},
-		ssh.MockCommand{Match: "cat /deployments/myapp/state", Output: ""},
+		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state.json' ]", Output: "absent"},
+		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state' ]", Output: "present\n" + ""},
 		ssh.MockCommand{Match: "mkdir -p /deployments/myapp/releases", Output: ""},
 		// Pre-existing release dir → skip rsync
 		ssh.MockCommand{Match: "test -d /deployments/myapp/releases/", Output: "yes"},
@@ -161,7 +163,8 @@ func TestStaticDeploy_StateCommitFailureRestoresPreviousRelease(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "mkdir -p /deployments/myapp", Output: ""},
 		ssh.MockCommand{Match: "mkdir /deployments/myapp/.lock", Output: ""},
-		ssh.MockCommand{Match: "cat /deployments/myapp/state", Output: "current_hash=old123\nprevious_hash=older456\n"},
+		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state.json' ]", Output: "absent"},
+		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state' ]", Output: "present\n" + "current_hash=old123\nprevious_hash=older456\n"},
 		ssh.MockCommand{Match: "mkdir -p /deployments/myapp/releases", Output: ""},
 		ssh.MockCommand{Match: "test -d /deployments/myapp/releases/", Output: "yes"},
 		ssh.MockCommand{Match: "ln -sfn releases/", Output: ""},
@@ -201,7 +204,8 @@ func TestStaticDeploy_StateCommitFailureRestoresPreviousRelease(t *testing.T) {
 func TestStaticRollback_StateCommitFailureRestoresOriginalRelease(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "mkdir /deployments/myapp/.lock", Output: ""},
-		ssh.MockCommand{Match: "cat /deployments/myapp/state", Output: "current_hash=v2\nprevious_hash=v1\n"},
+		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state.json' ]", Output: "absent"},
+		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state' ]", Output: "present\n" + "current_hash=v2\nprevious_hash=v1\n"},
 		ssh.MockCommand{Match: "test -d /deployments/myapp/releases/v1", Output: "yes"},
 		ssh.MockCommand{Match: "ln -sfn releases/", Output: ""},
 		ssh.MockCommand{Match: "cat /deployments/caddy/Caddyfile", Output: "{\n\tadmin 0.0.0.0:2019\n}\n"},

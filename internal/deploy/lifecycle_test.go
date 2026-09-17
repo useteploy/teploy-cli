@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
 	"strings"
 	"testing"
 
@@ -59,7 +58,8 @@ func TestStop_NoContainers(t *testing.T) {
 func TestStart(t *testing.T) {
 	stateContent := "current_port=49152\ncurrent_hash=v1\n"
 	mock := ssh.NewMockExecutor("1.2.3.4",
-		ssh.MockCommand{Match: "cat /deployments/myapp/state", Output: stateContent},
+		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state.json' ]", Output: "absent"},
+		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state' ]", Output: "present\n" + stateContent},
 		ssh.MockCommand{Match: "docker ps --all --filter label=teploy.app='myapp'",
 			Output: `{"ID":"abc123","Names":"myapp-web-v1","Image":"myapp:latest","State":"exited","Status":"Exited (0)","Labels":"teploy.app=myapp,teploy.version=v1,teploy.process=web"}`,
 		},
@@ -82,7 +82,8 @@ func TestStart(t *testing.T) {
 
 func TestStart_NoState(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
-		ssh.MockCommand{Match: "cat /deployments/myapp/state", Err: fmt.Errorf("not found")},
+		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state.json' ]", Output: "absent"},
+		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state' ]", Output: "absent"},
 	)
 
 	lc := NewLifecycle(mock, &bytes.Buffer{})
@@ -98,7 +99,8 @@ func TestStart_NoState(t *testing.T) {
 func TestRestart(t *testing.T) {
 	stateContent := "current_port=49152\ncurrent_hash=v1\n"
 	mock := ssh.NewMockExecutor("1.2.3.4",
-		ssh.MockCommand{Match: "cat /deployments/myapp/state", Output: stateContent},
+		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state.json' ]", Output: "absent"},
+		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state' ]", Output: "present\n" + stateContent},
 		ssh.MockCommand{Match: "docker ps --all --filter label=teploy.app='myapp'",
 			Output: `{"ID":"abc123","Names":"myapp-web-v1","Image":"myapp:latest","State":"running","Status":"Up 2h","Labels":"teploy.app=myapp,teploy.version=v1,teploy.process=web"}`,
 		},

@@ -10,7 +10,8 @@ import (
 
 func TestRead_MalformedPort(t *testing.T) {
 	mock := ssh.NewMockExecutor("server1",
-		ssh.MockCommand{Match: "cat /deployments/myapp/state", Output: "current_port=notanumber\ncurrent_hash=abc123\n"},
+		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state.json' ]", Output: "absent"},
+		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state' ]", Output: "present\ncurrent_port=notanumber\ncurrent_hash=abc123\n"},
 	)
 
 	s, err := Read(context.Background(), mock, "myapp")
@@ -31,7 +32,8 @@ func TestRead_MalformedPort(t *testing.T) {
 
 func TestRead_ExtraFields(t *testing.T) {
 	mock := ssh.NewMockExecutor("server1",
-		ssh.MockCommand{Match: "cat /deployments/myapp/state", Output: "current_port=49152\ncurrent_hash=abc123\nunknown_field=value\n"},
+		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state.json' ]", Output: "absent"},
+		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state' ]", Output: "present\ncurrent_port=49152\ncurrent_hash=abc123\nunknown_field=value\n"},
 	)
 
 	s, err := Read(context.Background(), mock, "myapp")
@@ -45,7 +47,8 @@ func TestRead_ExtraFields(t *testing.T) {
 
 func TestRead_EmptyLines(t *testing.T) {
 	mock := ssh.NewMockExecutor("server1",
-		ssh.MockCommand{Match: "cat /deployments/myapp/state", Output: "\n\ncurrent_port=49152\n\ncurrent_hash=abc123\n\n"},
+		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state.json' ]", Output: "absent"},
+		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state' ]", Output: "present\n\n\ncurrent_port=49152\n\ncurrent_hash=abc123\n\n"},
 	)
 
 	s, err := Read(context.Background(), mock, "myapp")
@@ -59,7 +62,8 @@ func TestRead_EmptyLines(t *testing.T) {
 
 func TestRead_MalformedLines(t *testing.T) {
 	mock := ssh.NewMockExecutor("server1",
-		ssh.MockCommand{Match: "cat /deployments/myapp/state", Output: "garbage\nno-equals-sign\ncurrent_port=49152\n"},
+		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state.json' ]", Output: "absent"},
+		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state' ]", Output: "present\ngarbage\nno-equals-sign\ncurrent_port=49152\n"},
 	)
 
 	s, err := Read(context.Background(), mock, "myapp")

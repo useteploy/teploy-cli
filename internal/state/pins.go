@@ -2,7 +2,6 @@ package state
 
 import (
 	"context"
-	"encoding/base64"
 	"fmt"
 	"sort"
 	"strings"
@@ -21,15 +20,22 @@ func pinsPath(app string) string {
 	return fmt.Sprintf("%s/%s/pinned", deploymentsDir, app)
 }
 
-// ReadPins returns the pinned versions for an app (nil if none/unset).
+// ReadPins returns the pinned versions for an app. Only a CONFIRMED-MISSING
+// file yields (nil, nil); every other read failure is an error — the old
+// version swallowed all failures, so a permission or transport problem
+// silently removed pin protection from versions the operator deliberately
+// retained (audit F78). Callers must fail CLOSED on error (skip pruning),
+// never prune as though no pins existed.
 func ReadPins(ctx context.Context, exec ssh.Executor, app string) ([]string, error) {
-	out, err := exec.Run(ctx, fmt.Sprintf("cat %s 2>/dev/null", pinsPath(app)))
+	data, present, err := readRemoteFile(ctx, exec, pinsPath(app))
 	if err != nil {
-		// Missing file is the normal "no pins" case, not an error.
+		return nil, fmt.Errorf("reading pins for %s: %w", app, err)
+	}
+	if !present {
 		return nil, nil
 	}
 	var pins []string
-	for _, line := range strings.Split(out, "\n") {
+	for _, line := range strings.Split(string(data), "\n") {
 		if v := strings.TrimSpace(line); v != "" {
 			pins = append(pins, v)
 		}
@@ -39,7 +45,10 @@ func ReadPins(ctx context.Context, exec ssh.Executor, app string) ([]string, err
 
 // AddPin pins a version (idempotent).
 func AddPin(ctx context.Context, exec ssh.Executor, app, version string) error {
-	pins, _ := ReadPins(ctx, exec, app)
+	pins, err := ReadPins(ctx, exec, app)
+	if err != nil {
+		return err
+	}
 	for _, p := range pins {
 		if p == version {
 			return nil
@@ -50,7 +59,10 @@ func AddPin(ctx context.Context, exec ssh.Executor, app, version string) error {
 
 // RemovePin unpins a version (idempotent).
 func RemovePin(ctx context.Context, exec ssh.Executor, app, version string) error {
-	pins, _ := ReadPins(ctx, exec, app)
+	pins, err := ReadPins(ctx, exec, app)
+	if err != nil {
+		return err
+	}
 	kept := make([]string, 0, len(pins))
 	for _, p := range pins {
 		if p != version {
@@ -60,6 +72,9 @@ func RemovePin(ctx context.Context, exec ssh.Executor, app, version string) erro
 	return writePins(ctx, exec, app, kept)
 }
 
+// writePins commits the pin set atomically: a staged sibling file is renamed
+// over the live one, so an interrupted write can no longer truncate the pin
+// file and drop protection (audit F78).
 func writePins(ctx context.Context, exec ssh.Executor, app string, pins []string) error {
 	if err := EnsureAppDir(ctx, exec, app); err != nil {
 		return err
@@ -69,11 +84,7 @@ func writePins(ctx context.Context, exec ssh.Executor, app string, pins []string
 	if content != "" {
 		content += "\n"
 	}
-	// base64 round-trip keeps the write shell-safe and lets an empty set
-	// truncate the file cleanly (no pins left => empty file).
-	encoded := base64.StdEncoding.EncodeToString([]byte(content))
-	cmd := fmt.Sprintf("printf %%s %s | base64 -d > %s", ssh.ShellQuote(encoded), pinsPath(app))
-	if _, err := exec.Run(ctx, cmd); err != nil {
+	if err := ssh.UploadAtomic(ctx, exec, strings.NewReader(content), pinsPath(app), "0600"); err != nil {
 		return fmt.Errorf("writing pins: %w", err)
 	}
 	return nil

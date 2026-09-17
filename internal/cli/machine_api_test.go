@@ -28,7 +28,7 @@ func TestCollectAppListCanonicalState(t *testing.T) {
 	container := `{"ID":"abc","Names":"blog-web-v2","Image":"example/blog:v2","State":"running","Status":"Up 2 hours","CreatedAt":"2026-07-22 10:00:00 +0000 UTC","Labels":"teploy.app=blog,teploy.process=web,teploy.version=v2"}`
 	mock := ssh.NewMockExecutor("192.0.2.10",
 		ssh.MockCommand{Match: "for f in /deployments/*/state.json", Output: "blog\n"},
-		ssh.MockCommand{Match: "cat -- /deployments/blog/state.json", Output: `{"schema_version":2,"deployment_type":"container","ingress_mode":"external","domain":"blog.example.com","current_hash":"v2","current_ports":[49153],"previous_hash":"v1","previous_ports":[49152]}`},
+		ssh.MockCommand{Match: "if [ ! -e '/deployments/blog/state.json' ]", Output: "present\n" + `{"schema_version":2,"deployment_type":"container","ingress_mode":"external","domain":"blog.example.com","current_hash":"v2","current_ports":[49153],"previous_hash":"v1","previous_ports":[49152]}`},
 		ssh.MockCommand{Match: "docker ps --all", Output: container},
 		ssh.MockCommand{Match: "cat /deployments/blog/.lock/info", Output: `{"type":"manual","user":"alice","ts":"2026-07-22T11:00:00Z"}`},
 		ssh.MockCommand{Match: "test -f /deployments/blog/.maintenance-block", Output: ""},

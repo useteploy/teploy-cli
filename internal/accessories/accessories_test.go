@@ -627,8 +627,8 @@ func TestEnsureRunning_SecretReference(t *testing.T) {
 		// No stored credentials.
 		ssh.MockCommand{Match: "cat /deployments/myapp/accessories/nucleus/credentials", Err: fmt.Errorf("not found")},
 		// Secret exists and decrypts.
-		ssh.MockCommand{Match: "test -f /deployments/myapp/secrets/NUCLEUS_PASSWORD.age", Output: ""},
-		ssh.MockCommand{Match: "age -d -i /deployments/.age-key /deployments/myapp/secrets/NUCLEUS_PASSWORD.age", Output: "s3cr3t-pa$$word\n"},
+		ssh.MockCommand{Match: "test -f", Output: ""},
+		ssh.MockCommand{Match: "age -d", Output: "s3cr3t-pa$$word"},
 		// Not running.
 		ssh.MockCommand{Match: "docker inspect", Err: fmt.Errorf("not found")},
 		ssh.MockCommand{Match: "mkdir -p /deployments/myapp/accessories/nucleus", Output: ""},

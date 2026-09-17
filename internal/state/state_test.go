@@ -16,7 +16,8 @@ func TestRead(t *testing.T) {
 	stateContent := "current_port=49153\ncurrent_hash=b2c4d6e8\nprevious_port=49152\nprevious_hash=6ef8a6a8\n"
 
 	mock := ssh.NewMockExecutor("1.2.3.4",
-		ssh.MockCommand{Match: "cat /deployments/myapp/state", Output: stateContent},
+		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state.json' ]", Output: "absent"},
+		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state' ]", Output: "present\n" + stateContent},
 	)
 
 	s, err := Read(context.Background(), mock, "myapp")
@@ -46,8 +47,7 @@ func TestRead(t *testing.T) {
 func TestRead_CanonicalV2TakesPrecedenceOverLegacy(t *testing.T) {
 	v2 := `{"schema_version":2,"deployment_type":"container","ingress_mode":"external","updated_at":"2026-07-22T10:00:00Z","operation_id":"op-2","generation":4,"current_hash":"v2"}`
 	mock := ssh.NewMockExecutor("1.2.3.4",
-		ssh.MockCommand{Match: "cat -- /deployments/myapp/state.json", Output: v2},
-		ssh.MockCommand{Match: "cat /deployments/myapp/state", Output: "current_hash=stale\n"},
+		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state.json' ]", Output: "present\n" + v2},
 	)
 
 	s, err := Read(context.Background(), mock, "myapp")
@@ -66,8 +66,7 @@ func TestRead_CanonicalV2TakesPrecedenceOverLegacy(t *testing.T) {
 
 func TestRead_MalformedCanonicalDoesNotFallBack(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
-		ssh.MockCommand{Match: "cat -- /deployments/myapp/state.json", Output: "{not-json"},
-		ssh.MockCommand{Match: "cat /deployments/myapp/state", Output: "current_hash=stale\n"},
+		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state.json' ]", Output: "present\n{not-json"},
 	)
 
 	if _, err := Read(context.Background(), mock, "myapp"); err == nil {
@@ -80,7 +79,8 @@ func TestRead_MalformedCanonicalDoesNotFallBack(t *testing.T) {
 
 func TestRead_NoState(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
-		ssh.MockCommand{Match: "cat /deployments/myapp/state", Err: fmt.Errorf("no such file")},
+		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state.json' ]", Output: "absent"},
+		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state' ]", Output: "absent"},
 	)
 
 	s, err := Read(context.Background(), mock, "myapp")
@@ -122,7 +122,8 @@ func TestWrite(t *testing.T) {
 
 func TestWrite_LegacyImportMigratesToCanonicalAuthority(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
-		ssh.MockCommand{Match: "cat /deployments/myapp/state", Output: "current_hash=old\ndomain=old.example.com\n"},
+		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state.json' ]", Output: "absent"},
+		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state' ]", Output: "present\ncurrent_hash=old\ndomain=old.example.com\n"},
 	)
 	mock.Files["/deployments/myapp/state"] = []byte("current_hash=old\ndomain=old.example.com\n")
 	legacy, err := Read(context.Background(), mock, "myapp")

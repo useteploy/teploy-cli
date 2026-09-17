@@ -122,7 +122,8 @@ func TestReportDrift(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			mock := ssh.NewMockExecutor("test-host",
-				ssh.MockCommand{Match: "cat /deployments/blog/state", Output: tt.stateOut},
+				ssh.MockCommand{Match: "if [ ! -e '/deployments/blog/state.json' ]", Output: "absent"},
+				ssh.MockCommand{Match: "if [ ! -e '/deployments/blog/state' ]", Output: "present\n" + tt.stateOut},
 				ssh.MockCommand{Match: "docker ps", Output: tt.psOut},
 			)
 			appCfg := &config.AppConfig{App: "blog"}
