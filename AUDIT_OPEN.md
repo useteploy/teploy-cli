@@ -8,6 +8,8 @@ fixed; what remains open is the deferred architectural tail and two
 upstream/owner items.
 
 Open items: 29 deferred sub-items across 24 findings + 2 upstream/owner.
+The two upstream items received from teploy-dash's 2026-09-17 pass are
+closed below.
 
 ## Resolved from this register
 
@@ -182,3 +184,33 @@ defect could corrupt data today.
   github.com/useteploy/teploy-cli.
 - F63 — goreleaser/Action version pins and trivy image digests require
   maintained reviewed digests; same owner workflow as above.
+
+## Upstream from teploy-dash (2026-09-17 pass) — received and fixed
+
+teploy-dash's own 2026-09-17 audit (its register, pass 6 at 46902d1)
+recorded two defects owned by THIS repo (its UPSTREAM-1 from its A23,
+its UPSTREAM-2 from its A36). Both fixed here; its register was not
+edited from this side.
+
+- UPSTREAM-1 (dash A23) — secrets in argv: `env set` values, template
+  `--var` values, and KV values traveled in the teploy argv, visible in
+  the host process list; dash cannot fix that alone (it redacts known
+  values and already pipes the registry password via stdin). FIXED in
+  cb7c0fc: a stdin secret-input contract — `env set KEY --stdin` and
+  `kv set KEY --stdin` read the value verbatim (kv never echoes it
+  back), `template deploy/install --var-stdin` reads a JSON object that
+  overrides `--var`. Reads bounded at 1 MiB, NUL rejected, argv forms
+  unchanged. Dash can capability-detect the flags before switching.
+- UPSTREAM-2 (dash A36) — atomic server rename/update: dash's rename was
+  remove+add across two CLI processes — non-atomic, and it lost
+  tags/vpn_ip, which `server add` cannot set (dash now rejects
+  destination collisions and restores on failure, but the metadata loss
+  was CLI-owned). FIXED in 72c57f9: `server rename` moves the entire
+  record in one commit (typed ErrServerExists on collision, verified
+  no-op on same name), `server update` changes only passed flags (empty
+  value clears, tags never touched), and every servers.yml mutation now
+  commits via sibling-temp + fsync + rename instead of an in-place
+  truncating write.
+
+Gates at the closing commits: `go vet ./...` clean; `go test ./... -race`
+all packages ok. No push performed.
