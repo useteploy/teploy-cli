@@ -3,6 +3,7 @@ package openbao
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -147,6 +148,13 @@ func (c *Client) Setup(ctx context.Context, opts SetupOptions) error {
 	} else if st.Sealed {
 		return fmt.Errorf("openbao is initialized but sealed — the seal key may have changed; check %s", secretSealKey)
 	} else {
+		// Initialized fast path. If the root token never made it into the
+		// store (e.g. an interrupted first Setup), say so loudly: teploy
+		// cannot manage KV mounts without it, and blindly re-initializing
+		// is impossible (the vault is already initialized).
+		if _, err := c.secrets.Get(ctx, opts.App, secretRootToken); err != nil {
+			return fmt.Errorf("openbao is initialized but the stored %s is unavailable — KV mount management is disabled until it is restored (vault recovery procedure; store failure: %w)", secretRootToken, err)
+		}
 		fmt.Fprintln(c.out, "OpenBao already initialized and unsealed.")
 	}
 	return nil
@@ -163,12 +171,20 @@ func (c *Client) Status(ctx context.Context, app, accessory string) (*Status, er
 // --- internals ---------------------------------------------------------------
 
 // ensureSecret returns the age-stored value for key, generating + storing it
-// via gen if absent.
+// via gen if — and only if — the key is CONFIRMED ABSENT from the store
+// (secret.ErrNotFound). Any other read failure (transport, permission,
+// decrypt) propagates: the old behavior regenerated after any error, which
+// could silently replace vault seal material or a database password because
+// of a transient SSH blip.
 func (c *Client) ensureSecret(ctx context.Context, app, key string, gen func() (string, error)) (string, error) {
-	if v, err := c.secrets.Get(ctx, app, key); err == nil && v != "" {
+	v, err := c.secrets.Get(ctx, app, key)
+	if err == nil && v != "" {
 		return v, nil
 	}
-	v, err := gen()
+	if !errors.Is(err, secret.ErrNotFound) {
+		return "", fmt.Errorf("reading %s (refusing to regenerate over a possibly-present value): %w", key, err)
+	}
+	v, err = gen()
 	if err != nil {
 		return "", err
 	}
@@ -287,13 +303,20 @@ func (c *Client) waitReady(ctx context.Context, container string, timeout time.D
 	}
 }
 
+// initialize runs `bao operator init` and persists ALL bootstrap material.
+// Every store write is mandatory: the vault is already initialized by the
+// time these run, so a failed persist cannot be recovered by re-running
+// init (a retry sees an initialized vault and skips this whole path). The
+// old code ignored the recovery-keys save error, which could leave a vault
+// running with NO recoverable unseal/recovery material anywhere while Setup
+// reported success.
 func (c *Client) initialize(ctx context.Context, app, container string) (rootToken string, err error) {
 	out, err := c.bao(ctx, container, "", "operator init -format=json")
 	if err != nil {
 		return "", fmt.Errorf("operator init: %w", err)
 	}
 	var res struct {
-		RootToken      string   `json:"root_token"`
+		RootToken       string   `json:"root_token"`
 		RecoveryKeysB64 []string `json:"recovery_keys_b64"`
 		UnsealKeysB64   []string `json:"unseal_keys_b64"`
 	}
@@ -303,15 +326,18 @@ func (c *Client) initialize(ctx context.Context, app, container string) (rootTok
 	if res.RootToken == "" {
 		return "", fmt.Errorf("init did not return a root token")
 	}
-	if err := c.secrets.Set(ctx, app, secretRootToken, res.RootToken); err != nil {
-		return "", fmt.Errorf("storing root token: %w", err)
-	}
+	// Persist the init output before anything else can fail. This is the
+	// only copy of the recovery material that ever exists outside the vault
+	// process; treat a persistence failure as fatal, not optional.
 	keys := res.RecoveryKeysB64
 	if len(keys) == 0 {
 		keys = res.UnsealKeysB64
 	}
-	if len(keys) > 0 {
-		_ = c.secrets.Set(ctx, app, secretRecovery, strings.Join(keys, ","))
+	if err := c.secrets.Set(ctx, app, secretRecovery, strings.Join(keys, ",")); err != nil {
+		return "", fmt.Errorf("vault initialized but recovery keys were NOT persisted — do not lose this material; resolve the store failure (%w) and see the vault's documented recovery procedure before restarting anything", err)
+	}
+	if err := c.secrets.Set(ctx, app, secretRootToken, res.RootToken); err != nil {
+		return "", fmt.Errorf("vault initialized but the root token was NOT persisted — recovery keys were stored; resolve the store failure: %w", err)
 	}
 	return res.RootToken, nil
 }
@@ -324,7 +350,6 @@ func (c *Client) enableKV(ctx context.Context, container, root string) error {
 	}
 	return nil
 }
-
 
 // extractJSON returns the JSON object embedded in output that may have leading
 // log lines — from the first "{" to the last "}" (bao -format=json is
