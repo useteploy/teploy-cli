@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -787,6 +788,228 @@ func TestAddServer_PreservesTagsAndVpnIP(t *testing.T) {
 	}
 	if s.Tags["region"] != "us-east" {
 		t.Errorf("tags should be preserved, got %v", s.Tags)
+	}
+}
+
+// TestRenameServer_PreservesAllFields is the UPSTREAM-2 regression: dash's
+// old rename was remove+add across two CLI invocations, which silently lost
+// tags and vpn_ip. RenameServer must move the ENTIRE record — including
+// fields the add command cannot set — in one commit.
+func TestRenameServer_PreservesAllFields(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "servers.yml")
+
+	seed := "servers:\n" +
+		"  old:\n" +
+		"    host: 1.2.3.4\n" +
+		"    user: deploy\n" +
+		"    role: app\n" +
+		"    vpn_ip: 100.64.0.7\n" +
+		"    tags:\n" +
+		"      region: us-east\n" +
+		"      SHARD: \"3\"\n" +
+		"  other:\n" +
+		"    host: 5.6.7.8\n"
+	if err := os.WriteFile(path, []byte(seed), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := RenameServer(path, "old", "new"); err != nil {
+		t.Fatalf("RenameServer: %v", err)
+	}
+
+	cfg, err := LoadServers(path)
+	if err != nil {
+		t.Fatalf("LoadServers: %v", err)
+	}
+	renamed, ok := cfg.Servers["new"]
+	if !ok {
+		t.Fatal("renamed entry missing under the new name")
+	}
+	if _, exists := cfg.Servers["old"]; exists {
+		t.Error("old entry still present after rename")
+	}
+	if renamed.Host != "1.2.3.4" || renamed.User != "deploy" || renamed.Role != "app" {
+		t.Errorf("scalar fields not preserved: %+v", renamed)
+	}
+	if renamed.VpnIP != "100.64.0.7" {
+		t.Errorf("vpn_ip not preserved: %q", renamed.VpnIP)
+	}
+	if renamed.Tags["region"] != "us-east" || renamed.Tags["SHARD"] != "3" {
+		t.Errorf("tags not preserved: %v", renamed.Tags)
+	}
+	// Bystanders are untouched.
+	if cfg.Servers["other"].Host != "5.6.7.8" {
+		t.Errorf("unrelated entry changed: %v", cfg.Servers["other"])
+	}
+}
+
+func TestRenameServer_DestinationCollisionRejected(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "servers.yml")
+
+	seed := "servers:\n  src:\n    host: 1.1.1.1\n  dst:\n    host: 2.2.2.2\n"
+	if err := os.WriteFile(path, []byte(seed), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	err := RenameServer(path, "src", "dst")
+	if !errors.Is(err, ErrServerExists) {
+		t.Fatalf("err = %v, want ErrServerExists", err)
+	}
+
+	// Both original entries survive a rejected rename: src untouched,
+	// dst not overwritten.
+	cfg, err := LoadServers(path)
+	if err != nil {
+		t.Fatalf("LoadServers after rejected rename: %v", err)
+	}
+	if cfg.Servers["src"].Host != "1.1.1.1" || cfg.Servers["dst"].Host != "2.2.2.2" {
+		t.Fatalf("rejected rename changed the file: %v", cfg.Servers)
+	}
+}
+
+func TestRenameServer_NotFound(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "servers.yml")
+	os.WriteFile(path, []byte("servers:\n  real:\n    host: 1.2.3.4\n"), 0644)
+
+	if err := RenameServer(path, "ghost", "x"); !errors.Is(err, ErrServerNotFound) {
+		t.Fatalf("missing entry: err = %v, want ErrServerNotFound", err)
+	}
+
+	// A missing file is the same typed failure, not a panic or a fresh file.
+	if err := RenameServer(filepath.Join(dir, "absent.yml"), "real", "x"); !errors.Is(err, ErrServerNotFound) {
+		t.Fatalf("missing file: err = %v, want ErrServerNotFound", err)
+	}
+}
+
+func TestRenameServer_SameNameNoop(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "servers.yml")
+	os.WriteFile(path, []byte("servers:\n  prod:\n    host: 1.2.3.4\n    tags:\n      a: b\n"), 0644)
+
+	if err := RenameServer(path, "prod", "prod"); err != nil {
+		t.Fatalf("same-name rename should be a no-op success: %v", err)
+	}
+	cfg, err := LoadServers(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Servers["prod"].Host != "1.2.3.4" || cfg.Servers["prod"].Tags["a"] != "b" {
+		t.Errorf("no-op rename changed the entry: %+v", cfg.Servers["prod"])
+	}
+}
+
+func TestUpdateServer_ChangesOnlySuppliedFields(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "servers.yml")
+
+	seed := "servers:\n" +
+		"  prod:\n" +
+		"    host: 1.2.3.4\n" +
+		"    user: deploy\n" +
+		"    role: app\n" +
+		"    vpn_ip: 100.64.0.7\n" +
+		"    tags:\n" +
+		"      region: us-east\n"
+	if err := os.WriteFile(path, []byte(seed), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	newHost := "9.9.9.9"
+	if err := UpdateServer(path, "prod", ServerUpdates{Host: &newHost}); err != nil {
+		t.Fatalf("UpdateServer: %v", err)
+	}
+
+	cfg, err := LoadServers(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := cfg.Servers["prod"]
+	if s.Host != "9.9.9.9" {
+		t.Errorf("host not updated: %q", s.Host)
+	}
+	// Unspecified fields keep their stored values.
+	if s.User != "deploy" || s.Role != "app" || s.VpnIP != "100.64.0.7" {
+		t.Errorf("unspecified fields changed: %+v", s)
+	}
+	if s.Tags["region"] != "us-east" {
+		t.Errorf("tags must never be touched by update: %v", s.Tags)
+	}
+}
+
+func TestUpdateServer_ClearsFieldWithEmptyString(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "servers.yml")
+	os.WriteFile(path, []byte("servers:\n  prod:\n    host: 1.2.3.4\n    vpn_ip: 100.64.0.7\n"), 0644)
+
+	empty := ""
+	if err := UpdateServer(path, "prod", ServerUpdates{VpnIP: &empty}); err != nil {
+		t.Fatalf("UpdateServer: %v", err)
+	}
+
+	cfg, err := LoadServers(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := cfg.Servers["prod"]
+	if s.VpnIP != "" {
+		t.Errorf("vpn_ip should be cleared by an explicit empty update: %q", s.VpnIP)
+	}
+	if s.Host != "1.2.3.4" {
+		t.Errorf("host should be untouched: %q", s.Host)
+	}
+}
+
+func TestUpdateServer_NotFound(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "servers.yml")
+	os.WriteFile(path, []byte("servers:\n  real:\n    host: 1.2.3.4\n"), 0644)
+
+	host := "h"
+	if err := UpdateServer(path, "ghost", ServerUpdates{Host: &host}); !errors.Is(err, ErrServerNotFound) {
+		t.Fatalf("err = %v, want ErrServerNotFound", err)
+	}
+	if err := UpdateServer(filepath.Join(dir, "absent.yml"), "real", ServerUpdates{Host: &host}); !errors.Is(err, ErrServerNotFound) {
+		t.Fatalf("missing file: err = %v, want ErrServerNotFound", err)
+	}
+}
+
+// TestServerMutations_LeaveNoTempFiles checks the atomic-commit cleanup: a
+// sibling temp file left behind by a crashed writer would litter the config
+// directory dash rewrites history into.
+func TestServerMutations_LeaveNoTempFiles(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "servers.yml")
+
+	if err := AddServer(path, "a", "1.1.1.1", "root", "app", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := AddServer(path, "b", "2.2.2.2", "root", "app", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := RenameServer(path, "a", "c"); err != nil {
+		t.Fatal(err)
+	}
+	host := "3.3.3.3"
+	if err := UpdateServer(path, "c", ServerUpdates{Host: &host}); err != nil {
+		t.Fatal(err)
+	}
+	if err := RemoveServer(path, "b"); err != nil {
+		t.Fatal(err)
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "servers.yml" {
+		names := make([]string, 0, len(entries))
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Fatalf("config directory should hold only servers.yml, got %v", names)
 	}
 }
 
