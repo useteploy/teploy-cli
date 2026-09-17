@@ -97,6 +97,15 @@ func (m *MockExecutor) RunStream(ctx context.Context, cmd string, stdout, stderr
 	return err
 }
 
+func (m *MockExecutor) RunInput(ctx context.Context, cmd string, stdin io.Reader) error {
+	_, err := io.Copy(io.Discard, stdin)
+	if err != nil {
+		return err
+	}
+	_, err = m.Run(ctx, cmd)
+	return err
+}
+
 func (m *MockExecutor) Upload(ctx context.Context, content io.Reader, remotePath string, mode string) error {
 	data, err := io.ReadAll(content)
 	if err != nil {

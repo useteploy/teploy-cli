@@ -19,6 +19,12 @@ type Executor interface {
 	// RunStream executes a command and streams stdout/stderr to the provided writers in real time.
 	RunStream(ctx context.Context, cmd string, stdout, stderr io.Writer) error
 
+	// RunInput executes a command with stdin streamed from the given reader,
+	// discarding stdout/stderr. For payloads (secrets, file contents) that
+	// must never be embedded in the command string itself, where the host's
+	// process list would otherwise show them.
+	RunInput(ctx context.Context, cmd string, stdin io.Reader) error
+
 	// Upload sends content to a remote file with the specified permissions.
 	Upload(ctx context.Context, content io.Reader, remotePath string, mode string) error
 

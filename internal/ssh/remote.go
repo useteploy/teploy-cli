@@ -6,11 +6,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net"
 	"os"
 	"path"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/knownhosts"
@@ -48,6 +50,13 @@ func Connect(ctx context.Context, cfg ConnectConfig) (*RemoteExecutor, error) {
 	host := cfg.Host
 	if !strings.Contains(host, ":") {
 		host = host + ":22"
+	} else if _, _, splitErr := net.SplitHostPort(host); splitErr != nil {
+		// A host that contains colons but doesn't parse as host:port is a
+		// bare (unbracketed) IPv6 literal — "2001:db8::1" — which would
+		// otherwise be passed to the dialer as-is and fail. Bracket it.
+		if net.ParseIP(strings.Trim(host, "[]")) != nil {
+			host = net.JoinHostPort(strings.Trim(host, "[]"), "22")
+		}
 	}
 
 	signers, err := resolveSigners(cfg.KeyPath)
@@ -142,31 +151,56 @@ func (e *RemoteExecutor) RunStream(ctx context.Context, cmd string, stdout, stde
 	}
 }
 
-func (e *RemoteExecutor) Upload(ctx context.Context, content io.Reader, remotePath string, mode string) error {
-	data, err := io.ReadAll(content)
-	if err != nil {
-		return fmt.Errorf("reading upload content: %w", err)
-	}
-
-	// Use path (not filepath) — remote is always Linux.
-	dir := path.Dir(remotePath)
-
-	cmd := fmt.Sprintf("mkdir -p %s && cat > %s && chmod %s %s",
-		ShellQuote(dir),
-		ShellQuote(remotePath),
-		ShellQuote(mode),
-		ShellQuote(remotePath),
-	)
-
+func (e *RemoteExecutor) RunInput(ctx context.Context, cmd string, stdin io.Reader) error {
 	session, err := e.client.NewSession()
 	if err != nil {
-		return fmt.Errorf("creating SSH session for upload: %w", err)
+		return fmt.Errorf("creating SSH session: %w", err)
 	}
 	defer session.Close()
 
-	session.Stdin = bytes.NewReader(data)
+	session.Stdin = stdin
 
-	if err := session.Run(cmd); err != nil {
+	done := make(chan error, 1)
+	go func() {
+		done <- session.Run(cmd)
+	}()
+
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		_ = session.Signal(ssh.SIGTERM)
+		_ = session.Close()
+		<-done
+		return ctx.Err()
+	}
+}
+
+// Upload streams content into a securely created sibling temporary file and
+// atomically renames it over remotePath.
+//
+// The old implementation buffered the whole input in client memory, wrote the
+// destination via shell redirection, and chmod'd afterwards — so under a
+// normal 022 umask a freshly created secret file was briefly world-readable,
+// an interrupted write left a half-written destination, and a pre-existing
+// symlink at the destination was followed. All three are closed here:
+// mktemp(1) creates the temp 0600, umask 077 keeps it that way until the
+// requested mode is applied BEFORE any content lands, cat streams stdin
+// without buffering, and mv -f renames on the same filesystem (replacing a
+// destination symlink itself, not its target). Readers of remotePath see
+// either the old file or the complete new one, never a partial write.
+func (e *RemoteExecutor) Upload(ctx context.Context, content io.Reader, remotePath string, mode string) error {
+	// Use path (not filepath) — remote is always Linux.
+	dir := path.Dir(remotePath)
+
+	script := fmt.Sprintf(
+		`umask 077 && mkdir -p %s && tmp=$(mktemp %s) && trap 'rm -f -- "$tmp"' EXIT HUP INT TERM && chmod %s "$tmp" && cat > "$tmp" && mv -f -- "$tmp" %s && trap - EXIT HUP INT TERM`,
+		ShellQuote(dir),
+		ShellQuote(dir+"/.teploy-upload.XXXXXXXX"),
+		ShellQuote(mode),
+		ShellQuote(remotePath),
+	)
+	if err := e.RunInput(ctx, script, content); err != nil {
 		return fmt.Errorf("uploading %s: %w", remotePath, err)
 	}
 	return nil
@@ -273,46 +307,79 @@ func parseEncryptedKey(data []byte, keyPath string) (ssh.Signer, error) {
 	return ssh.ParsePrivateKeyWithPassphrase(data, passphrase)
 }
 
+// dialWithContext bounds the SSH handshake by the context. The TCP dial is
+// covered by DialContext, but the key-exchange handshake itself
+// (ssh.NewClientConn) is not: a slow or malicious peer that accepts TCP and
+// then stalls could previously hang the connection attempt indefinitely,
+// past any caller timeout. A deadline bounds the whole handshake, and a
+// context cancellation closes the underlying connection so a blocked
+// handshake unblocks immediately. The deadline is cleared once the
+// connection is established so the returned client is not time-limited.
 func dialWithContext(ctx context.Context, network, addr string, config *ssh.ClientConfig) (*ssh.Client, error) {
 	conn, err := (&net.Dialer{}).DialContext(ctx, network, addr)
 	if err != nil {
 		return nil, err
 	}
 
+	deadline := time.Now().Add(15 * time.Second)
+	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
+		deadline = d
+	}
+	if err := conn.SetDeadline(deadline); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("setting handshake deadline: %w", err)
+	}
+	stopClose := context.AfterFunc(ctx, func() { _ = conn.Close() })
 	c, chans, reqs, err := ssh.NewClientConn(conn, addr, config)
+	if !stopClose() {
+		_ = conn.Close()
+		return nil, ctx.Err()
+	}
 	if err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return nil, err
+	}
+	if err := conn.SetDeadline(time.Time{}); err != nil {
+		_ = conn.Close()
+		_ = c.Close()
+		return nil, fmt.Errorf("clearing handshake deadline: %w", err)
 	}
 	return ssh.NewClient(c, chans, reqs), nil
 }
 
 // acceptNewHostKeyCallback returns a host key callback that accepts unknown
-// host keys (appending them to known_hosts) but rejects key mismatches.
+// host keys (appending them to known_hosts) but rejects every verification
+// failure that is NOT "host simply unknown": key mismatches (any algorithm),
+// revoked keys, and an unreadable/malformed known_hosts database all fail
+// closed. Trust-on-first-use must mean "unknown host", never "verification
+// was inconvenient" — the previous version treated a known_hosts parse
+// failure as "nothing is known" (accepting whatever key was presented) and
+// let knownhosts.RevokedError fall through the unknown-host branch.
 func acceptNewHostKeyCallback(knownHostsPath string) ssh.HostKeyCallback {
 	existing, existingErr := knownhosts.New(knownHostsPath)
+	if existingErr != nil && errors.Is(existingErr, fs.ErrNotExist) {
+		// A missing known_hosts is the fresh-box case: nothing is known, so
+		// every host is unknown and TOFU-enrollable. Only a file that EXISTS
+		// but cannot be read or parsed fails closed below.
+		existing, existingErr = nil, nil
+	}
 	return func(hostname string, remote net.Addr, key ssh.PublicKey) error {
-		if existingErr == nil {
+		if existingErr != nil {
+			return fmt.Errorf("cannot verify host key: reading %s failed: %w", knownHostsPath, existingErr)
+		}
+		if existing != nil {
 			err := existing(hostname, remote, key)
 			if err == nil {
 				return nil // known and matches
 			}
-			// Check if it's a genuine key mismatch vs unknown key type.
+			// Only a genuinely unknown host (empty Want list) may be enrolled.
+			// Any non-KeyError (revocation, database problem) and any mismatch
+			// against a known host (nonempty Want, same or different algorithm)
+			// is rejected.
 			var keyErr *knownhosts.KeyError
-			if errors.As(err, &keyErr) && len(keyErr.Want) > 0 {
-				// The host exists in known_hosts. Check if any wanted key
-				// has the same key type — if so, it's a real mismatch (different
-				// key for the same type = MITM). If the key types differ,
-				// it's just a new key type we haven't seen — accept it.
-				presentedType := key.Type()
-				for _, want := range keyErr.Want {
-					if want.Key.Type() == presentedType {
-						return err // same type, different key = real mismatch
-					}
-				}
-				// Different key type — accept and save.
+			if !errors.As(err, &keyErr) || len(keyErr.Want) != 0 {
+				return err
 			}
-			// Unknown key — fall through to accept and save.
 		}
 		// Append to known_hosts. Ensure the parent directory exists first (a
 		// fresh box may have no ~/.ssh at all) so a merely-missing directory
@@ -332,7 +399,9 @@ func acceptNewHostKeyCallback(knownHostsPath string) ssh.HostKeyCallback {
 			return fmt.Errorf("recording host key in %s: %w", knownHostsPath, err)
 		}
 		defer f.Close()
-		fmt.Fprintln(f, line)
+		if _, err := f.WriteString(line + "\n"); err != nil {
+			return fmt.Errorf("recording host key in %s: %w", knownHostsPath, err)
+		}
 		return nil
 	}
 }

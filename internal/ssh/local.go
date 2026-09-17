@@ -46,6 +46,14 @@ func (e *LocalExecutor) RunStream(ctx context.Context, cmd string, stdout, stder
 	return c.Run()
 }
 
+func (e *LocalExecutor) RunInput(ctx context.Context, cmd string, stdin io.Reader) error {
+	c := exec.CommandContext(ctx, "sh", "-c", cmd)
+	c.Stdin = stdin
+	c.Stdout = io.Discard
+	c.Stderr = io.Discard
+	return c.Run()
+}
+
 // Upload writes content to a local file, creating parent directories and
 // setting mode (an octal string, e.g. "0644") — mirroring
 // RemoteExecutor.Upload's semantics exactly so callers built against the
