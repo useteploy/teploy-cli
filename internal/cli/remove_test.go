@@ -26,8 +26,9 @@ func caddyMocks() []ssh.MockCommand {
 	return []ssh.MockCommand{
 		{Match: "[ -f /deployments/caddy/Caddyfile ]", Output: ""},
 		{Match: "mkdir /deployments/caddy/.lock", Output: ""},
+		ssh.MockCommand{Match: "[ \"$(docker exec caddy md5sum", Output: "TEPLOY_CADDY_OK"},
 		{Match: "cat /deployments/caddy/Caddyfile", Output: removeTestCaddyfile},
-		{Match: "mv /tmp/teploy_caddyfile.tmp", Output: ""},
+		{Match: "mv -f -- ", Output: ""},
 		{Match: "docker exec caddy caddy reload", Output: ""},
 		{Match: "rm -rf /deployments/caddy/.lock", Output: ""},
 		{Match: "rmdir /deployments/caddy/.lock", Output: ""},
@@ -127,7 +128,7 @@ func TestExecuteRemoveDefaultPreservesData(t *testing.T) {
 		t.Errorf("preserved = %v, want [/deployments/scratch/volumes]", sum.PreservedData)
 	}
 
-	written := string(exec.Files["/tmp/teploy_caddyfile.tmp"])
+	written := string(exec.Files["/deployments/caddy/Caddyfile"])
 	if written == "" {
 		t.Fatal("no Caddyfile written")
 	}
@@ -199,7 +200,7 @@ func TestExecuteRemoveRedirect(t *testing.T) {
 		t.Errorf("route = %q, want redirected", sum.Route)
 	}
 
-	written := string(exec.Files["/tmp/teploy_caddyfile.tmp"])
+	written := string(exec.Files["/deployments/caddy/Caddyfile"])
 	if strings.Contains(written, "TEPLOY BEGIN scratch") {
 		t.Error("managed block should be gone after redirect")
 	}

@@ -65,6 +65,7 @@ func TestDeploy_FirstDeploy(t *testing.T) {
 		ssh.MockCommand{Match: "cat /deployments/caddy/Caddyfile", Output: "{\n\tadmin 0.0.0.0:2019\n}\n"},
 		ssh.MockCommand{Match: "mv /tmp/teploy_caddyfile.tmp", Output: ""},
 		ssh.MockCommand{Match: "mkdir /deployments/caddy/.lock", Output: ""},
+		ssh.MockCommand{Match: "[ \"$(docker exec caddy md5sum", Output: "TEPLOY_CADDY_OK"},
 		ssh.MockCommand{Match: "docker exec caddy caddy reload", Output: ""},
 		ssh.MockCommand{Match: "rmdir /deployments/caddy/.lock", Output: ""},
 		// 11. Log append.
@@ -295,6 +296,7 @@ func TestDeploy_UpdateExisting(t *testing.T) {
 		ssh.MockCommand{Match: "cat /deployments/caddy/Caddyfile", Output: "{\n\tadmin 0.0.0.0:2019\n}\n"},
 		ssh.MockCommand{Match: "mv /tmp/teploy_caddyfile.tmp", Output: ""},
 		ssh.MockCommand{Match: "mkdir /deployments/caddy/.lock", Output: ""},
+		ssh.MockCommand{Match: "[ \"$(docker exec caddy md5sum", Output: "TEPLOY_CADDY_OK"},
 		ssh.MockCommand{Match: "docker exec caddy caddy reload", Output: ""},
 		ssh.MockCommand{Match: "rmdir /deployments/caddy/.lock", Output: ""},
 		// Stop and remove old container.
@@ -350,6 +352,7 @@ func TestDeploy_StateCommitFailureRestoresRouteWithoutStoppingOldWorkload(t *tes
 		ssh.MockCommand{Match: "cat /deployments/caddy/Caddyfile", Output: "{\n\tadmin 0.0.0.0:2019\n}\n"},
 		ssh.MockCommand{Match: "mv /tmp/teploy_caddyfile.tmp", Output: ""},
 		ssh.MockCommand{Match: "mkdir /deployments/caddy/.lock", Output: ""},
+		ssh.MockCommand{Match: "[ \"$(docker exec caddy md5sum", Output: "TEPLOY_CADDY_OK"},
 		ssh.MockCommand{Match: "docker exec caddy caddy reload", Output: ""},
 		ssh.MockCommand{Match: "rmdir /deployments/caddy/.lock", Output: ""},
 		ssh.MockCommand{Match: "UPLOAD:/deployments/myapp/state.json.tmp-", Err: fmt.Errorf("disk full")},
@@ -375,7 +378,7 @@ func TestDeploy_StateCommitFailureRestoresRouteWithoutStoppingOldWorkload(t *tes
 			t.Fatalf("old workload was stopped after failed state commit: %s", call)
 		}
 	}
-	restoredCaddyfile := string(mock.Files["/tmp/teploy_caddyfile.tmp"])
+	restoredCaddyfile := string(mock.Files["/deployments/caddy/Caddyfile"])
 	if !strings.Contains(restoredCaddyfile, "myapp-web-old123:80") {
 		t.Fatalf("previous route was not restored: %s", restoredCaddyfile)
 	}
@@ -627,6 +630,7 @@ func TestDeploy_SameVersion(t *testing.T) {
 		ssh.MockCommand{Match: "cat /deployments/caddy/Caddyfile", Output: "{\n\tadmin 0.0.0.0:2019\n}\n"},
 		ssh.MockCommand{Match: "mv /tmp/teploy_caddyfile.tmp", Output: ""},
 		ssh.MockCommand{Match: "mkdir /deployments/caddy/.lock", Output: ""},
+		ssh.MockCommand{Match: "[ \"$(docker exec caddy md5sum", Output: "TEPLOY_CADDY_OK"},
 		ssh.MockCommand{Match: "docker exec caddy caddy reload", Output: ""},
 		ssh.MockCommand{Match: "rmdir /deployments/caddy/.lock", Output: ""},
 		// Stop renamed container.
@@ -695,6 +699,7 @@ func TestDeploy_SameVersion_StaleReplaced(t *testing.T) {
 		ssh.MockCommand{Match: "cat /deployments/caddy/Caddyfile", Output: "{\n\tadmin 0.0.0.0:2019\n}\n"},
 		ssh.MockCommand{Match: "mv /tmp/teploy_caddyfile.tmp", Output: ""},
 		ssh.MockCommand{Match: "mkdir /deployments/caddy/.lock", Output: ""},
+		ssh.MockCommand{Match: "[ \"$(docker exec caddy md5sum", Output: "TEPLOY_CADDY_OK"},
 		ssh.MockCommand{Match: "docker exec caddy caddy reload", Output: ""},
 		ssh.MockCommand{Match: "rmdir /deployments/caddy/.lock", Output: ""},
 		ssh.MockCommand{Match: "docker stop", Output: ""},
@@ -763,6 +768,7 @@ func TestDeploy_WithHooks(t *testing.T) {
 		ssh.MockCommand{Match: "cat /deployments/caddy/Caddyfile", Output: "{\n\tadmin 0.0.0.0:2019\n}\n"},
 		ssh.MockCommand{Match: "mv /tmp/teploy_caddyfile.tmp", Output: ""},
 		ssh.MockCommand{Match: "mkdir /deployments/caddy/.lock", Output: ""},
+		ssh.MockCommand{Match: "[ \"$(docker exec caddy md5sum", Output: "TEPLOY_CADDY_OK"},
 		ssh.MockCommand{Match: "docker exec caddy caddy reload", Output: ""},
 		ssh.MockCommand{Match: "rmdir /deployments/caddy/.lock", Output: ""},
 		// Log and lock.
@@ -884,6 +890,7 @@ func TestDeploy_PostDeployHookFailure(t *testing.T) {
 		ssh.MockCommand{Match: "cat /deployments/caddy/Caddyfile", Output: "{\n\tadmin 0.0.0.0:2019\n}\n"},
 		ssh.MockCommand{Match: "mv /tmp/teploy_caddyfile.tmp", Output: ""},
 		ssh.MockCommand{Match: "mkdir /deployments/caddy/.lock", Output: ""},
+		ssh.MockCommand{Match: "[ \"$(docker exec caddy md5sum", Output: "TEPLOY_CADDY_OK"},
 		ssh.MockCommand{Match: "docker exec caddy caddy reload", Output: ""},
 		ssh.MockCommand{Match: "rmdir /deployments/caddy/.lock", Output: ""},
 		// Post-deploy hook fails.
@@ -949,6 +956,7 @@ func TestDeploy_WithWorkers(t *testing.T) {
 		ssh.MockCommand{Match: "cat /deployments/caddy/Caddyfile", Output: "{\n\tadmin 0.0.0.0:2019\n}\n"},
 		ssh.MockCommand{Match: "mv /tmp/teploy_caddyfile.tmp", Output: ""},
 		ssh.MockCommand{Match: "mkdir /deployments/caddy/.lock", Output: ""},
+		ssh.MockCommand{Match: "[ \"$(docker exec caddy md5sum", Output: "TEPLOY_CADDY_OK"},
 		ssh.MockCommand{Match: "docker exec caddy caddy reload", Output: ""},
 		ssh.MockCommand{Match: "rmdir /deployments/caddy/.lock", Output: ""},
 		// Log and lock.
@@ -1032,6 +1040,7 @@ func TestDeploy_NoHealthcheckForWorker(t *testing.T) {
 		ssh.MockCommand{Match: "cat /deployments/caddy/Caddyfile", Output: "{\n\tadmin 0.0.0.0:2019\n}\n"},
 		ssh.MockCommand{Match: "mv /tmp/teploy_caddyfile.tmp", Output: ""},
 		ssh.MockCommand{Match: "mkdir /deployments/caddy/.lock", Output: ""},
+		ssh.MockCommand{Match: "[ \"$(docker exec caddy md5sum", Output: "TEPLOY_CADDY_OK"},
 		ssh.MockCommand{Match: "docker exec caddy caddy reload", Output: ""},
 		ssh.MockCommand{Match: "rmdir /deployments/caddy/.lock", Output: ""},
 		ssh.MockCommand{Match: "printf %s", Output: ""},
@@ -1119,6 +1128,7 @@ func TestDeploy_WorkerStartFailure(t *testing.T) {
 		ssh.MockCommand{Match: "cat /deployments/caddy/Caddyfile", Output: "{\n\tadmin 0.0.0.0:2019\n}\n"},
 		ssh.MockCommand{Match: "mv /tmp/teploy_caddyfile.tmp", Output: ""},
 		ssh.MockCommand{Match: "mkdir /deployments/caddy/.lock", Output: ""},
+		ssh.MockCommand{Match: "[ \"$(docker exec caddy md5sum", Output: "TEPLOY_CADDY_OK"},
 		ssh.MockCommand{Match: "docker exec caddy caddy reload", Output: ""},
 		ssh.MockCommand{Match: "rmdir /deployments/caddy/.lock", Output: ""},
 		// Stop old containers.
@@ -1185,6 +1195,7 @@ func TestDeploy_AssetBridging(t *testing.T) {
 		ssh.MockCommand{Match: "cat /deployments/caddy/Caddyfile", Output: "{\n\tadmin 0.0.0.0:2019\n}\n"},
 		ssh.MockCommand{Match: "mv /tmp/teploy_caddyfile.tmp", Output: ""},
 		ssh.MockCommand{Match: "mkdir /deployments/caddy/.lock", Output: ""},
+		ssh.MockCommand{Match: "[ \"$(docker exec caddy md5sum", Output: "TEPLOY_CADDY_OK"},
 		ssh.MockCommand{Match: "docker exec caddy caddy reload", Output: ""},
 		ssh.MockCommand{Match: "rmdir /deployments/caddy/.lock", Output: ""},
 		// 10. Asset cleanup.
@@ -1269,6 +1280,7 @@ func TestDeploy_AssetBridgingCustomKeepDays(t *testing.T) {
 		ssh.MockCommand{Match: "cat /deployments/caddy/Caddyfile", Output: "{\n\tadmin 0.0.0.0:2019\n}\n"},
 		ssh.MockCommand{Match: "mv /tmp/teploy_caddyfile.tmp", Output: ""},
 		ssh.MockCommand{Match: "mkdir /deployments/caddy/.lock", Output: ""},
+		ssh.MockCommand{Match: "[ \"$(docker exec caddy md5sum", Output: "TEPLOY_CADDY_OK"},
 		ssh.MockCommand{Match: "docker exec caddy caddy reload", Output: ""},
 		ssh.MockCommand{Match: "rmdir /deployments/caddy/.lock", Output: ""},
 		ssh.MockCommand{Match: "find '/deployments/myapp/assets'", Output: ""},
@@ -1323,6 +1335,7 @@ func TestDeploy_SameVersionWithWorkers(t *testing.T) {
 		ssh.MockCommand{Match: "cat /deployments/caddy/Caddyfile", Output: "{\n\tadmin 0.0.0.0:2019\n}\n"},
 		ssh.MockCommand{Match: "mv /tmp/teploy_caddyfile.tmp", Output: ""},
 		ssh.MockCommand{Match: "mkdir /deployments/caddy/.lock", Output: ""},
+		ssh.MockCommand{Match: "[ \"$(docker exec caddy md5sum", Output: "TEPLOY_CADDY_OK"},
 		ssh.MockCommand{Match: "docker exec caddy caddy reload", Output: ""},
 		ssh.MockCommand{Match: "rmdir /deployments/caddy/.lock", Output: ""},
 		// Stop renamed containers.

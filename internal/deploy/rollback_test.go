@@ -30,6 +30,8 @@ func TestRollback(t *testing.T) {
 		sha256.Sum256(currentManifest), currentManifest, sha256.Sum256(previousManifest), previousManifest)
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state.json' ]", Output: "present\n" + stateContent},
+		ssh.MockCommand{Match: "mkdir /deployments/myapp/.lock", Output: ""},
+		ssh.MockCommand{Match: "cat /deployments/myapp/.lock/info", Err: fmt.Errorf("none")},
 		ssh.MockCommand{Match: "docker ps --all --filter label=teploy.app='myapp'",
 			Output: `{"ID":"aaa","Names":"myapp-web-v1","Image":"myapp:latest","State":"exited","Status":"Exited","Labels":"teploy.app=myapp,teploy.version=v1,teploy.process=web"}` + "\n" +
 				`{"ID":"bbb","Names":"myapp-web-v2","Image":"myapp:latest","State":"running","Status":"Up 1h","Labels":"teploy.app=myapp,teploy.version=v2,teploy.process=web"}`,
@@ -48,6 +50,7 @@ func TestRollback(t *testing.T) {
 		ssh.MockCommand{Match: "cat /deployments/caddy/Caddyfile", Output: "{\n\tadmin 0.0.0.0:2019\n}\n"},
 		ssh.MockCommand{Match: "mv /tmp/teploy_caddyfile.tmp", Output: ""},
 		ssh.MockCommand{Match: "mkdir /deployments/caddy/.lock", Output: ""},
+		ssh.MockCommand{Match: "[ \"$(docker exec caddy md5sum", Output: "TEPLOY_CADDY_OK"},
 		ssh.MockCommand{Match: "docker exec caddy caddy reload", Output: ""},
 		ssh.MockCommand{Match: "rmdir /deployments/caddy/.lock", Output: ""},
 		ssh.MockCommand{Match: "docker stop", Output: ""},
@@ -89,13 +92,8 @@ func TestRollback(t *testing.T) {
 
 	// Verify Caddy was pointed at the container's *internal* port, not
 	// the host-mapped PreviousPort (49152). The container exposes 3000.
-	var caddyfile []byte
-	for path, data := range mock.Files {
-		if strings.HasSuffix(path, "teploy_caddyfile.tmp") {
-			caddyfile = data
-		}
-	}
-	if caddyfile == nil {
+	caddyfile, ok := mock.Files["/deployments/caddy/Caddyfile"]
+	if !ok {
 		t.Fatal("expected Caddyfile to be written")
 	}
 	if !strings.Contains(string(caddyfile), "myapp-web-v1:3000") {
@@ -133,7 +131,11 @@ func TestRollback_StateCommitFailureRestoresOriginalRouteAndWorkload(t *testing.
 	stateContent := "current_port=49153\ncurrent_hash=v2\nprevious_port=49152\nprevious_hash=v1\ndomain=myapp.com\n"
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state.json' ]", Output: "absent"},
+		ssh.MockCommand{Match: "mkdir /deployments/myapp/.lock", Output: ""},
+		ssh.MockCommand{Match: "cat /deployments/myapp/.lock/info", Err: fmt.Errorf("none")},
 		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state' ]", Output: "present\n" + stateContent},
+		ssh.MockCommand{Match: "mkdir /deployments/myapp/.lock", Output: ""},
+		ssh.MockCommand{Match: "cat /deployments/myapp/.lock/info", Err: fmt.Errorf("none")},
 		ssh.MockCommand{Match: "docker ps --all --filter label=teploy.app='myapp'",
 			Output: `{"ID":"aaa","Names":"myapp-web-v1","Image":"myapp:latest","State":"exited","Status":"Exited","Labels":"teploy.app=myapp,teploy.version=v1,teploy.process=web"}` + "\n" +
 				`{"ID":"bbb","Names":"myapp-web-v2","Image":"myapp:latest","State":"running","Status":"Up 1h","Labels":"teploy.app=myapp,teploy.version=v2,teploy.process=web"}`,
@@ -147,6 +149,7 @@ func TestRollback_StateCommitFailureRestoresOriginalRouteAndWorkload(t *testing.
 		ssh.MockCommand{Match: "cat /deployments/caddy/Caddyfile", Output: "{\n\tadmin 0.0.0.0:2019\n}\n"},
 		ssh.MockCommand{Match: "mv /tmp/teploy_caddyfile.tmp", Output: ""},
 		ssh.MockCommand{Match: "mkdir /deployments/caddy/.lock", Output: ""},
+		ssh.MockCommand{Match: "[ \"$(docker exec caddy md5sum", Output: "TEPLOY_CADDY_OK"},
 		ssh.MockCommand{Match: "docker exec caddy caddy reload", Output: ""},
 		ssh.MockCommand{Match: "rmdir /deployments/caddy/.lock", Output: ""},
 		ssh.MockCommand{Match: "UPLOAD:/deployments/myapp/state.json.tmp-", Err: fmt.Errorf("disk full")},
@@ -166,7 +169,7 @@ func TestRollback_StateCommitFailureRestoresOriginalRouteAndWorkload(t *testing.
 			t.Fatalf("original workload was stopped after failed state commit: %s", call)
 		}
 	}
-	restoredCaddyfile := string(mock.Files["/tmp/teploy_caddyfile.tmp"])
+	restoredCaddyfile := string(mock.Files["/deployments/caddy/Caddyfile"])
 	if !strings.Contains(restoredCaddyfile, "myapp-web-v2:3000") {
 		t.Fatalf("original route was not restored: %s", restoredCaddyfile)
 	}
@@ -175,7 +178,11 @@ func TestRollback_StateCommitFailureRestoresOriginalRouteAndWorkload(t *testing.
 func TestRollback_NoState(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state.json' ]", Output: "absent"},
+		ssh.MockCommand{Match: "mkdir /deployments/myapp/.lock", Output: ""},
+		ssh.MockCommand{Match: "cat /deployments/myapp/.lock/info", Err: fmt.Errorf("none")},
 		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state' ]", Output: "absent"},
+		ssh.MockCommand{Match: "mkdir /deployments/myapp/.lock", Output: ""},
+		ssh.MockCommand{Match: "cat /deployments/myapp/.lock/info", Err: fmt.Errorf("none")},
 	)
 
 	err := Rollback(context.Background(), mock, &bytes.Buffer{}, rollbackCfg())
@@ -191,7 +198,11 @@ func TestRollback_NoPreviousDeploy(t *testing.T) {
 	stateContent := "current_port=49152\ncurrent_hash=v1\n"
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state.json' ]", Output: "absent"},
+		ssh.MockCommand{Match: "mkdir /deployments/myapp/.lock", Output: ""},
+		ssh.MockCommand{Match: "cat /deployments/myapp/.lock/info", Err: fmt.Errorf("none")},
 		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state' ]", Output: "present\n" + stateContent},
+		ssh.MockCommand{Match: "mkdir /deployments/myapp/.lock", Output: ""},
+		ssh.MockCommand{Match: "cat /deployments/myapp/.lock/info", Err: fmt.Errorf("none")},
 	)
 
 	err := Rollback(context.Background(), mock, &bytes.Buffer{}, rollbackCfg())
@@ -214,7 +225,11 @@ func TestRollback_NoPreviousContainers(t *testing.T) {
 	stateContent := "current_port=49153\ncurrent_hash=v2\nprevious_port=49152\nprevious_hash=v1\n"
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state.json' ]", Output: "absent"},
+		ssh.MockCommand{Match: "mkdir /deployments/myapp/.lock", Output: ""},
+		ssh.MockCommand{Match: "cat /deployments/myapp/.lock/info", Err: fmt.Errorf("none")},
 		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state' ]", Output: "present\n" + stateContent},
+		ssh.MockCommand{Match: "mkdir /deployments/myapp/.lock", Output: ""},
+		ssh.MockCommand{Match: "cat /deployments/myapp/.lock/info", Err: fmt.Errorf("none")},
 		ssh.MockCommand{Match: "docker ps --all --filter label=teploy.app='myapp'",
 			Output: `{"ID":"bbb","Names":"myapp-web-v2","Image":"myapp:latest","State":"running","Status":"Up 1h","Labels":"teploy.app=myapp,teploy.version=v2,teploy.process=web"}`,
 		},
@@ -233,7 +248,11 @@ func TestRollback_HealthCheckFails(t *testing.T) {
 	stateContent := "current_port=49153\ncurrent_hash=v2\nprevious_port=49152\nprevious_hash=v1\n"
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state.json' ]", Output: "absent"},
+		ssh.MockCommand{Match: "mkdir /deployments/myapp/.lock", Output: ""},
+		ssh.MockCommand{Match: "cat /deployments/myapp/.lock/info", Err: fmt.Errorf("none")},
 		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state' ]", Output: "present\n" + stateContent},
+		ssh.MockCommand{Match: "mkdir /deployments/myapp/.lock", Output: ""},
+		ssh.MockCommand{Match: "cat /deployments/myapp/.lock/info", Err: fmt.Errorf("none")},
 		ssh.MockCommand{Match: "docker ps --all --filter label=teploy.app='myapp'",
 			Output: `{"ID":"aaa","Names":"myapp-web-v1","Image":"myapp:latest","State":"exited","Status":"Exited","Labels":"teploy.app=myapp,teploy.version=v1,teploy.process=web"}` + "\n" +
 				`{"ID":"bbb","Names":"myapp-web-v2","Image":"myapp:latest","State":"running","Status":"Up 1h","Labels":"teploy.app=myapp,teploy.version=v2,teploy.process=web"}`,
@@ -267,7 +286,11 @@ func TestRollback_MultiReplica(t *testing.T) {
 		"current_ports=49153,49155\nprevious_ports=49152,49154\n"
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state.json' ]", Output: "absent"},
+		ssh.MockCommand{Match: "mkdir /deployments/myapp/.lock", Output: ""},
+		ssh.MockCommand{Match: "cat /deployments/myapp/.lock/info", Err: fmt.Errorf("none")},
 		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state' ]", Output: "present\n" + stateContent},
+		ssh.MockCommand{Match: "mkdir /deployments/myapp/.lock", Output: ""},
+		ssh.MockCommand{Match: "cat /deployments/myapp/.lock/info", Err: fmt.Errorf("none")},
 		ssh.MockCommand{Match: "docker ps --all --filter label=teploy.app='myapp'",
 			Output: `{"ID":"a1","Names":"myapp-web-v1-1","Image":"myapp:latest","State":"exited","Status":"Exited","Labels":"teploy.app=myapp,teploy.version=v1,teploy.process=web"}` + "\n" +
 				`{"ID":"a2","Names":"myapp-web-v1-2","Image":"myapp:latest","State":"exited","Status":"Exited","Labels":"teploy.app=myapp,teploy.version=v1,teploy.process=web"}` + "\n" +
@@ -286,6 +309,7 @@ func TestRollback_MultiReplica(t *testing.T) {
 		ssh.MockCommand{Match: "cat /deployments/caddy/Caddyfile", Output: "{\n\tadmin 0.0.0.0:2019\n}\n"},
 		ssh.MockCommand{Match: "mv /tmp/teploy_caddyfile.tmp", Output: ""},
 		ssh.MockCommand{Match: "mkdir /deployments/caddy/.lock", Output: ""},
+		ssh.MockCommand{Match: "[ \"$(docker exec caddy md5sum", Output: "TEPLOY_CADDY_OK"},
 		ssh.MockCommand{Match: "docker exec caddy caddy reload", Output: ""},
 		ssh.MockCommand{Match: "rmdir /deployments/caddy/.lock", Output: ""},
 		ssh.MockCommand{Match: "docker stop", Output: ""},
@@ -316,7 +340,7 @@ func TestRollback_MultiReplica(t *testing.T) {
 		}
 	}
 	// The Caddyfile written must reference both upstreams.
-	cf := string(mock.Files["/tmp/teploy_caddyfile.tmp"])
+	cf := string(mock.Files["/deployments/caddy/Caddyfile"])
 	if !strings.Contains(cf, "myapp-web-v1-1:3000") || !strings.Contains(cf, "myapp-web-v1-2:3000") {
 		t.Errorf("expected both replica upstreams in Caddyfile, got:\n%s", cf)
 	}
@@ -334,7 +358,11 @@ func TestRollback_ToSpecificHash(t *testing.T) {
 	stateContent := "current_port=49154\ncurrent_hash=v3\nprevious_port=49153\nprevious_hash=v2\n"
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state.json' ]", Output: "absent"},
+		ssh.MockCommand{Match: "mkdir /deployments/myapp/.lock", Output: ""},
+		ssh.MockCommand{Match: "cat /deployments/myapp/.lock/info", Err: fmt.Errorf("none")},
 		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state' ]", Output: "present\n" + stateContent},
+		ssh.MockCommand{Match: "mkdir /deployments/myapp/.lock", Output: ""},
+		ssh.MockCommand{Match: "cat /deployments/myapp/.lock/info", Err: fmt.Errorf("none")},
 		ssh.MockCommand{Match: "docker ps --all --filter label=teploy.app='myapp'",
 			Output: `{"ID":"aaa","Names":"myapp-web-v1","Image":"myapp:latest","State":"exited","Status":"Exited","Labels":"teploy.app=myapp,teploy.version=v1,teploy.process=web"}` + "\n" +
 				`{"ID":"bbb","Names":"myapp-web-v2","Image":"myapp:latest","State":"exited","Status":"Exited","Labels":"teploy.app=myapp,teploy.version=v2,teploy.process=web"}` + "\n" +
@@ -350,6 +378,7 @@ func TestRollback_ToSpecificHash(t *testing.T) {
 		ssh.MockCommand{Match: "cat /deployments/caddy/Caddyfile", Output: "{\n\tadmin 0.0.0.0:2019\n}\n"},
 		ssh.MockCommand{Match: "mv /tmp/teploy_caddyfile.tmp", Output: ""},
 		ssh.MockCommand{Match: "mkdir /deployments/caddy/.lock", Output: ""},
+		ssh.MockCommand{Match: "[ \"$(docker exec caddy md5sum", Output: "TEPLOY_CADDY_OK"},
 		ssh.MockCommand{Match: "docker exec caddy caddy reload", Output: ""},
 		ssh.MockCommand{Match: "rmdir /deployments/caddy/.lock", Output: ""},
 		ssh.MockCommand{Match: "docker stop", Output: ""},
@@ -399,7 +428,11 @@ func TestRollback_ToHash_AlreadyCurrent(t *testing.T) {
 	stateContent := "current_port=49153\ncurrent_hash=v2\nprevious_port=49152\nprevious_hash=v1\n"
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state.json' ]", Output: "absent"},
+		ssh.MockCommand{Match: "mkdir /deployments/myapp/.lock", Output: ""},
+		ssh.MockCommand{Match: "cat /deployments/myapp/.lock/info", Err: fmt.Errorf("none")},
 		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state' ]", Output: "present\n" + stateContent},
+		ssh.MockCommand{Match: "mkdir /deployments/myapp/.lock", Output: ""},
+		ssh.MockCommand{Match: "cat /deployments/myapp/.lock/info", Err: fmt.Errorf("none")},
 	)
 
 	cfg := rollbackCfg()
@@ -425,7 +458,11 @@ func TestRollback_ToHash_PortCollisionReallocates(t *testing.T) {
 	stateContent := "current_port=49152\ncurrent_hash=v3\nprevious_port=49153\nprevious_hash=v2\n"
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state.json' ]", Output: "absent"},
+		ssh.MockCommand{Match: "mkdir /deployments/myapp/.lock", Output: ""},
+		ssh.MockCommand{Match: "cat /deployments/myapp/.lock/info", Err: fmt.Errorf("none")},
 		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state' ]", Output: "present\n" + stateContent},
+		ssh.MockCommand{Match: "mkdir /deployments/myapp/.lock", Output: ""},
+		ssh.MockCommand{Match: "cat /deployments/myapp/.lock/info", Err: fmt.Errorf("none")},
 		ssh.MockCommand{Match: "docker ps --all --filter label=teploy.app='myapp'",
 			Output: `{"ID":"aaa","Names":"myapp-web-v1","Image":"myapp:latest","State":"exited","Status":"Exited","Labels":"teploy.app=myapp,teploy.version=v1,teploy.process=web"}` + "\n" +
 				`{"ID":"ccc","Names":"myapp-web-v3","Image":"myapp:latest","State":"running","Status":"Up 1h","Labels":"teploy.app=myapp,teploy.version=v3,teploy.process=web"}`,
@@ -443,6 +480,7 @@ func TestRollback_ToHash_PortCollisionReallocates(t *testing.T) {
 		ssh.MockCommand{Match: "cat /deployments/caddy/Caddyfile", Output: "{\n\tadmin 0.0.0.0:2019\n}\n"},
 		ssh.MockCommand{Match: "mv /tmp/teploy_caddyfile.tmp", Output: ""},
 		ssh.MockCommand{Match: "mkdir /deployments/caddy/.lock", Output: ""},
+		ssh.MockCommand{Match: "[ \"$(docker exec caddy md5sum", Output: "TEPLOY_CADDY_OK"},
 		ssh.MockCommand{Match: "docker exec caddy caddy reload", Output: ""},
 		ssh.MockCommand{Match: "rmdir /deployments/caddy/.lock", Output: ""},
 		ssh.MockCommand{Match: "docker stop", Output: ""},
@@ -489,6 +527,8 @@ func TestRollback_HostIngressKeepsTheFixedPort(t *testing.T) {
 	stateContent := `{"schema_version":2,"deployment_type":"container","ingress_mode":"host","updated_at":"2026-07-27T10:00:00Z","current_port":7460,"current_hash":"v2","previous_port":7460,"previous_hash":"v1"}`
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state.json' ]", Output: "present\n" + stateContent},
+		ssh.MockCommand{Match: "mkdir /deployments/myapp/.lock", Output: ""},
+		ssh.MockCommand{Match: "cat /deployments/myapp/.lock/info", Err: fmt.Errorf("none")},
 		ssh.MockCommand{Match: "docker ps --all --filter label=teploy.app='myapp'",
 			Output: `{"ID":"aaa","Names":"myapp-web-v1","Image":"myapp:latest","State":"exited","Status":"Exited","Labels":"teploy.app=myapp,teploy.version=v1,teploy.process=web"}` + "\n" +
 				`{"ID":"bbb","Names":"myapp-web-v2","Image":"myapp:latest","State":"running","Status":"Up 1h","Labels":"teploy.app=myapp,teploy.version=v2,teploy.process=web"}`,

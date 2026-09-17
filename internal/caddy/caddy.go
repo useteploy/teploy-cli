@@ -4,8 +4,10 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"regexp"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/useteploy/teploy/internal/ssh"
 )
@@ -214,8 +216,18 @@ func (c *Client) SetRoute(ctx context.Context, app, domain, upstream string, con
 
 // SetLoadBalancer adds or updates a load-balanced reverse proxy route: traffic
 // for the domain is distributed across upstreams via round-robin with active
-// /up health checks. Replaces any prior route block for the same app.
+// health checks on healthPath (empty = "/health", the same default the
+// deploy-time readiness probe uses — the block used to hardcode /up, so a
+// successfully deployed app with no /up route had every upstream marked
+// unhealthy; audit F47). Replaces any prior route block for the same app.
 func (c *Client) SetLoadBalancer(ctx context.Context, app, domain string, upstreams []Upstream, tls TLS, caddyExtra string, cache map[string]string, fw Firewall, access Access) error {
+	return c.SetLoadBalancerHealth(ctx, app, domain, upstreams, "", tls, caddyExtra, cache, fw, access)
+}
+
+// SetLoadBalancerHealth is SetLoadBalancer with an explicit active-check
+// path. Pass the app's configured health path so Caddy's upstream checks
+// probe the same endpoint the deploy readiness gate used.
+func (c *Client) SetLoadBalancerHealth(ctx context.Context, app, domain string, upstreams []Upstream, healthPath string, tls TLS, caddyExtra string, cache map[string]string, fw Firewall, access Access) error {
 	hosts, err := parseDomains(domain)
 	if err != nil {
 		return err
@@ -223,7 +235,7 @@ func (c *Client) SetLoadBalancer(ctx context.Context, app, domain string, upstre
 	if len(hosts) == 0 {
 		return fmt.Errorf("SetLoadBalancer: domain must be non-empty")
 	}
-	return c.applyManagedBlock(ctx, app, hosts, loadBalancerBlock(hosts, upstreams, tls, caddyExtra, cache, fw, access))
+	return c.applyManagedBlock(ctx, app, hosts, loadBalancerBlock(hosts, upstreams, healthPath, tls, caddyExtra, cache, fw, access))
 }
 
 // SetStaticRoute upserts a Caddyfile block that serves a static deploy.
@@ -263,7 +275,10 @@ func (c *Client) AppendRedirect(ctx context.Context, app string, hosts []string,
 		return fmt.Errorf("no domains recorded for app %q — cannot write a redirect", app)
 	}
 	return c.mutate(ctx, func(prev string) (string, error) {
-		updated := renderUpdated(prev, app, hosts, "")
+		updated, err := renderUpdated(prev, app, hosts, "")
+		if err != nil {
+			return "", err
+		}
 		block := strings.Join(hosts, ", ") + " {\n\tredir " + target + " permanent\n}"
 		return strings.TrimRight(updated, "\n") + "\n\n" + block + "\n", nil
 	})
@@ -307,7 +322,7 @@ func (c *Client) SetMaintenance(ctx context.Context, app, domain string) error {
 				return "", fmt.Errorf("stashing route for maintenance: %w", err)
 			}
 		}
-		return renderUpdated(prev, app, hosts, maintenanceBlock(hosts)), nil
+		return renderUpdated(prev, app, hosts, maintenanceBlock(hosts))
 	})
 }
 
@@ -334,7 +349,7 @@ func (c *Client) RemoveMaintenance(ctx context.Context, app string) error {
 	}
 
 	if err := c.mutate(ctx, func(prev string) (string, error) {
-		return renderUpdated(prev, app, nil, restored), nil
+		return renderUpdated(prev, app, nil, restored)
 	}); err != nil {
 		return err
 	}
@@ -372,10 +387,20 @@ func (c *Client) mutate(ctx context.Context, transform func(prev string) (string
 		return err
 	}
 	if err := c.reload(ctx); err != nil {
-		// Roll back so a bad config is never left on disk to break the next boot.
-		if rbErr := c.writeCaddyfile(ctx, prev); rbErr == nil {
-			c.reload(ctx) // best-effort restore of the live config
+		// Roll back so a bad config is never left on disk to break the next
+		// boot. The restore runs on a DETACHED bounded context — the deploy
+		// context may be cancelled (the reason the reload failed), and a
+		// restore that silently no-ops left the bad config live (audit F45).
+		restoreCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		if rbErr := c.writeCaddyfile(restoreCtx, prev); rbErr != nil {
+			cancel()
+			return fmt.Errorf("caddy reload failed (%w) AND restoring the previous Caddyfile failed (%v) — the on-disk config may break the next caddy boot; resolve manually at %s", err, rbErr, caddyfilePath)
 		}
+		if rbErr := c.reload(restoreCtx); rbErr != nil {
+			cancel()
+			return fmt.Errorf("caddy reload failed (%w); the previous Caddyfile was restored on disk but the reload-back failed (%v) — the running config may be stale until the next successful reload", err, rbErr)
+		}
+		cancel()
 		return fmt.Errorf("caddy reload failed, rolled back: %w", err)
 	}
 	// Confirm the running container actually sees the config we just wrote.
@@ -404,10 +429,14 @@ func (c *Client) verifyDelivered(ctx context.Context) error {
 		"[ \"$(docker exec %s md5sum %s 2>/dev/null | cut -d' ' -f1)\" = \"$(md5sum %s 2>/dev/null | cut -d' ' -f1)\" ] && echo %s || echo %s",
 		caddyContainer, containerCaddyfile, caddyfilePath, deliveredOK, deliveredStale)
 	out, err := c.exec.Run(ctx, check)
+	// The check itself ends in `|| echo STALE`, so a non-nil error here is a
+	// transport/execution failure, and an output with NEITHER sentinel is
+	// ambiguous (e.g. both checksums empty). Both used to be treated as
+	// delivered — fail closed instead (audit F45).
 	if err != nil {
-		return nil
+		return fmt.Errorf("could not verify the caddy container is serving the config just written: %w", err)
 	}
-	if !strings.Contains(out, deliveredOK) {
+	if out != strings.TrimSpace(deliveredOK) && !strings.HasPrefix(out, deliveredOK) {
 		return fmt.Errorf(
 			"caddy reloaded but the container's %s does not match the config Teploy wrote — "+
 				"the write did not reach the running container (legacy single-file Caddyfile bind mount "+
@@ -424,7 +453,7 @@ func (c *Client) verifyDelivered(ctx context.Context) error {
 // marker-delimited block, adopting any foreign block for the same hosts.
 func (c *Client) applyManagedBlock(ctx context.Context, app string, hosts []string, block string) error {
 	return c.mutate(ctx, func(prev string) (string, error) {
-		return renderUpdated(prev, app, hosts, block), nil
+		return renderUpdated(prev, app, hosts, block)
 	})
 }
 
@@ -432,10 +461,18 @@ func (c *Client) applyManagedBlock(ctx context.Context, app string, hosts []stri
 // Teploy block (and a legacy lb-<app> block), removes any non-Teploy block
 // serving the same hosts (brownfield adoption), then appends the new block
 // wrapped in per-app markers. An empty block just performs the removals.
-func renderUpdated(prev, app string, hosts []string, block string) string {
-	updated := removeCaddyfileBlock(prev, fmt.Sprintf(markerBeginFmt, app), fmt.Sprintf(markerEndFmt, app))
+// Marker matching is EXACT-LINE, so an app whose name is a prefix of
+// another's can no longer rewrite the other's block (audit F44).
+func renderUpdated(prev, app string, hosts []string, block string) (string, error) {
+	updated, err := removeCaddyfileBlock(prev, fmt.Sprintf(markerBeginFmt, app), fmt.Sprintf(markerEndFmt, app))
+	if err != nil {
+		return "", err
+	}
 	// Legacy: older versions used a separate lb-<app> marker block.
-	updated = removeCaddyfileBlock(updated, fmt.Sprintf(markerBeginFmt, "lb-"+app), fmt.Sprintf(markerEndFmt, "lb-"+app))
+	updated, err = removeCaddyfileBlock(updated, fmt.Sprintf(markerBeginFmt, "lb-"+app), fmt.Sprintf(markerEndFmt, "lb-"+app))
+	if err != nil {
+		return "", err
+	}
 	if len(hosts) > 0 {
 		updated = removeForeignHostBlocks(updated, hosts)
 	}
@@ -444,9 +481,9 @@ func renderUpdated(prev, app string, hosts []string, block string) string {
 		begin := fmt.Sprintf(markerBeginFmt, app)
 		end := fmt.Sprintf(markerEndFmt, app)
 		wrapped := begin + "\n" + strings.TrimRight(block, "\n") + "\n" + end
-		return strings.TrimRight(updated, "\n") + "\n\n" + wrapped + "\n"
+		return strings.TrimRight(updated, "\n") + "\n\n" + wrapped + "\n", nil
 	}
-	return strings.TrimRight(updated, "\n") + "\n"
+	return strings.TrimRight(updated, "\n") + "\n", nil
 }
 
 // writeCaddyfile persists the Caddyfile atomically via a temp file + rename. The
@@ -462,10 +499,12 @@ func renderUpdated(prev, app string, hosts []string, block string) string {
 // mount (-v /deployments/caddy:/etc/caddy). verifyDelivered catches an
 // un-migrated box and aborts the deploy loudly before any damage.
 func (c *Client) writeCaddyfile(ctx context.Context, content string) error {
-	if err := c.exec.Upload(ctx, strings.NewReader(content), tmpCaddyfile, "0644"); err != nil {
-		return fmt.Errorf("uploading caddyfile: %w", err)
-	}
-	if _, err := c.exec.Run(ctx, "mv "+tmpCaddyfile+" "+caddyfilePath); err != nil {
+	// Staged random SIBLING inside /deployments/caddy, then an atomic
+	// same-filesystem rename — replacing the old fixed /tmp staging path,
+	// which was shared (any concurrent process could race it), followed a
+	// pre-existing symlink at that path, and crossed filesystems for the
+	// final mv, losing rename atomicity (audit F46).
+	if err := ssh.UploadAtomic(ctx, c.exec, strings.NewReader(content), caddyfilePath, "0644"); err != nil {
 		return fmt.Errorf("writing caddyfile: %w", err)
 	}
 	return nil
@@ -500,11 +539,14 @@ func (c *Client) releaseLock(ctx context.Context) {
 	c.exec.Run(ctx, "rmdir "+lockDir+" 2>/dev/null || true")
 }
 
-// removeForeignHostBlocks strips top-level Caddyfile site blocks that serve any
-// of the given hosts and are NOT inside a Teploy marker region. This lets a
-// deploy adopt a domain previously served by a hand-written block, leaving a
-// single authoritative block per host (no duplicate-address errors, no
-// route-ordering ambiguity).
+// removeForeignHostBlocks strips top-level Caddyfile site blocks that serve
+// ONLY the given hosts and are NOT inside a Teploy marker region. This lets
+// a deploy adopt a domain previously served by a hand-written block, leaving
+// a single authoritative block per host. A foreign block that ALSO serves a
+// host outside the requested set is LEFT ALONE (audit F49): adopting it
+// would delete another application's routes, and the resulting duplicate
+// site address fails loudly at caddy reload instead of silently dropping
+// hosts nobody asked teploy to touch.
 func removeForeignHostBlocks(content string, hosts []string) string {
 	lines := strings.Split(content, "\n")
 	out := make([]string, 0, len(lines))
@@ -542,8 +584,8 @@ func removeForeignHostBlocks(content string, hosts []string) string {
 				j++
 			}
 			addr := strings.TrimSpace(strings.TrimSuffix(trimmed, "{"))
-			if addressMatchesHosts(addr, hosts) {
-				i = j // drop the foreign block
+			if addressWithinHosts(addr, hosts) {
+				i = j // drop the foreign block — every host it serves is being adopted
 				continue
 			}
 			out = append(out, block...)
@@ -557,9 +599,11 @@ func removeForeignHostBlocks(content string, hosts []string) string {
 	return strings.Join(out, "\n")
 }
 
-// addressMatchesHosts reports whether a Caddyfile site-address (e.g.
-// "example.com, www.example.com") references any of the given hosts.
-func addressMatchesHosts(addr string, hosts []string) bool {
+// addressWithinHosts reports whether EVERY host in a Caddyfile site-address
+// (e.g. "example.com, www.example.com") is among the given hosts — the
+// condition under which a foreign block may be adopted wholesale.
+func addressWithinHosts(addr string, hosts []string) bool {
+	seen := 0
 	for _, a := range strings.Split(addr, ",") {
 		a = strings.TrimSpace(a)
 		a = strings.TrimPrefix(a, "https://")
@@ -567,58 +611,154 @@ func addressMatchesHosts(addr string, hosts []string) bool {
 		if sp := strings.IndexAny(a, " \t"); sp >= 0 {
 			a = a[:sp]
 		}
+		matched := false
 		for _, h := range hosts {
 			if a == h {
-				return true
+				matched = true
+				break
 			}
 		}
+		if !matched {
+			return false
+		}
+		seen++
 	}
-	return false
+	return seen > 0
 }
 
 func isSpaceByte(b byte) bool { return b == ' ' || b == '\t' }
 
-// extractCaddyfileBlock returns the content between the begin and end markers
-// (markers excluded), or "" if not found.
-func extractCaddyfileBlock(content, begin, end string) string {
-	bi := strings.Index(content, begin)
-	if bi < 0 {
-		return ""
+// markerName constrains the app-name portion of a TEPLOY marker line: a
+// complete marker is exactly "# TEPLOY BEGIN <app>" (nothing else on the
+// line). Exact-line matching is what prevents app "web" from matching the
+// marker of "web-staging" — the old substring search rewrote the wrong
+// app's block whenever one app name was a prefix of another (audit F44).
+var markerName = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*[a-z0-9]$|^[a-z0-9]$`)
+
+// beginMarkerApp returns the app named by a complete "# TEPLOY BEGIN <app>"
+// line, or ok=false for anything else (including a longer line that merely
+// starts with a prefix of the marker).
+func beginMarkerApp(line string) (string, bool) {
+	t := strings.TrimSpace(strings.TrimSuffix(line, "\r"))
+	if !strings.HasPrefix(t, markerBeginPrefix) {
+		return "", false
 	}
-	tail := content[bi+len(begin):]
-	ei := strings.Index(tail, end)
-	if ei < 0 {
-		return ""
+	name := strings.TrimSpace(strings.TrimPrefix(t, markerBeginPrefix))
+	if !markerName.MatchString(name) {
+		return "", false
 	}
-	return strings.Trim(tail[:ei], "\n")
+	return name, true
 }
 
-// removeCaddyfileBlock removes every region bounded by `begin`..`end`,
-// collapsing surrounding blank lines so repeated upserts don't grow stray
-// whitespace. Tolerates a missing end marker by trimming to end-of-file.
-func removeCaddyfileBlock(content, begin, end string) string {
-	for {
-		bi := strings.Index(content, begin)
-		if bi < 0 {
-			return content
+// endMarkerApp is beginMarkerApp for "# TEPLOY END <app>" lines.
+func endMarkerApp(line string) (string, bool) {
+	t := strings.TrimSpace(strings.TrimSuffix(line, "\r"))
+	if !strings.HasPrefix(t, markerEndPrefix) {
+		return "", false
+	}
+	name := strings.TrimSpace(strings.TrimPrefix(t, markerEndPrefix))
+	if !markerName.MatchString(name) {
+		return "", false
+	}
+	return name, true
+}
+
+const (
+	markerBeginPrefix = "# TEPLOY BEGIN "
+	markerEndPrefix   = "# TEPLOY END "
+)
+
+// extractCaddyfileBlock returns the content between the app's exact begin
+// and end marker lines (markers excluded), or "" if not found. Marker lines
+// must match COMPLETELY — app "web" no longer matches inside
+// "# TEPLOY BEGIN web-staging" (audit F44).
+func extractCaddyfileBlock(content, begin, end string) string {
+	target := strings.TrimSpace(strings.TrimPrefix(begin, markerBeginPrefix))
+	var out []string
+	active := false
+	for _, line := range strings.Split(content, "\n") {
+		if name, ok := beginMarkerApp(line); ok {
+			if name == target {
+				active = true
+			}
+			continue
 		}
-		tail := content[bi:]
-		ei := strings.Index(tail, end)
-		if ei < 0 {
-			return strings.TrimRight(content[:bi], "\n") + "\n"
+		if name, ok := endMarkerApp(line); ok {
+			if active && name == target {
+				return strings.Trim(strings.Join(out, "\n"), "\n")
+			}
+			continue
 		}
-		ei = bi + ei + len(end)
-		before := content[:bi]
-		after := strings.TrimLeft(content[ei:], "\n")
-		switch {
-		case before == "":
-			content = after
-		case after == "":
-			content = strings.TrimRight(before, "\n") + "\n"
-		default:
-			content = strings.TrimRight(before, "\n") + "\n\n" + after
+		if active {
+			out = append(out, line)
 		}
 	}
+	return ""
+}
+
+// removeCaddyfileBlock removes the region bounded by the app's EXACT marker
+// lines, collapsing surrounding blank lines so repeated upserts don't grow
+// stray whitespace. An unterminated region trims to end-of-file (the
+// app's own damaged region only — exact matching guarantees the begin
+// marker named this app, not a longer one). Every end marker for a region
+// that is not the target's is an error: silently accepting unpaired
+// markers is how unrelated bytes used to get dropped (audit F44).
+func removeCaddyfileBlock(content, begin, end string) (string, error) {
+	target := strings.TrimSpace(strings.TrimPrefix(begin, markerBeginPrefix))
+	if !markerName.MatchString(target) {
+		return "", fmt.Errorf("invalid managed-block app name %q", target)
+	}
+	var out []string
+	active := false
+	removed := false
+	for _, line := range strings.Split(content, "\n") {
+		if name, ok := beginMarkerApp(line); ok {
+			if active {
+				return "", fmt.Errorf("nested TEPLOY BEGIN %q inside the %s block — refusing to edit a malformed Caddyfile", name, target)
+			}
+			if name == target {
+				if removed {
+					return "", fmt.Errorf("duplicate TEPLOY block for %s — refusing to edit a malformed Caddyfile", target)
+				}
+				active = true
+				removed = true
+				continue
+			}
+			out = append(out, line)
+			continue
+		}
+		if name, ok := endMarkerApp(line); ok {
+			if active && name == target {
+				active = false
+				continue
+			}
+			if !active && name == target {
+				return "", fmt.Errorf("unmatched TEPLOY END %s — refusing to edit a malformed Caddyfile", target)
+			}
+			out = append(out, line)
+			continue
+		}
+		if !active {
+			out = append(out, line)
+		}
+	}
+	if active {
+		// Unterminated region: drop through to EOF, same as before, but now
+		// guaranteed to be this app's own region.
+		_ = active
+	}
+	result := strings.Join(out, "\n")
+	if removed {
+		// Collapse runs of blank lines the removal may have created.
+		for strings.Contains(result, "\n\n\n") {
+			result = strings.ReplaceAll(result, "\n\n\n", "\n\n")
+		}
+		result = strings.TrimRight(result, "\n") + "\n"
+		if result == "\n" {
+			result = ""
+		}
+	}
+	return result, nil
 }
 
 // parseDomains splits a Teploy config "domain" field into a normalized host
@@ -695,9 +835,12 @@ func reverseProxyBlock(hosts []string, upstream string, port int, tls TLS, caddy
 	return b.String()
 }
 
-// loadBalancerBlock renders a round-robin reverse-proxy block with active /up
-// health checks.
-func loadBalancerBlock(hosts []string, upstreams []Upstream, tls TLS, caddyExtra string, cache map[string]string, fw Firewall, access Access) string {
+// loadBalancerBlock renders a round-robin reverse-proxy block with active
+// health checks on healthPath (default /health).
+func loadBalancerBlock(hosts []string, upstreams []Upstream, healthPath string, tls TLS, caddyExtra string, cache map[string]string, fw Firewall, access Access) string {
+	if healthPath == "" {
+		healthPath = "/health"
+	}
 	dials := make([]string, len(upstreams))
 	for i, u := range upstreams {
 		dials[i] = u.Dial

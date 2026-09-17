@@ -59,7 +59,7 @@ func TestFirewall_UserAgentRegexEscaped(t *testing.T) {
 func TestLoadBalancerBlock_WithFirewall(t *testing.T) {
 	fw := Firewall{DenyIPs: []string{"9.9.9.9"}}
 	got := loadBalancerBlock([]string{"example.com"},
-		[]Upstream{{Dial: "a:80"}, {Dial: "b:80"}}, TLS{}, "", nil, fw, Access{})
+		[]Upstream{{Dial: "a:80"}, {Dial: "b:80"}}, "", TLS{}, "", nil, fw, Access{})
 	if !strings.Contains(got, "\thandle {\n\t\treverse_proxy a:80 b:80 {") {
 		t.Errorf("LB reverse_proxy not wrapped in handle:\n%s", got)
 	}

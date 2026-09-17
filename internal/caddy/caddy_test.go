@@ -17,7 +17,7 @@ func lockCmds(caddyfile string) []ssh.MockCommand {
 	return []ssh.MockCommand{
 		{Match: "mkdir " + lockDir, Output: ""},
 		{Match: "cat " + caddyfilePath, Output: caddyfile},
-		{Match: "mv " + tmpCaddyfile, Output: ""},
+		{Match: "mv -f -- ", Output: ""},
 		{Match: reloadCmd, Output: ""},
 		// Post-reload delivery check: container's file matches what we wrote.
 		{Match: "[ \"$(docker exec caddy md5sum", Output: deliveredOK},
@@ -42,7 +42,7 @@ func TestSetRoute_WritesBlockAndReloads(t *testing.T) {
 		t.Fatalf("SetRoute: %v", err)
 	}
 
-	got := string(mock.Files[tmpCaddyfile])
+	got := string(mock.Files[caddyfilePath])
 	for _, want := range []string{"# TEPLOY BEGIN myapp", "# TEPLOY END myapp", "myapp.com {", "reverse_proxy myapp-v1:80"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("expected Caddyfile to contain %q\nfull:\n%s", want, got)
@@ -66,7 +66,7 @@ func TestSetRoute_UpdateExisting(t *testing.T) {
 		t.Fatalf("SetRoute: %v", err)
 	}
 
-	got := string(mock.Files[tmpCaddyfile])
+	got := string(mock.Files[caddyfilePath])
 	if strings.Count(got, "# TEPLOY BEGIN myapp") != 1 {
 		t.Errorf("expected exactly one block for myapp:\n%s", got)
 	}
@@ -92,7 +92,7 @@ func TestSetRoute_AdoptsForeignBlock(t *testing.T) {
 		t.Fatalf("SetRoute: %v", err)
 	}
 
-	got := string(mock.Files[tmpCaddyfile])
+	got := string(mock.Files[caddyfilePath])
 	if strings.Contains(got, "legacy-container:80") {
 		t.Errorf("foreign block for the same host was not adopted/removed:\n%s", got)
 	}
@@ -113,8 +113,8 @@ func TestSetRoute_MultiHost(t *testing.T) {
 	if err := client.SetRoute(context.Background(), "myapp", "myapp.com, www.myapp.com", "myapp-v1", 80, TLS{}, "", nil, Firewall{}, Access{}); err != nil {
 		t.Fatalf("SetRoute: %v", err)
 	}
-	if !strings.Contains(string(mock.Files[tmpCaddyfile]), "myapp.com, www.myapp.com {") {
-		t.Errorf("expected multi-host site block:\n%s", mock.Files[tmpCaddyfile])
+	if !strings.Contains(string(mock.Files[caddyfilePath]), "myapp.com, www.myapp.com {") {
+		t.Errorf("expected multi-host site block:\n%s", mock.Files[caddyfilePath])
 	}
 }
 
@@ -123,7 +123,7 @@ func TestSetRoute_ReloadFailureRollsBack(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "mkdir " + lockDir, Output: ""},
 		ssh.MockCommand{Match: "cat " + caddyfilePath, Output: initial},
-		ssh.MockCommand{Match: "mv " + tmpCaddyfile, Output: ""},
+		ssh.MockCommand{Match: "mv -f -- ", Output: ""},
 		// First reload (new config) fails; rollback reload then succeeds.
 		ssh.MockCommand{Match: reloadCmd, Err: fmt.Errorf("invalid config"), Once: true},
 		ssh.MockCommand{Match: reloadCmd, Output: ""},
@@ -136,8 +136,8 @@ func TestSetRoute_ReloadFailureRollsBack(t *testing.T) {
 		t.Fatal("expected error on reload failure")
 	}
 	// The last write must restore the original contents (no broken config left on disk).
-	if string(mock.Files[tmpCaddyfile]) != initial {
-		t.Errorf("expected Caddyfile rolled back to original, got:\n%s", mock.Files[tmpCaddyfile])
+	if string(mock.Files[caddyfilePath]) != initial {
+		t.Errorf("expected Caddyfile rolled back to original, got:\n%s", mock.Files[caddyfilePath])
 	}
 }
 
@@ -150,7 +150,7 @@ func TestSetRoute_StaleDeliveryFailsLoudly(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "mkdir " + lockDir, Output: ""},
 		ssh.MockCommand{Match: "cat " + caddyfilePath, Output: "{\n\tadmin 127.0.0.1:2019\n}\n"},
-		ssh.MockCommand{Match: "mv " + tmpCaddyfile, Output: ""},
+		ssh.MockCommand{Match: "mv -f -- ", Output: ""},
 		ssh.MockCommand{Match: reloadCmd, Output: ""},
 		ssh.MockCommand{Match: "[ \"$(docker exec caddy md5sum", Output: deliveredStale},
 		ssh.MockCommand{Match: "rmdir " + lockDir, Output: ""},
@@ -177,7 +177,7 @@ func TestSetLoadBalancer(t *testing.T) {
 		t.Fatalf("SetLoadBalancer: %v", err)
 	}
 
-	got := string(mock.Files[tmpCaddyfile])
+	got := string(mock.Files[caddyfilePath])
 	for _, want := range []string{
 		"# TEPLOY BEGIN myapp",
 		"reverse_proxy 10.0.0.1:80 10.0.0.2:80 10.0.0.3:80",
@@ -197,7 +197,7 @@ func TestSetRoute_WithCaddyExtra(t *testing.T) {
 	if err := client.SetRoute(context.Background(), "myapp", "myapp.com", "myapp-v1", 80, TLS{}, extra, nil, Firewall{}, Access{}); err != nil {
 		t.Fatalf("SetRoute: %v", err)
 	}
-	got := string(mock.Files[tmpCaddyfile])
+	got := string(mock.Files[caddyfilePath])
 	for _, want := range []string{
 		"reverse_proxy myapp-v1:80",
 		"# user-supplied caddy_extra:",
@@ -218,7 +218,7 @@ func TestSetLoadBalancer_WithCaddyExtra(t *testing.T) {
 	if err := client.SetLoadBalancer(context.Background(), "myapp", "myapp.com", upstreams, TLS{}, extra, nil, Firewall{}, Access{}); err != nil {
 		t.Fatalf("SetLoadBalancer: %v", err)
 	}
-	got := string(mock.Files[tmpCaddyfile])
+	got := string(mock.Files[caddyfilePath])
 	for _, want := range []string{
 		"lb_policy round_robin",
 		"# user-supplied caddy_extra:",
@@ -241,7 +241,7 @@ func TestRemoveRoute(t *testing.T) {
 		t.Fatalf("RemoveRoute: %v", err)
 	}
 
-	got := string(mock.Files[tmpCaddyfile])
+	got := string(mock.Files[caddyfilePath])
 	if strings.Contains(got, "# TEPLOY BEGIN myapp") {
 		t.Errorf("expected myapp block removed:\n%s", got)
 	}
@@ -272,7 +272,7 @@ func TestSetMaintenance(t *testing.T) {
 		t.Fatalf("SetMaintenance: %v", err)
 	}
 
-	got := string(mock.Files[tmpCaddyfile])
+	got := string(mock.Files[caddyfilePath])
 	if !strings.Contains(got, "respond 503") || !strings.Contains(got, "We'll be back soon") {
 		t.Errorf("expected 503 maintenance block:\n%s", got)
 	}
@@ -298,7 +298,7 @@ func TestRemoveMaintenance(t *testing.T) {
 		t.Fatalf("RemoveMaintenance: %v", err)
 	}
 
-	got := string(mock.Files[tmpCaddyfile])
+	got := string(mock.Files[caddyfilePath])
 	if !strings.Contains(got, "reverse_proxy myapp:80") {
 		t.Errorf("expected route restored from stash:\n%s", got)
 	}
@@ -311,11 +311,22 @@ func TestRemoveMaintenance(t *testing.T) {
 }
 
 func TestRemoveForeignHostBlocks(t *testing.T) {
+	// The foreign block serves BOTH drop.com and www.drop.com; adopting it
+	// is only safe when the deploy takes over every host it serves (F49).
 	in := "{\n\tadmin 127.0.0.1:2019\n}\n\n" +
 		"keep.com {\n\treverse_proxy keep:80\n}\n\n" +
 		"drop.com, www.drop.com {\n\treverse_proxy old:80\n}\n\n" +
 		"# TEPLOY BEGIN protected\ndrop.com {\n\treverse_proxy managed:80\n}\n# TEPLOY END protected\n"
+
+	// Partial takeover (drop.com only): the multi-host foreign block must
+	// SURVIVE — dropping it would delete www.drop.com's route, and the
+	// duplicate site address then fails loudly at caddy reload instead.
 	got := removeForeignHostBlocks(in, []string{"drop.com"})
+	if !strings.Contains(got, "reverse_proxy old:80") {
+		t.Errorf("partially-adopted multi-host foreign block was removed:\n%s", got)
+	}
+
+	got = removeForeignHostBlocks(in, []string{"drop.com", "www.drop.com"})
 	if strings.Contains(got, "reverse_proxy old:80") {
 		t.Errorf("foreign drop.com block not removed:\n%s", got)
 	}
@@ -330,21 +341,24 @@ func TestRemoveForeignHostBlocks(t *testing.T) {
 	}
 }
 
-func TestAddressMatchesHosts(t *testing.T) {
+func TestAddressWithinHosts(t *testing.T) {
 	cases := []struct {
 		addr  string
 		hosts []string
 		want  bool
 	}{
 		{"example.com", []string{"example.com"}, true},
-		{"example.com, www.example.com", []string{"www.example.com"}, true},
+		{"example.com, www.example.com", []string{"example.com", "www.example.com"}, true},
+		// audit F49: a foreign block serving a host OUTSIDE the requested set
+		// must NOT be adoptable wholesale.
+		{"example.com, www.example.com", []string{"www.example.com"}, false},
 		{"https://example.com", []string{"example.com"}, true},
 		{"example.com:8080", []string{"example.com"}, false}, // explicit port is a different address
 		{"other.com", []string{"example.com"}, false},
 	}
 	for _, c := range cases {
-		if got := addressMatchesHosts(c.addr, c.hosts); got != c.want {
-			t.Errorf("addressMatchesHosts(%q, %v) = %v, want %v", c.addr, c.hosts, got, c.want)
+		if got := addressWithinHosts(c.addr, c.hosts); got != c.want {
+			t.Errorf("addressWithinHosts(%q, %v) = %v, want %v", c.addr, c.hosts, got, c.want)
 		}
 	}
 }
@@ -358,7 +372,6 @@ func TestRemoveCaddyfileBlock(t *testing.T) {
 	}{
 		{"removes single block", "a\n\n# TEPLOY BEGIN x\nbody\n# TEPLOY END x\n\nb\n", "x", "a\n\nb\n"},
 		{"no-op when marker absent", "a\n\nb\n", "x", "a\n\nb\n"},
-		{"removes multiple blocks for same app", "# TEPLOY BEGIN x\n1\n# TEPLOY END x\nmid\n# TEPLOY BEGIN x\n2\n# TEPLOY END x\n", "x", "mid\n"},
 		{"only removes matching app, not others", "# TEPLOY BEGIN x\nx\n# TEPLOY END x\n# TEPLOY BEGIN y\ny\n# TEPLOY END y\n", "x", "# TEPLOY BEGIN y\ny\n# TEPLOY END y\n"},
 		{"malformed (missing end marker) truncates at begin", "a\n# TEPLOY BEGIN x\nb\nc\n", "x", "a\n"},
 	}
@@ -366,10 +379,53 @@ func TestRemoveCaddyfileBlock(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			begin := fmt.Sprintf(markerBeginFmt, tt.app)
 			end := fmt.Sprintf(markerEndFmt, tt.app)
-			if got := removeCaddyfileBlock(tt.input, begin, end); got != tt.expected {
+			got, err := removeCaddyfileBlock(tt.input, begin, end)
+			if err != nil {
+				t.Fatalf("removeCaddyfileBlock(%s): %v", tt.name, err)
+			}
+			if got != tt.expected {
 				t.Errorf("removeCaddyfileBlock:\ninput:    %q\nexpected: %q\ngot:      %q", tt.input, tt.expected, got)
 			}
 		})
+	}
+}
+
+// audit F44: marker matching must be exact-line. App "web" and app
+// "web-staging" are both valid names; removing web's block used to
+// substring-match web-staging's BEGIN/END markers and destroy the OTHER
+// app's routes. A duplicate block and an unmatched end marker are refused.
+func TestRemoveCaddyfileBlock_ExactMarkerLines(t *testing.T) {
+	staging := "# TEPLOY BEGIN web-staging\nstg.example { respond 200 }\n# TEPLOY END web-staging\n"
+	web := "# TEPLOY BEGIN web\nweb.example { respond 200 }\n# TEPLOY END web\n"
+
+	got, err := removeCaddyfileBlock(staging+web, "# TEPLOY BEGIN web", "# TEPLOY END web")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got, "web-staging") || !strings.Contains(got, "stg.example") {
+		t.Errorf("web-staging block damaged while removing web:\n%s", got)
+	}
+	if strings.Contains(got, "TEPLOY BEGIN web\n") {
+		t.Errorf("web block not removed:\n%s", got)
+	}
+
+	// Removing web-staging must leave web intact.
+	got, err = removeCaddyfileBlock(staging+web, "# TEPLOY BEGIN web-staging", "# TEPLOY END web-staging")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(got, "# TEPLOY BEGIN web\n") {
+		t.Errorf("web block damaged while removing web-staging:\n%s", got)
+	}
+
+	// Duplicate regions for the same app: refuse instead of guessing.
+	if _, err := removeCaddyfileBlock(web+web, "# TEPLOY BEGIN web", "# TEPLOY END web"); err == nil {
+		t.Error("duplicate TEPLOY blocks must be refused")
+	}
+
+	// Unmatched end marker: refuse.
+	if _, err := removeCaddyfileBlock("a\n# TEPLOY END web\n", "# TEPLOY BEGIN web", "# TEPLOY END web"); err == nil {
+		t.Error("unmatched end marker must be refused")
 	}
 }
 
@@ -390,7 +446,7 @@ func TestReverseProxyBlockMultiHost(t *testing.T) {
 }
 
 func TestLoadBalancerBlock(t *testing.T) {
-	got := loadBalancerBlock([]string{"example.com"}, []Upstream{{Dial: "a:80"}, {Dial: "b:80"}}, TLS{}, "", nil, Firewall{}, Access{})
+	got := loadBalancerBlock([]string{"example.com"}, []Upstream{{Dial: "a:80"}, {Dial: "b:80"}}, "", TLS{}, "", nil, Firewall{}, Access{})
 	for _, want := range []string{"example.com {", "reverse_proxy a:80 b:80 {", "lb_policy round_robin", "health_uri /up", "health_interval 10s", "health_timeout 5s"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("loadBalancerBlock missing %q\nfull:\n%s", want, got)
@@ -409,7 +465,7 @@ func TestReverseProxyBlock_WithTLS(t *testing.T) {
 
 func TestLoadBalancerBlock_WithTLS(t *testing.T) {
 	got := loadBalancerBlock([]string{"fylun.ai"}, []Upstream{{Dial: "a:3000"}, {Dial: "b:3000"}},
-		TLS{Cert: "/etc/caddy/tls/fylun-web.crt", Key: "/etc/caddy/tls/fylun-web.key"}, "", nil, Firewall{}, Access{})
+		"", TLS{Cert: "/etc/caddy/tls/fylun-web.crt", Key: "/etc/caddy/tls/fylun-web.key"}, "", nil, Firewall{}, Access{})
 	if !strings.Contains(got, "\ttls /etc/caddy/tls/fylun-web.crt /etc/caddy/tls/fylun-web.key\n") {
 		t.Errorf("loadBalancerBlock with TLS missing tls directive\nfull:\n%s", got)
 	}
@@ -581,7 +637,7 @@ func TestReverseProxyBlockRendersCacheRules(t *testing.T) {
 
 func TestLoadBalancerBlockRendersCacheRules(t *testing.T) {
 	block := loadBalancerBlock(
-		[]string{"example.com"}, []Upstream{{Dial: "app-v1:3000"}}, TLS{}, "",
+		[]string{"example.com"}, []Upstream{{Dial: "app-v1:3000"}}, "", TLS{}, "",
 		map[string]string{"*.css": "public, max-age=600"},
 		Firewall{}, Access{},
 	)

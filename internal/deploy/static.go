@@ -18,6 +18,7 @@ package deploy
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -164,8 +165,13 @@ func (d *StaticDeployer) Deploy(ctx context.Context, cfg StaticConfig) error {
 	}
 	defer state.ReleaseLockDetached(d.exec, cfg.App)
 
-	// 5. Read prior state for rollback bookkeeping.
-	prior, _ := state.Read(ctx, d.exec, cfg.App)
+	// 5. Read prior state for rollback bookkeeping. A read failure aborts —
+	// treating unreadable state as "no state" would drop the rollback
+	// history and mislabel a replacement as a first deploy (audit F15).
+	prior, err := state.Read(ctx, d.exec, cfg.App)
+	if err != nil {
+		return fmt.Errorf("refusing to deploy with unreadable state for %s: %w", cfg.App, err)
+	}
 
 	// 6. Ensure the releases dir exists, then rsync to a temp release dir and
 	//    atomically rename. If the release for this hash already exists we
@@ -197,9 +203,11 @@ func (d *StaticDeployer) Deploy(ctx context.Context, cfg StaticConfig) error {
 		fmt.Fprintf(d.out, "  uploaded release %s\n", shortHash)
 	}
 
-	// 7. Atomically flip the `current` symlink. Use ln -sfn so an existing
-	//    symlink is replaced atomically.
-	if _, err := d.exec.Run(ctx, fmt.Sprintf("ln -sfn releases/%s %s", shortHash, currentLink)); err != nil {
+	// 7. Atomically flip the `current` symlink. ln -sfn is NOT atomic
+	//    (it unlinks the old link before creating the new one, so a reader
+	//    in the gap sees ENOENT); swapCurrentLink creates a sibling link
+	//    and renames it over `current` in one step (audit F53).
+	if err := d.swapCurrentLink(ctx, cfg.App, cfg.StateDir, shortHash); err != nil {
 		return fmt.Errorf("symlink swap: %w", err)
 	}
 
@@ -213,7 +221,7 @@ func (d *StaticDeployer) Deploy(ctx context.Context, cfg StaticConfig) error {
 		Headers:     cfg.Headers,
 		CaddyExtra:  cfg.CaddyExtra,
 	}); err != nil {
-		if restoreErr := d.restoreStaticLink(ctx, currentLink, prior); restoreErr != nil {
+		if restoreErr := d.restoreStaticLink(ctx, cfg.App, cfg.StateDir, prior); restoreErr != nil {
 			return fmt.Errorf("caddy route: %w; restoring the prior static release failed: %v", err, restoreErr)
 		}
 		return fmt.Errorf("caddy route: %w; the prior static release was restored", err)
@@ -233,12 +241,13 @@ func (d *StaticDeployer) Deploy(ctx context.Context, cfg StaticConfig) error {
 		newState.PreviousRelease = prior.PreviousRelease
 	}
 	if err := state.Write(ctx, d.exec, cfg.App, newState); err != nil {
-		return d.abortStaticStateCommit(ctx, cfg.App, currentLink, prior, err)
+		return d.abortStaticStateCommit(ctx, cfg.App, cfg.StateDir, currentLink, prior, err)
 	}
 
 	// 11. Prune old releases (keep the most recent KeepReleases including
 	//     current). Best-effort; failure here doesn't fail the deploy.
-	if err := d.pruneReleases(ctx, releasesDir, shortHash, cfg.KeepReleases); err != nil {
+	prev := priorHashOrEmpty(prior, shortHash)
+	if err := d.pruneReleases(ctx, releasesDir, shortHash, prev, cfg.KeepReleases); err != nil {
 		fmt.Fprintf(d.out, "  warning: prune releases: %v\n", err)
 	}
 
@@ -256,26 +265,54 @@ func (d *StaticDeployer) Deploy(ctx context.Context, cfg StaticConfig) error {
 	return nil
 }
 
-func (d *StaticDeployer) restoreStaticLink(ctx context.Context, currentLink string, prior *state.AppState) error {
+func (d *StaticDeployer) restoreStaticLink(ctx context.Context, app, stateDir string, prior *state.AppState) error {
 	if prior == nil || prior.CurrentHash == "" {
-		if _, err := d.exec.Run(ctx, "rm -f "+currentLink); err != nil {
+		currentLink := fmt.Sprintf("%s/%s/current", stateDir, app)
+		if _, err := d.exec.Run(ctx, "rm -f "+ssh.ShellQuote(currentLink)); err != nil {
 			return fmt.Errorf("removing uncommitted current symlink: %w", err)
 		}
 		return nil
 	}
-	if _, err := d.exec.Run(ctx, fmt.Sprintf("ln -sfn releases/%s %s", prior.CurrentHash, currentLink)); err != nil {
+	if err := d.swapCurrentLink(ctx, app, stateDir, prior.CurrentHash); err != nil {
 		return fmt.Errorf("restoring current symlink to %s: %w", prior.CurrentHash, err)
 	}
 	return nil
 }
 
-func (d *StaticDeployer) abortStaticStateCommit(ctx context.Context, app, currentLink string, prior *state.AppState, commitErr error) error {
+// swapCurrentLink atomically points <stateDir>/<app>/current at
+// releases/<hash>: a unique sibling symlink is created and renamed over the
+// current link with mv -Tf, so readers see either the old or the new target,
+// never a missing link (ln -sfn unlinks first — audit F53). hash is
+// validated alphanumeric by safeReleaseName; app and stateDir are validated
+// at the config boundary, so the command needs no shell quoting.
+func (d *StaticDeployer) swapCurrentLink(ctx context.Context, app, stateDir, hash string) error {
+	if !safeReleaseName(hash) {
+		return fmt.Errorf("invalid release hash %q", hash)
+	}
+	current := fmt.Sprintf("%s/%s/current", stateDir, app)
+	tmp := fmt.Sprintf("%s/%s/.current-swap.%d", stateDir, app, time.Now().UnixNano())
+	cmd := fmt.Sprintf("ln -s -- releases/%s %s && mv -Tf -- %s %s", hash, tmp, tmp, current)
+	if _, err := d.exec.Run(ctx, cmd); err != nil {
+		d.exec.Run(context.WithoutCancel(ctx), "rm -f "+ssh.ShellQuote(tmp))
+		return err
+	}
+	return nil
+}
+
+// safeReleaseName constrains a release identifier used in remote paths and
+// commands (audit F18): release dirs are 12-hex from hashDir, but --to
+// accepts arbitrary operator input.
+func safeReleaseName(hash string) bool {
+	return len(hash) > 0 && len(hash) <= 64 && strings.Trim(hash, "abcdefghijklmnopqrstuvwxyz0123456789") == ""
+}
+
+func (d *StaticDeployer) abortStaticStateCommit(ctx context.Context, app, stateDir, currentLink string, prior *state.AppState, commitErr error) error {
 	if prior == nil || prior.CurrentHash == "" {
 		if err := d.caddy.RemoveRoute(ctx, app); err != nil {
 			return fmt.Errorf("committing authoritative applied state after static route switch: %w; removing the uncommitted route failed: %v; the new release was left active to avoid a broken route", commitErr, err)
 		}
 	}
-	if err := d.restoreStaticLink(ctx, currentLink, prior); err != nil {
+	if err := d.restoreStaticLink(ctx, app, stateDir, prior); err != nil {
 		return fmt.Errorf("committing authoritative applied state after static route switch: %w; %v; the new release was left active", commitErr, err)
 	}
 	if prior == nil || prior.CurrentHash == "" {
@@ -332,21 +369,25 @@ func (d *StaticDeployer) rsyncTo(ctx context.Context, srcDir, remoteDest string)
 }
 
 // pruneReleases keeps the `keep` most recent release directories under
-// releasesDir, always preserving the currently-active hash regardless of mtime.
-// "Most recent" is determined by directory mtime; a fresh deploy is always at
-// the top because rsync just touched it.
-func (d *StaticDeployer) pruneReleases(ctx context.Context, releasesDir, keepHash string, keep int) error {
+// releasesDir, always preserving the currently-active hash AND the recorded
+// previous release regardless of mtime ordering — the previous release is
+// the advertised rollback target, and pruning it left state pointing at a
+// directory that no longer existed (audit F54). "Most recent" is directory
+// mtime (rsync -a preserves source mtimes, so ordering can diverge from
+// deployment order for re-uploaded content; the mandatory protections above
+// are what make that safe). Removal failures are surfaced, not swallowed.
+func (d *StaticDeployer) pruneReleases(ctx context.Context, releasesDir, keepHash, previousHash string, keep int) error {
 	if keep <= 0 {
 		return nil
 	}
-	out, err := d.exec.Run(ctx, fmt.Sprintf("ls -1t %s 2>/dev/null", releasesDir))
+	out, err := d.exec.Run(ctx, fmt.Sprintf("ls -1t %s 2>/dev/null", ssh.ShellQuote(releasesDir)))
 	if err != nil {
 		return err
 	}
 	var entries []string
 	for _, l := range strings.Split(out, "\n") {
 		l = strings.TrimSpace(l)
-		if l != "" && !strings.HasSuffix(l, ".tmp") {
+		if l != "" && !strings.HasSuffix(l, ".tmp") && safeReleaseName(l) {
 			entries = append(entries, l)
 		}
 	}
@@ -354,55 +395,130 @@ func (d *StaticDeployer) pruneReleases(ctx context.Context, releasesDir, keepHas
 		return nil
 	}
 
-	// Build the keep set: the N newest, plus the current hash unconditionally.
+	// Build the keep set: the N newest, plus current + previous
+	// unconditionally (rollback targets).
 	keepSet := map[string]bool{keepHash: true}
+	if previousHash != "" {
+		keepSet[previousHash] = true
+	}
 	for i := 0; i < keep && i < len(entries); i++ {
 		keepSet[entries[i]] = true
 	}
+	var failures []string
 	for _, e := range entries {
 		if keepSet[e] {
 			continue
 		}
-		_, _ = d.exec.Run(ctx, fmt.Sprintf("rm -rf %s/%s", releasesDir, e))
+		if _, rmErr := d.exec.Run(ctx, fmt.Sprintf("rm -rf %s/%s", ssh.ShellQuote(releasesDir), ssh.ShellQuote(e))); rmErr != nil {
+			failures = append(failures, e)
+		}
+	}
+	if len(failures) > 0 {
+		return fmt.Errorf("could not remove %d pruned release(s): %s", len(failures), strings.Join(failures, ", "))
 	}
 	return nil
 }
 
-// hashDir returns the sha256 of the *contents* of dir — file paths and bytes
-// — so deploys with identical output get identical hashes. Symlinks are
-// followed; permission bits are intentionally ignored to keep the hash stable
-// across umask differences between developer machines.
+// hashDir returns the sha256 of the *contents* of dir — file paths and
+// bytes — so deploys with identical output get identical hashes. Permission
+// bits are intentionally ignored to keep the hash stable across umask
+// differences between developer machines.
+//
+// The encoding is versioned and length-prefixed (v2). The v1 encoding
+// (path + NUL + bytes + NUL) was ambiguous: a tree containing file "a" with
+// bytes "X\0b\0Y" hashed identically to a tree with "a"="X" and "b"="Y", so
+// different content could reuse an existing release directory (audit F51).
+// Length prefixes make the record stream unambiguous. NOTE: v2 digests
+// differ from v1 for identical trees by design; a redeploy after upgrading
+// creates a fresh release once rather than matching pre-upgrade hashes.
+//
+// Symlinks and other non-regular files are rejected (audit F52): hashDir
+// FOLLOWS symlinks while rsync -a PRESERVES them, so the remote file could
+// resolve to different content than what was hashed, or point outside the
+// release entirely. Rejecting before upload means an unvalidated link never
+// reaches the server.
 func hashDir(dir string) (string, error) {
 	h := sha256.New()
-	var paths []string
+	type entry struct {
+		rel  string
+		path string
+		size int64
+		info fs.FileInfo
+	}
+	var files []entry
+	var dirs int
 	err := filepath.WalkDir(dir, func(p string, dEnt fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
-		if dEnt.IsDir() {
+		if p == dir {
 			return nil
 		}
-		paths = append(paths, p)
+		info, err := dEnt.Info()
+		if err != nil {
+			return err
+		}
+		if info.Mode()&fs.ModeSymlink != 0 {
+			return fmt.Errorf("static source contains a symlink (%s) — symlinks cannot be content-hashed faithfully; replace it with a regular file or copy the target", p)
+		}
+		if !info.IsDir() && !info.Mode().IsRegular() {
+			return fmt.Errorf("static source contains an unsupported entry (%s); only regular files and directories can be deployed", p)
+		}
+		rel, err := filepath.Rel(dir, p)
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			dirs++
+		} else {
+			files = append(files, entry{rel: filepath.ToSlash(rel), path: p, size: info.Size(), info: info})
+		}
 		return nil
 	})
 	if err != nil {
 		return "", err
 	}
-	sort.Strings(paths)
-	for _, p := range paths {
-		rel, _ := filepath.Rel(dir, p)
-		h.Write([]byte(rel))
-		h.Write([]byte{0})
-		f, err := os.Open(p)
+	if len(files) == 0 {
+		return "", fmt.Errorf("static source %s contains no files (did the build step run?)", dir)
+	}
+	sort.Slice(files, func(i, j int) bool { return files[i].rel < files[j].rel })
+
+	// Versioned, typed, length-prefixed records.
+	h.Write([]byte("teploy-static-tree-v2\x00"))
+	var num [8]byte
+	binary.BigEndian.PutUint64(num[:], uint64(len(files)+dirs))
+	h.Write(num[:])
+	putLen := func(n uint64) {
+		binary.BigEndian.PutUint64(num[:], n)
+		h.Write(num[:])
+	}
+	for _, e := range files {
+		h.Write([]byte{'F'})
+		putLen(uint64(len(e.rel)))
+		h.Write([]byte(e.rel))
+		f, err := os.Open(e.path)
 		if err != nil {
 			return "", err
 		}
-		_, err = io.Copy(h, f)
-		f.Close()
+		fi, err := f.Stat()
 		if err != nil {
+			_ = f.Close()
 			return "", err
 		}
-		h.Write([]byte{0})
+		if !fi.Mode().IsRegular() || !os.SameFile(e.info, fi) || fi.Size() != e.size {
+			_ = f.Close()
+			return "", fmt.Errorf("source changed while hashing: %s", e.path)
+		}
+		putLen(uint64(fi.Size()))
+		n, copyErr := io.Copy(h, io.LimitReader(f, fi.Size()+1))
+		after, statErr := f.Stat()
+		closeErr := f.Close()
+		if err := errors.Join(copyErr, statErr, closeErr); err != nil {
+			return "", err
+		}
+		if n != fi.Size() || after.Size() != fi.Size() {
+			return "", fmt.Errorf("source changed while hashing: %s", e.path)
+		}
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
@@ -454,7 +570,10 @@ func (d *StaticDeployer) Rollback(ctx context.Context, cfg StaticRollbackConfig)
 	}
 	defer state.ReleaseLockDetached(d.exec, cfg.App)
 
-	prior, _ := state.Read(ctx, d.exec, cfg.App)
+	prior, err := state.Read(ctx, d.exec, cfg.App)
+	if err != nil {
+		return fmt.Errorf("reading state for %s: %w", cfg.App, err)
+	}
 	if prior == nil {
 		return errors.New("no state found — has this app been deployed?")
 	}
@@ -469,16 +588,18 @@ func (d *StaticDeployer) Rollback(ctx context.Context, cfg StaticRollbackConfig)
 	if target == prior.CurrentHash {
 		return fmt.Errorf("target hash %s is already current", target)
 	}
+	if !safeReleaseName(target) {
+		return fmt.Errorf("invalid target release %q — expected a release id from `teploy releases`", target)
+	}
 
 	releasesDir := fmt.Sprintf("%s/%s/releases", cfg.StateDir, cfg.App)
-	currentLink := fmt.Sprintf("%s/%s/current", cfg.StateDir, cfg.App)
 
 	// Verify the target release still exists on disk.
 	if out, _ := d.exec.Run(ctx, fmt.Sprintf("test -d %s/%s && echo yes || true", releasesDir, target)); strings.TrimSpace(out) != "yes" {
 		return fmt.Errorf("release %s no longer on server (may have been pruned)", target)
 	}
 
-	if _, err := d.exec.Run(ctx, fmt.Sprintf("ln -sfn releases/%s %s", target, currentLink)); err != nil {
+	if err := d.swapCurrentLink(ctx, cfg.App, cfg.StateDir, target); err != nil {
 		return fmt.Errorf("symlink swap: %w", err)
 	}
 
@@ -492,7 +613,7 @@ func (d *StaticDeployer) Rollback(ctx context.Context, cfg StaticRollbackConfig)
 		Headers:     cfg.Headers,
 		CaddyExtra:  cfg.CaddyExtra,
 	}); err != nil {
-		if restoreErr := d.restoreStaticLink(ctx, currentLink, prior); restoreErr != nil {
+		if restoreErr := d.restoreStaticLink(ctx, cfg.App, cfg.StateDir, prior); restoreErr != nil {
 			return fmt.Errorf("caddy route: %w; restoring release %s failed: %v", err, prior.CurrentHash, restoreErr)
 		}
 		return fmt.Errorf("caddy route: %w; release %s was restored", err, prior.CurrentHash)
@@ -511,7 +632,7 @@ func (d *StaticDeployer) Rollback(ctx context.Context, cfg StaticRollbackConfig)
 		newState.ApplyRelease(prior.PreviousRelease)
 	}
 	if err := state.Write(ctx, d.exec, cfg.App, newState); err != nil {
-		if restoreErr := d.restoreStaticLink(ctx, currentLink, prior); restoreErr != nil {
+		if restoreErr := d.restoreStaticLink(ctx, cfg.App, cfg.StateDir, prior); restoreErr != nil {
 			return fmt.Errorf("committing authoritative applied state after static rollback route switch: %w; restoring release %s failed: %v; the target release was left active", err, prior.CurrentHash, restoreErr)
 		}
 		return fmt.Errorf("committing authoritative applied state after static rollback route switch: %w; release %s was restored and state remains unchanged", err, prior.CurrentHash)

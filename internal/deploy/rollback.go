@@ -73,6 +73,11 @@ func (c RollbackConfig) ingressHost() bool { return c.Ingress == "host" }
 // Starts the target version's containers, health checks, re-routes
 // traffic, and stops the current containers. Updates state so target
 // becomes current and the version rolled back from becomes previous.
+//
+// The whole operation runs under the app lock (audit F11): an unlocked
+// rollback could race a deploy, another rollback, or pruning while both
+// read and replace the same authoritative state. StaticDeployer.Rollback
+// already locks; this now matches it.
 func Rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg RollbackConfig) error {
 	start := time.Now()
 	dk := docker.NewClient(exec)
@@ -103,12 +108,37 @@ func Rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg Rollbac
 		return fmt.Errorf("target version %s is already current", target)
 	}
 
+	// 1b. Serialize against deploys and other rollbacks (F11).
+	if err := state.AcquireLock(ctx, exec, cfg.App); err != nil {
+		return fmt.Errorf("acquiring deploy lock: %w", err)
+	}
+	defer state.ReleaseLockDetached(exec, cfg.App)
+
 	fmt.Fprintf(out, "Rolling back %s from %s to %s...\n", cfg.App, current.CurrentHash, target)
 
-	// 2. Find and start the target version's containers.
+	// 2. Find the target version's containers. This happens BEFORE anything
+	// is stopped: a missing/pruned target must fail while the current
+	// workload is still serving, not after host ingress already freed its
+	// fixed port (audit F12).
 	containers, err := dk.ListContainers(ctx, cfg.App)
 	if err != nil {
 		return fmt.Errorf("listing containers: %w", err)
+	}
+	var targetContainers, targetWebCandidates []docker.Container
+	for _, c := range containers {
+		if c.Labels["teploy.version"] != target {
+			continue
+		}
+		targetContainers = append(targetContainers, c)
+		if c.Labels["teploy.process"] == "web" {
+			targetWebCandidates = append(targetWebCandidates, c)
+		}
+	}
+	if len(targetContainers) == 0 {
+		return fmt.Errorf("no containers found for version %s — they may have been pruned (keep_versions retention)", target)
+	}
+	if len(targetWebCandidates) == 0 {
+		return fmt.Errorf("no web container found for version %s", target)
 	}
 
 	// Ports the current (about-to-be-stopped) version is live on right now —
@@ -152,12 +182,30 @@ func Rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg Rollbac
 	// there is no moment where both versions are live, so the window between
 	// stopping the current one and proving the target healthy is unavoidable.
 	var displacedHostWeb []string
+	// restoreDisplaced brings back the fixed-port workload displaced by host
+	// ingress. Every failure path after the displacement runs it — an error
+	// that returns while the displaced workload is still stopped leaves a
+	// host-ingress app down (audit F12).
+	restoreDisplaced := func() {
+		recoveryCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		for _, name := range displacedHostWeb {
+			if rerr := dk.Restart(recoveryCtx, name, nil); rerr != nil {
+				fmt.Fprintf(out, "  WARNING: could not restore %s after the failed rollback: %v\n", name, rerr)
+			} else {
+				fmt.Fprintf(out, "  Restored %s\n", name)
+			}
+		}
+	}
 	if cfg.ingressHost() {
 		for _, c := range containers {
 			if c.Labels["teploy.process"] != "web" || c.Labels["teploy.version"] == target {
 				continue
 			}
 			if err := dk.Stop(ctx, c.Name, 10); err != nil {
+				// Earlier containers may already be stopped — restore them
+				// before bailing (F12).
+				restoreDisplaced()
 				return fmt.Errorf("stopping current host-ingress container %s to free its fixed port: %w", c.Name, err)
 			}
 			fmt.Fprintf(out, "Freed the fixed port from %s\n", c.Name)
@@ -167,10 +215,7 @@ func Rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg Rollbac
 
 	var started []string
 	var targetWeb []docker.Container
-	for _, c := range containers {
-		if c.Labels["teploy.version"] != target {
-			continue
-		}
+	for _, c := range targetContainers {
 		fmt.Fprintf(out, "Starting %s...\n", c.Name)
 		// Recreate rather than `docker start`: Docker 29 silently fails
 		// to re-publish HostConfig.PortBindings on `docker start` when
@@ -181,6 +226,12 @@ func Rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg Rollbac
 		// with the same config, reallocating any port binding that
 		// collides with avoidPorts.
 		if err := dk.Restart(ctx, c.Name, avoidPorts); err != nil {
+			// Stop anything this rollback already (re)started, then put the
+			// displaced fixed-port workload back (F12).
+			for _, name := range started {
+				dk.Stop(ctx, name, 5)
+			}
+			restoreDisplaced()
 			return fmt.Errorf("restarting target container %s: %w", c.Name, err)
 		}
 		started = append(started, c.Name)
@@ -189,13 +240,7 @@ func Rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg Rollbac
 		}
 	}
 
-	if len(started) == 0 {
-		return fmt.Errorf("no containers found for version %s — they may have been pruned (keep_versions retention)", target)
-	}
 	sort.Slice(targetWeb, func(i, j int) bool { return targetWeb[i].Name < targetWeb[j].Name })
-	if len(targetWeb) == 0 {
-		return fmt.Errorf("no web container found for version %s", target)
-	}
 
 	// 3. Health check every target replica's host port (not just the
 	// primary), so a replica that comes back unhealthy after recreation is
@@ -217,6 +262,12 @@ func Rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg Rollbac
 	for _, c := range targetWeb {
 		p, err := dk.HostPort(ctx, c.Name)
 		if err != nil {
+			// A failed inspect must not strand the displaced fixed-port
+			// workload (F12).
+			for _, name := range started {
+				dk.Stop(ctx, name, 5)
+			}
+			restoreDisplaced()
 			return fmt.Errorf("inspecting target container host port: %w", err)
 		}
 		healthPorts = append(healthPorts, p)
@@ -234,13 +285,7 @@ func Rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg Rollbac
 			// fixed port. Put it back, or a failed rollback leaves the app down
 			// rather than where it started. Best-effort: there is nothing better
 			// to do if this also fails, and the original error is the useful one.
-			for _, name := range displacedHostWeb {
-				if rerr := dk.Restart(ctx, name, nil); rerr != nil {
-					fmt.Fprintf(out, "  WARNING: could not restore %s after the failed rollback: %v\n", name, rerr)
-				} else {
-					fmt.Fprintf(out, "  Restored %s\n", name)
-				}
-			}
+			restoreDisplaced()
 			return fmt.Errorf("health check failed on target version: %w", err)
 		}
 	}
@@ -270,7 +315,7 @@ func Rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg Rollbac
 				}
 				upstreams = append(upstreams, caddy.Upstream{Dial: fmt.Sprintf("%s:%d", c.Name, port)})
 			}
-			if err := cd.SetLoadBalancer(ctx, cfg.App, cfg.Domain, upstreams, tls, cfg.CaddyExtra, cfg.Cache, cfg.Firewall, cfg.Access); err != nil {
+			if err := cd.SetLoadBalancerHealth(ctx, cfg.App, cfg.Domain, upstreams, healthCfg.Path, tls, cfg.CaddyExtra, cfg.Cache, cfg.Firewall, cfg.Access); err != nil {
 				return fmt.Errorf("updating load balancer route: %w", err)
 			}
 			fmt.Fprintf(out, "  Traffic load-balanced across %d replicas\n", len(targetWeb))
@@ -326,6 +371,20 @@ func Rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg Rollbac
 		newState.ImageDigest = digest
 	}
 	if err := state.Write(ctx, exec, cfg.App, newState); err != nil {
+		// Host ingress: the target holds the fixed port. Stop it, restore the
+		// displaced workload, then remove the uncommitted target — previously
+		// this branch skipped the restore and still claimed "the original
+		// workload was left running" (audit F12).
+		if cfg.ingressHost() {
+			for _, name := range started {
+				dk.Stop(ctx, name, 5)
+			}
+			restoreDisplaced()
+			for _, name := range started {
+				dk.Remove(ctx, name)
+			}
+			return fmt.Errorf("committing authoritative applied state after rollback: %w; the fixed-port workload was restored and the uncommitted target was removed", err)
+		}
 		if cfg.usesCaddy() {
 			if restoreErr := restoreRollbackRoute(ctx, cd, dk, cfg, current, containers); restoreErr != nil {
 				return fmt.Errorf("committing authoritative applied state after rollback route switch: %w; restoring the original route failed: %v; original and target workloads were left running to avoid routing to a stopped container", err, restoreErr)
@@ -394,5 +453,5 @@ func restoreRollbackRoute(ctx context.Context, cd *caddy.Client, dk *docker.Clie
 		}
 		upstreams[i] = caddy.Upstream{Dial: fmt.Sprintf("%s:%d", container.Name, port)}
 	}
-	return cd.SetLoadBalancer(ctx, cfg.App, domain, upstreams, tls, cfg.CaddyExtra, cfg.Cache, cfg.Firewall, cfg.Access)
+	return cd.SetLoadBalancerHealth(ctx, cfg.App, domain, upstreams, cfg.Health.withDefaults().Path, tls, cfg.CaddyExtra, cfg.Cache, cfg.Firewall, cfg.Access)
 }

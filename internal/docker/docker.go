@@ -62,6 +62,29 @@ func ContainerName(app, process, version string) string {
 	return app + "-" + process + "-" + version
 }
 
+// ImageRepository returns the repository component of an image reference:
+// "postgres:16" → "postgres", "library/postgres" → "postgres",
+// "registry.example:5000/postgres:16" → "postgres",
+// "postgres@sha256:..." → "postgres". The FIRST colon used to be treated as
+// the tag separator, which collapsed "registry.example:5000/postgres" to
+// "registry.example" — classification by final repository component avoids
+// confusing a registry-port colon with a tag colon (audit F71). Not a full
+// OCI reference validator; callers use it for engine-type matching only.
+func ImageRepository(image string) string {
+	if i := strings.LastIndex(image, "@"); i >= 0 {
+		image = image[:i]
+	}
+	lastSlash := strings.LastIndex(image, "/")
+	lastColon := strings.LastIndex(image, ":")
+	if lastColon > lastSlash {
+		image = image[:lastColon]
+	}
+	if i := strings.LastIndex(image, "/"); i >= 0 {
+		image = image[i+1:]
+	}
+	return image
+}
+
 // ReplicaContainerName returns a replica-indexed container name: {app}-{process}-{version}-{index}.
 // Index is 1-based. If index is 0 or 1 with total replicas=1, falls back to standard name.
 func ReplicaContainerName(app, process, version string, index, total int) string {
@@ -308,6 +331,13 @@ func (c *Client) Start(ctx context.Context, name string) error {
 // containerInspect mirrors the subset of `docker inspect` JSON we use to
 // reconstruct a container's `docker run` invocation.
 type containerInspect struct {
+	// Image is the container's immutable, content-addressed image ID
+	// (sha256:…). This — not Config.Image, which is the original (possibly
+	// mutable tag) reference — is the identity a faithful recreation must
+	// preserve: after a newer image is pulled under the same tag,
+	// recreating from Config.Image silently runs the NEW bytes while
+	// reporting the old version (audit F19).
+	Image string
 	Config struct {
 		Image       string
 		Env         []string
@@ -454,8 +484,10 @@ func (c *Client) Restart(ctx context.Context, name string, avoidPorts map[int]bo
 	}
 
 	// Bind mounts (already host:container[:mode] formatted by docker).
+	// Quoted: a host path with a space would otherwise word-split into a
+	// second -v fragment or bleed into the next argument (F17).
 	for _, b := range spec.HostConfig.Binds {
-		args = append(args, "-v", b)
+		args = append(args, "-v", ssh.ShellQuote(b))
 	}
 
 	// Named volume + tmpfs + non-bind mounts (Binds covers bind mounts; this
@@ -511,8 +543,16 @@ func (c *Client) Restart(ctx context.Context, name string, avoidPorts map[int]bo
 		args = append(args, "-u", spec.Config.User)
 	}
 
-	// Image (last positional before cmd).
-	args = append(args, ssh.ShellQuote(spec.Config.Image))
+	// Image (last positional before cmd). Prefer the container's immutable
+	// top-level image ID over the Config.Image tag reference so a tag that
+	// has moved to newer bytes cannot silently change what the recreated
+	// container runs (F19). Config.Image is kept only as a fallback for
+	// odd daemons that report no top-level ID.
+	imageRef := spec.Image
+	if imageRef == "" || !strings.HasPrefix(imageRef, "sha256:") {
+		imageRef = spec.Config.Image
+	}
+	args = append(args, ssh.ShellQuote(imageRef))
 
 	// Cmd.
 	for _, cmdPart := range spec.Config.Cmd {

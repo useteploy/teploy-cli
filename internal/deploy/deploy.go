@@ -104,18 +104,43 @@ func NewDeployer(exec ssh.Executor, out io.Writer) *Deployer {
 	}
 }
 
-// Deploy performs a zero-downtime deploy.
-//
-// Flow: lock → start web → health check → start workers → route traffic →
-// write state → stop old containers → log → unlock.
-func (d *Deployer) Deploy(ctx context.Context, cfg Config) error {
-	if cfg.App == "" || cfg.Image == "" || cfg.Version == "" {
+// validate checks the deploy config's required fields.
+func (c Config) validate() error {
+	if c.App == "" || c.Image == "" || c.Version == "" {
 		return fmt.Errorf("app, image, and version are required")
 	}
 	// Caddy/external ingress route by domain; host ingress publishes a raw
 	// port and needs no domain.
-	if cfg.Domain == "" && !cfg.ingressHost() {
+	if c.Domain == "" && !c.ingressHost() {
 		return fmt.Errorf("domain is required")
+	}
+	return nil
+}
+
+// Deploy performs a zero-downtime deploy, acquiring the app lock for the
+// duration. Callers that already hold the app lock (the autodeploy path,
+// which locks before fetching so the checkout can't race a concurrent
+// trigger) must call DeployLocked instead — acquiring twice deadlocks on the
+// lock this just created (audit F07).
+//
+// Flow: lock → start web → health check → start workers → route traffic →
+// write state → stop old containers → log → unlock.
+func (d *Deployer) Deploy(ctx context.Context, cfg Config) error {
+	if err := cfg.validate(); err != nil {
+		return err
+	}
+	if err := state.AcquireLock(ctx, d.exec, cfg.App); err != nil {
+		return err
+	}
+	defer state.ReleaseLockDetached(d.exec, cfg.App)
+	return d.DeployLocked(ctx, cfg)
+}
+
+// DeployLocked performs a zero-downtime deploy WITHOUT acquiring the app
+// lock. The caller must already hold it (see Deploy).
+func (d *Deployer) DeployLocked(ctx context.Context, cfg Config) error {
+	if err := cfg.validate(); err != nil {
+		return err
 	}
 
 	stopTimeout := cfg.StopTimeout
@@ -160,8 +185,13 @@ func (d *Deployer) Deploy(ctx context.Context, cfg Config) error {
 	}
 	defer state.ReleaseLockDetached(d.exec, cfg.App)
 
-	// 3. Read current state.
-	current, _ := state.Read(ctx, d.exec, cfg.App)
+	// 3. Read current state. A read failure must stop the deploy — treating
+	// an unreadable state file as "no state" loses rollback bookkeeping and
+	// makes a replacement deploy look like a first deploy (audit F15).
+	current, err := state.Read(ctx, d.exec, cfg.App)
+	if err != nil {
+		return fmt.Errorf("refusing to deploy with unreadable state for %s: %w", cfg.App, err)
+	}
 
 	// 4. Determine host ports for all web replicas.
 	var ports []int
@@ -231,15 +261,23 @@ func (d *Deployer) Deploy(ctx context.Context, cfg Config) error {
 	// may have left one behind in Exited state, which would cause the rename to fail
 	// silently and leave the live container unrenamed, causing a "name already in use"
 	// conflict when docker run tries to start the new container.
+	//
+	// The candidate names are DEDUPLICATED first: with replicas==1 the replica
+	// name and the non-indexed name are the SAME string, and processing both
+	// used to (a) rename the live container to _replaced, then (b) remove
+	// _replaced and rename again — deleting the running predecessor before its
+	// replacement had even started, let alone passed its health check (audit
+	// F03).
 	if current != nil && current.CurrentHash == cfg.Version {
+		seen := map[string]bool{}
 		for _, process := range sortedProcessNames(processes) {
 			for ri := 1; ri <= replicas; ri++ {
-				name := docker.ReplicaContainerName(cfg.App, process, cfg.Version, ri, replicas)
-				d.exec.Run(ctx, fmt.Sprintf("docker rm -f %s 2>/dev/null", name+"_replaced"))
-				d.exec.Run(ctx, fmt.Sprintf("docker rename %s %s 2>/dev/null", name, name+"_replaced"))
+				seen[docker.ReplicaContainerName(cfg.App, process, cfg.Version, ri, replicas)] = true
 			}
 			// Also rename the non-indexed name (from pre-replica deploys).
-			name := docker.ContainerName(cfg.App, process, cfg.Version)
+			seen[docker.ContainerName(cfg.App, process, cfg.Version)] = true
+		}
+		for name := range seen {
 			d.exec.Run(ctx, fmt.Sprintf("docker rm -f %s 2>/dev/null", name+"_replaced"))
 			d.exec.Run(ctx, fmt.Sprintf("docker rename %s %s 2>/dev/null", name, name+"_replaced"))
 		}
@@ -255,15 +293,58 @@ func (d *Deployer) Deploy(ctx context.Context, cfg Config) error {
 			"docker ps --filter label=teploy.app=%s --filter label=teploy.process=web --format '{{.Names}}'", cfg.App))
 		for _, name := range strings.Fields(names) {
 			if err := d.docker.Stop(ctx, name, stopTimeout); err != nil {
-				return fmt.Errorf("stopping current host-ingress container %s: %w", name, err)
+				// A later container's stop failed after earlier ones already
+				// stopped: bring the displaced ones back before bailing (F05).
+				recoveryCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+				var lastErr error
+				for _, old := range displacedHostWeb {
+					if rerr := d.docker.Restart(recoveryCtx, old, nil); rerr != nil {
+						lastErr = rerr
+					}
+				}
+				cancel()
+				if lastErr != nil {
+					return fmt.Errorf("stopping current host-ingress container %s: %w — restoring the displaced workload also failed: %v; %s needs manual attention", name, err, lastErr, cfg.App)
+				}
+				return fmt.Errorf("stopping current host-ingress container %s: %w — the displaced workload was restored", name, err)
 			}
 			displacedHostWeb = append(displacedHostWeb, name)
 		}
 	}
 
-	// Track started containers for cleanup on failure.
+	// Track started containers for cleanup on failure. The failure handler
+	// is installed BEFORE the first container starts so an error at any
+	// later step (second replica, worker, hook, health, route) cleans up
+	// everything this deploy started AND restores the fixed-port workload
+	// displaced by host ingress — previously an early docker-run failure
+	// returned without either, orphaning the first replica and leaving a
+	// host-ingress app down (audit F05).
 	var started []string
 	webContainerNames := make([]string, replicas)
+	restoreDisplacedAndStarted := func(reason error) error {
+		// Cleanup runs detached from the (possibly cancelled) deploy context,
+		// bounded so a hung cleanup cannot outlive the process.
+		recoveryCtx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+		defer cancel()
+		for _, n := range started {
+			d.docker.Stop(recoveryCtx, n, 5)
+			d.docker.Remove(recoveryCtx, n)
+		}
+		restored := len(started) == 0
+		for _, old := range displacedHostWeb {
+			if err := d.docker.Restart(recoveryCtx, old, nil); err != nil {
+				fmt.Fprintf(d.out, "  WARNING: could not restore displaced container %s: %v\n", old, err)
+			} else {
+				restored = true
+				fmt.Fprintf(d.out, "  Restored %s\n", old)
+			}
+		}
+		d.logDeploy(recoveryCtx, cfg, false, start)
+		if !restored && len(displacedHostWeb) > 0 {
+			return fmt.Errorf("%w — recovery also failed: no container is serving; %s needs manual attention", reason, cfg.App)
+		}
+		return reason
+	}
 
 	// 6. Start web container(s).
 	for i := 0; i < replicas; i++ {
@@ -289,7 +370,7 @@ func (d *Deployer) Deploy(ctx context.Context, cfg Config) error {
 			NoHealthcheck: cfg.NoHealthcheck["web"],
 		})
 		if err != nil {
-			return fmt.Errorf("starting container %s: %w", name, err)
+			return restoreDisplacedAndStarted(fmt.Errorf("starting container %s: %w", name, err))
 		}
 		started = append(started, name)
 		fmt.Fprintf(d.out, "  Container %s started\n", containerID[:min(12, len(containerID))])
@@ -305,12 +386,7 @@ func (d *Deployer) Deploy(ctx context.Context, cfg Config) error {
 			fmt.Fprintf(d.out, "\n--- Container logs ---\n%s\n--- End logs ---\n", logs)
 		}
 		d.printDiagnosis(ctx, webContainerName, cfg.ContainerPort, reason, logs)
-		for _, n := range started {
-			d.docker.Stop(ctx, n, 5)
-			d.docker.Remove(ctx, n)
-		}
-		d.logDeploy(ctx, cfg, false, start)
-		return reason
+		return restoreDisplacedAndStarted(reason)
 	}
 
 	// 7. Verify all web containers are running (catch immediate crashes).
@@ -393,7 +469,9 @@ func (d *Deployer) Deploy(ctx context.Context, cfg Config) error {
 			for i := range replicas {
 				upstreams[i] = caddy.Upstream{Dial: fmt.Sprintf("%s:%d", webContainerNames[i], cfg.ContainerPort)}
 			}
-			if err := d.caddy.SetLoadBalancer(ctx, cfg.App, cfg.Domain, upstreams, tls, cfg.CaddyExtra, cfg.Cache, cfg.Firewall, cfg.Access); err != nil {
+			// Caddy's active upstream checks probe the SAME path the deploy
+			// readiness gate used (F47) — the block used to hardcode /up.
+			if err := d.caddy.SetLoadBalancerHealth(ctx, cfg.App, cfg.Domain, upstreams, healthCfg.Path, tls, cfg.CaddyExtra, cfg.Cache, cfg.Firewall, cfg.Access); err != nil {
 				return fail(fmt.Errorf("updating load balancer route: %w", err))
 			}
 			fmt.Fprintf(d.out, "  Traffic load-balanced across %d replicas\n", replicas)
@@ -445,49 +523,39 @@ func (d *Deployer) Deploy(ctx context.Context, cfg Config) error {
 	// 14. Stop old containers (all processes + all replicas).
 	// For same-version redeploys the old containers were renamed to _replaced;
 	// remove them after stopping so they don't block the next same-version deploy.
+	//
+	// The inventory path matches by the teploy.version LABEL across the full
+	// container list rather than by deriving names from the NEW process map —
+	// a worker removed from the manifest has no entry in the new map, but its
+	// old container can still be running, and duplicate consumers after a
+	// successful deploy are exactly as bad as the bug they fix (audit F06).
+	// The name-derived fallback only runs when the inventory cannot be listed.
 	sameVersion := current != nil && current.CurrentHash == cfg.Version
 	if current != nil && current.CurrentHash != "" {
-		// Stop old web replicas.
-		oldReplicas := len(current.CurrentPorts)
-		if oldReplicas == 0 {
-			oldReplicas = 1
+		stopped := map[string]bool{}
+		if inv, invErr := d.docker.ListContainers(ctx, cfg.App); invErr == nil {
+			for _, ct := range inv {
+				if ct.Labels["teploy.role"] == "accessory" {
+					continue // accessories have their own lifecycle
+				}
+				if ct.Labels["teploy.version"] != current.CurrentHash {
+					continue
+				}
+				if !sameVersion && ct.State != "running" {
+					continue // older stopped versions are kept as rollback targets
+				}
+				fmt.Fprintf(d.out, "Stopping old container %s...\n", ct.Name)
+				d.docker.Stop(ctx, ct.Name, stopTimeout)
+				if sameVersion {
+					d.docker.Remove(ctx, ct.Name)
+				}
+				stopped[ct.Name] = true
+			}
+		} else {
+			fmt.Fprintf(d.out, "Warning: could not list containers for old-workload cleanup (%v); falling back to name matching\n", invErr)
 		}
-		for ri := 1; ri <= oldReplicas; ri++ {
-			oldName := docker.ReplicaContainerName(cfg.App, "web", current.CurrentHash, ri, oldReplicas)
-			if sameVersion {
-				oldName += "_replaced"
-			}
-			fmt.Fprintf(d.out, "Stopping old container %s...\n", oldName)
-			d.docker.Stop(ctx, oldName, stopTimeout)
-			if sameVersion {
-				d.docker.Remove(ctx, oldName)
-			}
-		}
-		// Also stop non-indexed name (from pre-replica deploys).
-		if oldReplicas <= 1 {
-			oldName := docker.ContainerName(cfg.App, "web", current.CurrentHash)
-			if sameVersion {
-				oldName += "_replaced"
-			}
-			d.docker.Stop(ctx, oldName, stopTimeout)
-			if sameVersion {
-				d.docker.Remove(ctx, oldName)
-			}
-		}
-		// Stop old worker processes (always 1 per type).
-		for _, process := range sortedProcessNames(processes) {
-			if process == "web" {
-				continue
-			}
-			oldName := docker.ContainerName(cfg.App, process, current.CurrentHash)
-			if sameVersion {
-				oldName += "_replaced"
-			}
-			fmt.Fprintf(d.out, "Stopping old container %s...\n", oldName)
-			d.docker.Stop(ctx, oldName, stopTimeout)
-			if sameVersion {
-				d.docker.Remove(ctx, oldName)
-			}
+		if len(stopped) == 0 {
+			stopOldWorkloadsByName(ctx, d.docker, d.out, cfg, current, processes, stopTimeout)
 		}
 	}
 
@@ -515,16 +583,21 @@ func (d *Deployer) Deploy(ctx context.Context, cfg Config) error {
 		}
 		// Pinned versions are protected from pruning regardless of the keep
 		// window (teploy pin). Read them off the server so terminal, dash,
-		// and autodeploy all honor the same set.
+		// and autodeploy all honor the same set. A read failure SKIPS
+		// pruning entirely — treating an unreadable pin file as "no pins"
+		// could delete versions the operator deliberately retained (F78).
 		protected := []string{cfg.Version, prevHash}
-		if pins, err := state.ReadPins(ctx, d.exec, cfg.App); err == nil {
+		pins, pinsErr := state.ReadPins(ctx, d.exec, cfg.App)
+		if pinsErr != nil {
+			fmt.Fprintf(d.out, "Warning: version prune skipped — pin state could not be read: %v\n", pinsErr)
+		} else {
 			protected = append(protected, pins...)
-		}
-		pruned, err := d.docker.PruneVersions(ctx, cfg.App, cfg.KeepVersions, protected...)
-		if err != nil {
-			fmt.Fprintf(d.out, "Warning: version prune failed: %v\n", err)
-		} else if len(pruned) > 0 {
-			fmt.Fprintf(d.out, "Pruned %d superseded version(s): %s\n", len(pruned), strings.Join(pruned, ", "))
+			pruned, err := d.docker.PruneVersions(ctx, cfg.App, cfg.KeepVersions, protected...)
+			if err != nil {
+				fmt.Fprintf(d.out, "Warning: version prune failed: %v\n", err)
+			} else if len(pruned) > 0 {
+				fmt.Fprintf(d.out, "Pruned %d superseded version(s): %s\n", len(pruned), strings.Join(pruned, ", "))
+			}
 		}
 	}
 
@@ -534,6 +607,41 @@ func (d *Deployer) Deploy(ctx context.Context, cfg Config) error {
 	duration := time.Since(start)
 	fmt.Fprintf(d.out, "\nDeployed %s version %s in %s\n", cfg.App, cfg.Version, duration.Round(time.Millisecond))
 	return nil
+}
+
+// stopOldWorkloadsByName is the name-derived fallback for old-workload
+// cleanup when the container inventory cannot be listed (see step 14).
+func stopOldWorkloadsByName(ctx context.Context, dk *docker.Client, out io.Writer, cfg Config, current *state.AppState, processes map[string]string, stopTimeout int) {
+	if current == nil || current.CurrentHash == "" {
+		return
+	}
+	sameVersion := current.CurrentHash == cfg.Version
+	oldReplicas := len(current.CurrentPorts)
+	if oldReplicas == 0 {
+		oldReplicas = 1
+	}
+	stop := func(name string) {
+		if sameVersion {
+			name += "_replaced"
+		}
+		fmt.Fprintf(out, "Stopping old container %s...\n", name)
+		dk.Stop(ctx, name, stopTimeout)
+		if sameVersion {
+			dk.Remove(ctx, name)
+		}
+	}
+	for ri := 1; ri <= oldReplicas; ri++ {
+		stop(docker.ReplicaContainerName(cfg.App, "web", current.CurrentHash, ri, oldReplicas))
+	}
+	if oldReplicas <= 1 {
+		stop(docker.ContainerName(cfg.App, "web", current.CurrentHash))
+	}
+	for _, process := range sortedProcessNames(processes) {
+		if process == "web" {
+			continue
+		}
+		stop(docker.ContainerName(cfg.App, process, current.CurrentHash))
+	}
 }
 
 func (d *Deployer) abortStateCommit(ctx context.Context, cfg Config, current *state.AppState, started, displacedHostWeb []string, start time.Time, commitErr error) error {
@@ -613,7 +721,7 @@ func (d *Deployer) restorePreviousRoute(ctx context.Context, cfg Config, current
 	}
 	tls := caddy.TLS{Cert: cfg.TLSCert, Key: cfg.TLSKey, Internal: cfg.TLSInternal}
 	if replicas > 1 {
-		return d.caddy.SetLoadBalancer(ctx, cfg.App, domain, upstreams, tls, cfg.CaddyExtra, cfg.Cache, cfg.Firewall, cfg.Access)
+		return d.caddy.SetLoadBalancerHealth(ctx, cfg.App, domain, upstreams, cfg.Health.Path, tls, cfg.CaddyExtra, cfg.Cache, cfg.Firewall, cfg.Access)
 	}
 	return d.caddy.SetRoute(ctx, cfg.App, domain, names[0], primaryPort, tls, cfg.CaddyExtra, cfg.Cache, cfg.Firewall, cfg.Access)
 }

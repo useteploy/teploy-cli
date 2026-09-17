@@ -59,7 +59,7 @@ func TestStaticDeploy_FreshFirstDeploy(t *testing.T) {
 		// rename tmp to final
 		ssh.MockCommand{Match: "mv /deployments/myapp/releases/", Output: ""},
 		// symlink swap
-		ssh.MockCommand{Match: "ln -sfn releases/", Output: ""},
+		ssh.MockCommand{Match: "ln -s -- releases/", Output: ""},
 		// caddy admin API: ensure server (success — already exists)
 		ssh.MockCommand{Match: "curl -sf http://localhost:2019/config/apps/http/servers/srv0", Output: `{"listen":[":80",":443"]}`},
 		// deleteRouteByID for stale teploy-myapp / teploy-lb-myapp (404 = no-op)
@@ -68,6 +68,7 @@ func TestStaticDeploy_FreshFirstDeploy(t *testing.T) {
 		ssh.MockCommand{Match: "cat /deployments/caddy/Caddyfile", Output: "{\n\tadmin 0.0.0.0:2019\n}\n"},
 		ssh.MockCommand{Match: "mv /tmp/teploy_caddyfile.tmp", Output: ""},
 		ssh.MockCommand{Match: "mkdir /deployments/caddy/.lock", Output: ""},
+		ssh.MockCommand{Match: "[ \"$(docker exec caddy md5sum", Output: "TEPLOY_CADDY_OK"},
 		ssh.MockCommand{Match: "rmdir /deployments/caddy/.lock", Output: ""},
 		// caddy reload
 		ssh.MockCommand{Match: "docker exec caddy caddy reload", Output: ""},
@@ -101,12 +102,13 @@ func TestStaticDeploy_FreshFirstDeploy(t *testing.T) {
 		ssh.MockCommand{Match: "mkdir -p /deployments/myapp/releases", Output: ""},
 		// Pre-existing release dir → skip rsync
 		ssh.MockCommand{Match: "test -d /deployments/myapp/releases/", Output: "yes"},
-		ssh.MockCommand{Match: "ln -sfn releases/", Output: ""},
+		ssh.MockCommand{Match: "ln -s -- releases/", Output: ""},
 		ssh.MockCommand{Match: "curl -sf http://localhost:2019/config/apps/http/servers/srv0", Output: `{"listen":[":80",":443"]}`},
 		ssh.MockCommand{Match: "curl -sf -X DELETE", Err: fmt.Errorf("not found")},
 		ssh.MockCommand{Match: "cat /deployments/caddy/Caddyfile", Output: "{\n\tadmin 0.0.0.0:2019\n}\n"},
 		ssh.MockCommand{Match: "mv /tmp/teploy_caddyfile.tmp", Output: ""},
 		ssh.MockCommand{Match: "mkdir /deployments/caddy/.lock", Output: ""},
+		ssh.MockCommand{Match: "[ \"$(docker exec caddy md5sum", Output: "TEPLOY_CADDY_OK"},
 		ssh.MockCommand{Match: "rmdir /deployments/caddy/.lock", Output: ""},
 		ssh.MockCommand{Match: "docker exec caddy caddy reload", Output: ""},
 		ssh.MockCommand{Match: "ls -1t /deployments/myapp/releases", Output: ""},
@@ -135,7 +137,7 @@ func TestStaticDeploy_FreshFirstDeploy(t *testing.T) {
 	}
 
 	// Verify a Caddyfile mirror upload happened with a static block.
-	mirror, ok := mock.Files["/tmp/teploy_caddyfile.tmp"]
+	mirror, ok := mock.Files["/deployments/caddy/Caddyfile"]
 	if !ok {
 		t.Fatal("caddyfile mirror not uploaded")
 	}
@@ -167,10 +169,11 @@ func TestStaticDeploy_StateCommitFailureRestoresPreviousRelease(t *testing.T) {
 		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state' ]", Output: "present\n" + "current_hash=old123\nprevious_hash=older456\n"},
 		ssh.MockCommand{Match: "mkdir -p /deployments/myapp/releases", Output: ""},
 		ssh.MockCommand{Match: "test -d /deployments/myapp/releases/", Output: "yes"},
-		ssh.MockCommand{Match: "ln -sfn releases/", Output: ""},
+		ssh.MockCommand{Match: "ln -s -- releases/", Output: ""},
 		ssh.MockCommand{Match: "cat /deployments/caddy/Caddyfile", Output: "{\n\tadmin 0.0.0.0:2019\n}\n"},
 		ssh.MockCommand{Match: "mv /tmp/teploy_caddyfile.tmp", Output: ""},
 		ssh.MockCommand{Match: "mkdir /deployments/caddy/.lock", Output: ""},
+		ssh.MockCommand{Match: "[ \"$(docker exec caddy md5sum", Output: "TEPLOY_CADDY_OK"},
 		ssh.MockCommand{Match: "docker exec caddy caddy reload", Output: ""},
 		ssh.MockCommand{Match: "rmdir /deployments/caddy/.lock", Output: ""},
 		ssh.MockCommand{Match: "UPLOAD:/deployments/myapp/state.json.tmp-", Err: fmt.Errorf("disk full")},
@@ -189,7 +192,7 @@ func TestStaticDeploy_StateCommitFailureRestoresPreviousRelease(t *testing.T) {
 	}
 	var lastSwap string
 	for _, call := range mock.Calls {
-		if strings.HasPrefix(call, "ln -sfn releases/") {
+		if strings.HasPrefix(call, "ln -s -- releases/") {
 			lastSwap = call
 		}
 		if strings.HasPrefix(call, "ls -1t /deployments/myapp/releases") {
@@ -207,10 +210,11 @@ func TestStaticRollback_StateCommitFailureRestoresOriginalRelease(t *testing.T) 
 		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state.json' ]", Output: "absent"},
 		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state' ]", Output: "present\n" + "current_hash=v2\nprevious_hash=v1\n"},
 		ssh.MockCommand{Match: "test -d /deployments/myapp/releases/v1", Output: "yes"},
-		ssh.MockCommand{Match: "ln -sfn releases/", Output: ""},
+		ssh.MockCommand{Match: "ln -s -- releases/", Output: ""},
 		ssh.MockCommand{Match: "cat /deployments/caddy/Caddyfile", Output: "{\n\tadmin 0.0.0.0:2019\n}\n"},
 		ssh.MockCommand{Match: "mv /tmp/teploy_caddyfile.tmp", Output: ""},
 		ssh.MockCommand{Match: "mkdir /deployments/caddy/.lock", Output: ""},
+		ssh.MockCommand{Match: "[ \"$(docker exec caddy md5sum", Output: "TEPLOY_CADDY_OK"},
 		ssh.MockCommand{Match: "docker exec caddy caddy reload", Output: ""},
 		ssh.MockCommand{Match: "rmdir /deployments/caddy/.lock", Output: ""},
 		ssh.MockCommand{Match: "UPLOAD:/deployments/myapp/state.json.tmp-", Err: fmt.Errorf("disk full")},
@@ -229,7 +233,7 @@ func TestStaticRollback_StateCommitFailureRestoresOriginalRelease(t *testing.T) 
 	}
 	var lastSwap string
 	for _, call := range mock.Calls {
-		if strings.HasPrefix(call, "ln -sfn releases/") {
+		if strings.HasPrefix(call, "ln -s -- releases/") {
 			lastSwap = call
 		}
 	}
