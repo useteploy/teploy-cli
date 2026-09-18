@@ -44,12 +44,16 @@ func ExternalSSHArgs(host, keyPath string, acceptNew bool) []string {
 
 // RsyncTarget renders user@host:path for an rsync destination, bracketing a
 // bare IPv6 host (rsync's colon syntax cannot carry an unbracketed IPv6
-// literal) and moving any host:port suffix out of the target — rsync has no
+// literal) and moving ANY host:port suffix out of the target — rsync has no
 // port syntax; the port belongs in the -e ssh args (see ExternalSSHArgs).
+// The host is re-derived from the parsed endpoint, so an explicit :22 is
+// stripped just like any other port (it used to be left in place and then
+// bracketed as if it were part of an IPv6 literal), and an already-bracketed
+// IPv6 address with a port is never bracketed twice (TCL-52).
 func RsyncTarget(user, host, remotePath string) string {
 	rsyncHost := host
-	if _, port, err := SplitHostPort(host); err == nil && port != "" && port != "22" {
-		rsyncHost = rsyncHost[:len(rsyncHost)-len(":"+port)]
+	if h, port, err := SplitHostPort(host); err == nil && port != "" {
+		rsyncHost = strings.Trim(h, "[]")
 	}
 	if strings.Contains(rsyncHost, ":") {
 		rsyncHost = "[" + rsyncHost + "]"
