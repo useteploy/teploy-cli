@@ -200,8 +200,24 @@ func executeRemove(ctx context.Context, exec ssh.Executor, app string, domains [
 			}
 		}
 	} else {
-		fmt.Fprintln(out, "Removing deploy state (preserving volumes and accessory data)...")
-		exec.Run(ctx, "find "+ssh.ShellQuote(appDir)+" -mindepth 1 -maxdepth 1 ! -name volumes ! -name accessories -exec rm -rf {} + 2>/dev/null")
+		fmt.Fprintln(out, "Removing deploy state (preserving volumes, accessory data, and credentials)...")
+		// The keep-set preserves everything a retained DATABASE still needs
+		// to be usable again: volumes/ (the data), accessories/ (engine
+		// state), secrets/ (the encrypted secret store + age material),
+		// and .env. The old two-directory allowlist deleted the credential
+		// material while keeping the data — a remove-then-redeploy could
+		// never reconnect to the retained database (TCL-56). Hidden files
+		// (.maintenance-block etc.) are matched by find itself; the
+		// exclusion names must be bare, not dotted paths, to match .env.
+		keepArgs := ""
+		for _, keep := range []string{"volumes", "accessories", "secrets", ".env"} {
+			keepArgs += " ! -name " + ssh.ShellQuote(keep)
+		}
+		delCmd := fmt.Sprintf("find %s -mindepth 1 -maxdepth 1%s -exec rm -rf {} +",
+			ssh.ShellQuote(appDir), keepArgs)
+		if _, err := exec.Run(ctx, delCmd); err != nil {
+			return nil, fmt.Errorf("removing deploy state under %s: %w", appDir, err)
+		}
 		exec.Run(ctx, "rmdir "+ssh.ShellQuote(appDir)+" 2>/dev/null || true")
 		if left, err := exec.Run(ctx, "ls "+ssh.ShellQuote(appDir)+" 2>/dev/null"); err == nil {
 			for _, d := range strings.Fields(left) {

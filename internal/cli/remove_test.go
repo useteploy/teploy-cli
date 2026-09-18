@@ -26,7 +26,7 @@ func caddyMocks() []ssh.MockCommand {
 	return []ssh.MockCommand{
 		{Match: "[ -f /deployments/caddy/Caddyfile ]", Output: ""},
 		{Match: "mkdir /deployments/caddy/.lock", Output: ""},
-		ssh.MockCommand{Match: "[ \"$(docker exec caddy md5sum", Output: "TEPLOY_CADDY_OK"},
+		ssh.MockCommand{Match: "a=$(docker exec caddy md5sum", Output: "TEPLOY_CADDY_OK"},
 		{Match: "cat /deployments/caddy/Caddyfile", Output: removeTestCaddyfile},
 		{Match: "mv -f -- ", Output: ""},
 		{Match: "docker exec caddy caddy reload", Output: ""},
@@ -126,6 +126,19 @@ func TestExecuteRemoveDefaultPreservesData(t *testing.T) {
 	}
 	if len(sum.PreservedData) != 1 || sum.PreservedData[0] != "/deployments/scratch/volumes" {
 		t.Errorf("preserved = %v, want [/deployments/scratch/volumes]", sum.PreservedData)
+	}
+	// TCL-56: retained data must keep its credentials — the state deletion
+	// excludes secrets/ and .env alongside volumes/ and accessories/.
+	var findCmd string
+	for _, c := range exec.Calls {
+		if strings.HasPrefix(c, "find '/deployments/scratch'") {
+			findCmd = c
+		}
+	}
+	for _, keep := range []string{"! -name 'volumes'", "! -name 'accessories'", "! -name 'secrets'", "! -name '.env'"} {
+		if !strings.Contains(findCmd, keep) {
+			t.Errorf("state deletion missing keep exclusion %s: %s", keep, findCmd)
+		}
 	}
 
 	written := string(exec.Files["/deployments/caddy/Caddyfile"])
