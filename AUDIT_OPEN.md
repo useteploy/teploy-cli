@@ -5,9 +5,14 @@ Pass 1-5 (2026-09-09 through 2026-09-11, register: teploy-neutron-lullmail
 expanded audit) closed fully below. Pass 6 (2026-09-17, 78 findings F01-F78,
 pinned at 7d62778) is recorded beneath it: every P0/P1 contained defect is
 fixed; what remains open is the deferred architectural tail and two
-upstream/owner items.
+upstream/owner items. Round 2 (2026-09-17, 60 findings TCL-01..TCL-60,
+pinned at 1a8ea32) is recorded at the bottom: 24 findings closed with
+contained fixes (several narrowing pass-6 deferrals), the rest deferred —
+almost all of them the same architectural tail pass 6 already carries, now
+with the round-2 evidence folded in.
 
-Open items: 29 deferred sub-items across 24 findings + 2 upstream/owner.
+Open items: pass-6 deferred tail (29 sub-items across 24 findings) + 2
+upstream/owner, plus the round-2 residual tail itemized in that section.
 The two upstream items received from teploy-dash's 2026-09-17 pass are
 closed below.
 
@@ -211,6 +216,120 @@ edited from this side.
   value clears, tags never touched), and every servers.yml mutation now
   commits via sibling-temp + fsync + rename instead of an in-place
   truncating write.
+
+Gates at the closing commits: `go vet ./...` clean; `go test ./... -race`
+all packages ok. No push performed.
+
+## Round 2 (2026-09-17, TCL-01..TCL-60, pinned at 1a8ea32) — record
+
+Report reviewed finding-by-finding against the source; no false positives
+were found, but several pass-6 closure claims were genuinely incomplete at
+the sink (TCL-01 vs F07, TCL-02 vs F03/F06, TCL-20 vs F47, TCL-22 vs F44,
+TCL-21 vs F45, TCL-29 vs F23/F69). Contained fixes landed in 18 commits;
+everything else defers onto the standing pass-6 architectural tail (the
+rationale there still holds) or onto the new items below.
+
+### Round 2 — fixed (contained)
+
+| ID | P | Where |
+|---|---|-------|
+| TCL-01 | High | dde2989 — Deploy acquired its own mkdir lock and then DeployLocked acquired it again (non-reentrant: every normal deploy failed "already in progress"; the stateless mock let repeated mkdirs succeed, which is why CI stayed green). DeployLocked no longer locks; Deploy/autodeploy ensure the app dir exists before acquisition |
+| TCL-02 | High | dde2989 — same-version cleanup re-inventoried by version label AFTER the replacement started (same label → the sweep removed the just-deployed generation). Predecessors are snapshotted after the renames but before any new container starts; cleanup touches only that snapshot (F06 removed-worker property preserved) |
+| TCL-06 | High | 2877955 — rollback reads state and resolves its target under the app lock, not before it |
+| TCL-07 | Med | 2877955 — host-ingress displacement captures only RUNNING containers of the authoritative current version; stopped history is no longer recorded as displaced and resurrected on failure |
+| TCL-11 | High | 74a0509 — Restart quotes every inspect-derived argument (workdir, user, network, aliases, -p binding, restart policy) at the shell boundary |
+| TCL-16 | High | 8f39d41 — health URL built with JoinHostPort (IPv6 bracketed), host validated fail-closed (IP/localhost), path request-URI shaped, one quoted curl --url arg, --globoff, per-attempt deadlines; checkTCP validates its host |
+| TCL-18 | Med | c36ffd9 — deploy Config.validate enforces container-port/replica bounds, host-ingress single replica, non-negative stop timeout; config 'port' range-checked at parse |
+| TCL-19 | Med | dde2989 (partial) — predecessor cleanup stop/remove failures are reported, not silently dropped. Structured degraded outcome + LogEntry.Image population: still open |
+| TCL-20 | High | 5bf5594 — loadBalancerBlock renders the validated configured health path (was hardcoded health_uri /up — F47's fix never reached the rendering sink) |
+| TCL-21 | High | 5bf5594 — both delivery digests required non-empty (equal-empty no longer reads as delivered); a post-reload verification failure restores the previous Caddyfile so disk matches what the container serves |
+| TCL-22 | High | 5bf5594 — an unterminated managed marker fails closed instead of trimming through EOF |
+| TCL-23 | High | 5bf5594 — the legacy lb-<app> block is migrated only when its own site address proves it serves this app's hosts; a real app named lb-<app> is never touched |
+| TCL-25 | High | 5bf5594 (partial) — repeated maintenance-on no longer overwrites the stashed original route. Generation-scoped maintenance + security-envelope preservation: still F48 |
+| TCL-26 | High | ea4ce31 — no more recursive chown of /deployments; ownership is set non-recursively on the two control-plane directories and checked. App-data ownership is an invariant |
+| TCL-27 | High | ea4ce31 (partial) — the pre-recreate detailed mount inventory fails closed (inspect error and JSON parse error both abort); the stub Caddyfile is written only on confirmed absence. Compensated migration transaction: deferred (F67 tail) |
+| TCL-29 | High | 9c86f4d + 5fcd08f — secret Get/Remove/Rotate/List/ensureKey and accessory credential/.env reads classify absence by an always-exit-0 absent/present framing; transport failures are errors, never ErrNotFound; decrypt captures stdout/stderr separately so age warnings cannot contaminate plaintext |
+| TCL-30 | High | ac2ffea — mergeSecretVaultRefs allocates and returns the merged map; vault-only apps (nil secrets map) no longer panic |
+| TCL-35 | High | c36ffd9 — accessory volume keys validated as identifiers, container destinations must be absolute |
+| TCL-38 | Med | 4888719 — static tree hash v3 emits a typed record per entry including directory PATHS (v2 counted directories only; differently-named empty dirs collided) |
+| TCL-42 | High | fd2ec15 (partial) — redis backup/restore refuse AOF-enabled instances; the pre-stop recovery copy is mandatory when a dump exists. Same-second LASTSAVE ambiguity and persistence-status-acknowledged proof: open |
+| TCL-43 | High | fd2ec15 — recovery-incomplete restore failures retain their artifacts (typed marker; callers' run cleanup no longer deletes what the error calls "kept"); the fully-recovered branch states honestly that staging was discarded |
+| TCL-46 | Med | fd2ec15 — ValidateSchedule rejects descending/wildcard ranges; SetSchedule reads the crontab with its exit status checked and only the canonical no-crontab message starts from empty. Host-wide flock: still F39 |
+| TCL-52 | Med | 9772dad + 9895ba9 — RsyncTarget re-derives the host from the parsed endpoint (:22 stripped, IPv6 bracketed exactly once); rsync -e commands are quoted element-wise (ExternalSSHCommand) |
+| TCL-53 | High | 4550b35 — streamImage owns an explicit pipe, starts the consumer first, closes parent ends, waits concurrently, cancels+reaps the peer on either failure, and reaps on Start failure |
+| TCL-55 | Med | 1a9c70a (partial) — TCP dial bounded (15s) even with an unbounded context; explicit --key read/parse/passphrase errors surface instead of falling through to default identities. Session-open bounding (needs a dedicated connection per session) and TOFU enrollment serialization: deferred |
+| TCL-56 | High | 5bf45a0 (partial) — non-purge removal keeps secrets/ and .env beside volumes/ and accessories/, and the deletion is checked. Locked/journaled retirement and purge coverage of named volumes: deferred |
+| TCL-58 | Med | 1a9c70a (partial) — the update sanity run is context-bounded and must report the downloaded release's version; the permission-denied hint no longer points at the temp file the defer deletes. Downgrade policy, signature/provenance, Windows replacement: F62 tail |
+
+### Round 2 — deferred (architectural / product), with rationale
+
+Standing pass-6 entries still cover these; the round-2 evidence is folded
+into each rather than duplicated as new work items.
+
+- TCL-03 — F04 (generation-scoped identities / RouteSwitch handoff) + F21
+  (publish recreate strategy). Contained pieces already landed: candidate
+  name dedup (F03), publish+replicas rejected at validation.
+- TCL-04 — F08 (attempt-scoped immutable artifacts under one lease).
+- TCL-05 — F16 (fencing/renewal). Containment added this round: the caddy
+  lock release is detached/bounded so cancellation cannot strand it.
+- TCL-08 — F05/F35 tail (durable journal). Contained pieces landed this
+  round: cleanup failure reporting, caddy verify-failure compensation.
+- TCL-09 — F14/F13 (immutable per-release execution record).
+- TCL-10 — ingress-transition transaction (caddy→host/external leaves the
+  old route behind). Needs F04's generation handoff; a plain "reject
+  ingress changes" would break the documented host-migration flow. Folded
+  into F04.
+- TCL-12 — F22, narrowed: docker-run channels COULD lift env to --env-file
+  (Restart -e from inspect is now the registered contained follow-up);
+  docker exec channels (BAO_TOKEN, MYSQL_PWD) remain blocked on
+  container-side file plumbing shared with the engine images.
+- TCL-13 — F20 (full RecreateSpec preservation; needs F14).
+- TCL-14 — needs the recorded primary-port contract (F14 metadata);
+  multi-port ambiguity is real but not fixable contained without it.
+- TCL-15 — port allocation redesign (Docker-ephemeral publish + inspect).
+  With F14.
+- TCL-17 — F47 tail (explicit HTTP/TCP/auto probe modes; the 404/3xx TCP
+  fallback is documented deliberate compat).
+- TCL-24 — F49 tail (foreign-block adoption by brace counting; parser/
+  adapt-API based adoption is the fix).
+- TCL-28 — F50 (split the public static tree from /deployments).
+- TCL-31 — env-encoder unification across accessory/seal writers. The
+  app env writer validates records (F73); accessory credential values are
+  generated (no newlines possible) — contained follow-up, registered.
+- TCL-32 — strict ${VAR} resolution (fail on unset). Product decision:
+  would break deploys that currently rely on empty expansion; needs an
+  explicit opt-in syntax. Owner decision.
+- TCL-33 — F24 (resumable OpenBao Setup; mandatory persistence landed).
+- TCL-34 — OpenBao agent readiness gate + token-sink isolation (new
+  lifecycle surface; shares F24's step-journal design).
+- TCL-36 — F69 tail (credential rotation workflow, GID/nonzero-limit
+  drift detection).
+- TCL-37 — F05/F37 tail (readiness-gated accessory upgrade with verified
+  recovery).
+- TCL-39 — static route-policy restore needs F13/F48; renderer input
+  hardening (header-name grammar, fallback charset) registered as the
+  contained follow-up inside that item.
+- TCL-40 — restore under the app lock + writer quiescence (F37-adjacent;
+  the orchestrated quiesce/cutover boundary is new lifecycle surface).
+- TCL-41 — F37 (engine-specific consistency contract; verify-backup
+  exists as the correctness gate today).
+- TCL-44 — F37/host-helper (constrained extractor, entry policy, bounds).
+- TCL-45 — scheduled/manual backup unification (one engine + artifact
+  schema + private workspaces + protected credentials). Architectural.
+- TCL-47 — engine auth adapters + S3 session tokens. Medium; with F37.
+- TCL-48 — F42 (durable webhook queue).
+- TCL-49 — F40 (pin webhook builds to the event's commit).
+- TCL-50 — F60 (complete-plan fingerprint vs display digest).
+- TCL-51 — F57 (presence-aware overlay semantics).
+- TCL-54 — platform parity per builder (nixpacks --platform), DetectAt
+  stat distinction, pinned installer. Medium; registered with F63's
+  supply-chain work.
+- TCL-57 — F62 (bounded extraction).
+- TCL-59 — F65 (stateful fakes + integration matrix). This round's new
+  tests are behavioral where feasible (real shell for the crontab logic,
+  real subprocesses for the transfer stall, filesystem-backed fake for
+  the maintenance stash) — the prefix-response mock remains the gap.
+- TCL-60 — F63/F64 owner items (pinned actions/digests, branch rulesets).
 
 Gates at the closing commits: `go vet ./...` clean; `go test ./... -race`
 all packages ok. No push performed.
