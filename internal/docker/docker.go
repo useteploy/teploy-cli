@@ -425,8 +425,12 @@ func (c *Client) Restart(ctx context.Context, name string, avoidPorts map[int]bo
 	args := []string{"-d", "--name", ssh.ShellQuote(name)}
 
 	// Network mode (e.g. "teploy"). Skip docker's "default" / "bridge".
+	// Inspect-derived values are DATA, not shell syntax — an image whose
+	// metadata carries spaces or metacharacters must never be interpreted
+	// by the host shell (TCL-11). Every value below is quoted exactly once
+	// at this shell boundary.
 	if spec.HostConfig.NetworkMode != "" && spec.HostConfig.NetworkMode != "default" && spec.HostConfig.NetworkMode != "bridge" {
-		args = append(args, "--network", spec.HostConfig.NetworkMode)
+		args = append(args, "--network", ssh.ShellQuote(spec.HostConfig.NetworkMode))
 	}
 
 	// Network aliases on the primary network. Skip the container-name auto-alias
@@ -441,7 +445,7 @@ func (c *Client) Restart(ctx context.Context, name string, avoidPorts map[int]bo
 				continue
 			}
 			seenAlias[alias] = true
-			args = append(args, "--network-alias", alias)
+			args = append(args, "--network-alias", ssh.ShellQuote(alias))
 		}
 	}
 
@@ -474,7 +478,7 @@ func (c *Client) Restart(ctx context.Context, name string, avoidPorts map[int]bo
 				hostPort = strconv.Itoa(newPort)
 				claimed[newPort] = true
 			}
-			args = append(args, "-p", fmt.Sprintf("%s:%s:%s", host, hostPort, containerPort))
+			args = append(args, "-p", ssh.ShellQuote(fmt.Sprintf("%s:%s:%s", host, hostPort, containerPort)))
 		}
 	}
 
@@ -533,14 +537,14 @@ func (c *Client) Restart(ctx context.Context, name string, avoidPorts map[int]bo
 
 	// Restart policy (skip docker default "no").
 	if spec.HostConfig.RestartPolicy.Name != "" && spec.HostConfig.RestartPolicy.Name != "no" {
-		args = append(args, "--restart", spec.HostConfig.RestartPolicy.Name)
+		args = append(args, "--restart", ssh.ShellQuote(spec.HostConfig.RestartPolicy.Name))
 	}
 
 	if spec.Config.WorkingDir != "" {
-		args = append(args, "-w", spec.Config.WorkingDir)
+		args = append(args, "-w", ssh.ShellQuote(spec.Config.WorkingDir))
 	}
 	if spec.Config.User != "" {
-		args = append(args, "-u", spec.Config.User)
+		args = append(args, "-u", ssh.ShellQuote(spec.Config.User))
 	}
 
 	// Image (last positional before cmd). Prefer the container's immutable

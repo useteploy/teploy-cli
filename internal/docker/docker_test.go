@@ -673,3 +673,61 @@ func TestExecStream_PropagatesError(t *testing.T) {
 		t.Error("expected ExecStream to propagate the command's non-zero exit")
 	}
 }
+
+// TCL-11: Restart interpolates Docker-inspect metadata (working dir, user,
+// network, aliases, restart policy, port bindings) into a host shell
+// command. Those values are data — an image whose metadata contains shell
+// metacharacters must reach docker literally, never be interpreted by the
+// SSH shell.
+func TestClient_RestartQuotesInspectMetadata(t *testing.T) {
+	inspect := `[{
+		"Image": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+		"Config": {
+			"Image": "myapp:latest",
+			"Env": [],
+			"Cmd": [],
+			"WorkingDir": "/app dir; rm -rf /",
+			"User": "u'ser\" && touch /tmp/pwned",
+			"Labels": {}
+		},
+		"HostConfig": {
+			"NetworkMode": "net work",
+			"PortBindings": {"3000/tcp": [{"HostIp": "0.0.0.0", "HostPort": "49152"}]},
+			"RestartPolicy": {"Name": "unless;stopped"}
+		},
+		"NetworkSettings": {
+			"Networks": {"net work": {"Aliases": ["al;ias"]}}
+		}
+	}]`
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "docker inspect 'c'", Output: inspect},
+		ssh.MockCommand{Match: "docker rm -f", Output: ""},
+		ssh.MockCommand{Match: "docker run", Output: "newid\n"},
+	)
+	client := NewClient(mock)
+	if err := client.Restart(context.Background(), "c", nil); err != nil {
+		t.Fatalf("Restart: %v", err)
+	}
+	var run string
+	for _, call := range mock.Calls {
+		if strings.HasPrefix(call, "docker run ") {
+			run = call
+		}
+	}
+	if run == "" {
+		t.Fatal("no docker run issued")
+	}
+	// Every metacharacter-bearing value must appear only in its single-quoted form.
+	for _, want := range []string{
+		`-w '/app dir; rm -rf /'`,
+		`-u 'u'"'"'ser" && touch /tmp/pwned'`,
+		`--network 'net work'`,
+		`--network-alias 'al;ias'`,
+		`-p '0.0.0.0:49152:3000/tcp'`,
+		`--restart 'unless;stopped'`,
+	} {
+		if !strings.Contains(run, want) {
+			t.Errorf("docker run missing quoted %q in: %s", want, run)
+		}
+	}
+}
