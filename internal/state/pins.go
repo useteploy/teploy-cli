@@ -27,7 +27,7 @@ func pinsPath(app string) string {
 // retained (audit F78). Callers must fail CLOSED on error (skip pruning),
 // never prune as though no pins existed.
 func ReadPins(ctx context.Context, exec ssh.Executor, app string) ([]string, error) {
-	data, present, err := readRemoteFile(ctx, exec, pinsPath(app))
+	data, present, err := ReadRemoteFile(ctx, exec, pinsPath(app))
 	if err != nil {
 		return nil, fmt.Errorf("reading pins for %s: %w", app, err)
 	}
