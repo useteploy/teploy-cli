@@ -257,7 +257,11 @@ func defaultHostKeyCallback() (ssh.HostKeyCallback, error) {
 	return callback, nil
 }
 
-// resolveSigners finds and loads SSH private keys.
+// resolveSigners finds and loads SSH private keys. For an EXPLICIT key path,
+// read/parse/passphrase failures are returned, never swallowed: falling
+// through to the default identities on a bad --key used to end with the
+// misleading "no SSH keys found" (or, worse, authenticated as a different
+// key than the operator named) instead of the actual key error (TCL-55).
 func resolveSigners(keyPath string) ([]ssh.Signer, error) {
 	var paths []string
 	if keyPath != "" {
@@ -277,6 +281,9 @@ func resolveSigners(keyPath string) ([]ssh.Signer, error) {
 	for _, p := range paths {
 		data, err := os.ReadFile(p)
 		if err != nil {
+			if keyPath != "" {
+				return nil, fmt.Errorf("reading requested SSH identity %s: %w", p, err)
+			}
 			continue
 		}
 
@@ -286,9 +293,15 @@ func resolveSigners(keyPath string) ([]ssh.Signer, error) {
 			if errors.As(err, &passphraseErr) {
 				signer, err = parseEncryptedKey(data, p)
 				if err != nil {
+					if keyPath != "" {
+						return nil, fmt.Errorf("using requested SSH identity %s: %w", p, err)
+					}
 					continue
 				}
 			} else {
+				if keyPath != "" {
+					return nil, fmt.Errorf("parsing requested SSH identity %s: %w", p, err)
+				}
 				continue
 			}
 		}
@@ -316,7 +329,11 @@ func parseEncryptedKey(data []byte, keyPath string) (ssh.Signer, error) {
 // handshake unblocks immediately. The deadline is cleared once the
 // connection is established so the returned client is not time-limited.
 func dialWithContext(ctx context.Context, network, addr string, config *ssh.ClientConfig) (*ssh.Client, error) {
-	conn, err := (&net.Dialer{}).DialContext(ctx, network, addr)
+	// The TCP dial itself is bounded even when the caller's context has no
+	// deadline (Background): a black-holed address used to rely on the
+	// OS-level connect timeout (~75s+) before the handshake deadline below
+	// could even start (TCL-55). 15s matches the handshake bound.
+	conn, err := (&net.Dialer{Timeout: 15 * time.Second}).DialContext(ctx, network, addr)
 	if err != nil {
 		return nil, err
 	}

@@ -131,11 +131,22 @@ func runUpdate(currentVersion string, force bool) error {
 		return fmt.Errorf("setting permissions: %w", err)
 	}
 
-	out, err := exec.Command(tmpPath, "version").Output()
+	// Sanity-check the downloaded binary runs — bounded, so a hanging
+	// artifact cannot stall the updater indefinitely (it ran with no
+	// context at all before, TCL-58). The reported version must MATCH the
+	// release we downloaded: a wrong-version artifact used to pass any
+	// successful exit. `teploy version` prints "teploy <version>".
+	checkCtx, checkCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer checkCancel()
+	out, err := exec.CommandContext(checkCtx, tmpPath, "version").Output()
 	if err != nil {
 		return fmt.Errorf("downloaded binary is invalid: %w", err)
 	}
-	fmt.Printf("  Verified: %s", out)
+	reported := strings.TrimSpace(string(out))
+	if reported != "teploy "+latestVersion {
+		return fmt.Errorf("downloaded binary reports %q, expected %q — refusing to install", reported, "teploy "+latestVersion)
+	}
+	fmt.Printf("  Verified: %s\n", reported)
 
 	currentBinary, err := os.Executable()
 	if err != nil {
@@ -306,7 +317,14 @@ func replaceBinary(src, dst string) error {
 	}
 	if err := os.Rename(tmpPath, dst); err != nil {
 		if os.IsPermission(err) {
-			return fmt.Errorf("permission denied — try: sudo cp %s %s", src, dst)
+			// Do NOT point at src (the download temp file): the deferred
+			// os.Remove in the caller deletes it on return, so the old
+			// `sudo cp <src> <dst>` hint named a file that no longer
+			// existed by the time the operator read it (TCL-58). Suggest a
+			// privileged re-run instead — that path re-downloads and
+			// re-verifies rather than copying an unverified file over a
+			// running binary.
+			return fmt.Errorf("permission denied replacing %s — re-run with sudo (or: sudo env HOME=%s teploy update) so the verified binary can be installed", dst, os.Getenv("HOME"))
 		}
 		return err
 	}
