@@ -2,6 +2,7 @@ package backup
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"regexp"
@@ -13,6 +14,14 @@ import (
 )
 
 const deploymentsDir = "/deployments"
+
+// errRecoveryIncomplete marks restore failures whose recovery paths are
+// RETAINED on the server (recovery dir and/or staged tree) — the callers
+// must not run their broad run-directory cleanup over those artifacts, and
+// the error messages name them as kept. Without this marker the callers'
+// deferred cleanup deleted the very directories the errors had just
+// described as retained (TCL-43).
+var errRecoveryIncomplete = errors.New("recovery incomplete")
 
 // safeName matches safe values for shell interpolation: alphanumeric, hyphens, dots.
 var safeName = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]*$`)
@@ -74,8 +83,22 @@ func ValidateSchedule(schedule string) error {
 			if !validCronValue(lo, r.min, r.max) {
 				return fmt.Errorf("invalid cron schedule %q — %s value %q out of range %d-%d", schedule, r.name, lo, r.min, r.max)
 			}
-			if isRange && !validCronValue(hi, r.min, r.max) {
-				return fmt.Errorf("invalid cron schedule %q — %s range end %q out of range %d-%d", schedule, r.name, hi, r.min, r.max)
+			if isRange {
+				// A range needs two in-range NUMERIC endpoints in ascending
+				// order: '5-1', '5-*', and '*-5' all used to pass because
+				// '*' and each bare number are individually valid values
+				// (TCL-46).
+				if lo == "*" || hi == "*" {
+					return fmt.Errorf("invalid cron schedule %q — wildcards are not range endpoints in %s (%q)", schedule, r.name, part)
+				}
+				if !validCronValue(hi, r.min, r.max) {
+					return fmt.Errorf("invalid cron schedule %q — %s range end %q out of range %d-%d", schedule, r.name, hi, r.min, r.max)
+				}
+				loN, loErr := strconv.Atoi(lo)
+				hiN, hiErr := strconv.Atoi(hi)
+				if loErr != nil || hiErr != nil || loN > hiN {
+					return fmt.Errorf("invalid cron schedule %q — %s range %q must be ascending numeric bounds", schedule, r.name, part)
+				}
 			}
 		}
 	}
@@ -260,7 +283,13 @@ func (c *Client) RestoreVolumes(ctx context.Context, app, date string, s3 S3Conf
 
 	recoveryDir, err := extractToStagingThenPromote(ctx, c.exec, archivePath, stageDir, volumesDir, c.out, setAsideEnv)
 	if err != nil {
-		cleanupRun()
+		// A recovery-incomplete failure retains its artifacts INSIDE this
+		// run directory (and the recovery dir beside the live tree) — the
+		// broad run cleanup must not delete what the error just described
+		// as kept (TCL-43).
+		if !errors.Is(err, errRecoveryIncomplete) {
+			cleanupRun()
+		}
 		return err
 	}
 	// The volumes promotion succeeded but is not yet committed: keep the
@@ -377,9 +406,8 @@ func extractToStagingThenPromote(ctx context.Context, exec ssh.Executor, archive
 		moveBack := fmt.Sprintf("find %s -mindepth 1 -maxdepth 1 -exec mv -t %s -- {} +",
 			ssh.ShellQuote(recoveryDir), ssh.ShellQuote(liveDir))
 		if _, rbErr := exec.Run(context.WithoutCancel(ctx), moveBack); rbErr != nil {
-			cleanup()
-			return recoveryDir, fmt.Errorf("moving current contents aside for %s: %w — recovery INCOMPLETE; original entries preserved split across %s and %s, staged restore kept in %s",
-				liveDir, err, liveDir, recoveryDir, stageDir)
+			return recoveryDir, fmt.Errorf("%w: moving current contents aside for %s: %v — original entries preserved split across %s and %s, staged restore kept in %s",
+				errRecoveryIncomplete, liveDir, err, liveDir, recoveryDir, stageDir)
 		}
 		cleanup()
 		exec.Run(context.WithoutCancel(ctx), "rm -rf "+ssh.ShellQuote(recoveryDir))
@@ -395,14 +423,13 @@ func extractToStagingThenPromote(ctx context.Context, exec ssh.Executor, archive
 		rollbackCmd := fmt.Sprintf("find %s -mindepth 1 -delete && find %s -mindepth 1 -maxdepth 1 -exec mv -t %s -- {} +",
 			ssh.ShellQuote(liveDir), ssh.ShellQuote(recoveryDir), ssh.ShellQuote(liveDir))
 		if _, rbErr := exec.Run(context.WithoutCancel(ctx), rollbackCmd); rbErr != nil {
-			cleanup()
-			return recoveryDir, fmt.Errorf("promoting staged restore into %s: %w — rollback failed too; previous contents kept in %s, staged restore kept in %s",
-				liveDir, err, recoveryDir, stageDir)
+			return recoveryDir, fmt.Errorf("%w: promoting staged restore into %s: %v — rollback failed too; previous contents kept in %s, staged restore kept in %s",
+				errRecoveryIncomplete, liveDir, err, recoveryDir, stageDir)
 		}
 		cleanup()
 		exec.Run(context.WithoutCancel(ctx), "rm -rf "+ssh.ShellQuote(recoveryDir))
-		return "", fmt.Errorf("promoting staged restore into %s: %w — previous contents restored, staged restore kept in %s",
-			liveDir, err, stageDir)
+		return "", fmt.Errorf("promoting staged restore into %s: %w — previous contents restored, staged restore discarded",
+			liveDir, err)
 	}
 
 	cleanup()
@@ -503,6 +530,12 @@ func (c *Client) AccessoryBackup(ctx context.Context, app, name, image string, e
 		redisTmp := workDir + "/dump.rdb"
 		dumpCmd = strings.Join([]string{
 			"set -eu",
+			// AOF-enabled Redis persists to the append-only file; backing
+			// up only dump.rdb captures a stale or empty dataset. Fail
+			// closed rather than uploading a wrong-point-in-time artifact
+			// (TCL-42).
+			fmt.Sprintf("aof=$(docker exec %s redis-cli config get appendonly | tail -n 1)", qContainer),
+			`case "$aof" in *yes*) echo 'redis appendonly is enabled; teploy backup captures dump.rdb only — disable AOF or use an engine-level backup' >&2; exit 1;; esac`,
 			fmt.Sprintf("ls=$(docker exec %s redis-cli lastsave)", qContainer),
 			fmt.Sprintf("bgs=$(docker exec %s redis-cli bgsave 2>&1) || true", qContainer),
 			`case "$bgs" in *ERR*) case "$bgs" in *"in progress"*) ;; *) printf 'redis BGSAVE failed: %s\n' "$bgs" >&2; exit 1;; esac;; esac`,
@@ -632,7 +665,16 @@ func (c *Client) AccessoryRestore(ctx context.Context, app, name, image, date st
 		restoreCmd = strings.Join([]string{
 			"set -eu",
 			fmt.Sprintf("gunzip -c %s > %s", ssh.ShellQuote(restorePath), ssh.ShellQuote(rdbPath)),
-			fmt.Sprintf("docker cp %s:/data/dump.rdb %s 2>/dev/null || true", qContainer, ssh.ShellQuote(oldRdb)),
+			// AOF-enabled Redis loads the append-only file on restart, so
+			// replacing only dump.rdb restores nothing — refuse instead of
+			// reporting success over a stale dataset (TCL-42).
+			fmt.Sprintf("aof=$(docker exec %s redis-cli config get appendonly | tail -n 1)", qContainer),
+			`case "$aof" in *yes*) echo 'redis appendonly is enabled; teploy restore replaces dump.rdb only and Redis would load AOF on restart — an explicit restore plan is required' >&2; exit 1;; esac`,
+			// Save the current dump ONLY when one exists, and make the
+			// copy MANDATORY when it does: `docker cp … || true` masked a
+			// failed recovery copy, leaving no way back after the stop
+			// below (TCL-42).
+			fmt.Sprintf("if docker exec %s test -f /data/dump.rdb; then docker cp %s:/data/dump.rdb %s; fi", qContainer, qContainer, ssh.ShellQuote(oldRdb)),
 			fmt.Sprintf("docker stop %s", qContainer),
 			"ok=yes",
 			fmt.Sprintf("docker cp %s %s:/data/dump.rdb || ok=no", ssh.ShellQuote(rdbPath), qContainer),
@@ -670,6 +712,9 @@ func (c *Client) AccessoryRestore(ctx context.Context, app, name, image, date st
 		stageDir := tmpdir + "/restore-stage"
 		recoveryDir, err := extractToStagingThenPromote(ctx, c.exec, restorePath, stageDir, accDir, c.out, nil)
 		if err != nil {
+			// Recovery-incomplete failures retain their artifacts in
+			// tmpdir/stage — keepTmp's contract already preserves tmpdir,
+			// so the retained paths stay inspectable (TCL-43).
 			return keepTmp(fmt.Errorf("restoring %s: %w", name, err))
 		}
 		// No dependent steps follow a generic accessory restore, so the
@@ -709,8 +754,17 @@ func (c *Client) SetSchedule(ctx context.Context, schedule, command, marker stri
 	// it. Escape every % in the COMMAND portion — the schedule and the
 	// marker are % free — so cron passes them through literally.
 	line := fmt.Sprintf("%s %s # %s", schedule, strings.ReplaceAll(command, "%", "\\%"), tag)
+	// The current crontab is read with its exit status CHECKED (TCL-46):
+	// the old `crontab -l 2>/dev/null | grep -vF …` pipeline masked any
+	// real read failure as empty input and then installed only the new
+	// line — silently deleting every unrelated job. Only the canonical
+	// "no crontab for <user>" failure means "start from empty"; every
+	// other failure aborts without invoking the install.
 	cmd := fmt.Sprintf(
-		`(crontab -l 2>/dev/null | grep -vF %s; printf '%%s\n' %s) | crontab -`,
+		`raw=$(crontab -l 2>&1); rc=$?; `+
+			`if [ "$rc" -ne 0 ]; then case "$raw" in *"no crontab"*) raw="";; *) `+
+			`echo "reading crontab failed: $raw" >&2; exit 1;; esac; fi; `+
+			`(printf '%%s\n' "$raw" | grep -vF %s; printf '%%s\n' %s) | crontab -`,
 		ssh.ShellQuote(tag), ssh.ShellQuote(line),
 	)
 	if _, err := c.exec.Run(ctx, cmd); err != nil {

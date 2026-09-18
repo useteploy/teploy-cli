@@ -4,6 +4,10 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -516,7 +520,7 @@ func TestAccessoryBackup_Generic(t *testing.T) {
 // % signs while leaving the marker comment (and its grep -vF dedup) intact.
 func TestSetSchedule_EscapesPercentForCron(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
-		ssh.MockCommand{Match: "(crontab -l", Output: ""},
+		ssh.MockCommand{Match: "raw=$(crontab -l", Output: ""},
 	)
 
 	var buf bytes.Buffer
@@ -545,9 +549,9 @@ func TestSetSchedule_EscapesPercentForCron(t *testing.T) {
 		t.Errorf("marker comment must stay intact:\n%s", installed)
 	}
 	// No raw, unescaped % may remain in the command portion of the line.
-	if unquoted := strings.ReplaceAll(installed, `\%`, ""); strings.Count(unquoted, `%`) != 1 {
-		// exactly one % left: the printf format itself
-		t.Errorf("line contains raw %% outside the printf format:\n%s", installed)
+	if unquoted := strings.ReplaceAll(installed, `\%`, ""); strings.Count(unquoted, `%`) != 2 {
+		// exactly two % left: the two printf formats themselves
+		t.Errorf("line contains raw %% outside the printf formats:\n%s", installed)
 	}
 }
 
@@ -693,3 +697,69 @@ var errNotFound = &notFoundError{}
 type notFoundError struct{}
 
 func (e *notFoundError) Error() string { return "not found" }
+
+// TCL-46: descending ranges and wildcard range endpoints used to pass the
+// character/bounds check and produce crontab entries cron never runs.
+func TestValidateSchedule_RejectsMalformedRanges(t *testing.T) {
+	for _, bad := range []string{
+		"5-1 * * * *",  // descending
+		"5-* * * * *",  // wildcard as range end
+		"*-5 * * * *",  // wildcard as range start
+		"0 22-3 * * *", // descending hours
+		"0 0 * 12-2 *", // descending months
+	} {
+		if err := ValidateSchedule(bad); err == nil {
+			t.Errorf("ValidateSchedule accepted malformed range %q", bad)
+		}
+	}
+	for _, good := range []string{"*/5 * * * *", "0 3 * * 1-5", "30 8-18 * * *", "0 0 1 1 0"} {
+		if err := ValidateSchedule(good); err != nil {
+			t.Errorf("ValidateSchedule rejected valid schedule %q: %v", good, err)
+		}
+	}
+}
+
+// TCL-46: a crontab read failure other than the canonical "no crontab for
+// <user>" must abort the install — the old pipeline masked it as empty
+// input and deleted every unrelated job. The generated script is executed
+// against a fake crontab binary so the failure happens where it really
+// does: inside the shell.
+func TestSetSchedule_CrontabReadFailureAborts(t *testing.T) {
+	run := func(t *testing.T, readErrMsg string) (exitErr error, installed bool) {
+		t.Helper()
+		bin := t.TempDir()
+		installMarker := filepath.Join(bin, "installed")
+		crontab := fmt.Sprintf(`#!/bin/sh
+marker=%s
+case "$1" in
+-l) echo %s >&2; exit 1 ;;
+-) cat > /dev/null; touch "$marker"; exit 0 ;;
+esac
+`, ssh.ShellQuote(installMarker), ssh.ShellQuote(readErrMsg))
+		if err := os.WriteFile(filepath.Join(bin, "crontab"), []byte(crontab), 0755); err != nil {
+			t.Fatal(err)
+		}
+
+		mock := ssh.NewMockExecutor("1.2.3.4",
+			ssh.MockCommand{Match: "raw=$(crontab -l", Err: errors.New("unused")},
+		)
+		var buf bytes.Buffer
+		_ = NewClient(mock, &buf).SetSchedule(context.Background(), "0 3 * * *", "echo hi", "teploy-backup:myapp")
+		if len(mock.Calls) == 0 {
+			t.Fatal("no schedule command generated")
+		}
+		sh := exec.Command("sh", "-c", mock.Calls[0])
+		sh.Env = append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"))
+		exitErr = sh.Run()
+		_, statErr := os.Stat(installMarker)
+		installed = statErr == nil
+		return exitErr, installed
+	}
+
+	if err, installed := run(t, "crontab: permission denied"); err == nil || installed {
+		t.Errorf("real read failure: abort=%v installed=%v (want abort, no install)", err, installed)
+	}
+	if err, installed := run(t, "no crontab for root"); err != nil || !installed {
+		t.Errorf("canonical no-crontab: abort=%v installed=%v (want clean first install)", err, installed)
+	}
+}
