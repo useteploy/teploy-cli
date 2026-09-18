@@ -33,6 +33,7 @@ import (
 	"time"
 
 	"github.com/useteploy/teploy/internal/caddy"
+	"github.com/useteploy/teploy/internal/releasemeta"
 	"github.com/useteploy/teploy/internal/ssh"
 	"github.com/useteploy/teploy/internal/state"
 )
@@ -247,6 +248,31 @@ func (d *StaticDeployer) Deploy(ctx context.Context, cfg StaticConfig) error {
 	}
 	if err := state.Write(ctx, d.exec, cfg.App, newState); err != nil {
 		return d.abortStaticStateCommit(ctx, cfg.App, cfg.StateDir, currentLink, prior, err)
+	}
+
+	// 10b. Record the release metadata (F14): the serving configuration is
+	// exactly the piece state.json never retained, and it is what makes a
+	// state-only static rollback possible (F13). Warning-only — see the
+	// container path's recordRelease for the posture.
+	staticRec := &releasemeta.Record{
+		App:            cfg.App,
+		Hash:           shortHash,
+		Generation:     newState.Generation,
+		DeploymentType: "static",
+		IngressMode:    "caddy",
+		Domain:         cfg.Domain,
+		Static: &releasemeta.Static{
+			Domain:       cfg.Domain,
+			SPA:          cfg.SPA,
+			SPAFallback:  cfg.SPAFallback,
+			Cache:        cfg.Cache,
+			Headers:      cfg.Headers,
+			CaddyExtra:   cfg.CaddyExtra,
+			KeepReleases: cfg.KeepReleases,
+		},
+	}
+	if err := releasemeta.Write(ctx, d.exec, staticRec); err != nil {
+		fmt.Fprintf(d.out, "  warning: could not record release metadata for %s@%s: %v (state-only rollback for this release will ask for a redeploy first)\n", cfg.App, shortHash, err)
 	}
 
 	// 11. Prune old releases (keep the most recent KeepReleases including
@@ -597,18 +623,27 @@ func (d *StaticDeployer) Rollback(ctx context.Context, cfg StaticRollbackConfig)
 		return errors.New("no state found — has this app been deployed?")
 	}
 
-	target := cfg.ToHash
-	if target == "" {
-		target = prior.PreviousHash
+	target, err := staticRollbackTarget(prior, cfg.ToHash)
+	if err != nil {
+		return err
 	}
-	if target == "" {
-		return ErrNoPreviousDeploy
-	}
-	if target == prior.CurrentHash {
-		return fmt.Errorf("target hash %s is already current", target)
-	}
-	if !safeReleaseName(target) {
-		return fmt.Errorf("invalid target release %q — expected a release id from `teploy releases`", target)
+
+	// The recorded serving config is the target release's truth (F13/F14);
+	// the teploy.yml-passed options are the fallback for releases that
+	// predate the store. Absent record → keep what the caller passed;
+	// unreadable record → warn and keep the caller's config (a static
+	// rollback can proceed with explicit config, unlike RollbackStateOnly).
+	if rec, rerr := releasemeta.Read(ctx, d.exec, cfg.App, target); rerr != nil {
+		fmt.Fprintf(d.out, "Warning: %v — using the serving config from the command line\n", rerr)
+	} else if rec != nil && rec.Static != nil {
+		cfg.SPA = rec.Static.SPA
+		cfg.SPAFallback = rec.Static.SPAFallback
+		cfg.Cache = rec.Static.Cache
+		cfg.Headers = rec.Static.Headers
+		cfg.CaddyExtra = rec.Static.CaddyExtra
+		if rec.Static.Domain != "" {
+			cfg.Domain = rec.Static.Domain
+		}
 	}
 
 	releasesDir := fmt.Sprintf("%s/%s/releases", cfg.StateDir, cfg.App)
@@ -665,6 +700,114 @@ func (d *StaticDeployer) Rollback(ctx context.Context, cfg StaticRollbackConfig)
 	})
 	fmt.Fprintf(d.out, "Rolled back %s to %s\n", cfg.App, target)
 	return nil
+}
+
+// RollbackStateOnly rolls a static app back with NO teploy.yml: server-side
+// state plus the recorded release metadata supply everything the serving
+// config used to (F13 on top of F14). This is the path `teploy rollback
+// --app <name> --host ...` takes — before the record existed it could only
+// refuse, because SPA/headers/cache live nowhere in state.
+//
+// Fail-closed on the record: unlike a container rollback (which can rebuild
+// from live inspection), a static release's serving config is unrecoverable
+// from disk — the Caddyfile block is string fragments (F48) and the release
+// tree says nothing about how it was served. No record means asking for one
+// redeploy, not guessing.
+func (d *StaticDeployer) RollbackStateOnly(ctx context.Context, app, toHash string) error {
+	if err := state.AcquireLock(ctx, d.exec, app); err != nil {
+		return fmt.Errorf("acquire lock: %w", err)
+	}
+	defer state.ReleaseLockDetached(d.exec, app)
+
+	prior, err := state.Read(ctx, d.exec, app)
+	if err != nil {
+		return fmt.Errorf("reading state for %s: %w", app, err)
+	}
+	if prior == nil {
+		return errors.New("no state found — has this app been deployed?")
+	}
+
+	target, err := staticRollbackTarget(prior, toHash)
+	if err != nil {
+		return err
+	}
+
+	rec, err := releasemeta.Read(ctx, d.exec, app, target)
+	if err != nil {
+		return fmt.Errorf("reading release metadata for %s@%s: %w", app, target, err)
+	}
+	if rec == nil || rec.Static == nil {
+		return fmt.Errorf("no recorded release metadata for %s@%s — static rollback needs the recorded serving config; redeploy the release once with this CLI version to record it, then roll back", app, target)
+	}
+	st := rec.Static
+
+	releasesDir := fmt.Sprintf("%s/%s/releases", DefaultStateDir, app)
+	if out, _ := d.exec.Run(ctx, fmt.Sprintf("test -d %s/%s && echo yes || true", releasesDir, target)); strings.TrimSpace(out) != "yes" {
+		return fmt.Errorf("release %s no longer on server (may have been pruned)", target)
+	}
+
+	if err := d.swapCurrentLink(ctx, app, DefaultStateDir, target); err != nil {
+		return fmt.Errorf("symlink swap: %w", err)
+	}
+
+	domain := st.Domain
+	if domain == "" {
+		domain = prior.Domain
+	}
+	if err := d.caddy.SetStaticRoute(ctx, app, domain, caddy.StaticBlockOpts{
+		Root:        fmt.Sprintf("%s/%s/current", DefaultStaticMount, app),
+		SPA:         st.SPA,
+		SPAFallback: st.SPAFallback,
+		Cache:       st.Cache,
+		Headers:     st.Headers,
+		CaddyExtra:  st.CaddyExtra,
+	}); err != nil {
+		if restoreErr := d.restoreStaticLink(ctx, app, DefaultStateDir, prior); restoreErr != nil {
+			return fmt.Errorf("caddy route: %w; restoring release %s failed: %v; the target release was left active", err, prior.CurrentHash, restoreErr)
+		}
+		return fmt.Errorf("caddy route: %w; release %s was restored", err, prior.CurrentHash)
+	}
+
+	newState := state.NewAppliedState(prior, "static", "caddy", domain)
+	newState.CurrentHash = target
+	newState.PreviousHash = prior.CurrentHash
+	if prior.PreviousRelease != nil && prior.PreviousRelease.Hash == target {
+		newState.ApplyRelease(prior.PreviousRelease)
+	}
+	if err := state.Write(ctx, d.exec, app, newState); err != nil {
+		if restoreErr := d.restoreStaticLink(ctx, app, DefaultStateDir, prior); restoreErr != nil {
+			return fmt.Errorf("committing authoritative applied state after static rollback route switch: %w; restoring release %s failed: %v; the target release was left active", err, prior.CurrentHash, restoreErr)
+		}
+		return fmt.Errorf("committing authoritative applied state after static rollback route switch: %w; release %s was restored and state remains unchanged", err, prior.CurrentHash)
+	}
+	state.AppendLog(ctx, d.exec, state.LogEntry{
+		Timestamp: time.Now().UTC(),
+		App:       app,
+		Type:      "rollback",
+		Hash:      target,
+		Success:   true,
+	})
+	fmt.Fprintf(d.out, "Rolled back %s to %s (from recorded release metadata)\n", app, target)
+	return nil
+}
+
+// staticRollbackTarget resolves the rollback target for a static app from
+// state: an explicit --to hash, else the recorded previous release.
+func staticRollbackTarget(prior *state.AppState, toHash string) (string, error) {
+	target := toHash
+	if target == "" {
+		target = prior.PreviousHash
+	}
+	if target == "" {
+		return "", ErrNoPreviousDeploy
+	}
+	if target == prior.CurrentHash {
+		return "", fmt.Errorf("target hash %s is already current", target)
+	}
+	if !safeReleaseName(target) {
+		return "", fmt.Errorf("invalid target release %q — expected a release id from `teploy releases`", target)
+	}
+	return target, nil
 }
 
 // ListReleases returns the retained releases on disk for an app, newest

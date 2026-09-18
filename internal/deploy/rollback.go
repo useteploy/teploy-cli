@@ -10,6 +10,7 @@ import (
 
 	"github.com/useteploy/teploy/internal/caddy"
 	"github.com/useteploy/teploy/internal/docker"
+	"github.com/useteploy/teploy/internal/releasemeta"
 	"github.com/useteploy/teploy/internal/ssh"
 	"github.com/useteploy/teploy/internal/state"
 )
@@ -147,6 +148,30 @@ func Rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg Rollbac
 		return fmt.Errorf("no web container found for version %s", target)
 	}
 
+	// 3b. Load the target release's recorded spec (F14) — the rollback
+	// restores FROM THE RECORD, not from whatever the current teploy.yml
+	// happens to say. A confirmed-missing record is backfilled from the
+	// live containers (release-0 migration). The store must never be why a
+	// rollback that worked before stops working: an UNREADABLE record (or a
+	// failed backfill) degrades to the historical inspect-driven path with a
+	// warning, and only the genuinely recoverable overlays are skipped.
+	rec, recWarn := loadReleaseRecord(ctx, exec, dk, containers, cfg.App, target, current)
+	if recWarn != nil {
+		fmt.Fprintf(out, "Warning: %v — proceeding from live container inspection\n", recWarn)
+	}
+	if rec != nil {
+		applyRecordToRollback(&cfg, rec, &healthCfg)
+	}
+
+	// The recorded primary container port (TCL-14): with more than one
+	// published port, a fields[0] pick cannot tell the HTTP surface from an
+	// auxiliary listener. Health checks probe the primary's host binding and
+	// Caddy dials the primary container port.
+	primaryContainerPort := 0
+	if rec != nil {
+		primaryContainerPort, _ = releasemeta.PrimaryContainerPort(rec)
+	}
+
 	// Ports the current (about-to-be-stopped) version is live on right now —
 	// must not be handed to the target's recreated containers. A single-hop
 	// rollback could never collide (the immediately-previous version's port
@@ -157,15 +182,16 @@ func Rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg Rollbac
 	// container. See docker.Client.Restart's doc comment for how this is
 	// resolved (fresh port allocated instead of reusing a colliding one).
 	//
-	// EXCEPT under host ingress, where this reasoning inverts. There the port is
-	// fixed by config, so every version shares it and current.CurrentPort ALWAYS
-	// equals the target's port — avoiding it would reallocate on every single
-	// rollback, silently republishing the app on a random ephemeral port. That is
-	// not a rare collision case, it is guaranteed, and it made `teploy rollback`
-	// unusable for any host-ingress app. The fixed port is freed instead, by
+	// EXCEPT under fixed host ports (host ingress, or an app with publish
+	// entries — F21), where this reasoning inverts. There the ports are
+	// fixed by config, so every version shares them and the current
+	// version's port ALWAYS equals the target's — avoiding it would
+	// reallocate on every single rollback, silently republishing the app on
+	// a random ephemeral port. The fixed ports are freed instead, by
 	// stopping the current web containers before the target starts (below).
+	fixedPorts := cfg.ingressHost() || releasemeta.HasFixedHostPorts(rec)
 	avoidPorts := make(map[int]bool, len(current.CurrentPorts)+1)
-	if !cfg.ingressHost() {
+	if !fixedPorts {
 		for _, p := range current.CurrentPorts {
 			avoidPorts[p] = true
 		}
@@ -179,10 +205,11 @@ func Rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg Rollbac
 	// not "-<version>" — a suffix match silently skips every replica (leaving
 	// them stopped on rollback / orphaned on the next deploy). Every teploy
 	// container carries the version label.
-	// Host ingress recreates rather than blue/greens — the target reuses the same
-	// fixed host port, so the current web containers must stop before it starts.
-	// Deploy does exactly this (see deploy.go's displacedHostWeb); rollback did
-	// not, which is why it only ever "worked" by reallocating the port.
+	// Fixed host ports (host ingress or publish entries — F21) recreate
+	// rather than blue/green — the target reuses the same fixed port(s), so
+	// the current web containers must stop before it starts. Deploy does
+	// exactly this (see deploy.go's displacedHostWeb); rollback did not,
+	// which is why it only ever "worked" by reallocating the port.
 	//
 	// Recorded so a failed health check can bring them back: with a fixed port
 	// there is no moment where both versions are live, so the window between
@@ -203,7 +230,7 @@ func Rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg Rollbac
 			}
 		}
 	}
-	if cfg.ingressHost() {
+	if fixedPorts {
 		for _, c := range containers {
 			// Displace only the RUNNING web containers of the AUTHORITATIVE
 			// current generation (TCL-07). The old filter (any non-target
@@ -277,7 +304,19 @@ func Rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg Rollbac
 	// rollback of a host-ingress app with a bind address.
 	healthBindHost := ""
 	for _, c := range targetWeb {
-		p, err := dk.HostPort(ctx, c.Name)
+		var p int
+		// TCL-14: prefer the binding of the recorded PRIMARY container port
+		// over the first field docker's map happens to print — a multi-port
+		// container's auxiliary listeners must not steal the health probe.
+		if primaryContainerPort > 0 {
+			if hp, herr := dk.HostPortFor(ctx, c.Name, primaryContainerPort); herr == nil {
+				p = hp
+			} else {
+				p, err = dk.HostPort(ctx, c.Name)
+			}
+		} else {
+			p, err = dk.HostPort(ctx, c.Name)
+		}
 		if err != nil {
 			// A failed inspect must not strand the displaced fixed-port
 			// workload (F12).
@@ -323,10 +362,19 @@ func Rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg Rollbac
 	if cfg.usesCaddy() {
 		fmt.Fprintln(out, "Updating routes...")
 		tls := caddy.TLS{Cert: cfg.TLSCert, Key: cfg.TLSKey, Internal: cfg.TLSInternal}
+		// The Caddy upstream port is the recorded primary container port
+		// when there is one (TCL-14); without a record the first exposed
+		// port remains the historical best-effort pick.
+		upstreamPort := func(name string) (int, error) {
+			if primaryContainerPort > 0 {
+				return primaryContainerPort, nil
+			}
+			return dk.InternalPort(ctx, name)
+		}
 		if len(targetWeb) > 1 {
 			upstreams := make([]caddy.Upstream, 0, len(targetWeb))
 			for _, c := range targetWeb {
-				port, err := dk.InternalPort(ctx, c.Name)
+				port, err := upstreamPort(c.Name)
 				if err != nil {
 					return fmt.Errorf("inspecting target container port: %w", err)
 				}
@@ -337,7 +385,7 @@ func Rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg Rollbac
 			}
 			fmt.Fprintf(out, "  Traffic load-balanced across %d replicas\n", len(targetWeb))
 		} else {
-			port, err := dk.InternalPort(ctx, targetWeb[0].Name)
+			port, err := upstreamPort(targetWeb[0].Name)
 			if err != nil {
 				return fmt.Errorf("inspecting target container port: %w", err)
 			}
@@ -388,11 +436,11 @@ func Rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg Rollbac
 		newState.ImageDigest = digest
 	}
 	if err := state.Write(ctx, exec, cfg.App, newState); err != nil {
-		// Host ingress: the target holds the fixed port. Stop it, restore the
+		// Fixed host ports: the target holds them. Stop it, restore the
 		// displaced workload, then remove the uncommitted target — previously
 		// this branch skipped the restore and still claimed "the original
 		// workload was left running" (audit F12).
-		if cfg.ingressHost() {
+		if fixedPorts {
 			for _, name := range started {
 				dk.Stop(ctx, name, 5)
 			}
@@ -471,4 +519,64 @@ func restoreRollbackRoute(ctx context.Context, cd *caddy.Client, dk *docker.Clie
 		upstreams[i] = caddy.Upstream{Dial: fmt.Sprintf("%s:%d", container.Name, port)}
 	}
 	return cd.SetLoadBalancerHealth(ctx, cfg.App, domain, upstreams, cfg.Health.withDefaults().Path, tls, cfg.CaddyExtra, cfg.Cache, cfg.Firewall, cfg.Access)
+}
+
+// loadReleaseRecord resolves the F14 record for the rollback target,
+// backfilling a "release-0" record from the live containers when the release
+// predates the store (the convergence migration). The returned warning is
+// non-fatal by contract: rollback worked before the store existed and must
+// keep working without it — an unreadable record or failed backfill means
+// the overlays are skipped, never that the rollback refuses.
+func loadReleaseRecord(ctx context.Context, exec ssh.Executor, dk *docker.Client, containers []docker.Container, app, hash string, current *state.AppState) (*releasemeta.Record, error) {
+	rec, err := releasemeta.Read(ctx, exec, app, hash)
+	if err != nil {
+		return nil, err
+	}
+	if rec == nil {
+		rec, err = releasemeta.Backfill(ctx, exec, dk, containers, app, hash, current)
+		if err != nil {
+			return nil, fmt.Errorf("backfilling release metadata for %s@%s: %w", app, hash, err)
+		}
+	}
+	return rec, nil
+}
+
+// applyRecordToRollback overlays the recorded release spec onto the rollback
+// config: the record is the target release's truth, the CLI-passed values
+// (from the current teploy.yml) are the fallback. Wholesale replacement per
+// field group — an empty recorded TLS block MEANS "this release had no
+// custom TLS" and must not be silently upgraded to whatever the current
+// config says. Backfilled records carry no health/caddy data (unrecoverable
+// from containers), so those overlays simply don't fire for them.
+func applyRecordToRollback(cfg *RollbackConfig, rec *releasemeta.Record, healthCfg *HealthConfig) {
+	if rec.IngressMode != "" {
+		cfg.Ingress = rec.IngressMode
+	}
+	if rec.Domain != "" {
+		cfg.Domain = rec.Domain
+	}
+	if rec.Health != nil {
+		if rec.Health.Path != "" {
+			healthCfg.Path = rec.Health.Path
+		}
+		if rec.Health.TimeoutSeconds > 0 {
+			healthCfg.Timeout = time.Duration(rec.Health.TimeoutSeconds) * time.Second
+		}
+		if rec.Health.IntervalSeconds > 0 {
+			healthCfg.Interval = time.Duration(rec.Health.IntervalSeconds) * time.Second
+		}
+	}
+	if rec.Caddy != nil {
+		cfg.TLSCert = rec.Caddy.TLSCert
+		cfg.TLSKey = rec.Caddy.TLSKey
+		cfg.TLSInternal = rec.Caddy.TLSInternal
+		cfg.CaddyExtra = rec.Caddy.CaddyExtra
+		cfg.Cache = rec.Caddy.Cache
+		if rec.Caddy.Firewall != nil {
+			cfg.Firewall = *rec.Caddy.Firewall
+		}
+		if rec.Caddy.Access != nil {
+			cfg.Access = *rec.Caddy.Access
+		}
+	}
 }

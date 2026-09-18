@@ -131,12 +131,11 @@ func runRollback(flags *Flags, toHash string) error {
 // teploy.yml. Used by teploy-dash and for running rollback outside of an
 // app directory.
 //
-// Known gap, not addressed here: this always calls the container
-// deploy.Rollback — it never checks whether the app is actually
-// type:static (that requires teploy.yml, which this path deliberately
-// doesn't need) and branches to StaticDeployer.Rollback the way
-// runRollback does. Calling `teploy rollback --app <static-app> --host
-// ...` will fail rather than correctly flip the release symlink.
+// Both deploy types are complete on this path since F13/F14: container
+// rollbacks restore from the recorded release spec (deploy.Rollback reads
+// the F14 record, backfilling from live containers for pre-store releases),
+// and static rollbacks read the recorded serving config
+// (StaticDeployer.RollbackStateOnly).
 func runRollbackByApp(flags *Flags, appName, toHash string) error {
 	if err := config.ValidateName(appName); err != nil {
 		return err
@@ -172,10 +171,12 @@ func runRollbackByApp(flags *Flags, appName, toHash string) error {
 		return fmt.Errorf("no state found for app %q on %s — has it been deployed?", appName, host)
 	}
 	if appState.DeploymentType == "static" {
-		// Static rollback needs the release-serving config (SPA, headers,
-		// cache…) which state does not retain — deferred, see AUDIT_OPEN.md
-		// (F13): fail with direction instead of corrupting the route.
-		return fmt.Errorf("app %q is a static deploy; state-only static rollback is not supported yet — run `teploy rollback` from the app directory (teploy.yml provides the serving config)", appName)
+		// Static rollback reads the serving config (SPA, headers, cache…)
+		// from the recorded release metadata (F13/F14). Releases deployed
+		// before the store existed have no record — that is a redeploy-first
+		// request, not a guess at how the release was served.
+		d := deploy.NewStaticDeployer(executor, os.Stdout)
+		return d.RollbackStateOnly(ctx, appName, toHash)
 	}
 	ingress := appState.IngressMode
 	if ingress == "" {

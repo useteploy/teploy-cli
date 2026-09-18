@@ -5,12 +5,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/useteploy/teploy/internal/caddy"
 	"github.com/useteploy/teploy/internal/docker"
+	"github.com/useteploy/teploy/internal/releasemeta"
 	"github.com/useteploy/teploy/internal/ssh"
 	"github.com/useteploy/teploy/internal/state"
 )
@@ -194,6 +196,17 @@ func (d *Deployer) DeployLocked(ctx context.Context, cfg Config) error {
 		webBindHost = "0.0.0.0"
 	}
 
+	// recreateWeb selects the explicit recreate strategy (audit F21): stop
+	// the current web container(s) BEFORE starting the replacement. Host
+	// ingress needs it because the fixed published port cannot double-bind;
+	// `publish:` entries need it for the same reason — their host ports are
+	// operator-configured and identical across versions, so blue/green would
+	// just die on "port is already allocated" mid-deploy (previously a clean
+	// pre-mutation error; now a deliberate, brief-outage recreate with
+	// restore-on-failure, matching host ingress). Validation upstream keeps
+	// publish/host ingress single-replica.
+	recreateWeb := cfg.ingressHost() || len(cfg.Publish) > 0
+
 	start := time.Now()
 
 	if replicas > 1 {
@@ -335,12 +348,13 @@ func (d *Deployer) DeployLocked(ctx context.Context, cfg Config) error {
 		}
 	}
 
-	// Host ingress recreates rather than blue/greens: the new container reuses
-	// the old one's fixed host port, so stop the running web container first to
-	// free it. Keep the stopped container until state commits so a failed commit
-	// can recreate it with its original configuration and fixed port.
+	// Host ingress and publish-apps recreate rather than blue/green: the new
+	// container reuses the old one's fixed host port(s), so stop the running
+	// web container first to free them. Keep the stopped container until
+	// state commits so a failed commit can recreate it with its original
+	// configuration and fixed port.
 	var displacedHostWeb []string
-	if cfg.ingressHost() {
+	if recreateWeb {
 		names, _ := d.exec.Run(ctx, fmt.Sprintf(
 			"docker ps --filter label=teploy.app=%s --filter label=teploy.process=web --format '{{.Names}}'", cfg.App))
 		for _, name := range strings.Fields(names) {
@@ -356,9 +370,9 @@ func (d *Deployer) DeployLocked(ctx context.Context, cfg Config) error {
 				}
 				cancel()
 				if lastErr != nil {
-					return fmt.Errorf("stopping current host-ingress container %s: %w — restoring the displaced workload also failed: %v; %s needs manual attention", name, err, lastErr, cfg.App)
+					return fmt.Errorf("stopping current fixed-port container %s: %w — restoring the displaced workload also failed: %v; %s needs manual attention", name, err, lastErr, cfg.App)
 				}
-				return fmt.Errorf("stopping current host-ingress container %s: %w — the displaced workload was restored", name, err)
+				return fmt.Errorf("stopping current fixed-port container %s: %w — the displaced workload was restored", name, err)
 			}
 			displacedHostWeb = append(displacedHostWeb, name)
 		}
@@ -572,6 +586,12 @@ func (d *Deployer) DeployLocked(ctx context.Context, cfg Config) error {
 		return d.abortStateCommit(ctx, cfg, current, started, displacedHostWeb, start, err)
 	}
 
+	// 13b. Record the release metadata (F14). The containers are live and
+	// the route/state are committed — a record failure is a degraded
+	// rollback window, not a failed deploy, and it converges on the next
+	// deploy or backfill. Never abort into abortStateCommit from here.
+	d.recordRelease(ctx, cfg, newState, ports, webBindHost, webContainerName)
+
 	// 14. Stop the predecessor workload snapshotted in step 6b (all
 	// processes + all replicas). For same-version redeploys the old
 	// containers were renamed to _replaced; remove them after stopping so
@@ -692,7 +712,7 @@ func stopOldWorkloadsByName(ctx context.Context, dk *docker.Client, out io.Write
 func (d *Deployer) abortStateCommit(ctx context.Context, cfg Config, current *state.AppState, started, displacedHostWeb []string, start time.Time, commitErr error) error {
 	d.logDeploy(ctx, cfg, false, start)
 
-	if cfg.ingressHost() {
+	if cfg.ingressHost() || len(cfg.Publish) > 0 {
 		for _, name := range started {
 			d.docker.Stop(ctx, name, 5)
 		}
@@ -780,6 +800,90 @@ func (d *Deployer) logDeploy(ctx context.Context, cfg Config, success bool, star
 		Success:    success,
 		DurationMs: time.Since(start).Milliseconds(),
 	})
+}
+
+// recordRelease persists the F14 record for the release this deploy just
+// committed. Ports are the resolved live allocation (the primary's host
+// binding plus every publish entry); env records the references (server-side
+// env-file paths + the plaintext env map), never resolved secrets. The
+// primary web container's full RecreateSpec is embedded from docker's own
+// view of it. Every failure is a warning — see the call site.
+func (d *Deployer) recordRelease(ctx context.Context, cfg Config, applied *state.AppState, ports []int, webBindHost, webContainerName string) {
+	containerPort := cfg.ContainerPort
+	if containerPort == 0 {
+		containerPort = 80
+	}
+	healthCfg := cfg.Health.withDefaults()
+
+	rec := &releasemeta.Record{
+		App:            cfg.App,
+		Hash:           cfg.Version,
+		Generation:     applied.Generation,
+		DeploymentType: "container",
+		IngressMode:    cfg.Ingress,
+		Domain:         cfg.Domain,
+		ImageRef:       cfg.Image,
+		ImageDigest:    applied.ImageDigest,
+		Replicas:       len(ports),
+		Processes:      maps.Clone(cfg.Processes),
+		Cmd:            cfg.Cmd,
+		Env:            maps.Clone(cfg.Env),
+		EnvFiles:       append([]string(nil), cfg.EnvFiles...),
+		Volumes:        maps.Clone(cfg.Volumes),
+		Publish:        append([]string(nil), cfg.Publish...),
+		Memory:         cfg.Memory,
+		CPU:            cfg.CPU,
+		StopTimeout:    cfg.StopTimeout,
+		Bind:           cfg.Bind,
+		Health: &releasemeta.Health{
+			Path:            healthCfg.Path,
+			TimeoutSeconds:  int(healthCfg.Timeout.Seconds()),
+			IntervalSeconds: int(healthCfg.Interval.Seconds()),
+		},
+	}
+	if rec.IngressMode == "" {
+		rec.IngressMode = "caddy"
+	}
+	if len(ports) > 0 {
+		rec.Ports = append(rec.Ports, releasemeta.Port{
+			HostPort:      ports[0],
+			ContainerPort: containerPort,
+			Bind:          webBindHost,
+			Primary:       true,
+			Fixed:         cfg.ingressHost(),
+		})
+	}
+	for _, pub := range cfg.Publish {
+		if p, ok := releasemeta.PortFromPublishSpec(pub); ok {
+			rec.Ports = append(rec.Ports, p)
+		}
+	}
+	if cfg.usesCaddy() {
+		rec.Caddy = &releasemeta.CaddyRoute{
+			TLSCert:     cfg.TLSCert,
+			TLSKey:      cfg.TLSKey,
+			TLSInternal: cfg.TLSInternal,
+			CaddyExtra:  cfg.CaddyExtra,
+			Cache:       maps.Clone(cfg.Cache),
+		}
+		if !cfg.Firewall.Empty() {
+			fw := cfg.Firewall
+			rec.Caddy.Firewall = &fw
+		}
+		if !cfg.Access.Empty() {
+			acc := cfg.Access
+			rec.Caddy.Access = &acc
+		}
+	}
+
+	if spec, err := d.docker.InspectRecreate(ctx, webContainerName); err == nil {
+		rec.Recreate = spec
+	} else {
+		fmt.Fprintf(d.out, "Warning: could not capture the recreate spec for %s: %v (recreate falls back to live inspect)\n", webContainerName, err)
+	}
+	if err := releasemeta.Write(ctx, d.exec, rec); err != nil {
+		fmt.Fprintf(d.out, "Warning: could not record release metadata for %s@%s: %v (rollback for this release falls back to live inspection)\n", cfg.App, cfg.Version, err)
+	}
 }
 
 // sortedProcessNames returns process names with "web" first, then alphabetical.
