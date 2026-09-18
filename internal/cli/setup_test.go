@@ -34,6 +34,8 @@ func TestSetupServer(t *testing.T) {
 		ssh.MockCommand{Match: "docker info", Output: ""},
 		ssh.MockCommand{Match: "docker network", Output: "teploy"},
 		ssh.MockCommand{Match: "mkdir", Output: ""},
+		ssh.MockCommand{Match: "chown", Output: ""},
+		ssh.MockCommand{Match: "[ -f /deployments/caddy/Caddyfile ]", Output: "absent"},
 		ssh.MockCommand{Match: "docker ps -a --filter name=", Output: ""},
 		ssh.MockCommand{Match: "docker run", Output: "caddy_container_id"},
 	)
@@ -118,7 +120,7 @@ func TestSetupServer_InstallDocker(t *testing.T) {
 		ssh.MockCommand{Match: "docker network", Output: "teploy"},
 		ssh.MockCommand{Match: "mkdir", Output: ""},
 		ssh.MockCommand{Match: "chown", Output: ""},
-		ssh.MockCommand{Match: "test -s /deployments/caddy/Caddyfile", Err: fmt.Errorf("no such file")},
+		ssh.MockCommand{Match: "[ -f /deployments/caddy/Caddyfile ]", Output: "absent"},
 		ssh.MockCommand{Match: "docker ps -a --filter name=", Output: ""},
 		ssh.MockCommand{Match: "docker run", Output: "caddy_id"},
 	)
@@ -147,7 +149,7 @@ func TestSetupServer_CaddyAlreadyRunning(t *testing.T) {
 		ssh.MockCommand{Match: "docker network", Output: "teploy"},
 		ssh.MockCommand{Match: "mkdir", Output: ""},
 		ssh.MockCommand{Match: "chown", Output: ""},
-		ssh.MockCommand{Match: "test -s /deployments/caddy/Caddyfile", Output: ""},
+		ssh.MockCommand{Match: "[ -f /deployments/caddy/Caddyfile ]", Output: "absent"},
 		ssh.MockCommand{Match: "sed -i", Output: ""},
 		ssh.MockCommand{Match: "docker ps -a --filter name=", Output: "caddy"},
 		// Existing Caddy already on the new model: no --resume, directory-
@@ -190,12 +192,13 @@ func TestSetupServer_CaddyUpgradePreservesNetworksAndCaddyfile(t *testing.T) {
 		ssh.MockCommand{Match: "docker network", Output: "teploy"},
 		ssh.MockCommand{Match: "mkdir", Output: ""},
 		ssh.MockCommand{Match: "chown", Output: ""},
-		ssh.MockCommand{Match: "test -s /deployments/caddy/Caddyfile", Output: ""},
+		ssh.MockCommand{Match: "[ -f /deployments/caddy/Caddyfile ]", Output: "present"},
 		ssh.MockCommand{Match: "sed -i", Output: ""},
 		ssh.MockCommand{Match: "docker ps -a --filter name=", Output: "caddy"},
 		// Legacy Caddy cmd: launched WITH --resume, must migrate.
 		ssh.MockCommand{Match: "docker inspect -f '{{join .Config.Cmd", Output: "caddy run --config /etc/caddy/Caddyfile --adapter caddyfile --resume"},
 		ssh.MockCommand{Match: "docker inspect -f '{{range .Mounts}}", Output: "/data /config /etc/caddy/Caddyfile "},
+		ssh.MockCommand{Match: "docker inspect -f '{{json .Mounts}}'", Output: `[{"Type":"volume","Name":"caddy_data","Source":"/var/lib/docker/volumes/caddy_data/_data","Destination":"/data","RW":true},{"Type":"volume","Name":"caddy_config","Source":"/var/lib/docker/volumes/caddy_config/_data","Destination":"/config","RW":true},{"Type":"bind","Source":"/deployments/caddy/Caddyfile","Destination":"/etc/caddy/Caddyfile","RW":true}]`},
 		// Extra networks the existing caddy is attached to.
 		ssh.MockCommand{Match: "docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}", Output: "teploy dokploy-network bridge "},
 		ssh.MockCommand{Match: "docker rm -f caddy", Output: ""},
@@ -285,7 +288,7 @@ func TestSetupServer_PreservesForeignMountsOnRecreate(t *testing.T) {
 		ssh.MockCommand{Match: "docker network", Output: "teploy"},
 		ssh.MockCommand{Match: "mkdir", Output: ""},
 		ssh.MockCommand{Match: "chown", Output: ""},
-		ssh.MockCommand{Match: "test -s /deployments/caddy/Caddyfile", Output: ""},
+		ssh.MockCommand{Match: "[ -f /deployments/caddy/Caddyfile ]", Output: "absent"},
 		ssh.MockCommand{Match: "sed -i", Output: ""},
 		ssh.MockCommand{Match: "docker ps -a --filter name=", Output: "caddy"},
 		// No --resume, directory-mounted, but missing /deployments — the
@@ -343,12 +346,13 @@ func TestSetupServer_MigratesLegacyFileMount(t *testing.T) {
 		ssh.MockCommand{Match: "docker network", Output: "teploy"},
 		ssh.MockCommand{Match: "mkdir", Output: ""},
 		ssh.MockCommand{Match: "chown", Output: ""},
-		ssh.MockCommand{Match: "test -s /deployments/caddy/Caddyfile", Output: ""},
+		ssh.MockCommand{Match: "[ -f /deployments/caddy/Caddyfile ]", Output: "absent"},
 		ssh.MockCommand{Match: "sed -i", Output: ""},
 		ssh.MockCommand{Match: "docker ps -a --filter name=", Output: "caddy"},
 		// No --resume, but the legacy single-file mount is present → recreate.
 		ssh.MockCommand{Match: "docker inspect -f '{{join .Config.Cmd", Output: "caddy run --config /etc/caddy/Caddyfile --adapter caddyfile"},
 		ssh.MockCommand{Match: "docker inspect -f '{{range .Mounts}}", Output: "/data /config /etc/caddy/Caddyfile "},
+		ssh.MockCommand{Match: "docker inspect -f '{{json .Mounts}}'", Output: `[{"Type":"volume","Name":"caddy_data","Source":"/var/lib/docker/volumes/caddy_data/_data","Destination":"/data","RW":true},{"Type":"volume","Name":"caddy_config","Source":"/var/lib/docker/volumes/caddy_config/_data","Destination":"/config","RW":true},{"Type":"bind","Source":"/deployments/caddy/Caddyfile","Destination":"/etc/caddy/Caddyfile","RW":true}]`},
 		ssh.MockCommand{Match: "docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}", Output: "teploy "},
 		ssh.MockCommand{Match: "docker rm -f caddy", Output: ""},
 		ssh.MockCommand{Match: "docker run", Output: "caddy_id"},
@@ -401,7 +405,7 @@ func TestSetupServer_MigratesMissingStaticMount(t *testing.T) {
 		ssh.MockCommand{Match: "docker network", Output: "teploy"},
 		ssh.MockCommand{Match: "mkdir", Output: ""},
 		ssh.MockCommand{Match: "chown", Output: ""},
-		ssh.MockCommand{Match: "test -s /deployments/caddy/Caddyfile", Output: ""},
+		ssh.MockCommand{Match: "[ -f /deployments/caddy/Caddyfile ]", Output: "absent"},
 		ssh.MockCommand{Match: "sed -i", Output: ""},
 		ssh.MockCommand{Match: "docker ps -a --filter name=", Output: "caddy"},
 		// Already on the directory-mount model (no --resume, /etc/caddy
@@ -409,6 +413,7 @@ func TestSetupServer_MigratesMissingStaticMount(t *testing.T) {
 		// exactly what every server provisioned before this fix looks like.
 		ssh.MockCommand{Match: "docker inspect -f '{{join .Config.Cmd", Output: "caddy run --config /etc/caddy/Caddyfile --adapter caddyfile"},
 		ssh.MockCommand{Match: "docker inspect -f '{{range .Mounts}}", Output: "/data /config /etc/caddy "},
+		ssh.MockCommand{Match: "docker inspect -f '{{json .Mounts}}'", Output: `[{"Type":"volume","Name":"caddy_data","Source":"/var/lib/docker/volumes/caddy_data/_data","Destination":"/data","RW":true},{"Type":"volume","Name":"caddy_config","Source":"/var/lib/docker/volumes/caddy_config/_data","Destination":"/config","RW":true},{"Type":"bind","Source":"/deployments/caddy","Destination":"/etc/caddy","RW":true}]`},
 		ssh.MockCommand{Match: "docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}", Output: "teploy "},
 		ssh.MockCommand{Match: "docker rm -f caddy", Output: ""},
 		ssh.MockCommand{Match: "docker run", Output: "caddy_id"},
@@ -451,7 +456,7 @@ func TestSetupServer_UFWActive(t *testing.T) {
 		ssh.MockCommand{Match: "docker network", Output: "teploy"},
 		ssh.MockCommand{Match: "mkdir", Output: ""},
 		ssh.MockCommand{Match: "chown", Output: ""},
-		ssh.MockCommand{Match: "test -s /deployments/caddy/Caddyfile", Err: fmt.Errorf("no such file")},
+		ssh.MockCommand{Match: "[ -f /deployments/caddy/Caddyfile ]", Output: "absent"},
 		ssh.MockCommand{Match: "docker ps -a --filter name=", Output: ""},
 		ssh.MockCommand{Match: "docker run", Output: "caddy_id"},
 	)

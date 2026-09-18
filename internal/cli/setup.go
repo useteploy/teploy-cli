@@ -507,8 +507,18 @@ func setupServer(ctx context.Context, exec ssh.Executor, w io.Writer, yes bool) 
 	if _, err := exec.Run(ctx, sudo+"mkdir -p /deployments/caddy"); err != nil {
 		return fmt.Errorf("creating directories: %w", err)
 	}
-	// Ensure deploy user owns the directory.
-	exec.Run(ctx, sudo+"chown -R $(whoami):$(whoami) /deployments")
+	// Ensure the deploy user owns the CONTROL-PLANE directories only —
+	// never the whole /deployments tree. The old `chown -R
+	// $(whoami):$(whoami) /deployments` reassigned every application's
+	// bind-mounted data (database files owned by engine UIDs, accessory
+	// state) to the interactive SSH user on every re-run, breaking engines
+	// that rely on their own numeric ownership (TCL-26). Existing app data
+	// ownership is an invariant, not setup's cleanup target: app
+	// directories created later are owned by this user anyway, and the
+	// error is propagated instead of ignored.
+	if _, err := exec.Run(ctx, sudo+"chown $(whoami):$(whoami) /deployments /deployments/caddy"); err != nil {
+		return fmt.Errorf("setting control-plane directory ownership: %w", err)
+	}
 
 	// Caddy admin API listens on 0.0.0.0 inside container so Docker port
 	// forwarding can reach it. Port 2019 is only published to 127.0.0.1
@@ -519,7 +529,16 @@ func setupServer(ctx context.Context, exec ssh.Executor, w io.Writer, yes bool) 
 	// the existing Caddyfile holds live production routes and must be
 	// preserved.
 	const stubCaddyfile = "{\n\tadmin 127.0.0.1:2019\n}\n"
-	if _, err := exec.Run(ctx, "test -s /deployments/caddy/Caddyfile"); err != nil {
+	// Only write the stub Caddyfile when the file is confirmed ABSENT —
+	// `test -s` also fails for an unreadable or empty-but-present file, and
+	// overwriting either with a stub discards live routes (TCL-27
+	// containment). An existing empty file is left for the operator to
+	// inspect rather than silently clobbered.
+	present, err := exec.Run(ctx, "[ -f /deployments/caddy/Caddyfile ] && echo present || echo absent")
+	if err != nil {
+		return fmt.Errorf("checking for an existing Caddyfile: %w", err)
+	}
+	if strings.TrimSpace(present) == "absent" {
 		if err := exec.Upload(ctx, strings.NewReader(stubCaddyfile), "/deployments/caddy/Caddyfile", "0644"); err != nil {
 			return fmt.Errorf("uploading Caddyfile: %w", err)
 		}
@@ -612,23 +631,29 @@ func setupServer(ctx context.Context, exec ssh.Executor, w io.Writer, yes bool) 
 			// against an existing, previously-hand-managed server — not
 			// just a fresh one.
 			var extraMounts []dockerMount
-			mountJSON, _ := exec.Run(ctx, dockerCmd+" inspect -f '{{json .Mounts}}' caddy")
+			// The detailed mount inventory must SUCCEED before the
+			// destructive recreate below: a failed inspect or unparseable
+			// JSON used to read as "no extra mounts", silently dropping
+			// adopted volumes during the migration (TCL-27).
+			mountJSON, mountJSONErr := exec.Run(ctx, dockerCmd+" inspect -f '{{json .Mounts}}' caddy")
+			if mountJSONErr != nil {
+				return fmt.Errorf("cannot safely inventory the existing caddy container (mount detail): %w", mountJSONErr)
+			}
 			teployDestinations := map[string]bool{
 				"/data": true, "/config": true, "/etc/caddy": true, "/deployments": true,
 			}
-			if mountJSON != "" {
-				var mounts []dockerMount
-				if err := json.Unmarshal([]byte(mountJSON), &mounts); err == nil {
-					for _, m := range mounts {
-						if m.Type == "volume" && (m.Name == "caddy_data" || m.Name == "caddy_config") {
-							continue // teploy's own named volumes, re-added explicitly below
-						}
-						if teployDestinations[m.Destination] {
-							continue // teploy's own bind mounts, re-added explicitly below
-						}
-						extraMounts = append(extraMounts, m)
-					}
+			var mounts []dockerMount
+			if err := json.Unmarshal([]byte(mountJSON), &mounts); err != nil {
+				return fmt.Errorf("decoding the existing caddy container's mount inventory: %w", err)
+			}
+			for _, m := range mounts {
+				if m.Type == "volume" && (m.Name == "caddy_data" || m.Name == "caddy_config") {
+					continue // teploy's own named volumes, re-added explicitly below
 				}
+				if teployDestinations[m.Destination] {
+					continue // teploy's own bind mounts, re-added explicitly below
+				}
+				extraMounts = append(extraMounts, m)
 			}
 			for _, m := range extraMounts {
 				src := m.Source
