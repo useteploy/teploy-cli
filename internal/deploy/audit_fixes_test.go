@@ -185,3 +185,30 @@ func TestHashDir_RejectsSymlinksAndSpecials(t *testing.T) {
 		t.Fatal("empty tree accepted")
 	}
 }
+
+// TCL-16: the health-check URL must be a single quoted argument with the
+// IPv6 host bracketed, and a query string must survive verbatim — the old
+// unquoted interpolation let '&' change shell parsing.
+func TestProbeURL(t *testing.T) {
+	got, ok := probeURL("::1", 8080, "/ready?a=1&b=2")
+	if !ok || got != "http://[::1]:8080/ready?a=1&b=2" {
+		t.Fatalf("got %q, %v", got, ok)
+	}
+	if got, ok := probeURL("localhost", 80, "/health"); !ok || got != "http://localhost:80/health" {
+		t.Fatalf("got %q, %v", got, ok)
+	}
+	for _, tc := range []struct{ host, path string }{
+		{"localhost", "https://elsewhere/"},
+		{"localhost", "//elsewhere/"},
+		{"localhost", "/x\ncmd"},
+		{"evil;host", "/health"},
+		{"localhost", "noslash"},
+	} {
+		if _, ok := probeURL(tc.host, 8080, tc.path); ok {
+			t.Errorf("probeURL accepted %q / %q", tc.host, tc.path)
+		}
+	}
+	if _, ok := probeURL("localhost", 0, "/health"); ok {
+		t.Error("probeURL accepted port 0")
+	}
+}

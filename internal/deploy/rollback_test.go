@@ -44,6 +44,9 @@ func TestRollback(t *testing.T) {
 		ssh.MockCommand{Match: "docker run", Output: ""},
 		ssh.MockCommand{Match: "curl", Output: "200"},
 		// Target container's host port (health check) resolved via docker inspect -f.
+		// HostBindIP fixture: the bind IP the health probe actually dials (TCL-16 fail-closed host validation makes the old artifact — a bare
+		// port number reused from the HostPort fixture — an invalid probe host).
+		ssh.MockCommand{Match: "docker inspect -f '{{range $p, $b := .NetworkSettings.Ports}}{{range $b}}{{.HostIp}}", Output: "127.0.0.1 "},
 		ssh.MockCommand{Match: "docker inspect -f '{{range $p, $b := .NetworkSettings.Ports}}", Output: "49153"},
 		// Target container's internal port (Caddy upstream) resolved via docker inspect -f.
 		ssh.MockCommand{Match: "docker inspect -f '{{range $p, $_ := .NetworkSettings.Ports}}", Output: "3000/tcp"},
@@ -146,6 +149,9 @@ func TestRollback_StateCommitFailureRestoresOriginalRouteAndWorkload(t *testing.
 		ssh.MockCommand{Match: "docker inspect 'myapp-web-v1'", Output: `[{"Config":{"Image":"myapp:latest","Labels":{"teploy.app":"myapp"}},"HostConfig":{"NetworkMode":"teploy","PortBindings":{"3000/tcp":[{"HostIp":"127.0.0.1","HostPort":"49152"}]},"RestartPolicy":{"Name":"no"}},"NetworkSettings":{"Networks":{"teploy":{"Aliases":["myapp"]}}}}]`},
 		ssh.MockCommand{Match: "docker rm -f 'myapp-web-v1'", Output: ""},
 		ssh.MockCommand{Match: "docker run", Output: ""},
+		// HostBindIP fixture: the bind IP the health probe actually dials (TCL-16 fail-closed host validation makes the old artifact — a bare
+		// port number reused from the HostPort fixture — an invalid probe host).
+		ssh.MockCommand{Match: "docker inspect -f '{{range $p, $b := .NetworkSettings.Ports}}{{range $b}}{{.HostIp}}", Output: "127.0.0.1 "},
 		ssh.MockCommand{Match: "docker inspect -f '{{range $p, $b := .NetworkSettings.Ports}}", Output: "49152"},
 		ssh.MockCommand{Match: "docker inspect -f '{{range $p, $_ := .NetworkSettings.Ports}}", Output: "3000/tcp"},
 		ssh.MockCommand{Match: "curl", Output: "200"},
@@ -272,6 +278,9 @@ func TestRollback_HealthCheckFails(t *testing.T) {
 		ssh.MockCommand{Match: "docker inspect 'myapp-web-v1'", Output: `[{"Config":{"Image":"myapp:latest","Labels":{"teploy.app":"myapp"}},"HostConfig":{"NetworkMode":"teploy","PortBindings":{"3000/tcp":[{"HostIp":"127.0.0.1","HostPort":"49152"}]},"RestartPolicy":{"Name":"no"}},"NetworkSettings":{"Networks":{"teploy":{"Aliases":["myapp"]}}}}]`},
 		ssh.MockCommand{Match: "docker rm -f 'myapp-web-v1'", Output: ""},
 		ssh.MockCommand{Match: "docker run", Output: ""},
+		// HostBindIP fixture: the bind IP the health probe actually dials (TCL-16 fail-closed host validation makes the old artifact — a bare
+		// port number reused from the HostPort fixture — an invalid probe host).
+		ssh.MockCommand{Match: "docker inspect -f '{{range $p, $b := .NetworkSettings.Ports}}{{range $b}}{{.HostIp}}", Output: "127.0.0.1 "},
 		ssh.MockCommand{Match: "docker inspect -f '{{range $p, $b := .NetworkSettings.Ports}}", Output: "49153"},
 		ssh.MockCommand{Match: "curl", Err: fmt.Errorf("connection refused")},
 		ssh.MockCommand{Match: "bash -c", Err: fmt.Errorf("connection refused")},
@@ -315,6 +324,9 @@ func TestRollback_MultiReplica(t *testing.T) {
 		ssh.MockCommand{Match: "docker inspect 'myapp-web-v1", Output: `[{"Config":{"Image":"myapp:latest","Labels":{"teploy.app":"myapp"}},"HostConfig":{"NetworkMode":"teploy","PortBindings":{"3000/tcp":[{"HostIp":"127.0.0.1","HostPort":"49152"}]},"RestartPolicy":{"Name":"no"}},"NetworkSettings":{"Networks":{"teploy":{"Aliases":["myapp"]}}}}]`},
 		ssh.MockCommand{Match: "docker rm -f 'myapp-web-v1", Output: ""},
 		ssh.MockCommand{Match: "docker run", Output: ""},
+		// HostBindIP fixture: the bind IP the health probe actually dials (TCL-16 fail-closed host validation makes the old artifact — a bare
+		// port number reused from the HostPort fixture — an invalid probe host).
+		ssh.MockCommand{Match: "docker inspect -f '{{range $p, $b := .NetworkSettings.Ports}}{{range $b}}{{.HostIp}}", Output: "127.0.0.1 "},
 		ssh.MockCommand{Match: "docker inspect -f '{{range $p, $b := .NetworkSettings.Ports}}", Output: "49153"},
 		ssh.MockCommand{Match: "curl", Output: "200"},
 		ssh.MockCommand{Match: "docker inspect -f '{{range $p, $_ := .NetworkSettings.Ports}}", Output: "3000/tcp"},
@@ -386,6 +398,9 @@ func TestRollback_ToSpecificHash(t *testing.T) {
 		ssh.MockCommand{Match: "docker inspect 'myapp-web-v1'", Output: `[{"Config":{"Image":"myapp:latest","Labels":{"teploy.app":"myapp"}},"HostConfig":{"NetworkMode":"teploy","PortBindings":{"3000/tcp":[{"HostIp":"127.0.0.1","HostPort":"49152"}]},"RestartPolicy":{"Name":"no"}},"NetworkSettings":{"Networks":{"teploy":{"Aliases":["myapp"]}}}}]`},
 		ssh.MockCommand{Match: "docker rm -f 'myapp-web-v1'", Output: ""},
 		ssh.MockCommand{Match: "docker run", Output: ""},
+		// HostBindIP fixture: the bind IP the health probe actually dials (TCL-16 fail-closed host validation makes the old artifact — a bare
+		// port number reused from the HostPort fixture — an invalid probe host).
+		ssh.MockCommand{Match: "docker inspect -f '{{range $p, $b := .NetworkSettings.Ports}}{{range $b}}{{.HostIp}}", Output: "127.0.0.1 "},
 		ssh.MockCommand{Match: "docker inspect -f '{{range $p, $b := .NetworkSettings.Ports}}", Output: "49152"},
 		ssh.MockCommand{Match: "curl", Output: "200"},
 		ssh.MockCommand{Match: "docker inspect -f '{{range $p, $_ := .NetworkSettings.Ports}}", Output: "3000/tcp"},
@@ -492,6 +507,9 @@ func TestRollback_ToHash_PortCollisionReallocates(t *testing.T) {
 		ssh.MockCommand{Match: "docker rm -f 'myapp-web-v1'", Output: ""},
 		ssh.MockCommand{Match: "ss -tln", Output: "State  Recv-Q  Send-Q  Local Address:Port  Peer Address:Port\nLISTEN 0 128 0.0.0.0:49152 0.0.0.0:*"},
 		ssh.MockCommand{Match: "docker run", Output: ""},
+		// HostBindIP fixture: the bind IP the health probe actually dials (TCL-16 fail-closed host validation makes the old artifact — a bare
+		// port number reused from the HostPort fixture — an invalid probe host).
+		ssh.MockCommand{Match: "docker inspect -f '{{range $p, $b := .NetworkSettings.Ports}}{{range $b}}{{.HostIp}}", Output: "127.0.0.1 "},
 		ssh.MockCommand{Match: "docker inspect -f '{{range $p, $b := .NetworkSettings.Ports}}", Output: "49153"},
 		ssh.MockCommand{Match: "curl", Output: "200"},
 		ssh.MockCommand{Match: "docker inspect -f '{{range $p, $_ := .NetworkSettings.Ports}}", Output: "3000/tcp"},
@@ -557,6 +575,9 @@ func TestRollback_HostIngressKeepsTheFixedPort(t *testing.T) {
 		ssh.MockCommand{Match: "docker rm -f 'myapp-web-v1'", Output: ""},
 		ssh.MockCommand{Match: "docker run", Output: ""},
 		ssh.MockCommand{Match: "curl", Output: "200"},
+		// HostBindIP fixture: the bind IP the health probe actually dials (TCL-16 fail-closed host validation makes the old artifact — a bare
+		// port number reused from the HostPort fixture — an invalid probe host).
+		ssh.MockCommand{Match: "docker inspect -f '{{range $p, $b := .NetworkSettings.Ports}}{{range $b}}{{.HostIp}}", Output: "127.0.0.1 "},
 		ssh.MockCommand{Match: "docker inspect -f '{{range $p, $b := .NetworkSettings.Ports}}", Output: "7460"},
 		ssh.MockCommand{Match: "docker stop", Output: ""},
 		ssh.MockCommand{Match: "mkdir -p", Output: ""},
@@ -582,7 +603,8 @@ func TestRollback_HostIngressKeepsTheFixedPort(t *testing.T) {
 	if runCmd == "" {
 		t.Fatalf("no docker run issued\n%s", buf.String())
 	}
-	if !strings.Contains(runCmd, "-p 0.0.0.0:7460:7460/tcp") {
+	// Port-binding args are single-quoted at the shell boundary (TCL-11).
+	if !strings.Contains(runCmd, "-p '0.0.0.0:7460:7460/tcp'") {
 		t.Errorf("the fixed port was not preserved.\n  run: %s", runCmd)
 	}
 	// A reallocated ephemeral port is the specific regression.

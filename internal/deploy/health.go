@@ -3,10 +3,14 @@ package deploy
 import (
 	"context"
 	"fmt"
+	"net"
+	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/useteploy/teploy/internal/docker"
+	"github.com/useteploy/teploy/internal/ssh"
 )
 
 // HealthConfig configures health check behavior.
@@ -101,10 +105,23 @@ func (d *Deployer) HealthCheckAt(ctx context.Context, port int, containerName st
 }
 
 // checkHealth performs a single health check attempt.
+//
+// The URL is built with net.JoinHostPort (bracketing IPv6 literals) and
+// validated before it reaches the remote shell, then passed as ONE
+// single-quoted curl --url argument (TCL-16): the old unquoted
+// interpolation let an ordinary query string containing '&' change shell
+// parsing, and a bare IPv6 bind produced a malformed URL. --globoff keeps
+// curl from treating {} and [] in the path as its own glob syntax, and the
+// per-attempt connect/max deadlines bound each probe below the overall
+// readiness timeout.
 func (d *Deployer) checkHealth(ctx context.Context, host string, port int, path string) bool {
+	url, ok := probeURL(host, port, path)
+	if !ok {
+		return false
+	}
 	cmd := fmt.Sprintf(
-		"curl -s -o /dev/null -w '%%{http_code}' http://%s:%d%s",
-		host, port, path,
+		"curl -s -o /dev/null --globoff --connect-timeout 2 --max-time 5 -w '%%{http_code}' --url %s",
+		ssh.ShellQuote(url),
 	)
 	output, err := d.exec.Run(ctx, cmd)
 	if err == nil {
@@ -124,8 +141,45 @@ func (d *Deployer) checkHealth(ctx context.Context, host string, port int, path 
 	return false
 }
 
+// probeURL renders the health-check URL and validates its inputs. The host
+// must be an IP literal or "localhost" (it comes from the deploy config's
+// bind address), and the path must be a request-path-shaped URI without
+// control characters — anything else fails the attempt closed rather than
+// interpolating into remote shell text.
+func probeURL(host string, port int, path string) (string, bool) {
+	if port < 1 || port > 65535 {
+		return "", false
+	}
+	host = strings.Trim(host, "[]")
+	if host != "localhost" && net.ParseIP(host) == nil {
+		return "", false
+	}
+	if !strings.HasPrefix(path, "/") || strings.HasPrefix(path, "//") ||
+		strings.ContainsAny(path, "\r\n\x00") {
+		return "", false
+	}
+	p, err := url.ParseRequestURI(path)
+	if err != nil || p.IsAbs() || p.Host != "" {
+		return "", false
+	}
+	u := url.URL{
+		Scheme:   "http",
+		Host:     net.JoinHostPort(host, strconv.Itoa(port)),
+		Path:     p.Path,
+		RawPath:  p.RawPath,
+		RawQuery: p.RawQuery,
+	}
+	return u.String(), true
+}
+
 // checkTCP verifies that a TCP connection can be established to the port.
+// The /dev/tcp redirection runs inside a single-quoted bash -c argument, so
+// neither the host nor the port can break out of it.
 func (d *Deployer) checkTCP(ctx context.Context, host string, port int) bool {
+	host = strings.Trim(host, "[]")
+	if host != "localhost" && net.ParseIP(host) == nil {
+		return false
+	}
 	cmd := fmt.Sprintf("bash -c '</dev/tcp/%s/%d' 2>/dev/null", host, port)
 	_, err := d.exec.Run(ctx, cmd)
 	return err == nil
