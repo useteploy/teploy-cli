@@ -14,7 +14,7 @@ import (
 func TestEnsureRunning_New(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		// No stored credentials.
-		ssh.MockCommand{Match: "test -f", Err: fmt.Errorf("not found")},
+		ssh.MockCommand{Match: "if [ ! -e ", Output: "absent"},
 		// Not running.
 		ssh.MockCommand{Match: "docker inspect", Err: fmt.Errorf("not found")},
 		// Create directory.
@@ -130,7 +130,7 @@ func TestEnsureRunning_New(t *testing.T) {
 
 func TestEnsureRunning_ReconcilesFreshVolumeOwnership(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
-		ssh.MockCommand{Match: "test -f", Err: fmt.Errorf("not found")},
+		ssh.MockCommand{Match: "if [ ! -e ", Output: "absent"},
 		ssh.MockCommand{Match: "docker inspect", Err: fmt.Errorf("not found")},
 		ssh.MockCommand{Match: "mkdir -p /deployments/myapp/accessories/nucleus", Output: ""},
 		// The image drops to a non-root user; the fresh directory is not his.
@@ -180,7 +180,7 @@ func TestEnsureRunning_ReconcilesFreshVolumeOwnership(t *testing.T) {
 func TestEnsureRunning_AlreadyRunning(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		// Stored credentials exist (needed for connection string).
-		ssh.MockCommand{Match: "test -f", Output: ""},
+		ssh.MockCommand{Match: "if [ ! -e ", Output: "present"},
 		ssh.MockCommand{Match: "cat -- ", Output: "POSTGRES_PASSWORD=existingpass123\n"},
 		// Already running.
 		ssh.MockCommand{Match: "docker inspect", Output: "running"},
@@ -221,7 +221,7 @@ func TestEnsureRunning_AlreadyRunning(t *testing.T) {
 func TestEnsureRunning_StoredCredentials(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		// Stored credentials exist.
-		ssh.MockCommand{Match: "test -f", Output: ""},
+		ssh.MockCommand{Match: "if [ ! -e ", Output: "present"},
 		ssh.MockCommand{Match: "cat -- ", Output: "POSTGRES_PASSWORD=storedpass456\n"},
 		// Not running.
 		ssh.MockCommand{Match: "docker inspect", Err: fmt.Errorf("not found")},
@@ -397,7 +397,7 @@ func TestUpgrade(t *testing.T) {
 		// Remove old container.
 		ssh.MockCommand{Match: "docker rm", Output: ""},
 		// EnsureRunning: resolve env (no stored creds).
-		ssh.MockCommand{Match: "test -f", Err: fmt.Errorf("not found")},
+		ssh.MockCommand{Match: "if [ ! -e ", Output: "absent"},
 		// EnsureRunning: not running (just removed).
 		ssh.MockCommand{Match: "docker inspect", Err: fmt.Errorf("not found")},
 		// EnsureRunning: create directory.
@@ -513,7 +513,7 @@ func TestConnectionEnvVars_Unknown(t *testing.T) {
 func TestInjectEnvVars_NewFile(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		// No existing .env.
-		ssh.MockCommand{Match: "test -f", Err: fmt.Errorf("not found")},
+		ssh.MockCommand{Match: "if [ ! -e ", Output: "absent"},
 		ssh.MockCommand{Match: "mv -f -- ", Output: ""},
 	)
 
@@ -545,7 +545,7 @@ func TestInjectEnvVars_NewFile(t *testing.T) {
 func TestInjectEnvVars_SkipExisting(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		// Existing .env with DATABASE_URL already set.
-		ssh.MockCommand{Match: "test -f", Output: ""},
+		ssh.MockCommand{Match: "if [ ! -e ", Output: "present"},
 		ssh.MockCommand{Match: "cat -- ", Output: "DATABASE_URL=postgres://custom/mydb\n"},
 	)
 
@@ -575,7 +575,7 @@ func TestInjectEnvVars_SkipExisting(t *testing.T) {
 
 func TestInjectEnvVars_AllExist(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
-		ssh.MockCommand{Match: "test -f", Output: ""},
+		ssh.MockCommand{Match: "if [ ! -e ", Output: "present"},
 		ssh.MockCommand{Match: "cat -- ", Output: "DATABASE_URL=existing\nREDIS_URL=existing\n"},
 	)
 
@@ -630,8 +630,8 @@ func TestEnsureRunning_SecretReference(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		// No stored credentials (first test -f), then the secret EXISTS
 		// (second test -f) and decrypts.
-		ssh.MockCommand{Match: "test -f", Err: fmt.Errorf("not found"), Once: true},
-		ssh.MockCommand{Match: "test -f", Output: ""},
+		ssh.MockCommand{Match: "if [ ! -e ", Output: "absent", Once: true},
+		ssh.MockCommand{Match: "if [ ! -e ", Output: "present"},
 		ssh.MockCommand{Match: "age -d", Output: "s3cr3t-pa$$word"},
 		// Not running.
 		ssh.MockCommand{Match: "docker inspect", Err: fmt.Errorf("not found")},
@@ -689,9 +689,9 @@ func TestEnsureRunning_SecretReference(t *testing.T) {
 
 func TestEnsureRunning_SecretReferenceMissing(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
-		ssh.MockCommand{Match: "test -f", Err: fmt.Errorf("not found")},
+		ssh.MockCommand{Match: "if [ ! -e ", Output: "absent"},
 		// Secret file does not exist.
-		ssh.MockCommand{Match: "test -f /deployments/myapp/secrets/NUCLEUS_PASSWORD.age", Err: fmt.Errorf("exit 1")},
+		ssh.MockCommand{Match: "if [ ! -e  /deployments/myapp/secrets/NUCLEUS_PASSWORD.age", Output: "absent"},
 	)
 
 	var buf bytes.Buffer
@@ -717,7 +717,7 @@ func TestEnsureRunning_SecretReferenceMissing(t *testing.T) {
 
 func TestEnsureRunning_SecretReferenceEmptyKey(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
-		ssh.MockCommand{Match: "test -f", Err: fmt.Errorf("not found")},
+		ssh.MockCommand{Match: "if [ ! -e ", Output: "absent"},
 	)
 	var buf bytes.Buffer
 	mgr := NewManager(mock, &buf)

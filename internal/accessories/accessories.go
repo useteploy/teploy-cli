@@ -293,12 +293,33 @@ func (m *Manager) resolveEnv(ctx context.Context, app, name string, env map[stri
 	return result, nil
 }
 
+// remoteFileExists confirms a path's existence without folding transport
+// and permission failures into "missing" (TCL-29): the command always
+// exits 0 and prints absent/present, so anything else is a real error.
+func remoteFileExists(ctx context.Context, exec ssh.Executor, path string) (bool, error) {
+	out, err := exec.Run(ctx, fmt.Sprintf("if [ ! -e %s ]; then printf 'absent\\n'; else printf 'present\\n'; fi", ssh.ShellQuote(path)))
+	if err != nil {
+		return false, fmt.Errorf("checking %s: %w", path, err)
+	}
+	switch strings.TrimSpace(out) {
+	case "absent":
+		return false, nil
+	case "present":
+		return true, nil
+	}
+	return false, fmt.Errorf("checking %s: unrecognized output framing", path)
+}
+
 // loadCredentials returns the stored credential map. Only a confirmed
 // missing file yields an empty map; an existing-but-unreadable file is an
 // error (audit F69).
 func (m *Manager) loadCredentials(ctx context.Context, path string) (map[string]string, error) {
 	creds := make(map[string]string)
-	if _, statErr := m.exec.Run(ctx, "test -f "+ssh.ShellQuote(path)); statErr != nil {
+	exists, err := remoteFileExists(ctx, m.exec, path)
+	if err != nil {
+		return nil, err
+	}
+	if !exists {
 		return creds, nil
 	}
 	output, err := m.exec.Run(ctx, "cat -- "+ssh.ShellQuote(path))
@@ -346,7 +367,11 @@ func (m *Manager) InjectEnvVars(ctx context.Context, app string, vars map[string
 	// abort — treating it as empty used to let the write below replace the
 	// app's env wholesale (audit F73).
 	var output string
-	if _, statErr := m.exec.Run(ctx, "test -f "+ssh.ShellQuote(envPath)); statErr == nil {
+	envExists, err := remoteFileExists(ctx, m.exec, envPath)
+	if err != nil {
+		return err
+	}
+	if envExists {
 		out, catErr := m.exec.Run(ctx, "cat -- "+ssh.ShellQuote(envPath))
 		if catErr != nil {
 			return fmt.Errorf("reading existing %s (refusing to overwrite it as though empty): %w", envPath, catErr)
