@@ -290,6 +290,11 @@ func newWebhookHandler(cfg webhookHandlerConfig) http.HandlerFunc {
 // skipped with a warning), so this can still fail on a server that was
 // never successfully cloned.
 func triggerAutoDeploy(ctx context.Context, executor ssh.Executor, app, branch, buildDir string, out io.Writer, changedFiles []string, filesKnown bool) error {
+	// The lock's parent must exist before it can be acquired — a server
+	// whose app was never manually deployed has no /deployments/<app> yet.
+	if err := state.EnsureAppDir(ctx, executor, app); err != nil {
+		return fmt.Errorf("creating app directory: %w", err)
+	}
 	if err := state.AcquireLock(ctx, executor, app); err != nil {
 		return fmt.Errorf("acquiring deploy lock: %w", err)
 	}

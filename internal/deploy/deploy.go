@@ -120,14 +120,20 @@ func (c Config) validate() error {
 // Deploy performs a zero-downtime deploy, acquiring the app lock for the
 // duration. Callers that already hold the app lock (the autodeploy path,
 // which locks before fetching so the checkout can't race a concurrent
-// trigger) must call DeployLocked instead — acquiring twice deadlocks on the
-// lock this just created (audit F07).
+// trigger) must call DeployLocked instead — the mkdir lock is not
+// reentrant, so acquiring it twice fails (audit TCL-01).
 //
 // Flow: lock → start web → health check → start workers → route traffic →
 // write state → stop old containers → log → unlock.
 func (d *Deployer) Deploy(ctx context.Context, cfg Config) error {
 	if err := cfg.validate(); err != nil {
 		return err
+	}
+	// The lock lives at /deployments/<app>/.lock — its parent must exist
+	// before the lock can be acquired, and a first deploy has no app dir
+	// yet (TCL-01).
+	if err := state.EnsureAppDir(ctx, d.exec, cfg.App); err != nil {
+		return fmt.Errorf("creating app directory: %w", err)
 	}
 	if err := state.AcquireLock(ctx, d.exec, cfg.App); err != nil {
 		return err
@@ -137,7 +143,8 @@ func (d *Deployer) Deploy(ctx context.Context, cfg Config) error {
 }
 
 // DeployLocked performs a zero-downtime deploy WITHOUT acquiring the app
-// lock. The caller must already hold it (see Deploy).
+// lock. The caller must already hold it (see Deploy); this function does not
+// reacquire or release it.
 func (d *Deployer) DeployLocked(ctx context.Context, cfg Config) error {
 	if err := cfg.validate(); err != nil {
 		return err
@@ -169,25 +176,18 @@ func (d *Deployer) DeployLocked(ctx context.Context, cfg Config) error {
 
 	start := time.Now()
 
-	// 1. Ensure app directory exists.
 	if replicas > 1 {
 		fmt.Fprintf(d.out, "Deploying %s (version %s, %d replicas)...\n", cfg.App, cfg.Version, replicas)
 	} else {
 		fmt.Fprintf(d.out, "Deploying %s (version %s)...\n", cfg.App, cfg.Version)
 	}
-	if err := state.EnsureAppDir(ctx, d.exec, cfg.App); err != nil {
-		return fmt.Errorf("creating app directory: %w", err)
-	}
 
-	// 2. Acquire deploy lock.
-	if err := state.AcquireLock(ctx, d.exec, cfg.App); err != nil {
-		return err
-	}
-	defer state.ReleaseLockDetached(d.exec, cfg.App)
-
-	// 3. Read current state. A read failure must stop the deploy — treating
+	// 1. Read current state. A read failure must stop the deploy — treating
 	// an unreadable state file as "no state" loses rollback bookkeeping and
 	// makes a replacement deploy look like a first deploy (audit F15).
+	// (The caller owns the app lock; DeployLocked never acquires it — a
+	// mkdir lock is not reentrant, so a second acquisition fails, which is
+	// what broke every Deploy() call until TCL-01.)
 	current, err := state.Read(ctx, d.exec, cfg.App)
 	if err != nil {
 		return fmt.Errorf("refusing to deploy with unreadable state for %s: %w", cfg.App, err)
@@ -268,7 +268,8 @@ func (d *Deployer) DeployLocked(ctx context.Context, cfg Config) error {
 	// _replaced and rename again — deleting the running predecessor before its
 	// replacement had even started, let alone passed its health check (audit
 	// F03).
-	if current != nil && current.CurrentHash == cfg.Version {
+	sameVersion := current != nil && current.CurrentHash == cfg.Version
+	if sameVersion {
 		seen := map[string]bool{}
 		for _, process := range sortedProcessNames(processes) {
 			for ri := 1; ri <= replicas; ri++ {
@@ -280,6 +281,37 @@ func (d *Deployer) DeployLocked(ctx context.Context, cfg Config) error {
 		for name := range seen {
 			d.exec.Run(ctx, fmt.Sprintf("docker rm -f %s 2>/dev/null", name+"_replaced"))
 			d.exec.Run(ctx, fmt.Sprintf("docker rename %s %s 2>/dev/null", name, name+"_replaced"))
+		}
+	}
+
+	// 6b. Snapshot the PREDECESSOR workload now — after the same-version
+	// renames, but BEFORE any new container starts. The post-commit cleanup
+	// (step 14) stops exactly this snapshot. A fresh inventory taken after
+	// the candidates are live cannot be selected by the teploy.version
+	// label: during a same-version redeploy the replacement carries the
+	// SAME label, so the old sweep stopped and removed the containers it had
+	// just deployed while reporting success (TCL-02). The snapshot also
+	// preserves the F06 property — a worker removed from the manifest is
+	// still captured here, because it was running before this deploy.
+	var predecessors []docker.Container
+	predecessorsListed := false
+	if current != nil && current.CurrentHash != "" {
+		if inv, invErr := d.docker.ListContainers(ctx, cfg.App); invErr == nil {
+			predecessorsListed = true
+			for _, ct := range inv {
+				if ct.Labels["teploy.role"] == "accessory" {
+					continue // accessories have their own lifecycle
+				}
+				if ct.Labels["teploy.version"] != current.CurrentHash {
+					continue
+				}
+				if !sameVersion && ct.State != "running" {
+					continue // older stopped versions are kept as rollback targets
+				}
+				predecessors = append(predecessors, ct)
+			}
+		} else {
+			fmt.Fprintf(d.out, "Warning: could not list containers for the predecessor snapshot (%v); falling back to name matching\n", invErr)
 		}
 	}
 
@@ -520,43 +552,36 @@ func (d *Deployer) DeployLocked(ctx context.Context, cfg Config) error {
 		return d.abortStateCommit(ctx, cfg, current, started, displacedHostWeb, start, err)
 	}
 
-	// 14. Stop old containers (all processes + all replicas).
-	// For same-version redeploys the old containers were renamed to _replaced;
-	// remove them after stopping so they don't block the next same-version deploy.
+	// 14. Stop the predecessor workload snapshotted in step 6b (all
+	// processes + all replicas). For same-version redeploys the old
+	// containers were renamed to _replaced; remove them after stopping so
+	// they don't block the next same-version deploy.
 	//
-	// The inventory path matches by the teploy.version LABEL across the full
-	// container list rather than by deriving names from the NEW process map —
-	// a worker removed from the manifest has no entry in the new map, but its
-	// old container can still be running, and duplicate consumers after a
-	// successful deploy are exactly as bad as the bug they fix (audit F06).
-	// The name-derived fallback only runs when the inventory cannot be listed.
-	sameVersion := current != nil && current.CurrentHash == cfg.Version
-	if current != nil && current.CurrentHash != "" {
-		stopped := map[string]bool{}
-		if inv, invErr := d.docker.ListContainers(ctx, cfg.App); invErr == nil {
-			for _, ct := range inv {
-				if ct.Labels["teploy.role"] == "accessory" {
-					continue // accessories have their own lifecycle
-				}
-				if ct.Labels["teploy.version"] != current.CurrentHash {
-					continue
-				}
-				if !sameVersion && ct.State != "running" {
-					continue // older stopped versions are kept as rollback targets
-				}
-				fmt.Fprintf(d.out, "Stopping old container %s...\n", ct.Name)
-				d.docker.Stop(ctx, ct.Name, stopTimeout)
-				if sameVersion {
-					d.docker.Remove(ctx, ct.Name)
-				}
-				stopped[ct.Name] = true
+	// Only the snapshotted predecessors are touched. Selecting by the
+	// teploy.version label from a post-deploy inventory — the previous
+	// implementation — also matched the just-deployed replacement during a
+	// same-version redeploy and removed the live generation (TCL-02). The
+	// name-derived fallback only runs when the inventory could not be
+	// listed at snapshot time.
+	if predecessorsListed {
+		for _, ct := range predecessors {
+			fmt.Fprintf(d.out, "Stopping old container %s...\n", ct.Name)
+			if err := d.docker.Stop(ctx, ct.Name, stopTimeout); err != nil {
+				// Traffic is already committed to the new generation; a
+				// failed predecessor stop is degraded cleanup, not a failed
+				// deploy — but it must be reported, never silent (TCL-19):
+				// a leftover old worker keeps consuming jobs.
+				fmt.Fprintf(d.out, "Warning: could not stop old container %s: %v\n", ct.Name, err)
+				continue
 			}
-		} else {
-			fmt.Fprintf(d.out, "Warning: could not list containers for old-workload cleanup (%v); falling back to name matching\n", invErr)
+			if sameVersion {
+				if err := d.docker.Remove(ctx, ct.Name); err != nil {
+					fmt.Fprintf(d.out, "Warning: could not remove old container %s: %v\n", ct.Name, err)
+				}
+			}
 		}
-		if len(stopped) == 0 {
-			stopOldWorkloadsByName(ctx, d.docker, d.out, cfg, current, processes, stopTimeout)
-		}
+	} else if current != nil && current.CurrentHash != "" {
+		stopOldWorkloadsByName(ctx, d.docker, d.out, cfg, current, processes, stopTimeout)
 	}
 
 	// 15. Clean up old bridged assets.
