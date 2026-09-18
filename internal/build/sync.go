@@ -30,8 +30,9 @@ type SyncConfig struct {
 // policy, which by sync time has verified (and, under --accept-new,
 // recorded) the host key.
 func Sync(ctx context.Context, cfg SyncConfig, stdout, stderr io.Writer) error {
-	sshArgs := append([]string{"ssh"}, ssh.ExternalSSHArgs(cfg.Host, cfg.KeyPath, cfg.AcceptNewHost)...)
-	sshCmd := strings.Join(sshArgs, " ")
+	// rsync re-parses the -e value through a shell — quote each argument
+	// so an identity path containing spaces survives (TCL-52).
+	sshCmd := ssh.ExternalSSHCommand(cfg.Host, cfg.KeyPath, cfg.AcceptNewHost)
 
 	// Ensure local dir has trailing slash so rsync copies contents, not the dir itself.
 	localDir := strings.TrimRight(cfg.LocalDir, "/") + "/"

@@ -42,6 +42,19 @@ func ExternalSSHArgs(host, keyPath string, acceptNew bool) []string {
 	return args
 }
 
+// ExternalSSHCommand renders ExternalSSHArgs as the single shell string
+// rsync's -e option expects. rsync hands the -e value to a shell, so a
+// bare strings.Join of the argv breaks the moment an argument contains a
+// space (an identity path like ~/My Keys/id_ed25519); each element is
+// quoted exactly once for that re-parse (TCL-52).
+func ExternalSSHCommand(host, keyPath string, acceptNew bool) string {
+	args := append([]string{"ssh"}, ExternalSSHArgs(host, keyPath, acceptNew)...)
+	for i, a := range args {
+		args[i] = ShellQuote(a)
+	}
+	return strings.Join(args, " ")
+}
+
 // RsyncTarget renders user@host:path for an rsync destination, bracketing a
 // bare IPv6 host (rsync's colon syntax cannot carry an unbracketed IPv6
 // literal) and moving ANY host:port suffix out of the target — rsync has no

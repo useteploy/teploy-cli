@@ -363,10 +363,12 @@ func (d *StaticDeployer) rsyncTo(ctx context.Context, srcDir, remoteDest string)
 	}
 	src := strings.TrimRight(srcDir, "/") + "/"
 	target := ssh.RsyncTarget(d.exec.User(), d.exec.Host(), remoteDest) + "/"
-	sshArgs := ssh.ExternalSSHArgs(d.exec.Host(), d.SSHKeyPath, hostKeyPolicy == "accept-new")
-	sshCmdParts := append([]string{"ssh"}, sshArgs...)
+	// rsync re-parses the -e value through a shell — the pre-joined argv
+	// must be quoted element-wise so an identity path with spaces
+	// survives (TCL-52).
+	sshCmd := ssh.ExternalSSHCommand(d.exec.Host(), d.SSHKeyPath, hostKeyPolicy == "accept-new")
 	cmd := exec.CommandContext(ctx, "rsync",
-		append([]string{"-az", "--delete", "-e", strings.Join(sshCmdParts, " ")}, src, target)...,
+		append([]string{"-az", "--delete", "-e", sshCmd}, src, target)...,
 	)
 	cmd.Stdout = d.out
 	cmd.Stderr = d.out
