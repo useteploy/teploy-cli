@@ -30,6 +30,7 @@ func TestRollback(t *testing.T) {
 		sha256.Sum256(currentManifest), currentManifest, sha256.Sum256(previousManifest), previousManifest)
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state.json' ]", Output: "present\n" + stateContent},
+		ssh.MockCommand{Match: "mkdir -p /deployments/myapp", Output: ""},
 		ssh.MockCommand{Match: "mkdir /deployments/myapp/.lock", Output: ""},
 		ssh.MockCommand{Match: "cat /deployments/myapp/.lock/info", Err: fmt.Errorf("none")},
 		ssh.MockCommand{Match: "docker ps --all --filter label=teploy.app='myapp'",
@@ -131,9 +132,11 @@ func TestRollback_StateCommitFailureRestoresOriginalRouteAndWorkload(t *testing.
 	stateContent := "current_port=49153\ncurrent_hash=v2\nprevious_port=49152\nprevious_hash=v1\ndomain=myapp.com\n"
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state.json' ]", Output: "absent"},
+		ssh.MockCommand{Match: "mkdir -p /deployments/myapp", Output: ""},
 		ssh.MockCommand{Match: "mkdir /deployments/myapp/.lock", Output: ""},
 		ssh.MockCommand{Match: "cat /deployments/myapp/.lock/info", Err: fmt.Errorf("none")},
 		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state' ]", Output: "present\n" + stateContent},
+		ssh.MockCommand{Match: "mkdir -p /deployments/myapp", Output: ""},
 		ssh.MockCommand{Match: "mkdir /deployments/myapp/.lock", Output: ""},
 		ssh.MockCommand{Match: "cat /deployments/myapp/.lock/info", Err: fmt.Errorf("none")},
 		ssh.MockCommand{Match: "docker ps --all --filter label=teploy.app='myapp'",
@@ -178,9 +181,11 @@ func TestRollback_StateCommitFailureRestoresOriginalRouteAndWorkload(t *testing.
 func TestRollback_NoState(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state.json' ]", Output: "absent"},
+		ssh.MockCommand{Match: "mkdir -p /deployments/myapp", Output: ""},
 		ssh.MockCommand{Match: "mkdir /deployments/myapp/.lock", Output: ""},
 		ssh.MockCommand{Match: "cat /deployments/myapp/.lock/info", Err: fmt.Errorf("none")},
 		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state' ]", Output: "absent"},
+		ssh.MockCommand{Match: "mkdir -p /deployments/myapp", Output: ""},
 		ssh.MockCommand{Match: "mkdir /deployments/myapp/.lock", Output: ""},
 		ssh.MockCommand{Match: "cat /deployments/myapp/.lock/info", Err: fmt.Errorf("none")},
 	)
@@ -198,9 +203,11 @@ func TestRollback_NoPreviousDeploy(t *testing.T) {
 	stateContent := "current_port=49152\ncurrent_hash=v1\n"
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state.json' ]", Output: "absent"},
+		ssh.MockCommand{Match: "mkdir -p /deployments/myapp", Output: ""},
 		ssh.MockCommand{Match: "mkdir /deployments/myapp/.lock", Output: ""},
 		ssh.MockCommand{Match: "cat /deployments/myapp/.lock/info", Err: fmt.Errorf("none")},
 		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state' ]", Output: "present\n" + stateContent},
+		ssh.MockCommand{Match: "mkdir -p /deployments/myapp", Output: ""},
 		ssh.MockCommand{Match: "mkdir /deployments/myapp/.lock", Output: ""},
 		ssh.MockCommand{Match: "cat /deployments/myapp/.lock/info", Err: fmt.Errorf("none")},
 	)
@@ -225,9 +232,11 @@ func TestRollback_NoPreviousContainers(t *testing.T) {
 	stateContent := "current_port=49153\ncurrent_hash=v2\nprevious_port=49152\nprevious_hash=v1\n"
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state.json' ]", Output: "absent"},
+		ssh.MockCommand{Match: "mkdir -p /deployments/myapp", Output: ""},
 		ssh.MockCommand{Match: "mkdir /deployments/myapp/.lock", Output: ""},
 		ssh.MockCommand{Match: "cat /deployments/myapp/.lock/info", Err: fmt.Errorf("none")},
 		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state' ]", Output: "present\n" + stateContent},
+		ssh.MockCommand{Match: "mkdir -p /deployments/myapp", Output: ""},
 		ssh.MockCommand{Match: "mkdir /deployments/myapp/.lock", Output: ""},
 		ssh.MockCommand{Match: "cat /deployments/myapp/.lock/info", Err: fmt.Errorf("none")},
 		ssh.MockCommand{Match: "docker ps --all --filter label=teploy.app='myapp'",
@@ -248,9 +257,11 @@ func TestRollback_HealthCheckFails(t *testing.T) {
 	stateContent := "current_port=49153\ncurrent_hash=v2\nprevious_port=49152\nprevious_hash=v1\n"
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state.json' ]", Output: "absent"},
+		ssh.MockCommand{Match: "mkdir -p /deployments/myapp", Output: ""},
 		ssh.MockCommand{Match: "mkdir /deployments/myapp/.lock", Output: ""},
 		ssh.MockCommand{Match: "cat /deployments/myapp/.lock/info", Err: fmt.Errorf("none")},
 		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state' ]", Output: "present\n" + stateContent},
+		ssh.MockCommand{Match: "mkdir -p /deployments/myapp", Output: ""},
 		ssh.MockCommand{Match: "mkdir /deployments/myapp/.lock", Output: ""},
 		ssh.MockCommand{Match: "cat /deployments/myapp/.lock/info", Err: fmt.Errorf("none")},
 		ssh.MockCommand{Match: "docker ps --all --filter label=teploy.app='myapp'",
@@ -286,9 +297,11 @@ func TestRollback_MultiReplica(t *testing.T) {
 		"current_ports=49153,49155\nprevious_ports=49152,49154\n"
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state.json' ]", Output: "absent"},
+		ssh.MockCommand{Match: "mkdir -p /deployments/myapp", Output: ""},
 		ssh.MockCommand{Match: "mkdir /deployments/myapp/.lock", Output: ""},
 		ssh.MockCommand{Match: "cat /deployments/myapp/.lock/info", Err: fmt.Errorf("none")},
 		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state' ]", Output: "present\n" + stateContent},
+		ssh.MockCommand{Match: "mkdir -p /deployments/myapp", Output: ""},
 		ssh.MockCommand{Match: "mkdir /deployments/myapp/.lock", Output: ""},
 		ssh.MockCommand{Match: "cat /deployments/myapp/.lock/info", Err: fmt.Errorf("none")},
 		ssh.MockCommand{Match: "docker ps --all --filter label=teploy.app='myapp'",
@@ -358,9 +371,11 @@ func TestRollback_ToSpecificHash(t *testing.T) {
 	stateContent := "current_port=49154\ncurrent_hash=v3\nprevious_port=49153\nprevious_hash=v2\n"
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state.json' ]", Output: "absent"},
+		ssh.MockCommand{Match: "mkdir -p /deployments/myapp", Output: ""},
 		ssh.MockCommand{Match: "mkdir /deployments/myapp/.lock", Output: ""},
 		ssh.MockCommand{Match: "cat /deployments/myapp/.lock/info", Err: fmt.Errorf("none")},
 		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state' ]", Output: "present\n" + stateContent},
+		ssh.MockCommand{Match: "mkdir -p /deployments/myapp", Output: ""},
 		ssh.MockCommand{Match: "mkdir /deployments/myapp/.lock", Output: ""},
 		ssh.MockCommand{Match: "cat /deployments/myapp/.lock/info", Err: fmt.Errorf("none")},
 		ssh.MockCommand{Match: "docker ps --all --filter label=teploy.app='myapp'",
@@ -428,9 +443,11 @@ func TestRollback_ToHash_AlreadyCurrent(t *testing.T) {
 	stateContent := "current_port=49153\ncurrent_hash=v2\nprevious_port=49152\nprevious_hash=v1\n"
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state.json' ]", Output: "absent"},
+		ssh.MockCommand{Match: "mkdir -p /deployments/myapp", Output: ""},
 		ssh.MockCommand{Match: "mkdir /deployments/myapp/.lock", Output: ""},
 		ssh.MockCommand{Match: "cat /deployments/myapp/.lock/info", Err: fmt.Errorf("none")},
 		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state' ]", Output: "present\n" + stateContent},
+		ssh.MockCommand{Match: "mkdir -p /deployments/myapp", Output: ""},
 		ssh.MockCommand{Match: "mkdir /deployments/myapp/.lock", Output: ""},
 		ssh.MockCommand{Match: "cat /deployments/myapp/.lock/info", Err: fmt.Errorf("none")},
 	)
@@ -458,9 +475,11 @@ func TestRollback_ToHash_PortCollisionReallocates(t *testing.T) {
 	stateContent := "current_port=49152\ncurrent_hash=v3\nprevious_port=49153\nprevious_hash=v2\n"
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state.json' ]", Output: "absent"},
+		ssh.MockCommand{Match: "mkdir -p /deployments/myapp", Output: ""},
 		ssh.MockCommand{Match: "mkdir /deployments/myapp/.lock", Output: ""},
 		ssh.MockCommand{Match: "cat /deployments/myapp/.lock/info", Err: fmt.Errorf("none")},
 		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state' ]", Output: "present\n" + stateContent},
+		ssh.MockCommand{Match: "mkdir -p /deployments/myapp", Output: ""},
 		ssh.MockCommand{Match: "mkdir /deployments/myapp/.lock", Output: ""},
 		ssh.MockCommand{Match: "cat /deployments/myapp/.lock/info", Err: fmt.Errorf("none")},
 		ssh.MockCommand{Match: "docker ps --all --filter label=teploy.app='myapp'",
@@ -527,6 +546,7 @@ func TestRollback_HostIngressKeepsTheFixedPort(t *testing.T) {
 	stateContent := `{"schema_version":2,"deployment_type":"container","ingress_mode":"host","updated_at":"2026-07-27T10:00:00Z","current_port":7460,"current_hash":"v2","previous_port":7460,"previous_hash":"v1"}`
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state.json' ]", Output: "present\n" + stateContent},
+		ssh.MockCommand{Match: "mkdir -p /deployments/myapp", Output: ""},
 		ssh.MockCommand{Match: "mkdir /deployments/myapp/.lock", Output: ""},
 		ssh.MockCommand{Match: "cat /deployments/myapp/.lock/info", Err: fmt.Errorf("none")},
 		ssh.MockCommand{Match: "docker ps --all --filter label=teploy.app='myapp'",

@@ -74,10 +74,12 @@ func (c RollbackConfig) ingressHost() bool { return c.Ingress == "host" }
 // traffic, and stops the current containers. Updates state so target
 // becomes current and the version rolled back from becomes previous.
 //
-// The whole operation runs under the app lock (audit F11): an unlocked
-// rollback could race a deploy, another rollback, or pruning while both
-// read and replace the same authoritative state. StaticDeployer.Rollback
-// already locks; this now matches it.
+// The whole operation runs under the app lock (audit F11), and the lock is
+// acquired BEFORE the state read and target resolution (TCL-06): reading
+// first, then locking, let a deploy commit in between, leaving rollback
+// executing against an obsolete current generation, predecessor set, and
+// port-conflict set — serialized execution with a stale decision is still
+// a stale decision.
 func Rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg RollbackConfig) error {
 	start := time.Now()
 	dk := docker.NewClient(exec)
@@ -89,7 +91,17 @@ func Rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg Rollbac
 		stopTimeout = 10
 	}
 
-	// 1. Read state and resolve the rollback target.
+	// 1. Serialize against deploys and other rollbacks BEFORE reading state
+	// or resolving the target (F11 + TCL-06).
+	if err := state.EnsureAppDir(ctx, exec, cfg.App); err != nil {
+		return fmt.Errorf("creating app directory: %w", err)
+	}
+	if err := state.AcquireLock(ctx, exec, cfg.App); err != nil {
+		return fmt.Errorf("acquiring deploy lock: %w", err)
+	}
+	defer state.ReleaseLockDetached(exec, cfg.App)
+
+	// 2. Read state and resolve the rollback target — under the lock.
 	current, err := state.Read(ctx, exec, cfg.App)
 	if err != nil || current == nil {
 		return fmt.Errorf("no deploy state found for %s — deploy first", cfg.App)
@@ -108,15 +120,9 @@ func Rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg Rollbac
 		return fmt.Errorf("target version %s is already current", target)
 	}
 
-	// 1b. Serialize against deploys and other rollbacks (F11).
-	if err := state.AcquireLock(ctx, exec, cfg.App); err != nil {
-		return fmt.Errorf("acquiring deploy lock: %w", err)
-	}
-	defer state.ReleaseLockDetached(exec, cfg.App)
-
 	fmt.Fprintf(out, "Rolling back %s from %s to %s...\n", cfg.App, current.CurrentHash, target)
 
-	// 2. Find the target version's containers. This happens BEFORE anything
+	// 3. Find the target version's containers. This happens BEFORE anything
 	// is stopped: a missing/pruned target must fail while the current
 	// workload is still serving, not after host ingress already freed its
 	// fixed port (audit F12).
@@ -199,7 +205,18 @@ func Rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg Rollbac
 	}
 	if cfg.ingressHost() {
 		for _, c := range containers {
-			if c.Labels["teploy.process"] != "web" || c.Labels["teploy.version"] == target {
+			// Displace only the RUNNING web containers of the AUTHORITATIVE
+			// current generation (TCL-07). The old filter (any non-target
+			// web container) also captured stopped historical containers;
+			// they were recorded as "displaced live instances" and a failed
+			// rollback would Restart them — resurrecting obsolete versions
+			// and colliding with the real current generation on the fixed
+			// port. A stopped historical container was not serving traffic
+			// when the operation began; it must stay stopped.
+			if c.Labels["teploy.process"] != "web" || c.Labels["teploy.version"] != current.CurrentHash {
+				continue
+			}
+			if c.State != "running" {
 				continue
 			}
 			if err := dk.Stop(ctx, c.Name, 10); err != nil {
