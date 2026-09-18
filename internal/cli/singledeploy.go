@@ -234,7 +234,8 @@ func (s *singleServerDeployer) deployApp(ctx context.Context, appCfg *config.App
 	}
 	// Resolve `vault:<name>#<key>` env references from OpenBao (both deploy
 	// paths must do this — see the multi-server-secrets bug noted above).
-	if err := mergeSecretVaultRefs(ctx, s.exec, appCfg, deploySecrets); err != nil {
+	deploySecrets, err = mergeSecretVaultRefs(ctx, s.exec, appCfg, deploySecrets)
+	if err != nil {
 		return err
 	}
 

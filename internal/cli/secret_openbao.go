@@ -304,21 +304,28 @@ func newVaultPutCmd(flags *Flags) *cobra.Command {
 }
 
 // mergeSecretVaultRefs resolves any `vault:<name>#<key>` references in the app's env:
-// block from OpenBao and merges them into dst (the deploy secrets map). A no-op
-// when the app has no vault references, so it's safe to call on every deploy.
-// Uses the given executor (works for both the single- and multi-server paths).
-func mergeSecretVaultRefs(ctx context.Context, exec ssh.Executor, appCfg *config.AppConfig, dst map[string]string) error {
+// block from OpenBao and merges them into dst (the deploy secrets map),
+// RETURNING the merged map. DecryptAll returns a nil map when the app has no
+// ordinary age secrets, so writing into dst in place panicked for vault-only
+// apps (TCL-30); every caller must assign the returned value. A no-op returning
+// dst unchanged when the app has no vault references, so it's safe to call on
+// every deploy. Uses the given executor (works for both the single- and
+// multi-server paths).
+func mergeSecretVaultRefs(ctx context.Context, exec ssh.Executor, appCfg *config.AppConfig, dst map[string]string) (map[string]string, error) {
+	if dst == nil {
+		dst = make(map[string]string)
+	}
 	if len(openbao.CollectRefs(appCfg.Env)) == 0 {
-		return nil
+		return dst, nil
 	}
 	resolved, err := openbao.NewClient(exec, os.Stderr).ResolveEnvRefs(ctx, appCfg.App, appCfg.Secret.Accessory, appCfg.Env)
 	if err != nil {
-		return fmt.Errorf("resolving vault references: %w", err)
+		return nil, fmt.Errorf("resolving vault references: %w", err)
 	}
 	for k, v := range resolved {
 		dst[k] = v
 	}
-	return nil
+	return dst, nil
 }
 
 // ensureSecretAgent, when the app enables the OpenBao Agent sidecar

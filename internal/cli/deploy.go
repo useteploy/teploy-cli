@@ -532,7 +532,8 @@ func deployBuiltImageLockMode(ctx context.Context, executor ssh.Executor, appCfg
 	}
 	// Resolve any `vault:<name>#<key>` references in env: from OpenBao and merge
 	// them in (they win over plaintext env, same as decrypted secrets).
-	if err := mergeSecretVaultRefs(ctx, executor, appCfg, deploySecrets); err != nil {
+	deploySecrets, err = mergeSecretVaultRefs(ctx, executor, appCfg, deploySecrets)
+	if err != nil {
 		return err
 	}
 
