@@ -4,17 +4,18 @@ Unresolved findings for this repository from the ChatGPT-led audit series.
 Pass 1-5 (2026-09-09 through 2026-09-11, register: teploy-neutron-lullmail
 expanded audit) closed fully below. Pass 6 (2026-09-17, 78 findings F01-F78,
 pinned at 7d62778) is recorded beneath it: every P0/P1 contained defect is
-fixed; what remains open is the deferred architectural tail and two
-upstream/owner items. Round 2 (2026-09-17, 60 findings TCL-01..TCL-60,
+fixed; what remains open is the deferred architectural tail (the two
+upstream/owner items closed 2026-09-17 — rulesets live, actions pinned).
+Round 2 (2026-09-17, 60 findings TCL-01..TCL-60,
 pinned at 1a8ea32) is recorded at the bottom: 24 findings closed with
 contained fixes (several narrowing pass-6 deferrals), the rest deferred —
 almost all of them the same architectural tail pass 6 already carries, now
 with the round-2 evidence folded in.
 
-Open items: pass-6 deferred tail (29 sub-items across 24 findings) + 2
-upstream/owner, plus the round-2 residual tail itemized in that section.
-The two upstream items received from teploy-dash's 2026-09-17 pass are
-closed below.
+Open items: pass-6 deferred tail (29 sub-items across 24 findings), plus
+the round-2 residual tail itemized in that section. The 2 upstream/owner
+items are closed (below). The two upstream items received from
+teploy-dash's 2026-09-17 pass are closed below.
 
 ## Resolved from this register
 
@@ -82,7 +83,7 @@ closed below.
 | F60 | P2 | fixed (partial) | 2a04c41 — manifest records memory/cpu/publish/cache. Protected per-release full execution spec: deferred |
 | F61 | P1 | fixed | 5a4c470 — replaceBinary via sibling-temp + chmod + sync + rename; ETXTBSY and truncated-binary states eliminated |
 | F62 | P2 | fixed (partial) | 5a4c470 — downloads bounded at 256MB. Update-selection policy (prerelease/downgrade) + extraction bounds: deferred |
-| F64 | P1 | fixed (partial) | 6a7d642 — release pipeline runs CI as a required verify job. Branch/tag rulesets: upstream/owner (below) |
+| F64 | P1 | fixed | 6a7d642 + live rulesets — release pipeline runs CI as a required verify job; org layer closed 2026-09-17: ruleset 23638983 (main: required check `test`, strict up-to-date, no force-push/deletion) + 23638984 (v* tags: creation/update/deletion/non-FF blocked, maintainer-only bypass) |
 | F66 | P1 | fixed | 5a4c470 — webhook path resolves env_files from the fetched checkout with the same single-pass expansion |
 | F67 | P1 | fixed (partial) | 5a4c470 — failed Caddy inventory reads abort before destructive decisions; a stopped proxy is reported and started, not declared running. Adopted non-default /data//config sources during recreation: deferred |
 | F68 | P1 | fixed | 5a4c470 — manual backup/restore read image+env from the running container; config fallback only when free of auto/secret: references |
@@ -166,9 +167,10 @@ defect could corrupt data today.
   snapshot keeps its current role).
 - F62 — Update selection policy (prereleases/downgrades) + extraction
   member bounds.
-- F63 — Supply-chain pinning (Actions to reviewed SHAs, installer
-  digests, scanner image pin). Needs maintained, reviewed pins — not
-  fabricated ones; tracked with F64 as release-hygiene work.
+- F63 — Supply-chain pinning. Workflow action pins landed 2026-09-17
+  (reviewed release SHAs, see upstream section); trivy is not referenced
+  by any workflow in this repo, so no CI image pin applies. Remaining
+  open: installer digests (tracked with TCL-54).
 - F65 — Broader real-filesystem/Docker integration test matrix. Every
   fixed finding above landed with a mock-level regression test; the
   full fault-injection matrix is ongoing infrastructure work.
@@ -180,15 +182,28 @@ defect could corrupt data today.
 - F74 — Fresh-vs-existing recursive chown policy (explicit migration
   approval flow).
 
-## Pass 6 — upstream / owner
+## Pass 6 — upstream / owner (closed 2026-09-17)
 
-- F64 — branch protection + tag rulesets for main: GitHub repository
-  settings (api.github.com rulesets returned empty 2026-09-17). The
-  repo-side gate (release `needs: verify`) landed in 6a7d642; enabling
-  required checks/rulesets is an owner action on
-  github.com/useteploy/teploy-cli.
-- F63 — goreleaser/Action version pins and trivy image digests require
-  maintained reviewed digests; same owner workflow as above.
+- F64 — CLOSED: repository rulesets live on github.com/useteploy/teploy-cli
+  (api.github.com/repos/useteploy/teploy-cli/rulesets). 23638983
+  "main-protection" (branch, active, refs/heads/main): required status
+  check `test` (the CI workflow's job, confirmed as the reported context
+  on main) with strict up-to-date policy; deletion and non-fast-forward
+  blocked; no bypass actors. 23638984 "vtag-protection" (tag, active,
+  refs/tags/v*): creation, update, deletion, and non-fast-forward all
+  blocked; sole bypass actor im-tyler (always). A v-tag can no longer be
+  pushed, moved, or deleted except by the maintainer — the
+  any-v-tag-republishes-latest hazard is closed at the org layer too.
+- F63 — CLOSED for workflows: every `uses:` ref pinned to the tag's
+  reviewed release commit — actions/checkout v4.4.0
+  (11d5960a326750d5838078e36cf38b85af677262), actions/setup-go v5.6.0
+  (40f1582b2485089dde7abd97c1529aa768e1baff),
+  goreleaser/goreleaser-action v6.4.0
+  (e435ccd777264be153ace6237001ef4d979d3a7a) — resolved via
+  git/refs/tags and dereferenced/verified against the tagged commits. No
+  trivy reference exists in this repo's workflows (the README trivy gate
+  is teploy's server-side scan, not CI), so there is no scanner image to
+  digest-pin. Installer-digest pinning remains with TCL-54.
 
 ## Upstream from teploy-dash (2026-09-17 pass) — received and fixed
 
@@ -330,6 +345,8 @@ into each rather than duplicated as new work items.
   real subprocesses for the transfer stall, filesystem-backed fake for
   the maintenance stash) — the prefix-response mock remains the gap.
 - TCL-60 — F63/F64 owner items (pinned actions/digests, branch rulesets).
+  Closed 2026-09-17: workflow action pins landed; rulesets 23638983 +
+  23638984 live (pass-6 upstream section).
 
 Gates at the closing commits: `go vet ./...` clean; `go test ./... -race`
 all packages ok. No push performed.
