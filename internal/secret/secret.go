@@ -98,10 +98,32 @@ func (m *Manager) EnsureAge(ctx context.Context) error {
 	return nil
 }
 
+// remoteFileExists confirms a path's existence WITHOUT folding transport
+// and permission failures into "missing" (TCL-29): the command always
+// exits 0 and prints absent/present, so a non-zero exit or unrecognized
+// output is a real error, never an absence signal.
+func remoteFileExists(ctx context.Context, exec ssh.Executor, path string) (bool, error) {
+	out, err := exec.Run(ctx, fmt.Sprintf("if [ ! -e %s ]; then printf 'absent\\n'; else printf 'present\\n'; fi", ssh.ShellQuote(path)))
+	if err != nil {
+		return false, fmt.Errorf("checking %s: %w", path, err)
+	}
+	switch strings.TrimSpace(out) {
+	case "absent":
+		return false, nil
+	case "present":
+		return true, nil
+	}
+	return false, fmt.Errorf("checking %s: unrecognized output framing", path)
+}
+
 // ensureKey creates an age keypair on the server if one doesn't exist.
 // Returns the path to the key file.
 func (m *Manager) ensureKey(ctx context.Context) (string, error) {
-	if _, err := m.exec.Run(ctx, fmt.Sprintf("test -f %s", ageKeyPath)); err == nil {
+	exists, err := remoteFileExists(ctx, m.exec, ageKeyPath)
+	if err != nil {
+		return "", err
+	}
+	if exists {
 		return ageKeyPath, nil
 	}
 
@@ -188,18 +210,33 @@ func (m *Manager) Get(ctx context.Context, app, key string) (string, error) {
 		return "", err
 	}
 	path := secretPath(app, key)
-	if _, err := m.exec.Run(ctx, "test -f "+ssh.ShellQuote(path)); err != nil {
+	exists, err := remoteFileExists(ctx, m.exec, path)
+	if err != nil {
+		return "", err
+	}
+	if !exists {
 		return "", fmt.Errorf("%w: %s", ErrNotFound, key)
 	}
 
 	// RunStream (not Run) so the executor's output trimming cannot silently
-	// alter the plaintext.
-	var out bytes.Buffer
+	// alter the plaintext. stdout and stderr are captured SEPARATELY: the
+	// old single-buffer form let any age warning on stderr contaminate the
+	// secret value itself (TCL-29); diagnostics surface only in the error.
+	var out, diag bytes.Buffer
 	cmd := fmt.Sprintf("age -d -i %s %s", ageKeyPath, ssh.ShellQuote(path))
-	if err := m.exec.RunStream(ctx, cmd, &out, &out); err != nil {
-		return "", fmt.Errorf("decrypting secret %s: %w", key, err)
+	if err := m.exec.RunStream(ctx, cmd, &out, &diag); err != nil {
+		return "", fmt.Errorf("decrypting secret %s: %w%s", key, err, diagSuffix(diag.String()))
 	}
 	return out.String(), nil
+}
+
+// diagSuffix appends trimmed stderr output to an error message when present.
+func diagSuffix(diag string) string {
+	diag = strings.TrimSpace(diag)
+	if diag == "" {
+		return ""
+	}
+	return ": " + diag
 }
 
 // List returns all secret key names for the app. An absent secrets directory
@@ -208,7 +245,11 @@ func (m *Manager) Get(ctx context.Context, app, key string) (string, error) {
 // deployment proceed without secrets it actually has.
 func (m *Manager) List(ctx context.Context, app string) ([]string, error) {
 	dir := secretDir(app)
-	if _, err := m.exec.Run(ctx, "test -d "+ssh.ShellQuote(dir)); err != nil {
+	exists, err := remoteFileExists(ctx, m.exec, dir)
+	if err != nil {
+		return nil, err
+	}
+	if !exists {
 		return nil, nil
 	}
 	out, err := m.exec.Run(ctx, fmt.Sprintf("find %s -maxdepth 1 -name '*.age' -printf '%%f\\n' | sort", ssh.ShellQuote(dir)))
@@ -237,7 +278,11 @@ func (m *Manager) Remove(ctx context.Context, app, key string) (bool, error) {
 		return false, err
 	}
 	path := secretPath(app, key)
-	if _, err := m.exec.Run(ctx, "test -f "+ssh.ShellQuote(path)); err != nil {
+	exists, err := remoteFileExists(ctx, m.exec, path)
+	if err != nil {
+		return false, err
+	}
+	if !exists {
 		return false, nil
 	}
 	if _, err := m.exec.Run(ctx, "rm -f "+ssh.ShellQuote(path)); err != nil {
@@ -249,9 +294,11 @@ func (m *Manager) Remove(ctx context.Context, app, key string) (bool, error) {
 // Rotate generates a new random value for a key and re-encrypts it.
 // Returns the new value.
 func (m *Manager) Rotate(ctx context.Context, app, key string) (string, error) {
-	// Verify key exists.
-	path := secretPath(app, key)
-	if _, err := m.exec.Run(ctx, "test -f "+ssh.ShellQuote(path)); err != nil {
+	exists, err := remoteFileExists(ctx, m.exec, secretPath(app, key))
+	if err != nil {
+		return "", err
+	}
+	if !exists {
 		return "", fmt.Errorf("secret %s does not exist — cannot rotate: %w", key, ErrNotFound)
 	}
 

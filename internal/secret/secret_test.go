@@ -2,7 +2,9 @@ package secret
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"testing"
 
@@ -12,7 +14,7 @@ import (
 func TestSet(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "which age", Output: "/usr/bin/age"},
-		ssh.MockCommand{Match: "test -f /deployments/.age-key", Output: ""},
+		ssh.MockCommand{Match: "if [ ! -e '/deployments/.age-key' ]", Output: "present"},
 		ssh.MockCommand{Match: "grep 'public key:'", Output: "# public key: age1abc123"},
 		ssh.MockCommand{Match: "mkdir -p", Output: ""},
 		ssh.MockCommand{Match: "umask 077", Output: ""},
@@ -52,7 +54,7 @@ func TestSet_RejectsUnsafeKeys(t *testing.T) {
 
 func TestGet(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
-		ssh.MockCommand{Match: "test -f '/deployments/myapp/secrets/DB_PASS.age'", Output: ""},
+		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/secrets/DB_PASS.age' ]", Output: "present"},
 		ssh.MockCommand{Match: "age -d", Output: "supersecret"},
 	)
 
@@ -71,7 +73,7 @@ func TestGet(t *testing.T) {
 // intentionally carry leading/trailing whitespace.
 func TestGet_PreservesExactBytes(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
-		ssh.MockCommand{Match: "test -f", Output: ""},
+		ssh.MockCommand{Match: "if [ ! -e ", Output: "present"},
 		ssh.MockCommand{Match: "age -d", Output: "  padded password  \n"},
 	)
 	mgr := NewManager(mock)
@@ -86,7 +88,7 @@ func TestGet_PreservesExactBytes(t *testing.T) {
 
 func TestGet_NotSet(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
-		ssh.MockCommand{Match: "test -f", Err: fmt.Errorf("not found")},
+		ssh.MockCommand{Match: "if [ ! -e ", Output: "absent"},
 	)
 
 	mgr := NewManager(mock)
@@ -98,7 +100,7 @@ func TestGet_NotSet(t *testing.T) {
 
 func TestList(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
-		ssh.MockCommand{Match: "test -d '/deployments/myapp/secrets'", Output: ""},
+		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/secrets' ]", Output: "present"},
 		ssh.MockCommand{Match: "find", Output: "DB_PASS.age\nSECRET_KEY.age\n"},
 	)
 
@@ -117,7 +119,7 @@ func TestList(t *testing.T) {
 
 func TestList_Empty(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
-		ssh.MockCommand{Match: "test -d", Err: fmt.Errorf("exit status 1")},
+		ssh.MockCommand{Match: "if [ ! -e ", Output: "absent"},
 	)
 
 	mgr := NewManager(mock)
@@ -135,7 +137,7 @@ func TestList_Empty(t *testing.T) {
 // proceed as though every secret was simply absent.
 func TestList_ReadFailureIsError(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
-		ssh.MockCommand{Match: "test -d", Output: ""},
+		ssh.MockCommand{Match: "if [ ! -e ", Output: "present"},
 		ssh.MockCommand{Match: "find", Err: fmt.Errorf("permission denied")},
 	)
 	mgr := NewManager(mock)
@@ -146,9 +148,9 @@ func TestList_ReadFailureIsError(t *testing.T) {
 
 func TestRotate(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
-		ssh.MockCommand{Match: "test -f '/deployments/myapp/secrets/DB_PASS.age'", Output: ""},
+		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/secrets/DB_PASS.age' ]", Output: "present"},
 		ssh.MockCommand{Match: "which age", Output: "/usr/bin/age"},
-		ssh.MockCommand{Match: "test -f /deployments/.age-key", Output: ""},
+		ssh.MockCommand{Match: "if [ ! -e '/deployments/.age-key' ]", Output: "present"},
 		ssh.MockCommand{Match: "grep 'public key:'", Output: "# public key: age1abc123"},
 		ssh.MockCommand{Match: "mkdir -p", Output: ""},
 		ssh.MockCommand{Match: "umask 077", Output: ""},
@@ -181,7 +183,7 @@ func TestEnsureAge_AlreadyInstalled(t *testing.T) {
 
 func TestRemove(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
-		ssh.MockCommand{Match: "test -f '/deployments/myapp/secrets/DB_PASS.age'", Output: ""},
+		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/secrets/DB_PASS.age' ]", Output: "present"},
 		ssh.MockCommand{Match: "rm -f '/deployments/myapp/secrets/DB_PASS.age'", Output: ""},
 	)
 
@@ -207,7 +209,7 @@ func TestRemove(t *testing.T) {
 
 func TestRemove_NotSet(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
-		ssh.MockCommand{Match: "test -f '/deployments/myapp/secrets/GONE.age'", Err: fmt.Errorf("exit status 1")},
+		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/secrets/GONE.age' ]", Output: "absent"},
 	)
 
 	mgr := NewManager(mock)
@@ -229,9 +231,9 @@ func TestRemove_NotSet(t *testing.T) {
 // application secrets. DecryptAll must never hand them to a workload.
 func TestDecryptAll_ExcludesManagementSecrets(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
-		ssh.MockCommand{Match: "test -d", Output: ""},
+		ssh.MockCommand{Match: "if [ ! -e ", Output: "present"},
 		ssh.MockCommand{Match: "find", Output: "API_TOKEN.age\nVAULT_ROOT_TOKEN.age\nVAULT_RECOVERY_KEYS.age\nVAULT_SEAL_KEY.age\nVAULT_SEAL_KEY_ID.age\n"},
-		ssh.MockCommand{Match: "test -f", Output: ""},
+		ssh.MockCommand{Match: "if [ ! -e ", Output: "present"},
 		ssh.MockCommand{Match: "age -d", Output: "value"},
 	)
 
@@ -243,4 +245,50 @@ func TestDecryptAll_ExcludesManagementSecrets(t *testing.T) {
 	if len(got) != 1 || got["API_TOKEN"] != "value" {
 		t.Fatalf("expected only API_TOKEN, got %v", got)
 	}
+}
+
+// TCL-29: a transport failure at the existence check must surface as an
+// error, never as ErrNotFound — a false absence is what makes callers
+// regenerate seal material over existing data.
+func TestGet_ExistenceCheckTransportFailureIsNotAbsence(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "if [ ! -e ", Err: fmt.Errorf("connection reset")},
+	)
+	mgr := NewManager(mock)
+	_, err := mgr.Get(context.Background(), "myapp", "DB_PASS")
+	if err == nil || errors.Is(err, ErrNotFound) {
+		t.Fatalf("transport failure classified as absence: %v", err)
+	}
+}
+
+// TCL-29: age warnings on stderr must not contaminate the decrypted
+// plaintext — Get captured stdout and stderr in one buffer.
+func TestGet_StderrDoesNotContaminatePlaintext(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "if [ ! -e ", Output: "present"},
+		ssh.MockCommand{Match: "age -d", Output: ""},
+	)
+	// Model RunStream writing "warning: ..." to stderr only.
+	warn := &stderrOnlyMock{MockExecutor: mock, stderrOut: "age: warning: something\n"}
+	mgr := NewManager(warn)
+	got, err := mgr.Get(context.Background(), "myapp", "DB_PASS")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got != "s3cr3t" {
+		t.Fatalf("plaintext contaminated by stderr: %q", got)
+	}
+}
+
+type stderrOnlyMock struct {
+	*ssh.MockExecutor
+	stderrOut string
+}
+
+func (m *stderrOnlyMock) RunStream(ctx context.Context, cmd string, stdout, stderr io.Writer) error {
+	if _, err := stdout.Write([]byte("s3cr3t")); err != nil {
+		return err
+	}
+	_, err := stderr.Write([]byte(m.stderrOut))
+	return err
 }
