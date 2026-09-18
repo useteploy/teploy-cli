@@ -212,3 +212,31 @@ func TestProbeURL(t *testing.T) {
 		t.Error("probeURL accepted port 0")
 	}
 }
+
+// TCL-38: v2 recorded only a COUNT of directories, so trees with equal
+// files but differently-named empty directories hashed identically and a
+// content-addressed release name could describe the wrong tree. v3 emits a
+// typed record carrying every directory's path.
+func TestHashDir_V3EncodingSeparatesDirectoryNameCollisions(t *testing.T) {
+	a, b := t.TempDir(), t.TempDir()
+	if err := os.WriteFile(filepath.Join(a, "index.html"), []byte("same"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(b, "index.html"), []byte("same"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(b, "assets"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	ha, err := hashDir(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hb, err := hashDir(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ha == hb {
+		t.Fatalf("directory-name collision survived: both trees hash to %s", ha)
+	}
+}

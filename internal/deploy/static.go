@@ -429,13 +429,17 @@ func (d *StaticDeployer) pruneReleases(ctx context.Context, releasesDir, keepHas
 // bits are intentionally ignored to keep the hash stable across umask
 // differences between developer machines.
 //
-// The encoding is versioned and length-prefixed (v2). The v1 encoding
+// The encoding is versioned, typed, and length-prefixed. The v1 encoding
 // (path + NUL + bytes + NUL) was ambiguous: a tree containing file "a" with
-// bytes "X\0b\0Y" hashed identically to a tree with "a"="X" and "b"="Y", so
-// different content could reuse an existing release directory (audit F51).
-// Length prefixes make the record stream unambiguous. NOTE: v2 digests
-// differ from v1 for identical trees by design; a redeploy after upgrading
-// creates a fresh release once rather than matching pre-upgrade hashes.
+// bytes "X\0b\0Y" hashed identically to a tree with "a"="X" and "b"="Y"
+// (audit F51). v2 added length prefixes but recorded only a COUNT of
+// directories — two trees with equal files and differently-named (e.g.
+// empty) directories hashed identically, so a content-addressed release
+// name could describe the wrong tree (TCL-38). v3 emits a typed record for
+// EVERY entry, directories included, each carrying its path. NOTE: v3
+// digests differ from v2 for identical trees by design; a redeploy after
+// upgrading creates a fresh release once rather than matching pre-upgrade
+// hashes.
 //
 // Symlinks and other non-regular files are rejected (audit F52): hashDir
 // FOLLOWS symlinks while rsync -a PRESERVES them, so the remote file could
@@ -449,9 +453,9 @@ func hashDir(dir string) (string, error) {
 		path string
 		size int64
 		info fs.FileInfo
+		dir  bool
 	}
-	var files []entry
-	var dirs int
+	var entries []entry
 	err := filepath.WalkDir(dir, func(p string, dEnt fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
@@ -473,31 +477,39 @@ func hashDir(dir string) (string, error) {
 		if err != nil {
 			return err
 		}
-		if info.IsDir() {
-			dirs++
-		} else {
-			files = append(files, entry{rel: filepath.ToSlash(rel), path: p, size: info.Size(), info: info})
-		}
+		entries = append(entries, entry{rel: filepath.ToSlash(rel), path: p, size: info.Size(), info: info, dir: info.IsDir()})
 		return nil
 	})
 	if err != nil {
 		return "", err
 	}
-	if len(files) == 0 {
+	files := 0
+	for _, e := range entries {
+		if !e.dir {
+			files++
+		}
+	}
+	if files == 0 {
 		return "", fmt.Errorf("static source %s contains no files (did the build step run?)", dir)
 	}
-	sort.Slice(files, func(i, j int) bool { return files[i].rel < files[j].rel })
+	sort.Slice(entries, func(i, j int) bool { return entries[i].rel < entries[j].rel })
 
-	// Versioned, typed, length-prefixed records.
-	h.Write([]byte("teploy-static-tree-v2\x00"))
+	// Versioned, typed, length-prefixed records — directories included.
+	h.Write([]byte("teploy-static-tree-v3\x00"))
 	var num [8]byte
-	binary.BigEndian.PutUint64(num[:], uint64(len(files)+dirs))
+	binary.BigEndian.PutUint64(num[:], uint64(len(entries)))
 	h.Write(num[:])
 	putLen := func(n uint64) {
 		binary.BigEndian.PutUint64(num[:], n)
 		h.Write(num[:])
 	}
-	for _, e := range files {
+	for _, e := range entries {
+		if e.dir {
+			h.Write([]byte{'D'})
+			putLen(uint64(len(e.rel)))
+			h.Write([]byte(e.rel))
+			continue
+		}
 		h.Write([]byte{'F'})
 		putLen(uint64(len(e.rel)))
 		h.Write([]byte(e.rel))
