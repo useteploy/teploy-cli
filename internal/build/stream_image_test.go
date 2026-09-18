@@ -49,8 +49,10 @@ func TestStreamImage_ConsumerStartFailureIsClean(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(bin, "docker"), []byte("#!/bin/sh\nexit 0\n"), 0755); err != nil {
 		t.Fatal(err)
 	}
-	// A non-executable ssh on PATH: found, but Start fails.
-	if err := os.WriteFile(filepath.Join(bin, "ssh"), []byte("not executable\n"), 0644); err != nil {
+	// An ssh whose interpreter does not exist: LookPath resolves it, but
+	// execve fails and Start errors — without leaking to a real system ssh
+	// (which would turn this into a network test).
+	if err := os.WriteFile(filepath.Join(bin, "ssh"), []byte("#!/nonexistent-interpreter\n"), 0755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", bin+":"+os.Getenv("PATH"))
