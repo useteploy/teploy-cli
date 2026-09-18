@@ -113,12 +113,13 @@ type LogEntry struct {
 	Image string `json:"image,omitempty"`
 }
 
-// readRemoteFile returns the file's contents and whether it exists. Absence
+// ReadRemoteFile returns the file's contents and whether it exists. Absence
 // is CONFIRMED by the remote test — the old `cat path 2>/dev/null` shape
 // folded "missing", "unreadable", and "transport failed" into one silent
 // empty result, so a permission failure was indistinguishable from a first
-// deploy (audit F15).
-func readRemoteFile(ctx context.Context, exec ssh.Executor, path string) ([]byte, bool, error) {
+// deploy (audit F15). Exported for releasemeta, which reads per-release
+// records with the same absence/transport distinction.
+func ReadRemoteFile(ctx context.Context, exec ssh.Executor, path string) ([]byte, bool, error) {
 	cmd := fmt.Sprintf("if [ ! -e %s ]; then printf 'absent\\n'; else printf 'present\\n'; cat -- %s; fi",
 		ssh.ShellQuote(path), ssh.ShellQuote(path))
 	out, err := exec.Run(ctx, cmd)
@@ -146,7 +147,7 @@ func readRemoteFile(ctx context.Context, exec ssh.Executor, path string) ([]byte
 // (audit F15).
 func Read(ctx context.Context, exec ssh.Executor, app string) (*AppState, error) {
 	v2Path := fmt.Sprintf("%s/%s/state.json", deploymentsDir, app)
-	data, present, err := readRemoteFile(ctx, exec, v2Path)
+	data, present, err := ReadRemoteFile(ctx, exec, v2Path)
 	if err != nil {
 		return nil, fmt.Errorf("reading canonical state for %s: %w", app, err)
 	}
@@ -173,7 +174,7 @@ func Read(ctx context.Context, exec ssh.Executor, app string) (*AppState, error)
 
 	// Only a confirmed-missing canonical file reaches the legacy migration.
 	path := fmt.Sprintf("%s/%s/state", deploymentsDir, app)
-	data, present, err = readRemoteFile(ctx, exec, path)
+	data, present, err = ReadRemoteFile(ctx, exec, path)
 	if err != nil {
 		return nil, fmt.Errorf("reading legacy state for %s: %w", app, err)
 	}
