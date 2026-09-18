@@ -632,15 +632,21 @@ func TestRollback_HostIngressKeepsTheFixedPort(t *testing.T) {
 }
 
 // Caddy ingress keeps blue/green: the current version's port must still be
-// avoided there, since two versions genuinely do run at once.
+// avoided there, since two versions genuinely do run at once. The guard now
+// keys on fixedPorts (host ingress OR recorded fixed/publish ports — F21);
+// a plain caddy app computes fixedPorts=false and keeps avoiding the live
+// port. Pin both the derivation and the guard so neither regresses.
 func TestRollback_CaddyIngressStillAvoidsTheLivePort(t *testing.T) {
 	body, err := osReadFile("rollback.go")
 	if err != nil {
 		t.Fatalf("read rollback.go: %v", err)
 	}
 	src := string(body)
-	if !strings.Contains(src, "if !cfg.ingressHost() {") {
-		t.Error("the avoidPorts guard is not conditioned on host ingress; caddy rollbacks need the live port avoided")
+	if !strings.Contains(src, "fixedPorts := cfg.ingressHost() || releasemeta.HasFixedHostPorts(rec)") {
+		t.Error("fixedPorts must derive from host ingress or recorded fixed/publish ports only — anything else would stop a plain caddy rollback avoiding the live port")
+	}
+	if !strings.Contains(src, "if !fixedPorts {") {
+		t.Error("the avoidPorts guard is not conditioned on fixedPorts; caddy rollbacks need the live port avoided")
 	}
 }
 
