@@ -648,6 +648,13 @@ func (c *AppConfig) validate() error {
 	if c.Platform != "" && !validPlatform.MatchString(c.Platform) {
 		return fmt.Errorf("'platform' must be os/arch (e.g. linux/amd64, linux/arm64), got %q", c.Platform)
 	}
+	// 0 means "default" (80); anything else must be a real port. Direct
+	// construction of the deploy Config bypasses config-file parsing, so
+	// the shared execution validator can't be the only place this is
+	// checked (TCL-18).
+	if c.Port < 0 || c.Port > 65535 {
+		return fmt.Errorf("'port' must be in 1..65535 (got %d)", c.Port)
+	}
 	if err := validateResources("", c.Memory, c.CPU); err != nil {
 		return err
 	}
@@ -781,6 +788,19 @@ func (c *AppConfig) validate() error {
 		}
 		if acc.Command != "" && len(acc.CommandArgs) > 0 {
 			return fmt.Errorf("accessory %s: set either 'command' or 'command_args', not both", name)
+		}
+		// Accessory volume keys become path segments under the accessory's
+		// data directory (and reach mkdir/chown sites); the same grammar as
+		// top-level volume names applies, and container destinations must
+		// be absolute paths — a '..' key or relative destination can escape
+		// the accessory directory (TCL-35).
+		for vol, dest := range acc.Volumes {
+			if !validName.MatchString(vol) {
+				return fmt.Errorf("accessory %s volume %q must be lowercase alphanumeric with hyphens", name, vol)
+			}
+			if !strings.HasPrefix(dest, "/") || strings.ContainsAny(dest, "\r\n\x00") {
+				return fmt.Errorf("accessory %s volume %q: container destination must be an absolute path", name, vol)
+			}
 		}
 		for k, v := range acc.Env {
 			if strings.HasPrefix(v, "secret:") && strings.TrimSpace(strings.TrimPrefix(v, "secret:")) == "" {

@@ -104,7 +104,10 @@ func NewDeployer(exec ssh.Executor, out io.Writer) *Deployer {
 	}
 }
 
-// validate checks the deploy config's required fields.
+// validate checks the deploy config's required fields. This is the shared
+// execution-plan validator: direct/ad-hoc construction (multideploy,
+// preview, autodeploy) does not pass through config-file parsing, so the
+// bounds enforced there cannot be assumed here (TCL-18).
 func (c Config) validate() error {
 	if c.App == "" || c.Image == "" || c.Version == "" {
 		return fmt.Errorf("app, image, and version are required")
@@ -113,6 +116,23 @@ func (c Config) validate() error {
 	// port and needs no domain.
 	if c.Domain == "" && !c.ingressHost() {
 		return fmt.Errorf("domain is required")
+	}
+	// 0 means "default" (80 at the docker layer); anything else must be a
+	// real port.
+	if c.ContainerPort < 0 || c.ContainerPort > 65535 {
+		return fmt.Errorf("container port must be in 1..65535 (got %d)", c.ContainerPort)
+	}
+	if c.Replicas < 0 || c.Replicas > 1000 {
+		return fmt.Errorf("replicas must be in 1..1000 (got %d)", c.Replicas)
+	}
+	// A fixed host port cannot be shared across containers — mirror the
+	// config-layer rejection so a directly constructed Config cannot ask
+	// for a deploy that self-collides.
+	if c.ingressHost() && c.Replicas > 1 {
+		return fmt.Errorf("host ingress supports a single replica (a fixed host port can't be load-balanced across containers)")
+	}
+	if c.StopTimeout < 0 {
+		return fmt.Errorf("stop timeout cannot be negative (got %ds)", c.StopTimeout)
 	}
 	return nil
 }

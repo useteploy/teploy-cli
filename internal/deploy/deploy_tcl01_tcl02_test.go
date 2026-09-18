@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"strings"
 	"testing"
 	"time"
@@ -36,7 +37,7 @@ func TestDeploy_AcquiresLockExactlyOnce(t *testing.T) {
 		ssh.MockCommand{Match: "caddy", Output: ""},
 		ssh.MockCommand{Match: "cat /deployments/caddy/Caddyfile", Output: "{\n\tadmin 0.0.0.0:2019\n}\n"},
 		ssh.MockCommand{Match: "mkdir /deployments/caddy/.lock", Output: ""},
-		ssh.MockCommand{Match: "[ \"$(docker exec caddy md5sum", Output: "TEPLOY_CADDY_OK"},
+		ssh.MockCommand{Match: "a=$(docker exec caddy md5sum", Output: "TEPLOY_CADDY_OK"},
 		ssh.MockCommand{Match: "UPLOAD:", Output: ""},
 		ssh.MockCommand{Match: "mv -f -- ", Output: ""},
 		ssh.MockCommand{Match: "if [ ! -e '/deployments/caddy/Caddyfile'", Err: fmt.Errorf("none")},
@@ -98,7 +99,7 @@ func TestDeploy_SameVersionCleanupNeverTouchesReplacement(t *testing.T) {
 		ssh.MockCommand{Match: "caddy", Output: ""},
 		ssh.MockCommand{Match: "cat /deployments/caddy/Caddyfile", Output: "{\n\tadmin 0.0.0.0:2019\n}\n"},
 		ssh.MockCommand{Match: "mkdir /deployments/caddy/.lock", Output: ""},
-		ssh.MockCommand{Match: "[ \"$(docker exec caddy md5sum", Output: "TEPLOY_CADDY_OK"},
+		ssh.MockCommand{Match: "a=$(docker exec caddy md5sum", Output: "TEPLOY_CADDY_OK"},
 		ssh.MockCommand{Match: "UPLOAD:", Output: ""},
 		ssh.MockCommand{Match: "mv -f -- ", Output: ""},
 		ssh.MockCommand{Match: "if [ ! -e '/deployments/caddy/Caddyfile'", Err: fmt.Errorf("none")},
@@ -132,5 +133,24 @@ func TestDeploy_SameVersionCleanupNeverTouchesReplacement(t *testing.T) {
 	}
 	if !stoppedPredecessor {
 		t.Error("predecessor _replaced container was never cleaned up")
+	}
+}
+
+// TCL-18: the deployer is a library entry point (multideploy, preview,
+// autodeploy construct Config directly) — execution bounds must be
+// enforced here, not only at config-file parse time.
+func TestDeploy_ValidationBounds(t *testing.T) {
+	d := NewDeployer(ssh.NewMockExecutor("1.2.3.4"), io.Discard)
+	for name, cfg := range map[string]Config{
+		"container port high":        {App: "a", Image: "i", Version: "v", Domain: "x.com", ContainerPort: 65536},
+		"container port negative":    {App: "a", Image: "i", Version: "v", Domain: "x.com", ContainerPort: -1},
+		"replicas negative":          {App: "a", Image: "i", Version: "v", Domain: "x.com", Replicas: -2},
+		"replicas absurd":            {App: "a", Image: "i", Version: "v", Domain: "x.com", Replicas: 5000},
+		"host ingress multi-replica": {App: "a", Image: "i", Version: "v", Ingress: "host", ContainerPort: 8080, Replicas: 3},
+		"negative stop timeout":      {App: "a", Image: "i", Version: "v", Domain: "x.com", StopTimeout: -5},
+	} {
+		if err := d.Deploy(context.Background(), cfg); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
 	}
 }
