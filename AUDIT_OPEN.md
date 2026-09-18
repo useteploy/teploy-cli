@@ -12,10 +12,13 @@ contained fixes (several narrowing pass-6 deferrals), the rest deferred —
 almost all of them the same architectural tail pass 6 already carries, now
 with the round-2 evidence folded in.
 
-Open items: pass-6 deferred tail (29 sub-items across 24 findings), plus
-the round-2 residual tail itemized in that section. The 2 upstream/owner
-items are closed (below). The two upstream items received from
-teploy-dash's 2026-09-17 pass are closed below.
+Open items: the pass-6 deferred tail minus the F14 family (resolved
+2026-09-18, bottom section: F13/F14/F20/F21 plus round-2's TCL-09/TCL-13/
+TCL-14 folded into them), the round-2 residual tail itemized in that
+section, and the dependent designs F04/F48/F49/F57/F16 that stay deferred
+with their annotations. The 2 upstream/owner items are closed (below). The
+two upstream items received from teploy-dash's 2026-09-17 pass are closed
+below.
 
 ## Resolved from this register
 
@@ -112,25 +115,32 @@ defect could corrupt data today.
 - F04 — Generation-scoped container identities + a RouteSwitch handoff
   boundary (candidates unroutable before readiness, external-ingress
   policy). The contained F03 fix removed the deletion defect; the alias
-  handoff redesign spans deploy, rollback, and Caddy together.
+  handoff redesign spans deploy, rollback, and Caddy together. Unblocked
+  by F14 (the per-release record can now key generation-scoped identities
+  and attempt artifacts), design remains.
 - F08 — Attempt-scoped immutable artifacts (build dirs, env files, TLS)
   under one lease. The F07 lock split serializes container mutation; full
-  artifact generation needs F04's generation IDs.
-- F13 — State-only rollback restoring a complete target-release spec
-  (incl. static serving config). Requires F14's per-release metadata.
-- F14 — Per-release immutable metadata store keyed by target ID (beyond
-  the current one-level PreviousRelease). Schema + migration design.
+  artifact generation needs F04's generation IDs. F14's record exists as
+  the keying surface; the lease/generation design remains.
+- F13 — RESOLVED 2026-09-18 with F14 (see the F14-family section at the
+  bottom): state-only rollback restores the complete target-release spec,
+  including static serving config.
+- F14 — RESOLVED 2026-09-18 (see the F14-family section at the bottom):
+  per-release immutable metadata store keyed target+release at
+  /deployments/<app>/meta/<hash>.json, with live-container backfill so
+  existing installs converge.
 - F16 — Owner-token fenced locks with renewal (age-based breaking
   retained: TTLs are documented and manual locks never expire; a fencing
   redesign can strand apps mid-incident if it ships wrong).
 - F17 — Commands as argv arrays end-to-end (Cmd stays a deliberate
   operator-authored shell string; validated sources are quoted at the
   sinks).
-- F20 — Full RecreateSpec/Engine-API recreation preserving every inspect
-  field (immutable image ID + quoted binds landed; full spec needs F14).
-- F21 — Explicit recreate strategy for `publish` (product decision: the
-  current failure mode is a clean pre-mutation docker-run error, not an
-  outage).
+- F20 — RESOLVED 2026-09-18 with F14 (see the F14-family section at the
+  bottom): full RecreateSpec recreation preserving every inspect field
+  the docker CLI can represent.
+- F21 — RESOLVED 2026-09-18 with F14 (see the F14-family section at the
+  bottom): publish takes the explicit recreate strategy on deploy and
+  rollback.
 - F22 — Remaining argv exposure in `docker exec` channels (BAO_TOKEN,
   MYSQL_PWD, Restart -e): docker exec has no --env-file; needs
   container-side file plumbing shared with the engine images.
@@ -164,7 +174,10 @@ defect could corrupt data today.
 - F57 — Presence-aware overlay semantics (explicit clearing of
   maps/lists, null handling) — schema design decision.
 - F60 — Protected full execution spec per release (public redacted
-  snapshot keeps its current role).
+  snapshot keeps its current role). Largely delivered 2026-09-18 by F14's
+  per-release record (full execution spec, 0600, server-side, embedded
+  RecreateSpec); if the intent included a reader-facing access contract
+  (CLI/dash surfacing of the record), that design remains.
 - F62 — Update selection policy (prereleases/downgrades) + extraction
   member bounds.
 - F63 — Supply-chain pinning. Workflow action pins landed 2026-09-17
@@ -283,26 +296,33 @@ into each rather than duplicated as new work items.
 
 - TCL-03 — F04 (generation-scoped identities / RouteSwitch handoff) + F21
   (publish recreate strategy). Contained pieces already landed: candidate
-  name dedup (F03), publish+replicas rejected at validation.
+  name dedup (F03), publish+replicas rejected at validation. F21 RESOLVED
+  2026-09-18 (F14-family section); the F04 remainder is unblocked by F14,
+  design remains.
 - TCL-04 — F08 (attempt-scoped immutable artifacts under one lease).
 - TCL-05 — F16 (fencing/renewal). Containment added this round: the caddy
   lock release is detached/bounded so cancellation cannot strand it.
 - TCL-08 — F05/F35 tail (durable journal). Contained pieces landed this
   round: cleanup failure reporting, caddy verify-failure compensation.
-- TCL-09 — F14/F13 (immutable per-release execution record).
+- TCL-09 — RESOLVED 2026-09-18: F14/F13 landed (immutable per-release
+  execution record; state-only rollback restores from it — F14-family
+  section below).
 - TCL-10 — ingress-transition transaction (caddy→host/external leaves the
   old route behind). Needs F04's generation handoff; a plain "reject
   ingress changes" would break the documented host-migration flow. Folded
-  into F04.
+  into F04. Unblocked by F14, design remains.
 - TCL-12 — F22, narrowed: docker-run channels COULD lift env to --env-file
   (Restart -e from inspect is now the registered contained follow-up);
   docker exec channels (BAO_TOKEN, MYSQL_PWD) remain blocked on
   container-side file plumbing shared with the engine images.
-- TCL-13 — F20 (full RecreateSpec preservation; needs F14).
-- TCL-14 — needs the recorded primary-port contract (F14 metadata);
-  multi-port ambiguity is real but not fixable contained without it.
+- TCL-13 — RESOLVED 2026-09-18: F20 landed (full RecreateSpec preservation
+  — F14-family section below).
+- TCL-14 — RESOLVED 2026-09-18: the recorded primary-port contract landed
+  (ports with primary designation in the F14 record; health checks and
+  Caddy targets resolve through it — F14-family section below).
 - TCL-15 — port allocation redesign (Docker-ephemeral publish + inspect).
-  With F14.
+  Unblocked by F14 (the record now carries the resolved port allocation
+  per release), design remains.
 - TCL-17 — F47 tail (explicit HTTP/TCP/auto probe modes; the 404/3xx TCP
   fallback is documented deliberate compat).
 - TCL-24 — F49 tail (foreign-block adoption by brace counting; parser/
@@ -321,9 +341,11 @@ into each rather than duplicated as new work items.
   drift detection).
 - TCL-37 — F05/F37 tail (readiness-gated accessory upgrade with verified
   recovery).
-- TCL-39 — static route-policy restore needs F13/F48; renderer input
-  hardening (header-name grammar, fallback charset) registered as the
-  contained follow-up inside that item.
+- TCL-39 — static route-policy restore needs F13/F48; F13 landed 2026-09-18
+  (recorded serving config restored), F48 remains (structured route
+  representation for policy-layer preservation). Renderer input hardening
+  (header-name grammar, fallback charset) registered as the contained
+  follow-up inside that item.
 - TCL-40 — restore under the app lock + writer quiescence (F37-adjacent;
   the orchestrated quiesce/cutover boundary is new lifecycle surface).
 - TCL-41 — F37 (engine-specific consistency contract; verify-backup
@@ -347,6 +369,64 @@ into each rather than duplicated as new work items.
 - TCL-60 — F63/F64 owner items (pinned actions/digests, branch rulesets).
   Closed 2026-09-17: workflow action pins landed; rulesets 23638983 +
   23638984 live (pass-6 upstream section).
+
+Gates at the closing commits: `go vet ./...` clean; `go test ./... -race`
+all packages ok. No push performed.
+
+## F14 family (2026-09-18) — resolved
+
+The per-release metadata architecture landed in three commits, closing
+F14 and everything the register had blocked on it.
+
+- **F14** (`97e6d03`) — `internal/releasemeta`: one immutable JSON record
+  per (app, release id) at `/deployments/<app>/meta/<hash>.json`, atomic
+  write at 0600, keyed per-target like state.json/pins (the server a
+  command talks to IS the target). Records the full resolved spec: image
+  ref + digest, env-file references, volumes, labels, ports with the
+  TCL-14 primary designation and fixed/ephemeral flags, replicas/
+  processes/cmd, resource limits, stop timeout, bind, health gate, Caddy
+  edge config (TLS/extra/cache/firewall/access), static serving config,
+  and the primary web container's full RecreateSpec. Writers: deploy paths
+  only (a same-version redeploy is the one allowed rewrite); readers never
+  mutate. Migration: a confirmed-missing record is backfilled from the
+  live containers on first use ("release-0", flagged Backfilled) —
+  existing installs converge without a redeploy; backfill records only
+  what inspect can prove and leaves env-file refs/health/caddy empty for
+  the legacy fallbacks.
+- **F20** (`b3e2ed1`) — `internal/docker` RecreateSpec: InspectRecreate
+  captures the complete docker-run-representable config in one inspect;
+  RenderRecreateArgs is a pure renderer; Restart = Inspect + Recreate with
+  the same signature. Fields previously dropped on every recreate: log
+  rotation, entrypoint overrides, stop timeout/signal, extra hosts,
+  sysctls, tmpfs, capabilities, security opts, read-only/privileged,
+  secondary networks. Multi-element entrypoints that differ from the
+  image's own fail closed (the CLI cannot represent argv there) instead of
+  being silently joined.
+- **F13 / F21 / TCL-14** (`7314da7`) — rollback and publish recreate
+  restore from the record, not from reverse-engineered current state:
+  recorded health gate, domain, TLS/caddy_extra/cache/firewall/access,
+  ingress mode; recorded primary container port drives health probes
+  (HostPortFor) and Caddy upstreams; publish apps take the explicit
+  recreate strategy on deploy (displace current web first, restore on
+  failure — the host-ingress contract) and rollback (free the fixed ports
+  first, stop avoiding them). `teploy rollback --app <static-app>` is
+  complete via StaticDeployer.RollbackStateOnly; no record means an
+  explicit redeploy-first request, never a guess.
+
+Degradation posture (deliberate): the store is an overlay, not a new
+dependency — an unreadable record or failed backfill warns and falls back
+to the historical inspect-driven path; only state-only static rollback
+(which has nothing to fall back to) fails closed. Record-write failures
+warn after the live commit rather than aborting a routed deploy.
+
+Still deferred, now annotated: F04/TCL-10/TCL-15 are unblocked by F14
+(designs remain — generation handoff, ingress-transition transaction,
+Docker-ephemeral port allocation); F08 gains F14 as its keying surface;
+F60's protected-spec-per-release is largely delivered by the record (a
+reader-facing access contract, if wanted, is the remaining design);
+TCL-39's F13 half landed, F48 remains. F48/F49 (Caddy adapt-API route
+representation), F16 (lock fencing), F57 (overlay semantics) stay
+deferred as before — F14 does not unblock them.
 
 Gates at the closing commits: `go vet ./...` clean; `go test ./... -race`
 all packages ok. No push performed.
