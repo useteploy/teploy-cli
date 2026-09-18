@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"net/url"
 	"regexp"
 	"sort"
 	"strings"
@@ -224,6 +225,21 @@ func (c *Client) SetLoadBalancer(ctx context.Context, app, domain string, upstre
 	return c.SetLoadBalancerHealth(ctx, app, domain, upstreams, "", tls, caddyExtra, cache, fw, access)
 }
 
+// validHealthURI constrains an active-check path before it is rendered
+// into a Caddyfile: it must be a request-path-shaped URI with no
+// whitespace or control characters, so it cannot break out of the
+// health_uri directive (TCL-20).
+func validHealthURI(p string) bool {
+	if !strings.HasPrefix(p, "/") || strings.HasPrefix(p, "//") ||
+		strings.ContainsAny(p, " \t\r\n\x00{}#\"\\") {
+		return false
+	}
+	if _, err := url.ParseRequestURI(p); err != nil {
+		return false
+	}
+	return true
+}
+
 // SetLoadBalancerHealth is SetLoadBalancer with an explicit active-check
 // path. Pass the app's configured health path so Caddy's upstream checks
 // probe the same endpoint the deploy readiness gate used.
@@ -234,6 +250,9 @@ func (c *Client) SetLoadBalancerHealth(ctx context.Context, app, domain string, 
 	}
 	if len(hosts) == 0 {
 		return fmt.Errorf("SetLoadBalancer: domain must be non-empty")
+	}
+	if healthPath != "" && !validHealthURI(healthPath) {
+		return fmt.Errorf("invalid health path %q for %s", healthPath, app)
 	}
 	return c.applyManagedBlock(ctx, app, hosts, loadBalancerBlock(hosts, upstreams, healthPath, tls, caddyExtra, cache, fw, access))
 }
@@ -318,8 +337,16 @@ func (c *Client) SetMaintenance(ctx context.Context, app, domain string) error {
 		end := fmt.Sprintf(markerEndFmt, app)
 		if cur := extractCaddyfileBlock(prev, begin, end); cur != "" {
 			stash := fmt.Sprintf(maintStashFmt, app)
-			if err := c.exec.Upload(ctx, strings.NewReader(cur), stash, "0644"); err != nil {
-				return "", fmt.Errorf("stashing route for maintenance: %w", err)
+			// Never overwrite an existing stash (TCL-25): a SECOND
+			// maintenance-on extracts the app's CURRENT block — which by
+			// then IS the maintenance block — so stash-on overwrote the
+			// original route and maintenance-off restored maintenance
+			// forever. The first stash wins; it is deleted only by a
+			// successful RemoveMaintenance.
+			if _, statErr := c.exec.Run(ctx, "test -f "+ssh.ShellQuote(stash)); statErr != nil {
+				if err := c.exec.Upload(ctx, strings.NewReader(cur), stash, "0644"); err != nil {
+					return "", fmt.Errorf("stashing route for maintenance: %w", err)
+				}
 			}
 		}
 		return renderUpdated(prev, app, hosts, maintenanceBlock(hosts))
@@ -407,9 +434,23 @@ func (c *Client) mutate(ctx context.Context, transform func(prev string) (string
 	// A legacy single-file Caddyfile bind mount pins the container to a stale
 	// inode, so `reload` can "succeed" against an old file while serving stale
 	// routes — a silent 502 once the old app container stops. Fail loudly here
-	// (the deploy aborts before the old container is torn down) instead.
+	// (the deploy aborts before the old container is torn down) instead, and
+	// treat a delivery-verification failure like a reload failure: restore the
+	// previous Caddyfile so the on-disk file matches what the container is
+	// actually serving, rather than leaving disk and runtime disagreeing
+	// (TCL-21).
 	if err := c.verifyDelivered(ctx); err != nil {
-		return err
+		restoreCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		if rbErr := c.writeCaddyfile(restoreCtx, prev); rbErr != nil {
+			cancel()
+			return fmt.Errorf("caddy delivery verification failed (%w) AND restoring the previous Caddyfile failed (%v) — the on-disk config may not match what the container serves; resolve manually at %s", err, rbErr, caddyfilePath)
+		}
+		if rbErr := c.reload(restoreCtx); rbErr != nil {
+			cancel()
+			return fmt.Errorf("caddy delivery verification failed (%w); the previous Caddyfile was restored on disk but the reload-back failed (%v) — the running config may be stale until the next successful reload", err, rbErr)
+		}
+		cancel()
+		return fmt.Errorf("caddy delivery verification failed, rolled back: %w", err)
 	}
 	return nil
 }
@@ -425,14 +466,18 @@ func (c *Client) mutate(ctx context.Context, transform func(prev string) (string
 // inode. A failure to run the check at all is not treated as fatal (older shell
 // etc.); this is a safety net, not the primary path.
 func (c *Client) verifyDelivered(ctx context.Context) error {
+	// Both checksums are captured and required NON-EMPTY before comparison
+	// (TCL-21): the old `[ "$(…)" = "$(…)" ]` shape let two failing
+	// substitutions compare equal as empty strings and report delivery.
 	check := fmt.Sprintf(
-		"[ \"$(docker exec %s md5sum %s 2>/dev/null | cut -d' ' -f1)\" = \"$(md5sum %s 2>/dev/null | cut -d' ' -f1)\" ] && echo %s || echo %s",
+		"a=$(docker exec %s md5sum %s 2>/dev/null | cut -d' ' -f1); "+
+			"b=$(md5sum %s 2>/dev/null | cut -d' ' -f1); "+
+			"[ -n \"$a\" ] && [ \"$a\" = \"$b\" ] && echo %s || echo %s",
 		caddyContainer, containerCaddyfile, caddyfilePath, deliveredOK, deliveredStale)
 	out, err := c.exec.Run(ctx, check)
 	// The check itself ends in `|| echo STALE`, so a non-nil error here is a
-	// transport/execution failure, and an output with NEITHER sentinel is
-	// ambiguous (e.g. both checksums empty). Both used to be treated as
-	// delivered — fail closed instead (audit F45).
+	// transport/execution failure. Both are treated as NOT delivered —
+	// fail closed (audit F45).
 	if err != nil {
 		return fmt.Errorf("could not verify the caddy container is serving the config just written: %w", err)
 	}
@@ -458,20 +503,37 @@ func (c *Client) applyManagedBlock(ctx context.Context, app string, hosts []stri
 }
 
 // renderUpdated produces new Caddyfile contents: it removes the app's previous
-// Teploy block (and a legacy lb-<app> block), removes any non-Teploy block
-// serving the same hosts (brownfield adoption), then appends the new block
-// wrapped in per-app markers. An empty block just performs the removals.
-// Marker matching is EXACT-LINE, so an app whose name is a prefix of
-// another's can no longer rewrite the other's block (audit F44).
+// Teploy block (and a legacy lb-<app> block it can prove is legacy), removes
+// any non-Teploy block serving the same hosts (brownfield adoption), then
+// appends the new block wrapped in per-app markers. An empty block just
+// performs the removals. Marker matching is EXACT-LINE, so an app whose name
+// is a prefix of another's can no longer rewrite the other's block (audit F44).
 func renderUpdated(prev, app string, hosts []string, block string) (string, error) {
 	updated, err := removeCaddyfileBlock(prev, fmt.Sprintf(markerBeginFmt, app), fmt.Sprintf(markerEndFmt, app))
 	if err != nil {
 		return "", err
 	}
-	// Legacy: older versions used a separate lb-<app> marker block.
-	updated, err = removeCaddyfileBlock(updated, fmt.Sprintf(markerBeginFmt, "lb-"+app), fmt.Sprintf(markerEndFmt, "lb-"+app))
-	if err != nil {
-		return "", err
+	// Legacy: older versions used a separate lb-<app> marker block for
+	// multi-replica apps. Removing it unconditionally collided with a REAL
+	// application legitimately named lb-<app> (a valid app name) — updating
+	// or removing <app> deleted that other app's route (TCL-23). The legacy
+	// block is removed only when its own site address proves it serves the
+	// hosts this operation manages; anything else belongs to someone else.
+	if legacyLBHosts := managedBlockHosts(prev, "lb-"+app); len(legacyLBHosts) > 0 {
+		refHosts := hosts
+		if len(refHosts) == 0 {
+			// Removal path (no hosts given): compare against the hosts of
+			// the app's own current block in prev — the legacy block served
+			// the same app, so its hosts match the app's block, not another
+			// app's.
+			refHosts = managedBlockHosts(prev, app)
+		}
+		if addressWithinHosts(strings.Join(legacyLBHosts, ", "), refHosts) {
+			updated, err = removeCaddyfileBlock(updated, fmt.Sprintf(markerBeginFmt, "lb-"+app), fmt.Sprintf(markerEndFmt, "lb-"+app))
+			if err != nil {
+				return "", err
+			}
+		}
 	}
 	if len(hosts) > 0 {
 		updated = removeForeignHostBlocks(updated, hosts)
@@ -484,6 +546,29 @@ func renderUpdated(prev, app string, hosts []string, block string) (string, erro
 		return strings.TrimRight(updated, "\n") + "\n\n" + wrapped + "\n", nil
 	}
 	return strings.TrimRight(updated, "\n") + "\n", nil
+}
+
+// managedBlockHosts returns the site-address hosts of the app's managed
+// block (its first non-empty line), or nil when the app has no managed
+// block. Used to prove whether a legacy lb-<app> block belongs to this app
+// rather than to a distinct application of the same name (TCL-23).
+func managedBlockHosts(content, app string) []string {
+	block := extractCaddyfileBlock(content, fmt.Sprintf(markerBeginFmt, app), fmt.Sprintf(markerEndFmt, app))
+	for _, line := range strings.Split(block, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		addr := strings.TrimSpace(strings.TrimSuffix(line, "{"))
+		var hosts []string
+		for _, a := range strings.Split(addr, ",") {
+			if a = strings.TrimSpace(a); a != "" {
+				hosts = append(hosts, a)
+			}
+		}
+		return hosts
+	}
+	return nil
 }
 
 // writeCaddyfile persists the Caddyfile atomically via a temp file + rename. The
@@ -536,7 +621,13 @@ func (c *Client) acquireLock(ctx context.Context) error {
 }
 
 func (c *Client) releaseLock(ctx context.Context) {
-	c.exec.Run(ctx, "rmdir "+lockDir+" 2>/dev/null || true")
+	// A detached, bounded context: releasing with the operation's context
+	// let a cancelled deploy skip the rmdir entirely, leaving the lock dir
+	// behind to block every subsequent Caddy mutation for the stale window
+	// (TCL-05 containment — the release must survive caller cancellation).
+	rctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	c.exec.Run(rctx, "rmdir "+lockDir+" 2>/dev/null || true")
 }
 
 // removeForeignHostBlocks strips top-level Caddyfile site blocks that serve
@@ -743,9 +834,12 @@ func removeCaddyfileBlock(content, begin, end string) (string, error) {
 		}
 	}
 	if active {
-		// Unterminated region: drop through to EOF, same as before, but now
-		// guaranteed to be this app's own region.
-		_ = active
+		// Unterminated region: refuse the edit entirely (TCL-22). The old
+		// behavior trimmed from the begin marker through end-of-file, which
+		// a damaged or hand-edited marker turned into deletion of every
+		// unrelated unmanaged route below it. Malformed ownership
+		// boundaries fail closed before any rewrite.
+		return "", fmt.Errorf("unterminated TEPLOY BEGIN %s (no matching END marker) — refusing to edit a malformed Caddyfile", target)
 	}
 	result := strings.Join(out, "\n")
 	if removed {
@@ -850,7 +944,7 @@ func loadBalancerBlock(hosts []string, upstreams []Upstream, healthPath string, 
 	b.WriteString(" {\n")
 	b.WriteString(tls.directive())
 	b.WriteString(access.render())
-	b.WriteString(fw.wrapTerminal(fmt.Sprintf("\treverse_proxy %s {\n\t\tlb_policy round_robin\n\t\thealth_uri /up\n\t\thealth_interval 10s\n\t\thealth_timeout 5s\n\t}\n", strings.Join(dials, " "))))
+	b.WriteString(fw.wrapTerminal(fmt.Sprintf("\treverse_proxy %s {\n\t\tlb_policy round_robin\n\t\thealth_uri %s\n\t\thealth_interval 10s\n\t\thealth_timeout 5s\n\t}\n", strings.Join(dials, " "), healthPath)))
 	b.WriteString(renderCacheRules(cache))
 	if extra := strings.TrimSpace(caddyExtra); extra != "" {
 		b.WriteString("\n\t# user-supplied caddy_extra:\n")

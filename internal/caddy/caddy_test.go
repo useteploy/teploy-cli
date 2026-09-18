@@ -20,7 +20,7 @@ func lockCmds(caddyfile string) []ssh.MockCommand {
 		{Match: "mv -f -- ", Output: ""},
 		{Match: reloadCmd, Output: ""},
 		// Post-reload delivery check: container's file matches what we wrote.
-		{Match: "[ \"$(docker exec caddy md5sum", Output: deliveredOK},
+		{Match: "a=$(docker exec caddy md5sum", Output: deliveredOK},
 		{Match: "rmdir " + lockDir, Output: ""},
 	}
 }
@@ -152,7 +152,7 @@ func TestSetRoute_StaleDeliveryFailsLoudly(t *testing.T) {
 		ssh.MockCommand{Match: "cat " + caddyfilePath, Output: "{\n\tadmin 127.0.0.1:2019\n}\n"},
 		ssh.MockCommand{Match: "mv -f -- ", Output: ""},
 		ssh.MockCommand{Match: reloadCmd, Output: ""},
-		ssh.MockCommand{Match: "[ \"$(docker exec caddy md5sum", Output: deliveredStale},
+		ssh.MockCommand{Match: "a=$(docker exec caddy md5sum", Output: deliveredStale},
 		ssh.MockCommand{Match: "rmdir " + lockDir, Output: ""},
 	)
 
@@ -182,7 +182,7 @@ func TestSetLoadBalancer(t *testing.T) {
 		"# TEPLOY BEGIN myapp",
 		"reverse_proxy 10.0.0.1:80 10.0.0.2:80 10.0.0.3:80",
 		"lb_policy round_robin",
-		"health_uri /up",
+		"health_uri /health",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("expected %q in:\n%s", want, got)
@@ -373,7 +373,6 @@ func TestRemoveCaddyfileBlock(t *testing.T) {
 		{"removes single block", "a\n\n# TEPLOY BEGIN x\nbody\n# TEPLOY END x\n\nb\n", "x", "a\n\nb\n"},
 		{"no-op when marker absent", "a\n\nb\n", "x", "a\n\nb\n"},
 		{"only removes matching app, not others", "# TEPLOY BEGIN x\nx\n# TEPLOY END x\n# TEPLOY BEGIN y\ny\n# TEPLOY END y\n", "x", "# TEPLOY BEGIN y\ny\n# TEPLOY END y\n"},
-		{"malformed (missing end marker) truncates at begin", "a\n# TEPLOY BEGIN x\nb\nc\n", "x", "a\n"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -387,6 +386,13 @@ func TestRemoveCaddyfileBlock(t *testing.T) {
 				t.Errorf("removeCaddyfileBlock:\ninput:    %q\nexpected: %q\ngot:      %q", tt.input, tt.expected, got)
 			}
 		})
+	}
+
+	// TCL-22: an unterminated BEGIN marker used to trim through
+	// end-of-file, deleting every unrelated unmanaged route below the
+	// damaged marker. The edit must fail closed and leave the file alone.
+	if got, err := removeCaddyfileBlock("a\n# TEPLOY BEGIN x\nb\nc\n", fmt.Sprintf(markerBeginFmt, "x"), fmt.Sprintf(markerEndFmt, "x")); err == nil {
+		t.Fatalf("unterminated marker accepted (got %q)", got)
 	}
 }
 
@@ -447,7 +453,7 @@ func TestReverseProxyBlockMultiHost(t *testing.T) {
 
 func TestLoadBalancerBlock(t *testing.T) {
 	got := loadBalancerBlock([]string{"example.com"}, []Upstream{{Dial: "a:80"}, {Dial: "b:80"}}, "", TLS{}, "", nil, Firewall{}, Access{})
-	for _, want := range []string{"example.com {", "reverse_proxy a:80 b:80 {", "lb_policy round_robin", "health_uri /up", "health_interval 10s", "health_timeout 5s"} {
+	for _, want := range []string{"example.com {", "reverse_proxy a:80 b:80 {", "lb_policy round_robin", "health_uri /health", "health_interval 10s", "health_timeout 5s"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("loadBalancerBlock missing %q\nfull:\n%s", want, got)
 		}
