@@ -2,6 +2,7 @@ package build
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -291,32 +292,60 @@ func streamImage(ctx context.Context, tag, host, user, keyPath string, stdout io
 	sshArgs = append(sshArgs, sshTarget, "docker", "load")
 
 	// docker save <tag> | ssh <host> docker load
+	//
+	// Both subprocesses and the pipe are owned here (TCL-53): the consumer
+	// starts FIRST and the parent's pipe ends are closed promptly, so an
+	// early-exiting consumer cannot leave the producer blocked on a full
+	// pipe with the parent waiting on the producer (the old StdoutPipe
+	// shape stalled exactly that way until context cancellation). Waits run
+	// concurrently and either side's failure cancels and reaps the other.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	save := exec.CommandContext(ctx, "docker", "save", tag)
 	load := exec.CommandContext(ctx, "ssh", sshArgs...)
 
-	pipe, err := save.StdoutPipe()
+	pipeReader, pipeWriter, err := os.Pipe()
 	if err != nil {
 		return fmt.Errorf("creating pipe: %w", err)
 	}
-	load.Stdin = pipe
+	save.Stdout = pipeWriter
+	save.Stderr = stdout
+	load.Stdin = pipeReader
 	load.Stdout = stdout
 	load.Stderr = stdout
 
-	if err := save.Start(); err != nil {
-		return fmt.Errorf("starting docker save: %w", err)
-	}
 	if err := load.Start(); err != nil {
-		save.Process.Kill()
+		pipeReader.Close()
+		pipeWriter.Close()
 		return fmt.Errorf("starting ssh load: %w", err)
 	}
-
-	saveErr := save.Wait()
-	loadErr := load.Wait()
-	if saveErr != nil {
-		return fmt.Errorf("docker save: %w", saveErr)
+	if err := save.Start(); err != nil {
+		pipeReader.Close()
+		pipeWriter.Close()
+		cancel()
+		_ = load.Wait() // reap the started consumer
+		return fmt.Errorf("starting docker save: %w", err)
 	}
-	if loadErr != nil {
-		return fmt.Errorf("ssh docker load: %w", loadErr)
+	pipeReader.Close()
+	pipeWriter.Close()
+
+	type result struct {
+		role string
+		err  error
+	}
+	done := make(chan result, 2)
+	go func() { done <- result{"docker save", save.Wait()} }()
+	go func() { done <- result{"ssh docker load", load.Wait()} }()
+	var errs []error
+	for i := 0; i < 2; i++ {
+		r := <-done
+		if r.err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", r.role, r.err))
+			cancel() // unblock and reap the peer
+		}
+	}
+	if len(errs) > 0 {
+		return errors.Join(errs...)
 	}
 	return nil
 }
