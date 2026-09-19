@@ -5,11 +5,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/useteploy/teploy/internal/ssh"
 )
@@ -761,5 +763,151 @@ esac
 	}
 	if err, installed := run(t, "no crontab for root"); err != nil || !installed {
 		t.Errorf("canonical no-crontab: abort=%v installed=%v (want clean first install)", err, installed)
+	}
+}
+
+// TestNewBackupID_UniqueWithinSameSecond is the A44 regression: two ids
+// minted in the same second differ, and both parse under ValidateDate.
+func TestNewBackupID_UniqueWithinSameSecond(t *testing.T) {
+	now := time.Date(2026, 9, 19, 1, 2, 3, 0, time.UTC)
+	a, err := newBackupID(now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := newBackupID(now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a == b {
+		t.Fatalf("ids minted in the same second collided: %s", a)
+	}
+	for _, id := range []string{a, b} {
+		if err := ValidateDate(id); err != nil {
+			t.Errorf("ValidateDate(%q): %v", id, err)
+		}
+	}
+	// Legacy ids remain valid (restore/list of old backups).
+	if err := ValidateDate("20260101-000000"); err != nil {
+		t.Errorf("legacy id rejected: %v", err)
+	}
+	for _, bad := range []string{"20261301-000000", "20260101-000000-extra", "20260101-000000-", "20260101-000000-ZZZZZZZZZZZZZZZZ"} {
+		if err := ValidateDate(bad); err == nil {
+			t.Errorf("ValidateDate(%q) accepted", bad)
+		}
+	}
+}
+
+// TestValidateSchedule_RejectsSignedValues is the A46 regression: cron
+// fields are unsigned decimals — "+1" and negative steps are rejected.
+func TestValidateSchedule_RejectsSignedValues(t *testing.T) {
+	for _, s := range []string{"+1 * * * *", "*/+5 * * * *", "-1 * * * *"} {
+		if err := ValidateSchedule(s); err == nil {
+			t.Errorf("ValidateSchedule(%q) accepted a signed value", s)
+		}
+	}
+}
+
+// TestSetSchedule_EnforcesGrammarAtSink is the A46 regression: the sink
+// itself validates the schedule and rejects line breaks in the command or
+// marker — direct callers cannot bypass validation or split one job into
+// several crontab lines.
+func TestSetSchedule_EnforcesGrammarAtSink(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4")
+	client := NewClient(mock, io.Discard)
+	if err := client.SetSchedule(context.Background(), "99 * * * *", "cmd", "tag"); err == nil {
+		t.Error("an out-of-range schedule must be rejected at the sink")
+	}
+	if err := client.SetSchedule(context.Background(), "* * * * *", "echo one\necho two", "tag"); err == nil {
+		t.Error("a multi-line command must be rejected")
+	}
+	if err := client.SetSchedule(context.Background(), "* * * * *", "cmd", "tag\nother"); err == nil {
+		t.Error("a multi-line marker must be rejected")
+	}
+	for _, c := range mock.Calls {
+		if strings.Contains(c, "crontab -") {
+			t.Errorf("a rejected schedule must not touch the crontab: %s", c)
+		}
+	}
+}
+
+// TestRedisRestore_AOFRequiresProvenNo is the A40 regression: an AOF
+// preflight that errors (auth, transport) or replies unexpectedly must
+// refuse BEFORE any stop/copy — "not proven yes" is not "proven no".
+func TestRedisRestore_AOFRequiresProvenNo(t *testing.T) {
+	for _, tc := range []struct {
+		name, aofOut string
+		aofErr       error
+	}{
+		{"auth failure", "", fmt.Errorf("NOAUTH Authentication required")},
+		{"empty reply", "", nil},
+		{"unexpected reply", "WRONGTYPE Operation against a key", nil},
+		{"yes is refused", "appendonly yes", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mock := ssh.NewMockExecutor("1.2.3.4",
+				ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
+				ssh.MockCommand{Match: "aws s3 cp", Output: "ok"},
+				ssh.MockCommand{Match: "mktemp -d", Output: "/tmp/teploy-restore.abc\n"},
+				ssh.MockCommand{Match: "gunzip -c", Output: ""},
+				ssh.MockCommand{Match: "redis-cli --raw config get appendonly", Output: tc.aofOut, Err: tc.aofErr},
+				ssh.MockCommand{Match: "docker stop", Output: ""},
+				ssh.MockCommand{Match: "docker cp", Output: ""},
+			)
+			client := NewClient(mock, io.Discard)
+			err := client.AccessoryRestore(context.Background(), "myapp", "cache", "redis:7", "20260101-000000", nil, S3Config{Bucket: "b", Region: "us-east-1"})
+			if err == nil {
+				t.Fatal("expected the restore to refuse")
+			}
+			for _, c := range mock.Calls {
+				if strings.HasPrefix(c, "docker stop") {
+					t.Errorf("an unproven AOF state must abort before stopping redis: %s", c)
+				}
+			}
+		})
+	}
+}
+
+// TestRedisRestore_SnapshotsAfterStopAndCompensatesStartFailure is the
+// A41 regression: the restore script snapshots the original dump AFTER the
+// stop (so the shutdown save is included) and defines a restore_original
+// compensation invoked from BOTH failure branches — a failed install and a
+// failed final docker start.
+func TestRedisRestore_SnapshotsAfterStopAndCompensatesStartFailure(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
+		ssh.MockCommand{Match: "aws s3 cp", Output: "ok"},
+		ssh.MockCommand{Match: "mktemp -d", Output: "/tmp/teploy-restore.abc\n"},
+		ssh.MockCommand{Match: "docker exec 'myapp-cache' redis-cli --raw config get appendonly", Output: "appendonly no"},
+		ssh.MockCommand{Match: "set -eu", Output: ""},
+	)
+	client := NewClient(mock, io.Discard)
+	if err := client.AccessoryRestore(context.Background(), "myapp", "cache", "redis:7", "20260101-000000", nil, S3Config{Bucket: "b", Region: "us-east-1"}); err != nil {
+		t.Fatalf("AccessoryRestore: %v", err)
+	}
+	var script string
+	for _, c := range mock.Calls {
+		if strings.HasPrefix(c, "set -eu") {
+			script = c
+		}
+	}
+	if script == "" {
+		t.Fatal("the redis restore script never ran")
+	}
+	stopIdx := strings.Index(script, "docker stop 'myapp-cache'")
+	snapIdx := strings.Index(script, "docker cp 'myapp-cache':/data/dump.rdb")
+	if stopIdx < 0 || snapIdx < 0 || snapIdx < stopIdx {
+		t.Errorf("the original dump must be snapshotted AFTER the stop (stop=%d snapshot=%d)", stopIdx, snapIdx)
+	}
+	compIdx := strings.Index(script, "restore_original() {")
+	if compIdx < 0 {
+		t.Fatal("the script must define the restore_original compensation")
+	}
+	// Both failure branches invoke it.
+	branches := strings.Count(script, "\trestore_original") + strings.Count(script, "  restore_original")
+	if branches < 2 {
+		t.Errorf("both the failed-install and failed-start branches must compensate (found %d): %q", branches, script)
+	}
+	if !strings.Contains(script, "if ! docker start 'myapp-cache'; then") {
+		t.Error("a failed final docker start must be a handled branch")
 	}
 }

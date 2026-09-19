@@ -2,6 +2,8 @@ package backup
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -42,10 +44,33 @@ func ValidateRegion(region string) error {
 	return nil
 }
 
-// ValidateDate checks that a date/timestamp string is safe for shell use (e.g. 20060102-150405).
+// backupIDRE matches a backup identity: the historical timestamp form
+// (20060102-150405) or the collision-proof form newBackupID writes
+// (timestamp + 16 hex of randomness, audit A44) — two backups of the same
+// app inside one second used to target the same S3 key, silently
+// replacing each other.
+var backupIDRE = regexp.MustCompile(`^[0-9]{8}-[0-9]{6}(-[0-9a-f]{16})?$`)
+
+// newBackupID mints a backup identity that is timestamp-ordered AND
+// unique within the same second (A44).
+func newBackupID(now time.Time) (string, error) {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", fmt.Errorf("generating backup id: %w", err)
+	}
+	return now.UTC().Format("20060102-150405") + "-" + hex.EncodeToString(b[:]), nil
+}
+
+// ValidateDate checks that a date/timestamp backup identity is exactly the
+// expected grammar (legacy timestamp or newBackupID's collision-proof
+// form) and that its timestamp part parses — anything else is rejected
+// before it reaches a shell or an S3 key.
 func ValidateDate(date string) error {
-	if !safeName.MatchString(date) || len(date) > 30 {
-		return fmt.Errorf("invalid date %q — expected format like 20060102-150405", date)
+	if !backupIDRE.MatchString(date) {
+		return fmt.Errorf("invalid backup id %q — expected format like 20060102-150405[-0123456789abcdef]", date)
+	}
+	if _, err := time.Parse("20060102-150405", date[:15]); err != nil {
+		return fmt.Errorf("invalid backup id %q — timestamp part is not a real date", date)
 	}
 	return nil
 }
@@ -74,6 +99,9 @@ func ValidateSchedule(schedule string) error {
 		for _, part := range strings.Split(field, ",") {
 			bounds, step, hasStep := strings.Cut(part, "/")
 			if hasStep {
+				if !unsignedDecimal(step) {
+					return fmt.Errorf("invalid cron schedule %q — step %q in %s is not a positive number", schedule, step, r.name)
+				}
 				stepN, err := strconv.Atoi(step)
 				if err != nil || stepN < 1 {
 					return fmt.Errorf("invalid cron schedule %q — step %q in %s is not a positive number", schedule, step, r.name)
@@ -105,17 +133,35 @@ func ValidateSchedule(schedule string) error {
 	return nil
 }
 
-// validCronValue accepts "*" or a bare number within range. Empty strings
-// (e.g. from "1,,2") are rejected.
+// validCronValue accepts "*" or a bare UNSIGNED number within range.
+// Empty strings (e.g. from "1,,2") and signed forms like "+1" are
+// rejected — strconv.Atoi accepted the plus sign, which is not the
+// decimal-field grammar cron itself accepts (audit A46).
 func validCronValue(v string, min, max int) bool {
 	if v == "*" {
 		return true
+	}
+	if !unsignedDecimal(v) {
+		return false
 	}
 	n, err := strconv.Atoi(v)
 	if err != nil {
 		return false
 	}
 	return n >= min && n <= max
+}
+
+// unsignedDecimal reports whether s is one or more ASCII digits.
+func unsignedDecimal(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // S3Config holds S3 bucket and credentials info (stored on server).
@@ -176,7 +222,10 @@ func (c *Client) BackupVolumes(ctx context.Context, app string, s3 S3Config) err
 		return err
 	}
 
-	timestamp := time.Now().UTC().Format("20060102-150405")
+	timestamp, err := newBackupID(time.Now())
+	if err != nil {
+		return err
+	}
 	volumesDir := fmt.Sprintf("%s/%s/volumes", deploymentsDir, app)
 	appDir := fmt.Sprintf("%s/%s", deploymentsDir, app)
 
@@ -305,12 +354,29 @@ func (c *Client) RestoreVolumes(ctx context.Context, app, date string, s3 S3Conf
 	// Install the backed-up .env (if the archive carried one — older
 	// backups and volumes-only schedules don't) while keeping the previous
 	// file recoverable.
-	envCmd := fmt.Sprintf(
-		"if [ -f %s ]; then if [ -f %s ]; then cp -p %s %s; fi; mv %s %s && chmod 600 %s && echo 'Restored app .env'; fi",
-		ssh.ShellQuote(stagedEnv),
-		ssh.ShellQuote(envPath), ssh.ShellQuote(envPath), ssh.ShellQuote(envPath+".pre-restore"),
-		ssh.ShellQuote(stagedEnv), ssh.ShellQuote(envPath), ssh.ShellQuote(envPath),
-	)
+	// The env commit runs as a set -eu script (audit A39): the old .env's
+	// recovery copy is MANDATORY when one exists (the old `cp -p` inside an
+	// if-without-chaining was skipped on failure and the destructive mv ran
+	// anyway), and both files are staged as private siblings ON THE
+	// DESTINATION FILESYSTEM (mktemp in the app dir) so publication is an
+	// atomic same-filesystem rename with 0600 applied BEFORE the file is
+	// live — not a cross-filesystem mv from /tmp chmod'd after the fact.
+	envCmd := strings.Join([]string{
+		"set -eu",
+		fmt.Sprintf("if [ -f %s ]; then", ssh.ShellQuote(stagedEnv)),
+		fmt.Sprintf("  if [ -f %s ]; then", ssh.ShellQuote(envPath)),
+		`    old=$(mktemp ` + ssh.ShellQuote(appDir+"/.env-old.XXXXXXXX") + `)`,
+		fmt.Sprintf(`    cat %s > "$old"`, ssh.ShellQuote(envPath)),
+		`    chmod 600 "$old"`,
+		fmt.Sprintf(`    mv -fT -- "$old" %s`, ssh.ShellQuote(envPath+".pre-restore")),
+		"  fi",
+		`  new=$(mktemp ` + ssh.ShellQuote(appDir+"/.env-new.XXXXXXXX") + `)`,
+		fmt.Sprintf(`  cat %s > "$new"`, ssh.ShellQuote(stagedEnv)),
+		`  chmod 600 "$new"`,
+		fmt.Sprintf(`  mv -fT -- "$new" %s`, ssh.ShellQuote(envPath)),
+		"  echo 'Restored app .env'",
+		"fi",
+	}, "\n")
 	if out, err := c.exec.Run(ctx, envCmd); err != nil {
 		// Env commit failed: keep the recovery dir + run dir so the mixed
 		// state is manually recoverable, and say exactly that.
@@ -470,7 +536,10 @@ func (c *Client) AccessoryBackup(ctx context.Context, app, name, image string, e
 		return err
 	}
 
-	timestamp := time.Now().UTC().Format("20060102-150405")
+	timestamp, err := newBackupID(time.Now())
+	if err != nil {
+		return err
+	}
 	containerName := app + "-" + name
 	qContainer := ssh.ShellQuote(containerName)
 
@@ -534,8 +603,14 @@ func (c *Client) AccessoryBackup(ctx context.Context, app, name, image string, e
 			// up only dump.rdb captures a stale or empty dataset. Fail
 			// closed rather than uploading a wrong-point-in-time artifact
 			// (TCL-42).
-			fmt.Sprintf("aof=$(docker exec %s redis-cli config get appendonly | tail -n 1)", qContainer),
-			`case "$aof" in *yes*) echo 'redis appendonly is enabled; teploy backup captures dump.rdb only — disable AOF or use an engine-level backup' >&2; exit 1;; esac`,
+			// AOF gate (A40): the old `config get appendonly | tail -n 1`
+			// pipeline masked a failed docker exec (empty output fell
+			// through as "not yes") and only refused on a substring
+			// match. The reply must be a proven `appendonly no` —
+			// anything else (auth error, empty, unexpected) refuses.
+			fmt.Sprintf("aof=$(docker exec %s redis-cli --raw config get appendonly)", qContainer),
+			`set -- $aof`,
+			`if [ "${1:-}" != appendonly ] || [ "${2:-}" != no ]; then echo 'cannot confirm redis appendonly=no (got: '"$aof"') — teploy backup captures dump.rdb only; refusing' >&2; exit 1; fi`,
 			fmt.Sprintf("ls=$(docker exec %s redis-cli lastsave)", qContainer),
 			fmt.Sprintf("bgs=$(docker exec %s redis-cli bgsave 2>&1) || true", qContainer),
 			`case "$bgs" in *ERR*) case "$bgs" in *"in progress"*) ;; *) printf 'redis BGSAVE failed: %s\n' "$bgs" >&2; exit 1;; esac;; esac`,
@@ -662,29 +737,48 @@ func (c *Client) AccessoryRestore(ctx context.Context, app, name, image, date st
 		restorePath = tmpdir + "/restore.rdb.gz"
 		rdbPath := tmpdir + "/restore.rdb"
 		oldRdb := tmpdir + "/old-dump.rdb"
+		// A40: the AOF gate is a Go-level preflight so a failed or
+		// unexpected reply (auth error, empty output, anything but a
+		// proven `appendonly no`) refuses BEFORE any stop or copy — the
+		// old `config get appendonly | tail -n 1` pipeline masked a failed
+		// docker exec as "not yes" and fell through to the destructive
+		// replacement. ("Not proven yes" is not "proven no".)
+		aofOut, aofErr := c.exec.Run(ctx, fmt.Sprintf("docker exec %s redis-cli --raw config get appendonly", qContainer))
+		if aofErr != nil {
+			return keepTmp(fmt.Errorf("cannot establish the Redis persistence mode for %s: %w", containerName, aofErr))
+		}
+		if aofFields := strings.Fields(aofOut); len(aofFields) != 2 || aofFields[0] != "appendonly" || aofFields[1] != "no" {
+			return keepTmp(fmt.Errorf("cannot confirm appendonly=no for %s (got %q) — an AOF-enabled Redis would load the append-only file on restart and teploy's dump.rdb restore would be a no-op; an explicit restore plan is required", containerName, strings.TrimSpace(aofOut)))
+		}
+		// A41 ordering: the previous dump is snapshotted AFTER the stop —
+		// a graceful redis shutdown writes a final RDB, and the old
+		// copy-before-stop could miss data present at shutdown, making the
+		// "recovery copy" older than the state it claims to recover. The
+		// pre-stop `docker exec test` only records WHETHER a dump exists;
+		// the copy itself runs on the stopped container (docker cp works
+		// stopped) and its failure aborts before anything is modified. A
+		// failed final `docker start` now also puts the original dump back
+		// and retries the start (the old script exited without either).
 		restoreCmd = strings.Join([]string{
 			"set -eu",
 			fmt.Sprintf("gunzip -c %s > %s", ssh.ShellQuote(restorePath), ssh.ShellQuote(rdbPath)),
-			// AOF-enabled Redis loads the append-only file on restart, so
-			// replacing only dump.rdb restores nothing — refuse instead of
-			// reporting success over a stale dataset (TCL-42).
-			fmt.Sprintf("aof=$(docker exec %s redis-cli config get appendonly | tail -n 1)", qContainer),
-			`case "$aof" in *yes*) echo 'redis appendonly is enabled; teploy restore replaces dump.rdb only and Redis would load AOF on restart — an explicit restore plan is required' >&2; exit 1;; esac`,
-			// Save the current dump ONLY when one exists, and make the
-			// copy MANDATORY when it does: `docker cp … || true` masked a
-			// failed recovery copy, leaving no way back after the stop
-			// below (TCL-42).
-			fmt.Sprintf("if docker exec %s test -f /data/dump.rdb; then docker cp %s:/data/dump.rdb %s; fi", qContainer, qContainer, ssh.ShellQuote(oldRdb)),
+			"had=no",
+			fmt.Sprintf("if docker exec %s test -f /data/dump.rdb 2>/dev/null; then had=yes; fi", qContainer),
 			fmt.Sprintf("docker stop %s", qContainer),
+			fmt.Sprintf(`if [ "$had" = yes ]; then docker cp %s:/data/dump.rdb %s; fi`, qContainer, ssh.ShellQuote(oldRdb)),
 			"ok=yes",
 			fmt.Sprintf("docker cp %s %s:/data/dump.rdb || ok=no", ssh.ShellQuote(rdbPath), qContainer),
+			fmt.Sprintf(`restore_original() { if [ "$had" = yes ] && [ -f %s ]; then docker cp %s %s:/data/dump.rdb || true; fi; docker start %s || true; }`, ssh.ShellQuote(oldRdb), ssh.ShellQuote(oldRdb), qContainer, qContainer),
 			`if [ "$ok" != yes ]; then`,
-			fmt.Sprintf("  if [ -f %s ]; then docker cp %s %s:/data/dump.rdb || true; fi", ssh.ShellQuote(oldRdb), ssh.ShellQuote(oldRdb), qContainer),
-			fmt.Sprintf("  docker start %s || true", qContainer),
+			`  restore_original`,
 			"  echo 'redis restore failed after stopping the container; the original dump was restored when available' >&2",
 			"  exit 1",
 			"fi",
-			fmt.Sprintf("docker start %s", qContainer),
+			fmt.Sprintf("if ! docker start %s; then", qContainer),
+			`  restore_original`,
+			"  echo 'redis container failed to start after the restore; the original dump was put back — verify the accessory' >&2",
+			"  exit 1",
+			"fi",
 			fmt.Sprintf("rm -f %s", ssh.ShellQuote(rdbPath)),
 		}, "\n")
 	default:
@@ -735,6 +829,15 @@ func (c *Client) AccessoryRestore(ctx context.Context, app, name, image, date st
 // a stable per-target tag (e.g. "teploy-backup:<app>") appended as a trailing
 // comment so the entry can be found and replaced on reschedule.
 func (c *Client) SetSchedule(ctx context.Context, schedule, command, marker string) error {
+	// The sink enforces the grammar itself (A46): direct callers used to be
+	// able to bypass ValidateSchedule, and a command or marker containing a
+	// line break would silently install multiple unintended crontab lines.
+	if err := ValidateSchedule(schedule); err != nil {
+		return err
+	}
+	if strings.ContainsAny(command+marker, "\r\n\x00") {
+		return fmt.Errorf("cron command and marker must each be a single line")
+	}
 	// Dedup on the marker with grep -vF (fixed string). The previous grep -v
 	// matched the whole COMMAND as a regex — backup commands are full of regex
 	// metacharacters (. * $ ( ) /), so the dedup matched the wrong lines or none
