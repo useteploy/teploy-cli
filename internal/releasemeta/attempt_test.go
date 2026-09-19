@@ -36,19 +36,30 @@ func TestAttemptPaths_AreAttemptScoped(t *testing.T) {
 	if !strings.HasPrefix(a.EnvFile(), "/deployments/myapp/meta/att/abc123.") {
 		t.Errorf("EnvFile not in the attempt namespace: %s", a.EnvFile())
 	}
-	if !strings.HasPrefix(a.TLSDir(), "/deployments/caddy/tls/att/abc123.") {
-		t.Errorf("TLSDir not under the caddy tls att namespace: %s", a.TLSDir())
-	}
-	if want := "/etc/caddy/tls/att/" + a.Name() + "/myapp.crt"; a.TLSCertPath() != want {
-		t.Errorf("TLSCertPath: got %s want %s", a.TLSCertPath(), want)
-	}
-	if want := "/etc/caddy/tls/att/" + a.Name() + "/myapp.key"; a.TLSKeyPath() != want {
-		t.Errorf("TLSKeyPath: got %s want %s", a.TLSKeyPath(), want)
-	}
 	// A second attempt of the same release shares NO path with the first.
 	b := MustAttempt("myapp", "abc123")
 	if a.BuildDir() == b.BuildDir() || a.EnvFile() == b.EnvFile() || a.TLSDir() == b.TLSDir() {
 		t.Error("attempts of the same release must not share artifact paths")
+	}
+	// The TLS namespace is app-scoped (A01): the host dir sits under the
+	// app's own root beneath the caddy mount.
+	if !strings.HasPrefix(a.TLSDir(), "/deployments/caddy/tls/att/myapp/abc123.") {
+		t.Errorf("TLSDir not in the app-scoped caddy tls att namespace: %s", a.TLSDir())
+	}
+	if want := "/etc/caddy/tls/att/myapp/" + a.Name() + "/myapp.crt"; a.TLSCertPath() != want {
+		t.Errorf("TLSCertPath: got %s want %s", a.TLSCertPath(), want)
+	}
+	if want := "/etc/caddy/tls/att/myapp/" + a.Name() + "/myapp.key"; a.TLSKeyPath() != want {
+		t.Errorf("TLSKeyPath: got %s want %s", a.TLSKeyPath(), want)
+	}
+}
+
+func TestNewAttempt_RejectsInvalidAppName(t *testing.T) {
+	if _, err := NewAttempt("../escape", "abc123"); err == nil {
+		t.Error("an app name with path metacharacters must be rejected")
+	}
+	if _, err := NewAttempt("", "abc123"); err == nil {
+		t.Error("an empty app name must be rejected")
 	}
 }
 
@@ -63,7 +74,8 @@ func TestPruneAttempts_ProtectsKeepSetAndUnparsable(t *testing.T) {
 			"ancient.0000000000000003",
 			"stray-directory",
 		}, "\n")},
-		ssh.MockCommand{Match: "ls -1 /deployments/caddy/tls/att", Output: strings.Join([]string{
+		// The app's OWN TLS root (A01: /deployments/caddy/tls/att/<app>).
+		ssh.MockCommand{Match: "ls -1 /deployments/caddy/tls/att/myapp", Output: strings.Join([]string{
 			"ancient.0000000000000003",
 		}, "\n")},
 		ssh.MockCommand{Match: "rm -rf", Output: ""},
@@ -83,6 +95,47 @@ func TestPruneAttempts_ProtectsKeepSetAndUnparsable(t *testing.T) {
 	for _, r := range removed {
 		if !strings.Contains(r, "ancient.") {
 			t.Errorf("removed a protected or unparsable entry: %s", r)
+		}
+	}
+}
+
+// TestPruneAttempts_NeverTouchesOtherAppsOrLegacyFlatRoot is the A01
+// regression: pruning app A must not remove app B's TLS attempts (even when
+// B's release hash collides with an unprotected hash of A's) and must never
+// sweep the legacy flat /deployments/caddy/tls/att root, whose entries
+// cannot be attributed to an owning app.
+func TestPruneAttempts_NeverTouchesOtherAppsOrLegacyFlatRoot(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "ls -1 /deployments/app-a/meta/att", Output: strings.Join([]string{
+			"shared-name.0000000000000001", // A's prunable attempt...
+		}, "\n")},
+		ssh.MockCommand{Match: "ls -1 /deployments/caddy/tls/att/app-a", Output: strings.Join([]string{
+			"shared-name.0000000000000001", // ...in both of A's roots
+		}, "\n")},
+		ssh.MockCommand{Match: "rm -rf", Output: ""},
+	)
+	if err := PruneAttempts(context.Background(), mock, "app-a", "currenthash"); err != nil {
+		t.Fatalf("PruneAttempts: %v", err)
+	}
+	for _, c := range mock.Calls {
+		if !strings.HasPrefix(c, "rm -rf ") {
+			continue
+		}
+		if strings.Contains(c, "/deployments/caddy/tls/att/app-b") {
+			t.Errorf("pruned another app's TLS material: %s", c)
+		}
+		if !strings.Contains(c, "app-a") {
+			t.Errorf("pruned outside the pruning app's namespaces: %s", c)
+		}
+	}
+	// The sweep must be scoped to app-a's TLS root — a listing of the flat
+	// root or app-b's root proves the sweep reached beyond A's namespace.
+	for _, c := range mock.Calls {
+		if strings.HasPrefix(c, "ls -1 ") {
+			if c != "ls -1 /deployments/app-a/meta/att 2>/dev/null || true" &&
+				c != "ls -1 /deployments/caddy/tls/att/app-a 2>/dev/null || true" {
+				t.Errorf("attempt sweep listed a namespace it must not touch: %s", c)
+			}
 		}
 	}
 }

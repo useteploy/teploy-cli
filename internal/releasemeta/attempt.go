@@ -13,7 +13,7 @@
 //
 //   - build context: /deployments/<app>/meta/att/<hash>.<id>/build
 //   - env file:      /deployments/<app>/meta/att/<hash>.<id>/env
-//   - TLS cert/key:  /deployments/caddy/tls/att/<hash>.<id>/<app>.{crt,key}
+//   - TLS cert/key:  /deployments/caddy/tls/att/<app>/<hash>.<id>/<app>.{crt,key}
 //
 // Each attempt gets a fresh random id, so its paths are written exactly once
 // and never rewritten by anyone — concurrent attempts cannot interleave
@@ -24,19 +24,28 @@
 // TLS deliberately stays under /deployments/caddy/tls rather than moving
 // into meta/: the caddy container mounts that directory at /etc/caddy (the
 // only mount a server that can do custom TLS provably has), so attempt
-// scoping there changes no mount topology. Container-side path:
-// /etc/caddy/tls/att/<hash>.<id>/<app>.crt.
+// scoping there changes no mount topology. The TLS namespace is scoped BY
+// APP beneath that mount (audit A01): the first cut swept the flat
+// /deployments/caddy/tls/att root with one app's keep set, so deploying app
+// A deleted app B's live cert/key whenever B's release hash was not in A's
+// protected set — two apps can even share a hash string ("release-1").
+// Container-side path: /etc/caddy/tls/att/<app>/<hash>.<id>/<app>.crt.
+// Legacy flat attempt dirs (written between F08 and A01) are never swept by
+// anyone — a flat entry's owning app cannot be proven, so pruning it from
+// any single app's keep set is exactly the cross-app deletion A01 fixed.
 //
 // Retention: attempt dirs are dead weight once their release is outside the
 // rollback window (env is baked into the container at create; recreate uses
 // the inspect-derived resolved env, never the file). PruneAttempts removes
 // attempt dirs whose release hash is not protected — the same window
-// keep_versions pruning honors — and fails closed on entries it cannot
-// parse, like pin pruning (F78).
+// keep_versions pruning honors, which the caller must compute from every
+// still-retained release, not just current+previous (audit A02) — and fails
+// closed on entries it cannot parse, like pin pruning (F78).
 
 package releasemeta
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
@@ -44,8 +53,7 @@ import (
 	"sort"
 	"strings"
 
-	"context"
-
+	"github.com/useteploy/teploy/internal/config"
 	"github.com/useteploy/teploy/internal/ssh"
 )
 
@@ -65,10 +73,14 @@ type Attempt struct {
 	ID   string
 }
 
-// NewAttempt mints an attempt for (app, hash).
+// NewAttempt mints an attempt for (app, hash). The app name is validated
+// against the config grammar (audit A17): attempt paths interpolate the app
+// into host and container-side directories, so an app with path
+// metacharacters must be rejected at construction, not discovered when a
+// remote shell misparses it.
 func NewAttempt(app, hash string) (Attempt, error) {
-	if app == "" {
-		return Attempt{}, fmt.Errorf("attempt requires an app")
+	if err := config.ValidateName(app); err != nil {
+		return Attempt{}, fmt.Errorf("attempt requires a valid app: %w", err)
 	}
 	if !validHash.MatchString(hash) {
 		return Attempt{}, fmt.Errorf("invalid release id %q for app %q", hash, app)
@@ -106,19 +118,25 @@ func (a Attempt) EnvFile() string { return a.Dir() + "/env" }
 
 // TLSDir is the attempt's TLS directory on the HOST. It sits under
 // /deployments/caddy/tls (mounted at /etc/caddy in the caddy container) —
-// see the package doc for why not under meta/.
+// see the package doc for why not under meta/ — and is scoped BY APP so one
+// app's pruning can never sweep another app's certificates (audit A01).
 func (a Attempt) TLSDir() string {
-	return fmt.Sprintf("/deployments/caddy/tls/att/%s", a.Name())
+	return tlsAttemptRootFor(a.App) + "/" + a.Name()
 }
 
 // TLSCertPath / TLSKeyPath are the attempt's cert/key as seen INSIDE the
 // caddy container (what the Caddyfile site block references): the host's
 // /deployments/caddy/tls/att/... is mounted at /etc/caddy.
-func (a Attempt) TLSCertPath() string { return "/etc/caddy/tls/att/" + a.Name() + "/" + a.App + ".crt" }
-func (a Attempt) TLSKeyPath() string  { return "/etc/caddy/tls/att/" + a.Name() + "/" + a.App + ".key" }
+func (a Attempt) TLSCertPath() string { return "/etc/caddy/tls/att/" + a.App + "/" + a.Name() + "/" + a.App + ".crt" }
+func (a Attempt) TLSKeyPath() string  { return "/etc/caddy/tls/att/" + a.App + "/" + a.Name() + "/" + a.App + ".key" }
 
-// tlsAttemptRoot is the host root holding per-attempt TLS directories.
-const tlsAttemptRoot = "/deployments/caddy/tls/att"
+// tlsAttemptRootFor is the host root holding ONE app's per-attempt TLS
+// directories (audit A01). The legacy flat root
+// /deployments/caddy/tls/att (written before A01) is deliberately NOT this
+// and is never swept — see the package doc.
+func tlsAttemptRootFor(app string) string {
+	return "/deployments/caddy/tls/att/" + app
+}
 
 // attemptRoot is the host root holding per-attempt artifact directories.
 func attemptRoot(app string) string {
@@ -141,11 +159,12 @@ func listAttempts(ctx context.Context, exec ssh.Executor, root string) ([]string
 	return names, nil
 }
 
-// PruneAttempts removes the attempt directories (artifact root and TLS
-// root) of every release hash NOT in keepHashes. Entries whose names do not
-// parse as <hash>.<id> are kept — an unparsable name is not proof the
-// attempt is prunable (F78's rule). Removal failures are returned; callers
-// treat pruning as best-effort.
+// PruneAttempts removes the attempt directories (artifact root and the
+// app's TLS root) of every release hash NOT in keepHashes. Entries whose
+// names do not parse as <hash>.<id> are kept — an unparsable name is not
+// proof the attempt is prunable (F78's rule). Only THIS app's roots are
+// swept; the legacy flat TLS root is never touched (A01). Removal failures
+// are returned; callers treat pruning as best-effort.
 func PruneAttempts(ctx context.Context, exec ssh.Executor, app string, keepHashes ...string) error {
 	keep := make(map[string]bool, len(keepHashes))
 	for _, h := range keepHashes {
@@ -154,7 +173,7 @@ func PruneAttempts(ctx context.Context, exec ssh.Executor, app string, keepHashe
 		}
 	}
 	var failures []string
-	for _, root := range []string{attemptRoot(app), tlsAttemptRoot} {
+	for _, root := range []string{attemptRoot(app), tlsAttemptRootFor(app)} {
 		names, err := listAttempts(ctx, exec, root)
 		if err != nil {
 			return err

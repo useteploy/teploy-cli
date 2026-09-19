@@ -1169,8 +1169,9 @@ func appTLSContainerPaths(app string) (cert, key string) {
 
 // uploadAppTLS reads the local cert + key referenced by the app's tls config
 // and uploads them to the server's attempt-scoped TLS directory (F08:
-// /deployments/caddy/tls/att/<hash>.<id>/, key mode 0600), where the
-// directory-mounted Caddy container reads them at /etc/caddy/tls/att/….
+// /deployments/caddy/tls/att/<app>/<hash>.<id>/, key mode 0600), where the
+// directory-mounted Caddy container reads them at
+// /etc/caddy/tls/att/<app>/….
 // Attempt-scoping keeps the cert/key immutable for the release that
 // references it: the F14 record names these exact bytes, and a concurrent
 // or later attempt cannot overwrite them. It returns the container-side

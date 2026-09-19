@@ -642,24 +642,41 @@ func (d *Deployer) DeployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 	// contexts, env files, TLS certs) are dead weight once their release
 	// is outside the rollback window — env is baked into containers at
 	// create and recreate uses the inspect-derived resolved env, never
-	// the file. Same protection window as version pruning: current,
-	// previous, and pinned releases keep their artifacts.
+	// the file. The protection window is every release that still has
+	// CONTAINERS on this server, plus current, previous, and pinned
+	// (audit A02): keep_versions retention can hold releases far beyond
+	// current+previous, and their records and Caddy routes reference
+	// attempt-scoped TLS and env files — pruning those while the release
+	// is retained silently invalidates its rollback target. A version
+	// that falls out of the keep window loses its containers at step 15b
+	// of THIS deploy, so its attempt dirs are first prunable on the next.
 	{
 		var prevHash string
 		if current != nil {
 			prevHash = current.CurrentHash
 		}
-		protected := []string{cfg.Version, prevHash}
-		// Pins protect their release's artifacts like versions (F78
-		// parity): an unreadable pin file skips the extra protection, and
-		// that is reported, never silent.
-		if pins, pinsErr := state.ReadPins(ctx, d.exec, cfg.App); pinsErr == nil {
-			protected = append(protected, pins...)
+		pins, pinsErr := state.ReadPins(ctx, d.exec, cfg.App)
+		if pinsErr != nil {
+			// Fail closed exactly like version pruning (15b): an
+			// unreadable pin file means retention obligations cannot be
+			// established, and pruning anyway can delete a pinned
+			// release's artifacts precisely when the operator cannot see
+			// the pin (audit A03).
+			fmt.Fprintf(d.out, "Warning: attempt-artifact prune skipped — pin state could not be read: %v\n", pinsErr)
 		} else {
-			fmt.Fprintf(d.out, "Warning: attempt artifacts protected only as current+previous — pin state could not be read: %v\n", pinsErr)
-		}
-		if err := releasemeta.PruneAttempts(ctx, d.exec, cfg.App, protected...); err != nil {
-			fmt.Fprintf(d.out, "Warning: could not prune superseded attempt artifacts: %v\n", err)
+			protected := append([]string{cfg.Version, prevHash}, pins...)
+			if inv, invErr := d.docker.ListContainers(ctx, cfg.App); invErr != nil {
+				fmt.Fprintf(d.out, "Warning: attempt-artifact prune skipped — cannot inventory retained versions: %v\n", invErr)
+			} else {
+				for _, ct := range inv {
+					if v := ct.Labels["teploy.version"]; v != "" {
+						protected = append(protected, v)
+					}
+				}
+				if err := releasemeta.PruneAttempts(ctx, d.exec, cfg.App, protected...); err != nil {
+					fmt.Fprintf(d.out, "Warning: could not prune superseded attempt artifacts: %v\n", err)
+				}
+			}
 		}
 	}
 
