@@ -142,8 +142,8 @@ func (c Config) validate() error {
 // Deploy performs a zero-downtime deploy, acquiring the app lock for the
 // duration. Callers that already hold the app lock (the autodeploy path,
 // which locks before fetching so the checkout can't race a concurrent
-// trigger) must call DeployLocked instead — the mkdir lock is not
-// reentrant, so acquiring it twice fails (audit TCL-01).
+// trigger) must call DeployFenced with their lock handle instead — the mkdir
+// lock is not reentrant, so acquiring it twice fails (audit TCL-01).
 //
 // Flow: lock → start web → health check → start workers → route traffic →
 // write state → stop old containers → log → unlock.
@@ -157,17 +157,34 @@ func (d *Deployer) Deploy(ctx context.Context, cfg Config) error {
 	if err := state.EnsureAppDir(ctx, d.exec, cfg.App); err != nil {
 		return fmt.Errorf("creating app directory: %w", err)
 	}
-	if err := state.AcquireLock(ctx, d.exec, cfg.App); err != nil {
+	lk, err := state.AcquireLockFenced(ctx, d.exec, cfg.App)
+	if err != nil {
 		return err
 	}
-	defer state.ReleaseLockDetached(d.exec, cfg.App)
-	return d.DeployLocked(ctx, cfg)
+	defer state.ReleaseLockFenced(d.exec, lk, cfg.App)
+	// Renewal is what makes the lock's TTL safe for a slow-but-live deploy
+	// (F16): the heartbeat keeps the lock fresh, so only a dead holder's
+	// lock is ever broken as stale.
+	lk.StartRenewal(d.exec)
+	return d.DeployFenced(ctx, cfg, lk)
 }
 
 // DeployLocked performs a zero-downtime deploy WITHOUT acquiring the app
-// lock. The caller must already hold it (see Deploy); this function does not
-// reacquire or release it.
+// lock and WITHOUT fence checks — the pre-F16 shape, kept for callers and
+// tests that hold no lock handle. Production callers that already own the
+// lock pass the handle to DeployFenced instead, so their effects stay
+// fenced.
 func (d *Deployer) DeployLocked(ctx context.Context, cfg Config) error {
+	return d.DeployFenced(ctx, cfg, nil)
+}
+
+// DeployFenced is the deploy body under an explicitly-held lock handle
+// (audit F16). lk may be nil (no fencing — see DeployLocked). Fence checks
+// precede every effectful phase; recovery paths (restoreDisplacedAndStarted,
+// abortStateCommit) are deliberately NOT fenced — refusing to clean up this
+// operation's own partial effects is how a fencing design strands an app
+// mid-incident.
+func (d *Deployer) DeployFenced(ctx context.Context, cfg Config, lk *state.Lock) error {
 	if err := cfg.validate(); err != nil {
 		return err
 	}
@@ -303,6 +320,11 @@ func (d *Deployer) DeployLocked(ctx context.Context, cfg Config) error {
 	// F03).
 	sameVersion := current != nil && current.CurrentHash == cfg.Version
 	if sameVersion {
+		// Fence (F16): the renames below mutate the live workload — a
+		// holder whose lock was broken must not touch it.
+		if err := lk.Check(ctx, d.exec); err != nil {
+			return err
+		}
 		seen := map[string]bool{}
 		for _, process := range sortedProcessNames(processes) {
 			for ri := 1; ri <= replicas; ri++ {
@@ -355,6 +377,12 @@ func (d *Deployer) DeployLocked(ctx context.Context, cfg Config) error {
 	// configuration and fixed port.
 	var displacedHostWeb []string
 	if recreateWeb {
+		// Fence (F16): stopping the fixed-port workload is the deploy's
+		// first destructive effect; nothing of ours needs restoring yet,
+		// so a lost fence is a plain abort.
+		if err := lk.Check(ctx, d.exec); err != nil {
+			return err
+		}
 		names, _ := d.exec.Run(ctx, fmt.Sprintf(
 			"docker ps --filter label=teploy.app=%s --filter label=teploy.process=web --format '{{.Names}}'", cfg.App))
 		for _, name := range strings.Fields(names) {
@@ -413,6 +441,12 @@ func (d *Deployer) DeployLocked(ctx context.Context, cfg Config) error {
 	}
 
 	// 6. Start web container(s).
+	// Fence (F16): container creation is an effect. A lost fence here must
+	// still restore whatever this deploy displaced (recovery is never
+	// fenced — see DeployFenced's doc).
+	if err := lk.Check(ctx, d.exec); err != nil {
+		return restoreDisplacedAndStarted(err)
+	}
 	for i := 0; i < replicas; i++ {
 		name := docker.ReplicaContainerName(cfg.App, "web", cfg.Version, i+1, replicas)
 		webContainerNames[i] = name
@@ -494,6 +528,9 @@ func (d *Deployer) DeployLocked(ctx context.Context, cfg Config) error {
 	}
 
 	// 10. Start non-web process containers (workers, etc. — no replicas, one each).
+	if err := lk.Check(ctx, d.exec); err != nil {
+		return fail(err)
+	}
 	for _, process := range sortedProcessNames(processes) {
 		if process == "web" {
 			continue
@@ -529,6 +566,12 @@ func (d *Deployer) DeployLocked(ctx context.Context, cfg Config) error {
 	// teploy docker network, so Teploy has nothing to do here.
 	if cfg.usesCaddy() {
 		fmt.Fprintln(d.out, "Updating routes...")
+		// Fence (F16): the route switch commits traffic to this deploy's
+		// containers; a late write here would hijack a newer operation's
+		// route.
+		if err := lk.Check(ctx, d.exec); err != nil {
+			return fail(err)
+		}
 		tls := caddy.TLS{Cert: cfg.TLSCert, Key: cfg.TLSKey, Internal: cfg.TLSInternal}
 		if replicas > 1 {
 			upstreams := make([]caddy.Upstream, replicas)
@@ -582,7 +625,10 @@ func (d *Deployer) DeployLocked(ctx context.Context, cfg Config) error {
 		newState.PreviousPorts = current.CurrentPorts
 		newState.PreviousHash = current.CurrentHash
 	}
-	if err := state.Write(ctx, d.exec, cfg.App, newState); err != nil {
+	// The commit runs under the fence (F16): the atomic rename that makes
+	// this deploy authoritative is a guarded effect, so a broken holder
+	// commits nothing.
+	if err := state.WriteFenced(ctx, d.exec, cfg.App, newState, lk); err != nil {
 		return d.abortStateCommit(ctx, cfg, current, started, displacedHostWeb, start, err)
 	}
 
@@ -605,6 +651,16 @@ func (d *Deployer) DeployLocked(ctx context.Context, cfg Config) error {
 	// listed at snapshot time.
 	if predecessorsListed {
 		for _, ct := range predecessors {
+			// Fence (F16): the deploy is already committed; a fence loss
+			// mid-cleanup means another operation owns the app now. Refuse
+			// further stops (loudly) rather than interleaving with it —
+			// leaving an old worker running is degraded but visible.
+			if lk != nil {
+				if err := lk.Check(ctx, d.exec); err != nil {
+					fmt.Fprintf(d.out, "Warning: predecessor cleanup stopped — %v\n", err)
+					break
+				}
+			}
 			fmt.Fprintf(d.out, "Stopping old container %s...\n", ct.Name)
 			if err := d.docker.Stop(ctx, ct.Name, stopTimeout); err != nil {
 				// Traffic is already committed to the new generation; a
@@ -621,7 +677,17 @@ func (d *Deployer) DeployLocked(ctx context.Context, cfg Config) error {
 			}
 		}
 	} else if current != nil && current.CurrentHash != "" {
-		stopOldWorkloadsByName(ctx, d.docker, d.out, cfg, current, processes, stopTimeout)
+		// Fence (F16): same refusal as the snapshot-driven cleanup above —
+		// post-commit cleanup never interleaves with a new holder.
+		if lk != nil {
+			if err := lk.Check(ctx, d.exec); err != nil {
+				fmt.Fprintf(d.out, "Warning: predecessor cleanup skipped — %v\n", err)
+			} else {
+				stopOldWorkloadsByName(ctx, d.docker, d.out, cfg, current, processes, stopTimeout)
+			}
+		} else {
+			stopOldWorkloadsByName(ctx, d.docker, d.out, cfg, current, processes, stopTimeout)
+		}
 	}
 
 	// 15. Clean up old bridged assets.
@@ -642,26 +708,37 @@ func (d *Deployer) DeployLocked(ctx context.Context, cfg Config) error {
 	// version and the immediately-previous version so a rollback target
 	// is preserved regardless of timestamp ordering.
 	if cfg.KeepVersions > 0 {
-		var prevHash string
-		if current != nil {
-			prevHash = current.CurrentHash
+		// Fence (F16): pruning removes other versions' containers; a
+		// stale holder must not delete under a new owner's feet.
+		fenceOK := true
+		if lk != nil {
+			if err := lk.Check(ctx, d.exec); err != nil {
+				fmt.Fprintf(d.out, "Warning: version prune skipped — %v\n", err)
+				fenceOK = false
+			}
 		}
-		// Pinned versions are protected from pruning regardless of the keep
-		// window (teploy pin). Read them off the server so terminal, dash,
-		// and autodeploy all honor the same set. A read failure SKIPS
-		// pruning entirely — treating an unreadable pin file as "no pins"
-		// could delete versions the operator deliberately retained (F78).
-		protected := []string{cfg.Version, prevHash}
-		pins, pinsErr := state.ReadPins(ctx, d.exec, cfg.App)
-		if pinsErr != nil {
-			fmt.Fprintf(d.out, "Warning: version prune skipped — pin state could not be read: %v\n", pinsErr)
-		} else {
-			protected = append(protected, pins...)
-			pruned, err := d.docker.PruneVersions(ctx, cfg.App, cfg.KeepVersions, protected...)
-			if err != nil {
-				fmt.Fprintf(d.out, "Warning: version prune failed: %v\n", err)
-			} else if len(pruned) > 0 {
-				fmt.Fprintf(d.out, "Pruned %d superseded version(s): %s\n", len(pruned), strings.Join(pruned, ", "))
+		if fenceOK {
+			var prevHash string
+			if current != nil {
+				prevHash = current.CurrentHash
+			}
+			// Pinned versions are protected from pruning regardless of the keep
+			// window (teploy pin). Read them off the server so terminal, dash,
+			// and autodeploy all honor the same set. A read failure SKIPS
+			// pruning entirely — treating an unreadable pin file as "no pins"
+			// could delete versions the operator deliberately retained (F78).
+			protected := []string{cfg.Version, prevHash}
+			pins, pinsErr := state.ReadPins(ctx, d.exec, cfg.App)
+			if pinsErr != nil {
+				fmt.Fprintf(d.out, "Warning: version prune skipped — pin state could not be read: %v\n", pinsErr)
+			} else {
+				protected = append(protected, pins...)
+				pruned, err := d.docker.PruneVersions(ctx, cfg.App, cfg.KeepVersions, protected...)
+				if err != nil {
+					fmt.Fprintf(d.out, "Warning: version prune failed: %v\n", err)
+				} else if len(pruned) > 0 {
+					fmt.Fprintf(d.out, "Pruned %d superseded version(s): %s\n", len(pruned), strings.Join(pruned, ", "))
+				}
 			}
 		}
 	}

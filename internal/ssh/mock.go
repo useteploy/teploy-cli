@@ -1,6 +1,7 @@
 package ssh
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -43,6 +44,26 @@ func (m *MockExecutor) Run(ctx context.Context, cmd string) (string, error) {
 	m.mu.Lock()
 	m.Calls = append(m.Calls, cmd)
 
+	// Fenced-lock guards (internal/state, audit F16) arrive either alone
+	// (`grep -q '<owner>' '<info>'`) or composed with the effect they gate
+	// (`grep ... || { printf 'TEPLOY_FENCE_LOST\n' >&2; exit 75; }; <effect>`).
+	// Evaluating them against the recorded file state models the server:
+	// the guard passes while the uploaded lock info still names the owner
+	// and refuses once it does not, which is what the fence tests need to
+	// prove a refused effect never executes.
+	if rest, held, ok := evalFenceGuard(m.Files, cmd); ok {
+		if !held {
+			m.mu.Unlock()
+			return "", fmt.Errorf("exit status 75: TEPLOY_FENCE_LOST")
+		}
+		if rest == "" {
+			m.mu.Unlock()
+			return "", nil
+		}
+		cmd = rest
+		m.Calls = append(m.Calls, cmd)
+	}
+
 	for i, c := range m.commands {
 		if mockCommandMatches(cmd, c.Match) {
 			if c.Once {
@@ -62,6 +83,44 @@ func (m *MockExecutor) Run(ctx context.Context, cmd string) (string, error) {
 	}
 	m.mu.Unlock()
 	return "", fmt.Errorf("mock: unexpected command: %s", cmd)
+}
+
+// evalFenceGuard recognizes the guard fragment produced by state.Lock. It
+// returns the remaining effect command ("" for a bare guard), whether the
+// guard holds against the recorded files, and whether cmd was a guard at
+// all. Must be called with m.mu held.
+func evalFenceGuard(files map[string][]byte, cmd string) (rest string, held, ok bool) {
+	const guardSep = " || { printf 'TEPLOY_FENCE_LOST\\n' >&2; exit 75; }; "
+	if !strings.HasPrefix(cmd, "grep -q ") {
+		return "", false, false
+	}
+	guard, effect := cmd, ""
+	if i := strings.Index(cmd, guardSep); i >= 0 {
+		guard, effect = cmd[:i], cmd[i+len(guardSep):]
+	}
+	owner, path, parsed := parseFenceGuard(guard)
+	if !parsed {
+		return "", false, false
+	}
+	data, present := files[path]
+	held = present && bytes.Contains(data, []byte(owner))
+	return effect, held, true
+}
+
+// parseFenceGuard splits `grep -q '<owner>' '<path>'` into its two
+// single-quoted arguments.
+func parseFenceGuard(guard string) (owner, path string, ok bool) {
+	s := strings.TrimPrefix(guard, "grep -q ")
+	parts := strings.Split(s, " ")
+	if len(parts) != 2 {
+		return "", "", false
+	}
+	for _, p := range parts {
+		if len(p) < 2 || p[0] != '\'' || p[len(p)-1] != '\'' {
+			return "", "", false
+		}
+	}
+	return parts[0][1 : len(parts[0])-1], parts[1][1 : len(parts[1])-1], true
 }
 
 func mockCommandMatches(cmd, match string) bool {

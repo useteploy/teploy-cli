@@ -162,14 +162,17 @@ func (d *StaticDeployer) Deploy(ctx context.Context, cfg StaticConfig) error {
 	shortHash := hash[:12]
 	fmt.Fprintf(d.out, "  release %s\n", shortHash)
 
-	// 4. Lock the app to avoid concurrent deploys racing on the symlink swap.
+	// 4. Lock the app to avoid concurrent deploys racing on the symlink swap
+	// (F16: fenced, so a broken holder's late writes are refused).
 	if err := state.EnsureAppDir(ctx, d.exec, cfg.App); err != nil {
 		return fmt.Errorf("ensure app dir: %w", err)
 	}
-	if err := state.AcquireLock(ctx, d.exec, cfg.App); err != nil {
+	lk, err := state.AcquireLockFenced(ctx, d.exec, cfg.App)
+	if err != nil {
 		return fmt.Errorf("acquire lock: %w", err)
 	}
-	defer state.ReleaseLockDetached(d.exec, cfg.App)
+	defer state.ReleaseLockFenced(d.exec, lk, cfg.App)
+	lk.StartRenewal(d.exec)
 
 	// 5. Read prior state for rollback bookkeeping. A read failure aborts —
 	// treating unreadable state as "no state" would drop the rollback
@@ -189,6 +192,12 @@ func (d *StaticDeployer) Deploy(ctx context.Context, cfg StaticConfig) error {
 
 	if _, err := d.exec.Run(ctx, "mkdir -p "+releasesDir); err != nil {
 		return fmt.Errorf("mkdir releases: %w", err)
+	}
+
+	// Fence (F16): the upload and everything after it are effects of this
+	// attempt; check before the first one (nothing has been mutated yet).
+	if err := lk.Check(ctx, d.exec); err != nil {
+		return err
 	}
 
 	exists, _ := d.exec.Run(ctx, fmt.Sprintf("test -d %s && echo yes || true", finalRelease))
@@ -212,13 +221,24 @@ func (d *StaticDeployer) Deploy(ctx context.Context, cfg StaticConfig) error {
 	// 7. Atomically flip the `current` symlink. ln -sfn is NOT atomic
 	//    (it unlinks the old link before creating the new one, so a reader
 	//    in the gap sees ENOENT); swapCurrentLink creates a sibling link
-	//    and renames it over `current` in one step (audit F53).
+	//    and renames it over `current` in one step (audit F53). Fence-
+	//    checked (F16): the swap is the release-cutover effect.
+	if err := lk.Check(ctx, d.exec); err != nil {
+		return err
+	}
 	if err := d.swapCurrentLink(ctx, cfg.App, cfg.StateDir, shortHash); err != nil {
 		return fmt.Errorf("symlink swap: %w", err)
 	}
 
 	// 8. Upsert Caddyfile block. The container-side root is the mount path,
-	//    not the host path — Caddy reads through the bind mount.
+	// not the host path — Caddy reads through the bind mount. Fence-checked
+	// (F16): the route switch commits traffic to the new release.
+	if err := lk.Check(ctx, d.exec); err != nil {
+		if restoreErr := d.restoreStaticLink(ctx, cfg.App, cfg.StateDir, prior); restoreErr != nil {
+			return fmt.Errorf("fence check: %w; restoring the prior static release failed: %v", err, restoreErr)
+		}
+		return fmt.Errorf("fence check: %w; the prior static release was restored", err)
+	}
 	if err := d.caddy.SetStaticRoute(ctx, cfg.App, cfg.Domain, caddy.StaticBlockOpts{
 		Root:        fmt.Sprintf("%s/%s/current", cfg.MountBase, cfg.App),
 		SPA:         cfg.SPA,
@@ -246,7 +266,9 @@ func (d *StaticDeployer) Deploy(ctx context.Context, cfg StaticConfig) error {
 	if prior != nil && prior.CurrentHash == shortHash {
 		newState.PreviousRelease = prior.PreviousRelease
 	}
-	if err := state.Write(ctx, d.exec, cfg.App, newState); err != nil {
+	// The commit runs under the fence (F16): the rename that makes the new
+	// release authoritative is a guarded effect.
+	if err := state.WriteFenced(ctx, d.exec, cfg.App, newState, lk); err != nil {
 		return d.abortStaticStateCommit(ctx, cfg.App, cfg.StateDir, currentLink, prior, err)
 	}
 
@@ -610,10 +632,12 @@ func (d *StaticDeployer) Rollback(ctx context.Context, cfg StaticRollbackConfig)
 		cfg.StateDir = DefaultStateDir
 	}
 
-	if err := state.AcquireLock(ctx, d.exec, cfg.App); err != nil {
+	lk, err := state.AcquireLockFenced(ctx, d.exec, cfg.App)
+	if err != nil {
 		return fmt.Errorf("acquire lock: %w", err)
 	}
-	defer state.ReleaseLockDetached(d.exec, cfg.App)
+	defer state.ReleaseLockFenced(d.exec, lk, cfg.App)
+	lk.StartRenewal(d.exec)
 
 	prior, err := state.Read(ctx, d.exec, cfg.App)
 	if err != nil {
@@ -653,12 +677,23 @@ func (d *StaticDeployer) Rollback(ctx context.Context, cfg StaticRollbackConfig)
 		return fmt.Errorf("release %s no longer on server (may have been pruned)", target)
 	}
 
+	// Fence (F16): the symlink swap is the cutover effect of this rollback.
+	if err := lk.Check(ctx, d.exec); err != nil {
+		return err
+	}
 	if err := d.swapCurrentLink(ctx, cfg.App, cfg.StateDir, target); err != nil {
 		return fmt.Errorf("symlink swap: %w", err)
 	}
 
 	// Re-assert Caddyfile block so any header/cache changes in the rolled-
-	// back-from version don't carry over.
+	// back-from version don't carry over. Fence-checked: the route switch
+	// commits traffic to the target release.
+	if err := lk.Check(ctx, d.exec); err != nil {
+		if restoreErr := d.restoreStaticLink(ctx, cfg.App, cfg.StateDir, prior); restoreErr != nil {
+			return fmt.Errorf("fence check: %w; restoring release %s failed: %v", err, prior.CurrentHash, restoreErr)
+		}
+		return fmt.Errorf("fence check: %w; release %s was restored", err, prior.CurrentHash)
+	}
 	if err := d.caddy.SetStaticRoute(ctx, cfg.App, cfg.Domain, caddy.StaticBlockOpts{
 		Root:        fmt.Sprintf("%s/%s/current", cfg.MountBase, cfg.App),
 		SPA:         cfg.SPA,
@@ -685,7 +720,7 @@ func (d *StaticDeployer) Rollback(ctx context.Context, cfg StaticRollbackConfig)
 	if prior.PreviousRelease != nil && prior.PreviousRelease.Hash == target {
 		newState.ApplyRelease(prior.PreviousRelease)
 	}
-	if err := state.Write(ctx, d.exec, cfg.App, newState); err != nil {
+	if err := state.WriteFenced(ctx, d.exec, cfg.App, newState, lk); err != nil {
 		if restoreErr := d.restoreStaticLink(ctx, cfg.App, cfg.StateDir, prior); restoreErr != nil {
 			return fmt.Errorf("committing authoritative applied state after static rollback route switch: %w; restoring release %s failed: %v; the target release was left active", err, prior.CurrentHash, restoreErr)
 		}
@@ -714,10 +749,12 @@ func (d *StaticDeployer) Rollback(ctx context.Context, cfg StaticRollbackConfig)
 // tree says nothing about how it was served. No record means asking for one
 // redeploy, not guessing.
 func (d *StaticDeployer) RollbackStateOnly(ctx context.Context, app, toHash string) error {
-	if err := state.AcquireLock(ctx, d.exec, app); err != nil {
+	lk, err := state.AcquireLockFenced(ctx, d.exec, app)
+	if err != nil {
 		return fmt.Errorf("acquire lock: %w", err)
 	}
-	defer state.ReleaseLockDetached(d.exec, app)
+	defer state.ReleaseLockFenced(d.exec, lk, app)
+	lk.StartRenewal(d.exec)
 
 	prior, err := state.Read(ctx, d.exec, app)
 	if err != nil {
@@ -746,6 +783,10 @@ func (d *StaticDeployer) RollbackStateOnly(ctx context.Context, app, toHash stri
 		return fmt.Errorf("release %s no longer on server (may have been pruned)", target)
 	}
 
+	// Fence (F16): the symlink swap is the cutover effect.
+	if err := lk.Check(ctx, d.exec); err != nil {
+		return err
+	}
 	if err := d.swapCurrentLink(ctx, app, DefaultStateDir, target); err != nil {
 		return fmt.Errorf("symlink swap: %w", err)
 	}
@@ -753,6 +794,13 @@ func (d *StaticDeployer) RollbackStateOnly(ctx context.Context, app, toHash stri
 	domain := st.Domain
 	if domain == "" {
 		domain = prior.Domain
+	}
+	// Fence-checked: the route switch commits traffic to the target.
+	if err := lk.Check(ctx, d.exec); err != nil {
+		if restoreErr := d.restoreStaticLink(ctx, app, DefaultStateDir, prior); restoreErr != nil {
+			return fmt.Errorf("fence check: %w; restoring release %s failed: %v; the target release was left active", err, prior.CurrentHash, restoreErr)
+		}
+		return fmt.Errorf("fence check: %w; release %s was restored", err, prior.CurrentHash)
 	}
 	if err := d.caddy.SetStaticRoute(ctx, app, domain, caddy.StaticBlockOpts{
 		Root:        fmt.Sprintf("%s/%s/current", DefaultStaticMount, app),
@@ -774,7 +822,7 @@ func (d *StaticDeployer) RollbackStateOnly(ctx context.Context, app, toHash stri
 	if prior.PreviousRelease != nil && prior.PreviousRelease.Hash == target {
 		newState.ApplyRelease(prior.PreviousRelease)
 	}
-	if err := state.Write(ctx, d.exec, app, newState); err != nil {
+	if err := state.WriteFenced(ctx, d.exec, app, newState, lk); err != nil {
 		if restoreErr := d.restoreStaticLink(ctx, app, DefaultStateDir, prior); restoreErr != nil {
 			return fmt.Errorf("committing authoritative applied state after static rollback route switch: %w; restoring release %s failed: %v; the target release was left active", err, prior.CurrentHash, restoreErr)
 		}

@@ -365,14 +365,26 @@ func validateReleaseDigest(release *ReleaseMetadata) error {
 // key=value file, making that file an import-only migration source rather than
 // a second writable authority.
 func Write(ctx context.Context, exec ssh.Executor, app string, s *AppState) error {
+	data, err := prepareState(s)
+	if err != nil {
+		return err
+	}
+	path := fmt.Sprintf("%s/%s/state.json", deploymentsDir, app)
+	return ssh.UploadAtomic(ctx, exec, bytes.NewReader(data), path, "0644")
+}
+
+// prepareState validates and serializes s for writing (shared by Write and
+// the fenced commit, audit F16). The trailing newline matches the historical
+// format.
+func prepareState(s *AppState) ([]byte, error) {
 	if s == nil {
-		return fmt.Errorf("state is required")
+		return nil, fmt.Errorf("state is required")
 	}
 	if s.SchemaVersion == 0 {
 		s.SchemaVersion = SchemaVersionV2
 	}
 	if s.SchemaVersion != SchemaVersionV2 {
-		return fmt.Errorf("cannot write state schema version %d", s.SchemaVersion)
+		return nil, fmt.Errorf("cannot write state schema version %d", s.SchemaVersion)
 	}
 	if s.DeploymentType == "" {
 		s.DeploymentType = "container"
@@ -390,19 +402,17 @@ func Write(ctx context.Context, exec ssh.Executor, app string, s *AppState) erro
 		s.Generation = 1
 	}
 	if err := validateManifestDigest(s); err != nil {
-		return err
+		return nil, err
 	}
 	if err := validateReleaseDigest(s.PreviousRelease); err != nil {
-		return fmt.Errorf("validating previous release: %w", err)
+		return nil, fmt.Errorf("validating previous release: %w", err)
 	}
 
 	data, err := json.Marshal(s)
 	if err != nil {
-		return fmt.Errorf("marshaling state: %w", err)
+		return nil, fmt.Errorf("marshaling state: %w", err)
 	}
-	data = append(data, '\n')
-	path := fmt.Sprintf("%s/%s/state.json", deploymentsDir, app)
-	return ssh.UploadAtomic(ctx, exec, bytes.NewReader(data), path, "0644")
+	return append(data, '\n'), nil
 }
 
 // LockInfo represents the metadata stored in a .lock directory.
@@ -411,6 +421,14 @@ type LockInfo struct {
 	User    string `json:"user,omitempty"`
 	Message string `json:"message,omitempty"`
 	TS      string `json:"ts"`
+	// Owner is the unique holder token of an "auto" lock (audit F16) —
+	// the fencing token effect sites verify. Empty on locks written by
+	// pre-F16 binaries and on manual/heal locks (never fenced).
+	Owner string `json:"owner,omitempty"`
+	// RenewTS is the last renewal heartbeat of an "auto" lock (F16);
+	// staleness is measured from it when present, so a live-but-slow
+	// deploy that renews is never broken as stale.
+	RenewTS string `json:"renew_ts,omitempty"`
 }
 
 // ReadLock reads the lock info for an app. Returns nil if no lock exists.
@@ -442,14 +460,23 @@ func (l *LockInfo) IsStale() bool {
 	case "heal":
 		return isHealStale(l.TS)
 	default:
-		return isStale(l.TS)
+		return isStale(l.TS, l.RenewTS)
 	}
 }
 
 // AcquireLock acquires the deploy lock for an app using atomic mkdir.
 // Returns an error if a lock already exists (another deploy in progress or
-// manual freeze) and isn't stale (see staleLockTTL).
+// manual freeze) and isn't stale (see staleLockTTL). Callers that need the
+// fencing handle (audit F16) use AcquireLockFenced; the lock taken is the
+// same — this is that call with the handle discarded.
 func AcquireLock(ctx context.Context, exec ssh.Executor, app string) error {
+	return acquireAutoLock(ctx, exec, app, newOperationID())
+}
+
+// acquireAutoLock is the shared "auto" lock acquisition. Every acquire
+// carries a unique owner token (F16) so effect sites can refuse a broken
+// holder's late writes; the token is opaque to everything pre-F16.
+func acquireAutoLock(ctx context.Context, exec ssh.Executor, app, owner string) error {
 	lockPath := fmt.Sprintf("%s/%s/.lock", deploymentsDir, app)
 	if _, err := tryMkdirLock(ctx, exec, lockPath); err != nil {
 		info, _ := ReadLock(ctx, exec, app)
@@ -461,7 +488,7 @@ func AcquireLock(ctx context.Context, exec ssh.Executor, app string) error {
 			msg += fmt.Sprintf(". Locked at %s. Use 'teploy unlock' to release.", info.TS)
 			return fmt.Errorf("%s", msg)
 		}
-		if info != nil && info.Type == "auto" && isStale(info.TS) {
+		if info != nil && info.Type == "auto" && isStale(info.TS, info.RenewTS) {
 			ReleaseLock(ctx, exec, app)
 			if _, retryErr := tryMkdirLock(ctx, exec, lockPath); retryErr != nil {
 				// Someone else's deploy won the race to re-acquire right
@@ -469,7 +496,7 @@ func AcquireLock(ctx context.Context, exec ssh.Executor, app string) error {
 				// normal "in progress" error below.
 				return fmt.Errorf("deploy is already in progress for %s", app)
 			}
-			return writeLockInfo(ctx, exec, lockPath, app)
+			return writeLockInfo(ctx, exec, lockPath, app, owner)
 		}
 		// A crashed heal can leave its short-lived "heal" lock behind. A deploy
 		// (authoritative) may break a STALE heal lock so it isn't blocked — but
@@ -481,21 +508,22 @@ func AcquireLock(ctx context.Context, exec ssh.Executor, app string) error {
 			if _, retryErr := tryMkdirLock(ctx, exec, lockPath); retryErr != nil {
 				return fmt.Errorf("deploy is already in progress for %s", app)
 			}
-			return writeLockInfo(ctx, exec, lockPath, app)
+			return writeLockInfo(ctx, exec, lockPath, app, owner)
 		}
 		return fmt.Errorf("deploy is already in progress for %s", app)
 	}
-	return writeLockInfo(ctx, exec, lockPath, app)
+	return writeLockInfo(ctx, exec, lockPath, app, owner)
 }
 
 func tryMkdirLock(ctx context.Context, exec ssh.Executor, lockPath string) (string, error) {
 	return exec.Run(ctx, fmt.Sprintf("mkdir %s 2>/dev/null", lockPath))
 }
 
-func writeLockInfo(ctx context.Context, exec ssh.Executor, lockPath, app string) error {
+func writeLockInfo(ctx context.Context, exec ssh.Executor, lockPath, app, owner string) error {
 	info, _ := json.Marshal(LockInfo{
-		Type: "auto",
-		TS:   time.Now().UTC().Format(time.RFC3339),
+		Type:  "auto",
+		Owner: owner,
+		TS:    time.Now().UTC().Format(time.RFC3339),
 	})
 	if err := exec.Upload(ctx, bytes.NewReader(info), lockPath+"/info", "0644"); err != nil {
 		// Lock directory was created but info file failed — release and return error.
@@ -505,10 +533,19 @@ func writeLockInfo(ctx context.Context, exec ssh.Executor, lockPath, app string)
 	return nil
 }
 
-// isStale reports whether an "auto" lock's timestamp is older than
-// staleLockTTL. An unparseable timestamp is treated as stale — a lock file
-// too corrupted to read its own age isn't one worth respecting.
-func isStale(ts string) bool {
+// isStale reports whether an "auto" lock is older than staleLockTTL,
+// measured from the last RENEWAL when the lock carries one (F16) — a
+// live-but-slow deploy renews, so it is never falsely broken — and from the
+// acquisition timestamp otherwise (pre-F16 locks). An unparseable timestamp
+// is treated as stale — a lock file too corrupted to read its own age isn't
+// one worth respecting.
+func isStale(ts, renewTS string) bool {
+	if renewTS != "" {
+		if parsed, err := time.Parse(time.RFC3339, renewTS); err == nil {
+			return time.Since(parsed) > staleLockTTL
+		}
+		return true
+	}
 	parsed, err := time.Parse(time.RFC3339, ts)
 	if err != nil {
 		return true
