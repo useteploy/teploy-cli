@@ -12,6 +12,7 @@ import (
 	"github.com/useteploy/teploy/internal/build"
 	"github.com/useteploy/teploy/internal/config"
 	"github.com/useteploy/teploy/internal/docker"
+	"github.com/useteploy/teploy/internal/releasemeta"
 	"github.com/useteploy/teploy/internal/ssh"
 )
 
@@ -168,7 +169,15 @@ func runBuild(flags *Flags, version, destination string) error {
 		return reportBuild(flags, image, version, true)
 	}
 
-	remoteDir := fmt.Sprintf("/deployments/%s/build", appCfg.App)
+	// Attempt-scoped build context (F08): `teploy build` takes no app
+	// lock, so building into the shared /deployments/<app>/build could
+	// interleave with a concurrent deploy's rsync. A fresh attempt
+	// directory per run cannot collide with anything; the previous
+	// attempt's build dir is the --link-dest basis so transfer stays
+	// incremental. The directory is scratch — the next deploy of this app
+	// prunes it once its hash leaves the protection window.
+	att := releasemeta.MustAttempt(appCfg.App, version)
+	remoteDir := att.BuildDir()
 	if _, err := executor.Run(ctx, "mkdir -p "+remoteDir); err != nil {
 		return fmt.Errorf("creating build directory: %w", err)
 	}
@@ -180,6 +189,7 @@ func runBuild(flags *Flags, version, destination string) error {
 		User:      user,
 		KeyPath:   key,
 		Excludes:  build.LoadIgnore("."),
+		LinkDest:  releasemeta.PreviousAttemptBuildDir(ctx, executor, appCfg.App, att.ID),
 	}, out, os.Stderr); err != nil {
 		return fmt.Errorf("syncing source: %w", err)
 	}

@@ -11,6 +11,7 @@ import (
 	"github.com/useteploy/teploy/internal/config"
 	"github.com/useteploy/teploy/internal/deploy"
 	"github.com/useteploy/teploy/internal/docker"
+	"github.com/useteploy/teploy/internal/releasemeta"
 	"github.com/useteploy/teploy/internal/secret"
 	"github.com/useteploy/teploy/internal/ssh"
 )
@@ -63,7 +64,10 @@ func (s *singleServerDeployer) deployApp(ctx context.Context, appCfg *config.App
 		}
 	}
 
-	// Build if needed.
+	// Build if needed. The attempt (F08) keys every artifact this deploy
+	// generates; minted per server here (each target's artifacts are
+	// local to that target, like state and pins).
+	att := releasemeta.MustAttempt(appCfg.App, version)
 	needsBuild := image == ""
 	var buildMode build.Mode
 	if needsBuild {
@@ -94,7 +98,10 @@ func (s *singleServerDeployer) deployApp(ctx context.Context, appCfg *config.App
 				return fmt.Errorf("local build: %w", err)
 			}
 		} else {
-			remoteDir := fmt.Sprintf("/deployments/%s/build", appCfg.App)
+			// Attempt-scoped build context (F08): a fresh directory per
+			// (release, attempt), with the previous attempt's build dir as
+			// rsync's --link-dest basis so transfer stays incremental.
+			remoteDir := att.BuildDir()
 			if _, err := s.exec.Run(ctx, "mkdir -p "+remoteDir); err != nil {
 				return fmt.Errorf("creating build directory: %w", err)
 			}
@@ -108,6 +115,7 @@ func (s *singleServerDeployer) deployApp(ctx context.Context, appCfg *config.App
 				User:      s.exec.User(),
 				KeyPath:   s.keyPath,
 				Excludes:  excludes,
+				LinkDest:  releasemeta.PreviousAttemptBuildDir(ctx, s.exec, appCfg.App, att.ID),
 			}, s.out, s.out); err != nil {
 				return fmt.Errorf("syncing source: %w", err)
 			}
@@ -212,8 +220,8 @@ func (s *singleServerDeployer) deployApp(ctx context.Context, appCfg *config.App
 		}
 	}
 
-	// Upload custom TLS cert (if configured) before deploy.
-	tlsCert, tlsKey, tlsInternal, err := resolveAppTLS(ctx, s.exec, appCfg)
+	// Upload custom TLS cert (if configured) before deploy — attempt-scoped (F08).
+	tlsCert, tlsKey, tlsInternal, err := resolveAppTLS(ctx, s.exec, appCfg, &att)
 	if err != nil {
 		return err
 	}
@@ -243,7 +251,7 @@ func (s *singleServerDeployer) deployApp(ctx context.Context, appCfg *config.App
 	// servers.yml), and decrypted secrets, uploaded to a fresh env file
 	// rather than passed as `docker run -e` args — see
 	// buildContainerEnvFiles for why.
-	envFiles, err := buildContainerEnvFiles(ctx, s.exec, appCfg.App, envFile, appCfg.Env, tags, deploySecrets)
+	envFiles, err := buildContainerEnvFiles(ctx, s.exec, appCfg.App, &att, envFile, appCfg.Env, tags, deploySecrets)
 	if err != nil {
 		return err
 	}

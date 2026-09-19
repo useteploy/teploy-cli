@@ -108,3 +108,52 @@ func TestDeployFenced_LateHolderRefusedToStartContainers(t *testing.T) {
 		t.Error("late holder must not commit state")
 	}
 }
+
+// TestDeployFenced_PrunesSupersededAttempts: after a committed deploy, the
+// attempt artifacts of releases outside the protection window are pruned
+// (F08) while the deployed release's attempt survives.
+func TestDeployFenced_PrunesSupersededAttempts(t *testing.T) {
+	app := "fency"
+	mocks := fenceHappyPathMocks(app)
+	// Attempt prune: the artifact roots list an ancient attempt plus an
+	// unparsable stray; both roots' listings and the pin read succeed.
+	mocks = append(mocks,
+		ssh.MockCommand{Match: "cat /deployments/fency/pins", Output: ""},
+		ssh.MockCommand{Match: "ls -1 /deployments/fency/meta/att", Output: "ancient.0000000000000003\nstray"},
+		ssh.MockCommand{Match: "ls -1 /deployments/caddy/tls/att", Output: "ancient.0000000000000003"},
+		ssh.MockCommand{Match: "rm -rf ", Output: ""},
+	)
+	mock := ssh.NewMockExecutor("1.2.3.4", mocks...)
+	lk, err := state.AcquireLockFenced(context.Background(), mock, app)
+	if err != nil {
+		t.Fatalf("AcquireLockFenced: %v", err)
+	}
+	var buf bytes.Buffer
+	d := NewDeployer(mock, &buf)
+	if err := d.DeployFenced(context.Background(), Config{
+		App:     app,
+		Domain:  "fency.com",
+		Image:   "fency:latest",
+		Version: "abc123",
+		Health:  HealthConfig{Timeout: 5 * time.Second, Interval: 10 * time.Millisecond},
+	}, lk); err != nil {
+		t.Fatalf("DeployFenced: %v", err)
+	}
+	var prunedAncient, prunedStray bool
+	for _, c := range mock.Calls {
+		if strings.HasPrefix(c, "rm -rf ") {
+			if strings.Contains(c, "ancient.") {
+				prunedAncient = true
+			}
+			if strings.Contains(c, "stray") {
+				prunedStray = true
+			}
+		}
+	}
+	if !prunedAncient {
+		t.Error("expected the ancient release's attempt artifacts to be pruned")
+	}
+	if prunedStray {
+		t.Error("an unparsable attempt entry must be kept (fail closed)")
+	}
+}

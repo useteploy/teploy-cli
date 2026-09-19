@@ -18,6 +18,7 @@ import (
 	"github.com/useteploy/teploy/internal/config"
 	"github.com/useteploy/teploy/internal/docker"
 	"github.com/useteploy/teploy/internal/env"
+	"github.com/useteploy/teploy/internal/releasemeta"
 	"github.com/useteploy/teploy/internal/ssh"
 	"github.com/useteploy/teploy/internal/state"
 )
@@ -399,8 +400,9 @@ func triggerAutoDeploy(ctx context.Context, executor ssh.Executor, app, branch, 
 	}
 
 	// The outer lock taken at the top of triggerAutoDeploy is still held —
-	// route through the locked entry point so Deploy doesn't deadlock on its
-	// own second acquisition (audit F07), passing the fence handle so the
-	// deploy's effects stay fenced (F16).
-	return deployBuiltImageLockMode(ctx, executor, appCfg, image, version, "localhost", false, needsBuild, lk)
+	// route through the fenced entry point so Deploy doesn't deadlock on its
+	// own second acquisition (audit F07), passing the fence handle (F16) and
+	// the attempt that keys this deploy's env/TLS artifacts (F08).
+	att := releasemeta.MustAttempt(app, version)
+	return deployBuiltImageFenced(ctx, executor, appCfg, image, version, "localhost", false, needsBuild, lk, &att)
 }

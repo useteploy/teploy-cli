@@ -638,6 +638,31 @@ func (d *Deployer) DeployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 	// deploy or backfill. Never abort into abortStateCommit from here.
 	d.recordRelease(ctx, cfg, newState, ports, webBindHost, webContainerName)
 
+	// 13c. Prune superseded attempts (F08): attempt directories (build
+	// contexts, env files, TLS certs) are dead weight once their release
+	// is outside the rollback window — env is baked into containers at
+	// create and recreate uses the inspect-derived resolved env, never
+	// the file. Same protection window as version pruning: current,
+	// previous, and pinned releases keep their artifacts.
+	{
+		var prevHash string
+		if current != nil {
+			prevHash = current.CurrentHash
+		}
+		protected := []string{cfg.Version, prevHash}
+		// Pins protect their release's artifacts like versions (F78
+		// parity): an unreadable pin file skips the extra protection, and
+		// that is reported, never silent.
+		if pins, pinsErr := state.ReadPins(ctx, d.exec, cfg.App); pinsErr == nil {
+			protected = append(protected, pins...)
+		} else {
+			fmt.Fprintf(d.out, "Warning: attempt artifacts protected only as current+previous — pin state could not be read: %v\n", pinsErr)
+		}
+		if err := releasemeta.PruneAttempts(ctx, d.exec, cfg.App, protected...); err != nil {
+			fmt.Fprintf(d.out, "Warning: could not prune superseded attempt artifacts: %v\n", err)
+		}
+	}
+
 	// 14. Stop the predecessor workload snapshotted in step 6b (all
 	// processes + all replicas). For same-version redeploys the old
 	// containers were renamed to _replaced; remove them after stopping so
