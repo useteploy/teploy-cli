@@ -901,9 +901,16 @@ func (d *Deployer) DeployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 			} else {
 				protected = append(protected, pins...)
 				pruned, err := d.docker.PruneVersions(ctx, cfg.App, cfg.KeepVersions, protected...)
-				if err != nil {
-					fmt.Fprintf(d.out, "Warning: version prune failed: %v\n", err)
-				} else if len(pruned) > 0 {
+				switch {
+				case err != nil:
+					// Partial cleanup (A25): report what was left behind —
+					// the old path printed nothing when any removal failed,
+					// or reported failed removals as pruned.
+					fmt.Fprintf(d.out, "Warning: version prune incomplete: %v\n", err)
+					if len(pruned) > 0 {
+						fmt.Fprintf(d.out, "Pruned %d superseded version(s): %s\n", len(pruned), strings.Join(pruned, ", "))
+					}
+				case len(pruned) > 0:
 					fmt.Fprintf(d.out, "Pruned %d superseded version(s): %s\n", len(pruned), strings.Join(pruned, ", "))
 				}
 			}

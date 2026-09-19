@@ -140,7 +140,7 @@ func TestDeploy_FirstDeploy(t *testing.T) {
 	// Verify docker run included the right port.
 	for _, call := range mock.Calls {
 		if strings.HasPrefix(call, "docker run") {
-			if !strings.Contains(call, "-p 127.0.0.1:49152:80") {
+			if !strings.Contains(call, "-p '127.0.0.1:49152:80'") {
 				t.Errorf("expected port mapping 127.0.0.1:49152:80 in docker run: %s", call)
 			}
 			if !strings.Contains(call, "-e PORT=80") {
@@ -200,7 +200,7 @@ func TestDeploy_HostIngress(t *testing.T) {
 		}
 		if strings.HasPrefix(call, "docker run") {
 			sawRun = true
-			if !strings.Contains(call, "-p 0.0.0.0:3000:3000") {
+			if !strings.Contains(call, "-p '0.0.0.0:3000:3000'") {
 				t.Errorf("expected -p 0.0.0.0:3000:3000 in docker run: %s", call)
 			}
 		}
