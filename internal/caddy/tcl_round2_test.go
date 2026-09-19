@@ -16,8 +16,9 @@ import (
 // cannot (TCL-59: prefix-response doubles cannot model filesystem
 // semantics). Only the commands caddy.Client issues are implemented.
 type fakeStatefulExecutor struct {
-	mu    sync.Mutex
-	files map[string][]byte
+	mu       sync.Mutex
+	files    map[string][]byte
+	adaptErr error // when set, the server-side adapt gate refuses
 }
 
 func newFakeStatefulExecutor(initial map[string]string) *fakeStatefulExecutor {
@@ -46,6 +47,13 @@ func (f *fakeStatefulExecutor) Run(ctx context.Context, cmd string) (string, err
 		return "", nil
 	case strings.HasPrefix(cmd, "a=$(docker exec caddy md5sum"):
 		return deliveredOK, nil
+	case strings.HasPrefix(cmd, "docker exec -i caddy caddy adapt"):
+		// The pre-write adapt gate: the fake has no caddy; it accepts
+		// unless the test stages a refusal.
+		if f.adaptErr != nil {
+			return "", f.adaptErr
+		}
+		return "", nil
 	case strings.HasPrefix(cmd, "mkdir "+lockDir), strings.HasPrefix(cmd, "rmdir "+lockDir):
 		return "", nil
 	case cmd == reloadCmd:

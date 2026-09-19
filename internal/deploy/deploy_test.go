@@ -893,8 +893,9 @@ func TestDeploy_PostDeployHookFailure(t *testing.T) {
 		ssh.MockCommand{Match: "a=$(docker exec caddy md5sum", Output: "TEPLOY_CADDY_OK"},
 		ssh.MockCommand{Match: "docker exec caddy caddy reload", Output: ""},
 		ssh.MockCommand{Match: "rmdir /deployments/caddy/.lock", Output: ""},
-		// Post-deploy hook fails.
-		ssh.MockCommand{Match: "docker exec", Output: "cache clear failed", Err: fmt.Errorf("exit status 1")},
+		// Post-deploy hook fails (scoped to the app container so it cannot
+		// swallow the caddy adapt gate's docker exec).
+		ssh.MockCommand{Match: "docker exec myapp-web-abc123", Output: "cache clear failed", Err: fmt.Errorf("exit status 1")},
 		// Log and lock (deploy still succeeds).
 		ssh.MockCommand{Match: "printf %s", Output: ""},
 		ssh.MockCommand{Match: "rm -rf /deployments/myapp/.lock", Output: ""},
