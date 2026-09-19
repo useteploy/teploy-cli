@@ -81,6 +81,15 @@ func (m *MockExecutor) Run(ctx context.Context, cmd string) (string, error) {
 		m.mu.Unlock()
 		return "", nil
 	}
+	// The server-side adapt gate (internal/caddy, F48/F49) streams the
+	// proposed Caddyfile over stdin; the mock cannot run a real caddy, so
+	// it models "the server's caddy accepted it" — tests that need the
+	// refusal register an explicit Err command for the same prefix, which
+	// wins because matching above takes precedence.
+	if strings.HasPrefix(cmd, "docker exec -i caddy caddy adapt") {
+		m.mu.Unlock()
+		return "", nil
+	}
 	m.mu.Unlock()
 	return "", fmt.Errorf("mock: unexpected command: %s", cmd)
 }

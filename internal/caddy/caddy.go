@@ -323,7 +323,12 @@ p{color:#666}
 
 // SetMaintenance enables maintenance mode: the app's domain returns a 503
 // maintenance page. The app's current route block is stashed so it can be
-// restored by RemoveMaintenance without a redeploy.
+// restored by RemoveMaintenance without a redeploy. The current block's TLS
+// directive and access gate are carried into the maintenance block (F48):
+// enabling maintenance used to silently drop HTTPS termination and auth —
+// the site downgraded to ACME/default and went PUBLIC for the duration.
+// The policy is lifted from the PARSED current block; a block that cannot
+// be parsed fails the maintenance toggle rather than guessing.
 func (c *Client) SetMaintenance(ctx context.Context, app, domain string) error {
 	hosts, err := parseDomains(domain)
 	if err != nil {
@@ -335,7 +340,13 @@ func (c *Client) SetMaintenance(ctx context.Context, app, domain string) error {
 	return c.mutate(ctx, func(prev string) (string, error) {
 		begin := fmt.Sprintf(markerBeginFmt, app)
 		end := fmt.Sprintf(markerEndFmt, app)
+		var pol SitePolicy
 		if cur := extractCaddyfileBlock(prev, begin, end); cur != "" {
+			extracted, err := ExtractPolicy(cur)
+			if err != nil {
+				return "", fmt.Errorf("reading %s's TLS/access policy for maintenance (route left unchanged): %w", app, err)
+			}
+			pol = extracted
 			stash := fmt.Sprintf(maintStashFmt, app)
 			// Never overwrite an existing stash (TCL-25): a SECOND
 			// maintenance-on extracts the app's CURRENT block — which by
@@ -349,7 +360,7 @@ func (c *Client) SetMaintenance(ctx context.Context, app, domain string) error {
 				}
 			}
 		}
-		return renderUpdated(prev, app, hosts, maintenanceBlock(hosts))
+		return renderUpdated(prev, app, hosts, maintenanceBlock(hosts, pol))
 	})
 }
 
@@ -408,6 +419,18 @@ func (c *Client) mutate(ctx context.Context, transform func(prev string) (string
 	}
 	if updated == prev {
 		return nil
+	}
+
+	// Pre-write validation gate (F48/F49): the transformed Caddyfile must
+	// adapt under the SERVER's own caddy binary (docker exec, stdin) before
+	// it is written — structured edits that break the file are refused
+	// HERE, with the authoritative binary, instead of being discovered by
+	// the reload below. The LOCAL caddy (adapt.go) is deliberately NOT the
+	// gate: its version/modules can differ from the server's, and refusing
+	// a legitimate caddy_extra directive (e.g. a custom-build module) on
+	// binary drift would break deploys that work today.
+	if err := c.adaptCheck(ctx, updated); err != nil {
+		return fmt.Errorf("refusing to write a Caddyfile the server's caddy rejects: %w", err)
 	}
 
 	if err := c.writeCaddyfile(ctx, updated); err != nil {
@@ -494,6 +517,17 @@ func (c *Client) verifyDelivered(ctx context.Context) error {
 	return nil
 }
 
+// adaptCheck runs the server's own caddy adapt on the proposed Caddyfile
+// (streamed via stdin, never written) — the pre-write validation gate. A
+// non-zero exit refuses the edit before anything changes on disk.
+func (c *Client) adaptCheck(ctx context.Context, content string) error {
+	err := c.exec.RunInput(ctx, fmt.Sprintf("docker exec -i %s caddy adapt --config - --adapter caddyfile", caddyContainer), strings.NewReader(content))
+	if err != nil {
+		return fmt.Errorf("caddy adapt: %w", err)
+	}
+	return nil
+}
+
 // applyManagedBlock upserts (block != "") or removes (block == "") the app's
 // marker-delimited block, adopting any foreign block for the same hosts.
 func (c *Client) applyManagedBlock(ctx context.Context, app string, hosts []string, block string) error {
@@ -536,7 +570,10 @@ func renderUpdated(prev, app string, hosts []string, block string) (string, erro
 		}
 	}
 	if len(hosts) > 0 {
-		updated = removeForeignHostBlocks(updated, hosts)
+		updated, err = adoptForeignBlocks(updated, hosts)
+		if err != nil {
+			return "", err
+		}
 	}
 
 	if block != "" {
@@ -630,65 +667,11 @@ func (c *Client) releaseLock(ctx context.Context) {
 	c.exec.Run(rctx, "rmdir "+lockDir+" 2>/dev/null || true")
 }
 
-// removeForeignHostBlocks strips top-level Caddyfile site blocks that serve
-// ONLY the given hosts and are NOT inside a Teploy marker region. This lets
-// a deploy adopt a domain previously served by a hand-written block, leaving
-// a single authoritative block per host. A foreign block that ALSO serves a
-// host outside the requested set is LEFT ALONE (audit F49): adopting it
-// would delete another application's routes, and the resulting duplicate
-// site address fails loudly at caddy reload instead of silently dropping
-// hosts nobody asked teploy to touch.
-func removeForeignHostBlocks(content string, hosts []string) string {
-	lines := strings.Split(content, "\n")
-	out := make([]string, 0, len(lines))
-	inMarker := false
-	for i := 0; i < len(lines); {
-		line := lines[i]
-		trimmed := strings.TrimSpace(line)
-
-		if strings.HasPrefix(trimmed, "# TEPLOY BEGIN ") {
-			inMarker = true
-			out = append(out, line)
-			i++
-			continue
-		}
-		if strings.HasPrefix(trimmed, "# TEPLOY END ") {
-			inMarker = false
-			out = append(out, line)
-			i++
-			continue
-		}
-
-		// A top-level site-block opener: column 0, not a comment, not the
-		// global options block "{", not a snippet "(name) {", ends with "{".
-		isOpener := !inMarker && len(line) > 0 && !isSpaceByte(line[0]) &&
-			!strings.HasPrefix(trimmed, "#") && !strings.HasPrefix(trimmed, "{") &&
-			!strings.HasPrefix(trimmed, "(") && strings.HasSuffix(trimmed, "{")
-
-		if isOpener {
-			depth := strings.Count(line, "{") - strings.Count(line, "}")
-			block := []string{line}
-			j := i + 1
-			for j < len(lines) && depth > 0 {
-				block = append(block, lines[j])
-				depth += strings.Count(lines[j], "{") - strings.Count(lines[j], "}")
-				j++
-			}
-			addr := strings.TrimSpace(strings.TrimSuffix(trimmed, "{"))
-			if addressWithinHosts(addr, hosts) {
-				i = j // drop the foreign block — every host it serves is being adopted
-				continue
-			}
-			out = append(out, block...)
-			i = j
-			continue
-		}
-
-		out = append(out, line)
-		i++
-	}
-	return strings.Join(out, "\n")
-}
+// removeForeignHostBlocks' whole-block rule moved to routes.go's
+// adoptForeignBlocks (F49): adoption is decided on the PARSED structure, and
+// a foreign block sharing only some of the requested hosts has those hosts
+// removed from its address line instead of being left behind to fail at
+// reload.
 
 // addressWithinHosts reports whether EVERY host in a Caddyfile site-address
 // (e.g. "example.com, www.example.com") is among the given hosts — the
@@ -960,17 +943,32 @@ func loadBalancerBlock(hosts []string, upstreams []Upstream, healthPath string, 
 	return b.String()
 }
 
-// maintenanceBlock renders a site block that returns a 503 maintenance page for
-// the given hosts. Caddy adapts the `respond` directive to a static_response
-// handler, which the dashboard detects as maintenance mode.
-func maintenanceBlock(hosts []string) string {
-	// No custom-TLS param here — maintenance mode doesn't carry TLS config
-	// through today (a separate, pre-existing gap, not this fix's scope).
-	// Zero-value TLS still gets the right outcome for THIS fix: a non-public
-	// host falls back to http:// same as its regular route block would.
+// maintenanceBlock renders a site block that returns a 503 maintenance page
+// for the given hosts, preserving the site's TLS directive and access gate
+// (F48) — the extracted policy is verbatim, so maintenance holds the same
+// security envelope the real route did. A TLS directive present means the
+// operator explicitly opted into HTTPS for these hosts, so no http://
+// scheme downgrade is applied to non-public addresses (mirrors
+// siteAddresses' wantsTLS rule).
+func maintenanceBlock(hosts []string, pol SitePolicy) string {
+	var tlsLine string
+	if t := strings.TrimSpace(pol.TLS); t != "" {
+		tlsLine = t + "\n"
+	}
+	var accessSpan string
+	for _, a := range pol.Access {
+		accessSpan += a + "\n"
+	}
+	schemeHosts := hosts
+	if tlsLine == "" {
+		// Same fallback as a regular route with no TLS: a non-public host
+		// gets an explicit http:// scheme so Caddy does not hang on an
+		// ACME challenge that can never complete.
+		schemeHosts = siteAddresses(hosts, TLS{})
+	}
 	return fmt.Sprintf(
-		"%s {\n\theader Content-Type \"text/html; charset=utf-8\"\n\theader Retry-After \"3600\"\n\trespond 503 {\n\t\tbody `%s`\n\t}\n}",
-		strings.Join(siteAddresses(hosts, TLS{}), ", "), maintenancePage,
+		"%s {\n%s%s\theader Content-Type \"text/html; charset=utf-8\"\n\theader Retry-After \"3600\"\n\trespond 503 {\n\t\tbody `%s`\n\t}\n}",
+		strings.Join(schemeHosts, ", "), tlsLine, accessSpan, maintenancePage,
 	)
 }
 

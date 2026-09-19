@@ -310,23 +310,34 @@ func TestRemoveMaintenance(t *testing.T) {
 	}
 }
 
-func TestRemoveForeignHostBlocks(t *testing.T) {
-	// The foreign block serves BOTH drop.com and www.drop.com; adopting it
-	// is only safe when the deploy takes over every host it serves (F49).
+func TestAdoptForeignBlocks(t *testing.T) {
+	// The foreign block serves BOTH drop.com and www.drop.com; a full
+	// takeover adopts it wholesale, a partial one now REWRITES its address
+	// line instead of leaving a duplicate site address to fail at reload
+	// (F49's structured partial match).
 	in := "{\n\tadmin 127.0.0.1:2019\n}\n\n" +
 		"keep.com {\n\treverse_proxy keep:80\n}\n\n" +
 		"drop.com, www.drop.com {\n\treverse_proxy old:80\n}\n\n" +
 		"# TEPLOY BEGIN protected\ndrop.com {\n\treverse_proxy managed:80\n}\n# TEPLOY END protected\n"
 
-	// Partial takeover (drop.com only): the multi-host foreign block must
-	// SURVIVE — dropping it would delete www.drop.com's route, and the
-	// duplicate site address then fails loudly at caddy reload instead.
-	got := removeForeignHostBlocks(in, []string{"drop.com"})
+	// Partial takeover (drop.com only): the block SURVIVES for its other
+	// host, with the adopted host removed from its address line — and its
+	// directives untouched.
+	got, err := adoptForeignBlocks(in, []string{"drop.com"})
+	if err != nil {
+		t.Fatalf("adoptForeignBlocks: %v", err)
+	}
 	if !strings.Contains(got, "reverse_proxy old:80") {
 		t.Errorf("partially-adopted multi-host foreign block was removed:\n%s", got)
 	}
+	if !strings.Contains(got, "www.drop.com {") || strings.Contains(got, "drop.com, www.drop.com {") {
+		t.Errorf("the adopted host must be removed from the foreign address line:\n%s", got)
+	}
 
-	got = removeForeignHostBlocks(in, []string{"drop.com", "www.drop.com"})
+	got, err = adoptForeignBlocks(in, []string{"drop.com", "www.drop.com"})
+	if err != nil {
+		t.Fatalf("adoptForeignBlocks: %v", err)
+	}
 	if strings.Contains(got, "reverse_proxy old:80") {
 		t.Errorf("foreign drop.com block not removed:\n%s", got)
 	}
@@ -552,7 +563,7 @@ func TestReverseProxyBlock_CustomCertKeepsRealHost(t *testing.T) {
 }
 
 func TestMaintenanceBlock_NonPublicDomainGetsPlainHTTP(t *testing.T) {
-	got := maintenanceBlock([]string{"192.168.1.114"})
+	got := maintenanceBlock([]string{"192.168.1.114"}, SitePolicy{})
 	if !strings.HasPrefix(got, "http://192.168.1.114 {") {
 		t.Errorf("maintenanceBlock for a bare IP should start with http://, got:\n%s", got)
 	}
