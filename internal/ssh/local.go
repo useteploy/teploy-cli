@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"os/user"
 	"path/filepath"
 	"strconv"
@@ -32,7 +31,8 @@ func NewLocalExecutor() *LocalExecutor {
 }
 
 func (e *LocalExecutor) Run(ctx context.Context, cmd string) (string, error) {
-	out, err := exec.CommandContext(ctx, "sh", "-c", cmd).CombinedOutput()
+	c := localCommand(ctx, cmd)
+	out, err := c.CombinedOutput()
 	if err != nil {
 		return "", fmt.Errorf("%w: %s", err, string(out))
 	}
@@ -40,49 +40,90 @@ func (e *LocalExecutor) Run(ctx context.Context, cmd string) (string, error) {
 }
 
 func (e *LocalExecutor) RunStream(ctx context.Context, cmd string, stdout, stderr io.Writer) error {
-	c := exec.CommandContext(ctx, "sh", "-c", cmd)
+	c := localCommand(ctx, cmd)
 	c.Stdout = stdout
 	c.Stderr = stderr
 	return c.Run()
 }
 
 func (e *LocalExecutor) RunInput(ctx context.Context, cmd string, stdin io.Reader) error {
-	c := exec.CommandContext(ctx, "sh", "-c", cmd)
+	c := localCommand(ctx, cmd)
 	c.Stdin = stdin
 	c.Stdout = io.Discard
 	c.Stderr = io.Discard
 	return c.Run()
 }
 
-// Upload writes content to a local file, creating parent directories and
-// setting mode (an octal string, e.g. "0644") — mirroring
-// RemoteExecutor.Upload's semantics exactly so callers built against the
-// Executor interface don't need to know which implementation they have.
+// Upload writes content to a local file atomically, mirroring
+// RemoteExecutor.Upload's contract (audit A27): the previous version
+// buffered the whole input (ignoring cancellation), called os.WriteFile
+// directly on the destination (following a leaf symlink, truncating an
+// existing file on a mid-write failure), and chmod'd only AFTER the
+// content was already visible at the destination's old permissions. The
+// resident autodeploy path runs on this executor, so the remote
+// hardening did not cover it.
+//
+// The write lands in a private sibling temp (0600 from creation), is
+// chmod'd to the requested mode and fsync'd BEFORE publication, and is
+// renamed over the destination — replacing a destination symlink itself,
+// never its target. A failed or cancelled upload leaves the previous
+// contents untouched.
 func (e *LocalExecutor) Upload(ctx context.Context, content io.Reader, path string, mode string) error {
-	data, err := io.ReadAll(content)
-	if err != nil {
-		return fmt.Errorf("reading upload content: %w", err)
+	if err := ctx.Err(); err != nil {
+		return err
 	}
-
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
-		return fmt.Errorf("creating directory for %s: %w", path, err)
-	}
-
 	perm, err := strconv.ParseUint(mode, 8, 32)
 	if err != nil {
 		return fmt.Errorf("invalid mode %q: %w", mode, err)
 	}
-
-	if err := os.WriteFile(path, data, os.FileMode(perm)); err != nil {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return fmt.Errorf("creating directory for %s: %w", path, err)
+	}
+	f, err := os.CreateTemp(dir, ".teploy-upload-*")
+	if err != nil {
+		return fmt.Errorf("creating temp file beside %s: %w", path, err)
+	}
+	tmp := f.Name()
+	defer os.Remove(tmp)
+	// ctx is checked between reads; a reader that can block indefinitely
+	// must be closed by its owner (same contract as RemoteExecutor).
+	if _, err := io.Copy(f, readerWithCtx{ctx, content}); err != nil {
+		f.Close()
 		return fmt.Errorf("writing %s: %w", path, err)
 	}
-	// os.WriteFile only applies the mode on create — an existing file keeps
-	// its old permissions. Chmod explicitly so re-uploading (e.g. a
-	// redeployed binary) always ends up at the requested mode.
-	if err := os.Chmod(path, os.FileMode(perm)); err != nil {
-		return fmt.Errorf("chmod %s: %w", path, err)
+	if err := f.Chmod(os.FileMode(perm)); err != nil {
+		f.Close()
+		return fmt.Errorf("chmod %s: %w", tmp, err)
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return fmt.Errorf("syncing %s: %w", tmp, err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("closing %s: %w", tmp, err)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return fmt.Errorf("publishing %s: %w", path, err)
 	}
 	return nil
+}
+
+// readerWithCtx fails a copy once the context is done; reads themselves
+// still block on the underlying reader (documented above).
+type readerWithCtx struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (r readerWithCtx) Read(p []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return r.r.Read(p)
 }
 
 func (e *LocalExecutor) Close() error {
