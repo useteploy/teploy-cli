@@ -963,9 +963,22 @@ func LoadApp(dir string) (*AppConfig, error) {
 	return nil, fmt.Errorf("%w in %s", ErrNoConfig, dir)
 }
 
+// OverlayOptions configures destination-overlay semantics (audit F57's
+// opt-in strict mode).
+type OverlayOptions struct {
+	// Strict enables presence-aware overlay semantics: a key PRESENT in
+	// the overlay file with an empty value (`env:` null, `env: {}`,
+	// `publish: []`) explicitly CLEARS the base's map/list instead of
+	// being ignored — the one thing the historical non-zero overlay merge
+	// could not express. Non-empty values merge exactly as before. The
+	// default (false) preserves the historical behavior: absent and empty
+	// are indistinguishable, nothing is ever cleared.
+	Strict bool
+}
+
 // LoadAppWithDestination loads the base config and merges a destination overlay on top.
 // For example, -d staging loads teploy.yml then merges teploy.staging.yml over it.
-func LoadAppWithDestination(dir, dest string) (*AppConfig, error) {
+func LoadAppWithDestination(dir, dest string, opts OverlayOptions) (*AppConfig, error) {
 	base, err := LoadApp(dir)
 	if err != nil {
 		return nil, err
@@ -985,16 +998,22 @@ func LoadAppWithDestination(dir, dest string) (*AppConfig, error) {
 		}
 
 		var overlay AppConfig
+		var present map[string]any
 		if ext == ".toml" {
 			if err := unmarshalAppTOML(data, &overlay); err != nil {
 				return nil, fmt.Errorf("parsing %s: %w", name, err)
 			}
+			present = tomlTopLevelKeys(data)
 		} else {
 			if err := unmarshalAppYAML(data, &overlay); err != nil {
 				return nil, fmt.Errorf("parsing %s: %w", name, err)
 			}
+			present = yamlTopLevelKeys(data)
 		}
 
+		if opts.Strict {
+			clearExplicitEmpties(base, &overlay, present)
+		}
 		mergeConfigs(base, &overlay)
 		if err := base.validate(); err != nil {
 			return nil, fmt.Errorf("invalid config after merging %s: %w", name, err)
@@ -1003,6 +1022,72 @@ func LoadAppWithDestination(dir, dest string) (*AppConfig, error) {
 	}
 
 	return nil, fmt.Errorf("destination %q not found — expected teploy.%s.yml or teploy.%s.toml", dest, dest, dest)
+}
+
+// clearExplicitEmpties implements the strict-mode half of presence-aware
+// overlay semantics (F57): for every map/list field the overlay file names
+// explicitly with an empty value, reset the base's field so the subsequent
+// merge starts from nothing — writing `env: {}` in teploy.prod.yml then
+// MEANS "no env", instead of "keep base's env". Scalar fields are not
+// clearable (an empty scalar already has no effect under the merge, and a
+// zero-value int like port: 0 is more likely a mistake than a reset).
+func clearExplicitEmpties(base, overlay *AppConfig, present map[string]any) {
+	if present == nil {
+		return
+	}
+	if _, ok := present["servers"]; ok && len(overlay.Servers) == 0 {
+		base.Servers = nil
+	}
+	if _, ok := present["env_files"]; ok && len(overlay.EnvFiles) == 0 {
+		base.EnvFiles = nil
+	}
+	if _, ok := present["publish"]; ok && len(overlay.Publish) == 0 {
+		base.Publish = nil
+	}
+	if _, ok := present["volumes"]; ok && len(overlay.Volumes) == 0 {
+		base.Volumes = nil
+	}
+	if _, ok := present["processes"]; ok && len(overlay.Processes) == 0 {
+		base.Processes = nil
+	}
+	if _, ok := present["env"]; ok && len(overlay.Env) == 0 {
+		base.Env = nil
+	}
+	if _, ok := present["healthcheck"]; ok && len(overlay.Healthcheck) == 0 {
+		base.Healthcheck = nil
+	}
+	if _, ok := present["accessories"]; ok && len(overlay.Accessories) == 0 {
+		base.Accessories = nil
+	}
+	if _, ok := present["cache"]; ok && len(overlay.Cache) == 0 {
+		base.Cache = nil
+	}
+	if _, ok := present["headers"]; ok && len(overlay.Headers) == 0 {
+		base.Headers = nil
+	}
+	if _, ok := present["build"]; ok && len(overlay.Build) == 0 {
+		base.Build = nil
+	}
+}
+
+// yamlTopLevelKeys decodes just the top-level mapping keys of a YAML
+// document (nil for an empty document or a non-mapping one).
+func yamlTopLevelKeys(data []byte) map[string]any {
+	var doc map[string]any
+	if err := yaml.Unmarshal(data, &doc); err != nil {
+		return nil
+	}
+	return doc
+}
+
+// tomlTopLevelKeys decodes just the top-level table keys of a TOML
+// document.
+func tomlTopLevelKeys(data []byte) map[string]any {
+	var doc map[string]any
+	if err := toml.Unmarshal(data, &doc); err != nil {
+		return nil
+	}
+	return doc
 }
 
 // mergeConfigs applies non-zero values from overlay onto base (mutates base).

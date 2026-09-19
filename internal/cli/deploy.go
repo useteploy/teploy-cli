@@ -140,7 +140,7 @@ func runDeploy(flags *Flags, serverName, image, version string, skipDNSCheck boo
 	var appCfg *config.AppConfig
 	var err error
 	if destination != "" {
-		appCfg, err = config.LoadAppWithDestination(".", destination)
+		appCfg, err = config.LoadAppWithDestination(".", destination, config.OverlayOptions{Strict: flags.StrictEnv})
 	} else {
 		appCfg, err = config.LoadApp(".")
 	}
@@ -181,7 +181,11 @@ func runDeploy(flags *Flags, serverName, image, version string, skipDNSCheck boo
 	// file whose password contains a literal $ used to hand it to
 	// os.Expand at serialization time and silently alter it based on the
 	// operator's environment (audit F59); file/secret values are literal.
-	expandEnvTemplates(appCfg.Env)
+	// --strict-env (F57/TCL-32) turns an unset ${VAR} into a listed failure
+	// instead of a silent empty expansion.
+	if err := expandEnvTemplates(appCfg.Env, flags.StrictEnv); err != nil {
+		return err
+	}
 	if len(appCfg.EnvFiles) > 0 {
 		fileVars, err := env.LoadLocalEnvFiles(ctx, ".", appCfg.EnvFiles)
 		if err != nil {

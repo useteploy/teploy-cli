@@ -24,10 +24,37 @@ var validEnvKey = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 // os.Expand again — a decrypted password containing a literal $ used to be
 // substituted or emptied according to whatever happened to be in the
 // operator's environment at deploy time (audit F59).
-func expandEnvTemplates(env map[string]string) {
+//
+// strict (the opt-in --strict-env mode, audit F57/TCL-32) fails the deploy
+// listing every ${VAR} that is unset, instead of silently expanding it to
+// the empty string — a typo'd variable name currently deploys fine and
+// breaks at runtime. Default (non-strict) behavior is unchanged for
+// compatibility.
+func expandEnvTemplates(env map[string]string, strict bool) error {
 	for k, v := range env {
-		env[k] = os.Expand(v, os.Getenv)
+		var missing []string
+		expanded := os.Expand(v, func(name string) string {
+			if val, ok := os.LookupEnv(name); ok {
+				return val
+			}
+			missing = append(missing, name)
+			return ""
+		})
+		if strict && len(missing) > 0 {
+			seen := map[string]bool{}
+			var uniq []string
+			for _, m := range missing {
+				if !seen[m] {
+					seen[m] = true
+					uniq = append(uniq, m)
+				}
+			}
+			return fmt.Errorf("strict-env: env.%s references unset variable(s): %s — set %s or deploy without --strict-env",
+				k, strings.Join(uniq, ", "), strings.Join(uniq, ", "))
+		}
+		env[k] = expanded
 	}
+	return nil
 }
 
 // buildContainerEnvFiles computes the full container environment — values

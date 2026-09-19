@@ -300,7 +300,7 @@ func TestLoadAppWithDestination(t *testing.T) {
 	overlay := "domain: staging.myapp.com\nserver: staging-server\nport: 3001\n"
 	os.WriteFile(filepath.Join(dir, "teploy.staging.yml"), []byte(overlay), 0644)
 
-	cfg, err := LoadAppWithDestination(dir, "staging")
+	cfg, err := LoadAppWithDestination(dir, "staging", OverlayOptions{})
 	if err != nil {
 		t.Fatalf("LoadAppWithDestination: %v", err)
 	}
@@ -330,7 +330,7 @@ func TestLoadAppWithDestination_TOML(t *testing.T) {
 	overlay := "domain = \"staging.myapp.com\"\nserver = \"staging-box\"\n"
 	os.WriteFile(filepath.Join(dir, "teploy.staging.toml"), []byte(overlay), 0644)
 
-	cfg, err := LoadAppWithDestination(dir, "staging")
+	cfg, err := LoadAppWithDestination(dir, "staging", OverlayOptions{})
 	if err != nil {
 		t.Fatalf("LoadAppWithDestination TOML: %v", err)
 	}
@@ -360,7 +360,7 @@ processes:
 `
 	os.WriteFile(filepath.Join(dir, "teploy.staging.yml"), []byte(overlay), 0644)
 
-	cfg, err := LoadAppWithDestination(dir, "staging")
+	cfg, err := LoadAppWithDestination(dir, "staging", OverlayOptions{})
 	if err != nil {
 		t.Fatalf("LoadAppWithDestination: %v", err)
 	}
@@ -385,7 +385,7 @@ func TestLoadAppWithDestination_NotFound(t *testing.T) {
 	dir := t.TempDir()
 	os.WriteFile(filepath.Join(dir, "teploy.yml"), []byte("app: myapp\ndomain: myapp.com\n"), 0644)
 
-	_, err := LoadAppWithDestination(dir, "production")
+	_, err := LoadAppWithDestination(dir, "production", OverlayOptions{})
 	if err == nil {
 		t.Fatal("expected error when destination overlay not found")
 	}
@@ -456,7 +456,7 @@ assets:
 `
 	os.WriteFile(filepath.Join(dir, "teploy.staging.yml"), []byte(overlay), 0644)
 
-	cfg, err := LoadAppWithDestination(dir, "staging")
+	cfg, err := LoadAppWithDestination(dir, "staging", OverlayOptions{})
 	if err != nil {
 		t.Fatalf("LoadAppWithDestination: %v", err)
 	}

@@ -145,3 +145,47 @@ func TestBuildContainerEnvFiles_RejectsMultilineValues(t *testing.T) {
 		t.Fatalf("single-line values must still be accepted: %v", err)
 	}
 }
+
+// TestExpandEnvTemplates_StrictFailsOnUnset is TCL-32's opt-in: --strict-env
+// must fail listing every unset ${VAR} instead of silently expanding it to
+// the empty string; the default keeps the historical empty expansion.
+func TestExpandEnvTemplates_StrictFailsOnUnset(t *testing.T) {
+	t.Setenv("PRESENT_VAR", "value")
+
+	// Default: unset variables expand to empty (compat preserved).
+	env := map[string]string{"A": "${PRESENT_VAR}", "B": "${MISSING_VAR}"}
+	if err := expandEnvTemplates(env, false); err != nil {
+		t.Fatalf("default expansion must not fail: %v", err)
+	}
+	if env["A"] != "value" || env["B"] != "" {
+		t.Errorf("unexpected default expansion: %+v", env)
+	}
+
+	// Strict: unset variables fail the deploy, naming key and variables.
+	env = map[string]string{"A": "${PRESENT_VAR}", "B": "x${MISSING_ONE} y${MISSING_TWO}"}
+	err := expandEnvTemplates(env, true)
+	if err == nil {
+		t.Fatal("strict expansion must fail on unset variables")
+	}
+	for _, want := range []string{"env.B", "MISSING_ONE", "MISSING_TWO"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error should name %s, got: %v", want, err)
+		}
+	}
+	if strings.Contains(err.Error(), "PRESENT_VAR") {
+		t.Errorf("set variables must not be reported: %v", err)
+	}
+	// A failing strict expansion must not leave partial mutation.
+	if env["B"] != "x${MISSING_ONE} y${MISSING_TWO}" {
+		t.Errorf("failed strict expansion mutated the map: %+v", env)
+	}
+
+	// Strict with everything set succeeds.
+	env = map[string]string{"A": "${PRESENT_VAR}"}
+	if err := expandEnvTemplates(env, true); err != nil {
+		t.Fatalf("strict expansion with all variables set: %v", err)
+	}
+	if env["A"] != "value" {
+		t.Errorf("strict expansion value: %+v", env)
+	}
+}

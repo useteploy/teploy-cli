@@ -298,7 +298,7 @@ func resolveAppForKv(ctx context.Context, flags *Flags, appName string) (*config
 	var appCfg *config.AppConfig
 	var err error
 	if kvDestination != "" {
-		appCfg, err = config.LoadAppWithDestination(".", kvDestination)
+		appCfg, err = config.LoadAppWithDestination(".", kvDestination, config.OverlayOptions{})
 	} else {
 		appCfg, err = config.LoadApp(".")
 	}
