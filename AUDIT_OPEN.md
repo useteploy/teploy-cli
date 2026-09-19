@@ -13,12 +13,14 @@ almost all of them the same architectural tail pass 6 already carries, now
 with the round-2 evidence folded in.
 
 Open items: the pass-6 deferred tail minus the F14 family (resolved
-2026-09-18, bottom section: F13/F14/F20/F21 plus round-2's TCL-09/TCL-13/
-TCL-14 folded into them), the round-2 residual tail itemized in that
-section, and the dependent designs F04/F48/F49/F57/F16 that stay deferred
-with their annotations. The 2 upstream/owner items are closed (below). The
-two upstream items received from teploy-dash's 2026-09-17 pass are closed
-below.
+2026-09-18) and the F08/F16/F48/F49/F57 family (resolved 2026-09-18,
+bottom section: attempt-scoped artifacts, fenced locks, structured Caddy
+routes, strict-env — folding in round-2's TCL-04/TCL-05/TCL-24/TCL-32/
+TCL-51), the round-2 residual tail itemized in that section, and the
+dependent designs F04 (and its TCL-10/TCL-15 dependents) that stay
+deferred with their annotations. The 2 upstream/owner items are closed
+(below). The two upstream items received from teploy-dash's 2026-09-17
+pass are closed below.
 
 ## Resolved from this register
 
@@ -158,21 +160,29 @@ defect could corrupt data today.
   bounded by the per-app lock + content dedup).
 - F43 — Listener scoped to a private address/Unix socket reachable only
   by the Caddy bridge.
-- F45 — Exact managed-route snapshot/restore transaction (needs F48).
+- F45 — Exact managed-route snapshot/restore transaction (needs F48's
+  structured route representation — LANDED 2026-09-18, see the family
+  section; the transaction design itself remains open and can now be
+  built on ParseSites/ExtractPolicy).
 - F47 — Explicit HTTP/TCP/auto probe modes (compat fallback is
   deliberate and documented).
-- F48 — Maintenance mode preserving TLS/access layers (needs a structured
-  route representation, i.e. Caddy's adapt API — string fragments cannot
-  reconstruct policy faithfully).
-- F49 — Parser-based foreign-block adoption plans (whole-block-only rule
-  landed; partial matches now fail loudly at reload instead of deleting
-  another host's routes).
+- F48 — RESOLVED 2026-09-18 (see the F16/F08/F48/F49/F57 family section
+  at the bottom): maintenance preserves the site's TLS directive and
+  access gate, extracted from the parsed current block; plus a pre-write
+  adapt gate run by the SERVER's own caddy binary.
+- F49 — RESOLVED 2026-09-18 (see the F16/F08/F48/F49/F57 family section
+  at the bottom): parser-based foreign-block adoption with structured
+  partial matches (the foreign block keeps its remaining hosts and
+  directives); unparseable Caddyfiles abort the edit pre-write.
 - F50 — Splitting the public static tree from /deployments (filesystem
   layout migration across live servers; deliberate ops project).
 - F56 — Explicit pull policy (the warned local fallback is a deliberate
   out-of-band image story; changing it silently breaks offline deploys).
-- F57 — Presence-aware overlay semantics (explicit clearing of
-  maps/lists, null handling) — schema design decision.
+- F57 — RESOLVED 2026-09-18 as an opt-in (see the F16/F08/F48/F49/F57
+  family section at the bottom): --strict-env makes an explicitly-empty
+  map/list in a destination overlay CLEAR the base field. The default
+  stays presence-blind by the register's compat decision; promoting
+  strict to the default (if ever) is the remaining owner decision.
 - F60 — Protected full execution spec per release (public redacted
   snapshot keeps its current role). Largely delivered 2026-09-18 by F14's
   per-release record (full execution spec, 0600, server-side, embedded
@@ -299,9 +309,11 @@ into each rather than duplicated as new work items.
   name dedup (F03), publish+replicas rejected at validation. F21 RESOLVED
   2026-09-18 (F14-family section); the F04 remainder is unblocked by F14,
   design remains.
-- TCL-04 — F08 (attempt-scoped immutable artifacts under one lease).
-- TCL-05 — F16 (fencing/renewal). Containment added this round: the caddy
-  lock release is detached/bounded so cancellation cannot strand it.
+- TCL-04 — RESOLVED 2026-09-18 with F08 (family section at the bottom).
+- TCL-05 — RESOLVED 2026-09-18 with F16 (family section at the bottom);
+  the caddy-lock containment this round added is subsumed by the fenced
+  app lock (the caddy file lock stays short-lived and unfenced by
+  design).
 - TCL-08 — F05/F35 tail (durable journal). Contained pieces landed this
   round: cleanup failure reporting, caddy verify-failure compensation.
 - TCL-09 — RESOLVED 2026-09-18: F14/F13 landed (immutable per-release
@@ -325,15 +337,15 @@ into each rather than duplicated as new work items.
   per release), design remains.
 - TCL-17 — F47 tail (explicit HTTP/TCP/auto probe modes; the 404/3xx TCP
   fallback is documented deliberate compat).
-- TCL-24 — F49 tail (foreign-block adoption by brace counting; parser/
-  adapt-API based adoption is the fix).
+- TCL-24 — RESOLVED 2026-09-18 with F49 (family section at the bottom):
+  adoption is parser-based; brace counting is gone.
 - TCL-28 — F50 (split the public static tree from /deployments).
 - TCL-31 — env-encoder unification across accessory/seal writers. The
   app env writer validates records (F73); accessory credential values are
   generated (no newlines possible) — contained follow-up, registered.
-- TCL-32 — strict ${VAR} resolution (fail on unset). Product decision:
-  would break deploys that currently rely on empty expansion; needs an
-  explicit opt-in syntax. Owner decision.
+- TCL-32 — RESOLVED 2026-09-18 (family section at the bottom): the opt-in
+  landed as --strict-env / serve --strict-env / TEPLOY_STRICT_ENV=1;
+  default behavior unchanged per this entry's product decision.
 - TCL-33 — F24 (resumable OpenBao Setup; mandatory persistence landed).
 - TCL-34 — OpenBao agent readiness gate + token-sink isolation (new
   lifecycle surface; shares F24's step-journal design).
@@ -342,10 +354,11 @@ into each rather than duplicated as new work items.
 - TCL-37 — F05/F37 tail (readiness-gated accessory upgrade with verified
   recovery).
 - TCL-39 — static route-policy restore needs F13/F48; F13 landed 2026-09-18
-  (recorded serving config restored), F48 remains (structured route
-  representation for policy-layer preservation). Renderer input hardening
-  (header-name grammar, fallback charset) registered as the contained
-  follow-up inside that item.
+  (recorded serving config restored) and F48 landed 2026-09-18 (structured
+  route representation — ExtractPolicy — is now available for the
+  policy-layer preservation). The orchestrated restore design and the
+  renderer input hardening (header-name grammar, fallback charset) remain
+  the open follow-ups inside this item.
 - TCL-40 — restore under the app lock + writer quiescence (F37-adjacent;
   the orchestrated quiesce/cutover boundary is new lifecycle surface).
 - TCL-41 — F37 (engine-specific consistency contract; verify-backup
@@ -357,7 +370,8 @@ into each rather than duplicated as new work items.
 - TCL-48 — F42 (durable webhook queue).
 - TCL-49 — F40 (pin webhook builds to the event's commit).
 - TCL-50 — F60 (complete-plan fingerprint vs display digest).
-- TCL-51 — F57 (presence-aware overlay semantics).
+- TCL-51 — RESOLVED 2026-09-18 with F57's opt-in (family section at the
+  bottom).
 - TCL-54 — platform parity per builder (nixpacks --platform), DetectAt
   stat distinction, pinned installer. Medium; registered with F63's
   supply-chain work.
@@ -430,3 +444,80 @@ deferred as before — F14 does not unblock them.
 
 Gates at the closing commits: `go vet ./...` clean; `go test ./... -race`
 all packages ok. No push performed.
+
+## F16 / F08 / F48 / F49 / F57 family (2026-09-18) — resolved
+
+Four commits closing the architecture items the F14 keying surface
+unblocked, plus the strict-env owner decision. Gates at the closing
+commits: `go vet ./...` clean; `go test ./... -race` all packages ok. No
+push performed.
+
+- **F16 + TCL-05** (`3381947`) — `internal/state/lock.go`: every auto
+  lock carries a unique owner token (the fencing token) and is renewed in
+  the background every staleLockTTL/3; staleness is measured from the
+  last renewal, so a live-but-slow deploy is never falsely broken — the
+  stranding hazard the register warned about — while a dead holder still
+  self-heals after the historical 30-minute window. Effect sites verify
+  the fence before every effectful phase (deploy/rollback/static), and
+  the atomic state commit (`state.WriteFenced`) renames under the guard:
+  a broken holder's late write is refused with ErrFenceLost, never
+  applied. Recovery paths (restoring displaced containers, route
+  rollback, cleanup of one's own partial effects) are deliberately
+  UNFENCED — refusing to clean up is how a fencing design strands an app
+  mid-incident. The owner token doubles as the fencing token; a separate
+  monotonic counter adds nothing in this topology (the .lock dir on the
+  target is the single authority — refusal is exactly "does it still
+  name us"). MockExecutor evaluates the guard against its recorded file
+  state, so fence tests prove a refused effect never executes.
+- **F08 + TCL-04** (`fd93d7a`) — `internal/releasemeta/attempt.go`:
+  every deploy attempt mints (app, hash, random id) and writes its
+  artifacts immutable in the releasemeta namespace — build context at
+  meta/att/<hash>.<id>/build (rsync --link-dest against the previous
+  attempt restores incremental transfer and hardlink-shares unchanged
+  files), env file at meta/att/<hash>.<id>/env (the F14 record's
+  EnvFiles now names bytes no later attempt can overwrite), TLS at
+  /deployments/caddy/tls/att/<hash>.<id>/ (kept under the caddy tls dir
+  — the one mount every custom-TLS server provably has; container path
+  /etc/caddy/tls/att/…). The terminal deploy path acquires the fenced
+  lease BEFORE artifact generation, so attempts serialize at the source;
+  `teploy build` (lockless by design) builds into its own attempt dir
+  and can no longer interleave with a deploy's rsync. PruneAttempts
+  protects current + previous + pinned releases and fails closed on
+  unparsable entries (F78 parity). Rollback/LB TLS uploads keep the
+  legacy shared paths (nil attempt): pre-F14 records still reference
+  them and recorded releases override from the record.
+- **F48 + F49 + TCL-24** (`25f8118`) — `internal/caddy/routes.go` +
+  `adapt.go`: a vendored structural Caddyfile parser (site blocks with
+  verbatim bodies, global options, snippets, comments, quoted strings,
+  multi-line backtick literals, heredocs; loud errors on unbalanced
+  braces and top-level import). F49: foreign-block adoption is decided
+  on the parsed structure — whole-block when all hosts are adopted,
+  STRUCTURED PARTIAL when not (the foreign block keeps its remaining
+  hosts and its directives; the duplicate-site-address reload failure is
+  gone), managed regions never adopted, unparseable files abort the edit
+  pre-write. F48: SetMaintenance extracts the current block's tls
+  directive and basic_auth/forward_auth spans (ExtractPolicy) and
+  carries them into the maintenance block — no more silent TLS/auth
+  downgrade for the duration. The hard pre-write adapt gate runs the
+  SERVER's binary (docker exec -i caddy caddy adapt over stdin); a LOCAL
+  caddy is advisory only (version/module drift makes a local hard gate a
+  false-positive machine — found live with rate_limit under stock
+  caddy). Cross-checked against real caddy v2.10.2: parser host
+  extraction agrees with adapt's JSON on every fixture class, and the
+  F48/F49 outputs adapt cleanly (PATH-gated test; CI has no binary and
+  skips — the stub-binary tests cover the local-adapt plumbing).
+- **F57 + TCL-32 + TCL-51** (`4bb6a79`) — one opt-in flag, default off:
+  `--strict-env` (persistent) fails the deploy listing every unset
+  ${VAR} in teploy.yml's env: (terminal path, autodeploy serve flag, or
+  TEPLOY_STRICT_ENV=1 for already-installed units) and makes an
+  explicitly-empty map/list in a destination overlay CLEAR the base
+  field (`env: {}` / `publish: []` / TOML `publish = []`). Default
+  behavior byte-identical — the compat decision the register recorded.
+
+F04 dependency annotations (stay-out honored; recorded for its design
+pass): F08's attempt ids provide the artifact-side generation token F04
+wanted, and F08's early-lease restructure (`deployAppConfig` acquiring
+the fence before artifact generation) plus `DeployFenced`'s lock-handle
+parameter are the seam a generation handoff grows from. F45 can now
+build on ParseSites/ExtractPolicy. TCL-15's port allocation remains
+independent (the F14 record carries the resolved allocation).
