@@ -76,7 +76,7 @@ func (m *MockExecutor) Run(ctx context.Context, cmd string) (string, error) {
 			return c.Output, c.Err
 		}
 	}
-	if strings.HasPrefix(cmd, "mv -f -- ") || strings.HasPrefix(cmd, "rm -f -- ") {
+	if strings.HasPrefix(cmd, "mv -f -- ") || strings.HasPrefix(cmd, "rm -f -- ") || strings.HasPrefix(cmd, "rm -rf -- ") {
 		m.applyFileCommand(cmd)
 		m.mu.Unlock()
 		return "", nil
@@ -154,6 +154,17 @@ func (m *MockExecutor) applyFileCommand(cmd string) {
 	}
 	if len(fields) == 4 && fields[0] == "rm" && fields[1] == "-f" && fields[2] == "--" {
 		delete(m.Files, fields[3])
+	}
+	// rm -rf -- <dir>: a recursive removal deletes the directory AND every
+	// recorded file beneath it — the guarded lock release (state package,
+	// audit A04) removes /deployments/<app>/.lock and its info together.
+	if len(fields) == 4 && fields[0] == "rm" && fields[1] == "-rf" && fields[2] == "--" {
+		prefix := strings.TrimSuffix(fields[3], "/") + "/"
+		for p := range m.Files {
+			if p == fields[3] || strings.HasPrefix(p, prefix) {
+				delete(m.Files, p)
+			}
+		}
 	}
 }
 

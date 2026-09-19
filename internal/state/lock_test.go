@@ -217,3 +217,110 @@ func TestNilLockIsUnfencedPassthrough(t *testing.T) {
 	lk.StartRenewal(mock)
 	lk.StopRenewal()
 }
+
+// TestReleaseLockFenced_RefusesToReleaseSuccessorsLock is the A04 core
+// regression: after a takeover (the lock was broken and re-acquired by
+// another operation), the STALE holder's deferred release must leave the
+// successor's lock alone. The old unconditional rm -rf deleted it, letting
+// a third operation in concurrently with the successor.
+func TestReleaseLockFenced_RefusesToReleaseSuccessorsLock(t *testing.T) {
+	lk, mock := takeFencedLock(t, "myapp")
+	// Takeover: the server now names a different owner.
+	mock.Files["/deployments/myapp/.lock/info"] = []byte(`{"type":"auto","owner":"successor"}`)
+	ReleaseLockFenced(mock, lk, "myapp")
+	if _, ok := mock.Files["/deployments/myapp/.lock/info"]; !ok {
+		t.Fatal("stale holder's release deleted the successor's lock info")
+	}
+}
+
+// TestReleaseLockFenced_OwnerCheckRemovedOwnLock: with holdership intact,
+// the guarded release does remove the lock.
+func TestReleaseLockFenced_OwnerCheckRemovedOwnLock(t *testing.T) {
+	lk, mock := takeFencedLock(t, "myapp")
+	ReleaseLockFenced(mock, lk, "myapp")
+	if _, ok := mock.Files["/deployments/myapp/.lock/info"]; ok {
+		t.Fatal("expected the holder's own release to remove the lock info")
+	}
+}
+
+// TestReleaseLockFenced_WrongAppHandleRefused: a lease held for one app
+// must not release another app's lock (the A17 lease-correspondence rule).
+func TestReleaseLockFenced_WrongAppHandleRefused(t *testing.T) {
+	lk, mock := takeFencedLock(t, "myapp")
+	ReleaseLockFenced(mock, lk, "otherapp")
+	if _, ok := mock.Files["/deployments/myapp/.lock/info"]; !ok {
+		t.Fatal("a lease for myapp must not remove otherapp's (or any unrelated) lock state")
+	}
+	for _, c := range mock.Calls {
+		if strings.Contains(c, "otherapp") && strings.HasPrefix(strings.TrimPrefix(c, "grep -q "), "rm") {
+			t.Errorf("released another app's lock: %s", c)
+		}
+	}
+}
+
+// TestWriteFenced_UniqueStagingPerWrite is the A06 regression: two fenced
+// writers staging concurrently must not share a staging path — the fixed
+// state.json.tmp-fence name let a stale holder's bytes ride the successor's
+// guarded rename into authority.
+func TestWriteFenced_UniqueStagingPerWrite(t *testing.T) {
+	lk, mock := takeFencedLock(t, "myapp")
+	s := &AppState{SchemaVersion: SchemaVersionV2, CurrentHash: "h1"}
+	if err := WriteFenced(context.Background(), mock, "myapp", s, lk); err != nil {
+		t.Fatalf("WriteFenced: %v", err)
+	}
+	var uploads []string
+	for _, c := range mock.Calls {
+		if strings.HasPrefix(c, "UPLOAD:/deployments/myapp/state.json.tmp-") {
+			uploads = append(uploads, c)
+		}
+	}
+	if len(uploads) != 1 {
+		t.Fatalf("expected one staging upload, got %v", uploads)
+	}
+	if strings.Contains(uploads[0], "state.json.tmp-fence") {
+		t.Errorf("staging used the shared fixed name: %s", uploads[0])
+	}
+	if !strings.Contains(uploads[0], lk.Owner()) {
+		t.Errorf("staging name is not owner-scoped: %s", uploads[0])
+	}
+}
+
+// TestWriteFenced_WrongAppLeaseRefused: the state commit must verify the
+// lease belongs to the app whose state it renames (A17).
+func TestWriteFenced_WrongAppLeaseRefused(t *testing.T) {
+	lk, mock := takeFencedLock(t, "myapp")
+	s := &AppState{SchemaVersion: SchemaVersionV2, CurrentHash: "h1"}
+	if err := WriteFenced(context.Background(), mock, "otherapp", s, lk); err == nil {
+		t.Fatal("expected a refusal to commit otherapp's state under myapp's lease")
+	}
+	if _, ok := mock.Files["/deployments/otherapp/state.json"]; ok {
+		t.Error("refused write must not have committed anything")
+	}
+}
+
+// TestRenew_StagesOutsideLockDirAndUniqueNames: renewal staging must live
+// in the app directory (a stale renewal must never recreate a removed
+// .lock directory) under a unique name (A06).
+func TestRenew_StagesOutsideLockDirAndUniqueNames(t *testing.T) {
+	lk, mock := takeFencedLock(t, "myapp")
+	lk.StartRenewal(mock)
+	defer lk.StopRenewal()
+	if err := lk.renew(context.Background()); err != nil {
+		t.Fatalf("renew: %v", err)
+	}
+	if err := lk.renew(context.Background()); err != nil {
+		t.Fatalf("renew: %v", err)
+	}
+	var staged []string
+	for _, c := range mock.Calls {
+		if strings.HasPrefix(c, "UPLOAD:/deployments/myapp/.lock-info.tmp-") {
+			staged = append(staged, c)
+		}
+		if strings.HasPrefix(c, "UPLOAD:/deployments/myapp/.lock/info.renew") {
+			t.Errorf("renewal staged inside the lock dir under the old fixed name: %s", c)
+		}
+	}
+	if len(staged) != 2 || staged[0] == staged[1] {
+		t.Fatalf("expected two distinct owner-scoped staging names, got %v", staged)
+	}
+}
