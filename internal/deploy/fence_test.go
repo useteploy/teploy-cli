@@ -116,11 +116,13 @@ func TestDeployFenced_PrunesSupersededAttempts(t *testing.T) {
 	app := "fency"
 	mocks := fenceHappyPathMocks(app)
 	// Attempt prune: the artifact roots list an ancient attempt plus an
-	// unparsable stray; both roots' listings and the pin read succeed.
+	// unparsable stray; the pin read (ReadRemoteFile framing) and the
+	// retained-version inventory both succeed and report nothing extra.
 	mocks = append(mocks,
-		ssh.MockCommand{Match: "cat /deployments/fency/pins", Output: ""},
+		ssh.MockCommand{Match: "if [ ! -e '/deployments/fency/pinned' ]", Output: "absent"},
+		ssh.MockCommand{Match: "docker ps --all --filter label=teploy.app='fency'", Output: ""},
 		ssh.MockCommand{Match: "ls -1 /deployments/fency/meta/att", Output: "ancient.0000000000000003\nstray"},
-		ssh.MockCommand{Match: "ls -1 /deployments/caddy/tls/att", Output: "ancient.0000000000000003"},
+		ssh.MockCommand{Match: "ls -1 /deployments/caddy/tls/att/fency", Output: "ancient.0000000000000003"},
 		ssh.MockCommand{Match: "rm -rf ", Output: ""},
 	)
 	mock := ssh.NewMockExecutor("1.2.3.4", mocks...)

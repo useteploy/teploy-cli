@@ -35,10 +35,10 @@ func TestUploadAppTLS_AttemptScoped(t *testing.T) {
 	if err != nil {
 		t.Fatalf("uploadAppTLS: %v", err)
 	}
-	if want := "/etc/caddy/tls/att/" + att.Name() + "/myapp.crt"; cert != want {
+	if want := "/etc/caddy/tls/att/myapp/" + att.Name() + "/myapp.crt"; cert != want {
 		t.Errorf("cert container path: got %s want %s", cert, want)
 	}
-	if want := "/etc/caddy/tls/att/" + att.Name() + "/myapp.key"; key != want {
+	if want := "/etc/caddy/tls/att/myapp/" + att.Name() + "/myapp.key"; key != want {
 		t.Errorf("key container path: got %s want %s", key, want)
 	}
 	hostCert := att.TLSDir() + "/myapp.crt"
