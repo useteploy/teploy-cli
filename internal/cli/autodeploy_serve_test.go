@@ -295,3 +295,39 @@ func TestWebhookHandler_ContentReplayRejected(t *testing.T) {
 		t.Errorf("trigger called %d times for one unique signed body, want 1", triggerCount)
 	}
 }
+
+// TestWebhookHandler_ReusedDeliveryIDDifferentContentNotSuppressed is the
+// A36 regression: the (unauthenticated) delivery-ID header must never
+// suppress DISTINCT authenticated content — a provider reusing an ID with
+// a different signed body is a new event, and only content dedup decides
+// replays.
+func TestWebhookHandler_ReusedDeliveryIDDifferentContentNotSuppressed(t *testing.T) {
+	secret := "s3cret"
+	body1 := []byte(`{"ref":"refs/heads/main","after":"aaaa"}`)
+	body2 := []byte(`{"ref":"refs/heads/main","after":"bbbb"}`)
+	triggerCount := 0
+	handler := newWebhookHandler(webhookHandlerConfig{
+		secret: secret,
+		dedup:  autodeploy.NewDeliveryDedup(),
+		logf:   func(string, ...any) {},
+		trigger: func(_ []string, _ bool) {
+			triggerCount++
+		},
+	})
+	post := func(body []byte) {
+		req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(string(body)))
+		req.Header.Set("X-Hub-Signature-256", githubSign(secret, body))
+		req.Header.Set("X-GitHub-Delivery", "same-delivery-id")
+		handler(httptest.NewRecorder(), req)
+	}
+	post(body1)
+	post(body2)
+	if triggerCount != 2 {
+		t.Errorf("distinct authenticated content under a reused delivery ID must both deploy, got %d", triggerCount)
+	}
+	// The SAME content replays to a no-op regardless of the header.
+	post(body1)
+	if triggerCount != 2 {
+		t.Errorf("replayed content must be a no-op, got %d", triggerCount)
+	}
+}

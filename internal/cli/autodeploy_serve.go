@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -104,14 +105,31 @@ func runAutoDeployServe(app, branch string, port int, strictEnv bool) error {
 		fmt.Fprintf(out, "%s "+format+"\n", append([]any{time.Now().UTC().Format(time.RFC3339)}, args...)...)
 	}
 
+	// Dedup persistence is serialized AND atomic (audit A36): two
+	// concurrent requests used to snapshot and os.WriteFile the same file
+	// independently, so an older snapshot could overwrite a newer one,
+	// overlapping writes could truncate, and every error was ignored.
+	var dedupMu sync.Mutex
 	handler := newWebhookHandler(webhookHandlerConfig{
 		secret: secret,
 		branch: branch,
 		dedup:  dedup,
 		logf:   logf,
 		onDedupChanged: func() {
-			if snap, err := dedup.Snapshot(); err == nil {
-				_ = os.WriteFile(dedupPath, snap, 0600)
+			dedupMu.Lock()
+			defer dedupMu.Unlock()
+			snap, err := dedup.Snapshot()
+			if err != nil {
+				logf("could not snapshot webhook dedup state: %v", err)
+				return
+			}
+			tmp := dedupPath + ".tmp"
+			if err := os.WriteFile(tmp, snap, 0600); err != nil {
+				logf("could not persist webhook dedup state: %v", err)
+				return
+			}
+			if err := os.Rename(tmp, dedupPath); err != nil {
+				logf("could not publish webhook dedup state: %v", err)
 			}
 		},
 		trigger: func(changedFiles []string, filesKnown bool) {
@@ -235,24 +253,17 @@ func newWebhookHandler(cfg webhookHandlerConfig) http.HandlerFunc {
 		// Replay protection is keyed on the AUTHENTICATED CONTENT, not the
 		// unauthenticated delivery-ID header: a captured signed body could
 		// be replayed under a fresh (or absent) delivery ID and bypass an
-		// ID-only dedup (audit F41). The delivery ID is kept as a second
-		// key so provider retries of the same delivery are also no-ops.
+		// ID-only dedup (audit F41). Every legitimate provider retry
+		// replays the SAME signed body, so content dedup covers them all;
+		// the delivery ID is kept as log metadata only — a REUSED delivery
+		// ID carrying different authenticated content used to suppress a
+		// distinct event (audit A36).
 		contentSum := sha256.Sum256(body)
 		contentID := "content:" + hex.EncodeToString(contentSum[:])
 		if cfg.dedup.SeenAndRecord(contentID) {
 			w.WriteHeader(http.StatusOK)
 			if cfg.logf != nil {
 				cfg.logf("ignored replayed webhook content")
-			}
-			return
-		}
-		if deliveryID != "" && cfg.dedup.SeenAndRecord(deliveryID) {
-			// 200, not an error status — this is a provider retry/replay
-			// of a delivery we already handled, an intentional no-op, not
-			// a failure the provider should retry harder on.
-			w.WriteHeader(http.StatusOK)
-			if cfg.logf != nil {
-				cfg.logf("ignored replayed delivery %s", deliveryID)
 			}
 			return
 		}
@@ -273,7 +284,11 @@ func newWebhookHandler(cfg webhookHandlerConfig) http.HandlerFunc {
 
 		w.WriteHeader(http.StatusOK)
 		if cfg.logf != nil {
-			cfg.logf("accepted webhook, triggering deploy")
+			if deliveryID != "" {
+				cfg.logf("accepted webhook (delivery %s), triggering deploy", deliveryID)
+			} else {
+				cfg.logf("accepted webhook, triggering deploy")
+			}
 		}
 		if cfg.trigger != nil {
 			// Parse the changed-file set from the push body for monorepo

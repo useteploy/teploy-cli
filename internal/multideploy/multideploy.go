@@ -26,11 +26,23 @@ type Result struct {
 }
 
 // PrefixWriter wraps a writer to prefix each line with a server name.
+//
+// A single writer can be handed to BOTH stdout and stderr of one command
+// (docker.ScanImage does exactly that), so concurrent stream copies race
+// on the buffer unless writes are serialized — and a newline-free write
+// of unbounded length used to grow the partial-line buffer without cap
+// (audit A51). The buffer is mutex-protected and capped; a fragment that
+// reaches the cap is flushed as its own prefixed line (mid-"line" prefix
+// tradeoff documented here rather than buffering without bound).
 type PrefixWriter struct {
+	mu     sync.Mutex
 	prefix string
 	w      io.Writer
 	buf    []byte // partial line buffer
 }
+
+// fragmentLimit caps a single buffered partial line.
+const fragmentLimit = 64 << 10
 
 // NewPrefixWriter creates a writer that prefixes each line with the given string.
 func NewPrefixWriter(prefix string, w io.Writer) *PrefixWriter {
@@ -41,30 +53,41 @@ func NewPrefixWriter(prefix string, w io.Writer) *PrefixWriter {
 }
 
 func (pw *PrefixWriter) Write(p []byte) (n int, err error) {
-	pw.buf = append(pw.buf, p...)
-	for {
-		idx := bytes.IndexByte(pw.buf, '\n')
-		if idx < 0 {
-			break
+	pw.mu.Lock()
+	defer pw.mu.Unlock()
+	consumed := 0
+	for consumed < len(p) {
+		room := fragmentLimit - len(pw.buf)
+		n := min(room, len(p)-consumed)
+		piece := p[consumed : consumed+n]
+		if i := bytes.IndexByte(piece, '\n'); i >= 0 {
+			piece = piece[:i+1]
+			n = i + 1
 		}
-		line := pw.buf[:idx+1]
-		_, err = fmt.Fprintf(pw.w, "%s%s", pw.prefix, line)
-		if err != nil {
-			return len(p), err
+		pw.buf = append(pw.buf, piece...)
+		consumed += n
+		if pw.buf[len(pw.buf)-1] == '\n' || len(pw.buf) >= fragmentLimit {
+			if _, werr := pw.w.Write(append([]byte(pw.prefix), pw.buf...)); werr != nil {
+				// Do not blindly replay a partially written fragment.
+				pw.buf = nil
+				return consumed, werr
+			}
+			pw.buf = nil
 		}
-		pw.buf = pw.buf[idx+1:]
 	}
 	return len(p), nil
 }
 
 // Flush writes any remaining partial line in the buffer.
 func (pw *PrefixWriter) Flush() error {
-	if len(pw.buf) > 0 {
-		_, err := fmt.Fprintf(pw.w, "%s%s\n", pw.prefix, pw.buf)
-		pw.buf = nil
-		return err
+	pw.mu.Lock()
+	defer pw.mu.Unlock()
+	if len(pw.buf) == 0 {
+		return nil
 	}
-	return nil
+	_, err := pw.w.Write(append(append([]byte(pw.prefix), pw.buf...), '\n'))
+	pw.buf = nil
+	return err
 }
 
 // syncWriter wraps an io.Writer with a mutex for concurrent safety.
@@ -117,17 +140,29 @@ func parallelDeploy(ctx context.Context, servers []ServerTarget, parallel int, f
 	failed := false
 
 	for i, server := range servers {
-		wg.Add(1)
-		sem <- struct{}{} // acquire semaphore (blocks until a slot is free)
+		// Acquire with cancellation (A51): a cancelled fleet operation used
+		// to keep waiting for slots and launch callbacks after the caller
+		// had already given up. The slot is taken BEFORE the goroutine (and
+		// the fail-fast skip) so bookkeeping stays balanced on every path.
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			results[i] = Result{
+				Server:  server.Name,
+				Success: false,
+				Error:   fmt.Errorf("skipped: %w", ctx.Err()),
+			}
+			continue
+		}
 
 		// Fail-fast: if a previous deploy failed, skip the rest. Disabled for
 		// best-effort (rollback) runs, which must attempt every server.
 		if failFast {
 			mu.Lock()
-			if failed {
-				mu.Unlock()
+			f := failed
+			mu.Unlock()
+			if f {
 				<-sem
-				wg.Done()
 				results[i] = Result{
 					Server:  server.Name,
 					Success: false,
@@ -135,15 +170,31 @@ func parallelDeploy(ctx context.Context, servers []ServerTarget, parallel int, f
 				}
 				continue
 			}
-			mu.Unlock()
 		}
 
+		// Re-check cancellation after (possibly) waiting for the slot.
+		if err := ctx.Err(); err != nil {
+			<-sem
+			results[i] = Result{
+				Server:  server.Name,
+				Success: false,
+				Error:   fmt.Errorf("skipped: %w", err),
+			}
+			continue
+		}
+
+		wg.Add(1)
 		go func(idx int, srv ServerTarget) {
 			defer wg.Done()
+			defer func() { <-sem }()
 
 			pw := NewPrefixWriter(fmt.Sprintf("[%s] ", srv.Name), sw)
 			err := deployFn(ctx, srv, pw)
-			pw.Flush()
+			// Flush failure is part of the outcome — output the fleet
+			// operator sees must not silently stop mid-line (A51).
+			if ferr := pw.Flush(); err == nil && ferr != nil {
+				err = ferr
+			}
 
 			results[idx] = Result{
 				Server:  srv.Name,
@@ -156,8 +207,6 @@ func parallelDeploy(ctx context.Context, servers []ServerTarget, parallel int, f
 				failed = true
 				mu.Unlock()
 			}
-
-			<-sem // release semaphore after setting failed flag
 		}(i, server)
 	}
 

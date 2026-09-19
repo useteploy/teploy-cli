@@ -3,6 +3,7 @@ package multideploy
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -282,5 +283,102 @@ func TestFormatResults(t *testing.T) {
 	}
 	if !strings.Contains(output, "app3: skipped") {
 		t.Errorf("expected 'app3: skipped' in output: %s", output)
+	}
+}
+
+// TestPrefixWriter_ConcurrentWritesAreLineSafe is the A51 regression: two
+// concurrent writers into ONE PrefixWriter (stdout+stderr of the same
+// command) must not interleave partial lines, and every flushed line
+// carries the prefix.
+func TestPrefixWriter_ConcurrentWritesAreLineSafe(t *testing.T) {
+	var sink lockedBuffer
+	pw := NewPrefixWriter("[srv] ", &sink)
+	var wg sync.WaitGroup
+	for g := 0; g < 8; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 200; i++ {
+				if _, err := pw.Write([]byte("line-of-output\n")); err != nil {
+					t.Errorf("write: %v", err)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	if err := pw.Flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	for _, line := range strings.Split(strings.TrimSuffix(sink.String(), "\n"), "\n") {
+		if line != "[srv] line-of-output" {
+			t.Fatalf("interleaved or unprefixed line: %q", line)
+		}
+	}
+	if n := strings.Count(sink.String(), "line-of-output"); n != 8*200 {
+		t.Fatalf("lost output: got %d lines want %d", n, 8*200)
+	}
+}
+
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// TestPrefixWriter_BoundsUn newlineFreeOutput: a newline-free write larger
+// than the fragment cap is flushed in capped pieces instead of buffering
+// without bound (A51).
+func TestPrefixWriter_BoundsNewlineFreeOutput(t *testing.T) {
+	var sink bytes.Buffer
+	pw := NewPrefixWriter("[srv] ", &sink)
+	big := strings.Repeat("x", 200<<10)
+	if _, err := pw.Write([]byte(big)); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	// The buffer must never hold more than the cap.
+	pw.mu.Lock()
+	buffered := len(pw.buf)
+	pw.mu.Unlock()
+	if buffered > 64<<10 {
+		t.Errorf("partial-line buffer exceeded the cap: %d", buffered)
+	}
+	if err := pw.Flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	if got := sink.Len(); got < 200<<10 {
+		t.Errorf("output was lost: %d bytes written of %d", got, 200<<10)
+	}
+}
+
+// TestParallelDeploy_CancelledContextSkipsWaitingServers is the A51
+// regression: a cancelled fleet operation must not wait for concurrency
+// slots or launch callbacks — every server reports a context skip.
+func TestParallelDeploy_CancelledContextSkipsWaitingServers(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancelled before the fleet even starts
+	var launched atomic.Int32
+	targets := []ServerTarget{{Name: "a"}, {Name: "b"}, {Name: "c"}}
+	results := ParallelDeploy(ctx, targets, 2, func(ctx context.Context, srv ServerTarget, out io.Writer) error {
+		launched.Add(1)
+		return nil
+	}, io.Discard)
+	if got := launched.Load(); got != 0 {
+		t.Errorf("a cancelled fleet launched %d callbacks", got)
+	}
+	for _, r := range results {
+		if r.Success || !errors.Is(r.Error, context.Canceled) {
+			t.Errorf("server %s should report a context skip, got %+v", r.Server, r)
+		}
 	}
 }
