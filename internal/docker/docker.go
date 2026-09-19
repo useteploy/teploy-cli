@@ -3,8 +3,10 @@ package docker
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"sort"
 	"strconv"
 	"strings"
@@ -55,6 +57,26 @@ type RunConfig struct {
 	CPU           string            // CPU limit, e.g. "1.0"
 	Name          string            // explicit container name (overrides auto-generated)
 	NoHealthcheck bool              // pass --no-healthcheck so the container ignores the image HEALTHCHECK
+}
+
+// publishBinding renders a docker -p binding "[ip:]host:container" with
+// the bind IP correctly bracketed for IPv6 (A19) and both ports validated.
+// The bind must be an IP literal — docker requires one for an explicit
+// bind, and the health-probe builder already validates the same value, so
+// a hostname here could only ever produce a deploy that fails its own
+// health checks.
+func publishBinding(bind string, hostPort, containerPort int) (string, error) {
+	normalized := strings.TrimSuffix(strings.TrimPrefix(bind, "["), "]")
+	if net.ParseIP(normalized) == nil {
+		return "", fmt.Errorf("publish bind %q must be an IP address", bind)
+	}
+	if hostPort < 1 || hostPort > 65535 {
+		return "", fmt.Errorf("host port %d must be in 1..65535", hostPort)
+	}
+	if containerPort < 1 || containerPort > 65535 {
+		return "", fmt.Errorf("container port %d must be in 1..65535", containerPort)
+	}
+	return net.JoinHostPort(normalized, strconv.Itoa(hostPort)) + ":" + strconv.Itoa(containerPort), nil
 }
 
 // ContainerName returns the standard teploy container name: {app}-{process}-{version}.
@@ -144,12 +166,10 @@ func (c *Client) Run(ctx context.Context, cfg RunConfig) (string, error) {
 
 	// Port publishing and PORT env var injection.
 	if cfg.Port > 0 {
-		hostPort := strconv.Itoa(cfg.Port)
 		containerPort := cfg.ContainerPort
 		if containerPort == 0 {
 			containerPort = 80
 		}
-		cPortStr := strconv.Itoa(containerPort)
 		// Default: bind the published port to localhost only. Caddy reaches the
 		// container over the teploy network via its network alias (see
 		// InternalPort), so this host mapping exists solely for local health
@@ -157,11 +177,20 @@ func (c *Client) Run(ctx context.Context, cfg RunConfig) (string, error) {
 		// high port — bypassing Caddy/TLS, and Docker bypasses UFW — so we
 		// restrict it to 127.0.0.1 unless the caller opts into a wider bind
 		// (ingress: host sets BindHost to 0.0.0.0 for a directly-reachable port).
+		//
+		// The binding is built with net.JoinHostPort and validated as an IP
+		// (A19): a bare IPv6 bind such as ::1 used to concatenate into an
+		// ambiguous "::1:49152:80" that docker could only misparse, and the
+		// result is now quoted like every other interpolated argument.
 		bindHost := cfg.BindHost
 		if bindHost == "" {
 			bindHost = "127.0.0.1"
 		}
-		args = append(args, "-p", bindHost+":"+hostPort+":"+cPortStr, "-e", "PORT="+cPortStr)
+		binding, err := publishBinding(bindHost, cfg.Port, containerPort)
+		if err != nil {
+			return "", err
+		}
+		args = append(args, "-p", q(binding), "-e", "PORT="+strconv.Itoa(containerPort))
 	}
 
 	// Extra host port mappings (AppConfig.Publish), kept separate from the
@@ -425,6 +454,12 @@ func (c *Client) Remove(ctx context.Context, name string) error {
 // state.AppState.PreviousPort, which only ever remembers the single most
 // recent previous version — inspection works for --to <hash> rolling back
 // further than that.
+//
+// This is the LEGACY fallback for releases without a recorded primary port
+// (TCL-14): a container publishing MULTIPLE distinct host ports (publish:
+// entries) has no inspect-derived primary, and the old first-field pick
+// could probe an auxiliary listener — that ambiguity is now an error, and
+// callers prefer the record's designated primary (HostPortFor).
 func (c *Client) HostPort(ctx context.Context, name string) (int, error) {
 	out, err := c.exec.Run(ctx, fmt.Sprintf(
 		"docker inspect -f '{{range $p, $b := .NetworkSettings.Ports}}{{range $b}}{{.HostPort}} {{end}}{{end}}' %s",
@@ -436,6 +471,13 @@ func (c *Client) HostPort(ctx context.Context, name string) (int, error) {
 	fields := strings.Fields(out)
 	if len(fields) == 0 {
 		return 0, fmt.Errorf("container %s has no host-mapped ports", name)
+	}
+	distinct := map[string]bool{}
+	for _, f := range fields {
+		distinct[f] = true
+	}
+	if len(distinct) > 1 {
+		return 0, fmt.Errorf("container %s publishes multiple host ports (%s) and has no recorded primary — its release record (TCL-14) is required to pick one", name, strings.Join(fields, ","))
 	}
 	port, err := strconv.Atoi(fields[0])
 	if err != nil {
@@ -464,6 +506,13 @@ func (c *Client) HostBindIP(ctx context.Context, name string) string {
 	if len(fields) == 0 {
 		return ""
 	}
+	// A container whose ports bind DIFFERENT addresses has no single
+	// answer (A21) — report "cannot determine" rather than picking one.
+	for _, f := range fields {
+		if f != fields[0] {
+			return ""
+		}
+	}
 	return fields[0]
 }
 
@@ -485,7 +534,18 @@ func (c *Client) InternalPort(ctx context.Context, name string) (int, error) {
 	if len(fields) == 0 {
 		return 0, fmt.Errorf("container %s has no exposed ports", name)
 	}
-	// Take the first port — teploy only publishes one per container.
+	distinct := map[string]bool{}
+	for _, f := range fields {
+		distinct[f] = true
+	}
+	// teploy containers publish one primary port, but publish: entries and
+	// multi-EXPOSE images make multi-port containers real — picking the
+	// first field could route Caddy at an auxiliary listener (A21). The
+	// record's designated primary (TCL-14) is the authority; inspection
+	// alone must refuse the guess.
+	if len(distinct) > 1 {
+		return 0, fmt.Errorf("container %s exposes multiple ports (%s) and has no recorded primary — its release record (TCL-14) is required to pick one", name, strings.Join(fields, ","))
+	}
 	portStr, _, _ := strings.Cut(fields[0], "/")
 	port, err := strconv.Atoi(portStr)
 	if err != nil {
@@ -517,9 +577,10 @@ func (c *Client) ListContainers(ctx context.Context, app string) ([]Container, e
 // to bound the disk footprint of past deploys while keeping the current
 // version + a rollback window.
 //
-// Returns the list of pruned versions and a non-nil error only when the
-// initial container listing fails. Per-container removal failures are
-// non-fatal — this is best-effort disk cleanup, not a deploy gate.
+// Returns the list of versions whose containers were all removed (A25: a
+// version with a failed container removal is NOT reported as pruned) plus
+// a joined error describing every failed removal. Per-version image
+// removal stays best-effort (a shared image legitimately refuses).
 func (c *Client) PruneVersions(ctx context.Context, app string, keep int, protectedVersions ...string) ([]string, error) {
 	if keep < 0 {
 		keep = 0
@@ -599,6 +660,7 @@ func (c *Client) PruneVersions(ctx context.Context, app string, keep int, protec
 	}
 
 	var pruned []string
+	var failures []error
 	for _, e := range sorted {
 		if protect[e.version] {
 			continue
@@ -606,8 +668,16 @@ func (c *Client) PruneVersions(ctx context.Context, app string, keep int, protec
 		// Force-remove containers in case any are still running. We
 		// already took ownership of cleanup; refusing to nuke a stray
 		// running container from an older version defeats the point.
+		// A version counts as pruned ONLY when every container removal
+		// succeeded (A25) — the old loop counted it regardless, so
+		// "Pruned N" could report versions whose containers were still
+		// running, hiding disk exhaustion and failed cleanup.
+		complete := true
 		for _, name := range e.info.containerNames {
-			_, _ = c.exec.Run(ctx, "docker rm -f "+ssh.ShellQuote(name))
+			if _, err := c.exec.Run(ctx, "docker rm -f "+ssh.ShellQuote(name)); err != nil {
+				complete = false
+				failures = append(failures, fmt.Errorf("removing container %s (version %s): %w", name, e.version, err))
+			}
 		}
 		// Best-effort image removal. Fails (silently) if another
 		// container or tag still references the image, which is the
@@ -615,9 +685,11 @@ func (c *Client) PruneVersions(ctx context.Context, app string, keep int, protec
 		for img := range e.info.images {
 			_, _ = c.exec.Run(ctx, "docker rmi "+ssh.ShellQuote(img))
 		}
-		pruned = append(pruned, e.version)
+		if complete {
+			pruned = append(pruned, e.version)
+		}
 	}
-	return pruned, nil
+	return pruned, errors.Join(failures...)
 }
 
 // EnsureNetwork creates the "teploy" Docker network if it doesn't already exist.

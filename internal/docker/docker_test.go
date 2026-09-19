@@ -2,6 +2,7 @@ package docker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -137,7 +138,7 @@ func TestClient_Run(t *testing.T) {
 		"--label 'teploy.app=myapp'",
 		"--label 'teploy.process=web'",
 		"--label 'teploy.version=abc123'",
-		"-p 127.0.0.1:49152:80",
+		"-p '127.0.0.1:49152:80'",
 		"-e PORT=80",
 		"--log-opt max-size=10m",
 		"'nginx:latest'",
@@ -168,7 +169,7 @@ func TestClient_Run_Publish(t *testing.T) {
 
 	cmd := mock.Calls[0]
 	for _, want := range []string{
-		"-p 127.0.0.1:3000:80",
+		"-p '127.0.0.1:3000:80'",
 		"-e PORT=80",
 		"-p '0.0.0.0:3001:3001'",
 	} {
@@ -729,5 +730,115 @@ func TestClient_RestartQuotesInspectMetadata(t *testing.T) {
 		if !strings.Contains(run, want) {
 			t.Errorf("docker run missing quoted %q in: %s", want, run)
 		}
+	}
+}
+
+// TestPublishBinding_IPv6AndValidation is the A19 regression: a bare IPv6
+// bind renders bracketed, and non-IP binds / out-of-range ports are
+// rejected instead of concatenated into ambiguous docker arguments.
+func TestPublishBinding_IPv6AndValidation(t *testing.T) {
+	if got, err := publishBinding("::1", 49152, 80); err != nil || got != "[::1]:49152:80" {
+		t.Errorf("bare IPv6: got %q err %v", got, err)
+	}
+	if got, err := publishBinding("[::1]", 49152, 80); err != nil || got != "[::1]:49152:80" {
+		t.Errorf("bracketed IPv6: got %q err %v", got, err)
+	}
+	if _, err := publishBinding("", 49152, 80); err == nil {
+		t.Error("an empty bind must be rejected here (the caller supplies the default)")
+	}
+	for _, tc := range []struct{ bind string; hp, cp int }{
+		{"host.example.com", 49152, 80},
+		{"127.0.0.1", 0, 80},
+		{"127.0.0.1", 65536, 80},
+		{"127.0.0.1", 49152, 0},
+	} {
+		if _, err := publishBinding(tc.bind, tc.hp, tc.cp); err == nil {
+			t.Errorf("expected rejection for %+v", tc)
+		}
+	}
+}
+
+// TestClient_Run_IPv6BindRendered: the run command carries one quoted,
+// bracketed -p argument for an IPv6 bind (A19).
+func TestClient_Run_IPv6BindRendered(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4", ssh.MockCommand{Match: "docker run", Output: "abc123"})
+	client := NewClient(mock)
+	if _, err := client.Run(context.Background(), RunConfig{
+		App: "myapp", Process: "web", Version: "v1", Image: "i:latest",
+		Port: 49152, BindHost: "::1", ContainerPort: 80,
+	}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	found := false
+	for _, c := range mock.Calls {
+		if strings.Contains(c, "-p '[::1]:49152:80'") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected quoted bracketed -p binding, calls: %v", mock.Calls)
+	}
+}
+
+// TestClient_PortInspectors_RefuseAmbiguity is the A21 regression: with
+// multiple distinct exposed/host ports (publish: entries), the legacy
+// first-field picks are guesses — the helpers must fail (or, for the bind
+// IP, report undeterminable) instead of routing/probing an auxiliary
+// listener.
+func TestClient_PortInspectors_RefuseAmbiguity(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "docker inspect -f '{{range $p, $_ := .NetworkSettings.Ports}}", Output: "3000/tcp 8080/tcp "},
+		ssh.MockCommand{Match: "docker inspect -f '{{range $p, $b := .NetworkSettings.Ports}}{{range $b}}{{.HostPort}}", Output: "49153 3001 "},
+		ssh.MockCommand{Match: "docker inspect -f '{{range $p, $b := .NetworkSettings.Ports}}{{range $b}}{{.HostIp}}", Output: "127.0.0.1 0.0.0.0 "},
+	)
+	client := NewClient(mock)
+	ctx := context.Background()
+	if _, err := client.InternalPort(ctx, "multi"); err == nil || !strings.Contains(err.Error(), "multiple ports") {
+		t.Errorf("InternalPort must refuse a multi-port container: %v", err)
+	}
+	if _, err := client.HostPort(ctx, "multi"); err == nil || !strings.Contains(err.Error(), "multiple host ports") {
+		t.Errorf("HostPort must refuse a multi-port container: %v", err)
+	}
+	if ip := client.HostBindIP(ctx, "multi"); ip != "" {
+		t.Errorf("HostBindIP must report undeterminable on mixed binds, got %q", ip)
+	}
+	// Single-port answers are unchanged.
+	mock2 := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "docker inspect -f '{{range $p, $_ := .NetworkSettings.Ports}}", Output: "8080/tcp "},
+		ssh.MockCommand{Match: "docker inspect -f '{{range $p, $b := .NetworkSettings.Ports}}{{range $b}}{{.HostPort}}", Output: "49153 "},
+		ssh.MockCommand{Match: "docker inspect -f '{{range $p, $b := .NetworkSettings.Ports}}{{range $b}}{{.HostIp}}", Output: "0.0.0.0 0.0.0.0 "},
+	)
+	c2 := NewClient(mock2)
+	if p, err := c2.InternalPort(ctx, "single"); err != nil || p != 8080 {
+		t.Errorf("InternalPort single: %d %v", p, err)
+	}
+	if p, err := c2.HostPort(ctx, "single"); err != nil || p != 49153 {
+		t.Errorf("HostPort single: %d %v", p, err)
+	}
+	if ip := c2.HostBindIP(ctx, "single"); ip != "0.0.0.0" {
+		t.Errorf("HostBindIP single: %q", ip)
+	}
+}
+
+// TestPruneVersions_FailedRemovalNotReportedPruned is the A25 regression:
+// a version whose container removal fails is not counted as pruned, and
+// the failure is returned.
+func TestPruneVersions_FailedRemovalNotReportedPruned(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "docker ps --all", Output: strings.Join([]string{
+			`{"ID":"a","Names":"myapp-web-v1","Image":"myapp:v1","State":"running","Status":"Up","CreatedAt":"2026-01-01 00:00:00 +0000 UTC","Labels":"teploy.app=myapp,teploy.version=v1"}`,
+			`{"ID":"b","Names":"myapp-web-v2","Image":"myapp:v2","State":"running","Status":"Up","CreatedAt":"2026-01-02 00:00:00 +0000 UTC","Labels":"teploy.app=myapp,teploy.version=v2"}`,
+		}, "\n")},
+		ssh.MockCommand{Match: "docker rm -f 'myapp-web-v1'", Err: errors.New("device busy")},
+		ssh.MockCommand{Match: "docker rm -f", Output: ""},
+		ssh.MockCommand{Match: "docker rmi", Output: ""},
+	)
+	client := NewClient(mock)
+	pruned, err := client.PruneVersions(context.Background(), "myapp", 1, "v2")
+	if err == nil || !strings.Contains(err.Error(), "myapp-web-v1") {
+		t.Fatalf("expected the failed removal to be reported, got %v", err)
+	}
+	if len(pruned) != 0 {
+		t.Errorf("a version with a failed container removal must not be reported as pruned, got %v", pruned)
 	}
 }
