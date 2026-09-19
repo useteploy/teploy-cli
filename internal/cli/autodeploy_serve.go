@@ -295,10 +295,14 @@ func triggerAutoDeploy(ctx context.Context, executor ssh.Executor, app, branch, 
 	if err := state.EnsureAppDir(ctx, executor, app); err != nil {
 		return fmt.Errorf("creating app directory: %w", err)
 	}
-	if err := state.AcquireLock(ctx, executor, app); err != nil {
+	// Fenced acquisition (F16): the lease spans fetch → build → deploy, and
+	// the deploy's effect sites verify the fence.
+	lk, err := state.AcquireLockFenced(ctx, executor, app)
+	if err != nil {
 		return fmt.Errorf("acquiring deploy lock: %w", err)
 	}
-	defer state.ReleaseLockDetached(executor, app)
+	defer state.ReleaseLockFenced(executor, lk, app)
+	lk.StartRenewal(executor)
 
 	if _, err := executor.Run(ctx, "mkdir -p "+ssh.ShellQuote(buildDir)); err != nil {
 		return fmt.Errorf("creating build directory: %w", err)
@@ -396,6 +400,7 @@ func triggerAutoDeploy(ctx context.Context, executor ssh.Executor, app, branch, 
 
 	// The outer lock taken at the top of triggerAutoDeploy is still held —
 	// route through the locked entry point so Deploy doesn't deadlock on its
-	// own second acquisition (audit F07).
-	return deployBuiltImageLockMode(ctx, executor, appCfg, image, version, "localhost", false, needsBuild, true)
+	// own second acquisition (audit F07), passing the fence handle so the
+	// deploy's effects stay fenced (F16).
+	return deployBuiltImageLockMode(ctx, executor, appCfg, image, version, "localhost", false, needsBuild, lk)
 }

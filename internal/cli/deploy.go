@@ -479,14 +479,15 @@ func deployAppConfig(flags *Flags, appCfg *config.AppConfig, serverName, image, 
 // string for the notification payload (a hostname for the SSH path,
 // "localhost" for the resident-server path).
 func deployBuiltImage(ctx context.Context, executor ssh.Executor, appCfg *config.AppConfig, image, version, serverDisplay string, migrateVolumes, needsBuild bool) error {
-	return deployBuiltImageLockMode(ctx, executor, appCfg, image, version, serverDisplay, migrateVolumes, needsBuild, false)
+	return deployBuiltImageLockMode(ctx, executor, appCfg, image, version, serverDisplay, migrateVolumes, needsBuild, nil)
 }
 
 // deployBuiltImageLockMode is deployBuiltImage with an explicit lock mode:
-// lockHeld=true when the caller already owns the app lock (the resident
-// autodeploy path, which locks before fetching) and must not let
-// Deployer.Deploy acquire it a second time (audit F07).
-func deployBuiltImageLockMode(ctx context.Context, executor ssh.Executor, appCfg *config.AppConfig, image, version, serverDisplay string, migrateVolumes, needsBuild, lockHeld bool) error {
+// a non-nil lk is a lock the caller already owns (the resident autodeploy
+// path, which locks before fetching, and the terminal path's early lease —
+// audit F07/F08) and must not let Deployer.Deploy acquire it a second time;
+// nil means Deployer.Deploy acquires the lock itself.
+func deployBuiltImageLockMode(ctx context.Context, executor ssh.Executor, appCfg *config.AppConfig, image, version, serverDisplay string, migrateVolumes, needsBuild bool, lk *state.Lock) error {
 	appliedManifest, manifestSHA256, err := config.NormalizeAndDigest(appCfg, image)
 	if err != nil {
 		return fmt.Errorf("normalizing applied manifest: %w", err)
@@ -644,8 +645,8 @@ func deployBuiltImageLockMode(ctx context.Context, executor ssh.Executor, appCfg
 
 	multiNotifier := buildNotifier(appCfg)
 	var deployErr error
-	if lockHeld {
-		deployErr = deployer.DeployLocked(ctx, deployCfg)
+	if lk != nil {
+		deployErr = deployer.DeployFenced(ctx, deployCfg, lk)
 	} else {
 		deployErr = deployer.Deploy(ctx, deployCfg)
 	}

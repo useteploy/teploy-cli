@@ -93,14 +93,17 @@ func Rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg Rollbac
 	}
 
 	// 1. Serialize against deploys and other rollbacks BEFORE reading state
-	// or resolving the target (F11 + TCL-06).
+	// or resolving the target (F11 + TCL-06), with the fencing handle so
+	// effect sites can refuse a broken holder's late writes (F16).
 	if err := state.EnsureAppDir(ctx, exec, cfg.App); err != nil {
 		return fmt.Errorf("creating app directory: %w", err)
 	}
-	if err := state.AcquireLock(ctx, exec, cfg.App); err != nil {
+	lk, err := state.AcquireLockFenced(ctx, exec, cfg.App)
+	if err != nil {
 		return fmt.Errorf("acquiring deploy lock: %w", err)
 	}
-	defer state.ReleaseLockDetached(exec, cfg.App)
+	defer state.ReleaseLockFenced(exec, lk, cfg.App)
+	lk.StartRenewal(exec)
 
 	// 2. Read state and resolve the rollback target — under the lock.
 	current, err := state.Read(ctx, exec, cfg.App)
@@ -231,6 +234,11 @@ func Rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg Rollbac
 		}
 	}
 	if fixedPorts {
+		// Fence (F16): stopping the fixed-port workload is this rollback's
+		// first destructive effect; nothing of ours needs restoring yet.
+		if err := lk.Check(ctx, exec); err != nil {
+			return err
+		}
 		for _, c := range containers {
 			// Displace only the RUNNING web containers of the AUTHORITATIVE
 			// current generation (TCL-07). The old filter (any non-target
@@ -260,6 +268,16 @@ func Rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg Rollbac
 	var started []string
 	var targetWeb []docker.Container
 	for _, c := range targetContainers {
+		// Fence (F16): each target restart is an effect; a lost fence
+		// unwinds what this rollback started and restores the displaced
+		// workload before bailing (recovery is never fenced).
+		if err := lk.Check(ctx, exec); err != nil {
+			for _, name := range started {
+				dk.Stop(ctx, name, 5)
+			}
+			restoreDisplaced()
+			return err
+		}
 		fmt.Fprintf(out, "Starting %s...\n", c.Name)
 		// Recreate rather than `docker start`: Docker 29 silently fails
 		// to re-publish HostConfig.PortBindings on `docker start` when
@@ -361,6 +379,15 @@ func Rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg Rollbac
 	// container Teploy starts (in this case, the target version's).
 	if cfg.usesCaddy() {
 		fmt.Fprintln(out, "Updating routes...")
+		// Fence (F16): the route switch commits traffic to the target —
+		// a late write would hijack a newer operation's route.
+		if err := lk.Check(ctx, exec); err != nil {
+			for _, name := range started {
+				dk.Stop(ctx, name, 5)
+			}
+			restoreDisplaced()
+			return err
+		}
 		tls := caddy.TLS{Cert: cfg.TLSCert, Key: cfg.TLSKey, Internal: cfg.TLSInternal}
 		// The Caddy upstream port is the recorded primary container port
 		// when there is one (TCL-14); without a record the first exposed
@@ -435,7 +462,9 @@ func Rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg Rollbac
 	if digest, digestErr := dk.ContainerImageDigest(ctx, targetWeb[0].Name); digestErr == nil {
 		newState.ImageDigest = digest
 	}
-	if err := state.Write(ctx, exec, cfg.App, newState); err != nil {
+	// The commit runs under the fence (F16): the atomic rename that makes
+	// the rollback authoritative is a guarded effect.
+	if err := state.WriteFenced(ctx, exec, cfg.App, newState, lk); err != nil {
 		// Fixed host ports: the target holds them. Stop it, restore the
 		// displaced workload, then remove the uncommitted target — previously
 		// this branch skipped the restore and still claimed "the original
@@ -462,8 +491,17 @@ func Rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg Rollbac
 	}
 
 	// 6. The authoritative commit succeeded; the prior current workload can
-	// now be stopped (match by version label — see step 2).
+	// now be stopped (match by version label — see step 2). A fence loss
+	// here (F16) means another operation owns the app: refuse further
+	// stops loudly rather than interleave — leaving the superseded workload
+	// running is degraded but visible.
 	for _, c := range containers {
+		if lk != nil {
+			if err := lk.Check(ctx, exec); err != nil {
+				fmt.Fprintf(out, "Warning: current-workload cleanup stopped — %v\n", err)
+				break
+			}
+		}
 		if c.Labels["teploy.version"] == current.CurrentHash && c.State == "running" {
 			fmt.Fprintf(out, "Stopping %s...\n", c.Name)
 			dk.Stop(ctx, c.Name, stopTimeout)
