@@ -18,9 +18,11 @@ bottom section: attempt-scoped artifacts, fenced locks, structured Caddy
 routes, strict-env — folding in round-2's TCL-04/TCL-05/TCL-24/TCL-32/
 TCL-51), the round-2 residual tail itemized in that section, and the
 dependent designs F04 (and its TCL-10/TCL-15 dependents) that stay
-deferred with their annotations. The 2 upstream/owner items are closed
-(below). The two upstream items received from teploy-dash's 2026-09-17
-pass are closed below.
+deferred with their annotations — plus the round-3 deferrals recorded at
+the bottom (mostly the same architectural tail, with round-3 evidence
+folded in). The 2 upstream/owner items are closed (below). The two
+upstream items received from teploy-dash's 2026-09-17 pass are closed
+below.
 
 ## Resolved from this register
 
@@ -521,3 +523,109 @@ the fence before artifact generation) plus `DeployFenced`'s lock-handle
 parameter are the seam a generation handoff grows from. F45 can now
 build on ParseSites/ExtractPolicy. TCL-15's port allocation remains
 independent (the F14 record carries the resolved allocation).
+
+## Round 3 (2026-09-19, A01-A52, pinned at 0faf201) — record
+
+Report reviewed finding-by-finding against the source at the pinned HEAD
+(the register's closure claims were NOT taken as proof — several findings
+genuinely landed as new defects on top of the F08/F16 work, and several
+restated the standing architectural tail). 28 findings closed with
+contained fixes across 8 commits; the remaining 24 defer onto the
+standing pass-6/round-2 tail (evidence folded in) or onto the new items
+noted below. No false positives found; A21 and A17 were scoped to their
+legacy-fallback/boundary remainders (the record-driven TCL-14 paths
+already fixed the primary behavior).
+
+### Round 3 — fixed (contained)
+
+| ID | Sev | Where |
+|---|-----|-------|
+| A01 | High | 4537b89 — attempt TLS paths are app-scoped (/deployments/caddy/tls/att/<app>/<hash>.<id>/); PruneAttempts sweeps only the pruning app's artifact and TLS roots; the legacy flat TLS root is never swept (a flat entry's owner cannot be proven — the flat sweep deleted OTHER apps' live certs whenever hashes differed) |
+| A02 | High | 4537b89 — the attempt-prune protection window covers every release that still has containers plus current/previous/pins (keep_versions retention holds releases whose records/routes reference attempt-scoped TLS and env); inventory failure skips the prune |
+| A03 | High | 4537b89 — an unreadable pin file SKIPS attempt pruning entirely (version-prune parity) instead of pruning with current+previous only |
+| A04 | High | dd8a788 — ReleaseLockFenced runs the release under the holdership guard: after a takeover the stale holder's rm -rf is refused (fence-lost = success, the successor keeps its lock); nil handles keep the admin/unfenced release |
+| A06 | High | dd8a788 — WriteFenced and renewal stage to unique owner-scoped siblings (state.json.tmp-<owner>-<nonce>), so a stale holder cannot clobber the successor's staging and ride its guarded rename into authority; renewal stages in the app dir, never recreating a removed .lock |
+| A08 | High | 89625d3 — the same-version path refuses to force-remove a RUNNING _replaced container (the failed prior attempt's renamed SERVING workload) and aborts on unclassified rename failures with the source still present |
+| A10 | High | 89625d3 — abortStateCommit's fixed-port branch restores the Caddy route for caddy+publish apps (it used to return with Caddy pointing at the removed candidate names); on route-restore failure the candidates are restarted rather than routing to nothing |
+| A11 | High | 89625d3 — every abortStateCommit compensation runs on a detached bounded recovery context (a cancelled-context commit failure used to skip the stops/restarts via the dead ctx) |
+| A13 | Med | 89625d3 — restoreDisplacedAndStarted itemizes every failed stop/remove/restart in output and error; 'restored' is false when ANY displaced restart fails (was: true whenever zero candidates had started) |
+| A14 | Med | 2faab70 — a failed docker run reconciles the candidate name (created-but-unstarted corpse removed so the next deploy cannot collide; a RUNNING container under the name is never touched) |
+| A15 | High | 2faab70 — asset bridging builds the attempt's private tree (meta/att/<hash>.<id>/assets, seeded from the previous attempt with a real cp -a), extracts via docker create + docker cp (no image ENTRYPOINT runs), clones the volumes map before adding the mount — the shared live tree is never mutated pre-commit |
+| A17 | Med | 2faab70 — Config.validate checks identity grammar (app/version/process), the ingress enum, and rejects publish+replicas>1; releasemeta.Path validates the app grammar; SplitHostPort rejects ports outside 1..65535; WriteFenced/ReleaseLockFenced verify the lease belongs to the app |
+| A18 | Med | 2faab70 — ContainerPort==0 normalizes to 80 once at the top of DeployFenced and drives host ports, upstreams, diagnosis, and every create (no ':0' upstream) |
+| A19 | Med | 784c955 — the primary -p binding is built by publishBinding (IP-validated, JoinHostPort-bracketed, port-ranged) and quoted — '::1:49152:80' concatenation is gone |
+| A21 | Med | 784c955 — HostPort/InternalPort refuse containers with multiple DISTINCT ports instead of taking the first field (the release record's TCL-14 primary remains the authority); HostBindIP reports '' on mixed binds |
+| A23 | Med | 2faab70 — workers must still be running (not exited/dead/restarting/unhealthy) one second after the detached run or the deploy fails with full cleanup; unreadable state inspects degrade to a warning |
+| A25 | Med | 784c955 — PruneVersions counts a version pruned only when every container removal succeeded and returns the joined failures; the caller reports partial cleanup |
+| A26 | Med | 89625d3 — logDeploy populates LogEntry.Image (closes TCL-19's open half) |
+| A27 | High | 3b6025d — LocalExecutor.Upload is atomic (private sibling, chmod+fsync before publication, rename replacing a leaf symlink itself); the resident autodeploy path no longer runs on the un-hardened writer |
+| A28 | High | 3b6025d — local commands run in their own process group with Cancel SIGKILLing the group and WaitDelay bounding the wait (descendants keeping pipes open used to block CombinedOutput indefinitely); non-unix fallback is explicit about the weaker guarantee |
+| A32 | Med | 3b6025d — PublicKeyBytes derives the provisioning key from the requested private identity and verifies an existing .pub; PublicKeyPath no longer falls through to unrelated defaults for an explicit key; setup uses the derived key |
+| A36 | Med | d2e2d76 — dedup persistence is serialized + atomic + error-reporting; the delivery-ID header is log metadata only (reused ID with different authenticated content no longer suppresses a distinct event) |
+| A39 | High | 8bd4b70 — the .env commit is a set -eu script with a MANDATORY old-file recovery copy and both files staged as private same-filesystem siblings secured at 0600 before publication |
+| A40 | High | 8bd4b70 — the redis restore AOF gate is a Go-level preflight requiring a proven 'appendonly no' reply (auth/transport/empty/unexpected all refuse before any stop or copy); the backup script's gate is strict under set -eu |
+| A41 | High | 8bd4b70 — the redis restore snapshots the original dump AFTER the stop (the shutdown save is included), the copy is mandatory, and a failed final docker start invokes the same restore_original compensation as a failed install |
+| A44 | Med | 8bd4b70 — backup ids carry a random 16-hex suffix (same-second S3 key collisions gone); ValidateDate accepts legacy and new ids with a real-date check; ordering preserved by the timestamp prefix |
+| A46 | Med | 8bd4b70 — cron fields must be unsigned decimals; SetSchedule validates the schedule and rejects line breaks/NUL in command and marker at the sink |
+| A51 | Med | d2e2d76 — PrefixWriter is mutex-protected with a 64 KiB fragment cap and surfaces write/flush failures; fleet slot acquisition is ctx-aware with a post-acquire re-check |
+| A52 | Med | 2faab70 — DeployFenced resolves the immutable image ID once and creates every web/worker (and extracts assets) from it; the requested ref stays the recorded provenance; resolution failure warns and falls back |
+
+Gates at the closing commits: `go vet ./...` clean; `go test ./... -race`
+all packages ok. No push performed.
+
+### Round 3 — deferred (standing tail, with round-3 evidence folded in)
+
+- A05 — F16's remainder: a permanent server-side flock serialization of
+  every lock transition and guarded effect (two contenders can still both
+  read a stale owner; `grep owner; effect` is atomic per command but the
+  multi-command phases are not). The landed owner-token fencing refuses
+  stale effects; the full protocol is the redesign the register defers.
+- A07 — F04/F05/F35: unfenced compensation is deliberate (register);
+  generation/operation-scoped cleanup identities and the durable journal
+  are the deferred design. A10/A11/A13's honest reporting now covers the
+  contained half.
+- A09 — F04 generation identity: same-version redeploys still rewrite the
+  (app, hash) record — the documented immutability exception. Attempt ids
+  (F08) are the keying surface for the generation-keyed store.
+- A12 — F45 remainder: restorePreviousRoute still reconstructs from cfg +
+  live inspect (now failing closed on ambiguous ports via A21); the exact
+  receipt/compare-and-swap restore design remains open on
+  ParseSites/ExtractPolicy.
+- A16 — F04 external-ingress handoff (candidates reachable via the stable
+  alias before readiness).
+- A20 — TCL-15 port allocation redesign.
+- A22 — F47/TCL-17 explicit HTTP/TCP probe modes (the 404/3xx TCP
+  fallback stays documented compat).
+- A24 — F17 standing: Cmd remains a deliberate operator-authored shell
+  string at the docker-run sink.
+- A29 — TCL-55 session-open bounding (needs a dedicated connection per
+  session).
+- A30 — NEW deferral: unified structured executor output (CommandResult
+  with separated stdout/stderr, truncation flags). Cross-cutting contract
+  change over every caller; local/remote Run semantics documented as-is.
+- A31 — TCL-55 TOFU enrollment serialization (cross-process known_hosts
+  lock); the stale-snapshot window is narrower than the fixed
+  fail-open-on-parse-error that F25 closed.
+- A33 — F22: backup credentials in host-visible command text (AWS env
+  assignments, MYSQL_PWD via docker exec -e); needs the container-side
+  credential-file plumbing shared with the engine images.
+- A34 — F42 durable webhook queue (ack-before-durable-job remains; A36
+  closed the dedup-race half).
+- A35 — F40 webhook build pinning to the event commit.
+- A37 — F43 listener scope + operational bounds (graceful shutdown,
+  bounded admission) — the durable queue (A34) is the prerequisite for
+  honest shutdown semantics.
+- A38 — TCL-40 restore under the app lease + writer quiescence.
+- A42 — F37 per-engine validated cutover (SQL/Mongo in-place restore).
+- A43 — TCL-44 constrained extractor/host helper (staging extraction
+  still runs the host tar).
+- A45 — F39 crontab edit under a host-side flock.
+- A47 — F62/TCL-57 bounded update extraction.
+- A48 — F62 update selection policy (downgrade on string inequality).
+- A49 — F63/TCL-54 owner item: goreleaser `version: latest` and
+  aquasec/trivy:latest need reviewed pins (real digests/versions the
+  report deliberately does not invent); folded into the supply-chain
+  owner entry with the installer-digest work.
+- A50 — F65 real-filesystem/Docker integration matrix (this round's new
+  tests remain mock-level; PrefixWriter/cancellation tests are behavioral
+  with real processes).
