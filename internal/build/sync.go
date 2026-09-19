@@ -19,6 +19,12 @@ type SyncConfig struct {
 	KeyPath       string   // SSH key path (optional)
 	Excludes      []string // patterns to exclude
 	AcceptNewHost bool     // mirror the control connection's --accept-new policy (see Sync)
+	// LinkDest is an optional remote basis directory for --link-dest: the
+	// F08 attempt-scoped build contexts are fresh per attempt, so without
+	// a basis every deploy would re-transfer the whole tree. Pointing at
+	// the previous attempt's build dir restores incremental transfer and
+	// hardlink-shares unchanged files (no extra disk per attempt).
+	LinkDest string
 }
 
 // Sync transfers the local directory to the remote server via rsync over SSH.
@@ -44,6 +50,9 @@ func Sync(ctx context.Context, cfg SyncConfig, stdout, stderr io.Writer) error {
 
 	for _, pattern := range cfg.Excludes {
 		args = append(args, "--exclude", pattern)
+	}
+	if cfg.LinkDest != "" {
+		args = append(args, "--link-dest="+cfg.LinkDest)
 	}
 
 	remote := ssh.RsyncTarget(cfg.User, cfg.Host, cfg.RemoteDir)

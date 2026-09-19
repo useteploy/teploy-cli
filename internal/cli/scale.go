@@ -189,8 +189,10 @@ func rollbackSingleServer(ctx context.Context, appCfg *config.AppConfig, target 
 	defer executor.Close()
 
 	// Preserve custom TLS termination across rollback, same as the
-	// interactive `teploy rollback` path (internal/cli/rollback.go).
-	tlsCert, tlsKey, tlsInternal, err := resolveAppTLS(ctx, executor, appCfg)
+	// interactive `teploy rollback` path (internal/cli/rollback.go) —
+	// legacy shared paths (nil attempt): the record supplies the target
+	// release's own attempt-scoped cert when there is one (F08).
+	tlsCert, tlsKey, tlsInternal, err := resolveAppTLS(ctx, executor, appCfg, nil)
 	if err != nil {
 		return err
 	}
@@ -253,7 +255,9 @@ func updateLoadBalancer(ctx context.Context, flags *Flags, appCfg *config.AppCon
 
 		// Upload + reference the app's custom TLS cert on this LB host so the
 		// load balancer terminates HTTPS the same way the app servers do.
-		cert, key, internal, tlsErr := resolveAppTLS(ctx, executor, appCfg)
+		// Legacy shared paths (nil attempt): the LB is not the release's
+		// target of record — see uploadAppTLS (F08).
+		cert, key, internal, tlsErr := resolveAppTLS(ctx, executor, appCfg, nil)
 		if tlsErr != nil {
 			executor.Close()
 			return fmt.Errorf("uploading TLS to LB %s: %w", name, tlsErr)

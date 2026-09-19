@@ -75,7 +75,10 @@ func runRollback(flags *Flags, toHash string) error {
 
 	// Preserve custom TLS termination across rollback. The cert is already
 	// on the server from the last deploy; re-upload to be safe (idempotent).
-	tlsCert, tlsKey, tlsInternal, err := resolveAppTLS(ctx, executor, appCfg)
+	// Legacy shared path (nil attempt): the rollback target is not known
+	// here, and F14-recorded releases override these paths from the record
+	// with the target's own attempt-scoped cert (F08).
+	tlsCert, tlsKey, tlsInternal, err := resolveAppTLS(ctx, executor, appCfg, nil)
 	if err != nil {
 		return err
 	}

@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/useteploy/teploy/internal/releasemeta"
 	"github.com/useteploy/teploy/internal/ssh"
 )
 
@@ -32,9 +33,10 @@ func expandEnvTemplates(env map[string]string) {
 // buildContainerEnvFiles computes the full container environment — values
 // already resolved (YAML templates expanded once by expandEnvTemplates,
 // env_files loaded literally, decrypted secrets overlaid last so a secret
-// always wins over a plaintext default) — and uploads it to a fresh
-// per-deploy env file instead of returning it for use as `docker run -e`
-// arguments.
+// always wins over a plaintext default) — and uploads it to the ATTEMPT's
+// env file (F08: /deployments/<app>/meta/att/<hash>.<id>/env, written once
+// by this attempt and never rewritten by a later one) instead of returning
+// it for use as `docker run -e` arguments.
 //
 // This exists because `-e KEY=value` arguments are visible in this host's
 // `ps aux` / /proc/<pid>/cmdline output for the life of the `docker run`
@@ -48,9 +50,9 @@ func expandEnvTemplates(env map[string]string) {
 //
 // Returns the ordered --env-file path list for deploy.Config.EnvFiles: the
 // existing persisted /deployments/<app>/.env first (if present, managed by
-// `teploy env set`), then this fresh file last so its values — including
-// secrets — take precedence for any overlapping key.
-func buildContainerEnvFiles(ctx context.Context, executor ssh.Executor, app, persistedEnvFile string, appEnv, extra, secrets map[string]string) ([]string, error) {
+// `teploy env set`), then this attempt's file last so its values —
+// including secrets — take precedence for any overlapping key.
+func buildContainerEnvFiles(ctx context.Context, executor ssh.Executor, app string, att *releasemeta.Attempt, persistedEnvFile string, appEnv, extra, secrets map[string]string) ([]string, error) {
 	merged := make(map[string]string, len(appEnv)+len(extra)+len(secrets))
 	for k, v := range appEnv {
 		merged[k] = v
@@ -100,7 +102,13 @@ func buildContainerEnvFiles(ctx context.Context, executor ssh.Executor, app, per
 		fmt.Fprintf(&sb, "%s=%s\n", k, merged[k])
 	}
 
-	path := fmt.Sprintf("/deployments/%s/.deploy-env", app)
+	if att == nil {
+		return nil, fmt.Errorf("buildContainerEnvFiles requires a deploy attempt (F08) — the env file is attempt-scoped")
+	}
+	path := att.EnvFile()
+	if _, err := executor.Run(ctx, "mkdir -p "+ssh.ShellQuote(att.Dir())); err != nil {
+		return nil, fmt.Errorf("creating attempt directory: %w", err)
+	}
 	if err := executor.Upload(ctx, strings.NewReader(sb.String()), path, "0600"); err != nil {
 		return nil, fmt.Errorf("uploading deploy env file: %w", err)
 	}

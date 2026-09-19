@@ -5,8 +5,20 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/useteploy/teploy/internal/releasemeta"
 	"github.com/useteploy/teploy/internal/ssh"
 )
+
+// attMock builds a mock that answers the attempt-directory mkdir, plus the
+// attempt every env-file test deploys under (F08: the env file is
+// attempt-scoped).
+func attMock(cmds ...ssh.MockCommand) (*ssh.MockExecutor, *releasemeta.Attempt) {
+	mock := ssh.NewMockExecutor("1.2.3.4", append([]ssh.MockCommand{
+		ssh.MockCommand{Match: "mkdir -p ", Output: ""},
+	}, cmds...)...)
+	att := releasemeta.MustAttempt("myapp", "abc123")
+	return mock, &att
+}
 
 // TestBuildContainerEnvFiles_SecretsNeverBecomeArgs is the regression test
 // for the fix in this file: decrypted secrets used to be merged into a map
@@ -15,10 +27,10 @@ import (
 // must now only ever reach the server via Upload (SFTP-style, never a
 // shell command string).
 func TestBuildContainerEnvFiles_SecretsNeverBecomeArgs(t *testing.T) {
-	mock := ssh.NewMockExecutor("1.2.3.4")
+	mock, att := attMock()
 
 	secrets := map[string]string{"API_KEY": "super-secret-value"}
-	envFiles, err := buildContainerEnvFiles(context.Background(), mock, "myapp", "", nil, nil, secrets)
+	envFiles, err := buildContainerEnvFiles(context.Background(), mock, "myapp", att, "", nil, nil, secrets)
 	if err != nil {
 		t.Fatalf("buildContainerEnvFiles: %v", err)
 	}
@@ -44,9 +56,9 @@ func TestBuildContainerEnvFiles_SecretsNeverBecomeArgs(t *testing.T) {
 }
 
 func TestBuildContainerEnvFiles_PersistedFileComesFirst(t *testing.T) {
-	mock := ssh.NewMockExecutor("1.2.3.4")
+	mock, att := attMock()
 
-	envFiles, err := buildContainerEnvFiles(context.Background(), mock, "myapp",
+	envFiles, err := buildContainerEnvFiles(context.Background(), mock, "myapp", att,
 		"/deployments/myapp/.env",
 		map[string]string{"NODE_ENV": "production"},
 		nil, nil,
@@ -63,9 +75,9 @@ func TestBuildContainerEnvFiles_PersistedFileComesFirst(t *testing.T) {
 }
 
 func TestBuildContainerEnvFiles_NoValuesNoUpload(t *testing.T) {
-	mock := ssh.NewMockExecutor("1.2.3.4")
+	mock, att := attMock()
 
-	envFiles, err := buildContainerEnvFiles(context.Background(), mock, "myapp", "", nil, nil, nil)
+	envFiles, err := buildContainerEnvFiles(context.Background(), mock, "myapp", att, "", nil, nil, nil)
 	if err != nil {
 		t.Fatalf("buildContainerEnvFiles: %v", err)
 	}
@@ -85,11 +97,11 @@ func TestBuildContainerEnvFiles_NoValuesNoUpload(t *testing.T) {
 // into the SAME file (secrets applied last) rather than splitting them
 // across -e and --env-file.
 func TestBuildContainerEnvFiles_SecretWinsOverPlaintextDefault(t *testing.T) {
-	mock := ssh.NewMockExecutor("1.2.3.4")
+	mock, att := attMock()
 
 	appEnv := map[string]string{"API_KEY": "plaintext-default"}
 	secrets := map[string]string{"API_KEY": "real-secret"}
-	envFiles, err := buildContainerEnvFiles(context.Background(), mock, "myapp", "", appEnv, nil, secrets)
+	envFiles, err := buildContainerEnvFiles(context.Background(), mock, "myapp", att, "", appEnv, nil, secrets)
 	if err != nil {
 		t.Fatalf("buildContainerEnvFiles: %v", err)
 	}
@@ -107,12 +119,12 @@ func TestBuildContainerEnvFiles_SecretWinsOverPlaintextDefault(t *testing.T) {
 // confusing complaint about a variable name containing whitespace. Catch it at
 // the source and name the offending variable instead.
 func TestBuildContainerEnvFiles_RejectsMultilineValues(t *testing.T) {
-	mock := ssh.NewMockExecutor("1.2.3.4")
+	mock, att := attMock()
 
 	appEnv := map[string]string{
 		"APP_CONFIG": "port: 7880\nrtc:\n  tcp_port: 7881\n",
 	}
-	_, err := buildContainerEnvFiles(context.Background(), mock, "myapp", "", appEnv, nil, nil)
+	_, err := buildContainerEnvFiles(context.Background(), mock, "myapp", att, "", appEnv, nil, nil)
 	if err == nil {
 		t.Fatal("a multi-line env value must be rejected, not written into the env file")
 	}
@@ -121,14 +133,14 @@ func TestBuildContainerEnvFiles_RejectsMultilineValues(t *testing.T) {
 	}
 
 	// A carriage return alone breaks the format just the same.
-	_, err = buildContainerEnvFiles(context.Background(), mock, "myapp", "",
+	_, err = buildContainerEnvFiles(context.Background(), mock, "myapp", att, "",
 		map[string]string{"OTHER": "a\rb"}, nil, nil)
 	if err == nil {
 		t.Fatal("a value containing a carriage return must also be rejected")
 	}
 
 	// Ordinary single-line values are unaffected.
-	if _, err := buildContainerEnvFiles(context.Background(), mock, "myapp", "",
+	if _, err := buildContainerEnvFiles(context.Background(), mock, "myapp", att, "",
 		map[string]string{"FINE": "{a: 1, b: 2}"}, nil, nil); err != nil {
 		t.Fatalf("single-line values must still be accepted: %v", err)
 	}

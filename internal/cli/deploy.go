@@ -26,6 +26,7 @@ import (
 	"github.com/useteploy/teploy/internal/env"
 	"github.com/useteploy/teploy/internal/multideploy"
 	"github.com/useteploy/teploy/internal/notify"
+	"github.com/useteploy/teploy/internal/releasemeta"
 	"github.com/useteploy/teploy/internal/secret"
 	"github.com/useteploy/teploy/internal/ssh"
 	"github.com/useteploy/teploy/internal/state"
@@ -375,6 +376,27 @@ func deployAppConfig(flags *Flags, appCfg *config.AppConfig, serverName, image, 
 	}
 	defer executor.Close()
 
+	// 6a. Take the deploy lease NOW, before any artifact is generated
+	// (F08): the attempt's build context, env file, and TLS cert/key are
+	// written under this lease, so concurrent attempts of the same app
+	// serialize at the source instead of interleaving writes onto shared
+	// per-app paths. The lease is fenced (F16) and renewed in the
+	// background; it is released when deployAppConfig returns.
+	if err := state.EnsureAppDir(ctx, executor, appCfg.App); err != nil {
+		return fmt.Errorf("creating app directory: %w", err)
+	}
+	lk, err := state.AcquireLockFenced(ctx, executor, appCfg.App)
+	if err != nil {
+		return err
+	}
+	defer state.ReleaseLockFenced(executor, lk, appCfg.App)
+	lk.StartRenewal(executor)
+
+	// The attempt keys every artifact this deploy generates (F08):
+	// immutable per (release, attempt), so the F14 record's references
+	// name exactly the bytes that were deployed.
+	att := releasemeta.MustAttempt(appCfg.App, version)
+
 	// 6b. Ensure the pre-built image is available (CI pipeline mode). An image
 	// already present on the server — built or `docker load`ed out of band, and
 	// possibly in no registry at all — must not be re-pulled, or the deploy
@@ -408,8 +430,12 @@ func deployAppConfig(flags *Flags, appCfg *config.AppConfig, serverName, image, 
 				return fmt.Errorf("local build: %w", err)
 			}
 		} else {
-			// Server build mode: rsync + build on server.
-			remoteDir := fmt.Sprintf("/deployments/%s/build", appCfg.App)
+			// Server build mode: rsync into the ATTEMPT's build context
+			// (F08) — a directory no other attempt writes — with the
+			// previous attempt's build dir as rsync's --link-dest basis so
+			// the fresh directory still transfers incrementally and
+			// hardlink-shares unchanged files.
+			remoteDir := att.BuildDir()
 			if _, err := executor.Run(ctx, "mkdir -p "+remoteDir); err != nil {
 				return fmt.Errorf("creating build directory: %w", err)
 			}
@@ -423,6 +449,7 @@ func deployAppConfig(flags *Flags, appCfg *config.AppConfig, serverName, image, 
 				User:      user,
 				KeyPath:   key,
 				Excludes:  excludes,
+				LinkDest:  releasemeta.PreviousAttemptBuildDir(ctx, executor, appCfg.App, att.ID),
 			}, os.Stdout, os.Stderr); err != nil {
 				return fmt.Errorf("syncing source: %w", err)
 			}
@@ -461,7 +488,7 @@ func deployAppConfig(flags *Flags, appCfg *config.AppConfig, serverName, image, 
 		}
 	}
 
-	return deployBuiltImage(ctx, executor, appCfg, image, version, host, migrateVolumes, needsBuild)
+	return deployBuiltImageFenced(ctx, executor, appCfg, image, version, host, migrateVolumes, needsBuild, lk, &att)
 }
 
 // deployBuiltImage runs the shared post-build deploy orchestration:
@@ -479,15 +506,19 @@ func deployAppConfig(flags *Flags, appCfg *config.AppConfig, serverName, image, 
 // string for the notification payload (a hostname for the SSH path,
 // "localhost" for the resident-server path).
 func deployBuiltImage(ctx context.Context, executor ssh.Executor, appCfg *config.AppConfig, image, version, serverDisplay string, migrateVolumes, needsBuild bool) error {
-	return deployBuiltImageLockMode(ctx, executor, appCfg, image, version, serverDisplay, migrateVolumes, needsBuild, nil)
+	return deployBuiltImageFenced(ctx, executor, appCfg, image, version, serverDisplay, migrateVolumes, needsBuild, nil, nil)
 }
 
-// deployBuiltImageLockMode is deployBuiltImage with an explicit lock mode:
-// a non-nil lk is a lock the caller already owns (the resident autodeploy
-// path, which locks before fetching, and the terminal path's early lease —
-// audit F07/F08) and must not let Deployer.Deploy acquire it a second time;
-// nil means Deployer.Deploy acquires the lock itself.
-func deployBuiltImageLockMode(ctx context.Context, executor ssh.Executor, appCfg *config.AppConfig, image, version, serverDisplay string, migrateVolumes, needsBuild bool, lk *state.Lock) error {
+// deployBuiltImageFenced is deployBuiltImage with the caller's lease and
+// attempt: lk is a lock the caller already owns (the terminal path's early
+// lease and the resident autodeploy path — audits F07/F08) and att keys the
+// attempt-scoped artifacts (env file, TLS). lk == nil means Deployer.Deploy
+// acquires the lock itself (att must still be non-nil for the env file).
+func deployBuiltImageFenced(ctx context.Context, executor ssh.Executor, appCfg *config.AppConfig, image, version, serverDisplay string, migrateVolumes, needsBuild bool, lk *state.Lock, att *releasemeta.Attempt) error {
+	if att == nil {
+		attVal := releasemeta.MustAttempt(appCfg.App, version)
+		att = &attVal
+	}
 	appliedManifest, manifestSHA256, err := config.NormalizeAndDigest(appCfg, image)
 	if err != nil {
 		return fmt.Errorf("normalizing applied manifest: %w", err)
@@ -581,7 +612,9 @@ func deployBuiltImageLockMode(ctx context.Context, executor ssh.Executor, appCfg
 
 	// 10b. Upload custom TLS cert (if configured) so Caddy can terminate
 	// HTTPS with it instead of ACME — required behind Cloudflare proxy/Tunnel.
-	tlsCert, tlsKey, tlsInternal, err := resolveAppTLS(ctx, executor, appCfg)
+	// Attempt-scoped (F08): the cert bytes this deploy references are
+	// immutable for the release.
+	tlsCert, tlsKey, tlsInternal, err := resolveAppTLS(ctx, executor, appCfg, att)
 	if err != nil {
 		return err
 	}
@@ -590,9 +623,9 @@ func deployBuiltImageLockMode(ctx context.Context, executor ssh.Executor, appCfg
 	}
 
 	// Container env: teploy.yml's `env:` block plus decrypted secrets,
-	// uploaded to a fresh env file rather than passed as `docker run -e`
-	// args — see buildContainerEnvFiles for why.
-	envFiles, err := buildContainerEnvFiles(ctx, executor, appCfg.App, envFile, appCfg.Env, nil, deploySecrets)
+	// uploaded to the ATTEMPT's env file (F08) rather than passed as
+	// `docker run -e` args — see buildContainerEnvFiles for why.
+	envFiles, err := buildContainerEnvFiles(ctx, executor, appCfg.App, att, envFile, appCfg.Env, nil, deploySecrets)
 	if err != nil {
 		return err
 	}
@@ -1122,18 +1155,29 @@ func runStaticDeploy(cfg *config.AppConfig, host, user, key string) error {
 	return nil
 }
 
-// appTLSContainerPaths returns the container-side cert/key paths for an app's
-// custom TLS certificate. These live under /etc/caddy/tls, which the Caddy
-// container sees via the /deployments/caddy directory mount.
+// appTLSContainerPaths returns the LEGACY container-side cert/key paths for
+// an app's custom TLS certificate (pre-F08 layout). Kept because records
+// written before attempt-scoped TLS name these paths — a rollback target's
+// recorded TLSCert still points here, and those files were never moved.
 func appTLSContainerPaths(app string) (cert, key string) {
 	return "/etc/caddy/tls/" + app + ".crt", "/etc/caddy/tls/" + app + ".key"
 }
 
 // uploadAppTLS reads the local cert + key referenced by the app's tls config
-// and uploads them to the server's /deployments/caddy/tls directory (key mode
-// 0600), where the directory-mounted Caddy container reads them. It returns
-// the container-side paths to reference in the Caddy site block.
-func uploadAppTLS(ctx context.Context, exec ssh.Executor, app string, tls *config.TLSConfig) (cert, key string, err error) {
+// and uploads them to the server's attempt-scoped TLS directory (F08:
+// /deployments/caddy/tls/att/<hash>.<id>/, key mode 0600), where the
+// directory-mounted Caddy container reads them at /etc/caddy/tls/att/….
+// Attempt-scoping keeps the cert/key immutable for the release that
+// references it: the F14 record names these exact bytes, and a concurrent
+// or later attempt cannot overwrite them. It returns the container-side
+// paths to reference in the Caddy site block.
+//
+// A nil attempt selects the LEGACY shared path — the pre-F08 layout. That
+// is the rollback CLI's fallback: it re-uploads the operator's current
+// cert before the rollback target is known, and for any release recorded
+// by F14 the record overrides these paths with the target's own attempt
+// paths anyway; only backfilled (pre-F14) releases fall back to them.
+func uploadAppTLS(ctx context.Context, exec ssh.Executor, app string, tls *config.TLSConfig, att *releasemeta.Attempt) (cert, key string, err error) {
 	certBytes, err := os.ReadFile(tls.Cert)
 	if err != nil {
 		return "", "", fmt.Errorf("reading tls cert %s: %w", tls.Cert, err)
@@ -1142,18 +1186,26 @@ func uploadAppTLS(ctx context.Context, exec ssh.Executor, app string, tls *confi
 	if err != nil {
 		return "", "", fmt.Errorf("reading tls key %s: %w", tls.Key, err)
 	}
-	if _, err := exec.Run(ctx, "mkdir -p /deployments/caddy/tls"); err != nil {
-		return "", "", fmt.Errorf("creating tls dir: %w", err)
+	var hostCert, hostKey string
+	if att != nil {
+		if _, err := exec.Run(ctx, "mkdir -p "+ssh.ShellQuote(att.TLSDir())); err != nil {
+			return "", "", fmt.Errorf("creating tls dir: %w", err)
+		}
+		hostCert, hostKey = att.TLSDir()+"/"+app+".crt", att.TLSDir()+"/"+app+".key"
+		cert, key = att.TLSCertPath(), att.TLSKeyPath()
+	} else {
+		if _, err := exec.Run(ctx, "mkdir -p /deployments/caddy/tls"); err != nil {
+			return "", "", fmt.Errorf("creating tls dir: %w", err)
+		}
+		hostCert, hostKey = "/deployments/caddy/tls/"+app+".crt", "/deployments/caddy/tls/"+app+".key"
+		cert, key = "/etc/caddy/tls/"+app+".crt", "/etc/caddy/tls/"+app+".key"
 	}
-	hostCert := "/deployments/caddy/tls/" + app + ".crt"
-	hostKey := "/deployments/caddy/tls/" + app + ".key"
-	if err := exec.Upload(ctx, bytes.NewReader(certBytes), hostCert, "0644"); err != nil {
+	if err := ssh.UploadAtomic(ctx, exec, bytes.NewReader(certBytes), hostCert, "0644"); err != nil {
 		return "", "", fmt.Errorf("uploading tls cert: %w", err)
 	}
-	if err := exec.Upload(ctx, bytes.NewReader(keyBytes), hostKey, "0600"); err != nil {
+	if err := ssh.UploadAtomic(ctx, exec, bytes.NewReader(keyBytes), hostKey, "0600"); err != nil {
 		return "", "", fmt.Errorf("uploading tls key: %w", err)
 	}
-	cert, key = appTLSContainerPaths(app)
 	return cert, key, nil
 }
 
@@ -1161,15 +1213,16 @@ func uploadAppTLS(ctx context.Context, exec ssh.Executor, app string, tls *confi
 // whether tls.internal was requested, so every deploy/rollback call site
 // can populate deploy.Config's (or RollbackConfig's) TLSCert/TLSKey/
 // TLSInternal fields with one call instead of repeating the appCfg.TLS !=
-// nil / .Internal branch five times.
-func resolveAppTLS(ctx context.Context, exec ssh.Executor, appCfg *config.AppConfig) (cert, key string, internal bool, err error) {
+// nil / .Internal branch five times. att nil = legacy shared paths (see
+// uploadAppTLS).
+func resolveAppTLS(ctx context.Context, exec ssh.Executor, appCfg *config.AppConfig, att *releasemeta.Attempt) (cert, key string, internal bool, err error) {
 	if appCfg.TLS == nil {
 		return "", "", false, nil
 	}
 	if appCfg.TLS.Internal {
 		return "", "", true, nil
 	}
-	cert, key, err = uploadAppTLS(ctx, exec, appCfg.App, appCfg.TLS)
+	cert, key, err = uploadAppTLS(ctx, exec, appCfg.App, appCfg.TLS, att)
 	return cert, key, false, err
 }
 
