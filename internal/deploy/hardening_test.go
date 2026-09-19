@@ -23,7 +23,7 @@ func TestDeploy_EmptyVersion(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for empty version")
 	}
-	if !strings.Contains(err.Error(), "required") {
+	if !strings.Contains(err.Error(), "invalid version") {
 		t.Errorf("expected 'required' in error, got: %v", err)
 	}
 }

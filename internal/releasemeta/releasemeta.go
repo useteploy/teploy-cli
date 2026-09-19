@@ -39,6 +39,7 @@ import (
 	"time"
 
 	"github.com/useteploy/teploy/internal/caddy"
+	"github.com/useteploy/teploy/internal/config"
 	"github.com/useteploy/teploy/internal/docker"
 	"github.com/useteploy/teploy/internal/ssh"
 	"github.com/useteploy/teploy/internal/state"
@@ -151,9 +152,14 @@ type Record struct {
 
 // Path returns the record path for (app, hash). Both segments are grammar
 // checked here so no caller can interpolate an unvalidated id into a remote
-// path.
+// path — the app against the config name grammar (audit A17: it used to be
+// checked only for non-emptiness, so a path-metacharacter app reached the
+// remote shell), the hash against validHash.
 func Path(app, hash string) (string, error) {
-	if app == "" || !validHash.MatchString(hash) {
+	if err := config.ValidateName(app); err != nil {
+		return "", fmt.Errorf("release record requires a valid app: %w", err)
+	}
+	if !validHash.MatchString(hash) {
 		return "", fmt.Errorf("invalid release id %q for app %q", hash, app)
 	}
 	return fmt.Sprintf("%s/%s/meta/%s.json", deploymentsDir, app, hash), nil
