@@ -6,11 +6,13 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/useteploy/teploy/internal/caddy"
+	"github.com/useteploy/teploy/internal/config"
 	"github.com/useteploy/teploy/internal/docker"
 	"github.com/useteploy/teploy/internal/releasemeta"
 	"github.com/useteploy/teploy/internal/ssh"
@@ -106,13 +108,40 @@ func NewDeployer(exec ssh.Executor, out io.Writer) *Deployer {
 	}
 }
 
+// validVersion matches release ids the deploy accepts (the same grammar
+// releasemeta uses for meta file names — git short hashes, tags like
+// v1.2.3, sha256-<hex> image labels).
+var validVersion = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$`)
+
+// validProcessName keeps process names safe as container-name segments.
+var validProcessName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$`)
+
 // validate checks the deploy config's required fields. This is the shared
 // execution-plan validator: direct/ad-hoc construction (multideploy,
 // preview, autodeploy) does not pass through config-file parsing, so the
-// bounds enforced there cannot be assumed here (TCL-18).
+// bounds enforced there cannot be assumed here (TCL-18). Identity grammar
+// (app, version, process names) and the ingress enum are checked too, so
+// no matter how a Config was built, its values are safe to interpolate
+// into container names, remote paths, and shell text (audit A17).
 func (c Config) validate() error {
-	if c.App == "" || c.Image == "" || c.Version == "" {
-		return fmt.Errorf("app, image, and version are required")
+	if err := config.ValidateName(c.App); err != nil {
+		return err
+	}
+	if c.Image == "" {
+		return fmt.Errorf("image is required")
+	}
+	if !validVersion.MatchString(c.Version) {
+		return fmt.Errorf("invalid version %q — must be alphanumeric with . _ - (max 128 chars)", c.Version)
+	}
+	for process := range c.Processes {
+		if !validProcessName.MatchString(process) {
+			return fmt.Errorf("invalid process name %q", process)
+		}
+	}
+	switch c.Ingress {
+	case "", "caddy", "external", "host":
+	default:
+		return fmt.Errorf("unknown ingress mode %q (expected caddy, external, or host)", c.Ingress)
 	}
 	// Caddy/external ingress route by domain; host ingress publishes a raw
 	// port and needs no domain.
@@ -129,9 +158,11 @@ func (c Config) validate() error {
 	}
 	// A fixed host port cannot be shared across containers — mirror the
 	// config-layer rejection so a directly constructed Config cannot ask
-	// for a deploy that self-collides.
-	if c.ingressHost() && c.Replicas > 1 {
-		return fmt.Errorf("host ingress supports a single replica (a fixed host port can't be load-balanced across containers)")
+	// for a deploy that self-collides. Publish entries are fixed ports for
+	// the same reason host ingress is (A17): replicas>1 with publish would
+	// die on "port is already allocated" mid-deploy.
+	if (c.ingressHost() || len(c.Publish) > 0) && c.Replicas > 1 {
+		return fmt.Errorf("host ingress and fixed publish ports support a single replica (a fixed host port can't be load-balanced across containers)")
 	}
 	if c.StopTimeout < 0 {
 		return fmt.Errorf("stop timeout cannot be negative (got %ds)", c.StopTimeout)
@@ -194,6 +225,28 @@ func (d *Deployer) DeployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 		stopTimeout = 10
 	}
 
+	// Normalize the execution defaults ONCE and use the normalized value
+	// everywhere (A18): Config permits ContainerPort == 0 as "default 80",
+	// and the docker layer normalizes it only inside its publishing branch —
+	// using the raw zero for host ports or Caddy upstreams produced a ":0"
+	// upstream and a publish-less host deploy.
+	containerPort := cfg.ContainerPort
+	if containerPort == 0 {
+		containerPort = 80
+	}
+
+	// Pin every container creation this deploy makes to ONE immutable image
+	// identity (A52): a mutable tag can be re-pointed by a concurrent
+	// pull/build/tag between replica creates, mixing images within a
+	// release. Resolution failure warns and falls back to the requested
+	// reference (the create would fail against the same daemon anyway).
+	runImage := cfg.Image
+	if resolved, err := d.docker.ResolveImageID(ctx, cfg.Image); err == nil {
+		runImage = resolved
+	} else {
+		fmt.Fprintf(d.out, "Warning: could not resolve an immutable image ID for %s — creating from the requested reference (%v)\n", cfg.Image, err)
+	}
+
 	// Determine processes. Default: single web process with image CMD.
 	processes := cfg.Processes
 	if len(processes) == 0 {
@@ -250,8 +303,8 @@ func (d *Deployer) DeployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 		// the app stays reachable at a stable bind:port. A fixed port can't be
 		// blue/green (two containers can't bind it), so host mode recreates:
 		// existing web containers are removed below before the new one starts.
-		ports = []int{cfg.ContainerPort}
-		fmt.Fprintf(d.out, "Publishing on %s:%d (host ingress)...\n", webBindHost, cfg.ContainerPort)
+		ports = []int{containerPort}
+		fmt.Fprintf(d.out, "Publishing on %s:%d (host ingress)...\n", webBindHost, containerPort)
 	} else {
 		// Allocate ephemeral ports for blue/green. Track the ports claimed so
 		// far — containers aren't started until step 6, so `ss` can't see them
@@ -272,38 +325,60 @@ func (d *Deployer) DeployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 	}
 	port := ports[0] // primary port for health check, hooks, etc.
 
-	// 5. Asset bridging: extract assets from image before starting the container.
+	// 5. Asset bridging: extract assets from the image into THIS attempt's
+	// private tree before starting the container (audit A15). The old
+	// implementation copied straight into the SHARED
+	// /deployments/<app>/assets that the running release still reads — a
+	// failed candidate had already mutated the live app's files, with no
+	// compensation. The attempt-scoped tree is seeded from the previous
+	// attempt's tree with a real copy (cp -a, not hardlinks: a later
+	// extraction writing through a shared inode would truncate the previous
+	// tree's files), and the completed tree is mounted into the candidate.
+	// Extraction uses `docker create` + `docker cp`, so no image ENTRYPOINT
+	// ever executes (the old `docker run … sh -c` let an image with an
+	// ENTRYPOINT wrap or replace the copy command).
 	if cfg.AssetPath != "" {
-		hostAssetDir := fmt.Sprintf("/deployments/%s/assets", cfg.App)
+		att := releasemeta.MustAttempt(cfg.App, cfg.Version)
+		assetDir := att.Dir() + "/assets"
 		fmt.Fprintln(d.out, "Bridging assets...")
-		if _, err := d.exec.Run(ctx, "mkdir -p "+ssh.ShellQuote(hostAssetDir)); err != nil {
-			return fmt.Errorf("creating asset bridge directory: %w", err)
+		seed := ""
+		if prev := releasemeta.PreviousAttemptAssetsDir(ctx, d.exec, cfg.App, att.ID); prev != "" {
+			seed = prev
+		}
+		seedCmd := "mkdir -p " + ssh.ShellQuote(assetDir)
+		if seed != "" {
+			seedCmd += " && cp -a " + ssh.ShellQuote(seed+"/.") + " " + ssh.ShellQuote(assetDir+"/")
+		}
+		if _, err := d.exec.Run(ctx, seedCmd); err != nil {
+			return fmt.Errorf("creating asset tree: %w", err)
 		}
 
-		// Extract assets from image using a one-shot container.
-		// --user 0 (root) so the cp can write into the host-owned
-		// /deployments/<app>/assets dir without permission denied,
-		// regardless of the image's USER directive. Drop `2>/dev/null`
-		// from cp so genuine failures surface in the deploy output —
-		// the previous silent-fail mode meant an empty host volume
-		// was bind-mounted over the in-image static dir, hiding all
-		// files and serving 404 for every static asset.
-		copyCmd := fmt.Sprintf("cp -r %s/. /bridge/ && echo ok-bridge", ssh.ShellQuote(cfg.AssetPath))
-		extractCmd := fmt.Sprintf(
-			"docker run --rm --user 0 -v %s:/bridge %s sh -c %s",
-			ssh.ShellQuote(hostAssetDir), ssh.ShellQuote(cfg.Image), ssh.ShellQuote(copyCmd),
-		)
-		out, err := d.exec.Run(ctx, extractCmd)
-		if err != nil || !strings.Contains(out, "ok-bridge") {
-			return fmt.Errorf("asset extraction failed: %s", strings.TrimSpace(out))
+		// One-shot extraction container, removed on every exit. A stale
+		// corpse from an interrupted deploy is cleared first (a create with
+		// the same name would otherwise fail); the name carries the attempt
+		// id, so it can never collide with another attempt's extraction.
+		extractContainer := "teploy-assets-" + att.ID
+		extractCmd := strings.Join([]string{
+			"docker rm -f " + ssh.ShellQuote(extractContainer) + " 2>/dev/null || true",
+			"docker create --name " + ssh.ShellQuote(extractContainer) + " " + ssh.ShellQuote(runImage),
+			"docker cp " + ssh.ShellQuote(extractContainer+":"+cfg.AssetPath+"/.") + " " + ssh.ShellQuote(assetDir+"/"),
+			"rc=$?",
+			"docker rm -f " + ssh.ShellQuote(extractContainer) + " >/dev/null 2>&1 || true",
+			"exit $rc",
+		}, "; ")
+		if _, err := d.exec.Run(ctx, extractCmd); err != nil {
+			return fmt.Errorf("asset extraction failed: %w", err)
 		}
-		fmt.Fprintln(d.out, "  Assets extracted to host")
+		fmt.Fprintln(d.out, "  Assets extracted to the attempt's private tree")
 
-		// Mount the shared asset directory into the container.
+		// Mount the private tree — into a CLONED volumes map: mutating the
+		// caller's map through the Config value copy used to leak the mount
+		// into every subsequent use of that map (A15).
+		cfg.Volumes = maps.Clone(cfg.Volumes)
 		if cfg.Volumes == nil {
 			cfg.Volumes = map[string]string{}
 		}
-		cfg.Volumes[hostAssetDir] = cfg.AssetPath
+		cfg.Volumes[assetDir] = cfg.AssetPath
 	}
 
 	// 6. Handle same-version redeploy: rename existing containers to avoid name conflicts.
@@ -488,10 +563,10 @@ func (d *Deployer) DeployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 			App:           cfg.App,
 			Process:       "web",
 			Version:       cfg.Version,
-			Image:         cfg.Image,
+			Image:         runImage,
 			Port:          ports[i],
 			BindHost:      webBindHost,
-			ContainerPort: cfg.ContainerPort,
+			ContainerPort: containerPort,
 			Publish:       cfg.Publish,
 			EnvFiles:      cfg.EnvFiles,
 			Env:           cfg.Env,
@@ -503,6 +578,13 @@ func (d *Deployer) DeployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 			NoHealthcheck: cfg.NoHealthcheck["web"],
 		})
 		if err != nil {
+			// Docker can CREATE a container and still fail the run (port
+			// binding, for one) — that corpse is not in `started`, so it
+			// would outlive this deploy and collide with the next one's
+			// candidate name. Reconcile it: remove the name's container
+			// only when it is NOT running (a running container under the
+			// candidate name is not provably ours — never kill it, A14).
+			d.reconcilePartialRun(name)
 			return restoreDisplacedAndStarted(fmt.Errorf("starting container %s: %w", name, err))
 		}
 		started = append(started, name)
@@ -518,7 +600,7 @@ func (d *Deployer) DeployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 		if logs != "" {
 			fmt.Fprintf(d.out, "\n--- Container logs ---\n%s\n--- End logs ---\n", logs)
 		}
-		d.printDiagnosis(ctx, webContainerName, cfg.ContainerPort, reason, logs)
+		d.printDiagnosis(ctx, webContainerName, containerPort, reason, logs)
 		return restoreDisplacedAndStarted(reason)
 	}
 
@@ -574,7 +656,7 @@ func (d *Deployer) DeployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 			App:           cfg.App,
 			Process:       process,
 			Version:       cfg.Version,
-			Image:         cfg.Image,
+			Image:         runImage,
 			Port:          0, // non-web processes don't get a port
 			EnvFiles:      cfg.EnvFiles,
 			Env:           cfg.Env,
@@ -585,9 +667,19 @@ func (d *Deployer) DeployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 			NoHealthcheck: cfg.NoHealthcheck[process],
 		})
 		if err != nil {
+			d.reconcilePartialRun(name)
 			return fail(fmt.Errorf("starting %s: %w", name, err))
 		}
 		started = append(started, name)
+		// A detached `docker run` proves nothing about the worker's
+		// viability — a bad command or an instantly-crashing process used
+		// to be recorded as a successful deploy while no jobs were consumed
+		// (A23). Require the worker to still be running one second later,
+		// and treat an already-exited/restarting/unhealthy state as a
+		// failed deploy (cleaned up with everything else via fail()).
+		if err := d.workerRemainsRunning(ctx, name); err != nil {
+			return fail(err)
+		}
 	}
 
 	// 11. Update Caddy route to point at new web container(s).
@@ -609,7 +701,7 @@ func (d *Deployer) DeployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 		if replicas > 1 {
 			upstreams := make([]caddy.Upstream, replicas)
 			for i := range replicas {
-				upstreams[i] = caddy.Upstream{Dial: fmt.Sprintf("%s:%d", webContainerNames[i], cfg.ContainerPort)}
+				upstreams[i] = caddy.Upstream{Dial: fmt.Sprintf("%s:%d", webContainerNames[i], containerPort)}
 			}
 			// Caddy's active upstream checks probe the SAME path the deploy
 			// readiness gate used (F47) — the block used to hardcode /up.
@@ -618,7 +710,7 @@ func (d *Deployer) DeployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 			}
 			fmt.Fprintf(d.out, "  Traffic load-balanced across %d replicas\n", replicas)
 		} else {
-			if err := d.caddy.SetRoute(ctx, cfg.App, cfg.Domain, webContainerName, cfg.ContainerPort, tls, cfg.CaddyExtra, cfg.Cache, cfg.Firewall, cfg.Access); err != nil {
+			if err := d.caddy.SetRoute(ctx, cfg.App, cfg.Domain, webContainerName, containerPort, tls, cfg.CaddyExtra, cfg.Cache, cfg.Firewall, cfg.Access); err != nil {
 				return fail(fmt.Errorf("updating route: %w", err))
 			}
 			fmt.Fprintln(d.out, "  Traffic routed to new container")
@@ -1090,4 +1182,84 @@ func imageDigestFromRef(image string) string {
 		return digest
 	}
 	return ""
+}
+
+// reconcilePartialRun removes the container occupying a candidate name
+// after a failed `docker run`, but ONLY when it is not running (A14):
+// Docker can create a container and fail the start (port binding, for one),
+// leaving a corpse under the candidate name that this deploy never tracked
+// and the next deploy's candidate would collide with. A RUNNING container
+// under the name is not provably this operation's — it is left alone.
+func (d *Deployer) reconcilePartialRun(name string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	out, err := d.exec.Run(ctx, "docker inspect -f '{{.State.Status}}' "+ssh.ShellQuote(name)+" 2>/dev/null || true")
+	if err != nil || strings.TrimSpace(out) == "" || strings.TrimSpace(out) == "running" {
+		return
+	}
+	if _, rmErr := d.exec.Run(ctx, "docker rm -f "+ssh.ShellQuote(name)); rmErr != nil {
+		fmt.Fprintf(d.out, "Warning: a partial container may remain under %s after the failed start: %v\n", name, rmErr)
+	}
+}
+
+// workerRemainsRunning verifies a just-started worker process is actually
+// viable: still running (not exited/dead/restarting) one second after the
+// detached run, and not already flagged unhealthy by the image's
+// healthcheck (A23). An inspect result that cannot be parsed degrades to a
+// warning — the container itself remains subject to the normal cleanup
+// paths — but a PARSED dead/restarting state fails the deploy.
+func (d *Deployer) workerRemainsRunning(ctx context.Context, name string) error {
+	st, ok := d.inspectWorkerState(ctx, name)
+	if !ok {
+		fmt.Fprintf(d.out, "Warning: could not verify worker %s stability (inspect unreadable); proceeding\n", name)
+		return nil
+	}
+	if err := workerStateViable(st); err != nil {
+		return fmt.Errorf("worker %s is not viable: %w", name, err)
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(time.Second):
+	}
+	st, ok = d.inspectWorkerState(ctx, name)
+	if !ok {
+		return nil
+	}
+	return workerStateViable(st)
+}
+
+type workerStateJSON struct {
+	Status     string `json:"Status"`
+	Running    bool   `json:"Running"`
+	Restarting bool   `json:"Restarting"`
+	ExitCode   int    `json:"ExitCode"`
+	Health     *struct {
+		Status string `json:"Status"`
+	} `json:"Health"`
+}
+
+func (d *Deployer) inspectWorkerState(ctx context.Context, name string) (workerStateJSON, bool) {
+	out, err := d.exec.Run(ctx, "docker inspect -f '{{json .State}}' "+ssh.ShellQuote(name))
+	if err != nil {
+		return workerStateJSON{}, false
+	}
+	var st workerStateJSON
+	if err := json.Unmarshal([]byte(strings.TrimSpace(out)), &st); err != nil {
+		return workerStateJSON{}, false
+	}
+	return st, true
+}
+
+func workerStateViable(st workerStateJSON) error {
+	if st.Restarting || st.Status == "exited" || st.Status == "dead" {
+		return fmt.Errorf("container is %s (exit %d)", st.Status, st.ExitCode)
+	}
+	if st.Status != "running" {
+		return fmt.Errorf("container status is %q", st.Status)
+	}
+	if st.Health != nil && st.Health.Status == "unhealthy" {
+		return fmt.Errorf("image healthcheck reports unhealthy")
+	}
+	return nil
 }

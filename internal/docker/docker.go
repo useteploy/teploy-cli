@@ -266,6 +266,23 @@ func nameAlreadyInUse(output string, err error) bool {
 	return strings.Contains(haystack, "already in use")
 }
 
+// ResolveImageID returns the immutable local image ID for ref. Deploy
+// resolves this ONCE and creates every replica/worker from the ID (audit
+// A52): a mutable tag can be re-pointed by a concurrent pull/build/tag on
+// the same host mid-deploy — an app-scoped lock does not own the global
+// Docker tag namespace — silently mixing images within one release.
+func (c *Client) ResolveImageID(ctx context.Context, ref string) (string, error) {
+	out, err := c.exec.Run(ctx, "docker image inspect --format '{{.Id}}' "+ssh.ShellQuote(ref))
+	if err != nil {
+		return "", fmt.Errorf("resolving image identity for %s: %w", ref, err)
+	}
+	id := strings.TrimSpace(out)
+	if !strings.HasPrefix(id, "sha256:") || len(id) != len("sha256:")+64 {
+		return "", fmt.Errorf("docker returned no immutable image ID for %s (got %q)", ref, id)
+	}
+	return id, nil
+}
+
 // Stop stops a container by name. Sends SIGTERM, then SIGKILL after timeout seconds.
 func (c *Client) Stop(ctx context.Context, name string, timeout int) error {
 	cmd := fmt.Sprintf("docker stop -t %d %s", timeout, ssh.ShellQuote(name))

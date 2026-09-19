@@ -75,14 +75,16 @@ func RsyncTarget(user, host, remotePath string) string {
 }
 
 // SplitHostPort splits an endpoint that may be "host", "host:port", a
-// bracketed IPv6 "[host]:port", or a bare IPv6 literal. Returns
+// bracketed IPv6 "[host]:port", or a bare IPv6 literal. The port, when
+// present, must be a real TCP port number in 1..65535 — Atoi alone also
+// accepted "0", negatives, and out-of-range values (audit A17). Returns
 // ("", "", error) for anything else.
 func SplitHostPort(endpoint string) (host, port string, err error) {
 	if endpoint == "" {
 		return "", "", fmt.Errorf("empty endpoint")
 	}
 	if h, p, splitErr := net.SplitHostPort(endpoint); splitErr == nil && h != "" && p != "" {
-		if _, convErr := strconv.Atoi(p); convErr == nil {
+		if n, convErr := strconv.Atoi(p); convErr == nil && n >= 1 && n <= 65535 {
 			return h, p, nil
 		}
 	}

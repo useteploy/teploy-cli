@@ -1183,9 +1183,12 @@ func TestDeploy_AssetBridging(t *testing.T) {
 		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state' ]", Output: "absent"},
 		// 4. Find port.
 		ssh.MockCommand{Match: "ss -tln", Output: ssOutput},
-		// 5. Asset bridging: create dir + extract.
-		ssh.MockCommand{Match: "mkdir -p '/deployments/myapp/assets'", Output: ""},
-		ssh.MockCommand{Match: "docker run --rm --user 0 -v '/deployments/myapp/assets':/bridge", Output: "ok-bridge\n"},
+		// 5. Asset bridging: attempt-scoped tree (A15) + create/cp extraction.
+		ssh.MockCommand{Match: "mkdir -p '/deployments/myapp/meta/att/abc123.", Output: ""},
+		ssh.MockCommand{Match: "ls -1 /deployments/myapp/meta/att", Output: ""},
+		ssh.MockCommand{Match: "docker rm -f 'teploy-assets-", Output: ""},
+		ssh.MockCommand{Match: "docker create --name 'teploy-assets-", Output: "extractcontainer"},
+		ssh.MockCommand{Match: "docker cp 'teploy-assets-", Output: ""},
 		// 6. Start container.
 		ssh.MockCommand{Match: "docker run --detach", Output: "abc123container"},
 		// 7. Verify running.
@@ -1236,22 +1239,26 @@ func TestDeploy_AssetBridging(t *testing.T) {
 	// Verify docker run includes asset volume mount.
 	for _, call := range mock.Calls {
 		if strings.HasPrefix(call, "docker run --detach") {
-			if !strings.Contains(call, "-v '/deployments/myapp/assets:/app/public/assets'") {
+			if !strings.Contains(call, "-v '/deployments/myapp/meta/att/abc123.") || !strings.Contains(call, ":/app/public/assets'") {
 				t.Errorf("expected asset volume mount in docker run: %s", call)
 			}
 			break
 		}
 	}
 
-	// Verify one-shot extraction container was run.
+	// Verify one-shot extraction container was created (never run — no
+	// image ENTRYPOINT executes during extraction, A15).
 	foundExtract := false
 	for _, call := range mock.Calls {
-		if strings.Contains(call, "docker run --rm") && strings.Contains(call, "/bridge") {
+		if strings.Contains(call, "docker create --name 'teploy-assets-") &&
+			strings.Contains(call, "'myapp:latest'") &&
+			strings.Contains(call, "docker cp 'teploy-assets-") &&
+			strings.Contains(call, ":/app/public/assets/.") {
 			foundExtract = true
 		}
 	}
 	if !foundExtract {
-		t.Error("expected one-shot asset extraction container")
+		t.Error("expected one-shot asset extraction via docker create + docker cp")
 	}
 
 	// Verify asset cleanup was run.
@@ -1274,7 +1281,11 @@ func TestDeploy_AssetBridgingCustomKeepDays(t *testing.T) {
 		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state' ]", Output: "absent"},
 		ssh.MockCommand{Match: "ss -tln", Output: ssOutput},
 		ssh.MockCommand{Match: "mkdir -p '/deployments/myapp/assets'", Output: ""},
-		ssh.MockCommand{Match: "docker run --rm --user 0", Output: "ok-bridge\n"},
+		ssh.MockCommand{Match: "mkdir -p '/deployments/myapp/meta/att/abc123.", Output: ""},
+		ssh.MockCommand{Match: "ls -1 /deployments/myapp/meta/att", Output: ""},
+		ssh.MockCommand{Match: "docker rm -f 'teploy-assets-", Output: ""},
+		ssh.MockCommand{Match: "docker create --name 'teploy-assets-", Output: "extractcontainer"},
+		ssh.MockCommand{Match: "docker cp 'teploy-assets-", Output: ""},
 		ssh.MockCommand{Match: "docker run --detach", Output: "abc123"},
 		ssh.MockCommand{Match: "docker inspect", Output: "running"},
 		ssh.MockCommand{Match: "curl -s -o /dev/null", Output: "200"},

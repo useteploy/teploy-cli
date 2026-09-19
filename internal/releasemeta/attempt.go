@@ -201,6 +201,27 @@ func PruneAttempts(ctx context.Context, exec ssh.Executor, app string, keepHashe
 // none (first attempt). Best-effort by contract: any failure simply means a
 // full transfer.
 func PreviousAttemptBuildDir(ctx context.Context, exec ssh.Executor, app, excludeID string) string {
+	return previousAttemptSubDir(ctx, exec, app, excludeID, "build")
+}
+
+// PreviousAttemptAssetsDir returns the assets directory of the most recent
+// other attempt, when one exists — the SEED for this attempt's private
+// asset tree (audit A15): asset bridging must not mutate the live shared
+// tree a running release still reads. Empty when there is none.
+func PreviousAttemptAssetsDir(ctx context.Context, exec ssh.Executor, app, excludeID string) string {
+	dir := previousAttemptSubDir(ctx, exec, app, excludeID, "assets")
+	if dir == "" {
+		return ""
+	}
+	// Only a directory that provably exists is a usable seed; anything
+	// else means "no previous tree" (full extraction), not an error.
+	if out, err := exec.Run(ctx, "test -d "+ssh.ShellQuote(dir)+" && echo yes || echo no"); err != nil || strings.TrimSpace(out) != "yes" {
+		return ""
+	}
+	return dir
+}
+
+func previousAttemptSubDir(ctx context.Context, exec ssh.Executor, app, excludeID, sub string) string {
 	names, err := listAttempts(ctx, exec, attemptRoot(app))
 	if err != nil {
 		return ""
@@ -218,5 +239,5 @@ func PreviousAttemptBuildDir(ctx context.Context, exec ssh.Executor, app, exclud
 	// random, so this is not chronology — it does not need to be; any
 	// recent-ish basis gives rsync its delta.
 	sort.Strings(filtered)
-	return attemptRoot(app) + "/" + filtered[len(filtered)-1] + "/build"
+	return attemptRoot(app) + "/" + filtered[len(filtered)-1] + "/" + sub
 }
