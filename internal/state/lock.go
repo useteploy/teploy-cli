@@ -33,9 +33,12 @@ package state
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -235,11 +238,29 @@ func (l *Lock) renewLoop(stop, done chan struct{}) {
 	}
 }
 
+// ownerTempName returns a staging sibling unique to this write: path +
+// ".tmp-" + owner + "-" + random. F16's first cut staged to FIXED names
+// (state.json.tmp-fence, .lock/info.renew) shared by every generation, so a
+// stale holder could upload into the successor's staging path and have the
+// successor's own guard pass those stale bytes into authority (audit A06).
+// Staging under a random owner-scoped name makes cross-generation clobber
+// impossible.
+func ownerTempName(path, owner string) (string, error) {
+	var nonce [8]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return "", fmt.Errorf("generating staging name: %w", err)
+	}
+	return fmt.Sprintf("%s.tmp-%s-%s", path, owner, hex.EncodeToString(nonce[:])), nil
+}
+
 // renew refreshes renew_ts under the holdership guard — a renewal that no
 // longer holds must never clobber the new holder's info file. The payload
-// is staged to a fixed sibling (writing it is not an effect; the lock dir
-// belongs to the holder) and the rename that makes it live is the guarded
-// effect, so guard and write cannot interleave.
+// is staged to a unique sibling in the APP directory (not inside .lock: a
+// stale renewal whose lock directory was already removed must never
+// RECREATE it, which Upload's mkdir -p would do — leaving a ghost .lock
+// that blocks the next acquire for a full staleLockTTL), and the rename
+// that makes it live is the guarded effect, so guard and write cannot
+// interleave.
 func (l *Lock) renew(ctx context.Context) error {
 	l.mu.Lock()
 	exec := l.renewer
@@ -258,38 +279,87 @@ func (l *Lock) renew(ctx context.Context) error {
 		return err
 	}
 	path := lockInfoPath(l.app)
-	tmp := path + ".renew"
+	tmp, err := ownerTempName(fmt.Sprintf("%s/%s/.lock-info", deploymentsDir, l.app), l.owner)
+	if err != nil {
+		return err
+	}
 	if err := exec.Upload(ctx, strings.NewReader(string(payload)), tmp, "0644"); err != nil {
 		return fmt.Errorf("renewing lock info: %w", err)
 	}
+	// No mkdir here: the guard just proved .lock/info exists, so .lock
+	// exists; recreating it unconditionally would resurrect a released
+	// lock's directory. A lock removed in the grep→mv window makes mv
+	// fail — a transient renewal error that is retried on the next tick.
 	_, err = l.Guarded(ctx, exec, "mv -f -- "+ssh.ShellQuote(tmp)+" "+ssh.ShellQuote(path))
-	return err
+	if err != nil {
+		// The staged file is inert outside .lock; a fence-lost renewal
+		// must not leave litter behind it (best-effort, bounded).
+		if fenceLostErr(err) {
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			exec.Run(cleanupCtx, "rm -f -- "+ssh.ShellQuote(tmp))
+			cancel()
+		}
+		return err
+	}
+	return nil
 }
 
-// ReleaseLockFenced stops renewal and releases the lock. The release itself
-// uses the detached bounded context (see ReleaseLockDetached) so a cancelled
-// deploy context cannot skip the unlock and strand the app.
+// ReleaseLockFenced stops renewal and releases the lock — but only when the
+// server still names THIS operation as the holder. The release effect runs
+// under the holdership guard (audit A04): after a takeover or a manual
+// unlock/reacquire, a stale deploy's deferred release used to execute an
+// unconditional rm -rf on the lock directory, deleting the SUCCESSOR's lock
+// and letting a third operation in. A refused release (ErrFenceLost) is a
+// success here — the lock belongs to someone else, and leaving it alone is
+// exactly the correct outcome. A nil handle keeps the historical unfenced
+// release for callers that never held a fence (admin unlock, pre-F16
+// paths).
 func ReleaseLockFenced(exec ssh.Executor, lk *Lock, app string) {
 	if lk != nil {
 		lk.StopRenewal()
+		if lk.App() != "" && lk.App() != app {
+			// A handle for a different app has no authority over this
+			// app's lock; releasing it would be A04's defect with extra
+			// steps. Refuse and say so.
+			fmt.Fprintf(os.Stderr, "teploy: refusing to release %s's lock with a lease held for %s\n", app, lk.App())
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_, err := lk.Guarded(ctx, exec, "rm -rf -- "+ssh.ShellQuote(fmt.Sprintf("%s/%s/.lock", deploymentsDir, app)))
+		if err != nil && !fenceLostErr(err) {
+			// Transport-level failure: fall back to the detached
+			// unconditional release rather than stranding the app —
+			// same trade-off as the pre-A04 behavior, but only when the
+			// owner check itself could not be evaluated.
+			ReleaseLockDetached(exec, app)
+		}
+		return
 	}
 	ReleaseLockDetached(exec, app)
 }
 
 // WriteFenced is Write with the state commit under the fence: the content is
-// staged to a sibling temp (no effect), and the atomic rename — the instant
-// the new state becomes authoritative — runs as a guarded effect. A holder
-// that lost the lock commits nothing.
+// staged to a unique sibling (no effect — a stale holder cannot clobber the
+// successor's staging, A06), and the atomic rename — the instant the new
+// state becomes authoritative — runs as a guarded effect. A holder that
+// lost the lock commits nothing.
 func WriteFenced(ctx context.Context, exec ssh.Executor, app string, s *AppState, lk *Lock) error {
 	if lk == nil {
 		return Write(ctx, exec, app, s)
+	}
+	if lk.App() != app {
+		return fmt.Errorf("refusing to commit state for %s under a lease held for %s", app, lk.App())
 	}
 	data, err := prepareState(s)
 	if err != nil {
 		return err
 	}
 	path := fmt.Sprintf("%s/%s/state.json", deploymentsDir, app)
-	tmpPath := path + ".tmp-fence"
+	tmpPath, err := ownerTempName(path, lk.Owner())
+	if err != nil {
+		return err
+	}
 	if err := exec.Upload(ctx, strings.NewReader(string(data)), tmpPath, "0644"); err != nil {
 		return fmt.Errorf("uploading temporary state file: %w", err)
 	}
