@@ -26,6 +26,8 @@ func TestRestoreVolumes_StagesBeforePromoting(t *testing.T) {
 		ssh.MockCommand{Match: "find ", Output: ""},
 		ssh.MockCommand{Match: "cp -a ", Output: ""},
 		ssh.MockCommand{Match: "if [ -f", Output: ""},
+		// A39's env commit is a set -eu script.
+		ssh.MockCommand{Match: "set -eu", Output: "Restored app .env\n"},
 	)
 
 	var buf bytes.Buffer
@@ -104,11 +106,23 @@ func TestRestoreVolumes_StagesBeforePromoting(t *testing.T) {
 	if envInstall == "" {
 		t.Fatalf("expected an .env install step, got calls: %v", mock.Calls)
 	}
-	if !strings.Contains(envInstall, "mv '"+runDir+"/new.env' '/deployments/myapp/.env'") {
-		t.Errorf(".env must be installed beside volumes/ in the app directory, got: %s", envInstall)
+	// A39: the new env is staged as a private sibling on the DESTINATION
+	// filesystem (never a cross-filesystem mv from /tmp), secured at 0600
+	// before publication, and the old file's recovery copy is mandatory.
+	if !strings.Contains(envInstall, "mktemp '/deployments/myapp/.env-new.") {
+		t.Errorf(".env must be staged beside the destination on the same filesystem, got: %s", envInstall)
 	}
-	if !strings.Contains(envInstall, ".env.pre-restore") || !strings.Contains(envInstall, "chmod 600") {
-		t.Errorf(".env install must keep the previous file recoverable and restrict permissions, got: %s", envInstall)
+	if !strings.Contains(envInstall, "chmod 600 \"$new\"") || !strings.Contains(envInstall, "chmod 600 \"$old\"") {
+		t.Errorf("both staged files must be secured before publication, got: %s", envInstall)
+	}
+	if !strings.Contains(envInstall, "mv -fT -- \"$new\" '/deployments/myapp/.env'") {
+		t.Errorf(".env publication must be the atomic rename of the staged sibling, got: %s", envInstall)
+	}
+	if !strings.Contains(envInstall, ".env-old.") || !strings.Contains(envInstall, ".env.pre-restore") {
+		t.Errorf("the old .env's recovery copy must be staged then renamed into place, got: %s", envInstall)
+	}
+	if !strings.Contains(envInstall, "set -eu") {
+		t.Errorf("the env commit must abort on the first failed step, got: %s", envInstall)
 	}
 }
 
@@ -281,6 +295,8 @@ func TestAccessoryRestore_RedisRestartsAfterCopyFailure(t *testing.T) {
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
 		ssh.MockCommand{Match: "aws s3 cp", Output: "download: done\n"},
 		ssh.MockCommand{Match: "mktemp -d '/tmp/teploy-restore.XXXXXX'", Output: "/tmp/teploy-restore.abc123\n"},
+		// A40's preflight must prove appendonly=no before the script runs.
+		ssh.MockCommand{Match: "docker exec 'myapp-redis' redis-cli --raw config get appendonly", Output: "appendonly no"},
 		ssh.MockCommand{Match: "set -eu", Err: fmt.Errorf("exit status 1: docker cp failed")},
 	)
 
