@@ -619,7 +619,8 @@ func TestDeploy_SameVersion(t *testing.T) {
 		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state' ]", Output: "present\n" + existingState},
 		ssh.MockCommand{Match: "ss -tln", Output: ssOutput},
 		// Rename existing container.
-		ssh.MockCommand{Match: "docker rename", Output: ""},
+ssh.MockCommand{Match: "docker inspect -f '{{.State.Status}}' 'myapp-web-abc123_replaced'", Output: ""},
+				ssh.MockCommand{Match: "docker rename", Output: ""},
 		ssh.MockCommand{Match: "docker run", Output: "newcontainer"},
 		ssh.MockCommand{Match: "docker inspect -f", Output: "running"},
 		ssh.MockCommand{Match: "curl -s -o /dev/null", Output: "200"},
@@ -657,7 +658,7 @@ func TestDeploy_SameVersion(t *testing.T) {
 	// Verify rename was called.
 	renameFound := false
 	for _, call := range mock.Calls {
-		if strings.Contains(call, "docker rename myapp-web-abc123 myapp-web-abc123_replaced") {
+		if strings.Contains(call, "docker rename 'myapp-web-abc123' 'myapp-web-abc123_replaced'") {
 			renameFound = true
 		}
 	}
@@ -687,6 +688,9 @@ func TestDeploy_SameVersion_StaleReplaced(t *testing.T) {
 		ssh.MockCommand{Match: "ss -tln", Output: ssOutput},
 		// Pre-rename cleanup of stale _replaced container.
 		ssh.MockCommand{Match: "docker rm -f", Output: ""},
+		// The stale _replaced container exists in Exited state (A08: a
+		// RUNNING one must be refused, an exited corpse is cleared).
+		ssh.MockCommand{Match: "docker inspect -f '{{.State.Status}}' 'myapp-web-abc123_replaced'", Output: "exited"},
 		// Rename live container.
 		ssh.MockCommand{Match: "docker rename", Output: ""},
 		ssh.MockCommand{Match: "docker run", Output: "newcontainer"},
@@ -1323,7 +1327,8 @@ func TestDeploy_SameVersionWithWorkers(t *testing.T) {
 		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state.json' ]", Output: "absent"},
 		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state' ]", Output: "present\n" + stateContent},
 		ssh.MockCommand{Match: "ss -tln", Output: ssOutput},
-		// Rename existing containers.
+ssh.MockCommand{Match: "docker inspect -f '{{.State.Status}}' 'myapp-", Output: ""},
+				// Rename existing containers.
 		ssh.MockCommand{Match: "docker rename", Output: ""},
 		// Start new containers.
 		ssh.MockCommand{Match: "docker run", Output: "redeploycontainer"},
@@ -1369,10 +1374,10 @@ func TestDeploy_SameVersionWithWorkers(t *testing.T) {
 	renameWeb := false
 	renameWorker := false
 	for _, call := range mock.Calls {
-		if strings.Contains(call, "docker rename myapp-web-abc123 myapp-web-abc123_replaced") {
+		if strings.Contains(call, "docker rename 'myapp-web-abc123' 'myapp-web-abc123_replaced'") {
 			renameWeb = true
 		}
-		if strings.Contains(call, "docker rename myapp-worker-abc123 myapp-worker-abc123_replaced") {
+		if strings.Contains(call, "docker rename 'myapp-worker-abc123' 'myapp-worker-abc123_replaced'") {
 			renameWorker = true
 		}
 	}

@@ -89,6 +89,7 @@ func TestDeploy_SameVersionCleanupNeverTouchesReplacement(t *testing.T) {
 		ssh.MockCommand{Match: "docker rm -f", Output: ""},
 		ssh.MockCommand{Match: "docker rename", Output: ""},
 		ssh.MockCommand{Match: "docker run", Output: "abc123def456\n"},
+		ssh.MockCommand{Match: "docker inspect -f '{{.State.Status}}' 'myapp-web-abc123_replaced'", Output: "exited"},
 		ssh.MockCommand{Match: "docker inspect -f '{{.State.Status}}'", Output: "running"},
 		ssh.MockCommand{Match: "curl", Output: "200"},
 		ssh.MockCommand{Match: "docker ps --all", Output: `{"ID":"old","Names":"myapp-web-abc123_replaced","Image":"myapp:v1","State":"running","Status":"Up","CreatedAt":"2026-01-01 00:00:00 +0000 UTC","Labels":"teploy.app=myapp,teploy.version=abc123,teploy.process=web"}`},

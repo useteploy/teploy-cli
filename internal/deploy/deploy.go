@@ -334,8 +334,28 @@ func (d *Deployer) DeployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 			seen[docker.ContainerName(cfg.App, process, cfg.Version)] = true
 		}
 		for name := range seen {
-			d.exec.Run(ctx, fmt.Sprintf("docker rm -f %s 2>/dev/null", name+"_replaced"))
-			d.exec.Run(ctx, fmt.Sprintf("docker rename %s %s 2>/dev/null", name, name+"_replaced"))
+			replaced := name + "_replaced"
+			// A RUNNING _replaced container is the serving predecessor a
+			// previous failed attempt renamed (audit A08): the unconditional
+			// force-remove here used to delete the live workload before the
+			// replacement had even started, so a failed same-version retry
+			// took the app DOWN. Refuse and name the recovery path instead;
+			// a stopped corpse (interrupted deploy, completed redeploy whose
+			// remove failed) is still cleared as before.
+			if stOut, stErr := d.exec.Run(ctx, "docker inspect -f '{{.State.Status}}' "+ssh.ShellQuote(replaced)+" 2>/dev/null || true"); stErr == nil && strings.TrimSpace(stOut) == "running" {
+				return fmt.Errorf("container %s is still running — it is the previous same-version attempt's renamed (serving) workload; refusing to delete it. Restore it first (teploy rollback --app %s) or remove it deliberately", replaced, cfg.App)
+			}
+			d.exec.Run(ctx, "docker rm -f "+ssh.ShellQuote(replaced)+" 2>/dev/null || true")
+			// The rename's failure must not be swallowed (A08): with the
+			// predecessor still live under `name`, a silently ignored
+			// rename failure made the snapshot and the candidate run disagree
+			// about which container holds the workload. Only a confirmed
+			// absence of the source is a no-op.
+			if _, err := d.exec.Run(ctx, "docker rename "+ssh.ShellQuote(name)+" "+ssh.ShellQuote(replaced)); err != nil {
+				if srcOut, srcErr := d.exec.Run(ctx, "docker inspect -f '{{.State.Status}}' "+ssh.ShellQuote(name)+" 2>/dev/null || true"); srcErr != nil || strings.TrimSpace(srcOut) != "" {
+					return fmt.Errorf("renaming the current container %s to %s failed: %w — the workload is untouched; inspect the server before retrying", name, replaced, err)
+				}
+			}
 		}
 	}
 
@@ -420,22 +440,35 @@ func (d *Deployer) DeployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 		// bounded so a hung cleanup cannot outlive the process.
 		recoveryCtx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 		defer cancel()
+		// Every intended compensation is reported (A13): a stop/remove
+		// failure leaves a stray container, a failed restart leaves the app
+		// (or one of its replicas) down — "at least one thing worked" must
+		// never read as "recovered".
+		var cleanupFailures []string
 		for _, n := range started {
-			d.docker.Stop(recoveryCtx, n, 5)
-			d.docker.Remove(recoveryCtx, n)
+			if err := d.docker.Stop(recoveryCtx, n, 5); err != nil {
+				cleanupFailures = append(cleanupFailures, fmt.Sprintf("stop %s: %v", n, err))
+				continue
+			}
+			if err := d.docker.Remove(recoveryCtx, n); err != nil {
+				cleanupFailures = append(cleanupFailures, fmt.Sprintf("remove %s: %v", n, err))
+			}
 		}
-		restored := len(started) == 0
+		restored := len(displacedHostWeb) == 0
 		for _, old := range displacedHostWeb {
 			if err := d.docker.Restart(recoveryCtx, old, nil); err != nil {
+				cleanupFailures = append(cleanupFailures, fmt.Sprintf("restore %s: %v", old, err))
 				fmt.Fprintf(d.out, "  WARNING: could not restore displaced container %s: %v\n", old, err)
 			} else {
-				restored = true
 				fmt.Fprintf(d.out, "  Restored %s\n", old)
 			}
 		}
+		if len(cleanupFailures) > 0 {
+			fmt.Fprintf(d.out, "  WARNING: cleanup incomplete after failure — %s\n", strings.Join(cleanupFailures, "; "))
+		}
 		d.logDeploy(recoveryCtx, cfg, false, start)
 		if !restored && len(displacedHostWeb) > 0 {
-			return fmt.Errorf("%w — recovery also failed: no container is serving; %s needs manual attention", reason, cfg.App)
+			return fmt.Errorf("%w — recovery also failed: no container is serving; %s needs manual attention (%s)", reason, cfg.App, strings.Join(cleanupFailures, "; "))
 		}
 		return reason
 	}
@@ -829,22 +862,43 @@ func stopOldWorkloadsByName(ctx context.Context, dk *docker.Client, out io.Write
 }
 
 func (d *Deployer) abortStateCommit(ctx context.Context, cfg Config, current *state.AppState, started, displacedHostWeb []string, start time.Time, commitErr error) error {
-	d.logDeploy(ctx, cfg, false, start)
+	// Compensation runs on a DETACHED bounded context (A11): if the commit
+	// failed because the deploy context was cancelled, reusing that context
+	// would skip the very stops/restarts/route restores that undo the
+	// deploy — leaving the app dark while the error text claims recovery.
+	recoveryCtx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	d.logDeploy(recoveryCtx, cfg, false, start)
 
 	if cfg.ingressHost() || len(cfg.Publish) > 0 {
 		for _, name := range started {
-			d.docker.Stop(ctx, name, 5)
+			d.docker.Stop(recoveryCtx, name, 5)
 		}
 		for _, old := range displacedHostWeb {
-			if err := d.docker.Restart(ctx, old, nil); err != nil {
+			if err := d.docker.Restart(recoveryCtx, old, nil); err != nil {
 				for _, name := range started {
-					d.docker.Start(ctx, name)
+					d.docker.Start(recoveryCtx, name)
 				}
 				return fmt.Errorf("committing authoritative applied state after replacing the fixed-port host workload: %w; restoring the original workload failed: %v; Teploy attempted to restart the new workload to avoid an outage", commitErr, err)
 			}
 		}
+		// A caddy-ingress app with publish entries entered this branch too
+		// (its fixed ports forced the recreate strategy) and its route WAS
+		// switched in step 11 — the commit failure used to return here
+		// without restoring the route, leaving Caddy pointed at the removed
+		// candidate names (A10). Restore it before removing the candidates;
+		// if that fails, keep the candidates running rather than routing to
+		// nothing.
+		if cfg.usesCaddy() {
+			if err := d.restorePreviousRoute(recoveryCtx, cfg, current); err != nil {
+				for _, name := range started {
+					d.docker.Start(recoveryCtx, name)
+				}
+				return fmt.Errorf("committing authoritative applied state after replacing the fixed-port host workload: %w; the original workload restarted but its route could not be restored: %v; the uncommitted workload was restarted to avoid an outage", commitErr, err)
+			}
+		}
 		for _, name := range started {
-			d.docker.Remove(ctx, name)
+			d.docker.Remove(recoveryCtx, name)
 		}
 		if len(displacedHostWeb) == 0 {
 			return fmt.Errorf("committing authoritative applied state after starting the first host-ingress workload: %w; the uncommitted workload was stopped and removed", commitErr)
@@ -853,14 +907,14 @@ func (d *Deployer) abortStateCommit(ctx context.Context, cfg Config, current *st
 	}
 
 	if cfg.usesCaddy() {
-		if err := d.restorePreviousRoute(ctx, cfg, current); err != nil {
+		if err := d.restorePreviousRoute(recoveryCtx, cfg, current); err != nil {
 			return fmt.Errorf("committing authoritative applied state after route switch: %w; restoring the previous route failed: %v; old and new workloads were left running to avoid routing to a stopped container", commitErr, err)
 		}
 	}
 
 	for _, name := range started {
-		d.docker.Stop(ctx, name, 5)
-		d.docker.Remove(ctx, name)
+		d.docker.Stop(recoveryCtx, name, 5)
+		d.docker.Remove(recoveryCtx, name)
 	}
 	if current == nil {
 		return fmt.Errorf("committing authoritative applied state after route switch: %w; the new route was removed and the uncommitted workload was stopped", commitErr)
@@ -916,6 +970,7 @@ func (d *Deployer) logDeploy(ctx context.Context, cfg Config, success bool, star
 		App:        cfg.App,
 		Type:       "deploy",
 		Hash:       cfg.Version,
+		Image:      cfg.Image,
 		Success:    success,
 		DurationMs: time.Since(start).Milliseconds(),
 	})

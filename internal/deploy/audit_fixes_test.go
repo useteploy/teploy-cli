@@ -31,6 +31,7 @@ func TestDeploy_SameVersion_DedupesReplicaAndPlainNames(t *testing.T) {
 		ssh.MockCommand{Match: "docker rm -f", Output: ""},
 		ssh.MockCommand{Match: "docker rename", Output: ""},
 		ssh.MockCommand{Match: "docker run", Output: "abc123def456\n"},
+		ssh.MockCommand{Match: "docker inspect -f '{{.State.Status}}' 'myapp-web-abc123_replaced'", Output: ""},
 		ssh.MockCommand{Match: "docker inspect -f '{{.State.Status}}'", Output: "running"},
 		ssh.MockCommand{Match: "curl", Output: "200"},
 		ssh.MockCommand{Match: "docker ps --all", Output: ""},
@@ -64,10 +65,10 @@ func TestDeploy_SameVersion_DedupesReplicaAndPlainNames(t *testing.T) {
 	rmCount := 0
 	renameIdx, runIdx := -1, -1
 	for i, call := range mock.Calls {
-		if strings.Contains(call, "docker rm -f myapp-web-abc123_replaced") {
+		if strings.Contains(call, "docker rm -f 'myapp-web-abc123_replaced'") {
 			rmCount++
 		}
-		if strings.Contains(call, "docker rename myapp-web-abc123 ") && renameIdx < 0 {
+		if strings.Contains(call, "docker rename 'myapp-web-abc123' ") && renameIdx < 0 {
 			renameIdx = i
 		}
 		if strings.HasPrefix(call, "docker run") && runIdx < 0 {
