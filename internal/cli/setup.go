@@ -91,13 +91,12 @@ func runSetup(flags *Flags, host string, name string, noHarden bool, networkProv
 
 	// If password auth was used, inject the local SSH public key for future key-based auth.
 	if usePassword {
-		pubKeyPath, err := ssh.PublicKeyPath(flags.Key)
+		// Derived from the private identity itself (A32): the old
+		// PublicKeyPath fallthrough could hand provisioning an unrelated
+		// default public key when --key named a key without a .pub.
+		pubKeyData, err := ssh.PublicKeyBytes(flags.Key)
 		if err != nil {
-			return fmt.Errorf("finding SSH public key: %w", err)
-		}
-		pubKeyData, err := os.ReadFile(pubKeyPath)
-		if err != nil {
-			return fmt.Errorf("reading SSH public key: %w", err)
+			return fmt.Errorf("deriving SSH public key: %w", err)
 		}
 		pubKey := strings.TrimSpace(string(pubKeyData))
 		installCmd := fmt.Sprintf(

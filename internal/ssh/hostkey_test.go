@@ -5,7 +5,9 @@ import (
 	"crypto/rand"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"golang.org/x/crypto/ssh"
@@ -81,3 +83,54 @@ func TestAcceptNewHostKeyCallback_WriteSuccessRecordsKey(t *testing.T) {
 }
 
 var _ = net.Addr(fakeAddr{}) // compile-time interface check
+
+// TestPublicKeyBytes_DerivesFromPrivateKey is the A32 regression: with an
+// explicit identity and NO .pub file, the public key is DERIVED from the
+// private key instead of falling through to an unrelated default; a
+// mismatched .pub is an error, never a silent identity switch.
+func TestPublicKeyBytes_DerivesFromPrivateKey(t *testing.T) {
+	if _, err := exec.LookPath("ssh-keygen"); err != nil {
+		t.Skip("ssh-keygen not available")
+	}
+	dir := t.TempDir()
+	key := filepath.Join(dir, "id_test")
+	if out, err := exec.Command("ssh-keygen", "-t", "ed25519", "-N", "", "-f", key).CombinedOutput(); err != nil {
+		t.Fatalf("ssh-keygen: %v: %s", err, out)
+	}
+
+	derived, err := PublicKeyBytes(key)
+	if err != nil {
+		t.Fatalf("PublicKeyBytes without .pub: %v", err)
+	}
+	want, err := os.ReadFile(key + ".pub")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// MarshalAuthorizedKey omits the .pub's trailing comment — compare the
+	// key type and material only.
+	gotFields := strings.Fields(string(derived))
+	wantFields := strings.Fields(string(want))
+	if len(gotFields) < 2 || len(wantFields) < 2 || gotFields[0] != wantFields[0] || gotFields[1] != wantFields[1] {
+		t.Errorf("derived key does not match the generated .pub:\n got %q\nwant %q", derived, want)
+	}
+
+	// A .pub that disagrees with the private key must be refused.
+	other := filepath.Join(dir, "id_other")
+	if out, err := exec.Command("ssh-keygen", "-t", "ed25519", "-N", "", "-f", other).CombinedOutput(); err != nil {
+		t.Fatalf("ssh-keygen: %v: %s", err, out)
+	}
+	if err := os.Rename(other+".pub", key+".pub"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := PublicKeyBytes(key); err == nil || !strings.Contains(err.Error(), "does not match") {
+		t.Fatalf("a mismatched .pub must be refused, got %v", err)
+	}
+
+	// PublicKeyPath with an explicit key never falls through to defaults.
+	if err := os.Remove(key + ".pub"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := PublicKeyPath(key); err == nil {
+		t.Error("an explicit key without .pub must not select an unrelated default public key")
+	}
+}

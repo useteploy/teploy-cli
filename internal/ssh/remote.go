@@ -14,17 +14,18 @@ import (
 	"strings"
 	"time"
 
-	"golang.org/x/crypto/ssh"
+	gossh "golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/knownhosts"
 	"golang.org/x/term"
 )
+
 
 // Compile-time check: RemoteExecutor implements Executor.
 var _ Executor = (*RemoteExecutor)(nil)
 
 // RemoteExecutor implements Executor using a real SSH connection.
 type RemoteExecutor struct {
-	client *ssh.Client
+	client *gossh.Client
 	host   string
 	user   string
 	// acceptNewHost records the host-key policy this connection was created
@@ -67,15 +68,15 @@ func Connect(ctx context.Context, cfg ConnectConfig) (*RemoteExecutor, error) {
 		return nil, fmt.Errorf("no SSH keys found; provide --key, set TEPLOY_SSH_KEY, or place a key at ~/.ssh/id_ed25519")
 	}
 
-	authMethods := []ssh.AuthMethod{}
+	authMethods := []gossh.AuthMethod{}
 	if len(signers) > 0 {
-		authMethods = append(authMethods, ssh.PublicKeys(signers...))
+		authMethods = append(authMethods, gossh.PublicKeys(signers...))
 	}
 	if cfg.Password != "" {
-		authMethods = append(authMethods, ssh.Password(cfg.Password))
+		authMethods = append(authMethods, gossh.Password(cfg.Password))
 	}
 
-	var hostKeyCallback ssh.HostKeyCallback
+	var hostKeyCallback gossh.HostKeyCallback
 	if cfg.AcceptNewHost {
 		home, err := os.UserHomeDir()
 		if err != nil {
@@ -90,7 +91,7 @@ func Connect(ctx context.Context, cfg ConnectConfig) (*RemoteExecutor, error) {
 		}
 	}
 
-	clientConfig := &ssh.ClientConfig{
+	clientConfig := &gossh.ClientConfig{
 		User:            cfg.User,
 		Auth:            authMethods,
 		HostKeyCallback: hostKeyCallback,
@@ -141,7 +142,7 @@ func (e *RemoteExecutor) RunStream(ctx context.Context, cmd string, stdout, stde
 	case err := <-done:
 		return err
 	case <-ctx.Done():
-		_ = session.Signal(ssh.SIGTERM)
+		_ = session.Signal(gossh.SIGTERM)
 		_ = session.Close()
 		// Wait for session.Run to actually return before we do — otherwise the
 		// goroutine can keep writing to the caller's stdout/stderr after
@@ -169,7 +170,7 @@ func (e *RemoteExecutor) RunInput(ctx context.Context, cmd string, stdin io.Read
 	case err := <-done:
 		return err
 	case <-ctx.Done():
-		_ = session.Signal(ssh.SIGTERM)
+		_ = session.Signal(gossh.SIGTERM)
 		_ = session.Close()
 		<-done
 		return ctx.Err()
@@ -225,7 +226,7 @@ func (e *RemoteExecutor) User() string {
 // defaultHostKeyCallback returns a known_hosts-based callback. When
 // known_hosts doesn't exist yet it falls back to trust-on-first-use (see
 // acceptNewHostKeyCallback) rather than accepting every key.
-func defaultHostKeyCallback() (ssh.HostKeyCallback, error) {
+func defaultHostKeyCallback() (gossh.HostKeyCallback, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		// Previously fell through to ssh.InsecureIgnoreHostKey() here — silently
@@ -262,7 +263,7 @@ func defaultHostKeyCallback() (ssh.HostKeyCallback, error) {
 // through to the default identities on a bad --key used to end with the
 // misleading "no SSH keys found" (or, worse, authenticated as a different
 // key than the operator named) instead of the actual key error (TCL-55).
-func resolveSigners(keyPath string) ([]ssh.Signer, error) {
+func resolveSigners(keyPath string) ([]gossh.Signer, error) {
 	var paths []string
 	if keyPath != "" {
 		paths = []string{keyPath}
@@ -277,7 +278,7 @@ func resolveSigners(keyPath string) ([]ssh.Signer, error) {
 		}
 	}
 
-	var signers []ssh.Signer
+	var signers []gossh.Signer
 	for _, p := range paths {
 		data, err := os.ReadFile(p)
 		if err != nil {
@@ -287,9 +288,9 @@ func resolveSigners(keyPath string) ([]ssh.Signer, error) {
 			continue
 		}
 
-		signer, err := ssh.ParsePrivateKey(data)
+		signer, err := gossh.ParsePrivateKey(data)
 		if err != nil {
-			var passphraseErr *ssh.PassphraseMissingError
+			var passphraseErr *gossh.PassphraseMissingError
 			if errors.As(err, &passphraseErr) {
 				signer, err = parseEncryptedKey(data, p)
 				if err != nil {
@@ -310,14 +311,14 @@ func resolveSigners(keyPath string) ([]ssh.Signer, error) {
 	return signers, nil
 }
 
-func parseEncryptedKey(data []byte, keyPath string) (ssh.Signer, error) {
+func parseEncryptedKey(data []byte, keyPath string) (gossh.Signer, error) {
 	fmt.Fprintf(os.Stderr, "Enter passphrase for %s: ", keyPath)
 	passphrase, err := term.ReadPassword(int(os.Stdin.Fd()))
 	fmt.Fprintln(os.Stderr)
 	if err != nil {
 		return nil, fmt.Errorf("reading passphrase: %w", err)
 	}
-	return ssh.ParsePrivateKeyWithPassphrase(data, passphrase)
+	return gossh.ParsePrivateKeyWithPassphrase(data, passphrase)
 }
 
 // dialWithContext bounds the SSH handshake by the context. The TCP dial is
@@ -328,7 +329,7 @@ func parseEncryptedKey(data []byte, keyPath string) (ssh.Signer, error) {
 // context cancellation closes the underlying connection so a blocked
 // handshake unblocks immediately. The deadline is cleared once the
 // connection is established so the returned client is not time-limited.
-func dialWithContext(ctx context.Context, network, addr string, config *ssh.ClientConfig) (*ssh.Client, error) {
+func dialWithContext(ctx context.Context, network, addr string, config *gossh.ClientConfig) (*gossh.Client, error) {
 	// The TCP dial itself is bounded even when the caller's context has no
 	// deadline (Background): a black-holed address used to rely on the
 	// OS-level connect timeout (~75s+) before the handshake deadline below
@@ -347,7 +348,7 @@ func dialWithContext(ctx context.Context, network, addr string, config *ssh.Clie
 		return nil, fmt.Errorf("setting handshake deadline: %w", err)
 	}
 	stopClose := context.AfterFunc(ctx, func() { _ = conn.Close() })
-	c, chans, reqs, err := ssh.NewClientConn(conn, addr, config)
+	c, chans, reqs, err := gossh.NewClientConn(conn, addr, config)
 	if !stopClose() {
 		_ = conn.Close()
 		return nil, ctx.Err()
@@ -361,7 +362,7 @@ func dialWithContext(ctx context.Context, network, addr string, config *ssh.Clie
 		_ = c.Close()
 		return nil, fmt.Errorf("clearing handshake deadline: %w", err)
 	}
-	return ssh.NewClient(c, chans, reqs), nil
+	return gossh.NewClient(c, chans, reqs), nil
 }
 
 // acceptNewHostKeyCallback returns a host key callback that accepts unknown
@@ -372,7 +373,7 @@ func dialWithContext(ctx context.Context, network, addr string, config *ssh.Clie
 // was inconvenient" — the previous version treated a known_hosts parse
 // failure as "nothing is known" (accepting whatever key was presented) and
 // let knownhosts.RevokedError fall through the unknown-host branch.
-func acceptNewHostKeyCallback(knownHostsPath string) ssh.HostKeyCallback {
+func acceptNewHostKeyCallback(knownHostsPath string) gossh.HostKeyCallback {
 	existing, existingErr := knownhosts.New(knownHostsPath)
 	if existingErr != nil && errors.Is(existingErr, fs.ErrNotExist) {
 		// A missing known_hosts is the fresh-box case: nothing is known, so
@@ -380,7 +381,7 @@ func acceptNewHostKeyCallback(knownHostsPath string) ssh.HostKeyCallback {
 		// but cannot be read or parsed fails closed below.
 		existing, existingErr = nil, nil
 	}
-	return func(hostname string, remote net.Addr, key ssh.PublicKey) error {
+	return func(hostname string, remote net.Addr, key gossh.PublicKey) error {
 		if existingErr != nil {
 			return fmt.Errorf("cannot verify host key: reading %s failed: %w", knownHostsPath, existingErr)
 		}
@@ -423,14 +424,53 @@ func acceptNewHostKeyCallback(knownHostsPath string) ssh.HostKeyCallback {
 	}
 }
 
-// PublicKeyPath returns the path to the SSH public key file.
-// Checks KeyPath+".pub" first, then default locations.
+// PublicKeyBytes returns the authorized-key line for the identity the
+// caller will actually authenticate with (audit A32): for an explicit key
+// path the public key is DERIVED from that private key, an existing .pub
+// file is verified against it (a stale .pub used to silently provision a
+// different identity), and there is no fallthrough to unrelated default
+// keys. For an empty keyPath the first loadable default identity is used,
+// matching resolveSigners' preference order.
+func PublicKeyBytes(keyPath string) ([]byte, error) {
+	signers, err := resolveSigners(keyPath)
+	if err != nil {
+		return nil, err
+	}
+	if len(signers) == 0 {
+		return nil, fmt.Errorf("no SSH identity found for %q", keyPath)
+	}
+	derived := signers[0].PublicKey()
+	if keyPath != "" {
+		if raw, rerr := os.ReadFile(keyPath + ".pub"); rerr == nil {
+			pub, _, _, _, perr := gossh.ParseAuthorizedKey(raw)
+			if perr != nil {
+				return nil, fmt.Errorf("parsing %s.pub: %w", keyPath, perr)
+			}
+			if !bytes.Equal(pub.Marshal(), derived.Marshal()) {
+				return nil, fmt.Errorf("%s.pub does not match the private key %s — refusing to provision an unrelated identity", keyPath, keyPath)
+			}
+		} else if !errors.Is(rerr, fs.ErrNotExist) {
+			return nil, fmt.Errorf("reading %s.pub: %w", keyPath, rerr)
+		}
+	}
+	return gossh.MarshalAuthorizedKey(derived), nil
+}
+
+// PublicKeyPath returns the path to the SSH public key file. With an
+// EXPLICIT key path it returns that key's .pub only when the file exists
+// and matches the private key — never an unrelated default (audit A32);
+// derive one with PublicKeyBytes when the .pub is absent.
 func PublicKeyPath(keyPath string) (string, error) {
 	if keyPath != "" {
 		pub := keyPath + ".pub"
 		if _, err := os.Stat(pub); err == nil {
+			// Verify the .pub against the private key before trusting it.
+			if _, derr := PublicKeyBytes(keyPath); derr != nil {
+				return "", derr
+			}
 			return pub, nil
 		}
+		return "", fmt.Errorf("no public key file at %s — one can be derived from the private key (see PublicKeyBytes)", pub)
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
