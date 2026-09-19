@@ -150,7 +150,7 @@ domain: fylun.ai
 	if err := os.WriteFile(filepath.Join(dir, "teploy.prod.yml"), []byte(overlay), 0644); err != nil {
 		t.Fatal(err)
 	}
-	cfg, err := LoadAppWithDestination(dir, "prod")
+	cfg, err := LoadAppWithDestination(dir, "prod", OverlayOptions{})
 	if err != nil {
 		t.Fatalf("LoadAppWithDestination: %v", err)
 	}

@@ -69,7 +69,7 @@ func runBuild(flags *Flags, version, destination string) error {
 	var appCfg *config.AppConfig
 	var err error
 	if destination != "" {
-		appCfg, err = config.LoadAppWithDestination(".", destination)
+		appCfg, err = config.LoadAppWithDestination(".", destination, config.OverlayOptions{Strict: flags.StrictEnv})
 	} else {
 		appCfg, err = config.LoadApp(".")
 	}

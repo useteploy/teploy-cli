@@ -317,7 +317,7 @@ port: 3000
 	if err := os.WriteFile(filepath.Join(dir, "teploy.home.yml"), []byte(overlay), 0644); err != nil {
 		t.Fatal(err)
 	}
-	cfg, err := LoadAppWithDestination(dir, "home")
+	cfg, err := LoadAppWithDestination(dir, "home", OverlayOptions{})
 	if err != nil {
 		t.Fatalf("LoadAppWithDestination: %v", err)
 	}
@@ -339,7 +339,7 @@ domain: myapp.com
 	if err := os.WriteFile(filepath.Join(dir, "teploy.prod.yml"), []byte(overlay), 0644); err != nil {
 		t.Fatal(err)
 	}
-	cfg, err := LoadAppWithDestination(dir, "prod")
+	cfg, err := LoadAppWithDestination(dir, "prod", OverlayOptions{})
 	if err != nil {
 		t.Fatalf("LoadAppWithDestination: %v", err)
 	}

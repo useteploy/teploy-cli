@@ -28,7 +28,7 @@ var accessoryDestination string
 // top when -d is supplied. Falls back to plain LoadApp otherwise.
 func loadAppCfgForAccessory() (*config.AppConfig, error) {
 	if accessoryDestination != "" {
-		return config.LoadAppWithDestination(".", accessoryDestination)
+		return config.LoadAppWithDestination(".", accessoryDestination, config.OverlayOptions{})
 	}
 	return config.LoadApp(".")
 }

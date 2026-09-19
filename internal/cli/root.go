@@ -14,6 +14,13 @@ type Flags struct {
 	Key        string
 	ProjectDir string
 	JSON       bool
+	// StrictEnv is the opt-in strict mode (audits F57/TCL-32): unset
+	// ${VAR} references in teploy.yml's env: fail the deploy with the
+	// variable names listed, and a destination overlay that names a
+	// map/list key with an empty value explicitly CLEARS the base's field
+	// (`env: {}` means "no env"). Default off: deploys relying on
+	// empty-expansion keep working.
+	StrictEnv bool
 }
 
 func NewRootCmd(version string) *cobra.Command {
@@ -41,6 +48,7 @@ func NewRootCmd(version string) *cobra.Command {
 	root.PersistentFlags().StringVar(&flags.Key, "key", "", "path to SSH private key")
 	root.PersistentFlags().StringVar(&flags.ProjectDir, "project-dir", "", "run as if teploy was started in this directory")
 	root.PersistentFlags().BoolVar(&flags.JSON, "json", false, "output in JSON format")
+	root.PersistentFlags().BoolVar(&flags.StrictEnv, "strict-env", false, "strict env/overlay mode: fail on unset ${VAR} in env:, and let an empty map/list in a destination overlay explicitly clear the base value")
 
 	root.AddCommand(newDeployCmd(flags))
 	root.AddCommand(newBuildCmd(flags))

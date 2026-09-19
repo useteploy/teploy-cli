@@ -32,9 +32,10 @@ import (
 // real deploy at all (see the autodeploy rebuild for what that cost).
 func newAutoDeployServeCmd() *cobra.Command {
 	var (
-		app    string
-		branch string
-		port   int
+		app       string
+		branch    string
+		port      int
+		strictEnv bool
 	)
 
 	cmd := &cobra.Command{
@@ -43,19 +44,26 @@ func newAutoDeployServeCmd() *cobra.Command {
 		Hidden: true,
 		Args:   cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runAutoDeployServe(app, branch, port)
+			// The systemd unit cannot easily grow a flag retroactively;
+			// the environment variable is the config surface for already
+			// installed units (set TEPLOY_STRICT_ENV=1 in the unit file).
+			if os.Getenv("TEPLOY_STRICT_ENV") == "1" {
+				strictEnv = true
+			}
+			return runAutoDeployServe(app, branch, port, strictEnv)
 		},
 	}
 
 	cmd.Flags().StringVar(&app, "app", "", "app name (required)")
 	cmd.Flags().StringVar(&branch, "branch", "main", "branch to watch for pushes")
 	cmd.Flags().IntVar(&port, "port", 9876, "port to listen on — 0.0.0.0, reachable from Caddy's docker bridge network; every request still requires a valid HMAC signature")
+	cmd.Flags().BoolVar(&strictEnv, "strict-env", false, "strict env mode: fail the deploy when env: references an unset ${VAR} (also enabled by TEPLOY_STRICT_ENV=1)")
 	cmd.MarkFlagRequired("app")
 
 	return cmd
 }
 
-func runAutoDeployServe(app, branch string, port int) error {
+func runAutoDeployServe(app, branch string, port int, strictEnv bool) error {
 	if err := config.ValidateName(app); err != nil {
 		return err
 	}
@@ -115,7 +123,7 @@ func runAutoDeployServe(app, branch string, port int) error {
 			go func() {
 				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 				defer cancel()
-				if err := triggerAutoDeploy(ctx, executor, app, branch, buildDir, out, changedFiles, filesKnown); err != nil {
+				if err := triggerAutoDeploy(ctx, executor, app, branch, buildDir, out, changedFiles, filesKnown, strictEnv); err != nil {
 					logf("deploy failed: %v", err)
 				} else {
 					logf("deploy complete")
@@ -290,7 +298,7 @@ func newWebhookHandler(cfg webhookHandlerConfig) http.HandlerFunc {
 // needs credentials already configured for the server's user, or it's
 // skipped with a warning), so this can still fail on a server that was
 // never successfully cloned.
-func triggerAutoDeploy(ctx context.Context, executor ssh.Executor, app, branch, buildDir string, out io.Writer, changedFiles []string, filesKnown bool) error {
+func triggerAutoDeploy(ctx context.Context, executor ssh.Executor, app, branch, buildDir string, out io.Writer, changedFiles []string, filesKnown, strictEnv bool) error {
 	// The lock's parent must exist before it can be acquired — a server
 	// whose app was never manually deployed has no /deployments/<app> yet.
 	if err := state.EnsureAppDir(ctx, executor, app); err != nil {
@@ -327,8 +335,11 @@ func triggerAutoDeploy(ctx context.Context, executor ssh.Executor, app, branch, 
 	// expansion rule manual deploys use (audit F59/F66): without this, the
 	// same manifest received different container env depending on whether
 	// the deploy was manual or webhook-triggered — encrypted-file secrets
-	// simply went missing on the webhook path.
-	expandEnvTemplates(appCfg.Env)
+	// simply went missing on the webhook path. strictEnv (F57/TCL-32)
+	// makes unset variables fail loudly here too.
+	if err := expandEnvTemplates(appCfg.Env, strictEnv); err != nil {
+		return err
+	}
 	if len(appCfg.EnvFiles) > 0 {
 		fileVars, err := env.LoadLocalEnvFiles(ctx, buildDir, appCfg.EnvFiles)
 		if err != nil {

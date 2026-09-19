@@ -146,7 +146,7 @@ healthcheck:
 		t.Fatal(err)
 	}
 
-	cfg, err := LoadAppWithDestination(dir, "staging")
+	cfg, err := LoadAppWithDestination(dir, "staging", OverlayOptions{})
 	if err != nil {
 		t.Fatalf("LoadAppWithDestination failed: %v", err)
 	}
