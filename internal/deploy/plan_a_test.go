@@ -112,6 +112,7 @@ func TestDeploy_AllCreatesUseResolvedImageID(t *testing.T) {
 		ssh.MockCommand{Match: "ss -tln", Output: ssOutput},
 		ssh.MockCommand{Match: "docker image inspect --format '{{.Id}}'", Output: imageID},
 		ssh.MockCommand{Match: "docker run", Output: "abc123"},
+		ssh.MockCommand{Match: "docker inspect -f '{{json .State}}'", Output: `{"Status":"running","Running":true}`},
 		ssh.MockCommand{Match: "docker inspect", Output: "running"},
 		ssh.MockCommand{Match: "curl -s -o /dev/null", Output: "200"},
 		ssh.MockCommand{Match: "cat /deployments/caddy/Caddyfile", Output: "{\n\tadmin 0.0.0.0:2019\n}\n"},

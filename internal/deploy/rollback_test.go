@@ -651,3 +651,47 @@ func TestRollback_CaddyIngressStillAvoidsTheLivePort(t *testing.T) {
 }
 
 func osReadFile(name string) ([]byte, error) { return os.ReadFile(name) }
+
+// TestRollback_RoutePhaseFailureUnwinds is the T06 regression: a route-phase
+// failure (SetRoute here) after the target restarted used to return
+// directly, leaving the uncommitted target running. It must unwind exactly
+// like a health failure: stop what this rollback started.
+func TestRollback_RoutePhaseFailureUnwinds(t *testing.T) {
+	stateContent := `{"schema_version":2,"deployment_type":"container","ingress_mode":"caddy","domain":"myapp.com","current_port":49153,"current_hash":"v2","previous_port":49152,"previous_hash":"v1"}`
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state.json' ]", Output: "present\n" + stateContent},
+		ssh.MockCommand{Match: "mkdir -p /deployments/myapp", Output: ""},
+		ssh.MockCommand{Match: "mkdir /deployments/myapp/.lock", Output: ""},
+		ssh.MockCommand{Match: "docker ps --all --filter label=teploy.app='myapp'",
+			Output: `{"ID":"aaa","Names":"myapp-web-v1","Image":"myapp:latest","State":"exited","Status":"Exited","Labels":{"teploy.app":"myapp","teploy.version":"v1","teploy.process":"web"}}` + "\n" +
+				`{"ID":"bbb","Names":"myapp-web-v2","Image":"myapp:latest","State":"running","Status":"Up 1h","Labels":{"teploy.app":"myapp","teploy.version":"v2","teploy.process":"web"}}`,
+		},
+		ssh.MockCommand{Match: "docker inspect 'myapp-web-v1'", Output: `[{"Config":{"Image":"myapp:latest"},"HostConfig":{"NetworkMode":"teploy","PortBindings":{"3000/tcp":[{"HostIp":"127.0.0.1","HostPort":"49152"}]},"RestartPolicy":{"Name":"no"}},"NetworkSettings":{"Networks":{"teploy":{"Aliases":["myapp"]}}}}]`},
+		ssh.MockCommand{Match: "docker rm -f 'myapp-web-v1'", Output: ""},
+		ssh.MockCommand{Match: "docker run", Output: ""},
+		ssh.MockCommand{Match: "curl -s -o /dev/null", Output: "200"},
+		ssh.MockCommand{Match: "docker inspect -f '{{range $p, $b := .NetworkSettings.Ports}}{{range $b}}{{.HostIp}}", Output: "127.0.0.1 "},
+		ssh.MockCommand{Match: "docker inspect -f '{{range $p, $b := .NetworkSettings.Ports}}", Output: "49152"},
+		ssh.MockCommand{Match: "docker inspect -f '{{range $p, $_ := .NetworkSettings.Ports}}", Output: "3000/tcp"},
+		// The route update fails: the Caddyfile cannot even be read.
+		ssh.MockCommand{Match: "cat /deployments/caddy/Caddyfile", Err: fmt.Errorf("no such file")},
+		ssh.MockCommand{Match: "docker stop", Output: ""},
+	)
+	var buf bytes.Buffer
+	err := Rollback(context.Background(), mock, &buf, rollbackCfg())
+	if err == nil {
+		t.Fatal("expected the route-phase failure to fail the rollback")
+	}
+	if !strings.Contains(err.Error(), "updating route") {
+		t.Fatalf("expected the route failure to be surfaced, got: %v", err)
+	}
+	var stoppedUncommitted bool
+	for _, c := range mock.Calls {
+		if strings.HasPrefix(c, "docker stop -t 5 'myapp-web-v1'") {
+			stoppedUncommitted = true
+		}
+	}
+	if !stoppedUncommitted {
+		t.Error("the uncommitted target container was left running after the route failure")
+	}
+}
