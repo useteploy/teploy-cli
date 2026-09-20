@@ -324,18 +324,29 @@ func ReleaseLockFenced(exec ssh.Executor, lk *Lock, app string) {
 			fmt.Fprintf(os.Stderr, "teploy: refusing to release %s's lock with a lease held for %s\n", app, lk.App())
 			return
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_, err := lk.Guarded(ctx, exec, "rm -rf -- "+ssh.ShellQuote(fmt.Sprintf("%s/%s/.lock", deploymentsDir, app)))
-		if err != nil && !fenceLostErr(err) {
-			// Transport-level failure: fall back to the detached
-			// unconditional release rather than stranding the app —
-			// same trade-off as the pre-A04 behavior, but only when the
-			// owner check itself could not be evaluated.
-			ReleaseLockDetached(exec, app)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	lockDir := fmt.Sprintf("%s/%s/.lock", deploymentsDir, app)
+	_, err := lk.Guarded(ctx, exec, "rm -rf -- "+ssh.ShellQuote(lockDir))
+	if err != nil && !fenceLostErr(err) {
+		// The guarded release failed ambiguously (transport timeout, for
+		// one): the release MAY have completed, and a successor may have
+		// acquired the path in the meantime. An unconditional detached
+		// release here can delete the SUCCESSOR's lock (audit T02) — but
+		// never releasing strands the app for a full staleLockTTL. Resolve
+		// the ambiguity with one shell-level conditional: remove the lock
+		// only when it still names THIS operation, or when it is already
+		// gone. A lock that names someone else is left strictly alone.
+		conditional := fmt.Sprintf(
+			"if [ -d %s ] && grep -q %s %s 2>/dev/null; then rm -rf -- %s; fi",
+			ssh.ShellQuote(lockDir), ssh.ShellQuote(lk.owner), ssh.ShellQuote(lockInfoPath(app)), ssh.ShellQuote(lockDir),
+		)
+		if _, cerr := exec.Run(ctx, conditional); cerr != nil {
+			fmt.Fprintf(os.Stderr, "teploy: could not confirm release of %s's deploy lock: %v (the lock will self-heal after the stale window if abandoned)\n", app, cerr)
 		}
-		return
 	}
+	return
+}
 	ReleaseLockDetached(exec, app)
 }
 

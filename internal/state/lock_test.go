@@ -243,6 +243,36 @@ func TestReleaseLockFenced_OwnerCheckRemovedOwnLock(t *testing.T) {
 	}
 }
 
+// TestReleaseLockFenced_AmbiguousFailureNeverDeletesSuccessor is the T02
+// regression: when the guarded release fails with a non-fence (transport)
+// error, the fallback must still not unconditionally delete the lock — the
+// guarded command may have completed and a successor may already hold the
+// path. Only a lock whose info still names THIS owner may be removed.
+func TestReleaseLockFenced_AmbiguousFailureNeverDeletesSuccessor(t *testing.T) {
+	lk, mock := takeFencedLock(t, "myapp")
+	// The guarded release fails with a plain transport error (not fence
+	// loss): every guarded command errors this round.
+	mock.GuardTransportFailures = 1
+	// ...and the server has already moved on: a successor holds the lock.
+	mock.Files["/deployments/myapp/.lock/info"] = []byte(`{"type":"auto","owner":"successor"}`)
+	ReleaseLockFenced(mock, lk, "myapp")
+	if _, ok := mock.Files["/deployments/myapp/.lock/info"]; !ok {
+		t.Fatal("ambiguous guarded-release failure fell back to deleting the successor's lock")
+	}
+}
+
+// TestReleaseLockFenced_AmbiguousFailureRemovesOwnLock: the same fallback
+// still removes the lock when it provably names the releasing owner — an
+// ambiguous failure must not strand the app for a full stale window.
+func TestReleaseLockFenced_AmbiguousFailureRemovesOwnLock(t *testing.T) {
+	lk, mock := takeFencedLock(t, "myapp")
+	mock.GuardTransportFailures = 1
+	ReleaseLockFenced(mock, lk, "myapp")
+	if _, ok := mock.Files["/deployments/myapp/.lock/info"]; ok {
+		t.Fatal("conditional fallback failed to remove the holder's own lock")
+	}
+}
+
 // TestReleaseLockFenced_WrongAppHandleRefused: a lease held for one app
 // must not release another app's lock (the A17 lease-correspondence rule).
 func TestReleaseLockFenced_WrongAppHandleRefused(t *testing.T) {
