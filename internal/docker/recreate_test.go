@@ -153,8 +153,7 @@ func TestRecreate_RendersEveryPreservedField(t *testing.T) {
 		"--network-alias 'myapp'",
 		"-p '127.0.0.1:49152:3000/tcp'",
 		"-p '0.0.0.0:51820:51820/udp'",
-		"-e 'PORT=3000'",
-		"-e 'TOKEN=sec;ret'",
+		"--env-file '/tmp/.teploy-recreate-env-",
 		"-v '/deployments/myapp/volumes/data:/data:ro'",
 		"--mount 'type=volume,target=/uploads,source=myapp-uploads'",
 		"--memory 536870912b",
@@ -185,6 +184,44 @@ func TestRecreate_RendersEveryPreservedField(t *testing.T) {
 	}
 	if strings.Contains(run, "--privileged") {
 		t.Errorf("privileged rendered for an unprivileged container: %s", run)
+	}
+	// T19: the resolved env (secrets included) rides the private --env-file
+	// and must never appear as -e argv in the docker run command.
+	for _, leaked := range []string{"-e 'PORT=3000'", "-e 'TOKEN=sec;ret'"} {
+		if strings.Contains(run, leaked) {
+			t.Errorf("resolved env leaked into argv: %s\n  run: %s", leaked, run)
+		}
+	}
+	var cleaned bool
+	for _, c := range mock.Calls {
+		if strings.HasPrefix(c, "rm -f -- '/tmp/.teploy-recreate-env-") {
+			cleaned = true
+		}
+	}
+	if !cleaned {
+		t.Error("the staged env file was not removed after the recreate")
+	}
+}
+
+// TestPublishRecreateEnv validates the staged env file's contents and the
+// values a docker env file cannot represent (T19).
+func TestPublishRecreateEnv(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4")
+	c := NewClient(mock)
+	path, err := c.publishRecreateEnv(context.Background(), []string{"PORT=3000", "TOKEN=sec;ret"})
+	if err != nil {
+		t.Fatalf("publishRecreateEnv: %v", err)
+	}
+	if got := string(mock.Files[path]); got != "PORT=3000\nTOKEN=sec;ret\n" {
+		t.Errorf("staged env = %q", got)
+	}
+	for _, bad := range []string{"MULTI=a\nb", "NUL=a\x00b"} {
+		if _, err := c.publishRecreateEnv(context.Background(), []string{bad}); err == nil {
+			t.Errorf("expected %q to fail closed", bad)
+		}
+	}
+	if _, err := c.publishRecreateEnv(context.Background(), []string{"NOT_AN_ASSIGNMENT"}); err == nil {
+		t.Error("expected a non KEY=VALUE entry to fail closed")
 	}
 }
 
@@ -321,5 +358,96 @@ func TestRecreate_AvoidPortsReallocatesCollidingBinding(t *testing.T) {
 	}
 	if !strings.Contains(run, "-p '127.0.0.1:49153:3000/tcp'") {
 		t.Errorf("expected reallocation to the next free port 49153: %s", run)
+	}
+}
+
+// TestRecreatePreservesAnonymousVolumes is the T12 regression: an effective
+// top-level volume mount (a Dockerfile VOLUME's anonymous volume) appears in
+// neither HostConfig.Binds nor HostConfig.Mounts, so recreation used to
+// attach a fresh empty volume. The spec must capture it BY NAME and the
+// rendered run must re-mount the same volume.
+func TestRecreatePreservesAnonymousVolumes(t *testing.T) {
+	inspect := fmt.Sprintf(`[{
+  "Image": "sha256:%s",
+  "Config": {"Image": "myapp:v9"},
+  "HostConfig": {"NetworkMode": "teploy", "PortBindings": {}, "RestartPolicy": {}, "Binds": ["/deployments/myapp/uploads:/uploads:ro"], "Mounts": []},
+  "Mounts": [
+    {"Type": "volume", "Name": "4b1c8a3f9b2c_anon", "Source": "/var/lib/docker/volumes/4b1c8a3f9b2c_anon/_data", "Destination": "/var/lib/postgresql/data", "RW": true},
+    {"Type": "bind", "Source": "/deployments/myapp/uploads", "Destination": "/uploads", "RW": false}
+  ],
+  "NetworkSettings": {"Networks": {"teploy": {"Aliases": ["myapp"]}}}
+}]`, strings.Repeat("c", 64))
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "docker inspect 'c'", Output: inspect},
+		ssh.MockCommand{Match: "docker rm -f", Output: ""},
+		ssh.MockCommand{Match: "docker run", Output: ""},
+	)
+	if err := NewClient(mock).Restart(context.Background(), "c", nil); err != nil {
+		t.Fatalf("Restart with an anonymous volume sibling: %v", err)
+	}
+	var run string
+	for _, c := range mock.Calls {
+		if strings.HasPrefix(c, "docker run ") {
+			run = c
+		}
+	}
+	if !strings.Contains(run, "--mount 'type=volume,target=/var/lib/postgresql/data,source=4b1c8a3f9b2c_anon'") {
+		t.Errorf("anonymous volume not re-attached by name: %s", run)
+	}
+	// The explicit bind also present in HostConfig.Binds is covered by the
+	// requested spec and must NOT be re-added from the effective view as a
+	// second mount targeting the same destination.
+	if strings.Contains(run, "target=/uploads") {
+		t.Errorf("explicit bind duplicated from the effective mount view: %s", run)
+	}
+}
+
+// TestRecreateFailsClosedOnUnrepresentableEffectiveMount: an effective mount
+// the CLI path cannot represent (a bind nobody requested in HostConfig)
+// must abort the recreate instead of silently dropping the mount.
+func TestRecreateFailsClosedOnUnrepresentableEffectiveMount(t *testing.T) {
+	inspect := fmt.Sprintf(`[{
+  "Image": "sha256:%s",
+  "Config": {"Image": "myapp:v9"},
+  "HostConfig": {"NetworkMode": "teploy", "PortBindings": {}, "RestartPolicy": {}, "Binds": [], "Mounts": []},
+  "Mounts": [{"Type": "bind", "Source": "/somewhere/else", "Destination": "/data", "RW": true}],
+  "NetworkSettings": {"Networks": {"teploy": {}}}
+}]`, strings.Repeat("d", 64))
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "docker inspect 'c'", Output: inspect},
+	)
+	if err := NewClient(mock).Restart(context.Background(), "c", nil); err == nil {
+		t.Fatal("expected recreate to fail closed on an effective bind mount outside HostConfig")
+	}
+	for _, c := range mock.Calls {
+		if strings.HasPrefix(c, "docker rm -f") {
+			t.Fatalf("original container was removed despite the closed failure: %s", c)
+		}
+	}
+}
+
+// TestRecreateBracketsIPv6Bindings is the T13 regression: an IPv6 bind must
+// render bracketed via net.JoinHostPort ("[::1]:49152:3000/tcp"), not the
+// concatenated "::1:49152:3000/tcp" that docker cannot parse.
+func TestRecreateBracketsIPv6Bindings(t *testing.T) {
+	b, err := recreatePublishBinding(RecreateBinding{HostIP: "::1", HostPort: 49152, ContainerPort: 3000, Proto: "tcp"})
+	if err != nil {
+		t.Fatalf("recreatePublishBinding: %v", err)
+	}
+	if b != "[::1]:49152:3000/tcp" {
+		t.Errorf("IPv6 binding = %q, want [::1]:49152:3000/tcp", b)
+	}
+	if _, err := recreatePublishBinding(RecreateBinding{HostIP: "not-an-ip", HostPort: 49152, ContainerPort: 3000}); err == nil {
+		t.Error("expected an invalid bind IP to fail closed")
+	}
+	if _, err := recreatePublishBinding(RecreateBinding{HostIP: "0.0.0.0", HostPort: 70000, ContainerPort: 3000}); err == nil {
+		t.Error("expected an out-of-range host port to fail closed")
+	}
+	ephemeral, err := recreatePublishBinding(RecreateBinding{HostIP: "0.0.0.0", HostPort: 0, ContainerPort: 3000})
+	if err != nil {
+		t.Fatalf("ephemeral binding: %v", err)
+	}
+	if ephemeral != "0.0.0.0::3000" {
+		t.Errorf("ephemeral binding = %q, want 0.0.0.0::3000", ephemeral)
 	}
 }

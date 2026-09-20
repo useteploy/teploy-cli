@@ -2,11 +2,16 @@ package docker
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/csv"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/useteploy/teploy/internal/ssh"
 )
@@ -49,6 +54,11 @@ type RecreateSpec struct {
 	Entrypoint    []string            `json:"entrypoint,omitempty"`
 	Cmd           []string            `json:"cmd,omitempty"`
 	Env           []string            `json:"env,omitempty"`
+	// EnvFile, when set, names a private on-target env file rendered from
+	// Env; Recreate publishes it via --env-file instead of -e arguments so
+	// resolved values never appear in the host process list / command
+	// diagnostics (audit T19). Empty at inspect time.
+	EnvFile       string              `json:"-"`
 	WorkingDir    string              `json:"working_dir,omitempty"`
 	User          string              `json:"user,omitempty"`
 	Labels        map[string]string   `json:"labels,omitempty"`
@@ -130,6 +140,20 @@ type containerInspect struct {
 		Privileged   bool
 		ReadonlyRootfs bool
 	}
+	// EffectiveMounts is the container's EFFECTIVE mount inventory
+	// (docker's top-level .Mounts): everything actually attached, including
+	// anonymous volumes Dockerfile VOLUME directives created — which appear
+	// in NEITHER HostConfig.Binds NOR HostConfig.Mounts. Without it, a
+	// recreate attached a fresh anonymous volume and the application
+	// started against empty storage while the original volume lingered on
+	// disk (audit T12).
+	EffectiveMounts []struct {
+		Type        string `json:"Type"` // "volume" | "bind" | "tmpfs" | "npipe"
+		Name        string `json:"Name"` // volume name (named + anonymous volumes)
+		Source      string `json:"Source"`
+		Destination string `json:"Destination"`
+		RW          bool   `json:"RW"`
+	} `json:"Mounts"`
 	NetworkSettings struct {
 		Networks map[string]struct {
 			Aliases []string
@@ -151,12 +175,12 @@ func (c *Client) InspectRecreate(ctx context.Context, name string) (*RecreateSpe
 	if len(arr) == 0 {
 		return nil, fmt.Errorf("container %s not found", name)
 	}
-	return specFromInspect(name, arr[0]), nil
+	return specFromInspect(name, arr[0])
 }
 
 // specFromInspect is the pure inspect-JSON -> RecreateSpec mapping, split out
 // so tests can drive it without an executor.
-func specFromInspect(name string, in containerInspect) *RecreateSpec {
+func specFromInspect(name string, in containerInspect) (*RecreateSpec, error) {
 	spec := &RecreateSpec{
 		Name:          name,
 		ImageID:       in.Image,
@@ -250,12 +274,41 @@ func specFromInspect(name string, in containerInspect) *RecreateSpec {
 		spec.Mounts = append(spec.Mounts, RecreateMount{Type: m.Type, Source: m.Source, Target: m.Target, ReadOnly: m.ReadOnly})
 	}
 
+	// Effective mounts not requested in HostConfig (image VOLUME anonymous
+	// volumes, chiefly): preserve them by NAME so the recreated container
+	// re-attaches the SAME volume instead of a fresh empty one (T12). A
+	// destination already covered by an explicit bind/mount is skipped —
+	// docker's effective view mirrors the request there. Anything the CLI
+	// cannot represent faithfully fails the whole inspect: silently
+	// dropping an effective mount is how data "disappears" on restart.
+	explicit := map[string]bool{}
+	for _, m := range in.HostConfig.Mounts {
+		if m.Target != "" {
+			explicit[m.Target] = true
+		}
+	}
+	for _, b := range in.HostConfig.Binds {
+		parts := strings.Split(b, ":")
+		if len(parts) >= 2 {
+			explicit[parts[1]] = true
+		}
+	}
+	for _, m := range in.EffectiveMounts {
+		if m.Destination == "" || explicit[m.Destination] {
+			continue
+		}
+		if m.Type != "volume" || m.Name == "" {
+			return nil, fmt.Errorf("container %s has an effective %s mount at %s that the docker CLI recreation path cannot represent; refusing to silently drop it", name, m.Type, m.Destination)
+		}
+		spec.Mounts = append(spec.Mounts, RecreateMount{Type: "volume", Source: m.Name, Target: m.Destination, ReadOnly: !m.RW})
+	}
+
 	for k, v := range in.HostConfig.LogConfig.Config {
 		spec.LogOpts = append(spec.LogOpts, k+"="+v)
 	}
 	sort.Strings(spec.LogOpts)
 
-	return spec
+	return spec, nil
 }
 
 func atoiOrZero(s string) int {
@@ -280,19 +333,24 @@ func RenderRecreateArgs(spec *RecreateSpec) ([]string, error) {
 	}
 
 	for _, b := range spec.PortBindings {
-		containerPort := strconv.Itoa(b.ContainerPort)
-		if b.Proto != "" {
-			containerPort += "/" + b.Proto
+		binding, err := recreatePublishBinding(b)
+		if err != nil {
+			return nil, fmt.Errorf("container %s: %w", spec.Name, err)
 		}
-		hostPort := ""
-		if b.HostPort > 0 {
-			hostPort = strconv.Itoa(b.HostPort)
-		}
-		args = append(args, "-p", q(b.HostIP+":"+hostPort+":"+containerPort))
+		args = append(args, "-p", q(binding))
 	}
 
-	for _, e := range spec.Env {
-		args = append(args, "-e", q(e))
+	switch {
+	case spec.EnvFile != "":
+		// The resolved env rides a private on-target file, not -e argv
+		// (audit T19): inspect-derived values include secrets resolved at
+		// create time, and the docker CLI argument list is visible in the
+		// host process list and command-bearing errors.
+		args = append(args, "--env-file", q(spec.EnvFile))
+	case len(spec.Env) > 0:
+		for _, e := range spec.Env {
+			args = append(args, "-e", q(e))
+		}
 	}
 
 	for _, b := range spec.Binds {
@@ -300,14 +358,7 @@ func RenderRecreateArgs(spec *RecreateSpec) ([]string, error) {
 	}
 
 	for _, m := range spec.Mounts {
-		parts := []string{"type=" + m.Type, "target=" + m.Target}
-		if m.Source != "" {
-			parts = append(parts, "source="+m.Source)
-		}
-		if m.ReadOnly {
-			parts = append(parts, "readonly")
-		}
-		args = append(args, "--mount", q(strings.Join(parts, ",")))
+		args = append(args, "--mount", q(encodeMountCSV(m)))
 	}
 
 	if spec.MemoryBytes > 0 {
@@ -432,6 +483,63 @@ func RenderRecreateArgs(spec *RecreateSpec) ([]string, error) {
 	return args, nil
 }
 
+// encodeMountCSV renders one --mount value with encoding/csv so a source or
+// destination containing a comma is quoted instead of silently splitting
+// into bogus options (T12).
+func encodeMountCSV(m RecreateMount) string {
+	fields := []string{"type=" + m.Type, "target=" + m.Target}
+	if m.Source != "" {
+		fields = append(fields, "source="+m.Source)
+	}
+	if m.ReadOnly {
+		fields = append(fields, "readonly")
+	}
+	var buf strings.Builder
+	w := csv.NewWriter(&buf)
+	_ = w.Write(fields)
+	w.Flush()
+	return strings.TrimSuffix(buf.String(), "\n")
+}
+
+// recreatePublishBinding renders one inspected port binding back into a
+// docker -p spec with the bind IP correctly bracketed for IPv6 and both
+// ports validated (audit T13): the renderer used to concatenate
+// HostIP+":"+hostPort+":"+containerPort, so an IPv6 bind (::1) produced the
+// unparseable "::1:49152:80/tcp" and every restart/rollback of an
+// IPv6-published container failed at docker run — a defect the normal
+// deploy path's publishBinding (A19) had already fixed. HostPort 0 keeps
+// docker's ephemeral-allocation form (empty host port field).
+func recreatePublishBinding(b RecreateBinding) (string, error) {
+	if b.ContainerPort < 1 || b.ContainerPort > 65535 {
+		return "", fmt.Errorf("container port %d must be in 1..65535", b.ContainerPort)
+	}
+	if b.HostPort < 0 || b.HostPort > 65535 {
+		return "", fmt.Errorf("host port %d must be in 0..65535", b.HostPort)
+	}
+	switch b.Proto {
+	case "", "tcp", "udp", "sctp":
+	default:
+		return "", fmt.Errorf("unsupported protocol %q", b.Proto)
+	}
+	ip := b.HostIP
+	if ip == "" {
+		ip = "0.0.0.0"
+	}
+	normalized := strings.TrimSuffix(strings.TrimPrefix(ip, "["), "]")
+	if net.ParseIP(normalized) == nil {
+		return "", fmt.Errorf("bind address %q must be an IP address", ip)
+	}
+	hostPort := ""
+	if b.HostPort > 0 {
+		hostPort = strconv.Itoa(b.HostPort)
+	}
+	containerPort := strconv.Itoa(b.ContainerPort)
+	if b.Proto != "" {
+		containerPort += "/" + b.Proto
+	}
+	return net.JoinHostPort(normalized, hostPort) + ":" + containerPort, nil
+}
+
 // Recreate force-removes the named container and runs a fresh one from the
 // spec. avoidPorts is the set of host ports currently held by containers
 // this recreation must not collide with; a binding whose original port is
@@ -472,6 +580,24 @@ func (c *Client) Recreate(ctx context.Context, spec *RecreateSpec, avoidPorts ma
 		}
 	}
 
+	// Resolved env (secrets included — inspect shows what the container
+	// actually runs with) is published to a private on-target file and
+	// passed via --env-file, keeping it out of the host process list and
+	// command-bearing diagnostics (audit T19). Values a docker env file
+	// cannot represent (newlines, NUL) fail closed rather than corrupt.
+	if len(spec.Env) > 0 {
+		envPath, err := c.publishRecreateEnv(ctx, spec.Env)
+		if err != nil {
+			return err
+		}
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer func() {
+			c.exec.Run(cleanupCtx, "rm -f -- "+ssh.ShellQuote(envPath))
+			cleanupCancel()
+		}()
+		spec.EnvFile = envPath
+	}
+
 	args, err := RenderRecreateArgs(spec)
 	if err != nil {
 		return err
@@ -484,6 +610,32 @@ func (c *Client) Recreate(ctx context.Context, spec *RecreateSpec, avoidPorts ma
 		return fmt.Errorf("recreating %s: %w", spec.Name, err)
 	}
 	return nil
+}
+
+// publishRecreateEnv stages the resolved environment as a private (0600)
+// file under /tmp and returns its path. The caller removes it when the
+// recreated container is running.
+func (c *Client) publishRecreateEnv(ctx context.Context, env []string) (string, error) {
+	var b strings.Builder
+	for _, e := range env {
+		if !strings.Contains(e, "=") {
+			return "", fmt.Errorf("environment entry %q is not KEY=VALUE and cannot be written to an env file", e)
+		}
+		if strings.ContainsAny(e, "\n\x00") {
+			return "", fmt.Errorf("environment entry %q contains a newline or NUL that a docker env file cannot represent", e)
+		}
+		b.WriteString(e)
+		b.WriteByte('\n')
+	}
+	var nonce [8]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return "", fmt.Errorf("generating env staging name: %w", err)
+	}
+	path := "/tmp/.teploy-recreate-env-" + hex.EncodeToString(nonce[:])
+	if err := c.exec.Upload(ctx, strings.NewReader(b.String()), path, "0600"); err != nil {
+		return "", fmt.Errorf("staging the recreated container's env file: %w", err)
+	}
+	return path, nil
 }
 
 // entrypointMatchesImage reports whether the container's multi-element
