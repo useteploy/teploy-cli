@@ -165,6 +165,22 @@ func (c Config) validate() error {
 	if (c.ingressHost() || len(c.Publish) > 0) && c.Replicas > 1 {
 		return fmt.Errorf("host ingress and fixed publish ports support a single replica (a fixed host port can't be load-balanced across containers)")
 	}
+	// Publish grammar + duplicate-binding preflight (T23): direct
+	// construction bypasses config-file parsing, so the shared validator
+	// runs here too — malformed entries used to reach docker after the
+	// fixed-port predecessor had already been stopped.
+	if len(c.Publish) > 0 {
+		if err := config.ValidatePublishEntries(c.Publish); err != nil {
+			return err
+		}
+		if c.ingressHost() {
+			for _, p := range c.Publish {
+				if spec, err := config.ParsePublishSpec(p); err == nil && spec.HostPort != 0 && spec.HostPort == containerPort(c) {
+					return fmt.Errorf("'publish' entry %q binds host port %d, which is already the app's fixed ingress:host port", p, spec.HostPort)
+				}
+			}
+		}
+	}
 	if c.StopTimeout < 0 {
 		return fmt.Errorf("stop timeout cannot be negative (got %ds)", c.StopTimeout)
 	}
@@ -1239,6 +1255,15 @@ func (c Config) usesCaddy() bool {
 // port (no Caddy, recreate instead of blue/green). See config.IngressHost.
 func (c Config) ingressHost() bool {
 	return c.Ingress == "host"
+}
+
+// containerPort returns the effective internal container port (0 = the
+// docker layer's 80 default).
+func containerPort(c Config) int {
+	if c.ContainerPort == 0 {
+		return 80
+	}
+	return c.ContainerPort
 }
 
 func imageDigestFromRef(image string) string {

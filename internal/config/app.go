@@ -7,6 +7,7 @@ import (
 	"io"
 	"maps"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -464,20 +465,42 @@ func (a AccessConfig) IsZero() bool {
 	return len(a.BasicAuth) == 0 && (a.ForwardAuth == nil || a.ForwardAuth.URL == "")
 }
 
-var bcryptHash = regexp.MustCompile(`^\$2[aby]\$\d{2}\$`)
+var bcryptHash = regexp.MustCompile(`^\$2[aby]\$\d{2}\$[./A-Za-z0-9]{53}$`)
+
+// httpToken matches a single HTTP header-name token (RFC 7230 token).
+var httpToken = regexp.MustCompile("^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
 
 func (a AccessConfig) validate() error {
 	for user, hash := range a.BasicAuth {
-		if strings.ContainsAny(user, " \t\r\n{}\"") {
-			return fmt.Errorf("access.basic_auth: username %q contains characters not allowed in a Caddyfile", user)
+		if user == "" || strings.ContainsAny(user, " \t\r\n{}\":") {
+			return fmt.Errorf("access.basic_auth: username %q is empty or contains characters not allowed in a Caddyfile", user)
 		}
+		// Complete structural bcrypt validation (T53): the old
+		// prefix-only check accepted any "$2a$10$" followed by garbage,
+		// which broke the reload at runtime instead of the config load.
 		if !bcryptHash.MatchString(hash) {
-			return fmt.Errorf("access.basic_auth[%s]: value must be a bcrypt hash ($2a$/$2b$/$2y$…); Caddy does not accept plaintext", user)
+			return fmt.Errorf("access.basic_auth[%s]: value must be a complete bcrypt hash ($2a$/$2b$/$2y$ + cost + 53-character base64 salt+digest); Caddy does not accept plaintext", user)
 		}
 	}
 	if a.ForwardAuth != nil && a.ForwardAuth.URL != "" {
-		if strings.ContainsAny(a.ForwardAuth.URL, " \t\r\n{}\"") {
+		if strings.ContainsAny(a.ForwardAuth.URL, " \t\r\n{}\"") || strings.ContainsFunc(a.ForwardAuth.URL, func(r rune) bool { return r < 0x20 }) {
 			return fmt.Errorf("access.forward_auth.url %q contains characters not allowed in a Caddyfile", a.ForwardAuth.URL)
+		}
+		// The verify URI is rendered as the uri sub-directive: when
+		// configured it must be a request-path-shaped URI (T53).
+		if uri := a.ForwardAuth.URI; uri != "" {
+			if !strings.HasPrefix(uri, "/") || strings.HasPrefix(uri, "//") ||
+				strings.ContainsAny(uri, " \t\r\n\x00{}#\"\\") {
+				return fmt.Errorf("access.forward_auth.uri %q must be a request path like /api/verify", uri)
+			}
+			if _, err := url.ParseRequestURI(uri); err != nil {
+				return fmt.Errorf("access.forward_auth.uri %q is not a valid request URI", uri)
+			}
+		}
+		for _, h := range a.ForwardAuth.CopyHeaders {
+			if !httpToken.MatchString(h) {
+				return fmt.Errorf("access.forward_auth.copy_headers: %q is not a valid HTTP header name", h)
+			}
 		}
 	}
 	return nil
@@ -614,6 +637,148 @@ func isSafeSubPath(p string) bool {
 // value. allowEmpty should be true only for ingress: host, which publishes
 // a raw port directly and needs no hostname. Exported for the same reason
 // as ValidateName.
+// PublishSpec is one parsed docker -p publish entry. HostPort 0 means
+// "let docker allocate" (valid only for the explicit empty host-port forms).
+type PublishSpec struct {
+	Bind          string // host IP ("" = all interfaces); bracketed IPv6 accepted
+	HostPort      int    // 0 = ephemeral
+	ContainerPort int
+	Proto         string // "tcp" (default), "udp", "sctp"
+}
+
+// ParsePublishSpec validates one publish entry against the SUPPORTED
+// grammar and returns its parsed form (audit T23). The supported grammar is
+// deliberately narrow and documented: "container[/proto]",
+// "host:container[/proto]", or "[ip]:host:container[/proto]" with single
+// numeric ports (no ranges, no ip-less 3-segment form). Anything docker
+// accepts beyond this fails the config load rather than partially working
+// mid-deploy; widen deliberately, never silently.
+func ParsePublishSpec(spec string) (PublishSpec, error) {
+	s := strings.TrimSpace(spec)
+	invalid := func(reason string) (PublishSpec, error) {
+		return PublishSpec{}, fmt.Errorf("'publish' entry %q is invalid (%s); supported: [ip:]host:container[/proto] with single numeric ports, e.g. \"127.0.0.1:3001:3001\"", spec, reason)
+	}
+	if s == "" {
+		return invalid("empty")
+	}
+	proto := ""
+	if i := strings.LastIndex(s, "/"); i >= 0 {
+		proto = s[i+1:]
+		switch proto {
+		case "tcp", "udp", "sctp":
+		default:
+			return invalid("protocol " + strconv.Quote(proto))
+		}
+		s = s[:i]
+	}
+	// Split into 1-3 segments, tolerating ONE bracketed IPv6 first segment.
+	var segs []string
+	if strings.HasPrefix(s, "[") {
+		end := strings.Index(s, "]")
+		if end < 0 {
+			return invalid("unterminated IPv6 bracket")
+		}
+		segs = append(segs, s[:end+1])
+		rest := s[end+1:]
+		if !strings.HasPrefix(rest, ":") {
+			return invalid("garbage after the bracketed address")
+		}
+		segs = append(segs, strings.Split(strings.TrimPrefix(rest, ":"), ":")...)
+	} else {
+		segs = strings.Split(s, ":")
+	}
+	if len(segs) < 1 || len(segs) > 3 {
+		return invalid("too many colon-separated segments")
+	}
+	port := func(field string, allowZero bool) (int, error) {
+		if field == "" {
+			if allowZero {
+				return 0, nil
+			}
+			return 0, fmt.Errorf("empty port")
+		}
+		n, err := strconv.Atoi(field)
+		if err != nil || n < 1 || n > 65535 {
+			return 0, fmt.Errorf("port %q must be a number in 1..65535", field)
+		}
+		return n, nil
+	}
+	out := PublishSpec{Proto: proto}
+	switch len(segs) {
+	case 1:
+		cp, err := port(segs[0], false)
+		if err != nil {
+			return invalid(err.Error())
+		}
+		out.ContainerPort, out.HostPort = cp, 0
+	case 2:
+		hp, err := port(segs[0], false)
+		if err != nil {
+			return invalid(err.Error())
+		}
+		cp, err := port(segs[1], false)
+		if err != nil {
+			return invalid(err.Error())
+		}
+		out.HostPort, out.ContainerPort = hp, cp
+	default:
+		bind := strings.TrimSuffix(strings.TrimPrefix(segs[0], "["), "]")
+		if net.ParseIP(bind) == nil {
+			return invalid("bind address must be an IP literal")
+		}
+		hp, err := port(segs[1], true)
+		if err != nil {
+			return invalid(err.Error())
+		}
+		cp, err := port(segs[2], false)
+		if err != nil {
+			return invalid(err.Error())
+		}
+		out.Bind, out.HostPort, out.ContainerPort = bind, hp, cp
+	}
+	return out, nil
+}
+
+// ValidatePublishEntries parses every publish entry and rejects duplicate
+// fixed host bindings — the same host port bound again (on any address,
+// because a wildcard bind covers every specific one) is a guaranteed
+// "port is already allocated" at container start (audit T23).
+func ValidatePublishEntries(entries []string) error {
+	type bindSet struct {
+		binds    map[string]bool
+		wildcard bool
+	}
+	seen := map[string]*bindSet{}
+	for _, e := range entries {
+		spec, err := ParsePublishSpec(e)
+		if err != nil {
+			return err
+		}
+		if spec.HostPort == 0 {
+			continue // ephemeral ports cannot collide with each other by name
+		}
+		key := fmt.Sprintf("%d/%s", spec.HostPort, spec.Proto)
+		set, ok := seen[key]
+		if !ok {
+			set = &bindSet{binds: map[string]bool{}}
+			seen[key] = set
+		}
+		bind := spec.Bind
+		if bind == "" || bind == "0.0.0.0" || bind == "::" {
+			if set.wildcard || len(set.binds) > 0 {
+				return fmt.Errorf("'publish' binds host port %d more than once — a wildcard bind covers every address, so a host port can only be published once", spec.HostPort)
+			}
+			set.wildcard = true
+			continue
+		}
+		if set.wildcard || set.binds[bind] {
+			return fmt.Errorf("'publish' binds host port %d more than once — a host port can only be published once", spec.HostPort)
+		}
+		set.binds[bind] = true
+	}
+	return nil
+}
+
 func ValidateDomain(domain string, allowEmpty bool) error {
 	if domain == "" {
 		if allowEmpty {
@@ -702,9 +867,19 @@ func (c *AppConfig) validate() error {
 		if c.Replicas > 1 {
 			return fmt.Errorf("'publish' supports a single replica (a fixed host port can't be shared across containers)")
 		}
-		for _, p := range c.Publish {
-			if strings.TrimSpace(p) == "" {
-				return fmt.Errorf("'publish' entries must be non-empty (e.g. \"127.0.0.1:3001:3001\")")
+		if err := ValidatePublishEntries(c.Publish); err != nil {
+			return err
+		}
+		// Under host ingress the primary port is the FIXED container port;
+		// a publish entry binding the same host port collides with it at
+		// container start, mid-deploy. Checked here (not in the shared
+		// grammar validator) because only the config layer knows the port
+		// semantics.
+		if c.Ingress == IngressHost {
+			for _, p := range c.Publish {
+				if spec, err := ParsePublishSpec(p); err == nil && spec.HostPort != 0 && spec.HostPort == c.Port {
+					return fmt.Errorf("'publish' entry %q binds host port %d, which is already the app's fixed ingress: host port — remove the duplicate binding", p, c.Port)
+				}
 			}
 		}
 	}
