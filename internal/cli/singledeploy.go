@@ -107,7 +107,10 @@ func (s *singleServerDeployer) deployApp(ctx context.Context, appCfg *config.App
 			}
 
 			fmt.Fprintln(s.out, "Syncing source to server...")
-			excludes := build.LoadIgnore(".")
+			excludes, err := build.LoadIgnore(".")
+			if err != nil {
+				return fmt.Errorf("loading ignore rules: %w", err)
+			}
 			if err := build.Sync(ctx, build.SyncConfig{
 				LocalDir:  ".",
 				RemoteDir: remoteDir,

@@ -182,13 +182,17 @@ func runBuild(flags *Flags, version, destination string) error {
 		return fmt.Errorf("creating build directory: %w", err)
 	}
 	fmt.Fprintln(out, "Syncing source to server...")
+	excludes, err := build.LoadIgnore(".")
+	if err != nil {
+		return fmt.Errorf("loading ignore rules: %w", err)
+	}
 	if err := build.Sync(ctx, build.SyncConfig{
 		LocalDir:  ".",
 		RemoteDir: remoteDir,
 		Host:      host,
 		User:      user,
 		KeyPath:   key,
-		Excludes:  build.LoadIgnore("."),
+		Excludes:  excludes,
 		LinkDest:  releasemeta.PreviousAttemptBuildDir(ctx, executor, appCfg.App, att.ID),
 	}, out, os.Stderr); err != nil {
 		return fmt.Errorf("syncing source: %w", err)
