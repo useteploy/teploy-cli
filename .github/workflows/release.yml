@@ -4,8 +4,10 @@ on:
   push:
     tags: ['v*']
 
+# Least privilege by default (audit T61): the workflow as a whole is
+# read-only; only the publishing job escalates to contents: write.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   verify:
@@ -17,6 +19,8 @@ jobs:
   release:
     needs: verify
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
