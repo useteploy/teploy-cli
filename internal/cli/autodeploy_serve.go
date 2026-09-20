@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -76,11 +77,18 @@ func runAutoDeployServe(app, branch string, port int, strictEnv bool) error {
 	if err != nil {
 		return fmt.Errorf("reading webhook secret from %s (run `teploy autodeploy setup` first): %w", autodeploy.SecretPath(app), err)
 	}
-	secret := strings.TrimSpace(string(secretBytes))
-	if secret == "" {
+	// The stored bytes are the HMAC key, used VERBATIM (audit T32): setup
+	// rejects whitespace-wrapped secrets, so silently trimming here would
+	// sign with different bytes than a hand-edited file actually contains
+	// and turn a visible configuration mistake into an unexplained 401.
+	if len(secretBytes) == 0 {
 		// An empty secret authenticates nothing (any unsigned request would
 		// compare equal) — fail closed at startup (audit F43).
 		return fmt.Errorf("webhook secret at %s is empty — every request would be unauthenticated; re-run `teploy autodeploy setup`", autodeploy.SecretPath(app))
+	}
+	secret := string(secretBytes)
+	if secret != strings.TrimSpace(secret) {
+		return fmt.Errorf("webhook secret at %s has leading/trailing whitespace — the HMAC key is used verbatim, so verification would fail against a provider sending the trimmed value; fix the file (or re-run `teploy autodeploy setup`)", autodeploy.SecretPath(app))
 	}
 
 	logPath := fmt.Sprintf("/deployments/%s/autodeploy.log", app)
@@ -346,6 +354,15 @@ func triggerAutoDeploy(ctx context.Context, executor ssh.Executor, app, branch, 
 		return fmt.Errorf("teploy.yml in %s declares app %q, expected %q — refusing to deploy the wrong app", buildDir, appCfg.App, app)
 	}
 
+	// Local file references resolve against the CHECKOUT, not the resident
+	// process's working directory (audit T31): the systemd unit has no
+	// WorkingDirectory, so a relative tls.cert/key that worked in a manual
+	// invocation resolved against "/" under the service and read the wrong
+	// file (or nothing). Absolute paths are preserved as-is.
+	if appCfg.TLS != nil && !appCfg.TLS.Internal {
+		appCfg.TLS = resolveTLSFromRoot(appCfg.TLS, buildDir)
+	}
+
 	// Resolve env_files from the CHECKOUT, with the same single-pass ${VAR}
 	// expansion rule manual deploys use (audit F59/F66): without this, the
 	// same manifest received different container env depending on whether
@@ -431,4 +448,21 @@ func triggerAutoDeploy(ctx context.Context, executor ssh.Executor, app, branch, 
 	// the attempt that keys this deploy's env/TLS artifacts (F08).
 	att := releasemeta.MustAttempt(app, version)
 	return deployBuiltImageFenced(ctx, executor, appCfg, image, version, "localhost", false, needsBuild, lk, &att)
+}
+
+// resolveTLSFromRoot returns a COPY of tls with relative cert/key paths
+// resolved against root (audit T31) — the resident autodeploy process runs
+// under systemd with no WorkingDirectory, so relative paths must never be
+// interpreted against whatever cwd it inherited.
+func resolveTLSFromRoot(tls *config.TLSConfig, root string) *config.TLSConfig {
+	resolve := func(p string) string {
+		if p == "" || filepath.IsAbs(p) {
+			return p
+		}
+		return filepath.Join(root, p)
+	}
+	out := *tls
+	out.Cert = resolve(out.Cert)
+	out.Key = resolve(out.Key)
+	return &out
 }

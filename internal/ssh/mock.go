@@ -75,6 +75,16 @@ func (m *MockExecutor) Run(ctx context.Context, cmd string) (string, error) {
 		m.Calls = append(m.Calls, cmd)
 	}
 
+	// `cat <path>` answers from the recorded file state when the mock has
+	// one (the real server re-reads whatever earlier writes left); an
+	// explicit registration still wins for paths the mock has no file for.
+	if rest, ok := strings.CutPrefix(cmd, "cat "); ok && !strings.Contains(rest, " | ") {
+		path := strings.Trim(strings.TrimSpace(rest), "'")
+		if data, present := m.Files[path]; present {
+			m.mu.Unlock()
+			return string(data), nil
+		}
+	}
 	for i, c := range m.commands {
 		if mockCommandMatches(cmd, c.Match) {
 			if c.Once {
@@ -112,6 +122,21 @@ func (m *MockExecutor) Run(ctx context.Context, cmd string) (string, error) {
 	if strings.HasPrefix(cmd, "docker exec -i caddy caddy adapt") {
 		m.mu.Unlock()
 		return "", nil
+	}
+	// Framed server-file reads (state.ReadRemoteFile, caddy's webhook
+	// descriptor): answer from the recorded file state when no explicit
+	// registration matches, so tests exercising route/state edits do not
+	// need to stub every read individually.
+	if rest, ok := strings.CutPrefix(cmd, "if [ ! -e "); ok && strings.Contains(cmd, "printf 'absent\\n'") {
+		if pathQ, _, found := strings.Cut(rest, " ]; then"); found {
+			path := strings.Trim(pathQ, "'")
+			if data, present := m.Files[path]; present {
+				m.mu.Unlock()
+				return "present\n" + string(data), nil
+			}
+			m.mu.Unlock()
+			return "absent", nil
+		}
 	}
 	m.mu.Unlock()
 	return "", fmt.Errorf("mock: unexpected command: %s", cmd)

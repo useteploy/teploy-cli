@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/useteploy/teploy/internal/autodeploy"
+	"github.com/useteploy/teploy/internal/config"
 )
 
 func githubSign(secret string, body []byte) string {
@@ -329,5 +330,23 @@ func TestWebhookHandler_ReusedDeliveryIDDifferentContentNotSuppressed(t *testing
 	post(body1)
 	if triggerCount != 2 {
 		t.Errorf("replayed content must be a no-op, got %d", triggerCount)
+	}
+}
+
+// TestResolveTLSFromRoot is the T31 regression: the resident autodeploy
+// process runs under systemd without a WorkingDirectory, so relative TLS
+// paths must resolve against the checkout, and absolute paths must pass
+// through untouched.
+func TestResolveTLSFromRoot(t *testing.T) {
+	in := &config.TLSConfig{Cert: "certs/app.crt", Key: "/etc/absolute.key"}
+	out := resolveTLSFromRoot(in, "/deployments/myapp/build")
+	if out.Cert != "/deployments/myapp/build/certs/app.crt" {
+		t.Errorf("relative cert not resolved against the checkout: %q", out.Cert)
+	}
+	if out.Key != "/etc/absolute.key" {
+		t.Errorf("absolute key must pass through: %q", out.Key)
+	}
+	if in.Cert != "certs/app.crt" {
+		t.Errorf("input TLSConfig mutated: %+v", in)
 	}
 }

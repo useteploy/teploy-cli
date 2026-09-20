@@ -127,13 +127,14 @@ func runAutoDeploySetup(flags *Flags, branch, secret string) error {
 		Branch:           branch,
 		Secret:           secret,
 		TeployBinaryPath: teployBinaryPath,
+		Port:             autodeploy.DefaultPort,
 	}
 
 	if err := mgr.Setup(ctx, cfg); err != nil {
 		return err
 	}
 
-	if err := mgr.SetupCaddyRoute(ctx, appCfg.App, appCfg.Domain); err != nil {
+	if err := mgr.SetupCaddyRoute(ctx, appCfg.App, appCfg.Domain, cfg.Port); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: could not add Caddy route: %v\n", err)
 		fmt.Fprintf(os.Stderr, "  You may need to add the webhook route manually\n")
 	}
