@@ -750,25 +750,30 @@ func (c *Client) AccessoryRestore(ctx context.Context, app, name, image, date st
 		if aofFields := strings.Fields(aofOut); len(aofFields) != 2 || aofFields[0] != "appendonly" || aofFields[1] != "no" {
 			return keepTmp(fmt.Errorf("cannot confirm appendonly=no for %s (got %q) — an AOF-enabled Redis would load the append-only file on restart and teploy's dump.rdb restore would be a no-op; an explicit restore plan is required", containerName, strings.TrimSpace(aofOut)))
 		}
-		// A41 ordering: the previous dump is snapshotted AFTER the stop —
-		// a graceful redis shutdown writes a final RDB, and the old
-		// copy-before-stop could miss data present at shutdown, making the
-		// "recovery copy" older than the state it claims to recover. The
-		// pre-stop `docker exec test` only records WHETHER a dump exists;
-		// the copy itself runs on the stopped container (docker cp works
-		// stopped) and its failure aborts before anything is modified. A
-		// failed final `docker start` now also puts the original dump back
-		// and retries the start (the old script exited without either).
+		// A41 ordering + T37/T38 arming: restore_original is defined (and
+		// the old-dump capture attempted) AFTER the stop — a graceful redis
+		// shutdown writes a final RDB, so the pre-stop existence flag could
+		// miss data present at shutdown. The baseline copy itself
+		// distinguishes "no such file" (nothing to preserve) from every
+		// other failure, and ANY failure after the stop restarts the
+		// container before aborting: the old script's `set -e` exit on a
+		// failed docker cp left Redis stopped with no recovery attempt.
 		restoreCmd = strings.Join([]string{
 			"set -eu",
 			fmt.Sprintf("gunzip -c %s > %s", ssh.ShellQuote(restorePath), ssh.ShellQuote(rdbPath)),
 			"had=no",
-			fmt.Sprintf("if docker exec %s test -f /data/dump.rdb 2>/dev/null; then had=yes; fi", qContainer),
+			fmt.Sprintf(`restore_original() { if [ "$had" = yes ] && [ -f %s ]; then docker cp %s %s:/data/dump.rdb || true; fi; docker start %s || true; }`,
+				ssh.ShellQuote(oldRdb), ssh.ShellQuote(oldRdb), qContainer, qContainer),
 			fmt.Sprintf("docker stop %s", qContainer),
-			fmt.Sprintf(`if [ "$had" = yes ]; then docker cp %s:/data/dump.rdb %s; fi`, qContainer, ssh.ShellQuote(oldRdb)),
+			// Post-stop baseline (docker cp works on a stopped container):
+			// success -> had=yes; a proven not-found -> nothing to
+			// preserve; anything else -> restart + abort.
+			`cperr=$(mktemp)`,
+			fmt.Sprintf(`if docker cp %s:/data/dump.rdb %s 2>"$cperr"; then had=yes; elif grep -qi 'no such' "$cperr"; then had=no; else cat "$cperr" >&2; rm -f "$cperr"; restore_original; echo 'capturing the pre-restore dump failed; the container was restarted' >&2; exit 1; fi`,
+				qContainer, ssh.ShellQuote(oldRdb)),
+			`rm -f "$cperr"`,
 			"ok=yes",
 			fmt.Sprintf("docker cp %s %s:/data/dump.rdb || ok=no", ssh.ShellQuote(rdbPath), qContainer),
-			fmt.Sprintf(`restore_original() { if [ "$had" = yes ] && [ -f %s ]; then docker cp %s %s:/data/dump.rdb || true; fi; docker start %s || true; }`, ssh.ShellQuote(oldRdb), ssh.ShellQuote(oldRdb), qContainer, qContainer),
 			`if [ "$ok" != yes ]; then`,
 			`  restore_original`,
 			"  echo 'redis restore failed after stopping the container; the original dump was restored when available' >&2",

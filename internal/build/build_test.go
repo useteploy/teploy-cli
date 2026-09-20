@@ -226,7 +226,10 @@ func TestPruneImages(t *testing.T) {
 
 func TestLoadIgnore_Default(t *testing.T) {
 	dir := t.TempDir()
-	patterns := LoadIgnore(dir)
+	patterns, err := LoadIgnore(dir)
+	if err != nil {
+		t.Fatalf("LoadIgnore: %v", err)
+	}
 
 	if len(patterns) != len(DefaultIgnore) {
 		t.Fatalf("expected %d default patterns, got %d", len(DefaultIgnore), len(patterns))
@@ -238,20 +241,29 @@ func TestLoadIgnore_Default(t *testing.T) {
 	}
 }
 
-func TestLoadIgnore_CustomFile(t *testing.T) {
+// TestLoadIgnore_CustomFileExtendsDefaults is the T51 regression: a custom
+// .teployignore must EXTEND the protected defaults (.env/.git), never
+// replace them — one custom pattern used to ship the .env file to the build
+// host.
+func TestLoadIgnore_CustomFileExtendsDefaults(t *testing.T) {
 	dir := t.TempDir()
 	content := "vendor\n# comment\n.cache\n\nbuild\n"
 	os.WriteFile(filepath.Join(dir, ".teployignore"), []byte(content), 0644)
 
-	patterns := LoadIgnore(dir)
-	expected := []string{"vendor", ".cache", "build"}
-
-	if len(patterns) != len(expected) {
-		t.Fatalf("expected %d patterns, got %d: %v", len(expected), len(patterns), patterns)
+	patterns, err := LoadIgnore(dir)
+	if err != nil {
+		t.Fatalf("LoadIgnore: %v", err)
 	}
-	for i, p := range patterns {
-		if p != expected[i] {
-			t.Errorf("pattern %d: expected %s, got %s", i, expected[i], p)
+
+	joined := "\n" + strings.Join(patterns, "\n") + "\n"
+	for _, protected := range DefaultIgnore {
+		if !strings.Contains(joined, "\n"+protected+"\n") {
+			t.Errorf("custom ignore file dropped the protected default %q: %v", protected, patterns)
+		}
+	}
+	for _, custom := range []string{"vendor", ".cache", "build"} {
+		if !strings.Contains(joined, "\n"+custom+"\n") {
+			t.Errorf("custom pattern %q missing: %v", custom, patterns)
 		}
 	}
 }
@@ -260,9 +272,26 @@ func TestLoadIgnore_EmptyFile(t *testing.T) {
 	dir := t.TempDir()
 	os.WriteFile(filepath.Join(dir, ".teployignore"), []byte("\n\n# only comments\n"), 0644)
 
-	patterns := LoadIgnore(dir)
+	patterns, err := LoadIgnore(dir)
+	if err != nil {
+		t.Fatalf("LoadIgnore: %v", err)
+	}
 	if len(patterns) != len(DefaultIgnore) {
 		t.Fatalf("expected defaults for empty file, got %d patterns", len(patterns))
+	}
+}
+
+// TestLoadIgnore_UnreadableFileIsAnError is the T51 regression: read
+// failures used to fold into "no custom rules" and transfer silently.
+func TestLoadIgnore_UnreadableFileIsAnError(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, ".teployignore")
+	os.WriteFile(path, []byte("vendor\n"), 0644)
+	if err := os.Chmod(path, 0000); err != nil {
+		t.Skip("cannot make the ignore file unreadable")
+	}
+	if _, err := LoadIgnore(dir); err == nil {
+		t.Error("an unreadable .teployignore must be an error, never a silent defaults-only transfer")
 	}
 }
 
