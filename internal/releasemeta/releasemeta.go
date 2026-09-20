@@ -188,6 +188,15 @@ func Read(ctx context.Context, exec ssh.Executor, app, hash string) (*Record, er
 	if rec.SchemaVersion != SchemaVersion {
 		return nil, fmt.Errorf("unsupported release-metadata schema version %d for %s@%s", rec.SchemaVersion, app, hash)
 	}
+	// Identity check (audit T56): the record loaded from (app, hash)'s path
+	// must actually DESCRIBE (app, hash). An accidentally copied, partially
+	// migrated, or corrupted-but-valid record used to be accepted on schema
+	// alone and could drive rollback/recreate effects at a different
+	// release's spec. Every record this package writes carries both fields
+	// (Write requires them), so a mismatch is never a legacy artifact.
+	if rec.App != app || rec.Hash != hash {
+		return nil, fmt.Errorf("release record identity mismatch: requested %s@%s, record describes %s@%s — refusing to use it", app, hash, rec.App, rec.Hash)
+	}
 	return &rec, nil
 }
 

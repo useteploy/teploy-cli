@@ -1194,7 +1194,7 @@ func TestDeploy_AssetBridging(t *testing.T) {
 		ssh.MockCommand{Match: "ss -tln", Output: ssOutput},
 		// 5. Asset bridging: attempt-scoped tree (A15) + create/cp extraction.
 		ssh.MockCommand{Match: "mkdir -p '/deployments/myapp/meta/att/abc123.", Output: ""},
-		ssh.MockCommand{Match: "ls -1 /deployments/myapp/meta/att", Output: ""},
+		ssh.MockCommand{Match: "ls -1t /deployments/myapp/meta/att", Output: ""},
 		ssh.MockCommand{Match: "docker rm -f 'teploy-assets-", Output: ""},
 		ssh.MockCommand{Match: "docker create --name 'teploy-assets-", Output: "extractcontainer"},
 		ssh.MockCommand{Match: "docker cp 'teploy-assets-", Output: ""},
@@ -1291,7 +1291,7 @@ func TestDeploy_AssetBridgingCustomKeepDays(t *testing.T) {
 		ssh.MockCommand{Match: "ss -tln", Output: ssOutput},
 		ssh.MockCommand{Match: "mkdir -p '/deployments/myapp/assets'", Output: ""},
 		ssh.MockCommand{Match: "mkdir -p '/deployments/myapp/meta/att/abc123.", Output: ""},
-		ssh.MockCommand{Match: "ls -1 /deployments/myapp/meta/att", Output: ""},
+		ssh.MockCommand{Match: "ls -1t /deployments/myapp/meta/att", Output: ""},
 		ssh.MockCommand{Match: "docker rm -f 'teploy-assets-", Output: ""},
 		ssh.MockCommand{Match: "docker create --name 'teploy-assets-", Output: "extractcontainer"},
 		ssh.MockCommand{Match: "docker cp 'teploy-assets-", Output: ""},

@@ -50,7 +50,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"regexp"
-	"sort"
 	"strings"
 
 	"github.com/useteploy/teploy/internal/config"
@@ -143,10 +142,11 @@ func attemptRoot(app string) string {
 	return fmt.Sprintf("%s/%s/meta/att", deploymentsDir, app)
 }
 
-// listAttempts lists attempt directory names under root ("" when the
-// directory does not exist yet — a first deploy).
-func listAttempts(ctx context.Context, exec ssh.Executor, root string) ([]string, error) {
-	out, err := exec.Run(ctx, "ls -1 "+root+" 2>/dev/null || true")
+// listAttemptsByMtime lists attempt directory names newest-first (mtime
+// order) — the closest thing to chronology the id gives us (the random ids
+// sort lexicographically, which is NOT recency).
+func listAttemptsByMtime(ctx context.Context, exec ssh.Executor, root string) ([]string, error) {
+	out, err := exec.Run(ctx, "ls -1t "+root+" 2>/dev/null || true")
 	if err != nil {
 		return nil, fmt.Errorf("listing attempts under %s: %w", root, err)
 	}
@@ -159,12 +159,23 @@ func listAttempts(ctx context.Context, exec ssh.Executor, root string) ([]string
 	return names, nil
 }
 
+// keepAttemptsPerHash bounds how many attempts of a RETAINED hash stay on
+// disk (audit T11). One would be the record's own reference (records always
+// name the newest attempt of their hash — a same-version redeploy rewrites
+// the record with its attempt); two also cover a lockless `teploy build`
+// creating a newer attempt of the same hash after the deploy committed, so
+// pruning "older" can never delete the attempt a live record references.
+const keepAttemptsPerHash = 2
+
 // PruneAttempts removes the attempt directories (artifact root and the
-// app's TLS root) of every release hash NOT in keepHashes. Entries whose
-// names do not parse as <hash>.<id> are kept — an unparsable name is not
-// proof the attempt is prunable (F78's rule). Only THIS app's roots are
-// swept; the legacy flat TLS root is never touched (A01). Removal failures
-// are returned; callers treat pruning as best-effort.
+// app's TLS root) of every release hash NOT in keepHashes, and bounds the
+// attempts retained per KEPT hash to the newest keepAttemptsPerHash —
+// repeated same-version or failed attempts used to retain build trees, env
+// files, and certificates indefinitely (audit T11). Entries whose names do
+// not parse as <hash>.<id> are kept — an unparsable name is not proof the
+// attempt is prunable (F78's rule). Only THIS app's roots are swept; the
+// legacy flat TLS root is never touched (A01). Removal failures are
+// returned; callers treat pruning as best-effort.
 func PruneAttempts(ctx context.Context, exec ssh.Executor, app string, keepHashes ...string) error {
 	keep := make(map[string]bool, len(keepHashes))
 	for _, h := range keepHashes {
@@ -174,14 +185,21 @@ func PruneAttempts(ctx context.Context, exec ssh.Executor, app string, keepHashe
 	}
 	var failures []string
 	for _, root := range []string{attemptRoot(app), tlsAttemptRootFor(app)} {
-		names, err := listAttempts(ctx, exec, root)
+		names, err := listAttemptsByMtime(ctx, exec, root)
 		if err != nil {
 			return err
 		}
-		for _, name := range names {
+		keptForHash := make(map[string]int)
+		for _, name := range names { // newest first
 			m := attemptDirRE.FindStringSubmatch(name)
-			if m == nil || keep[m[1]] {
+			if m == nil {
 				continue
+			}
+			if keep[m[1]] {
+				keptForHash[m[1]]++
+				if keptForHash[m[1]] <= keepAttemptsPerHash {
+					continue
+				}
 			}
 			if _, rmErr := exec.Run(ctx, "rm -rf "+ssh.ShellQuote(root+"/"+name)); rmErr != nil {
 				failures = append(failures, root+"/"+name)
@@ -205,39 +223,39 @@ func PreviousAttemptBuildDir(ctx context.Context, exec ssh.Executor, app, exclud
 }
 
 // PreviousAttemptAssetsDir returns the assets directory of the most recent
-// other attempt, when one exists — the SEED for this attempt's private
-// asset tree (audit A15): asset bridging must not mutate the live shared
-// tree a running release still reads. Empty when there is none.
+// other attempt THAT HAS ONE — the SEED for this attempt's private asset
+// tree (audit A15): asset bridging must not mutate the live shared tree a
+// running release still reads. Empty when there is none.
+//
+// The candidate set is mtime-ordered and existence-filtered (T10): the
+// previous attempt by recency may be an env-only or build-only attempt with
+// NO assets directory, and seeding from an empty set silently dropped the
+// cached asset files older releases accumulated — the bridge copied only
+// what the new image re-extracted.
 func PreviousAttemptAssetsDir(ctx context.Context, exec ssh.Executor, app, excludeID string) string {
-	dir := previousAttemptSubDir(ctx, exec, app, excludeID, "assets")
-	if dir == "" {
-		return ""
-	}
-	// Only a directory that provably exists is a usable seed; anything
-	// else means "no previous tree" (full extraction), not an error.
-	if out, err := exec.Run(ctx, "test -d "+ssh.ShellQuote(dir)+" && echo yes || echo no"); err != nil || strings.TrimSpace(out) != "yes" {
-		return ""
-	}
-	return dir
+	return previousAttemptSubDir(ctx, exec, app, excludeID, "assets")
 }
 
+// previousAttemptSubDir picks the newest (mtime) other attempt whose <sub>
+// directory provably exists. Existence filtering matters most for assets
+// (an empty seed is a silent loss) and is harmless for the rsync
+// --link-dest basis — a basis that does not exist transfers in full anyway.
+// The id is random, so lexicographic order is NOT recency; mtime is the
+// closest chronology the directory names offer.
 func previousAttemptSubDir(ctx context.Context, exec ssh.Executor, app, excludeID, sub string) string {
-	names, err := listAttempts(ctx, exec, attemptRoot(app))
+	names, err := listAttemptsByMtime(ctx, exec, attemptRoot(app))
 	if err != nil {
 		return ""
 	}
-	filtered := names[:0]
-	for _, n := range names {
-		if m := attemptDirRE.FindStringSubmatch(n); m != nil && m[2] != excludeID {
-			filtered = append(filtered, n)
+	for _, n := range names { // newest first
+		m := attemptDirRE.FindStringSubmatch(n)
+		if m == nil || m[2] == excludeID {
+			continue
+		}
+		candidate := attemptRoot(app) + "/" + n + "/" + sub
+		if out, err := exec.Run(ctx, "test -d "+ssh.ShellQuote(candidate)+" && echo yes || echo no"); err == nil && strings.TrimSpace(out) == "yes" {
+			return candidate
 		}
 	}
-	if len(filtered) == 0 {
-		return ""
-	}
-	// Deterministic pick: lexicographically greatest name. The id is
-	// random, so this is not chronology — it does not need to be; any
-	// recent-ish basis gives rsync its delta.
-	sort.Strings(filtered)
-	return attemptRoot(app) + "/" + filtered[len(filtered)-1] + "/" + sub
+	return ""
 }

@@ -24,8 +24,8 @@ func deployWithAttemptPruneMocks(t *testing.T, pinsStub, inventoryStub ssh.MockC
 	mocks = append(mocks,
 		pinsStub,
 		inventoryStub,
-		ssh.MockCommand{Match: "ls -1 /deployments/fency/meta/att", Output: "ancient.0000000000000003"},
-		ssh.MockCommand{Match: "ls -1 /deployments/caddy/tls/att/fency", Output: "ancient.0000000000000003"},
+		ssh.MockCommand{Match: "ls -1t /deployments/fency/meta/att", Output: "ancient.0000000000000003"},
+		ssh.MockCommand{Match: "ls -1t /deployments/caddy/tls/att/fency", Output: "ancient.0000000000000003"},
 		ssh.MockCommand{Match: "rm -rf ", Output: ""},
 	)
 	mock := ssh.NewMockExecutor("1.2.3.4", mocks...)
@@ -60,7 +60,7 @@ func TestDeployFenced_PinReadFailureSkipsAttemptPrune(t *testing.T) {
 		if strings.HasPrefix(c, "rm -rf ") && strings.Contains(c, "/meta/att") {
 			t.Errorf("attempt artifacts must not be pruned when pins cannot be read: %s", c)
 		}
-		if strings.HasPrefix(c, "ls -1 /deployments/fency/meta/att") {
+		if strings.HasPrefix(c, "ls -1t /deployments/fency/meta/att") {
 			t.Errorf("the prune sweep must not even run when pins cannot be read: %s", c)
 		}
 	}
@@ -93,7 +93,7 @@ func TestDeployFenced_InventoryFailureSkipsAttemptPrune(t *testing.T) {
 		ssh.MockCommand{Match: "docker ps --all --filter label=teploy.app='fency'", Err: errBoom},
 	)
 	for _, c := range mock.Calls {
-		if strings.HasPrefix(c, "ls -1 /deployments/fency/meta/att") {
+		if strings.HasPrefix(c, "ls -1t /deployments/fency/meta/att") {
 			t.Errorf("the prune sweep must not run when the version inventory is unreadable: %s", c)
 		}
 	}

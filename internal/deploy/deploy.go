@@ -338,8 +338,9 @@ func (d *Deployer) DeployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 	// Extraction uses `docker create` + `docker cp`, so no image ENTRYPOINT
 	// ever executes (the old `docker run … sh -c` let an image with an
 	// ENTRYPOINT wrap or replace the copy command).
+	assetAttempt := releasemeta.MustAttempt(cfg.App, cfg.Version)
 	if cfg.AssetPath != "" {
-		att := releasemeta.MustAttempt(cfg.App, cfg.Version)
+		att := assetAttempt
 		assetDir := att.Dir() + "/assets"
 		fmt.Fprintln(d.out, "Bridging assets...")
 		seed := ""
@@ -843,17 +844,27 @@ func (d *Deployer) DeployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 		}
 	}
 
-	// 15. Clean up old bridged assets.
+	// 15. Clean up old bridged assets (asset_keep_days). The LIVE tree the
+	// container mounts is the attempt's private tree (A15), so the expiry
+	// runs THERE — the old cleanup targeted only the legacy shared
+	// /deployments/<app>/assets path, which made asset_keep_days a no-op
+	// for every deploy since F08 (audit T11). The legacy tree still serves
+	// releases deployed before attempt scoping, so it keeps its sweep too.
 	if cfg.AssetPath != "" {
 		keepDays := cfg.AssetKeepDays
 		if keepDays <= 0 {
 			keepDays = 7
 		}
-		cleanCmd := fmt.Sprintf(
-			"find %s -type f -mtime +%d -delete 2>/dev/null || true",
-			ssh.ShellQuote(fmt.Sprintf("/deployments/%s/assets", cfg.App)), keepDays,
-		)
-		d.exec.Run(ctx, cleanCmd)
+		for _, assetRoot := range []string{
+			assetAttempt.Dir() + "/assets",
+			fmt.Sprintf("/deployments/%s/assets", cfg.App),
+		} {
+			cleanCmd := fmt.Sprintf(
+				"find %s -type f -mtime +%d -delete 2>/dev/null || true",
+				ssh.ShellQuote(assetRoot), keepDays,
+			)
+			d.exec.Run(ctx, cleanCmd)
+		}
 	}
 
 	// 15b. Prune superseded app versions (containers + images) if the
