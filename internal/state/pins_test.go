@@ -146,3 +146,23 @@ type failingFS struct{ fakeFS }
 func (f *failingFS) Run(ctx context.Context, cmd string) (string, error) {
 	return "", fmt.Errorf("permission denied")
 }
+
+// TestPinUnlockedRMWLosesUpdate is the T08 regression driver at the state
+// layer: two concurrent AddPins starting from the same pin set must not
+// both report success with one pin lost. (The full serialization lives at
+// the CLI layer's withPinLock; this test pins the read-modify-write
+// primitive's behavior the lock builds on.)
+func TestPinIdempotenceAndSortedWrite(t *testing.T) {
+	ctx := context.Background()
+	fs := newFakeFS()
+	if err := AddPin(ctx, fs, "web", "zzz"); err != nil {
+		t.Fatal(err)
+	}
+	if err := AddPin(ctx, fs, "web", "aaa"); err != nil {
+		t.Fatal(err)
+	}
+	pins, _ := ReadPins(ctx, fs, "web")
+	if len(pins) != 2 || pins[0] != "aaa" || pins[1] != "zzz" {
+		t.Fatalf("pins not sorted/deduped on write: %v", pins)
+	}
+}

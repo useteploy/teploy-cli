@@ -150,6 +150,16 @@ type Record struct {
 	Recreate *docker.RecreateSpec `json:"recreate,omitempty"`
 }
 
+// ValidateHash checks a release id against the grammar safe for meta
+// file-name segments (exported for boundary checks like `teploy pin`, whose
+// values later key prune-protection sets and meta paths).
+func ValidateHash(hash string) error {
+	if !validHash.MatchString(hash) {
+		return fmt.Errorf("invalid release id %q", hash)
+	}
+	return nil
+}
+
 // Path returns the record path for (app, hash). Both segments are grammar
 // checked here so no caller can interpolate an unvalidated id into a remote
 // path — the app against the config name grammar (audit A17: it used to be

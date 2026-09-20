@@ -9,6 +9,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/useteploy/teploy/internal/config"
+	"github.com/useteploy/teploy/internal/releasemeta"
 	"github.com/useteploy/teploy/internal/ssh"
 	"github.com/useteploy/teploy/internal/state"
 )
@@ -78,6 +79,24 @@ func pinExecutor(flags *Flags) (context.Context, context.CancelFunc, ssh.Executo
 	return ctx, cancel, executor, appCfg, nil
 }
 
+// withPinLock serializes a pin read-modify-write against deploys, prunes,
+// and other pin edits using the SAME fenced app lock every mutation path
+// holds (audit T08): AddPin/RemovePin publish atomically, but two unlocked
+// read-modify-writes could both "succeed" while one pin silently
+// disappeared, and a pin could race a prune that had already read an older
+// protection set — a successful pin was not a retention guarantee.
+func withPinLock(ctx context.Context, executor ssh.Executor, app string, fn func() error) error {
+	if err := state.EnsureAppDir(ctx, executor, app); err != nil {
+		return fmt.Errorf("creating app directory: %w", err)
+	}
+	lk, err := state.AcquireLockFenced(ctx, executor, app)
+	if err != nil {
+		return fmt.Errorf("acquiring deploy lock: %w", err)
+	}
+	defer state.ReleaseLockFenced(executor, lk, app)
+	return fn()
+}
+
 func runPin(flags *Flags, version string) error {
 	ctx, cancel, executor, appCfg, err := pinExecutor(flags)
 	if err != nil {
@@ -93,8 +112,16 @@ func runPin(flags *Flags, version string) error {
 		}
 		version = s.CurrentHash
 	}
+	// The pin value keys prune-protection sets and (per release) meta file
+	// paths — reject path-metacharacter ids at the command boundary rather
+	// than discovering them at a remote shell (T08).
+	if err := releasemeta.ValidateHash(version); err != nil {
+		return err
+	}
 
-	if err := state.AddPin(ctx, executor, appCfg.App, version); err != nil {
+	if err := withPinLock(ctx, executor, appCfg.App, func() error {
+		return state.AddPin(ctx, executor, appCfg.App, version)
+	}); err != nil {
 		return err
 	}
 	if !flags.JSON {
@@ -111,7 +138,12 @@ func runUnpin(flags *Flags, version string) error {
 	defer cancel()
 	defer executor.Close()
 
-	if err := state.RemovePin(ctx, executor, appCfg.App, version); err != nil {
+	if err := releasemeta.ValidateHash(version); err != nil {
+		return err
+	}
+	if err := withPinLock(ctx, executor, appCfg.App, func() error {
+		return state.RemovePin(ctx, executor, appCfg.App, version)
+	}); err != nil {
 		return err
 	}
 	if !flags.JSON {
