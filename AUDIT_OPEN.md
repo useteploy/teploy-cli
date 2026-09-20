@@ -10,7 +10,10 @@ Round 2 (2026-09-17, 60 findings TCL-01..TCL-60,
 pinned at 1a8ea32) is recorded at the bottom: 24 findings closed with
 contained fixes (several narrowing pass-6 deferrals), the rest deferred —
 almost all of them the same architectural tail pass 6 already carries, now
-with the round-2 evidence folded in.
+with the round-2 evidence folded in. Round 4 (2026-09-19, 63 findings
+T01-T63, pinned at c30e4b3, record at the bottom) closed 35 findings with
+contained fixes; its residual tail is the standing architectural items with
+round-4 evidence folded in, plus the new T28/T40/T59 deferrals.
 
 Open items: the pass-6 deferred tail minus the F14 family (resolved
 2026-09-18) and the F08/F16/F48/F49/F57 family (resolved 2026-09-18,
@@ -20,9 +23,10 @@ TCL-51), the round-2 residual tail itemized in that section, and the
 dependent designs F04 (and its TCL-10/TCL-15 dependents) that stay
 deferred with their annotations — plus the round-3 deferrals recorded at
 the bottom (mostly the same architectural tail, with round-3 evidence
-folded in). The 2 upstream/owner items are closed (below). The two
-upstream items received from teploy-dash's 2026-09-17 pass are closed
-below.
+folded in) and the round-4 deferrals recorded at the bottom (standing tail
++ round-4 evidence, plus the new T28/T40/T59 items). The 2 upstream/owner
+items are closed (below). The two upstream items received from
+teploy-dash's 2026-09-17 pass are closed below.
 
 ## Resolved from this register
 
@@ -629,3 +633,139 @@ all packages ok. No push performed.
 - A50 — F65 real-filesystem/Docker integration matrix (this round's new
   tests remain mock-level; PrefixWriter/cancellation tests are behavioral
   with real processes).
+
+## Round 4 (2026-09-19, T01-T63, pinned at c30e4b3) — record
+
+Report reviewed finding-by-finding against the source at the pinned HEAD
+(the register's closure claims were NOT taken as proof — several findings
+landed as genuine defects on top of the newest surfaces, and several
+restated the standing architectural tail). 35 findings closed with
+contained fixes across 12 commits; the remaining 28 defer onto the standing
+pass-6/round-2/round-3 tail (round-4 evidence folded in) or onto the new
+items noted below. No false positives found; T38 was confirmed against the
+post-A41 script (the pre-stop existence FLAG was the residual defect, not
+the copy ordering); T07 confirmed A13's flag accounting never set restored
+on success.
+
+### Round 4 — fixed (contained)
+
+| ID | Sev | Where |
+|---|-----|-------|
+| T02 | High | 41192f4 — the ambiguous-failure fallback of ReleaseLockFenced is a shell-level CONDITIONAL: the lock is removed only when its info still names the releasing owner (or is already gone); a successor's lock is never deleted by the old unconditional detached release |
+| T06 | High | 34d6dc9 — every rollback route-phase failure (upstream-port inspection, SetRoute, SetLoadBalancerHealth) unwinds through the same cleanup as start/health failures: stop the uncommitted target, restore the displaced fixed-port workload |
+| T07 | Med | 34d6dc9 — restoreDisplacedAndStarted sets restored on SUCCESSFUL restarts (an all-restored recovery no longer reports "no container is serving"); partial cleanup failures are joined into the returned error |
+| T08 | High | c9260a7 — pin/unpin run under the app's fenced lock (the same one deploys/prunes hold) with release-id grammar validation at the command boundary |
+| T10 | Med | 67c097b — the asset-bridge seed selector is mtime-ordered and skips attempts with no assets directory (the lexicographically-greatest pick could select an env-only attempt and silently seed nothing) |
+| T11 | Med | 67c097b — asset_keep_days cleanup runs on the LIVE attempt-scoped tree (it had been a no-op since F08) and PruneAttempts bounds attempts per retained hash to the two newest |
+| T12 | High | a83ff14 — InspectRecreate captures docker's EFFECTIVE top-level mounts: anonymous volumes (Dockerfile VOLUME) are preserved BY NAME, and an effective mount the CLI cannot represent fails the inspect instead of silently dropping storage; --mount values are CSV-encoded |
+| T13 | Med | a83ff14 — the recreation renderer brackets IPv6 binds via net.JoinHostPort with validated ports/protocol ('::1:49152:80' concatenation is gone) |
+| T15 | High | 1b267ec — ListContainers requests Labels as a JSON object via a custom --format; the comma-joined display string (whose values could forge reserved teploy.* labels) is no longer parsed for lifecycle decisions |
+| T17 | Med | 1b267ec (half) — ImageExists distinguishes a proven "no such image" from daemon/permission failures (the old framing turned a broken daemon into a convincing cache miss). The deploy-path resolve-warns-and-fall-back stays deliberate (A52) |
+| T19 | High | a83ff14 (recreation half, the TCL-12 registered follow-up) — resolved env rides a private 0600 on-target --env-file instead of -e argv; the docker-exec AWS/MySQL channels stay deferred (A33) |
+| T20 | Med | 555581b (half) — health probes pass curl --noproxy '*' so ambient proxy configuration cannot hijack host-local readiness. The explicit HTTP/TCP mode redesign stays deferred (A22) |
+| T21 | Med | 34d6dc9 — worker verification treats a persistently unreadable inspect as a deploy FAILURE after bounded retries (reversing A23's degrade-to-warning: unknown is not readiness) |
+| T23 | Med | 9694108 — publish entries are parsed against a documented narrow grammar ([ip:]host:container[/proto], single ports, bracketed IPv6) at BOTH boundaries, duplicate host bindings (incl. wildcard-vs-specific) are rejected pre-mutation, and host-ingress conflicts with the fixed port fail at validation |
+| T26 | High | 82d0ed3 — the webhook route is PERSISTED in the Caddyfile inside the app's managed site block from a per-app descriptor; every managed render (deploy/rollback/maintenance) re-applies it under the same lock + adapt gate + reload/verify transaction — the runtime admin-API injection could be erased by the very deploy it triggered |
+| T27 | Med | 82d0ed3 — the route honors the configured listener port (9876 was hardcoded) and matches every configured domain (the comma list was one JSON host value) |
+| T29 | High | 82d0ed3 — autodeploy Schedule/Unschedule read the crontab status-checked (only the canonical no-crontab message starts from empty) and the crontab -r fallback is gone |
+| T30 | Med | 82d0ed3 — autodeploy Remove aggregates every step failure into an "incomplete" error; Status reports transport failures as errors, never as "inactive" |
+| T31 | Med | 82d0ed3 — the resident path resolves relative TLS cert/key paths against the fetched checkout (the systemd unit has no WorkingDirectory) |
+| T32 | Low | 82d0ed3 — the webhook secret is stored and HMAC-verified verbatim: setup rejects whitespace-wrapped secrets, serve refuses (with the reason) instead of trimming the key |
+| T37 | High | 353dc93 — restore_original is defined and the baseline capture compensated AFTER the stop: a failed docker cp under set -e used to exit with Redis stopped and no restart attempted (behavioral tests drive the script under a real bash with a stub docker) |
+| T38 | High | 353dc93 — the baseline is captured against the STOPPED container (docker cp), distinguishing "no such file" from every other failure — the old pre-stop existence flag missed the final RDB a graceful shutdown writes when none existed |
+| T41 | High | a602edc — secret List runs a bare status-checked find and sorts in Go (the old find|sort pipeline without pipefail reported a failed listing as "no secrets"); listed names are grammar-validated |
+| T45 | High | a602edc — every atomic publication renames with mv -fT (remote Upload, UploadAtomic, secret Set): a plain mv into a destination symlinked to a directory silently nested the file and left the destination unchanged |
+| T46 | Med | a602edc (local half) — LocalExecutor.Upload fsyncs the containing directory after the rename. The remote-shell durability contract (fsync + parent sync over SSH) stays deferred |
+| T48 | High | 555581b (narrowing A47) — update extraction is bounded and single-binary: declared sizes checked before reading, limited reads, non-regular/duplicate entries refused, entry count capped |
+| T49 | Med | 555581b (half) — the updater derives its context from the Cobra command. The selection policy (downgrade/prerelease ordering, --allow-downgrade) stays deferred (A48) |
+| T51 | High | 353dc93 — .teployignore EXTENDS the always-protected defaults (.env/.env.*/.git/node_modules); an unreadable ignore file is an error, never a silent defaults-only transfer |
+| T53 | Med | 9694108 — basic_auth requires a COMPLETE structural bcrypt hash, forward_auth's verify URI must be request-path-shaped, copy_headers must be HTTP tokens, and the upstream URL rejects control characters (closes the TCL-39 renderer-input follow-up) |
+| T56 | Med | 67c097b — releasemeta.Read validates the record's embedded App/Hash against the requested key; a copied or corrupted-but-valid record can no longer drive effects at a different release's spec |
+| T57 | High | 5401f87 — a failed load-balancer update after a fully successful fleet wave is a nonzero exit ("backends deployed but load-balancer activation failed") |
+| T58 | High | 5401f87 (half) — both fleet rollback waves run on bounded detached recovery contexts (a Ctrl-C no longer cancels the recovery itself into a no-op). The generation-identity half (compensating only the recorded predecessor) defers with the T04 family |
+| T61 | Low | 555581b — CI and the release workflow are read-only by default; contents:write is granted only to the publishing job |
+| T62 | High | 5401f87 (half) — maintenance on/off takes the app's fenced deploy lock, the --app path verifies the authoritative server ingress mode, and the stash is read/created/deleted inside the Caddyfile mutation transaction. The versioned-desired-state redesign stays deferred |
+| T63 | Med | 34d6dc9 — the name-derived cleanup fallback retries the container inventory first (removed workers are invisible to name-derived retirement) and reports every fallback stop/remove failure |
+
+### Round 4 — deferred (standing tail, with round-4 evidence folded in)
+
+- T01 — A05's remainder (the grep-based guard is check-then-act at the
+  multi-command phase granularity; the fenced single-command guards refuse
+  stale effects but two contenders can still both read a stale owner). The
+  permanent server-side serialization transaction is the redesign A05
+  defers; T02's conditional fallback removed the worst unguarded deletion.
+- T03 — the shared Caddy lock stays short-lived, ownerless, and unfenced BY
+  DESIGN (the register's TCL-05 note); every Caddyfile edit now runs under
+  the adapt gate + delivery verification, and the app-level fence covers
+  deploy effects. The full target-side lock redesign folds into A05.
+- T04 — A07/F04: operation-scoped receipts (attempt labels, container-ID
+  receipts, generation comparison before compensation). T58's detached
+  contexts and T06/T62's transactional cleanups cover the contained halves.
+- T05 — A12's remainder: restorePreviousRoute still reconstructs the
+  predecessor block from cfg + live inspect (now via A21's ambiguity-refusing
+  port reads); the exact-block receipt/compare-and-swap restore design
+  remains open on ParseSites/ExtractPolicy.
+- T09 — A09: same-version redeploys rewrite the (app, hash) record (the
+  documented immutability exception) and the record is written after the
+  live commit (the deliberate degradation posture); attempt-keyed
+  generation records remain the F04-adjacent design.
+- T14 — F20's remainder: candidate-before-destructive recreate and the
+  fields the docker CLI cannot round-trip (health checks beyond NONE,
+  restart retries, DNS/devices/ulimits). T12/T13/T19 removed the silent
+  DATA-loss halves (anonymous volumes, IPv6, env argv).
+- T16 — A20/TCL-15: host-port preselection is not a reservation (ss-based
+  allocation + Docker as final authority).
+- T18 — A24/F17: Cmd stays a deliberate operator-authored shell string at
+  the docker-run sink.
+- T22 — A16: stable aliases expose external-ingress candidates before
+  readiness (generation-scoped aliases need F04's handoff).
+- T24 — A34: durable webhook job queue (ack-before-durable-job remains;
+  A36's content dedup + T26's persisted routing cover the routing halves).
+- T25 — A35: webhook builds fetch the watched branch HEAD, not the
+  authenticated payload commit (fetch + worktree pinning design).
+- T28 — NEW deferral: the scheduled-redeploy cron script is a separate
+  forked deployment engine (no lock, health gate, route/state/metadata
+  commit). Unifying it behind the real deploy engine is the fix; whether
+  to fail closed on `autodeploy schedule` until then is an owner product
+  decision (it disables a shipped feature). T29's strict crontab handling
+  removed the destructive halves around it.
+- T33 — A37: listener scope, bounded admission, graceful shutdown with
+  recoverable jobs (the durable queue is the prerequisite).
+- T34 — A38/TCL-40: restore under the app lease + writer quiescence.
+- T35 — A42: per-engine transactional consistency (SQL/Mongo staging +
+  controlled cutover).
+- T36 — A43/TCL-44: constrained extractor for restore archives (the host
+  tar runs in a private staging tree today).
+- T39 — TCL-42's open half: same-second LASTSAVE ambiguity and
+  persistence-path discovery (dir/dbfilename assumptions).
+- T40 — NEW deferral: a versioned whole-app disaster-recovery bundle
+  (release records, secret stores + age identity, TLS references) is a
+  product decision; today's archives are data-only by design.
+- T42 — A30: errno-aware confirmed-missing reads (test -e folds EACCES
+  into absence); needs the structured executor result.
+- T43 — A30: local/remote executor output semantics (stdout/stderr split,
+  no trimming) — the cross-cutting CommandResult contract.
+- T44 — A29: session-open cancellation needs a per-command transport.
+- T47 — A31: cross-process TOFU serialization of first-use host-key
+  acceptance.
+- T50 — A49 + the nixpacks curl|bash installer: reviewed pins/digests are
+  owner items the register does not invent; the installer now joins them.
+- T52 — TCL-54: nixpacks --platform parity and DetectAt's stat
+  distinction.
+- T54 — F57's owner decision: presence-aware overlay semantics beyond the
+  strict-env opt-in.
+- T55 — TCL-50/F60: the redacted manifest digest is not a complete-plan
+  identity.
+- T59 — NEW deferral: static publication hashes the mutable source before
+  transfer and trusts an existing short-hash directory (snapshot +
+  content-manifest verification design; concurrent source mutation is the
+  precondition).
+- T60 — A50: the fencing mock models a stronger atomicity guarantee than
+  the real shell (this round's behavioral tests — the redis script under a
+  real bash — are the pattern the integration matrix wants more of).
+
+Gates at the closing commits: `go vet ./...` clean; `go test ./... -race`
+all packages ok. No push performed. (Environmental note: Apple's Xcode 27
+update landed mid-session and required license re-acceptance for
+/usr/bin/git; the closing gates ran against the standalone Command Line
+Tools git on PATH.)
