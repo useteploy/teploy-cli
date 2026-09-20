@@ -61,8 +61,8 @@ func (f *fakeStatefulExecutor) Run(ctx context.Context, cmd string) (string, err
 	case strings.HasPrefix(cmd, "rm -f "):
 		delete(f.files, strings.Trim(strings.TrimPrefix(cmd, "rm -f "), "'"))
 		return "", nil
-	case strings.HasPrefix(cmd, "mv -f -- "):
-		fields := strings.Fields(strings.TrimPrefix(cmd, "mv -f -- "))
+	case strings.HasPrefix(cmd, "mv -f -- "), strings.HasPrefix(cmd, "mv -fT -- "):
+		fields := strings.Fields(strings.TrimPrefix(strings.TrimPrefix(cmd, "mv -fT -- "), "mv -f -- "))
 		if len(fields) == 2 {
 			src := strings.Trim(fields[0], "'")
 			dst := strings.Trim(fields[1], "'")

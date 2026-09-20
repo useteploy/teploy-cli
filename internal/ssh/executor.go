@@ -59,7 +59,12 @@ func UploadAtomic(ctx context.Context, exec Executor, content io.Reader, remoteP
 	if err := exec.Upload(ctx, content, tmpPath, mode); err != nil {
 		return fmt.Errorf("uploading temporary file: %w", err)
 	}
-	if _, err := exec.Run(ctx, "mv -f -- "+ShellQuote(tmpPath)+" "+ShellQuote(remotePath)); err != nil {
+	// -T (no-target-directory): the destination is one path, never a
+	// directory operand. A plain `mv -f -- tmp dest` with dest a symlink TO
+	// A DIRECTORY succeeds by moving the file INSIDE that directory and
+	// leaving the expected destination untouched — a false-success write
+	// (audit T45).
+	if _, err := exec.Run(ctx, "mv -fT -- "+ShellQuote(tmpPath)+" "+ShellQuote(remotePath)); err != nil {
 		return fmt.Errorf("renaming temporary file into place: %w", err)
 	}
 	committed = true

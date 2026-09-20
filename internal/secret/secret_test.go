@@ -292,3 +292,17 @@ func (m *stderrOnlyMock) RunStream(ctx context.Context, cmd string, stdout, stde
 	_, err := stderr.Write([]byte(m.stderrOut))
 	return err
 }
+
+// TestList_FindFailureIsAnError is the T41 regression: the old
+// `find … | sort` pipeline lost find's failure to sort's success (no
+// pipefail), so an unlistable secrets directory returned an empty list that
+// read as "this app has no secrets" and DeployAll skipped every secret.
+func TestList_FindFailureIsAnError(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/secrets' ]", Output: "present"},
+		ssh.MockCommand{Match: "find ", Err: fmt.Errorf("find: '/deployments/myapp/secrets': Permission denied")},
+	)
+	if _, err := NewManager(mock).List(context.Background(), "myapp"); err == nil {
+		t.Fatal("a failed find must be an error, never an empty secret list")
+	}
+}

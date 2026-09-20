@@ -109,6 +109,15 @@ func (e *LocalExecutor) Upload(ctx context.Context, content io.Reader, path stri
 	if err := os.Rename(tmp, path); err != nil {
 		return fmt.Errorf("publishing %s: %w", path, err)
 	}
+	// Sync the containing directory after the rename (T46's local half):
+	// the file itself was fsynced above, but without a directory fsync a
+	// power loss can leave the rename unpersisted — the old file back, or
+	// nothing. The remote-shell halves stay on the deferred durability
+	// contract (documented in AUDIT_OPEN.md).
+	if d, derr := os.Open(dir); derr == nil {
+		_ = d.Sync()
+		_ = d.Close()
+	}
 	return nil
 }
 
