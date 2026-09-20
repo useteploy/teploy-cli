@@ -893,8 +893,13 @@ func runMultiDeploy(flags *Flags, appCfg *config.AppConfig, image, version strin
 
 	if failCount == 0 {
 		if len(successTargets) > 0 {
+			// Front-door activation is a required deployment phase (audit
+			// T57): the old shape printed a warning and returned nil, so a
+			// green CLI exit did not prove the deployment was reachable —
+			// backends could serve new versions on new ports while the LB
+			// still targeted the old ones.
 			if err := updateLoadBalancer(ctx, flags, appCfg, serversPath, successTargets); err != nil {
-				fmt.Fprintf(os.Stderr, "Warning: LB update failed: %v\n", err)
+				return fmt.Errorf("backends deployed but load-balancer activation failed — the fleet needs reconciliation: %w", err)
 			}
 		}
 		return nil
@@ -933,12 +938,18 @@ func runMultiDeploy(flags *Flags, appCfg *config.AppConfig, image, version strin
 		fmt.Printf("\n%d of %d servers failed — rolling back the %d server(s) that succeeded...\n",
 			failCount, len(targets), len(successTargets))
 
-		// Best-effort: attempt to roll back EVERY succeeded server even if one
-		// rollback fails — otherwise a single rollback failure would fail-fast
-		// and strand the remaining servers on the new version (M1).
-		rollbackResults := multideploy.ParallelDeployAll(ctx, successTargets, parallel, func(ctx context.Context, target multideploy.ServerTarget, out io.Writer) error {
-			return rollbackSingleServer(ctx, appCfg, target, out)
-		}, os.Stdout)
+	// Best-effort: attempt to roll back EVERY succeeded server even if one
+	// rollback fails — otherwise a single rollback failure would fail-fast
+	// and strand the remaining servers on the new version (M1). The wave
+	// runs on a bounded DETACHED recovery context (audit T58): the deploy
+	// context is signal-cancelled exactly when the operator interrupts,
+	// and recovery work that skips itself because the cancelled context
+	// disappeared is how a Ctrl-C strands half a fleet on the new version.
+	rollbackCtx, rollbackCancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Minute)
+	defer rollbackCancel()
+	rollbackResults := multideploy.ParallelDeployAll(rollbackCtx, successTargets, parallel, func(ctx context.Context, target multideploy.ServerTarget, out io.Writer) error {
+		return rollbackSingleServer(ctx, appCfg, target, out)
+	}, os.Stdout)
 
 		var rolledBack, firstDeploys, rollbackFailed []string
 		for _, r := range rollbackResults {
@@ -990,7 +1001,12 @@ func rollbackFailedWave(ctx context.Context, appCfg *config.AppConfig, wave []mu
 	}
 	if len(succeeded) > 0 {
 		fmt.Printf("Rolling back %d canary server(s) that succeeded...\n", len(succeeded))
-		rollbackResults := multideploy.ParallelDeployAll(ctx, succeeded, parallel, func(ctx context.Context, target multideploy.ServerTarget, out io.Writer) error {
+		// Detached bounded recovery context (audit T58, same rationale as
+		// the partial-failure rollback): an interrupted canary wave must
+		// still converge its succeeded servers.
+		recoveryCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Minute)
+		defer cancel()
+		rollbackResults := multideploy.ParallelDeployAll(recoveryCtx, succeeded, parallel, func(ctx context.Context, target multideploy.ServerTarget, out io.Writer) error {
 			return rollbackSingleServer(ctx, appCfg, target, out)
 		}, os.Stdout)
 		for _, r := range rollbackResults {
