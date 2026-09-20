@@ -40,7 +40,10 @@ func newUpdateCmd(currentVersion string) *cobra.Command {
 		Use:   "update",
 		Short: "Update teploy to the latest version",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runUpdate(currentVersion, force)
+			// Derive from the command's context (audit T49's cancellation
+			// half): a background context ignored Ctrl-C for the whole
+			// check/download/verify sequence.
+			return runUpdate(cmd.Context(), currentVersion, force)
 		},
 	}
 
@@ -49,12 +52,12 @@ func newUpdateCmd(currentVersion string) *cobra.Command {
 	return cmd
 }
 
-func runUpdate(currentVersion string, force bool) error {
+func runUpdate(ctx context.Context, currentVersion string, force bool) error {
 	fmt.Printf("Current version: %s\n", currentVersion)
 
 	// Fetch latest release info.
 	fmt.Println("Checking for updates...")
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
 
 	latest, err := fetchLatestRelease(ctx)
@@ -234,24 +237,65 @@ func checksumFor(checksums []byte, asset string) (string, error) {
 	return "", fmt.Errorf("no checksum entry for %s — refusing to install unverified binary", asset)
 }
 
-// extractBinary pulls binName out of a tar.gz or zip archive held in memory.
+// Extraction policy bounds (audit T48): the compressed download is capped
+// by maxUpdateBytes, but decompressed members were previously read with a
+// bare io.ReadAll — a small, highly compressible archive member could
+// expand until memory exhaustion before any checksum ran.
+const (
+	maxUpdateBinarySize = 128 << 20 // 128 MB decompressed binary
+	maxUpdateEntries    = 4096      // whole-archive entry count
+)
+
+// extractBinary pulls binName out of a tar.gz or zip archive held in
+// memory, under a bounded, single-binary policy (audit T48, narrowing the
+// A47 deferral): the member's DECLARED size is checked before any byte is
+// read, the read itself is bounded, non-regular entries are refused, a
+// duplicate matching name is refused (exactly one binary or the archive is
+// not what we published), and the total entry count is capped so a
+// millions-of-empty-entries archive cannot stall the walk.
 func extractBinary(archive []byte, ext, binName string) ([]byte, error) {
 	if ext == "zip" {
 		zr, err := zip.NewReader(bytes.NewReader(archive), int64(len(archive)))
 		if err != nil {
 			return nil, err
 		}
-		for _, f := range zr.File {
-			if path.Base(f.Name) == binName {
-				rc, err := f.Open()
-				if err != nil {
-					return nil, err
-				}
-				defer rc.Close()
-				return io.ReadAll(rc)
-			}
+		if len(zr.File) > maxUpdateEntries {
+			return nil, fmt.Errorf("archive has %d entries (limit %d)", len(zr.File), maxUpdateEntries)
 		}
-		return nil, fmt.Errorf("%s not found in archive", binName)
+		var found bool
+		var binary []byte
+		for _, f := range zr.File {
+			if path.Base(f.Name) != binName {
+				continue
+			}
+			if found {
+				return nil, fmt.Errorf("archive contains %s more than once — refusing to pick arbitrarily", binName)
+			}
+			if f.FileInfo().IsDir() {
+				return nil, fmt.Errorf("%s in the archive is a directory", binName)
+			}
+			size := f.UncompressedSize64
+			if size == 0 || size > maxUpdateBinarySize {
+				return nil, fmt.Errorf("%s declares %d decompressed bytes (limit %d)", binName, size, maxUpdateBinarySize)
+			}
+			rc, err := f.Open()
+			if err != nil {
+				return nil, err
+			}
+			binary, err = io.ReadAll(io.LimitReader(rc, maxUpdateBinarySize+1))
+			rc.Close()
+			if err != nil {
+				return nil, err
+			}
+			if int64(len(binary)) > maxUpdateBinarySize {
+				return nil, fmt.Errorf("%s expands beyond the %d MB extraction limit", binName, maxUpdateBinarySize>>20)
+			}
+			found = true
+		}
+		if !found {
+			return nil, fmt.Errorf("%s not found in archive", binName)
+		}
+		return binary, nil
 	}
 
 	gz, err := gzip.NewReader(bytes.NewReader(archive))
@@ -260,6 +304,9 @@ func extractBinary(archive []byte, ext, binName string) ([]byte, error) {
 	}
 	defer gz.Close()
 	tr := tar.NewReader(gz)
+	var found bool
+	var binary []byte
+	entries := 0
 	for {
 		hdr, err := tr.Next()
 		if err == io.EOF {
@@ -268,11 +315,35 @@ func extractBinary(archive []byte, ext, binName string) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		if path.Base(hdr.Name) == binName {
-			return io.ReadAll(tr)
+		entries++
+		if entries > maxUpdateEntries {
+			return nil, fmt.Errorf("archive exceeds %d entries", maxUpdateEntries)
 		}
+		if path.Base(hdr.Name) != binName {
+			continue
+		}
+		if found {
+			return nil, fmt.Errorf("archive contains %s more than once — refusing to pick arbitrarily", binName)
+		}
+		if hdr.Typeflag != tar.TypeReg {
+			return nil, fmt.Errorf("%s in the archive is not a regular file", binName)
+		}
+		if hdr.Size <= 0 || hdr.Size > maxUpdateBinarySize {
+			return nil, fmt.Errorf("%s declares %d decompressed bytes (limit %d)", binName, hdr.Size, maxUpdateBinarySize)
+		}
+		binary, err = io.ReadAll(io.LimitReader(tr, maxUpdateBinarySize+1))
+		if err != nil {
+			return nil, err
+		}
+		if int64(len(binary)) > maxUpdateBinarySize {
+			return nil, fmt.Errorf("%s expands beyond the %d MB extraction limit", binName, maxUpdateBinarySize>>20)
+		}
+		found = true
 	}
-	return nil, fmt.Errorf("%s not found in archive", binName)
+	if !found {
+		return nil, fmt.Errorf("%s not found in archive", binName)
+	}
+	return binary, nil
 }
 
 // replaceBinary installs the verified update atomically: a sibling

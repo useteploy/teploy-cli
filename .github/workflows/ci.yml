@@ -7,6 +7,10 @@ on:
     branches: [main]
   workflow_call: {}
 
+# Least privilege by default (audit T61): CI only needs to read the repo.
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest

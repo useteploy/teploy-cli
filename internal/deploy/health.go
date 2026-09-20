@@ -113,14 +113,16 @@ func (d *Deployer) HealthCheckAt(ctx context.Context, port int, containerName st
 // parsing, and a bare IPv6 bind produced a malformed URL. --globoff keeps
 // curl from treating {} and [] in the path as its own glob syntax, and the
 // per-attempt connect/max deadlines bound each probe below the overall
-// readiness timeout.
+// readiness timeout. --noproxy '*' (audit T20's contained half) makes the
+// host-local probe ignore ambient proxy configuration — an inherited
+// HTTP_PROXY made the probe ask a proxy about a loopback address.
 func (d *Deployer) checkHealth(ctx context.Context, host string, port int, path string) bool {
 	url, ok := probeURL(host, port, path)
 	if !ok {
 		return false
 	}
 	cmd := fmt.Sprintf(
-		"curl -s -o /dev/null --globoff --connect-timeout 2 --max-time 5 -w '%%{http_code}' --url %s",
+		"curl -s -o /dev/null --noproxy '*' --globoff --connect-timeout 2 --max-time 5 -w '%%{http_code}' --url %s",
 		ssh.ShellQuote(url),
 	)
 	output, err := d.exec.Run(ctx, cmd)
