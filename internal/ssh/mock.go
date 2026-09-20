@@ -21,6 +21,12 @@ type MockExecutor struct {
 	mu    sync.Mutex
 	Calls []string          // records every command executed
 	Files map[string][]byte // records uploaded file contents by path
+
+	// GuardTransportFailures, when > 0, makes the next that-many GUARDED
+	// commands (the fence-guard shape) fail with a plain transport error
+	// instead of being evaluated against Files — modeling an SSH channel
+	// dying mid-command, the ambiguous-release case of audit T02.
+	GuardTransportFailures int
 }
 
 // MockCommand maps a command prefix to a response.
@@ -52,6 +58,11 @@ func (m *MockExecutor) Run(ctx context.Context, cmd string) (string, error) {
 	// and refuses once it does not, which is what the fence tests need to
 	// prove a refused effect never executes.
 	if rest, held, ok := evalFenceGuard(m.Files, cmd); ok {
+		if m.GuardTransportFailures > 0 {
+			m.GuardTransportFailures--
+			m.mu.Unlock()
+			return "", fmt.Errorf("ssh: connection timed out")
+		}
 		if !held {
 			m.mu.Unlock()
 			return "", fmt.Errorf("exit status 75: TEPLOY_FENCE_LOST")
@@ -76,8 +87,20 @@ func (m *MockExecutor) Run(ctx context.Context, cmd string) (string, error) {
 			return c.Output, c.Err
 		}
 	}
-	if strings.HasPrefix(cmd, "mv -f -- ") || strings.HasPrefix(cmd, "rm -f -- ") || strings.HasPrefix(cmd, "rm -rf -- ") {
+	if strings.HasPrefix(cmd, "mv -f -- ") || strings.HasPrefix(cmd, "mv -fT -- ") ||
+		strings.HasPrefix(cmd, "rm -f -- ") || strings.HasPrefix(cmd, "rm -rf -- ") {
 		m.applyFileCommand(cmd)
+		m.mu.Unlock()
+		return "", nil
+	}
+	// The conditional lock release (internal/state, audit T02): remove the
+	// lock directory only when its info still names the releasing owner.
+	// Modeled against the recorded file state like evalFenceGuard.
+	if dir, owner, ok := parseConditionalLockRelease(cmd); ok {
+		info := dir + "/info"
+		if data, present := m.Files[info]; present && bytes.Contains(data, []byte(owner)) {
+			m.applyFileCommand("rm -rf -- " + dir)
+		}
 		m.mu.Unlock()
 		return "", nil
 	}
@@ -132,6 +155,55 @@ func parseFenceGuard(guard string) (owner, path string, ok bool) {
 	return parts[0][1 : len(parts[0])-1], parts[1][1 : len(parts[1])-1], true
 }
 
+// parseConditionalLockRelease recognizes the single-command conditional
+// release emitted by state.ReleaseLockFenced's ambiguous-failure fallback:
+// `if [ -d '<dir>' ] && grep -q '<owner>' '<dir>/info' 2>/dev/null; then rm -rf -- '<dir>'; fi`
+func parseConditionalLockRelease(cmd string) (dir, owner string, ok bool) {
+	unquote := func(s string) (string, bool) {
+		if len(s) >= 2 && s[0] == '\'' && s[len(s)-1] == '\'' {
+			return s[1 : len(s)-1], true
+		}
+		return "", false
+	}
+	rest, found := strings.CutPrefix(cmd, "if [ -d ")
+	if !found {
+		return "", "", false
+	}
+	dirField, rest, found := strings.Cut(rest, " ] && grep -q ")
+	if !found {
+		return "", "", false
+	}
+	ownerField, rest, found := strings.Cut(rest, " ")
+	if !found {
+		return "", "", false
+	}
+	infoField, rest, found := strings.Cut(rest, " 2>/dev/null; then rm -rf -- ")
+	if !found {
+		return "", "", false
+	}
+	rmField, found := strings.CutSuffix(rest, "; fi")
+	if !found {
+		return "", "", false
+	}
+	dir, ok = unquote(dirField)
+	if !ok {
+		return "", "", false
+	}
+	owner, ok = unquote(ownerField)
+	if !ok {
+		return "", "", false
+	}
+	info, ok := unquote(infoField)
+	if !ok || info != dir+"/info" {
+		return "", "", false
+	}
+	rm, ok := unquote(rmField)
+	if !ok || rm != dir {
+		return "", "", false
+	}
+	return dir, owner, true
+}
+
 func mockCommandMatches(cmd, match string) bool {
 	if !strings.HasPrefix(cmd, match) {
 		return false
@@ -146,7 +218,7 @@ func (m *MockExecutor) applyFileCommand(cmd string) {
 	for i := range fields {
 		fields[i] = strings.Trim(fields[i], "'")
 	}
-	if len(fields) == 5 && fields[0] == "mv" && fields[1] == "-f" && fields[2] == "--" {
+	if len(fields) == 5 && fields[0] == "mv" && (fields[1] == "-f" || fields[1] == "-fT") && fields[2] == "--" {
 		if data, ok := m.Files[fields[3]]; ok {
 			m.Files[fields[4]] = data
 			delete(m.Files, fields[3])
