@@ -68,14 +68,14 @@ func TestPruneAttempts_ProtectsKeepSetAndUnparsable(t *testing.T) {
 		// Artifact root listing: a protected current attempt, a protected
 		// previous attempt, an unprotected old one, and an unparsable name
 		// that must be KEPT (fail closed, F78 parity).
-		ssh.MockCommand{Match: "ls -1 /deployments/myapp/meta/att", Output: strings.Join([]string{
+		ssh.MockCommand{Match: "ls -1t /deployments/myapp/meta/att", Output: strings.Join([]string{
 			"newhash.0000000000000001",
 			"oldhash.0000000000000002",
 			"ancient.0000000000000003",
 			"stray-directory",
 		}, "\n")},
 		// The app's OWN TLS root (A01: /deployments/caddy/tls/att/<app>).
-		ssh.MockCommand{Match: "ls -1 /deployments/caddy/tls/att/myapp", Output: strings.Join([]string{
+		ssh.MockCommand{Match: "ls -1t /deployments/caddy/tls/att/myapp", Output: strings.Join([]string{
 			"ancient.0000000000000003",
 		}, "\n")},
 		ssh.MockCommand{Match: "rm -rf", Output: ""},
@@ -106,10 +106,10 @@ func TestPruneAttempts_ProtectsKeepSetAndUnparsable(t *testing.T) {
 // cannot be attributed to an owning app.
 func TestPruneAttempts_NeverTouchesOtherAppsOrLegacyFlatRoot(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
-		ssh.MockCommand{Match: "ls -1 /deployments/app-a/meta/att", Output: strings.Join([]string{
+		ssh.MockCommand{Match: "ls -1t /deployments/app-a/meta/att", Output: strings.Join([]string{
 			"shared-name.0000000000000001", // A's prunable attempt...
 		}, "\n")},
-		ssh.MockCommand{Match: "ls -1 /deployments/caddy/tls/att/app-a", Output: strings.Join([]string{
+		ssh.MockCommand{Match: "ls -1t /deployments/caddy/tls/att/app-a", Output: strings.Join([]string{
 			"shared-name.0000000000000001", // ...in both of A's roots
 		}, "\n")},
 		ssh.MockCommand{Match: "rm -rf", Output: ""},
@@ -132,8 +132,8 @@ func TestPruneAttempts_NeverTouchesOtherAppsOrLegacyFlatRoot(t *testing.T) {
 	// root or app-b's root proves the sweep reached beyond A's namespace.
 	for _, c := range mock.Calls {
 		if strings.HasPrefix(c, "ls -1 ") {
-			if c != "ls -1 /deployments/app-a/meta/att 2>/dev/null || true" &&
-				c != "ls -1 /deployments/caddy/tls/att/app-a 2>/dev/null || true" {
+			if c != "ls -1t /deployments/app-a/meta/att 2>/dev/null || true" &&
+				c != "ls -1t /deployments/caddy/tls/att/app-a 2>/dev/null || true" {
 				t.Errorf("attempt sweep listed a namespace it must not touch: %s", c)
 			}
 		}
@@ -156,11 +156,12 @@ func TestPruneAttempts_AbsentRootsAreNoops(t *testing.T) {
 
 func TestPreviousAttemptBuildDir(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
-		ssh.MockCommand{Match: "ls -1 /deployments/myapp/meta/att", Output: strings.Join([]string{
+		ssh.MockCommand{Match: "ls -1t /deployments/myapp/meta/att", Output: strings.Join([]string{
 			"aaa.0000000000000001",
 			"bbb.0000000000000002",
 			"not-an-attempt",
 		}, "\n")},
+		ssh.MockCommand{Match: "test -d ", Output: "yes"},
 	)
 	got := PreviousAttemptBuildDir(context.Background(), mock, "myapp", "0000000000000002")
 	if want := "/deployments/myapp/meta/att/aaa.0000000000000001/build"; got != want {
@@ -170,5 +171,60 @@ func TestPreviousAttemptBuildDir(t *testing.T) {
 	// unparsable names never become a basis.
 	if got := PreviousAttemptBuildDir(context.Background(), mock, "myapp", "0000000000000001"); got != "/deployments/myapp/meta/att/bbb.0000000000000002/build" {
 		t.Errorf("unexpected basis when 0001 is excluded: %s", got)
+	}
+}
+
+// TestPreviousAttemptAssetsDir_SkipsAttemptsWithoutAssets is the T10
+// regression: the most recent attempt may be env-only or build-only (no
+// assets directory); seeding from it silently dropped the cached asset
+// files older releases accumulated. The selector must skip to the newest
+// attempt that actually HAS the subtree.
+func TestPreviousAttemptAssetsDir_SkipsAttemptsWithoutAssets(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		// mtime-newest first: newest has no assets, next one does.
+		ssh.MockCommand{Match: "ls -1t /deployments/myapp/meta/att", Output: strings.Join([]string{
+			"envonly.0000000000000009",
+			"withassets.0000000000000008",
+		}, "\n")},
+		ssh.MockCommand{Match: "test -d '/deployments/myapp/meta/att/envonly.0000000000000009/assets'", Output: "no"},
+		ssh.MockCommand{Match: "test -d '/deployments/myapp/meta/att/withassets.0000000000000008/assets'", Output: "yes"},
+	)
+	got := PreviousAttemptAssetsDir(context.Background(), mock, "myapp", "ffffffffffffffff")
+	if want := "/deployments/myapp/meta/att/withassets.0000000000000008/assets"; got != want {
+		t.Errorf("PreviousAttemptAssetsDir: got %q want %q (the asset-less newest attempt must be skipped)", got, want)
+	}
+}
+
+// TestPruneAttempts_BoundsAttemptsPerKeptHash is the T11 regression:
+// repeated same-version or failed attempts of a RETAINED hash used to be
+// kept forever (every attempt dir of a kept hash was protected). Only the
+// newest keepAttemptsPerHash attempts of a kept hash stay.
+func TestPruneAttempts_BoundsAttemptsPerKeptHash(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "ls -1t /deployments/myapp/meta/att", Output: strings.Join([]string{
+			"kept.0000000000000005", // newest
+			"kept.0000000000000004",
+			"kept.0000000000000003",
+			"kept.0000000000000002",
+		}, "\n")},
+		ssh.MockCommand{Match: "ls -1t /deployments/caddy/tls/att/myapp", Output: ""},
+		ssh.MockCommand{Match: "rm -rf", Output: ""},
+	)
+	if err := PruneAttempts(context.Background(), mock, "myapp", "kept"); err != nil {
+		t.Fatalf("PruneAttempts: %v", err)
+	}
+	var removed []string
+	for _, c := range mock.Calls {
+		if strings.HasPrefix(c, "rm -rf ") {
+			removed = append(removed, c)
+		}
+	}
+	if len(removed) != 2 {
+		t.Fatalf("expected the 2 oldest attempts of the kept hash pruned, got %v", removed)
+	}
+	for _, r := range removed {
+		if !strings.Contains(r, "kept.0000000000000002") && !strings.Contains(r, "kept.0000000000000003") {
+			t.Errorf("pruned a newest-two attempt: %s", r)
+		}
 	}
 }
