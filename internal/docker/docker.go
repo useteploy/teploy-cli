@@ -409,13 +409,18 @@ func (c *Client) Pull(ctx context.Context, image string) error {
 }
 
 // ImageExists reports whether the named image is already present in the
-// server's local Docker image cache. It runs `docker image inspect` behind a
-// shell guard that always exits 0 ("exists"/"missing"), so a real transport
-// failure (SSH/docker daemon down) surfaces as an error while a plain cache
-// miss does not — letting callers gate a pull without pull access failing the
-// check itself.
+// server's local Docker image cache. A plain cache miss is distinguished
+// from every other inspect failure (audit T17): the old
+// `inspect && echo exists || echo missing` shape turned a daemon outage or
+// permission error into a convincing "missing", so callers pulled (or fell
+// back to stale local copies) against a Docker connection that was broken
+// to begin with. Only a stderr proving "no such image" is a miss now;
+// anything else fails closed as an error.
 func (c *Client) ImageExists(ctx context.Context, image string) (bool, error) {
-	cmd := "docker image inspect " + ssh.ShellQuote(image) + " >/dev/null 2>&1 && echo exists || echo missing"
+	cmd := fmt.Sprintf(
+		`err=$(mktemp); if docker image inspect %s >/dev/null 2>"$err"; then st=exists; elif grep -qi 'no such image' "$err"; then st=missing; else echo 'docker image inspect failed:' >&2; cat "$err" >&2; rm -f "$err"; exit 1; fi; rm -f "$err"; printf '%%s\n' "$st"`,
+		ssh.ShellQuote(image),
+	)
 	out, err := c.exec.Run(ctx, cmd)
 	if err != nil {
 		return false, fmt.Errorf("checking for local image %s: %w", image, err)
@@ -556,7 +561,15 @@ func (c *Client) InternalPort(ctx context.Context, name string) (int, error) {
 
 // ListContainers returns all containers for the given app, including stopped ones.
 func (c *Client) ListContainers(ctx context.Context, app string) ([]Container, error) {
-	cmd := "docker ps --all --filter label=teploy.app=" + ssh.ShellQuote(app) + " --format '{{json .}}'"
+	// Labels are requested as a structured JSON object ({{json .Labels}}),
+	// not through `{{json .}}` — whose Labels field renders docker's
+	// comma-joined DISPLAY string. Splitting that display at commas cannot
+	// distinguish separators from commas inside values, so an unrelated
+	// label like "note=text,teploy.version=bad" forged a reserved teploy
+	// label in the parsed map and steered rollback/prune at the wrong
+	// containers (audit T15).
+	cmd := "docker ps --all --filter label=teploy.app=" + ssh.ShellQuote(app) +
+		` --format '{"ID":{{json .ID}},"Names":{{json .Names}},"Image":{{json .Image}},"State":{{json .State}},"Status":{{json .Status}},"CreatedAt":{{json .CreatedAt}},"Labels":{{json .Labels}}}'`
 	output, err := c.exec.Run(ctx, cmd)
 	if err != nil {
 		return nil, fmt.Errorf("listing containers for %s: %w", app, err)
@@ -731,15 +744,17 @@ func (c *Client) FindAvailablePortExcluding(ctx context.Context, claimed map[int
 	return 0, fmt.Errorf("no available ports in range 49152-65535")
 }
 
-// psEntry matches Docker's JSON output from docker ps --format '{{json .}}'.
+// psEntry matches the structured per-container JSON emitted by
+// ListContainers' custom --format. Labels arrive as a JSON OBJECT (or, for
+// legacy callers/tests, docker's comma-separated display string).
 type psEntry struct {
-	ID        string `json:"ID"`
-	Names     string `json:"Names"`
-	Image     string `json:"Image"`
-	State     string `json:"State"`
-	Status    string `json:"Status"`
-	CreatedAt string `json:"CreatedAt"`
-	Labels    string `json:"Labels"` // comma-separated "k=v,k=v"
+	ID        string          `json:"ID"`
+	Names     string          `json:"Names"`
+	Image     string          `json:"Image"`
+	State     string          `json:"State"`
+	Status    string          `json:"Status"`
+	CreatedAt string          `json:"CreatedAt"`
+	Labels    json.RawMessage `json:"Labels"`
 }
 
 // ParseContainers parses Docker JSON output into Container structs.
@@ -756,6 +771,11 @@ func ParseContainers(output string) ([]Container, error) {
 			return nil, fmt.Errorf("parsing container entry: %w", err)
 		}
 
+		labels, err := parseEntryLabels(entry.Labels)
+		if err != nil {
+			return nil, fmt.Errorf("parsing labels of %s: %w", entry.Names, err)
+		}
+
 		containers = append(containers, Container{
 			ID:        entry.ID,
 			Name:      entry.Names,
@@ -763,16 +783,40 @@ func ParseContainers(output string) ([]Container, error) {
 			State:     entry.State,
 			Status:    entry.Status,
 			CreatedAt: entry.CreatedAt,
-			Labels:    parseLabels(entry.Labels),
+			Labels:    labels,
 		})
 	}
 	return containers, nil
 }
 
-// parseLabels splits docker ps's comma-separated "k=v,k=v" label string
-// into a map. Values containing commas would break this, but teploy labels
-// (teploy.app, teploy.process, teploy.version) are safe and known.
-func parseLabels(s string) map[string]string {
+// parseEntryLabels decodes the Labels field, which is authoritative as a
+// JSON object. The legacy string form (docker's comma-joined display) is
+// still accepted for backward compatibility with old-format producers, but
+// ListContainers itself never emits it — the display string is inherently
+// ambiguous (audit T15).
+func parseEntryLabels(raw json.RawMessage) (map[string]string, error) {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" || trimmed == "null" {
+		return nil, nil
+	}
+	if trimmed[0] == '{' {
+		var labels map[string]string
+		if err := json.Unmarshal(raw, &labels); err != nil {
+			return nil, err
+		}
+		return labels, nil
+	}
+	var display string
+	if err := json.Unmarshal(raw, &display); err != nil {
+		return nil, err
+	}
+	return parseLabelsDisplay(display), nil
+}
+
+// parseLabelsDisplay splits docker's legacy comma-separated "k=v,k=v"
+// display string into a map. Values containing commas break this — which is
+// exactly why ListContainers no longer produces this form (audit T15).
+func parseLabelsDisplay(s string) map[string]string {
 	if s == "" {
 		return nil
 	}
