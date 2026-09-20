@@ -3,6 +3,7 @@ package deploy
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"maps"
@@ -448,18 +449,7 @@ func (d *Deployer) DeployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 	if current != nil && current.CurrentHash != "" {
 		if inv, invErr := d.docker.ListContainers(ctx, cfg.App); invErr == nil {
 			predecessorsListed = true
-			for _, ct := range inv {
-				if ct.Labels["teploy.role"] == "accessory" {
-					continue // accessories have their own lifecycle
-				}
-				if ct.Labels["teploy.version"] != current.CurrentHash {
-					continue
-				}
-				if !sameVersion && ct.State != "running" {
-					continue // older stopped versions are kept as rollback targets
-				}
-				predecessors = append(predecessors, ct)
-			}
+			predecessors = selectPredecessors(inv, current, sameVersion)
 		} else {
 			fmt.Fprintf(d.out, "Warning: could not list containers for the predecessor snapshot (%v); falling back to name matching\n", invErr)
 		}
@@ -535,6 +525,11 @@ func (d *Deployer) DeployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 				cleanupFailures = append(cleanupFailures, fmt.Sprintf("restore %s: %v", old, err))
 				fmt.Fprintf(d.out, "  WARNING: could not restore displaced container %s: %v\n", old, err)
 			} else {
+				// A successful restart is proof of restoration (T07): the
+				// flag used to stay false even when EVERY predecessor came
+				// back, so an accurate "all restored" recovery reported
+				// "no container is serving".
+				restored = true
 				fmt.Fprintf(d.out, "  Restored %s\n", old)
 			}
 		}
@@ -542,8 +537,11 @@ func (d *Deployer) DeployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 			fmt.Fprintf(d.out, "  WARNING: cleanup incomplete after failure — %s\n", strings.Join(cleanupFailures, "; "))
 		}
 		d.logDeploy(recoveryCtx, cfg, false, start)
-		if !restored && len(displacedHostWeb) > 0 {
-			return fmt.Errorf("%w — recovery also failed: no container is serving; %s needs manual attention (%s)", reason, cfg.App, strings.Join(cleanupFailures, "; "))
+		if len(displacedHostWeb) > 0 && !restored {
+			return fmt.Errorf("%w — recovery also failed: no predecessor could be restarted; %s needs manual attention (%s)", reason, cfg.App, strings.Join(cleanupFailures, "; "))
+		}
+		if len(cleanupFailures) > 0 {
+			return fmt.Errorf("%w — recovery incomplete, %s needs attention: %s", reason, cfg.App, strings.Join(cleanupFailures, "; "))
 		}
 		return reason
 	}
@@ -813,47 +811,35 @@ func (d *Deployer) DeployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 	// Only the snapshotted predecessors are touched. Selecting by the
 	// teploy.version label from a post-deploy inventory — the previous
 	// implementation — also matched the just-deployed replacement during a
-	// same-version redeploy and removed the live generation (TCL-02). The
-	// name-derived fallback only runs when the inventory could not be
-	// listed at snapshot time.
+	// same-version redeploy and removed the live generation (TCL-02). When
+	// the snapshot could not be listed, the cleanup RETRIES the inventory
+	// first (T63): the name-derived fallback derives worker names from the
+	// NEW config's processes, so a worker the operator REMOVED this deploy
+	// is invisible to it and would keep consuming jobs while the deploy
+	// reported success. Only a still-failing inventory degrades to names —
+	// now with every stop/remove failure reported (T63's honest-retirement
+	// half).
 	if predecessorsListed {
-		for _, ct := range predecessors {
-			// Fence (F16): the deploy is already committed; a fence loss
-			// mid-cleanup means another operation owns the app now. Refuse
-			// further stops (loudly) rather than interleaving with it —
-			// leaving an old worker running is degraded but visible.
-			if lk != nil {
-				if err := lk.Check(ctx, d.exec); err != nil {
-					fmt.Fprintf(d.out, "Warning: predecessor cleanup stopped — %v\n", err)
-					break
-				}
-			}
-			fmt.Fprintf(d.out, "Stopping old container %s...\n", ct.Name)
-			if err := d.docker.Stop(ctx, ct.Name, stopTimeout); err != nil {
-				// Traffic is already committed to the new generation; a
-				// failed predecessor stop is degraded cleanup, not a failed
-				// deploy — but it must be reported, never silent (TCL-19):
-				// a leftover old worker keeps consuming jobs.
-				fmt.Fprintf(d.out, "Warning: could not stop old container %s: %v\n", ct.Name, err)
-				continue
-			}
-			if sameVersion {
-				if err := d.docker.Remove(ctx, ct.Name); err != nil {
-					fmt.Fprintf(d.out, "Warning: could not remove old container %s: %v\n", ct.Name, err)
-				}
-			}
-		}
+		d.stopPredecessorSnapshot(ctx, predecessors, sameVersion, stopTimeout, lk)
 	} else if current != nil && current.CurrentHash != "" {
-		// Fence (F16): same refusal as the snapshot-driven cleanup above —
-		// post-commit cleanup never interleaves with a new holder.
+		// Fence (F16): post-commit cleanup never interleaves with a new
+		// holder.
+		fenceOK := true
 		if lk != nil {
 			if err := lk.Check(ctx, d.exec); err != nil {
 				fmt.Fprintf(d.out, "Warning: predecessor cleanup skipped — %v\n", err)
-			} else {
-				stopOldWorkloadsByName(ctx, d.docker, d.out, cfg, current, processes, stopTimeout)
+				fenceOK = false
 			}
-		} else {
-			stopOldWorkloadsByName(ctx, d.docker, d.out, cfg, current, processes, stopTimeout)
+		}
+		if fenceOK {
+			if inv, invErr := d.docker.ListContainers(ctx, cfg.App); invErr == nil {
+				d.stopPredecessorSnapshot(ctx, selectPredecessors(inv, current, sameVersion), sameVersion, stopTimeout, lk)
+			} else {
+				fmt.Fprintf(d.out, "Warning: container inventory still unreadable (%v) — cleaning up by derived names; a removed worker process may escape retirement\n", invErr)
+				if err := stopOldWorkloadsByName(ctx, d.docker, d.out, cfg, current, processes, stopTimeout); err != nil {
+					fmt.Fprintf(d.out, "Warning: name-based cleanup incomplete: %v\n", err)
+				}
+			}
 		}
 	}
 
@@ -925,25 +911,84 @@ func (d *Deployer) DeployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 	return nil
 }
 
+// selectPredecessors picks the containers this deploy must retire from an
+// app inventory: the authoritative current version's workload (accessories
+// excluded — they have their own lifecycle), keeping stopped historical
+// containers ONLY for a same-version redeploy (they were just renamed to
+// _replaced and must be removed, TCL-02/A08's contract).
+func selectPredecessors(inv []docker.Container, current *state.AppState, sameVersion bool) []docker.Container {
+	var out []docker.Container
+	for _, ct := range inv {
+		if ct.Labels["teploy.role"] == "accessory" {
+			continue // accessories have their own lifecycle
+		}
+		if ct.Labels["teploy.version"] != current.CurrentHash {
+			continue
+		}
+		if !sameVersion && ct.State != "running" {
+			continue // older stopped versions are kept as rollback targets
+		}
+		out = append(out, ct)
+	}
+	return out
+}
+
+// stopPredecessorSnapshot retires exactly the snapshotted predecessor set.
+// Fence checks precede each stop: the deploy is already committed, and a
+// fence loss mid-cleanup means another operation owns the app — refuse
+// further stops (loudly) rather than interleaving.
+func (d *Deployer) stopPredecessorSnapshot(ctx context.Context, predecessors []docker.Container, sameVersion bool, stopTimeout int, lk *state.Lock) {
+	for _, ct := range predecessors {
+		if lk != nil {
+			if err := lk.Check(ctx, d.exec); err != nil {
+				fmt.Fprintf(d.out, "Warning: predecessor cleanup stopped — %v\n", err)
+				break
+			}
+		}
+		fmt.Fprintf(d.out, "Stopping old container %s...\n", ct.Name)
+		if err := d.docker.Stop(ctx, ct.Name, stopTimeout); err != nil {
+			// Traffic is already committed to the new generation; a
+			// failed predecessor stop is degraded cleanup, not a failed
+			// deploy — but it must be reported, never silent (TCL-19):
+			// a leftover old worker keeps consuming jobs.
+			fmt.Fprintf(d.out, "Warning: could not stop old container %s: %v\n", ct.Name, err)
+			continue
+		}
+		if sameVersion {
+			if err := d.docker.Remove(ctx, ct.Name); err != nil {
+				fmt.Fprintf(d.out, "Warning: could not remove old container %s: %v\n", ct.Name, err)
+			}
+		}
+	}
+}
+
 // stopOldWorkloadsByName is the name-derived fallback for old-workload
-// cleanup when the container inventory cannot be listed (see step 14).
-func stopOldWorkloadsByName(ctx context.Context, dk *docker.Client, out io.Writer, cfg Config, current *state.AppState, processes map[string]string, stopTimeout int) {
+// cleanup when the container inventory cannot be listed at all (see step
+// 14). Every stop/remove failure is reported (T63): the old shape ignored
+// them entirely, so an incomplete retirement read as a clean one.
+func stopOldWorkloadsByName(ctx context.Context, dk *docker.Client, out io.Writer, cfg Config, current *state.AppState, processes map[string]string, stopTimeout int) error {
 	if current == nil || current.CurrentHash == "" {
-		return
+		return nil
 	}
 	sameVersion := current.CurrentHash == cfg.Version
 	oldReplicas := len(current.CurrentPorts)
 	if oldReplicas == 0 {
 		oldReplicas = 1
 	}
+	var failures []error
 	stop := func(name string) {
 		if sameVersion {
 			name += "_replaced"
 		}
 		fmt.Fprintf(out, "Stopping old container %s...\n", name)
-		dk.Stop(ctx, name, stopTimeout)
+		if err := dk.Stop(ctx, name, stopTimeout); err != nil {
+			failures = append(failures, fmt.Errorf("stop %s: %w", name, err))
+			return
+		}
 		if sameVersion {
-			dk.Remove(ctx, name)
+			if err := dk.Remove(ctx, name); err != nil {
+				failures = append(failures, fmt.Errorf("remove %s: %w", name, err))
+			}
 		}
 	}
 	for ri := 1; ri <= oldReplicas; ri++ {
@@ -958,6 +1003,7 @@ func stopOldWorkloadsByName(ctx context.Context, dk *docker.Client, out io.Write
 		}
 		stop(docker.ContainerName(cfg.App, process, current.CurrentHash))
 	}
+	return errors.Join(failures...)
 }
 
 func (d *Deployer) abortStateCommit(ctx context.Context, cfg Config, current *state.AppState, started, displacedHostWeb []string, start time.Time, commitErr error) error {
@@ -1212,14 +1258,14 @@ func (d *Deployer) reconcilePartialRun(name string) {
 // workerRemainsRunning verifies a just-started worker process is actually
 // viable: still running (not exited/dead/restarting) one second after the
 // detached run, and not already flagged unhealthy by the image's
-// healthcheck (A23). An inspect result that cannot be parsed degrades to a
-// warning — the container itself remains subject to the normal cleanup
-// paths — but a PARSED dead/restarting state fails the deploy.
+// healthcheck (A23). An inspect that stays unreadable across bounded
+// retries FAILS the deploy (audit T21 — this reverses A23's deliberate
+// degrade-to-warning, which let a deploy commit while unable to prove any
+// worker existed): unknown is not readiness.
 func (d *Deployer) workerRemainsRunning(ctx context.Context, name string) error {
-	st, ok := d.inspectWorkerState(ctx, name)
+	st, ok := d.inspectWorkerStateRetry(ctx, name)
 	if !ok {
-		fmt.Fprintf(d.out, "Warning: could not verify worker %s stability (inspect unreadable); proceeding\n", name)
-		return nil
+		return fmt.Errorf("cannot verify worker %s: its state is unreadable after repeated inspection — refusing to commit a deploy whose worker viability is unknown", name)
 	}
 	if err := workerStateViable(st); err != nil {
 		return fmt.Errorf("worker %s is not viable: %w", name, err)
@@ -1229,9 +1275,9 @@ func (d *Deployer) workerRemainsRunning(ctx context.Context, name string) error 
 		return ctx.Err()
 	case <-time.After(time.Second):
 	}
-	st, ok = d.inspectWorkerState(ctx, name)
+	st, ok = d.inspectWorkerStateRetry(ctx, name)
 	if !ok {
-		return nil
+		return fmt.Errorf("cannot re-verify worker %s after the settling delay: its state is unreadable — refusing to commit a deploy whose worker viability is unknown", name)
 	}
 	return workerStateViable(st)
 }
@@ -1256,6 +1302,23 @@ func (d *Deployer) inspectWorkerState(ctx context.Context, name string) (workerS
 		return workerStateJSON{}, false
 	}
 	return st, true
+}
+
+// inspectWorkerStateRetry retries an unreadable inspect a few times with a
+// short gap (a transport hiccup right after a detached run is common);
+// persistently-unknown states stay unknown so callers fail closed.
+func (d *Deployer) inspectWorkerStateRetry(ctx context.Context, name string) (workerStateJSON, bool) {
+	for attempt := 0; attempt < 3; attempt++ {
+		if st, ok := d.inspectWorkerState(ctx, name); ok {
+			return st, true
+		}
+		select {
+		case <-ctx.Done():
+			return workerStateJSON{}, false
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+	return workerStateJSON{}, false
 }
 
 func workerStateViable(st workerStateJSON) error {

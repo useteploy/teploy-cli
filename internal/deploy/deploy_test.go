@@ -395,6 +395,7 @@ func TestDeploy_HealthCheckFailure(t *testing.T) {
 		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state' ]", Output: "absent"},
 		ssh.MockCommand{Match: "ss -tln", Output: ssOutput},
 		ssh.MockCommand{Match: "docker run", Output: "failcontainer"},
+		ssh.MockCommand{Match: "docker inspect -f '{{json .State}}'", Output: `{"Status":"running","Running":true}`},
 		ssh.MockCommand{Match: "docker inspect -f", Output: "running"},
 		// Health check always fails (connection refused).
 		ssh.MockCommand{Match: "curl -s -o /dev/null", Err: fmt.Errorf("connection refused")},
@@ -622,6 +623,7 @@ func TestDeploy_SameVersion(t *testing.T) {
 ssh.MockCommand{Match: "docker inspect -f '{{.State.Status}}' 'myapp-web-abc123_replaced'", Output: ""},
 				ssh.MockCommand{Match: "docker rename", Output: ""},
 		ssh.MockCommand{Match: "docker run", Output: "newcontainer"},
+		ssh.MockCommand{Match: "docker inspect -f '{{json .State}}'", Output: `{"Status":"running","Running":true}`},
 		ssh.MockCommand{Match: "docker inspect -f", Output: "running"},
 		ssh.MockCommand{Match: "curl -s -o /dev/null", Output: "200"},
 		ssh.MockCommand{Match: "curl -sf http://localhost:2019/config/apps/http/servers/srv0", Output: `{"listen":[":80",":443"]}`},
@@ -694,6 +696,7 @@ func TestDeploy_SameVersion_StaleReplaced(t *testing.T) {
 		// Rename live container.
 		ssh.MockCommand{Match: "docker rename", Output: ""},
 		ssh.MockCommand{Match: "docker run", Output: "newcontainer"},
+		ssh.MockCommand{Match: "docker inspect -f '{{json .State}}'", Output: `{"Status":"running","Running":true}`},
 		ssh.MockCommand{Match: "docker inspect -f", Output: "running"},
 		ssh.MockCommand{Match: "curl -s -o /dev/null", Output: "200"},
 		ssh.MockCommand{Match: "curl -sf http://localhost:2019/config/apps/http/servers/srv0", Output: `{"listen":[":80",":443"]}`},
@@ -759,6 +762,7 @@ func TestDeploy_WithHooks(t *testing.T) {
 		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state' ]", Output: "absent"},
 		ssh.MockCommand{Match: "ss -tln", Output: ssOutput},
 		ssh.MockCommand{Match: "docker run", Output: "abc123container"},
+		ssh.MockCommand{Match: "docker inspect -f '{{json .State}}'", Output: `{"Status":"running","Running":true}`},
 		ssh.MockCommand{Match: "docker inspect -f", Output: "running"},
 		// Pre-deploy hook.
 		ssh.MockCommand{Match: "docker exec", Output: "migrated 3 tables"},
@@ -827,6 +831,7 @@ func TestDeploy_PreDeployHookFailure(t *testing.T) {
 		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state' ]", Output: "absent"},
 		ssh.MockCommand{Match: "ss -tln", Output: ssOutput},
 		ssh.MockCommand{Match: "docker run", Output: "hookfailcontainer"},
+		ssh.MockCommand{Match: "docker inspect -f '{{json .State}}'", Output: `{"Status":"running","Running":true}`},
 		ssh.MockCommand{Match: "docker inspect -f", Output: "running"},
 		// Pre-deploy hook fails.
 		ssh.MockCommand{Match: "docker exec", Output: "ERROR: migration failed", Err: fmt.Errorf("exit status 1")},
@@ -883,6 +888,7 @@ func TestDeploy_PostDeployHookFailure(t *testing.T) {
 		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state' ]", Output: "absent"},
 		ssh.MockCommand{Match: "ss -tln", Output: ssOutput},
 		ssh.MockCommand{Match: "docker run", Output: "postfailcontainer"},
+		ssh.MockCommand{Match: "docker inspect -f '{{json .State}}'", Output: `{"Status":"running","Running":true}`},
 		ssh.MockCommand{Match: "docker inspect -f", Output: "running"},
 		// Health check.
 		ssh.MockCommand{Match: "curl -s -o /dev/null", Output: "200"},
@@ -949,6 +955,7 @@ func TestDeploy_WithWorkers(t *testing.T) {
 		ssh.MockCommand{Match: "ss -tln", Output: ssOutput},
 		// Web container.
 		ssh.MockCommand{Match: "docker run", Output: "web123container"},
+		ssh.MockCommand{Match: "docker inspect -f '{{json .State}}'", Output: `{"Status":"running","Running":true}`},
 		ssh.MockCommand{Match: "docker inspect -f", Output: "running"},
 		// Health check (web).
 		ssh.MockCommand{Match: "curl -s -o /dev/null", Output: "200"},
@@ -1036,6 +1043,7 @@ func TestDeploy_NoHealthcheckForWorker(t *testing.T) {
 		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state' ]", Output: "absent"},
 		ssh.MockCommand{Match: "ss -tln", Output: ssOutput},
 		ssh.MockCommand{Match: "docker run", Output: "web123container"},
+		ssh.MockCommand{Match: "docker inspect -f '{{json .State}}'", Output: `{"Status":"running","Running":true}`},
 		ssh.MockCommand{Match: "docker inspect -f", Output: "running"},
 		ssh.MockCommand{Match: "curl -s -o /dev/null", Output: "200"},
 		ssh.MockCommand{Match: "curl -sf http://localhost:2019/config/apps/http/servers/srv0", Output: `{"listen":[":80",":443"]}`},
@@ -1122,6 +1130,7 @@ func TestDeploy_WorkerStartFailure(t *testing.T) {
 		ssh.MockCommand{Match: "ss -tln", Output: ssOutput},
 		// Start new containers (both match "docker run").
 		ssh.MockCommand{Match: "docker run", Output: "new123container"},
+		ssh.MockCommand{Match: "docker inspect -f '{{json .State}}'", Output: `{"Status":"running","Running":true}`},
 		ssh.MockCommand{Match: "docker inspect -f", Output: "running"},
 		// Health check.
 		ssh.MockCommand{Match: "curl -s -o /dev/null", Output: "200"},
@@ -1343,6 +1352,7 @@ ssh.MockCommand{Match: "docker inspect -f '{{.State.Status}}' 'myapp-", Output: 
 		ssh.MockCommand{Match: "docker rename", Output: ""},
 		// Start new containers.
 		ssh.MockCommand{Match: "docker run", Output: "redeploycontainer"},
+		ssh.MockCommand{Match: "docker inspect -f '{{json .State}}'", Output: `{"Status":"running","Running":true}`},
 		ssh.MockCommand{Match: "docker inspect -f", Output: "running"},
 		ssh.MockCommand{Match: "curl -s -o /dev/null", Output: "200"},
 		ssh.MockCommand{Match: "curl -sf http://localhost:2019/config/apps/http/servers/srv0", Output: `{"listen":[":80",":443"]}`},
@@ -1423,6 +1433,7 @@ func TestDeploy_IngressExternalSkipsCaddy(t *testing.T) {
 		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state' ]", Output: "absent"},
 		ssh.MockCommand{Match: "ss -tln", Output: ssOutput},
 		ssh.MockCommand{Match: "docker run", Output: "web123container"},
+		ssh.MockCommand{Match: "docker inspect -f '{{json .State}}'", Output: `{"Status":"running","Running":true}`},
 		ssh.MockCommand{Match: "docker inspect -f", Output: "running"},
 		ssh.MockCommand{Match: "curl -s -o /dev/null", Output: "200"},
 		// No Caddy mocks — the deploy must not call them.

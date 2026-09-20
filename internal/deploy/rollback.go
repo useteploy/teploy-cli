@@ -388,6 +388,19 @@ func Rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg Rollbac
 			restoreDisplaced()
 			return err
 		}
+		// failRoutePhase unwinds a route-phase failure the same way a
+		// health/start failure unwinds (audit T06): the upstream-port
+		// inspections and SetRoute/SetLoadBalancerHealth used to return
+		// directly, leaving the uncommitted target running and — under
+		// fixed ports, where Caddy still points at the STOPPED current
+		// container — the app dark.
+		failRoutePhase := func(reason error) error {
+			for _, name := range started {
+				dk.Stop(ctx, name, 5)
+			}
+			restoreDisplaced()
+			return reason
+		}
 		tls := caddy.TLS{Cert: cfg.TLSCert, Key: cfg.TLSKey, Internal: cfg.TLSInternal}
 		// The Caddy upstream port is the recorded primary container port
 		// when there is one (TCL-14); without a record the first exposed
@@ -403,21 +416,21 @@ func Rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg Rollbac
 			for _, c := range targetWeb {
 				port, err := upstreamPort(c.Name)
 				if err != nil {
-					return fmt.Errorf("inspecting target container port: %w", err)
+					return failRoutePhase(fmt.Errorf("inspecting target container port: %w", err))
 				}
 				upstreams = append(upstreams, caddy.Upstream{Dial: fmt.Sprintf("%s:%d", c.Name, port)})
 			}
 			if err := cd.SetLoadBalancerHealth(ctx, cfg.App, cfg.Domain, upstreams, healthCfg.Path, tls, cfg.CaddyExtra, cfg.Cache, cfg.Firewall, cfg.Access); err != nil {
-				return fmt.Errorf("updating load balancer route: %w", err)
+				return failRoutePhase(fmt.Errorf("updating load balancer route: %w", err))
 			}
 			fmt.Fprintf(out, "  Traffic load-balanced across %d replicas\n", len(targetWeb))
 		} else {
 			port, err := upstreamPort(targetWeb[0].Name)
 			if err != nil {
-				return fmt.Errorf("inspecting target container port: %w", err)
+				return failRoutePhase(fmt.Errorf("inspecting target container port: %w", err))
 			}
 			if err := cd.SetRoute(ctx, cfg.App, cfg.Domain, targetWeb[0].Name, port, tls, cfg.CaddyExtra, cfg.Cache, cfg.Firewall, cfg.Access); err != nil {
-				return fmt.Errorf("updating route: %w", err)
+				return failRoutePhase(fmt.Errorf("updating route: %w", err))
 			}
 			fmt.Fprintln(out, "  Traffic routed to target version")
 		}

@@ -212,8 +212,8 @@ func TestDeploy_HostIngressRunFailure_ItemizesFailedRecovery(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected the deploy to fail")
 	}
-	if !strings.Contains(err.Error(), "no container is serving") {
-		t.Fatalf("a total recovery failure must say no container is serving, got: %v", err)
+	if !strings.Contains(err.Error(), "no predecessor could be restarted") {
+		t.Fatalf("a total recovery failure must say no predecessor could be restarted, got: %v", err)
 	}
 	if !strings.Contains(buf.String(), "cleanup incomplete") {
 		t.Error("failed compensations must be itemized in the output")
@@ -251,3 +251,4 @@ func TestLogDeploy_RecordsImage(t *testing.T) {
 		t.Errorf("log entry image: got %q want myapp:latest", entry.Image)
 	}
 }
+
