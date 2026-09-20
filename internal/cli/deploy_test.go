@@ -54,7 +54,7 @@ func pullAttempted(mock *ssh.MockExecutor) bool {
 // serve a five-day-old `:latest` while every deploy reported success.
 func TestEnsureImage_LocalPresent(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
-		ssh.MockCommand{Match: "docker image inspect", Output: "exists\n"},
+		ssh.MockCommand{Match: "err=$(mktemp); if docker image inspect", Output: "exists\n"},
 		ssh.MockCommand{Match: "docker pull", Output: ""},
 	)
 	dk := docker.NewClient(mock)
@@ -77,7 +77,7 @@ func TestEnsureImage_LocalPresent(t *testing.T) {
 // already present in the server's cache. It must still be pulled.
 func TestEnsureImage_LocalPresentUntaggedRegistry(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
-		ssh.MockCommand{Match: "docker image inspect", Output: "exists\n"},
+		ssh.MockCommand{Match: "err=$(mktemp); if docker image inspect", Output: "exists\n"},
 		ssh.MockCommand{Match: "docker pull", Output: ""},
 	)
 	dk := docker.NewClient(mock)
@@ -97,7 +97,7 @@ func TestEnsureImage_LocalPresentUntaggedRegistry(t *testing.T) {
 func TestEnsureImage_LocalPresentDigestPinned(t *testing.T) {
 	image := "registry.example.com/app@sha256:" + strings.Repeat("a", 64)
 	mock := ssh.NewMockExecutor("1.2.3.4",
-		ssh.MockCommand{Match: "docker image inspect", Output: "exists\n"},
+		ssh.MockCommand{Match: "err=$(mktemp); if docker image inspect", Output: "exists\n"},
 		ssh.MockCommand{Match: "docker pull", Output: ""},
 	)
 	dk := docker.NewClient(mock)
@@ -121,7 +121,7 @@ func TestEnsureImage_LocalPresentDigestPinned(t *testing.T) {
 // output must say the local copy may be stale rather than reporting a pull.
 func TestEnsureImage_PullFailsLocalPresent(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
-		ssh.MockCommand{Match: "docker image inspect", Output: "exists\n"},
+		ssh.MockCommand{Match: "err=$(mktemp); if docker image inspect", Output: "exists\n"},
 		ssh.MockCommand{Match: "docker pull", Err: errors.New("no such repository")},
 	)
 	dk := docker.NewClient(mock)
@@ -147,7 +147,7 @@ func TestEnsureImage_PullFailsLocalPresent(t *testing.T) {
 // copy is still an error.
 func TestEnsureImage_PullFailsNothingLocal(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
-		ssh.MockCommand{Match: "docker image inspect", Output: "missing\n"},
+		ssh.MockCommand{Match: "err=$(mktemp); if docker image inspect", Output: "missing\n"},
 		ssh.MockCommand{Match: "docker pull", Err: errors.New("unauthorized")},
 	)
 	dk := docker.NewClient(mock)
@@ -162,7 +162,7 @@ func TestEnsureImage_PullFailsNothingLocal(t *testing.T) {
 // is pulled from its registry (unchanged behavior for real registry images).
 func TestEnsureImage_Missing(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
-		ssh.MockCommand{Match: "docker image inspect", Output: "missing\n"},
+		ssh.MockCommand{Match: "err=$(mktemp); if docker image inspect", Output: "missing\n"},
 		ssh.MockCommand{Match: "docker pull", Output: ""},
 	)
 	dk := docker.NewClient(mock)
