@@ -166,7 +166,7 @@ func TestWrite_UploadFailurePreservesExistingStateAndCleansTemp(t *testing.T) {
 
 func TestWrite_RenameFailurePreservesExistingStateAndCleansTemp(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
-		ssh.MockCommand{Match: "mv -f -- '/deployments/myapp/state.json.tmp-", Err: fmt.Errorf("rename failed")},
+		ssh.MockCommand{Match: "mv -fT -- '/deployments/myapp/state.json.tmp-", Err: fmt.Errorf("rename failed")},
 	)
 	mock.Files["/deployments/myapp/state.json"] = []byte(`{"schema_version":2,"current_hash":"old"}`)
 

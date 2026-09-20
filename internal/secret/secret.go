@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/useteploy/teploy/internal/ssh"
@@ -189,7 +190,7 @@ func (m *Manager) Set(ctx context.Context, app, key, value string) error {
 	// temporary file; only after a successful encryption is it renamed over
 	// the destination.
 	script := fmt.Sprintf(
-		`umask 077 && tmp=$(mktemp %s) && trap 'rm -f -- "$tmp"' EXIT HUP INT TERM && age -r %s -o "$tmp" && chmod 0600 "$tmp" && mv -f -- "$tmp" %s && trap - EXIT HUP INT TERM`,
+		`umask 077 && tmp=$(mktemp %s) && trap 'rm -f -- "$tmp"' EXIT HUP INT TERM && age -r %s -o "$tmp" && chmod 0600 "$tmp" && mv -fT -- "$tmp" %s && trap - EXIT HUP INT TERM`,
 		ssh.ShellQuote(dir+"/.teploy-secret.XXXXXXXX"),
 		ssh.ShellQuote(recipient),
 		ssh.ShellQuote(path),
@@ -243,6 +244,11 @@ func diagSuffix(diag string) string {
 // is the normal "no secrets" case (nil, nil); a directory that exists but
 // cannot be listed is an error — silently treating it as empty would let a
 // deployment proceed without secrets it actually has.
+//
+// The listing is a BARE find with its exit status observed (audit T41): the
+// old `find … | sort` pipeline lost find's failure to sort's success (no
+// pipefail), so an unlistable directory returned an empty list that read as
+// "this app has no secrets". Sorting happens in Go.
 func (m *Manager) List(ctx context.Context, app string) ([]string, error) {
 	dir := secretDir(app)
 	exists, err := remoteFileExists(ctx, m.exec, dir)
@@ -252,7 +258,7 @@ func (m *Manager) List(ctx context.Context, app string) ([]string, error) {
 	if !exists {
 		return nil, nil
 	}
-	out, err := m.exec.Run(ctx, fmt.Sprintf("find %s -maxdepth 1 -name '*.age' -printf '%%f\\n' | sort", ssh.ShellQuote(dir)))
+	out, err := m.exec.Run(ctx, fmt.Sprintf("find %s -maxdepth 1 -name '*.age' -printf '%%f\\n'", ssh.ShellQuote(dir)))
 	if err != nil {
 		return nil, fmt.Errorf("listing secrets for %s: %w", app, err)
 	}
@@ -264,8 +270,15 @@ func (m *Manager) List(ctx context.Context, app string) ([]string, error) {
 			continue
 		}
 		name := strings.TrimSuffix(line, ".age")
+		// A file whose name is not a valid key cannot be addressed by this
+		// package's path-building grammar — report it instead of handing
+		// callers a key that fails later at a random sink.
+		if err := ValidateKey(name); err != nil {
+			return nil, fmt.Errorf("invalid entry in %s: %w", dir, err)
+		}
 		keys = append(keys, name)
 	}
+	sort.Strings(keys)
 	return keys, nil
 }
 

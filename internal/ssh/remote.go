@@ -195,7 +195,7 @@ func (e *RemoteExecutor) Upload(ctx context.Context, content io.Reader, remotePa
 	dir := path.Dir(remotePath)
 
 	script := fmt.Sprintf(
-		`umask 077 && mkdir -p %s && tmp=$(mktemp %s) && trap 'rm -f -- "$tmp"' EXIT HUP INT TERM && chmod %s "$tmp" && cat > "$tmp" && mv -f -- "$tmp" %s && trap - EXIT HUP INT TERM`,
+		`umask 077 && mkdir -p %s && tmp=$(mktemp %s) && trap 'rm -f -- "$tmp"' EXIT HUP INT TERM && chmod %s "$tmp" && cat > "$tmp" && mv -fT -- "$tmp" %s && trap - EXIT HUP INT TERM`,
 		ShellQuote(dir),
 		ShellQuote(dir+"/.teploy-upload.XXXXXXXX"),
 		ShellQuote(mode),

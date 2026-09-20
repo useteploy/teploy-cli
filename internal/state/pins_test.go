@@ -35,8 +35,8 @@ func (f *fakeFS) Run(ctx context.Context, cmd string) (string, error) {
 		return f.files[path], nil
 	case strings.HasPrefix(cmd, "mkdir -p"), strings.HasPrefix(cmd, "mkdir "):
 		return "", nil
-	case strings.HasPrefix(cmd, "mv -f -- "):
-		fields := strings.Fields(strings.TrimPrefix(cmd, "mv -f -- "))
+	case strings.HasPrefix(cmd, "mv -f -- "), strings.HasPrefix(cmd, "mv -fT -- "):
+		fields := strings.Fields(strings.TrimPrefix(strings.TrimPrefix(cmd, "mv -fT -- "), "mv -f -- "))
 		if len(fields) == 2 {
 			if data, ok := f.files[strings.Trim(fields[0], "'")]; ok {
 				f.files[strings.Trim(fields[1], "'")] = data
