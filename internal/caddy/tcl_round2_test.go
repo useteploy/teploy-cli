@@ -39,6 +39,14 @@ func (f *fakeStatefulExecutor) Run(ctx context.Context, cmd string) (string, err
 			return "", fmt.Errorf("no such file")
 		}
 		return string(data), nil
+	case strings.HasPrefix(cmd, "if [ ! -e "):
+		// Framed server-file read (webhook descriptor): absent unless staged.
+		rest := strings.TrimPrefix(cmd, "if [ ! -e ")
+		path := strings.Trim(rest[:strings.Index(rest, " ]; then")], "'")
+		if data, ok := f.files[path]; ok {
+			return "present\n" + string(data), nil
+		}
+		return "absent", nil
 	case strings.HasPrefix(cmd, "test -f "):
 		path := strings.Trim(strings.TrimPrefix(cmd, "test -f "), "'")
 		if _, ok := f.files[path]; !ok {

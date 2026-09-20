@@ -360,7 +360,15 @@ func (c *Client) SetMaintenance(ctx context.Context, app, domain string) error {
 				}
 			}
 		}
-		return renderUpdated(prev, app, hosts, maintenanceBlock(hosts, pol))
+		updated, err := renderUpdated(prev, app, hosts, maintenanceBlock(hosts, pol))
+		if err != nil {
+			return "", err
+		}
+		// Webhooks stay reachable THROUGH maintenance (the listener is
+		// HMAC-authenticated and a deploy is how maintenance ends); the
+		// persisted fragment is re-applied to the maintenance block under
+		// the same transaction (webhook.go, audit T26).
+		return c.applyWebhookToBlock(ctx, app, updated)
 	})
 }
 
@@ -387,7 +395,13 @@ func (c *Client) RemoveMaintenance(ctx context.Context, app string) error {
 	}
 
 	if err := c.mutate(ctx, func(prev string) (string, error) {
-		return renderUpdated(prev, app, nil, restored)
+		updated, err := renderUpdated(prev, app, nil, restored)
+		if err != nil {
+			return "", err
+		}
+		// The stash may predate a webhook port change; normalize the
+		// fragment against the CURRENT persisted descriptor (webhook.go).
+		return c.applyWebhookToBlock(ctx, app, updated)
 	}); err != nil {
 		return err
 	}
@@ -530,9 +544,16 @@ func (c *Client) adaptCheck(ctx context.Context, content string) error {
 
 // applyManagedBlock upserts (block != "") or removes (block == "") the app's
 // marker-delimited block, adopting any foreign block for the same hosts.
+// The app's persisted webhook fragment (webhook.go) is re-applied to the
+// rendered block, so deploys and rollbacks can no longer erase the webhook
+// route the way they erased the old runtime-API injection (audit T26).
 func (c *Client) applyManagedBlock(ctx context.Context, app string, hosts []string, block string) error {
 	return c.mutate(ctx, func(prev string) (string, error) {
-		return renderUpdated(prev, app, hosts, block)
+		updated, err := renderUpdated(prev, app, hosts, block)
+		if err != nil {
+			return "", err
+		}
+		return c.applyWebhookToBlock(ctx, app, updated)
 	})
 }
 

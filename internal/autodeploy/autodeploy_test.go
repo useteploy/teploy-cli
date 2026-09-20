@@ -330,7 +330,12 @@ func TestRemove(t *testing.T) {
 		ssh.MockCommand{Match: "systemctl disable", Output: ""},
 		ssh.MockCommand{Match: "rm -f", Output: ""},
 		ssh.MockCommand{Match: "systemctl daemon-reload", Output: ""},
-		ssh.MockCommand{Match: "docker exec caddy sh -c", Output: ""},
+		ssh.MockCommand{Match: "raw=$(crontab -l 2>&1)", Output: "0 4 * * 0 /deployments/myapp/scheduled-redeploy.sh >> /deployments/myapp/scheduled-redeploy.log 2>&1"},
+		ssh.MockCommand{Match: "mkdir /deployments/caddy/.lock", Output: ""},
+		ssh.MockCommand{Match: "cat /deployments/caddy/Caddyfile", Output: "{\n\tadmin 0.0.0.0:2019\n}\n"},
+		ssh.MockCommand{Match: "a=$(docker exec caddy md5sum", Output: "TEPLOY_CADDY_OK"},
+		ssh.MockCommand{Match: "docker exec caddy caddy reload", Output: ""},
+		ssh.MockCommand{Match: "rmdir /deployments/caddy/.lock", Output: ""},
 	)
 
 	var buf bytes.Buffer
@@ -343,19 +348,26 @@ func TestRemove(t *testing.T) {
 		t.Error("expected removal message")
 	}
 
-	// Reproduces a real failure found live: without cleaning up the Caddy
-	// route, its @id lingers forever, and re-running `autodeploy setup`
-	// for the same app fails outright (PUT with a duplicate @id is
-	// rejected by Caddy's admin API).
-	var deletedRoute bool
+	// The persisted webhook route must go too (T26): the descriptor file
+	// and any fragment inside the app's Caddyfile block, in one
+	// transaction — a stale runtime-API @id can no longer linger because
+	// nothing lives in the runtime API anymore.
+	var removedDescriptor, removedFragment bool
 	for _, c := range mock.Calls {
-		if strings.Contains(c, "DELETE http://localhost:2019/id/teploy-webhook-myapp") {
-			deletedRoute = true
+		if strings.HasPrefix(c, "rm -f -- '/deployments/myapp/.webhook-route'") {
+			removedDescriptor = true
 		}
 	}
-	if !deletedRoute {
-		t.Error("expected Remove to delete the Caddy webhook route by its @id")
+	if _, ok := mock.Files["/deployments/myapp/.webhook-route"]; ok {
+		t.Error("webhook route descriptor survived removal")
 	}
+	if !removedDescriptor {
+		t.Error("expected Remove to delete the persisted webhook route descriptor")
+	}
+	if strings.Contains(string(mock.Files["/deployments/caddy/Caddyfile"]), "teploy-webhook") {
+		t.Error("webhook fragment survived removal")
+	}
+	_ = removedFragment
 }
 
 // TestSetupCaddyRoute_RunsThroughDockerExec reproduces a real failure found
@@ -366,54 +378,26 @@ func TestRemove(t *testing.T) {
 // 7, connection refused. It must run via `docker exec caddy`, the same way
 // every other admin-API interaction in this codebase (Caddyfile reload)
 // already does.
-func TestSetupCaddyRoute_RunsThroughDockerExec(t *testing.T) {
+func TestSetupCaddyRoute_PersistsInCaddyfile(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
-		ssh.MockCommand{Match: "docker exec caddy sh -c", Output: ""},
+		ssh.MockCommand{Match: "mkdir /deployments/caddy/.lock", Output: ""},
+		ssh.MockCommand{Match: "cat /deployments/caddy/Caddyfile", Output: "{\n\tadmin 0.0.0.0:2019\n}\n"},
+		ssh.MockCommand{Match: "a=$(docker exec caddy md5sum", Output: "TEPLOY_CADDY_OK"},
+		ssh.MockCommand{Match: "docker exec caddy caddy reload", Output: ""},
+		ssh.MockCommand{Match: "rmdir /deployments/caddy/.lock", Output: ""},
 	)
-
 	var buf bytes.Buffer
 	mgr := NewManager(mock, &buf)
-	if err := mgr.SetupCaddyRoute(context.Background(), "myapp", "myapp.com"); err != nil {
+	if err := mgr.SetupCaddyRoute(context.Background(), "myapp", "myapp.com", 9876); err != nil {
 		t.Fatalf("SetupCaddyRoute: %v", err)
 	}
-
-	if len(mock.Calls) != 1 {
-		t.Fatalf("expected exactly one command, got %d: %v", len(mock.Calls), mock.Calls)
+	// The persisted descriptor names the configured port and path.
+	desc, ok := mock.Files["/deployments/myapp/.webhook-route"]
+	if !ok {
+		t.Fatal("webhook route descriptor not persisted")
 	}
-	call := mock.Calls[0]
-	if !strings.HasPrefix(call, "docker exec caddy sh -c") {
-		t.Errorf("expected the admin-API call to run via docker exec caddy, got: %s", call)
-	}
-
-	// Must PUT to routes/0 (insert-at-front), not POST to routes (append).
-	// The app's own route is always routes[0]: unconditional host match,
-	// terminal: true. Caddy evaluates routes in array order and stops at
-	// the first terminal match, so an appended webhook route never gets a
-	// chance to match — confirmed live, every webhook request 404'd
-	// straight through to the app container. Only inserting the narrower
-	// webhook route ahead of it lets it actually match first.
-	if !strings.Contains(call, "-X PUT") {
-		t.Errorf("expected a PUT (insert), got a different method: %s", call)
-	}
-	if !strings.Contains(call, "/routes/0") {
-		t.Errorf("expected PUT to .../routes/0 (insert-at-front), got: %s", call)
-	}
-	if strings.Contains(call, "-X POST") {
-		t.Error("POST appends to the end of the routes array — the app's terminal route would always win over it")
-	}
-}
-
-// TestWebhookRouteJSON_DialsHostDockerInternal covers the dial-target half
-// of the same live-found bug: even once the admin-API call reaches Caddy,
-// a "localhost" dial target would resolve to the Caddy container itself,
-// not the host process actually listening.
-func TestWebhookRouteJSON_DialsHostDockerInternal(t *testing.T) {
-	route := webhookRouteJSON("myapp", "myapp.com")
-	if strings.Contains(route, `"dial": "localhost:9876"`) {
-		t.Error("dial target must not be localhost — unreachable from inside the Caddy container")
-	}
-	if !strings.Contains(route, `"dial": "host.docker.internal:9876"`) {
-		t.Errorf("expected dial target host.docker.internal:9876, got: %s", route)
+	if !strings.Contains(string(desc), "\"port\":9876") || !strings.Contains(string(desc), "/teploy-webhook/myapp") {
+		t.Errorf("descriptor wrong: %s", desc)
 	}
 }
 
@@ -456,7 +440,7 @@ func TestSchedule(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "mkdir -p /deployments/myapp", Output: ""},
 		ssh.MockCommand{Match: "UPLOAD:", Output: ""},
-		ssh.MockCommand{Match: "(crontab", Output: ""},
+		ssh.MockCommand{Match: "raw=$(crontab -l 2>&1)", Output: "5 5 * * * unrelated-job"},
 	)
 
 	var buf bytes.Buffer
@@ -513,7 +497,7 @@ func TestSchedule_RejectsEmptyApp(t *testing.T) {
 
 func TestUnschedule(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
-		ssh.MockCommand{Match: "(crontab", Output: ""},
+		ssh.MockCommand{Match: "raw=$(crontab -l 2>&1)", Output: "5 5 * * * unrelated-job"},
 	)
 
 	var buf bytes.Buffer
@@ -572,5 +556,86 @@ func TestGenerateScheduledRedeployScript(t *testing.T) {
 		if !strings.Contains(script, want) {
 			t.Errorf("scheduled redeploy script missing %q", want)
 		}
+	}
+}
+
+// TestSchedule_FailedCrontabReadAborts is the T29 regression: a failed
+// `crontab -l` used to be masked as empty input, wiping every unrelated
+// cron job and installing only teploy's entry.
+func TestSchedule_FailedCrontabReadAborts(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "mkdir -p /deployments/myapp", Output: ""},
+		ssh.MockCommand{Match: "UPLOAD:", Output: ""},
+		ssh.MockCommand{Match: "raw=$(crontab -l 2>&1)", Err: fmt.Errorf("crontab: permission denied")},
+	)
+	var buf bytes.Buffer
+	mgr := NewManager(mock, &buf)
+	if err := mgr.Schedule(context.Background(), "myapp", "0 4 * * 0"); err == nil {
+		t.Fatal("a failed crontab read must abort the install, never replace the crontab")
+	}
+	for _, c := range mock.Calls {
+		if strings.Contains(c, "| crontab -") && strings.HasPrefix(c, "(printf") {
+			t.Errorf("a new crontab was installed despite the failed read: %s", c)
+		}
+	}
+}
+
+// TestUnschedule_NeverRunsCrontabR is the T29 regression: the old fallback
+// `|| crontab -r` removed the user's ENTIRE crontab when the replacement
+// failed.
+func TestUnschedule_NeverRunsCrontabR(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "raw=$(crontab -l 2>&1)", Err: fmt.Errorf("crontab: permission denied")},
+	)
+	var buf bytes.Buffer
+	mgr := NewManager(mock, &buf)
+	if err := mgr.Unschedule(context.Background(), "myapp"); err == nil {
+		t.Fatal("a failed crontab read must abort")
+	}
+	for _, c := range mock.Calls {
+		if strings.Contains(c, "crontab -r") {
+			t.Errorf("crontab -r executed: %s", c)
+		}
+	}
+}
+
+// TestRemove_AggregatesStepFailures is the T30 regression: Remove used to
+// ignore every failure and print "removed" — a live service could keep
+// deploying after the operator believed it disabled.
+func TestRemove_AggregatesStepFailures(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "id -u", Output: "0"},
+		ssh.MockCommand{Match: "systemctl stop", Err: fmt.Errorf("systemctl: connection refused")},
+		ssh.MockCommand{Match: "systemctl disable", Output: ""},
+		ssh.MockCommand{Match: "rm -f --", Output: ""},
+		ssh.MockCommand{Match: "systemctl daemon-reload", Output: ""},
+		ssh.MockCommand{Match: "raw=$(crontab -l 2>&1)", Output: ""},
+		ssh.MockCommand{Match: "mkdir /deployments/caddy/.lock", Output: ""},
+		ssh.MockCommand{Match: "cat /deployments/caddy/Caddyfile", Output: "{\n\tadmin 0.0.0.0:2019\n}\n"},
+		ssh.MockCommand{Match: "a=$(docker exec caddy md5sum", Output: "TEPLOY_CADDY_OK"},
+		ssh.MockCommand{Match: "docker exec caddy caddy reload", Output: ""},
+		ssh.MockCommand{Match: "rmdir /deployments/caddy/.lock", Output: ""},
+	)
+	var buf bytes.Buffer
+	mgr := NewManager(mock, &buf)
+	err := mgr.Remove(context.Background(), "myapp")
+	if err == nil {
+		t.Fatal("a failed removal step must surface, not print success")
+	}
+	if !strings.Contains(err.Error(), "incomplete") || !strings.Contains(err.Error(), "stopping the webhook service") {
+		t.Fatalf("error must name the failed step: %v", err)
+	}
+}
+
+// TestSetup_RejectsWhitespaceWrappedSecret is the T32 regression: the
+// stored secret is HMAC-verified verbatim at both ends; a whitespace-wrapped
+// secret would sign different bytes than the trimmed end expects.
+func TestSetup_RejectsWhitespaceWrappedSecret(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4")
+	var buf bytes.Buffer
+	mgr := NewManager(mock, &buf)
+	err := mgr.Setup(context.Background(), Config{App: "myapp", Branch: "main", Secret: " spaced ", TeployBinaryPath: "/deployments/.bin/teploy"})
+	if err == nil || !strings.Contains(err.Error(), "whitespace") {
+		t.Fatalf("whitespace-wrapped secret must be rejected at setup: %v", err)
 	}
 }

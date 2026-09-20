@@ -59,7 +59,11 @@ func TestRead_AbsentVsPresentVsUnreadable(t *testing.T) {
 	})
 
 	t.Run("transport failure is an error, not absence", func(t *testing.T) {
-		mock := ssh.NewMockExecutor("1.2.3.4") // no fixture: unexpected command
+		// The mock answers framed reads from its recorded file state when
+		// it has one, so the transport failure is modeled explicitly.
+		mock := ssh.NewMockExecutor("1.2.3.4",
+			ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/meta/v1.json' ]", Err: fmt.Errorf("ssh: connection reset")},
+		)
 		if _, err := Read(context.Background(), mock, "myapp", "v1"); err == nil {
 			t.Fatal("transport failure must be an error, never silent absence")
 		}

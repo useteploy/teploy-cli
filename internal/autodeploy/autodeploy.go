@@ -2,13 +2,14 @@ package autodeploy
 
 import (
 	"context"
-	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"regexp"
 	"strings"
 	"time"
 
+	"github.com/useteploy/teploy/internal/caddy"
 	"github.com/useteploy/teploy/internal/ssh"
 )
 
@@ -55,6 +56,9 @@ func ValidateBranch(branch string) error {
 	return nil
 }
 
+// DefaultPort is the webhook listener's default local port.
+const DefaultPort = 9876
+
 // Config holds auto-deploy configuration.
 type Config struct {
 	App    string
@@ -68,7 +72,7 @@ type Config struct {
 	// autodeploy serve --app <app> --port <port>`.
 	TeployBinaryPath string
 	// Port is the local port `teploy autodeploy serve` listens on and
-	// Caddy's webhook route (SetupCaddyRoute) proxies to. Defaults to 9876.
+	// Caddy's webhook route (SetupCaddyRoute) proxies to (DefaultPort).
 	Port int
 }
 
@@ -125,14 +129,23 @@ func (m *Manager) Setup(ctx context.Context, cfg Config) error {
 		return err
 	}
 	if cfg.Port == 0 {
-		cfg.Port = 9876
+		cfg.Port = DefaultPort
+	}
+	if cfg.Port < 1 || cfg.Port > 65535 {
+		return fmt.Errorf("auto-deploy listener port must be in 1..65535 (got %d)", cfg.Port)
 	}
 	// Require a secret. Without one the webhook listener accepts any POST and
 	// becomes an unauthenticated remote deploy trigger. The CLI generates a
 	// random secret when the user doesn't supply one, so an empty secret here
-	// is a programming error, not a user choice.
+	// is a programming error, not a user choice. A secret with surrounding
+	// whitespace is rejected TOO (audit T32): the value is stored verbatim
+	// and HMAC-verified verbatim at both ends — a "helpfully" trimmed key at
+	// one end only would sign with different bytes than the provider.
 	if strings.TrimSpace(cfg.Secret) == "" {
 		return fmt.Errorf("auto-deploy requires a webhook secret (refusing to install an unauthenticated listener)")
+	}
+	if cfg.Secret != strings.TrimSpace(cfg.Secret) {
+		return fmt.Errorf("the webhook secret must not have leading or trailing whitespace — quote the value exactly as the git provider will send it")
 	}
 	if strings.TrimSpace(cfg.TeployBinaryPath) == "" {
 		return fmt.Errorf("auto-deploy requires TeployBinaryPath (upload the teploy binary before calling Setup)")
@@ -268,71 +281,42 @@ func (m *Manager) allowWebhookPortInFirewall(ctx context.Context, sudo string, p
 	return nil
 }
 
-// webhookRouteJSON builds the Caddy admin-API route object that proxies
-// POST /teploy-webhook/{app} to the webhook listener.
-//
-// dial targets host.docker.internal, not localhost: Caddy runs in its own
-// container on the "teploy" bridge network — a separate network namespace
-// from `teploy autodeploy serve` (a systemd-resident host process, not a
-// container, since it needs direct Docker CLI access to run deploys).
-// "localhost" inside the Caddy container would resolve to the container
-// itself, where nothing is listening. host.docker.internal resolves to the
-// host via the --add-host=host.docker.internal:host-gateway flag teploy
-// setup adds to the Caddy container (internal/cli/setup.go). Found live:
-// routes silently never connected with the old "localhost" dial target, on
-// top of the admin-API unreachability fixed in SetupCaddyRoute below.
-func webhookRouteJSON(app, domain string) string {
-	return fmt.Sprintf(`{
-		"@id": "teploy-webhook-%s",
-		"match": [{"host": ["%s"], "path": ["/teploy-webhook/%s"]}],
-		"handle": [{"handler": "reverse_proxy", "upstreams": [{"dial": "host.docker.internal:9876"}]}]
-	}`, app, domain, app)
-}
 
-// SetupCaddyRoute adds a Caddy route to proxy webhook requests to the listener.
-func (m *Manager) SetupCaddyRoute(ctx context.Context, app, domain string) error {
+// SetupCaddyRoute persists the webhook route INTO THE CADDYFILE, inside
+// the app's managed site block (see internal/caddy/webhook.go — audit
+// T26/T27). The old runtime admin-API injection lived only in Caddy's
+// memory: the next ordinary deploy's Caddyfile regeneration and reload —
+// including a webhook-triggered deploy — silently erased the webhook
+// endpoint. The route also now honors the CONFIGURED listener port (the
+// old renderer hardcoded 9876) and matches every configured domain (the
+// old renderer inserted the comma-separated domain string as ONE host).
+func (m *Manager) SetupCaddyRoute(ctx context.Context, app, domain string, port int) error {
 	fmt.Fprintln(m.out, "Adding Caddy webhook route...")
-
-	// Pipe the route JSON straight into curl over stdin instead of staging it in
-	// a fixed /tmp file that concurrent setups would clobber. base64 keeps the
-	// JSON shell-safe through the remote shell.
-	//
-	// Runs via `docker exec caddy`, not directly on the host: Caddy's admin
-	// API (port 2019) is intentionally never published to the host (see
-	// setup.go's caddy `docker run` — only 80/443 are `-p` published), so
-	// curling http://localhost:2019 from the host shell always fails with
-	// connection refused. Every other admin-API interaction in this
-	// codebase (internal/caddy's reload) already goes through `docker exec
-	// caddy`; this was the one place that didn't. Found live: this step
-	// failed with curl exit 7 on every setup, every time.
-	//
-	// PUT .../routes/0, not POST .../routes: the app's own route (added by
-	// a normal `teploy deploy`, unconditional host match, terminal: true)
-	// is always routes[0]. Caddy evaluates routes in array order and stops
-	// at the first terminal match — POSTing appends to the END regardless
-	// of the trailing index, so the webhook route never got a chance to
-	// match; every /teploy-webhook/<app> request 404'd straight through to
-	// the app container instead. PUT to a numeric index inserts (shifts
-	// existing elements down), confirmed live — the only way to make the
-	// narrower, non-terminal webhook route win by evaluating first.
-	encoded := base64.StdEncoding.EncodeToString([]byte(webhookRouteJSON(app, domain)))
-	innerCmd := fmt.Sprintf(
-		"printf %%s %s | base64 -d | curl -sf -X PUT http://localhost:2019/config/apps/http/servers/srv0/routes/0 -H 'Content-Type: application/json' -d @-",
-		ssh.ShellQuote(encoded),
-	)
-	cmd := fmt.Sprintf("docker exec caddy sh -c %s", ssh.ShellQuote(innerCmd))
-	if _, err := m.exec.Run(ctx, cmd); err != nil {
-		return fmt.Errorf("adding Caddy webhook route: %w", err)
+	c := caddy.NewClient(m.exec)
+	if err := c.SetWebhookRoute(ctx, app, domain, port); err != nil {
+		return fmt.Errorf("persisting the webhook route: %w", err)
+	}
+	// The fragment renders inside the app's managed site block; an app
+	// that was never deployed (or uses external ingress) has none yet —
+	// say so instead of implying the endpoint is live.
+	live, err := c.HasManagedBlock(ctx, app)
+	if err != nil {
+		return nil // the route IS persisted; block detection is advisory
+	}
+	if !live {
+		fmt.Fprintln(m.out, "  Note: the app has no Caddy site block yet — the webhook route attaches on its first deploy")
 	}
 	return nil
 }
 
-// Status checks if auto-deploy is set up for the app.
+// Status checks if auto-deploy is set up for the app. A transport/execution
+// failure is an ERROR (audit T30): the old shape classified it as "not
+// active", so a broken SSH connection read as "autodeploy removed".
 func (m *Manager) Status(ctx context.Context, app string) (bool, string, error) {
 	serviceName := fmt.Sprintf("teploy-webhook-%s", app)
 	out, err := m.exec.Run(ctx, fmt.Sprintf("systemctl is-active %s 2>/dev/null", serviceName))
 	if err != nil {
-		return false, "", nil
+		return false, "", fmt.Errorf("checking the webhook listener service for %s: %w", app, err)
 	}
 	status := strings.TrimSpace(out)
 	return status == "active", status, nil
@@ -392,16 +376,23 @@ func (m *Manager) Schedule(ctx context.Context, app, schedule string) error {
 		return fmt.Errorf("uploading scheduled-redeploy script: %w", err)
 	}
 
-	// Replace any existing entry pointing at this script, then add the new one.
-	// A bare && would short-circuit if there's no existing crontab; the
-	// `crontab -l 2>/dev/null || true` form keeps the pipeline going from
-	// a zero-state install.
+	// Replace any existing entry pointing at this script, then add the new
+	// one. The current crontab is read with its exit status CHECKED
+	// (audit T29, mirroring backup.SetSchedule's TCL-46 shape): the old
+	// `crontab -l 2>/dev/null | grep -vF …` pipeline masked any real read
+	// failure as empty input and then installed ONLY teploy's entry —
+	// silently deleting every unrelated cron job on the machine. Only the
+	// canonical "no crontab for <user>" failure means "start from empty".
+	entry := fmt.Sprintf("%s %s >> %s/scheduled-redeploy.log 2>&1", schedule, scriptPath, appDir)
 	cronCmd := fmt.Sprintf(
-		"(crontab -l 2>/dev/null | grep -vF %s; echo '%s %s >> %s/scheduled-redeploy.log 2>&1') | crontab -",
-		ssh.ShellQuote(scriptPath), schedule, scriptPath, appDir,
+		`raw=$(crontab -l 2>&1); rc=$?; `+
+			`if [ "$rc" -ne 0 ]; then case "$raw" in *"no crontab"*) raw="";; *) `+
+			`echo "reading crontab failed: $raw" >&2; exit 1;; esac; fi; `+
+			`(printf '%%s\n' "$raw" | grep -vF %s; printf '%%s\n' %s) | crontab -`,
+		ssh.ShellQuote(scriptPath), ssh.ShellQuote(entry),
 	)
 	if _, err := m.exec.Run(ctx, cronCmd); err != nil {
-		return fmt.Errorf("installing cron entry: %w", err)
+		return fmt.Errorf("installing cron entry (unrelated jobs are preserved): %w", err)
 	}
 
 	fmt.Fprintf(m.out, "Scheduled redeploy installed for %s\n", app)
@@ -413,7 +404,10 @@ func (m *Manager) Schedule(ctx context.Context, app, schedule string) error {
 
 // Unschedule removes the scheduled redeploy cron entry for the app.
 // The on-server script file is left in place so a subsequent Schedule()
-// call doesn't have to reupload it.
+// call doesn't have to reupload it. The crontab read is status-checked
+// like Schedule's, and the `crontab -r` fallback is GONE (audit T29): a
+// failed replacement used to fall through to removing the user's ENTIRE
+// crontab.
 func (m *Manager) Unschedule(ctx context.Context, app string) error {
 	if app == "" {
 		return fmt.Errorf("app name is required")
@@ -421,48 +415,56 @@ func (m *Manager) Unschedule(ctx context.Context, app string) error {
 	scriptPath := fmt.Sprintf("%s/%s/%s", deploymentsDir, app, scheduledScriptName)
 
 	cronCmd := fmt.Sprintf(
-		"(crontab -l 2>/dev/null | grep -vF %s) | crontab - || crontab -r 2>/dev/null || true",
+		`raw=$(crontab -l 2>&1); rc=$?; `+
+			`if [ "$rc" -ne 0 ]; then case "$raw" in *"no crontab"*) raw="";; *) `+
+			`echo "reading crontab failed: $raw" >&2; exit 1;; esac; fi; `+
+			`printf '%%s\n' "$raw" | grep -vF %s | crontab -`,
 		ssh.ShellQuote(scriptPath),
 	)
 	if _, err := m.exec.Run(ctx, cronCmd); err != nil {
-		return fmt.Errorf("removing cron entry: %w", err)
+		return fmt.Errorf("removing cron entry (unrelated jobs are preserved): %w", err)
 	}
 	fmt.Fprintf(m.out, "Scheduled redeploy removed for %s\n", app)
 	return nil
 }
 
 // Remove disables and removes both the auto-deploy webhook and any
-// scheduled redeploy for the app.
+// scheduled redeploy for the app. Every step's failure is aggregated
+// (audit T30): the old shape ignored stop/disable/unit-delete/reload,
+// unschedule, and route-removal errors and then printed "removed" — a live
+// service could keep deploying after the operator believed it disabled.
+// Best-effort cleanup is fine; presenting incomplete cleanup as complete
+// is not.
 func (m *Manager) Remove(ctx context.Context, app string) error {
 	serviceName := fmt.Sprintf("teploy-webhook-%s", app)
 
 	sudo := m.sudoPrefix(ctx)
-	cmds := []string{
-		fmt.Sprintf("%ssystemctl stop %s 2>/dev/null", sudo, serviceName),
-		fmt.Sprintf("%ssystemctl disable %s 2>/dev/null", sudo, serviceName),
-		fmt.Sprintf("%srm -f /etc/systemd/system/%s.service", sudo, serviceName),
-		sudo + "systemctl daemon-reload",
+	var failures []error
+	for _, step := range []struct {
+		name string
+		cmd  string
+	}{
+		{"stopping the webhook service", fmt.Sprintf("%ssystemctl stop %s 2>/dev/null", sudo, serviceName)},
+		{"disabling the webhook service", fmt.Sprintf("%ssystemctl disable %s 2>/dev/null", sudo, serviceName)},
+		{"deleting the unit file", fmt.Sprintf("%srm -f /etc/systemd/system/%s.service", sudo, serviceName)},
+		{"reloading systemd", sudo + "systemctl daemon-reload"},
+	} {
+		if _, err := m.exec.Run(ctx, step.cmd); err != nil {
+			failures = append(failures, fmt.Errorf("%s: %w", step.name, err))
+		}
 	}
-	for _, cmd := range cmds {
-		m.exec.Run(ctx, cmd)
+	if err := m.Unschedule(ctx, app); err != nil {
+		failures = append(failures, fmt.Errorf("unscheduling: %w", err))
 	}
-
-	// Remove scheduled redeploy too, if configured. Errors are non-fatal —
-	// we're best-effort cleaning up.
-	_ = m.Unschedule(ctx, app)
-
-	// Remove the Caddy webhook route — without this, a stale route with
-	// this app's @id lingers forever (Caddy config has no TTL/GC), and a
-	// subsequent `autodeploy setup` for the same app fails outright: PUT
-	// with a duplicate @id is rejected. Found live: re-running setup after
-	// remove failed with curl exit 22 for exactly this reason. Best-effort
-	// like the rest of this cleanup — deleting an @id that's already gone
-	// (never set up, or Caddy's config was reset) 404s, which is fine.
-	routeID := fmt.Sprintf("teploy-webhook-%s", app)
-	deleteCmd := fmt.Sprintf("docker exec caddy sh -c %s",
-		ssh.ShellQuote(fmt.Sprintf("curl -s -X DELETE http://localhost:2019/id/%s", routeID)))
-	m.exec.Run(ctx, deleteCmd)
-
+	// Remove the persisted webhook route (webhook.go): the descriptor and
+	// the fragment inside the app's site block go in one Caddyfile
+	// transaction — a stale fragment would 502 after the listener dies.
+	if err := caddy.NewClient(m.exec).RemoveWebhookRoute(ctx, app); err != nil {
+		failures = append(failures, fmt.Errorf("removing the webhook route: %w", err))
+	}
+	if len(failures) > 0 {
+		return fmt.Errorf("autodeploy removal incomplete for %s — %w", app, errors.Join(failures...))
+	}
 	fmt.Fprintf(m.out, "Auto-deploy removed for %s\n", app)
 	return nil
 }
