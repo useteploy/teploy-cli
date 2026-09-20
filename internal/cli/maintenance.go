@@ -9,6 +9,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/useteploy/teploy/internal/caddy"
 	"github.com/useteploy/teploy/internal/config"
+	"github.com/useteploy/teploy/internal/state"
 )
 
 func newMaintenanceCmd(flags *Flags) *cobra.Command {
@@ -53,9 +54,10 @@ func newMaintenanceOffCmd(flags *Flags) *cobra.Command {
 }
 
 func runMaintenanceToggle(flags *Flags, appName string, enable bool) error {
-	// With --app there's no teploy.yml to check ingress against; the server
-	// state doesn't record ingress mode. Only enforce the Caddy-required check
-	// in the cwd path where we have full config.
+	// With --app there's no teploy.yml to check ingress against, so the
+	// AUTHORITATIVE server state decides (audit T62): the old shape assumed
+	// caddy ingress on that path, and a maintenance toggle against a
+	// host/external-ingress app happily rewrote routes nothing serves.
 	if appName == "" {
 		appCfg, err := config.LoadApp(".")
 		if err != nil {
@@ -78,6 +80,30 @@ func runMaintenanceToggle(flags *Flags, appName string, enable bool) error {
 		return err
 	}
 	defer executor.Close()
+
+	if appName != "" {
+		st, err := state.Read(ctx, executor, appName)
+		if err != nil {
+			return fmt.Errorf("reading server state for %s: %w", appName, err)
+		}
+		if st != nil && st.IngressMode != "" && st.IngressMode != "caddy" {
+			return fmt.Errorf("'teploy maintenance' requires Teploy-managed Caddy; %s uses ingress: %s (per its server state) — route traffic away via that ingress instead", appName, st.IngressMode)
+		}
+	}
+
+	// Maintenance is serialized with deploys under the SAME fenced app lock
+	// (audit T62): the toggle used to run unlocked, so a deploy during
+	// maintenance re-rendered the app's route while the stash held a route
+	// for the now-stopped release — and maintenance-off then restored that
+	// stale route over the deploy's live one.
+	if err := state.EnsureAppDir(ctx, executor, appCfg.App); err != nil {
+		return fmt.Errorf("creating app directory: %w", err)
+	}
+	lk, err := state.AcquireLockFenced(ctx, executor, appCfg.App)
+	if err != nil {
+		return fmt.Errorf("acquiring deploy lock: %w", err)
+	}
+	defer state.ReleaseLockFenced(executor, lk, appCfg.App)
 
 	client := caddy.NewClient(executor)
 

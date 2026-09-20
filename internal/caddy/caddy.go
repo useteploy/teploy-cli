@@ -353,8 +353,14 @@ func (c *Client) SetMaintenance(ctx context.Context, app, domain string) error {
 			// then IS the maintenance block — so stash-on overwrote the
 			// original route and maintenance-off restored maintenance
 			// forever. The first stash wins; it is deleted only by a
-			// successful RemoveMaintenance.
-			if _, statErr := c.exec.Run(ctx, "test -f "+ssh.ShellQuote(stash)); statErr != nil {
+			// successful RemoveMaintenance. Existence is CONFIRMED with a
+			// framed read (T62): `test -f` treated a transport failure as
+			// "missing" and overwrote a stash that might exist.
+			_, stashed, err := readServerFile(ctx, c.exec, stash)
+			if err != nil {
+				return "", fmt.Errorf("checking the maintenance stash for %s: %w", app, err)
+			}
+			if !stashed {
 				if err := c.exec.Upload(ctx, strings.NewReader(cur), stash, "0644"); err != nil {
 					return "", fmt.Errorf("stashing route for maintenance: %w", err)
 				}
@@ -373,42 +379,54 @@ func (c *Client) SetMaintenance(ctx context.Context, app, domain string) error {
 }
 
 // RemoveMaintenance disables maintenance mode, restoring the stashed route
-// block. It fails safe: a missing stash is a no-op, and a stash that exists but
-// can't be read (or is empty) aborts WITHOUT touching the route — the previous
-// version ignored the read error, so any transient SSH/read failure rendered an
-// empty block and silently deleted the app's route, taking the domain offline.
+// block. The stash is read INSIDE the mutation transaction (audit T62):
+// the old shape read it before taking the Caddy lock and deleted it after,
+// so a concurrent maintenance-on between the two could overwrite the stash
+// the read had just captured, or the deletion could remove a stash a
+// concurrent operation had just written. A missing stash is a no-op, and a
+// stash that exists but can't be read (or is empty) aborts WITHOUT
+// touching the route.
 func (c *Client) RemoveMaintenance(ctx context.Context, app string) error {
 	stash := fmt.Sprintf(maintStashFmt, app)
 
-	// Missing stash → maintenance isn't active (or was already removed). No-op.
-	// `test -f` so a genuine read error below isn't masked by `cat 2>/dev/null`.
-	if _, err := c.exec.Run(ctx, "test -f "+stash); err != nil {
-		return nil
-	}
-	saved, err := c.exec.Run(ctx, "cat "+stash)
-	if err != nil {
-		return fmt.Errorf("reading stashed maintenance route (route left unchanged): %w", err)
-	}
-	restored := strings.Trim(saved, "\n")
-	if restored == "" {
-		return fmt.Errorf("stashed maintenance route for %s is empty — refusing to remove the route; delete %s manually if this is intended", app, stash)
-	}
-
+	stashRemoved := false
 	if err := c.mutate(ctx, func(prev string) (string, error) {
+		data, present, err := readServerFile(ctx, c.exec, stash)
+		if err != nil {
+			return "", fmt.Errorf("reading stashed maintenance route (route left unchanged): %w", err)
+		}
+		if !present {
+			// Maintenance isn't active (or was already removed). No-op:
+			// returning prev unchanged skips the write/reload entirely.
+			return prev, nil
+		}
+		restored := strings.Trim(string(data), "\n")
+		if restored == "" {
+			return "", fmt.Errorf("stashed maintenance route for %s is empty — refusing to remove the route; delete %s manually if this is intended", app, stash)
+		}
 		updated, err := renderUpdated(prev, app, nil, restored)
 		if err != nil {
 			return "", err
 		}
 		// The stash may predate a webhook port change; normalize the
 		// fragment against the CURRENT persisted descriptor (webhook.go).
-		return c.applyWebhookToBlock(ctx, app, updated)
+		updated, err = c.applyWebhookToBlock(ctx, app, updated)
+		if err != nil {
+			return "", err
+		}
+		stashRemoved = true
+		return updated, nil
 	}); err != nil {
 		return err
 	}
 
-	// Delete the stash only after the reload succeeded, so a failed (rolled
-	// back) reload can be retried.
-	c.exec.Run(ctx, "rm -f "+stash)
+	// Delete the stash only when the reload succeeded (a failed/rolled-back
+	// reload can be retried), and only when this transaction actually
+	// restored one — deleting a stash a concurrent maintenance-on wrote
+	// would make THAT maintenance unexitable (audit T62).
+	if stashRemoved {
+		c.exec.Run(ctx, "rm -f -- "+ssh.ShellQuote(stash))
+	}
 	return nil
 }
 
