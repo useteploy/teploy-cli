@@ -45,7 +45,7 @@ func TestClient_HostPort_NoBindings(t *testing.T) {
 
 func TestClient_ImageExists_Present(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
-		ssh.MockCommand{Match: "docker image inspect", Output: "exists\n"},
+		ssh.MockCommand{Match: "err=$(mktemp); if docker image inspect", Output: "exists\n"},
 	)
 	client := NewClient(mock)
 
@@ -60,7 +60,7 @@ func TestClient_ImageExists_Present(t *testing.T) {
 
 func TestClient_ImageExists_Missing(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
-		ssh.MockCommand{Match: "docker image inspect", Output: "missing\n"},
+		ssh.MockCommand{Match: "err=$(mktemp); if docker image inspect", Output: "missing\n"},
 	)
 	client := NewClient(mock)
 
@@ -73,9 +73,32 @@ func TestClient_ImageExists_Missing(t *testing.T) {
 	}
 }
 
+// TestClient_ImageExists_DaemonFailureIsNotAMiss is the T17 regression: a
+// Docker daemon error (permission, daemon down — anything whose stderr is
+// not literally "no such image") must surface as an error, never as a
+// cache miss that steers the caller into a pull or the warned local
+// fallback against a broken connection.
+func TestClient_ImageExists_DaemonFailureIsNotAMiss(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{
+			Match: "err=$(mktemp); if docker image inspect",
+			Err:   fmt.Errorf("exit status 1: docker image inspect failed: Cannot connect to the Docker daemon"),
+		},
+	)
+	client := NewClient(mock)
+
+	ok, err := client.ImageExists(context.Background(), "nginx:latest")
+	if err == nil {
+		t.Fatal("expected a daemon failure to be an error, not a cache miss")
+	}
+	if ok {
+		t.Error("a failed inspect must never report the image present")
+	}
+}
+
 func TestClient_ImageExists_TransportError(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
-		ssh.MockCommand{Match: "docker image inspect", Err: fmt.Errorf("connection refused")},
+		ssh.MockCommand{Match: "err=$(mktemp); if docker image inspect", Err: fmt.Errorf("connection refused")},
 	)
 	client := NewClient(mock)
 
@@ -840,5 +863,47 @@ func TestPruneVersions_FailedRemovalNotReportedPruned(t *testing.T) {
 	}
 	if len(pruned) != 0 {
 		t.Errorf("a version with a failed container removal must not be reported as pruned, got %v", pruned)
+	}
+}
+
+// TestParseContainers_StructuredLabelsDefeatCommaInjection is the T15
+// regression: ListContainers now requests Labels as a JSON object, so a
+// label VALUE containing ",teploy.version=…" is a distinct map entry and
+// can no longer forge a reserved teploy label.
+func TestParseContainers_StructuredLabelsDefeatCommaInjection(t *testing.T) {
+	output := `{"ID":"abc","Names":"myapp-web-v1","Image":"myapp:v1","State":"running","Status":"Up","CreatedAt":"2026-05-28 21:00:00 -0700 PDT","Labels":{"note":"text,teploy.version=bad","teploy.app":"myapp","teploy.process":"web","teploy.version":"v1"}}`
+	cs, err := ParseContainers(output)
+	if err != nil {
+		t.Fatalf("ParseContainers: %v", err)
+	}
+	if len(cs) != 1 {
+		t.Fatalf("expected 1 container, got %d", len(cs))
+	}
+	if cs[0].Labels["teploy.version"] != "v1" {
+		t.Errorf("teploy.version = %q, want v1 (the comma-containing value must not have overwritten it)", cs[0].Labels["teploy.version"])
+	}
+	if cs[0].Labels["note"] != "text,teploy.version=bad" {
+		t.Errorf("note label not preserved verbatim: %q", cs[0].Labels["note"])
+	}
+}
+
+// TestListContainers_RequestsStructuredLabels pins the docker ps format
+// string: labels must be requested as a JSON object, never through
+// `{{json .}}`'s comma-joined display string.
+func TestListContainers_RequestsStructuredLabels(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "docker ps", Output: ""},
+	)
+	if _, err := NewClient(mock).ListContainers(context.Background(), "myapp"); err != nil {
+		t.Fatalf("ListContainers: %v", err)
+	}
+	if len(mock.Calls) != 1 {
+		t.Fatalf("expected one docker ps call, got %v", mock.Calls)
+	}
+	if !strings.Contains(mock.Calls[0], `"Labels":{{json .Labels}}`) {
+		t.Errorf("labels not requested as a structured JSON object: %s", mock.Calls[0])
+	}
+	if strings.Contains(mock.Calls[0], "'{{json .}}'") {
+		t.Errorf("ambiguous whole-entry format still in use: %s", mock.Calls[0])
 	}
 }
