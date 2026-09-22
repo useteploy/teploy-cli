@@ -186,9 +186,14 @@ func (s *singleServerDeployer) deployApp(ctx context.Context, appCfg *config.App
 	if len(appCfg.Volumes) > 0 {
 		volumes = make(map[string]string, len(appCfg.Volumes))
 		for name, containerPath := range appCfg.Volumes {
+			// Host binds pass through untouched — see the single-server path.
+			if config.IsHostBindVolume(name) {
+				volumes[name] = containerPath
+				continue
+			}
 			hostPath := fmt.Sprintf("/deployments/%s/volumes/%s", appCfg.App, name)
 			volumes[hostPath] = containerPath
-			if _, err := s.exec.Run(ctx, fmt.Sprintf("mkdir -p %s", hostPath)); err != nil {
+			if _, err := s.exec.Run(ctx, "mkdir -p "+hostPath); err != nil {
 				return fmt.Errorf("creating volume directory %s: %w", hostPath, err)
 			}
 		}

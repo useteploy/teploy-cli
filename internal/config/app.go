@@ -801,6 +801,33 @@ func ValidateDomain(domain string, allowEmpty bool) error {
 	return nil
 }
 
+// IsHostBindVolume reports whether a volume key declares a HOST BIND: an
+// absolute path the operator owns and teploy mounts exactly as given. Named
+// volumes (the validName grammar) are teploy-managed under
+// /deployments/<app>/volumes/<name>; a bind is how a process receives
+// something that already lives at a specific host path — a worker's trusted
+// checkout and its deploy credentials, most famously — and teploy must not
+// create, move, or back it up as if it were app data.
+func IsHostBindVolume(name string) bool {
+	return strings.HasPrefix(name, "/")
+}
+
+// validVolumeDestination checks the container side of a volume mapping: an
+// absolute path, optionally carrying a docker mount-mode suffix (:ro/:rw).
+// Relative destinations are refused — a typo'd "data" would silently create
+// a path inside whatever cwd docker resolves, which is never what anyone
+// wrote.
+func validVolumeDestination(dest string) error {
+	mount := dest
+	if strings.HasSuffix(mount, ":ro") || strings.HasSuffix(mount, ":rw") {
+		mount = mount[:strings.LastIndex(mount, ":")]
+	}
+	if !strings.HasPrefix(mount, "/") || strings.ContainsAny(mount, "\r\n\x00") {
+		return fmt.Errorf("container destination must be an absolute path (a :ro/:rw mode suffix is allowed), got %q", dest)
+	}
+	return nil
+}
+
 func (c *AppConfig) validate() error {
 	if err := ValidateName(c.App); err != nil {
 		return err
@@ -952,9 +979,12 @@ func (c *AppConfig) validate() error {
 	if c.Health.IntervalSeconds < 0 {
 		return fmt.Errorf("'health.interval_seconds' must be >= 0 (got %d)", c.Health.IntervalSeconds)
 	}
-	for name := range c.Volumes {
-		if !validName.MatchString(name) {
-			return fmt.Errorf("volume name %q must be lowercase alphanumeric with hyphens", name)
+	for name, dest := range c.Volumes {
+		if !validName.MatchString(name) && !IsHostBindVolume(name) {
+			return fmt.Errorf("volume name %q must be lowercase alphanumeric with hyphens, or an absolute host path for a bind mount", name)
+		}
+		if err := validVolumeDestination(dest); err != nil {
+			return fmt.Errorf("volume %q: %w", name, err)
 		}
 	}
 	for name, acc := range c.Accessories {

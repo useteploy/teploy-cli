@@ -134,6 +134,39 @@ volumes:
 	}
 }
 
+func TestLoadApp_HostBindVolumes(t *testing.T) {
+	dir := t.TempDir()
+	content := `app: myapp
+domain: myapp.com
+volumes:
+  "/srv/trusted-clone": "/srv/trusted-clone"
+  "/srv/creds": "/home/node/.ssh:ro"
+`
+	os.WriteFile(filepath.Join(dir, "teploy.yml"), []byte(content), 0644)
+
+	cfg, err := LoadApp(dir)
+	if err != nil {
+		t.Fatalf("absolute-path volume keys are host binds and must load: %v", err)
+	}
+	if got := cfg.Volumes["/srv/creds"]; got != "/home/node/.ssh:ro" {
+		t.Fatalf("bind mount mode suffix must survive load, got %q", got)
+	}
+	if !IsHostBindVolume("/srv/trusted-clone") || IsHostBindVolume("app-data") {
+		t.Fatal("IsHostBindVolume must key on the leading slash, nothing else")
+	}
+
+	// A relative destination is refused whichever side of the mapping failed.
+	bad := `app: myapp
+domain: myapp.com
+volumes:
+  "/srv/clone": "relative/path"
+`
+	os.WriteFile(filepath.Join(dir, "teploy.yml"), []byte(bad), 0644)
+	if _, err := LoadApp(dir); err == nil {
+		t.Fatal("expected error for a relative volume destination")
+	}
+}
+
 func TestLoadApp_TOML(t *testing.T) {
 	dir := t.TempDir()
 	content := `app = "myapp"

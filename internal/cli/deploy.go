@@ -581,6 +581,13 @@ func deployBuiltImageFenced(ctx context.Context, executor ssh.Executor, appCfg *
 	if len(appCfg.Volumes) > 0 {
 		volumes = make(map[string]string, len(appCfg.Volumes))
 		for name, containerPath := range appCfg.Volumes {
+			// A host bind mounts a directory the operator owns, exactly as
+			// given — teploy never creates or relocates it (it may hold a
+			// clone with credentials, or anything else that is not app data).
+			if config.IsHostBindVolume(name) {
+				volumes[name] = containerPath
+				continue
+			}
 			hostPath := fmt.Sprintf("/deployments/%s/volumes/%s", appCfg.App, name)
 			volumes[hostPath] = containerPath
 			if _, err := executor.Run(ctx, fmt.Sprintf("mkdir -p %s", hostPath)); err != nil {
