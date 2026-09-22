@@ -2,6 +2,45 @@
 
 All notable changes to teploy are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.36] - 2026-09-22
+
+### Fixed
+
+- **Preview environments no longer collide across branch names.**
+  Branches that sanitize to the same slug (`feature/login` and
+  `feature-login`) used to share one preview record — the second
+  deploy destroyed the first's state, container and route. Previews
+  now carry canonical IDs (`<app>-p-<hex8>`, derived from the app and
+  the FULL branch ref) through state files, container names, network
+  aliases, Caddy routes and domains; the slug is only a display
+  prefix. Existing slug-keyed records are adopted when their stored
+  full branch matches; a genuine collision surfaces an explicit error
+  naming both branches instead of guessing or deleting.
+- **Webhook deliveries during a running deploy were acknowledged, then
+  silently dropped.** The deploy lock returns immediately when already
+  held — it does not queue — so every push arriving mid-deploy got a
+  200 and then nothing. Admission is now durable before the
+  acknowledgment (an fsync'd append-only ledger), with one bounded
+  newest-wins pending slot per app (older pending deliveries are
+  marked superseded, never piled up in goroutines), and a listener
+  restart resumes admitted-but-unprocessed work exactly once.
+  Persistence failure refuses with 503 + Retry-After instead of
+  acknowledging something that is not durable.
+
+### Changed
+
+- **Scheduled redeploys run through the deploy engine.** The cron
+  script no longer reconstructs the container from `docker inspect`
+  with its own stop/rm/run (no lock, no health gate, no release
+  record, no rollback, a stop-to-start downtime window). It keeps the
+  cheap digest pre-check and, when the digest moved, invokes the new
+  server-side `teploy autodeploy redeploy` — the same fenced,
+  health-gated deploy path as the webhook listener. `schedule` gains
+  `--branch`, installs the server binary, and verifies it supports the
+  command. **Re-run `teploy autodeploy schedule` on existing apps to
+  upgrade an installed script**; until then the old script keeps its
+  previous behavior.
+
 ## [0.1.35] - 2026-09-22
 
 ### Fixed
