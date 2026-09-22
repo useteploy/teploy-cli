@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/useteploy/teploy/internal/ssh"
@@ -18,13 +19,13 @@ type composeFile struct {
 }
 
 type composeService struct {
-	Image       string      `yaml:"image"`
-	Build       interface{} `yaml:"build"` // string or struct
-	Ports       []string    `yaml:"ports"`
-	Command     interface{} `yaml:"command"`     // string or []string
-	Environment interface{} `yaml:"environment"` // map or list
-	Volumes     []string    `yaml:"volumes"`
-	DependsOn   interface{} `yaml:"depends_on"` // list or map
+	Image       string        `yaml:"image"`
+	Build       interface{}   `yaml:"build"`       // string or struct
+	Ports       []interface{} `yaml:"ports"`       // short-form strings or bare numbers; anything else is refused in composeAppPort
+	Command     interface{}   `yaml:"command"`     // string or []string
+	Environment interface{}   `yaml:"environment"` // map or list
+	Volumes     []string      `yaml:"volumes"`
+	DependsOn   interface{}   `yaml:"depends_on"` // list or map
 }
 
 // knownAccessoryImages maps image prefixes to default ports.
@@ -124,6 +125,20 @@ func mapCompose(dir string, compose composeFile) (*AppConfig, error) {
 		}
 		return nil, fmt.Errorf("no service with ports found in compose file")
 	}
+	// The web service's ports decide the application container port.
+	// Compose host-side bindings are deliberately not preserved (teploy
+	// allocates host ports itself and routes via Caddy), while non-TCP
+	// publishes carry into Publish verbatim. Unsupported grammar —
+	// ranges, long-form entries, multiple distinct container ports —
+	// is refused with the reason instead of given arbitrary meaning
+	// (previously every port entry was used only for web candidacy and
+	// silently discarded, so '8080:3000' imported with Port=0 and
+	// deployed as :80).
+	webPort, extraPublish, err := composeAppPort(webServiceName, webService.Ports)
+	if err != nil {
+		return nil, err
+	}
+
 	webBuildContext := parseBuildContext(webService.Build)
 
 	// Set domain placeholder — user must set this.
@@ -137,7 +152,14 @@ func mapCompose(dir string, compose composeFile) (*AppConfig, error) {
 		cfg.Image = webService.Image
 	}
 
+	// The application port resolved from the web service's ports.
+	cfg.Port = webPort
+	if len(extraPublish) > 0 {
+		cfg.Publish = extraPublish
+	}
+
 	// Classify remaining services.
+	var unsupportedBuilds []string
 	for name, svc := range compose.Services {
 		if name == webServiceName {
 			continue
@@ -194,8 +216,22 @@ func mapCompose(dir string, compose composeFile) (*AppConfig, error) {
 			continue
 		}
 
-		// Has build context different from web → worker (different build).
-		cfg.Processes[name] = parseCommand(svc.Command)
+		// Build context different from web's with no image: the
+		// single-image process model cannot preserve an independent
+		// build. Collect and refuse below — flattening the service
+		// into a worker of web's image used to deploy the wrong code
+		// under the right command (`jobs: build ./jobs` ran web's
+		// image).
+		unsupportedBuilds = append(unsupportedBuilds, fmt.Sprintf("%s (build %q)", name, svcBuildContext))
+	}
+
+	if len(unsupportedBuilds) > 0 {
+		sort.Strings(unsupportedBuilds)
+		webSrc := fmt.Sprintf("%q builds from %q", webServiceName, webBuildContext)
+		if webBuildContext == "" {
+			webSrc = fmt.Sprintf("%q runs image %q", webServiceName, webService.Image)
+		}
+		return nil, fmt.Errorf("unsupported independent build in compose import: %s while %s — teploy runs one image per app and cannot preserve a separately built service; use the same build context as the app, a prebuilt image, or write teploy.yml", strings.Join(unsupportedBuilds, ", "), webSrc)
 	}
 
 	// Clean up empty maps.
@@ -207,6 +243,61 @@ func mapCompose(dir string, compose composeFile) (*AppConfig, error) {
 	}
 
 	return cfg, nil
+}
+
+// composeAppPort resolves the web service's application container port
+// from its Compose ports entries, returning the port and any non-TCP
+// entries that must be preserved verbatim as publishes. The supported
+// grammar is the same narrow grammar as ParsePublishSpec: short-form
+// "[host:]container[/proto]" strings (or bare numbers) with single
+// numeric ports. Long-form ports objects, ranges and multiple distinct
+// container ports are refused naming the reason — never given arbitrary
+// meaning. The Compose HOST-side binding is not part of the returned
+// value: it is host plumbing that teploy replaces with its own
+// allocation and Caddy routing.
+func composeAppPort(service string, raw []interface{}) (int, []string, error) {
+	seen := map[int]bool{}
+	var extra []string
+	for _, entry := range raw {
+		var s string
+		switch v := entry.(type) {
+		case string:
+			s = v
+		case int:
+			s = strconv.Itoa(v)
+		default:
+			return 0, nil, fmt.Errorf("compose service %q ports: unsupported ports entry %v — only short \"[host:]container[/proto]\" strings or bare numbers import; write teploy.yml for long-form Compose ports", service, entry)
+		}
+		spec, err := ParsePublishSpec(s)
+		if err != nil {
+			return 0, nil, fmt.Errorf("compose service %q ports: %w", service, err)
+		}
+		if spec.Proto != "" && spec.Proto != "tcp" {
+			extra = append(extra, s)
+			continue
+		}
+		seen[spec.ContainerPort] = true
+	}
+	ports := make([]int, 0, len(seen))
+	for p := range seen {
+		ports = append(ports, p)
+	}
+	sort.Ints(ports)
+	switch len(ports) {
+	case 1:
+		return ports[0], extra, nil
+	case 0:
+		if len(extra) > 0 {
+			return 0, nil, fmt.Errorf("compose service %q publishes only non-TCP ports — teploy serves HTTP over TCP and cannot pick an application port; write teploy.yml", service)
+		}
+		return 0, nil, fmt.Errorf("compose service %q publishes no usable TCP application port", service)
+	default:
+		var names []string
+		for _, p := range ports {
+			names = append(names, strconv.Itoa(p))
+		}
+		return 0, nil, fmt.Errorf("ambiguous compose import: service %q publishes multiple container ports (%s) — teploy routes one application port; remove the extra ports or write teploy.yml", service, strings.Join(names, ", "))
+	}
 }
 
 func parseBuildContext(build interface{}) string {

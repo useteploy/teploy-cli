@@ -228,7 +228,7 @@ func TestIsAccessoryImage(t *testing.T) {
 		{"mongo:latest", true},
 		{"myapp:latest", false},
 		{"ghcr.io/myorg/myapp:v1", false},
-		{"", false},		// Registry ports: the colon before the last slash is a registry
+		{"", false}, // Registry ports: the colon before the last slash is a registry
 		// host port, not a tag separator (teploy-cli-08 twin — this used
 		// to reduce to "registry.example" and disable classification).
 		{"registry.example:5000/postgres:16", true},
@@ -431,5 +431,237 @@ services:
 	}
 	if !strings.Contains(err.Error(), "accessory") {
 		t.Errorf("error should mention the accessory situation, got: %v", err)
+	}
+}
+
+// TestLoadCompose_PreservesWebContainerPort: the import contract from the
+// product evaluation (C05) — a supported one-image short-port Compose file
+// must import with its declared INTERNAL web port. "8080:3000" means
+// container 3000 bound to host 8080 in Compose; the container port is the
+// application port, and the host binding is Compose host plumbing teploy
+// does not preserve. This used to import with Port=0 (deployed as :80).
+func TestLoadCompose_PreservesWebContainerPort(t *testing.T) {
+	compose := `
+services:
+  web:
+    image: example/web:v1
+    ports: ["8080:3000"]
+`
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "compose.yml"), []byte(compose), 0644)
+
+	cfg, err := LoadCompose(dir)
+	if err != nil {
+		t.Fatalf("supported short-port Compose fixture must import: %v", err)
+	}
+	if cfg == nil {
+		t.Fatal("expected non-nil config")
+	}
+	if cfg.Port != 3000 {
+		t.Errorf("web container port = %d, want 3000 (the host binding 8080 is not the application port)", cfg.Port)
+	}
+	if cfg.Image != "example/web:v1" {
+		t.Errorf("web image = %q, want example/web:v1", cfg.Image)
+	}
+}
+
+// TestLoadCompose_PortShortForms covers the supported short-form port
+// grammar: host:container, bare container port (quoted and unquoted),
+// IPv4- and bracketed-IPv6-prefixed bindings, and the same container port
+// published through several bindings — one application port, not two.
+func TestLoadCompose_PortShortForms(t *testing.T) {
+	tests := []struct {
+		name  string
+		ports string
+		want  int
+	}{
+		{"host:container", `["8080:3000"]`, 3000},
+		{"bare container port", `["3000"]`, 3000},
+		{"bare unquoted number", "[3000]", 3000},
+		{"ipv4-prefixed", `["127.0.0.1:8080:3000"]`, 3000},
+		{"ipv6-prefixed", `["[::1]:8080:3000"]`, 3000},
+		{"same container port twice", `["8080:3000", "127.0.0.1:8081:3000"]`, 3000},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			compose := "services:\n  web:\n    image: example/web:v1\n    ports: " + tt.ports + "\n"
+			dir := t.TempDir()
+			os.WriteFile(filepath.Join(dir, "compose.yml"), []byte(compose), 0644)
+
+			cfg, err := LoadCompose(dir)
+			if err != nil {
+				t.Fatalf("supported short form must import: %v", err)
+			}
+			if cfg.Port != tt.want {
+				t.Errorf("application port = %d, want %d", cfg.Port, tt.want)
+			}
+		})
+	}
+}
+
+// TestLoadCompose_MultipleAppPortsRefused: two distinct container ports on
+// the web service have no principled single application port — the import
+// must refuse and name both rather than pick one.
+func TestLoadCompose_MultipleAppPortsRefused(t *testing.T) {
+	compose := `
+services:
+  web:
+    image: myapp:latest
+    ports: ["8080:3000", "8081:3001"]
+`
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "docker-compose.yml"), []byte(compose), 0644)
+
+	_, err := LoadCompose(dir)
+	if err == nil {
+		t.Fatal("expected an ambiguity error for multiple container ports")
+	}
+	if !strings.Contains(err.Error(), "ambiguous") ||
+		!strings.Contains(err.Error(), "3000") ||
+		!strings.Contains(err.Error(), "3001") {
+		t.Errorf("error must name the ambiguity and both ports, got: %v", err)
+	}
+}
+
+// TestLoadCompose_NonTCPPorts: a non-TCP publish is not an application
+// port (teploy serves HTTP over TCP) but is preserved verbatim as a
+// publish; a service with ONLY non-TCP ports is refused with the reason.
+func TestLoadCompose_NonTCPPorts(t *testing.T) {
+	mixed := `
+services:
+  web:
+    image: example/dns:v1
+    ports: ["8080:3000", "53:53/udp"]
+`
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "compose.yml"), []byte(mixed), 0644)
+
+	cfg, err := LoadCompose(dir)
+	if err != nil {
+		t.Fatalf("mixed TCP + UDP service must import: %v", err)
+	}
+	if cfg.Port != 3000 {
+		t.Errorf("application port = %d, want 3000 (the TCP port)", cfg.Port)
+	}
+	if len(cfg.Publish) != 1 || cfg.Publish[0] != "53:53/udp" {
+		t.Errorf("UDP entry must be preserved verbatim in publish, got %v", cfg.Publish)
+	}
+
+	udpOnly := `
+services:
+  web:
+    image: example/dns:v1
+    ports: ["53:53/udp"]
+`
+	dir = t.TempDir()
+	os.WriteFile(filepath.Join(dir, "compose.yml"), []byte(udpOnly), 0644)
+
+	_, err = LoadCompose(dir)
+	if err == nil {
+		t.Fatal("expected an error when only a UDP port is published")
+	}
+	if !strings.Contains(err.Error(), "TCP") {
+		t.Errorf("error must explain the TCP requirement, got: %v", err)
+	}
+}
+
+// TestLoadCompose_PortRangeRefused: port ranges are outside the supported
+// grammar and must be refused at import with the reason, before any
+// deploy effect.
+func TestLoadCompose_PortRangeRefused(t *testing.T) {
+	compose := `
+services:
+  web:
+    image: myapp:latest
+    ports: ["3000-3005:3000-3005"]
+`
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "docker-compose.yml"), []byte(compose), 0644)
+
+	_, err := LoadCompose(dir)
+	if err == nil {
+		t.Fatal("expected an error for a port range")
+	}
+	if !strings.Contains(err.Error(), "web") || !strings.Contains(err.Error(), "3000-3005") {
+		t.Errorf("error must name the service and the offending entry, got: %v", err)
+	}
+}
+
+// TestLoadCompose_LongFormPortsRefused: Compose long-form ports objects
+// (target/published maps) are outside the supported grammar — refuse
+// naming the service and the supported alternative.
+func TestLoadCompose_LongFormPortsRefused(t *testing.T) {
+	compose := `
+services:
+  web:
+    image: myapp:latest
+    ports:
+      - target: 3000
+        published: 8080
+`
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "docker-compose.yml"), []byte(compose), 0644)
+
+	_, err := LoadCompose(dir)
+	if err == nil {
+		t.Fatal("expected an error for long-form ports")
+	}
+	if !strings.Contains(err.Error(), "web") || !strings.Contains(err.Error(), "ports") {
+		t.Errorf("error must name the service and its ports, got: %v", err)
+	}
+}
+
+// TestLoadCompose_RefusesIndependentBuild: a service built from a context
+// different from the web service's cannot be preserved by the single-image
+// process model — the import must refuse naming the service and its
+// build, never silently flatten it into a worker of the app's image
+// (which deployed the wrong code under the right command).
+func TestLoadCompose_RefusesIndependentBuild(t *testing.T) {
+	tests := []struct {
+		name    string
+		compose string
+	}{
+		{
+			"build-based web",
+			`
+services:
+  web:
+    build: ./web
+    ports: ["3000:3000"]
+  jobs:
+    build: ./jobs
+    command: python jobs.py
+`,
+		},
+		{
+			"image-based web",
+			`
+services:
+  web:
+    image: myapp:latest
+    ports: ["3000:3000"]
+  jobs:
+    build: ./jobs
+    command: python jobs.py
+`,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			os.WriteFile(filepath.Join(dir, "compose.yml"), []byte(tt.compose), 0644)
+
+			cfg, err := LoadCompose(dir)
+			if err == nil {
+				t.Fatalf("unsupported independent build must be refused, not flattened: config=%+v", cfg)
+			}
+			detail := strings.ToLower(err.Error())
+			if !strings.Contains(detail, "jobs") || !strings.Contains(detail, "build") {
+				t.Fatalf("refusal must identify the service and its build, got: %v", err)
+			}
+			if !strings.Contains(detail, "./jobs") {
+				t.Fatalf("refusal must name the unsupported build context, got: %v", err)
+			}
+		})
 	}
 }

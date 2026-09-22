@@ -38,15 +38,19 @@ func TestDeployConfigCopiesEveryMatchingAppConfigField(t *testing.T) {
 		"Env":      "folded into EnvFiles by buildContainerEnvFiles, so secrets never reach the docker run argv",
 	}
 
-	source, err := os.ReadFile("deploy.go")
+	// The mapping lives in one place — deployConfigFromApp in
+	// deployconfig.go — shared by BOTH deploy entry points (deploy.go
+	// and singledeploy.go), so guarding this one literal guards the
+	// mapping each entry point actually uses.
+	source, err := os.ReadFile("deployconfig.go")
 	if err != nil {
-		t.Fatalf("reading deploy.go: %v", err)
+		t.Fatalf("reading deployconfig.go: %v", err)
 	}
 	// Just the deploy.Config literal, so an unrelated mention elsewhere in the
 	// file cannot make a missing assignment look present.
-	literal := regexp.MustCompile(`(?s)deployCfg := deploy\.Config\{(.*?)\n\t\}`).FindSubmatch(source)
+	literal := regexp.MustCompile(`(?s)return deploy\.Config\{(.*?)\n\t\}`).FindSubmatch(source)
 	if literal == nil {
-		t.Fatal("could not find the `deployCfg := deploy.Config{...}` literal in deploy.go")
+		t.Fatal("could not find the `return deploy.Config{...}` literal in deployconfig.go")
 	}
 	// Strip line comments before matching. `strings.Contains(body, "Memory:")`
 	// is otherwise satisfied by `// Memory: appCfg.Memory,` — verified: deleting

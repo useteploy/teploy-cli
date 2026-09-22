@@ -639,40 +639,7 @@ func deployBuiltImageFenced(ctx context.Context, executor ssh.Executor, appCfg *
 
 	// 11. Deploy.
 	deployer := deploy.NewDeployer(executor, os.Stdout)
-	deployCfg := deploy.Config{
-		App:             appCfg.App,
-		Domain:          appCfg.Domain,
-		Image:           image,
-		Version:         version,
-		EnvFiles:        envFiles,
-		Volumes:         volumes,
-		Processes:       appCfg.Processes,
-		NoHealthcheck:   disabledHealthchecks(appCfg.Healthcheck),
-		Health:          healthConfigFrom(appCfg.Health),
-		KeepVersions:    appCfg.KeepVersions,
-		Ingress:         appCfg.Ingress,
-		Bind:            appCfg.Bind,
-		ContainerPort:   appCfg.Port,
-		Publish:         appCfg.Publish,
-		StopTimeout:     appCfg.StopTimeout,
-		Memory:          appCfg.Memory,
-		CPU:             appCfg.CPU,
-		Replicas:        appCfg.Replicas,
-		PreDeploy:       appCfg.Hooks.PreDeploy,
-		PostDeploy:      appCfg.Hooks.PostDeploy,
-		AssetPath:       appCfg.Assets.Path,
-		AssetKeepDays:   appCfg.Assets.KeepDays,
-		TLSCert:         tlsCert,
-		TLSKey:          tlsKey,
-		TLSInternal:     tlsInternal,
-		CaddyExtra:      appCfg.CaddyExtra,
-		Cache:           appCfg.Cache,
-		Firewall:        caddyFirewall(appCfg.Firewall),
-		Access:          caddyAccess(appCfg.Access),
-		ManifestSHA256:  manifestSHA256,
-		AppliedManifest: appliedManifest,
-		SourceRevision:  appCfg.SourceRevision,
-	}
+	deployCfg := deployConfigFromApp(appCfg, image, version, envFiles, volumes, tlsCert, tlsKey, tlsInternal, appliedManifest, manifestSHA256)
 
 	// Vulnerability gate: scan the image on the server before any container
 	// starts — fixable CRITICALs block the deploy.

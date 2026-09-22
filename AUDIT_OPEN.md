@@ -769,3 +769,42 @@ all packages ok. No push performed. (Environmental note: Apple's Xcode 27
 update landed mid-session and required license re-acceptance for
 /usr/bin/git; the closing gates ran against the standalone Command Line
 Tools git on PATH.)
+
+## Product programme slices (2026-09-21) — Compose import contracts
+
+Two C05 findings from the product evaluation's strengthened contract
+probes (`_internal/evals/2026-09-21/`), fixed as bounded slices with
+evidence. Base revision `8486355`; changes left uncommitted for review.
+
+- **Compose port preservation** — `mapCompose` used the web service's
+  ports only for candidacy and silently discarded them, so
+  `ports: ['8080:3000']` imported with `Port=0` (deployed as `:80`,
+  health check probing the wrong port). Ports now resolve through
+  `composeAppPort` over the same narrow grammar as `ParsePublishSpec`
+  (short strings or bare numbers; ranges and long-form objects refused
+  naming the service; multiple distinct container ports refused as
+  ambiguous; non-TCP entries preserved verbatim into `publish`). The
+  Compose host-side binding is deliberately not preserved — teploy
+  allocates host ports and routes via Caddy. The config→deploy hop was
+  made observable by extracting `deployConfigFromApp` (both entry
+  points now share one literal, covered by the strengthened
+  `TestDeployConfigCopiesEveryMatchingAppConfigField` wiring guard,
+  which previously saw only deploy.go's copy).
+- **Independent-build refusal** — a service built from a different
+  context than web's with no image was flattened into a same-image
+  process (`jobs: build ./jobs` ran web's image under the jobs
+  command — wrong code, right command, success reported). The import
+  now refuses, deterministically naming every offending service and
+  its build context, with the remediation (same context / prebuilt
+  image / teploy.yml). Full multi-image build identity remains C05.
+
+Gates: `go vet ./...` clean; `go test ./... -race` all packages ok;
+strengthened probes — port and worker contracts PASS, both controls
+PASS, the preview branch-identity probe remains a known failure (C06,
+separate task). Mutation checks in a scratch copy: removing the port
+assignment, substituting the host port, breaking the seam mapping, and
+restoring the lossy flatten each fail the new regressions for the
+intended reason. Real Docker port behavior remains a later journey
+gate (J05); no remote deployment was performed. The preview collision
+and full Compose breadth stay open under the product programme
+(`_internal/TEPLOY_PRODUCT_EXCELLENCE_PROGRAMME_2026-09-21.md` C05/C06).
