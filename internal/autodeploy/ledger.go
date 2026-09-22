@@ -43,12 +43,18 @@ const (
 // (ID/Digest/App/Branch/Received) are carried on every record so a folded
 // line is self-describing; transition kinds add their own fields.
 type AdmissionRecord struct {
-	Kind         string    `json:"kind"`
-	ID           string    `json:"id"`
-	Delivery     string    `json:"delivery,omitempty"` // provider delivery header, metadata only (A36)
-	Digest       string    `json:"digest"`             // hex sha256 of the AUTHENTICATED body
-	App          string    `json:"app"`
-	Branch       string    `json:"branch,omitempty"`
+	Kind     string `json:"kind"`
+	ID       string `json:"id"`
+	Delivery string `json:"delivery,omitempty"` // provider delivery header, metadata only (A36)
+	Digest   string `json:"digest"`             // hex sha256 of the AUTHENTICATED body
+	App      string `json:"app"`
+	Branch   string `json:"branch,omitempty"`
+	// Commit is the commit the authenticated push named as the branch's new
+	// head (payload after/checkout_sha; see PushCommit). Carried through
+	// superseded/processed transitions so restart resume re-triggers the
+	// delivery PINNED to its commit, not the moving tip. Empty when the
+	// payload carried no usable commit (tip deploy).
+	Commit       string    `json:"commit,omitempty"`
 	Received     time.Time `json:"received"`
 	SupersededBy string    `json:"superseded_by,omitempty"`
 	At           time.Time `json:"at,omitempty"` // transition time (superseded/processed)

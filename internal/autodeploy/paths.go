@@ -27,6 +27,7 @@ type pushPayload struct {
 	Ref               string `json:"ref"`
 	Deleted           *bool  `json:"deleted"`
 	After             string `json:"after"`
+	CheckoutSHA       string `json:"checkout_sha"`
 }
 
 // PushEvent classifies an authenticated webhook body against the branch this
@@ -54,6 +55,59 @@ func PushEvent(body []byte, branch string) (ok bool) {
 		return true // caller did not pin a branch: any push event qualifies
 	}
 	return p.Ref == "refs/heads/"+branch || strings.TrimPrefix(p.Ref, "refs/heads/") == branch
+}
+
+// PushCommit returns the commit the authenticated push event names as the
+// new head of the pushed branch (C02 commit pinning): GitLab's checkout_sha
+// when present, else after (GitHub, Gitea/Forgejo). The value is what the
+// deploy must be pinned to — NOT the branch tip at fetch time.
+//
+// Empty when the payload carries no usable commit: a non-push shape (the
+// caller has already filtered with PushEvent), a branch deletion, the
+// all-zero deletion marker, or a malformed hash. An empty result means
+// "deploy the tip and say so", never "pin to garbage".
+func PushCommit(body []byte) string {
+	var p pushPayload
+	if err := json.Unmarshal(body, &p); err != nil {
+		return ""
+	}
+	if p.Deleted != nil && *p.Deleted {
+		return ""
+	}
+	// No ref = ping/non-push; a tag ref's "after" is the tag object, not a
+	// branch head — neither pins a branch deploy.
+	if p.Ref == "" || strings.HasPrefix(p.Ref, "refs/tags/") {
+		return ""
+	}
+	for _, c := range []string{p.CheckoutSHA, p.After} {
+		if isCommitHash(c) {
+			return c
+		}
+	}
+	return ""
+}
+
+// isCommitHash reports whether s is a well-formed git object id as providers
+// send them in push payloads: 40 lowercase hex (SHA-1 repos) or 64 lowercase
+// hex (SHA-256 repos), and not the all-zero deletion marker.
+func isCommitHash(s string) bool {
+	if len(s) != 40 && len(s) != 64 {
+		return false
+	}
+	allZero := true
+	for _, r := range s {
+		switch {
+		case r >= '0' && r <= '9':
+			if r != '0' {
+				allZero = false
+			}
+		case r >= 'a' && r <= 'f':
+			allZero = false
+		default:
+			return false
+		}
+	}
+	return !allZero
 }
 
 // githubCommitCap is the number of commits GitHub includes in a push event

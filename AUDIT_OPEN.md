@@ -160,8 +160,11 @@ defect could corrupt data today.
   over). `accessory verify-backup` already proves archives in scratch;
   the orchestrated boundary is new lifecycle surface.
 - F39 — Crontab edit under a host-side flock.
-- F40 — Pinning webhook builds to the payload's exact commit (fetch +
-  ancestry policy).
+- F40 — Pinning webhook builds to the payload's exact commit: LANDED
+  2026-09-22 (see the C02 commit-pinned builds slice at the bottom —
+  fetch + verify + reset to payload.after/checkout_sha, loud refusal when
+  the commit is unfetchable). The standing F42/A37 remainder (queue
+  durability beyond the ledger, listener scope) is unchanged.
 - F42 — Durable webhook queue with per-app workers (in-proc model is
   bounded by the per-app lock + content dedup).
 - F43 — Listener scoped to a private address/Unix socket reachable only
@@ -374,7 +377,8 @@ into each rather than duplicated as new work items.
   schema + private workspaces + protected credentials). Architectural.
 - TCL-47 — engine auth adapters + S3 session tokens. Medium; with F37.
 - TCL-48 — F42 (durable webhook queue).
-- TCL-49 — F40 (pin webhook builds to the event's commit).
+- TCL-49 — F40 (pin webhook builds to the event commit): LANDED
+  2026-09-22 (C02 commit-pinned builds slice, bottom).
 - TCL-50 — F60 (complete-plan fingerprint vs display digest).
 - TCL-51 — RESOLVED 2026-09-18 with F57's opt-in (family section at the
   bottom).
@@ -615,7 +619,8 @@ all packages ok. No push performed.
   credential-file plumbing shared with the engine images.
 - A34 — F42 durable webhook queue (ack-before-durable-job remains; A36
   closed the dedup-race half).
-- A35 — F40 webhook build pinning to the event commit.
+- A35 — F40 webhook build pinning to the event commit: LANDED 2026-09-22
+  (C02 commit-pinned builds slice, bottom).
 - A37 — F43 listener scope + operational bounds (graceful shutdown,
   bounded admission) — the durable queue (A34) is the prerequisite for
   honest shutdown semantics.
@@ -721,8 +726,9 @@ on success.
   readiness (generation-scoped aliases need F04's handoff).
 - T24 — A34: durable webhook job queue (ack-before-durable-job remains;
   A36's content dedup + T26's persisted routing cover the routing halves).
-- T25 — A35: webhook builds fetch the watched branch HEAD, not the
-  authenticated payload commit (fetch + worktree pinning design).
+- T25 — A35: webhook builds fetched the watched branch HEAD, not the
+  authenticated payload commit. LANDED 2026-09-22 (C02 commit-pinned
+  builds slice, bottom).
 - T28 — NEW deferral: the scheduled-redeploy cron script is a separate
   forked deployment engine (no lock, health gate, route/state/metadata
   commit). Unifying it behind the real deploy engine is the fix; whether
@@ -1046,12 +1052,14 @@ Branch-match → all three ambiguity tests fail (adopted instead of
 refusing). Both reverted; gates after revert: `go vet ./...` clean,
 `go test ./... -race` all packages ok, gofmt clean on touched files.
 
-**Remaining C06 scope (explicitly NOT in this slice)** — preview
-lifecycle behavior (old preview serving until the new one is ready —
-destroy-before-recreate stays as-is; expiry timer/automation beyond the
-existing deploy-piggyback prune; config propagation through a preview
-profile; network/secret isolation between previews) and any Dash-side
-changes.
+**Remaining C06 scope after this and the 2026-09-22 lifecycle slice (see
+the bottom section)** — preview-profile config propagation through a
+preview (image build args, env surface per preview), network/secret
+isolation between previews, and the enforcement TIMER (pruning now CAN be
+cron'd via `teploy preview prune`; nothing schedules it server-side) and
+any Dash-side changes. The destroy-before-recreate lifecycle and the
+deploy-piggyback-only TTL enforcement recorded above were closed by the
+2026-09-22 lifecycle slice at the bottom.
 
 ## Product programme slice (2026-09-22) — C02: scheduled redeploys run through the engine
 
@@ -1155,15 +1163,13 @@ torn-tail/corruption parsing, fold/newest/seed units. Gates: `go vet
 touched files (deploy.go/secret_audit.go/update_test.go were unformatted
 at base — left alone).
 
-**Remaining C02 scope (explicitly NOT in this slice):**
+**Remaining C02 scope (explicitly NOT in that slice):**
 
-- **Commit-pinned builds — still open, verified**: `triggerAutoDeploy`
-  fetches and resets to `origin/<branch>` TIP (autodeploy_serve.go
-  `git fetch origin <b> && git reset --hard origin/<b>`), not the
-  authenticated payload's `after` commit — the tip IS pinned to the
-  remote ref at deploy time, but a push landing between event and fetch
-  deploys the newer commit under the older event's admission. Full
-  pinning = F40/A35/T25 (fetch + worktree checkout of the event commit).
+- **Commit-pinned builds — LANDED 2026-09-22** as its own slice (see the
+  C02 commit-pinned builds section at the bottom): the fetch now resets to
+  the authenticated `payload.after`/`checkout_sha` commit, and an
+  unfetchable commit fails loudly naming both commits. Closes F40/A35/T25
+  and the T25 half of that section's recon.
 - **Dash/CI trigger convergence** — teploy-dash and CI-triggered deploys
   do not go through this admission path; converging them onto the ledger
   + queue (or the engine trigger generally) is cross-repo work.
@@ -1190,3 +1196,143 @@ right). Candidate fix: include the presented key type and the on-file types
 in the error, or document "scan without -t" in the error string. Found
 while provisioning the ship delivery worker; worked around by scanning all
 algorithms.
+
+## Programme slice (2026-09-22, later still) — C02: commit-pinned builds
+
+Closes the F40/TCL-49/A35/T25 family and the remaining-scope bullet of the
+admission-durability slice above. Base revision `b7e030d`; changes left
+uncommitted for review.
+
+**Design:**
+
+- `autodeploy.PushCommit(body)` (internal/autodeploy/paths.go) extracts the
+  commit the authenticated push names as the branch's new head — GitLab's
+  `checkout_sha` preferred, else `after` (GitHub/Gitea/Forgejo). Returns ""
+  for non-push shapes, tag refs (whose "after" is the tag object), explicit
+  deletions, the all-zero deletion marker, and malformed hashes (40/64
+  lowercase hex required): "" means "deploy the tip and say so", never
+  "pin to garbage".
+- `fetchCheckout` (internal/cli/autodeploy_serve.go, extracted from
+  triggerAutoDeploy) — tip mode renders the historical fetch+reset unchanged
+  and states "Deploying tip of <branch>"; commit mode fetches the branch,
+  best-effort fetches the SHA itself (pulls force-pushed-away commits on
+  servers that allow SHA fetches — GitHub/GitLab do; failure fine),
+  VERIFIES presence with `git cat-file -e '<sha>^{commit}'`, then
+  `git reset --hard '<sha>'` — exact args asserted in tests. An unfetchable
+  commit FAILS LOUDLY naming the authenticated commit, the branch, and the
+  branch's current tip (`git rev-parse origin/<branch>`), and never resets
+  the worktree — never a silent tip fallback. Output states
+  "Deploying <commit> from delivery (branch <b>)".
+- Threading: the handler parses the commit once per delivery and binds it
+  to the durable admission (new `AdmissionRecord.Commit`, carried through
+  superseded/processed transitions), the bounded queue's single worker
+  passes it to the trigger, and restart resume re-triggers PINNED to the
+  ledger-recorded commit. `autodeploy redeploy` (the scheduled path) passes
+  "" — tip mode with the explicit tip output; `triggerAutoDeploy` grew the
+  commit parameter (empty = tip).
+
+**Evidence** — TDD: behavioral red first after a pure-behavior-preserving
+extraction of fetchCheckout (commit-pinned test failed "not implemented
+yet"; unfetchable test failed with no error; handler-threading test failed
+with record/trigger commit ""). Ping/tag no-op coverage
+(TestWebhookHandler_OnlyWatchedBranchPushes) verified unchanged. New
+coverage: PushCommit provider shapes (GitHub/GitLab/deletion/zeros/
+malformed/64-hex), exact fetch/verify/reset command forms + ordering, tip
+mode never running pin commands, unfetchable → error naming both commits +
+no reset, handler→ledger→trigger commit threading, no-commit → tip,
+resume-carries-commit. Mutation checks (in-place, reverted):
+removing the cat-file guard fails the commit-pinned and unfetchable tests
+for the intended reason; severing PushCommit's pinning fails the handler
+threading test and 3 PushCommit subtests. Gates after revert:
+`go vet ./...` clean; `go test ./... -race` all 25 packages ok; gofmt
+clean on touched files; contract probes 5/5 PASS.
+
+**Remaining C02 scope:** Dash/CI trigger convergence (cross-repo);
+cancellation propagation (supersede never interrupts a running deploy —
+deliberate non-goal with the A37/T33 graceful-shutdown remainder). The
+ancestry-policy question (should a tip AHEAD of the authenticated commit
+ever deploy it? today: yes, the authenticated commit always wins — that is
+what "bound to the authenticated commit" means) is settled by the
+programme text, not by config.
+
+## Programme slice (2026-09-22, later still) — C06: preview lifecycle
+
+Closes the two recorded C06 lifecycle defects. Base revision `b7e030d`;
+changes left uncommitted for review.
+
+**Blue/green previews (defect: "Preview destroys old preview before
+starting new"):**
+
+- Candidate container name/alias/process carry the version
+  (`<app>-preview-p-<hex>-<version>`; RunConfig.Name set explicitly), so
+  each generation has its OWN docker network alias — the stable route can
+  point at exactly one generation (a shared alias round-robins between
+  predecessor and candidate the moment both run; SetRoute's doc contract
+  asks for a specific container name as upstream, which preview now
+  honors).
+- Update order: allocate port → (same-version: `docker rename` the
+  running predecessor aside `<name>-replaced`, the engine's pattern) →
+  start candidate → inspect internal port → READINESS GATE → SetRoute
+  under the STABLE key `<app>-preview-p-<hex>` with the CANDIDATE as
+  upstream → rewrite the record → only then stop+remove the predecessor
+  (+ remove a legacy-era route key when the adopted record had one; the
+  canonical key is repointed, not removed). Canonical ID, state path,
+  route key, and domain are unchanged across updates.
+- Readiness gate mirrors internal/deploy/health.go's probe shape scoped to
+  preview's own executor (no engine import): curl against the candidate's
+  localhost-published port — 200 ready, 404/3xx → TCP-connect fallback,
+  bounded by 30s/1s defaults (test-shortened knobs). Main deploys gate the
+  same way; previews failing a dead image loudly is the consistent
+  posture.
+- On candidate failure (start, port inspect, health, route): stop+remove
+  the CANDIDATE, rename a renamed-aside predecessor back under its
+  recorded name, leave the predecessor running/routed/recorded, and the
+  error names the failed candidate. Same-version updates are the engine's
+  compromise: the alias is shared for the brief window between candidate
+  start and predecessor retirement (recorded below as residual).
+
+**TTL enforcement (defect: "Preview expiration cleanup occurs when another
+preview deploy is invoked"):**
+
+- `Manager.Prune` is the one shared prune core (per-preview outcome
+  lines; failures warn and continue); `Manager.PruneAll` enumerates
+  `/deployments/*/previews` across ALL apps and runs that core per app —
+  canonical and legacy eras alike (enumeration is over files; Destroy
+  adopts legacy records by full-Branch match as before). Idempotent by
+  construction; touches nothing outside the previews directories and the
+  artifacts records name.
+- `teploy preview prune` now runs PruneAll (help text says so; connects
+  via the cwd teploy.yml's server — the file identifies the target, the
+  prune is not app-scoped). The deploy piggyback calls the SAME
+  `Manager.Prune` core for its own app. The TTL field is the record's
+  absolute `ExpiresAt`, default 72h documented on DeployConfig.TTL and
+  State.ExpiresAt, applied on create AND refreshed on update.
+
+**Evidence** — TDD: behavioral red recorded before implementation
+(ordering test showed stop=5 < switch=12 < run=17 — the defect live in
+the call log; failed-candidate deployed "successfully" with no gate;
+same-version had no rename-aside; PruneAll stub pruned 0). New coverage:
+blue/green ordering via mock call-log indexes (run < reload < stop, rm
+after stop, record names the candidate under the stable route key),
+failed candidate (predecessor container/route/record byte-identical,
+candidate cleaned up, error names candidate + health), same-version
+rename-aside + retirement after the healthy candidate holds the name
+(no reload expected — a byte-identical Caddyfile block is a deliberate
+no-op skip in caddy.mutate), prune exactness across two apps and both
+eras + non-preview state.json untouched + idempotent second run (zero
+docker commands), TTL default = CreatedAt+72h. All pre-existing preview
+tests (coexistence, adoption, ambiguity, prune fixtures) pass unchanged.
+Mutation checks (in-place, reverted): moving retirement ahead of the
+route switch fails the ordering test with stop-before-switch; making
+Prune skip ID-less records fails the era test (pruned 1, want 2) AND the
+pre-existing legacy-fixture prune test. Gates: `go vet ./...` clean;
+`go test ./... -race` all 25 packages ok; gofmt clean on touched files;
+contract probes 5/5 PASS.
+
+**Remaining C06 scope (residual):** preview-profile config propagation
+(per-preview env/build-arg surface), network/secret isolation between
+previews (candidates share the `teploy` network today, like all app
+containers), the enforcement TIMER (nothing server-side schedules
+pruning — `preview prune` is cron-able but teploy ships no daemon, by
+design), the same-version shared-alias window above, and Dash-side
+changes.

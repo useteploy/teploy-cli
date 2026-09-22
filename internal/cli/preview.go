@@ -111,16 +111,17 @@ func runPreviewDeploy(flags *Flags, branch, ttlStr, image string) error {
 
 	mgr := preview.NewManager(executor, os.Stdout)
 
-	// Prune expired previews for this app before deploying a new one.
-	// Teploy deliberately has no server-side agent/daemon (see CLAUDE.md),
-	// so nothing else ever enforces preview TTLs — ExpiresAt was being
-	// written but never checked by anything, letting expired containers
-	// and Caddy routes leak indefinitely for an app nobody deploys new
-	// previews for. Piggybacking on the one client-driven action that's
-	// guaranteed to recur for any team actively using preview environments
-	// avoids needing a resident process just for this; teams that stop
-	// using previews stop accumulating them too. Best-effort: a prune
-	// failure shouldn't block the actual deploy the operator asked for.
+	// Prune expired previews for this app before deploying a new one
+	// (the same shared prune core `teploy preview prune` runs across all
+	// apps — Manager.Prune). Teploy deliberately has no server-side
+	// agent/daemon (see CLAUDE.md), so nothing else enforces preview TTLs
+	// on its own — ExpiresAt was being written but never checked by
+	// anything, letting expired containers and Caddy routes leak
+	// indefinitely for an app nobody deploys new previews for. The
+	// standalone `preview prune` (PruneAll) is the cron-able enforcement
+	// point; this piggyback keeps an actively-used app clean between runs.
+	// Best-effort: a prune failure shouldn't block the actual deploy the
+	// operator asked for.
 	if pruned, err := mgr.Prune(ctx, appCfg.App); err != nil {
 		fmt.Printf("Warning: pruning expired previews: %v\n", err)
 	} else if pruned > 0 {
@@ -244,12 +245,18 @@ func newPreviewPruneCmd(flags *Flags) *cobra.Command {
 	return &cobra.Command{
 		Use:   "prune",
 		Short: "Remove expired previews",
-		Long: "Remove expired previews for this app.\n\n" +
-			"`teploy preview deploy` already runs this automatically before " +
-			"deploying a new preview, so you don't normally need to run it " +
-			"by hand — teploy has no server-side agent/daemon, so nothing " +
-			"else enforces preview TTLs on a schedule. Run this directly if " +
-			"you want expired previews cleaned up without deploying a new one.",
+		Long: "Remove expired previews across ALL apps on the target server,\n" +
+			"enumerating every app's preview records (both the current\n" +
+			"canonical and the legacy slug-keyed era).\n\n" +
+			"`teploy preview deploy` prunes that app's expired previews\n" +
+			"automatically before deploying, but teploy has no server-side\n" +
+			"agent/daemon — nothing enforces TTLs on a schedule by itself.\n" +
+			"This command is the standalone enforcement point: run it by hand\n" +
+			"or from cron to tear down expired previews even for apps nobody\n" +
+			"is actively deploying. It connects to the server named by the\n" +
+			"teploy.yml in the current directory and never touches anything\n" +
+			"outside /deployments/<app>/previews and the artifacts those\n" +
+			"records name.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runPreviewPrune(flags)
@@ -273,7 +280,9 @@ func runPreviewPrune(flags *Flags) error {
 	defer executor.Close()
 
 	mgr := preview.NewManager(executor, os.Stdout)
-	n, err := mgr.Prune(ctx, appCfg.App)
+	// PruneAll — the same shared prune core the deploy piggyback uses
+	// (Manager.Prune), driven across every app on this server.
+	n, err := mgr.PruneAll(ctx)
 	if err != nil {
 		return err
 	}

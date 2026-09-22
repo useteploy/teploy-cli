@@ -105,3 +105,42 @@ func TestChangedFilesEmptyOrJunk(t *testing.T) {
 		t.Fatal("unparseable → known=false")
 	}
 }
+
+// TestPushCommit (C02): the commit a push payload authenticates as the
+// branch's new head — GitLab's checkout_sha preferred, else after
+// (GitHub/Gitea/Forgejo). Non-push shapes, deletions, all-zero deletion
+// markers, and malformed hashes return "" so the caller deploys the tip and
+// says so, never pins to garbage.
+func TestPushCommit(t *testing.T) {
+	const sha = "0123456789abcdef0123456789abcdef01234567"
+	const sha2 = "fedcba9876543210fedcba9876543210fedcba98"
+	const zeros = "0000000000000000000000000000000000000000"
+	cases := []struct {
+		name string
+		body string
+		want string
+	}{
+		{"github after", `{"ref":"refs/heads/main","after":"` + sha + `"}`, sha},
+		{"gitlab checkout_sha preferred", `{"ref":"refs/heads/main","checkout_sha":"` + sha + `","after":"` + sha2 + `"}`, sha},
+		{"gitlab empty checkout_sha falls to after", `{"ref":"refs/heads/main","checkout_sha":"","after":"` + sha2 + `"}`, sha2},
+		{"ping", `{}`, ""},
+		{"tag push", `{"ref":"refs/tags/v1.0.0","after":"` + sha + `"}`, ""},
+		{"branch deletion marker", `{"ref":"refs/heads/main","deleted":true,"after":"` + sha + `"}`, ""},
+		{"all-zero after (deletion)", `{"ref":"refs/heads/main","after":"` + zeros + `"}`, ""},
+		{"malformed hash ignored", `{"ref":"refs/heads/main","after":"deadbeef"}`, ""},
+		{"non-hex ignored", `{"ref":"refs/heads/main","after":"zzz456789abcdef0123456789abcdef01234567"}`, ""},
+		{"unparseable body", `not json`, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := PushCommit([]byte(tc.body)); got != tc.want {
+				t.Errorf("PushCommit(%s) = %q, want %q", tc.name, got, tc.want)
+			}
+		})
+	}
+	// sha256-object-id repos send 64-hex hashes — those must pin too.
+	const sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	if got := PushCommit([]byte(`{"ref":"refs/heads/main","after":"` + sha256 + `"}`)); got != sha256 {
+		t.Errorf("PushCommit(64-hex) = %q, want %q", got, sha256)
+	}
+}

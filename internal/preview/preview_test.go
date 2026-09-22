@@ -97,6 +97,7 @@ func TestDeploy(t *testing.T) {
 		ssh.MockCommand{Match: "ss -tln", Output: ""},
 		ssh.MockCommand{Match: "docker run", Output: "abc123"},
 		ssh.MockCommand{Match: "docker inspect -f '{{range $p", Output: "80/tcp"},
+		ssh.MockCommand{Match: "curl -s -o /dev/null", Output: "200"},
 		ssh.MockCommand{Match: "curl -sf http://localhost:2019/config/apps/http/servers/srv0", Output: `{"listen":[":80",":443"]}`},
 		ssh.MockCommand{Match: "curl -sf -X PATCH", Err: fmt.Errorf("not found")},
 		ssh.MockCommand{Match: "curl -sf -X POST http://localhost:2019/config/apps/http/servers/srv0/routes", Output: ""},
@@ -221,16 +222,18 @@ func TestPreviewDomain(t *testing.T) {
 }
 
 // previewDeployMocks is the mock bundle for a full Deploy against a bare
-// server: port allocation, container start, and the Caddyfile
-// edit/reload/verify transaction (see TestDeploy for the origins of each
-// entry). State-file and Caddyfile writes go through the mock's file
-// state, so successive deploys observe each other's records and routes.
+// server: port allocation, container start, the candidate health probe
+// (blue/green readiness gate), and the Caddyfile edit/reload/verify
+// transaction (see TestDeploy for the origins of each entry). State-file
+// and Caddyfile writes go through the mock's file state, so successive
+// deploys observe each other's records and routes.
 func previewDeployMocks() []ssh.MockCommand {
 	return []ssh.MockCommand{
 		ssh.MockCommand{Match: "mkdir -p /deployments/myapp/previews", Output: ""},
 		ssh.MockCommand{Match: "ss -tln", Output: ""},
 		ssh.MockCommand{Match: "docker run", Output: "abc123"},
 		ssh.MockCommand{Match: "docker inspect -f '{{range $p", Output: "80/tcp"},
+		ssh.MockCommand{Match: "curl -s -o /dev/null", Output: "200"},
 		ssh.MockCommand{Match: "cat /deployments/caddy/Caddyfile", Output: "{\n\tadmin 0.0.0.0:2019\n}\n"},
 		ssh.MockCommand{Match: "mkdir /deployments/caddy/.lock", Output: ""},
 		ssh.MockCommand{Match: "a=$(docker exec caddy md5sum", Output: "TEPLOY_CADDY_OK"},

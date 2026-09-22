@@ -549,3 +549,43 @@ func TestAdmission_LedgerFileDurability(t *testing.T) {
 		t.Errorf("ledger mode = %v, want 0600", info.Mode().Perm())
 	}
 }
+
+// TestAdmission_ResumeCarriesCommit (C02): the authenticated commit is
+// durable in the ledger, so a crash-resumed admission re-triggers PINNED to
+// its delivery's commit rather than the moving branch tip.
+func TestAdmission_ResumeCarriesCommit(t *testing.T) {
+	dir := t.TempDir()
+	ledgerPath := filepath.Join(dir, ".autodeploy-ledger.jsonl")
+	fileLedger, err := autodeploy.OpenLedger(ledgerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const sha = "0123456789abcdef0123456789abcdef01234567"
+	if err := fileLedger.Append(autodeploy.AdmissionRecord{
+		Kind: autodeploy.AdmissionKindAdmitted, ID: "id-pin", Delivery: "del-1", Digest: "dddd",
+		App: "myapp", Branch: "main", Commit: sha, Received: time.Now().UTC().Add(-time.Minute),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	fileLedger.Close()
+
+	var gotCommit string
+	var gotMu sync.Mutex
+	run := func(_ []string, _ bool, commit string) {
+		gotMu.Lock()
+		gotCommit = commit
+		gotMu.Unlock()
+	}
+	resumeLedger := &memLedger{}
+	queue := newAdmissionQueue(resumeLedger, run, func(string, ...any) {})
+	if err := resumeAdmissions(ledgerPath, "myapp", resumeLedger, queue, autodeploy.NewDeliveryDedup(), func(string, ...any) {}); err != nil {
+		t.Fatal(err)
+	}
+	waitQueueIdle(t, queue)
+
+	gotMu.Lock()
+	defer gotMu.Unlock()
+	if gotCommit != sha {
+		t.Errorf("resumed deploy pinned to commit %q, want %q (the ledger-recorded commit, not the tip)", gotCommit, sha)
+	}
+}

@@ -5,9 +5,12 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -41,6 +44,11 @@ type State struct {
 	Container string    `json:"container"`
 	Image     string    `json:"image"`
 	CreatedAt time.Time `json:"created_at"`
+	// ExpiresAt is the record's absolute TTL deadline: written on every
+	// Deploy as creation/update time + the configured TTL (the documented
+	// default is 72h — DeployConfig.TTL). Enforcement reads this field;
+	// `teploy preview prune` (and the deploy piggyback) destroy records
+	// whose deadline has passed.
 	ExpiresAt time.Time `json:"expires_at"`
 }
 
@@ -54,7 +62,10 @@ type DeployConfig struct {
 	EnvFile string
 	Env     map[string]string
 	Volumes map[string]string
-	TTL     time.Duration // default 72h
+	// TTL is how long the preview lives; 0 means the documented default of
+	// 72h. Applied on every Deploy (create AND update — an update refreshes
+	// the deadline), recorded as the absolute State.ExpiresAt.
+	TTL time.Duration
 	// Repo is the normalized repo identity recorded in the preview record
 	// (see State.Repo). Empty is allowed: the repo is provenance, not part
 	// of the preview ID.
@@ -67,15 +78,22 @@ type Manager struct {
 	docker *docker.Client
 	caddy  *caddy.Client
 	out    io.Writer
+	// healthTimeout/healthInterval bound the candidate readiness gate
+	// (blue/green switch). Defaults set by NewManager; unexported knobs so
+	// tests can shorten them.
+	healthTimeout  time.Duration
+	healthInterval time.Duration
 }
 
 // NewManager creates a preview manager.
 func NewManager(exec ssh.Executor, out io.Writer) *Manager {
 	return &Manager{
-		exec:   exec,
-		docker: docker.NewClient(exec),
-		caddy:  caddy.NewClient(exec),
-		out:    out,
+		exec:           exec,
+		docker:         docker.NewClient(exec),
+		caddy:          caddy.NewClient(exec),
+		out:            out,
+		healthTimeout:  30 * time.Second,
+		healthInterval: time.Second,
 	}
 }
 
@@ -282,6 +300,15 @@ func (m *Manager) writeRecord(ctx context.Context, s *State, path string) error 
 }
 
 // Deploy creates or updates a preview environment for the given branch.
+//
+// Updates are blue/green (C06): the candidate starts under a
+// version-suffixed container name and network alias, passes a readiness
+// gate, and only then takes over the preview's stable Caddy route key —
+// the predecessor is stopped and removed AFTER the switch. A candidate
+// that fails its gate (or the route switch) leaves the predecessor
+// running, routed, and recorded; only the failed candidate is cleaned up.
+// The canonical ID, state path, route key, and domain are stable across
+// updates — only the upstream container moves.
 func (m *Manager) Deploy(ctx context.Context, cfg DeployConfig) error {
 	if cfg.TTL == 0 {
 		cfg.TTL = 72 * time.Hour
@@ -305,7 +332,7 @@ func (m *Manager) Deploy(ctx context.Context, cfg DeployConfig) error {
 		}
 		// The record's live artifacts predate the migration (Route empty,
 		// slug-keyed) — keep them described exactly as they are so the
-		// destroy below tears down what is actually running.
+		// retirement below tears down what is actually running.
 		if err := m.writeRecord(ctx, &adopted, previewStatePath(cfg.App, cfg.Branch)); err != nil {
 			return fmt.Errorf("migrating legacy preview record: %w", err)
 		}
@@ -314,9 +341,13 @@ func (m *Manager) Deploy(ctx context.Context, cfg DeployConfig) error {
 
 	idHex := previewIDHex(cfg.App, cfg.Branch)
 	domain := previewDomain(cfg.App, cfg.Branch, cfg.Domain)
-	process := "preview-p-" + idHex
-	routeApp := cfg.App + "-" + process
-	containerName := fmt.Sprintf("%s-%s-%s", cfg.App, process, cfg.Version)
+	// The process (container name component AND network alias) carries the
+	// version: each candidate gets its own alias, so the stable route can
+	// point at exactly one generation — a shared alias would round-robin
+	// between predecessor and candidate the moment both run.
+	process := "preview-p-" + idHex + "-" + cfg.Version
+	routeApp := cfg.App + "-preview-p-" + idHex
+	containerName := cfg.App + "-" + process
 
 	fmt.Fprintf(m.out, "Deploying preview for branch %q...\n", cfg.Branch)
 	fmt.Fprintf(m.out, "  Domain: %s\n", domain)
@@ -326,9 +357,6 @@ func (m *Manager) Deploy(ctx context.Context, cfg DeployConfig) error {
 		return fmt.Errorf("creating preview directory: %w", err)
 	}
 
-	// Destroy existing preview for this branch if it exists.
-	m.Destroy(ctx, cfg.App, cfg.Branch)
-
 	// Allocate port.
 	port, err := m.docker.FindAvailablePort(ctx)
 	if err != nil {
@@ -336,7 +364,42 @@ func (m *Manager) Deploy(ctx context.Context, cfg DeployConfig) error {
 	}
 	fmt.Fprintf(m.out, "  Port: %d\n", port)
 
-	// Start container.
+	// Same-version update: the running predecessor holds the candidate's
+	// exact name. Rename it aside (it keeps serving under the shared
+	// alias until the switch — the main engine's _replaced pattern).
+	predecessorContainer := ""
+	predecessorRoute := ""
+	renamedAside := false
+	if existing != nil {
+		predecessorContainer = existing.Container
+		predecessorRoute = previewRouteKey(cfg.App, existing)
+		if predecessorContainer == containerName {
+			if _, err := m.exec.Run(ctx, fmt.Sprintf("docker rename %s %s",
+				ssh.ShellQuote(predecessorContainer), ssh.ShellQuote(predecessorContainer+"-replaced"))); err != nil {
+				return fmt.Errorf("renaming the running preview %s aside for the same-version update (a leftover -replaced container may need `docker rm` first): %w", predecessorContainer, err)
+			}
+			renamedAside = true
+			predecessorContainer = predecessorContainer + "-replaced"
+		}
+	}
+
+	// abortCandidate tears down the failed candidate and puts a renamed
+	// predecessor back under its recorded name. The predecessor is never
+	// touched beyond that — it keeps serving.
+	abortCandidate := func(reason error, format string, args ...any) error {
+		m.docker.Stop(ctx, containerName, 5)
+		m.docker.Remove(ctx, containerName)
+		if renamedAside {
+			m.exec.Run(ctx, fmt.Sprintf("docker rename %s %s",
+				ssh.ShellQuote(predecessorContainer), ssh.ShellQuote(containerName)))
+		}
+		if reason != nil {
+			return fmt.Errorf(format+": %w", append(args, reason)...)
+		}
+		return fmt.Errorf(format, args...)
+	}
+
+	// Start the candidate.
 	var envFiles []string
 	if cfg.EnvFile != "" {
 		envFiles = []string{cfg.EnvFile}
@@ -345,6 +408,7 @@ func (m *Manager) Deploy(ctx context.Context, cfg DeployConfig) error {
 		App:      cfg.App,
 		Process:  process,
 		Version:  cfg.Version,
+		Name:     containerName,
 		Image:    cfg.Image,
 		Port:     port,
 		EnvFiles: envFiles,
@@ -352,28 +416,33 @@ func (m *Manager) Deploy(ctx context.Context, cfg DeployConfig) error {
 		Volumes:  cfg.Volumes,
 	})
 	if err != nil {
-		return fmt.Errorf("starting preview container: %w", err)
+		return abortCandidate(err, "starting preview container %s", containerName)
 	}
 
-	// Set Caddy route for the preview domain. The preview container gets a
-	// dedicated network alias (cfg.App + "-" + process) via
-	// docker.RunConfig.Process, which is what we dial here.
 	// Caddy dials the upstream over the docker network, so it needs the
-	// container's INTERNAL port, not the host-published port (which is what
-	// `port` is). Passing the host port made Caddy dial a port the container
-	// isn't listening on inside the network, so every preview route 502'd.
+	// container's INTERNAL port, not the host-published port (which is
+	// what `port` is). Passing the host port made Caddy dial a port the
+	// container isn't listening on inside the network, so every preview
+	// route 502'd.
 	internalPort, err := m.docker.InternalPort(ctx, containerName)
 	if err != nil {
-		m.docker.Stop(ctx, containerName, 5)
-		m.docker.Remove(ctx, containerName)
-		return fmt.Errorf("inspecting preview container port: %w", err)
+		return abortCandidate(err, "inspecting preview container %s port", containerName)
 	}
-	// Preview subdomains use Caddy automatic HTTPS (no custom cert).
-	if err := m.caddy.SetRoute(ctx, routeApp, domain, routeApp, internalPort, caddy.TLS{}, "", nil, caddy.Firewall{}, caddy.Access{}); err != nil {
-		// Clean up container on route failure.
-		m.docker.Stop(ctx, containerName, 5)
-		m.docker.Remove(ctx, containerName)
-		return fmt.Errorf("setting preview route: %w", err)
+
+	// Readiness gate: traffic only switches to a candidate that answers.
+	// Mirrors the deploy engine's probe (HTTP 200 on /health, 404/3xx
+	// falling back to a TCP check) against the candidate's
+	// localhost-published port.
+	if err := m.waitReady(ctx, port); err != nil {
+		return abortCandidate(err, "preview candidate %s failed its health check — the previous preview is still serving", containerName)
+	}
+
+	// Switch the preview domain's route to the candidate. The route KEY
+	// (and with it the canonical identity) is stable; only the upstream
+	// container moves. Preview subdomains use Caddy automatic HTTPS (no
+	// custom cert).
+	if err := m.caddy.SetRoute(ctx, routeApp, domain, containerName, internalPort, caddy.TLS{}, "", nil, caddy.Firewall{}, caddy.Access{}); err != nil {
+		return abortCandidate(err, "setting preview route — the previous preview is still serving")
 	}
 
 	// Write state.
@@ -394,9 +463,75 @@ func (m *Manager) Deploy(ctx context.Context, cfg DeployConfig) error {
 		return fmt.Errorf("writing preview state: %w", err)
 	}
 
+	// Retire the predecessor — strictly AFTER the route serves the
+	// candidate (blue/green: this ordering is the fix; stopping first was
+	// the downtime window).
+	if predecessorContainer != "" {
+		m.docker.Stop(ctx, predecessorContainer, 5)
+		m.docker.Remove(ctx, predecessorContainer)
+	}
+	// A legacy-era predecessor lived under a different route key; that key
+	// must go. The canonical key was just repointed, so it stays.
+	if predecessorRoute != "" && predecessorRoute != routeApp {
+		m.caddy.RemoveRoute(ctx, predecessorRoute)
+	}
+
 	fmt.Fprintf(m.out, "  Preview deployed: https://%s\n", domain)
 	fmt.Fprintf(m.out, "  Expires: %s\n", state.ExpiresAt.Format(time.RFC3339))
 	return nil
+}
+
+// waitReady polls the candidate's localhost-published port until it
+// answers, bounded by the manager's health timeout. The probe mirrors the
+// deploy engine's readiness check: HTTP 200 on /health is ready; 404 or a
+// redirect means the app is listening but has no /health route, and a TCP
+// connect counts as ready; anything else retries until the deadline.
+func (m *Manager) waitReady(ctx context.Context, port int) error {
+	deadlineCtx, cancel := context.WithTimeout(ctx, m.healthTimeout)
+	defer cancel()
+	for {
+		if m.probeOnce(deadlineCtx, port) {
+			return nil
+		}
+		select {
+		case <-deadlineCtx.Done():
+			return fmt.Errorf("no response on localhost:%d within %s", port, m.healthTimeout)
+		case <-time.After(m.healthInterval):
+			// retry
+		}
+	}
+}
+
+// probeOnce performs one health probe attempt against the preview
+// candidate (same curl discipline as internal/deploy's checkHealth: one
+// quoted --url argument, globoff, no proxy, bounded per-attempt timeouts).
+func (m *Manager) probeOnce(ctx context.Context, port int) bool {
+	if port < 1 || port > 65535 {
+		return false
+	}
+	target := "http://" + net.JoinHostPort("localhost", strconv.Itoa(port)) + "/health"
+	out, err := m.exec.Run(ctx, fmt.Sprintf(
+		"curl -s -o /dev/null --noproxy '*' --globoff --connect-timeout 2 --max-time 5 -w '%%{http_code}' --url %s",
+		ssh.ShellQuote(target)))
+	if err == nil {
+		switch code := strings.TrimSpace(out); {
+		case code == "200":
+			return true
+		case code == "404" || strings.HasPrefix(code, "3"):
+			return m.probeTCP(ctx, port)
+		}
+	}
+	return false
+}
+
+// probeTCP reports whether a TCP connection to localhost:port succeeds —
+// the listening-but-no-/health fallback.
+func (m *Manager) probeTCP(ctx context.Context, port int) bool {
+	if port < 1 || port > 65535 {
+		return false
+	}
+	_, err := m.exec.Run(ctx, fmt.Sprintf("bash -c '</dev/tcp/localhost/%d' 2>/dev/null", port))
+	return err == nil
 }
 
 // List returns all active previews for the app. Records from both the
@@ -452,7 +587,9 @@ func (m *Manager) Destroy(ctx context.Context, app, branch string) error {
 	return nil
 }
 
-// Prune removes expired previews.
+// Prune removes a single app's expired previews, reporting the outcome of
+// each one. This is the shared prune core: the deploy piggyback and the
+// standalone all-apps prune (PruneAll) both run exactly this code path.
 func (m *Manager) Prune(ctx context.Context, app string) (int, error) {
 	previews, err := m.List(ctx, app)
 	if err != nil {
@@ -462,13 +599,56 @@ func (m *Manager) Prune(ctx context.Context, app string) (int, error) {
 	now := time.Now().UTC()
 	pruned := 0
 	for _, p := range previews {
-		if now.After(p.ExpiresAt) {
-			if err := m.Destroy(ctx, app, p.Branch); err != nil {
-				fmt.Fprintf(m.out, "Warning: failed to prune preview %s: %v\n", p.Branch, err)
-				continue
-			}
-			pruned++
+		if !now.After(p.ExpiresAt) {
+			continue
 		}
+		if err := m.Destroy(ctx, app, p.Branch); err != nil {
+			fmt.Fprintf(m.out, "Warning: failed to prune preview %s: %v\n", p.Branch, err)
+			continue
+		}
+		fmt.Fprintf(m.out, "Pruned expired preview %q (%s)\n", p.Branch, p.Domain)
+		pruned++
 	}
 	return pruned, nil
+}
+
+// PruneAll removes expired previews across EVERY app on the target server,
+// enumerating each app's preview records (canonical and legacy eras alike
+// — List reads whatever files exist under the app's previews directory).
+// This is what the standalone `teploy preview prune` runs, so TTL
+// enforcement no longer depends on someone deploying a new preview of the
+// same app: the command can be cron'd. Idempotent by construction — a
+// pruned record is gone, so a second run finds nothing expired. Never
+// touches anything outside /deployments/<app>/previews and the artifacts
+// the records themselves name.
+func (m *Manager) PruneAll(ctx context.Context) (int, error) {
+	out, err := m.exec.Run(ctx, "ls -d /deployments/*/previews 2>/dev/null")
+	if err != nil && strings.TrimSpace(out) == "" {
+		// No preview directories at all — nothing to prune.
+		return 0, nil
+	}
+
+	var apps []string
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		rest, ok := strings.CutPrefix(line, deploymentsDir+"/")
+		if !ok {
+			continue
+		}
+		app, ok := strings.CutSuffix(rest, "/previews")
+		if ok && app != "" && !strings.Contains(app, "/") {
+			apps = append(apps, app)
+		}
+	}
+
+	total := 0
+	var errs []error
+	for _, app := range apps {
+		n, err := m.Prune(ctx, app)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("app %s: %w", app, err))
+		}
+		total += n
+	}
+	return total, errors.Join(errs...)
 }

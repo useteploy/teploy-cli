@@ -374,7 +374,7 @@ func runAutoDeployRedeploy(app, branch string, strictEnv bool) error {
 	executor := ssh.NewLocalExecutor()
 	defer executor.Close()
 
-	return triggerAutoDeploy(ctx, executor, app, branch, autodeploy.BuildDir(app), os.Stdout, nil, false, strictEnv)
+	return triggerAutoDeploy(ctx, executor, app, branch, autodeploy.BuildDir(app), "", os.Stdout, nil, false, strictEnv)
 }
 
 func newAutoDeployUnscheduleCmd(flags *Flags) *cobra.Command {

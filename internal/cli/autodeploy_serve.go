@@ -126,10 +126,10 @@ func runAutoDeployServe(app, branch string, port int, strictEnv bool) error {
 
 	// Bounded queueing: one worker, one newest-wins pending slot. The
 	// deploy itself runs in the worker — never a goroutine per delivery.
-	queue := newAdmissionQueue(ledger, func(changedFiles []string, filesKnown bool) {
+	queue := newAdmissionQueue(ledger, func(changedFiles []string, filesKnown bool, commit string) {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 		defer cancel()
-		if err := triggerAutoDeploy(ctx, executor, app, branch, buildDir, out, changedFiles, filesKnown, strictEnv); err != nil {
+		if err := triggerAutoDeploy(ctx, executor, app, branch, buildDir, commit, out, changedFiles, filesKnown, strictEnv); err != nil {
 			logf("deploy failed: %v", err)
 		} else {
 			logf("deploy complete")
@@ -324,6 +324,11 @@ func newWebhookHandler(cfg webhookHandlerConfig) http.HandlerFunc {
 		// tag/ping payload) means the deploy step must not skip.
 		changedFiles, filesKnown := autodeploy.ChangedFiles(body)
 
+		// Bind the deploy to the AUTHENTICATED COMMIT (C02): the payload's
+		// after/checkout_sha names the exact commit this event built; the
+		// fetch pins the checkout to it instead of the moving tip.
+		commit := autodeploy.PushCommit(body)
+
 		// DURABLE ADMISSION (C02): the record is fsynced BEFORE the 200.
 		// A crash immediately after the response still leaves the admitted
 		// delivery discoverable by restart resume.
@@ -334,6 +339,7 @@ func newWebhookHandler(cfg webhookHandlerConfig) http.HandlerFunc {
 			Digest:   digest,
 			App:      cfg.app,
 			Branch:   cfg.branch,
+			Commit:   commit,
 			Received: time.Now().UTC(),
 		}
 		if err := cfg.ledger.Append(rec); err != nil {
@@ -386,7 +392,9 @@ const (
 )
 
 // queuedAdmission is PENDING WORK AS A RECORD, never a blocked goroutine:
-// the single worker picks it up when the running deploy finishes.
+// the single worker picks it up when the running deploy finishes. The
+// authenticated commit rides on the record (rec.Commit), so a resumed
+// admission stays pinned to its delivery's commit across a restart.
 type queuedAdmission struct {
 	rec          autodeploy.AdmissionRecord
 	changedFiles []string
@@ -404,11 +412,11 @@ type admissionQueue struct {
 	pending    *queuedAdmission
 
 	ledger autodeploy.LedgerAppender
-	run    func(changedFiles []string, filesKnown bool)
+	run    func(changedFiles []string, filesKnown bool, commit string)
 	logf   func(format string, args ...any)
 }
 
-func newAdmissionQueue(ledger autodeploy.LedgerAppender, run func(changedFiles []string, filesKnown bool), logf func(format string, args ...any)) *admissionQueue {
+func newAdmissionQueue(ledger autodeploy.LedgerAppender, run func(changedFiles []string, filesKnown bool, commit string), logf func(format string, args ...any)) *admissionQueue {
 	return &admissionQueue{ledger: ledger, run: run, logf: logf}
 }
 
@@ -452,7 +460,7 @@ func (q *admissionQueue) worker() {
 		q.mu.Unlock()
 
 		if q.run != nil {
-			q.run(item.changedFiles, item.filesKnown)
+			q.run(item.changedFiles, item.filesKnown, item.rec.Commit)
 		}
 		q.markProcessed(item.rec)
 	}
@@ -469,6 +477,7 @@ func (q *admissionQueue) markSupersededLocked(old autodeploy.AdmissionRecord, by
 		Digest:       old.Digest,
 		App:          old.App,
 		Branch:       old.Branch,
+		Commit:       old.Commit,
 		Received:     old.Received,
 		SupersededBy: byID,
 		At:           time.Now().UTC(),
@@ -490,6 +499,7 @@ func (q *admissionQueue) markProcessed(rec autodeploy.AdmissionRecord) {
 		Digest:   rec.Digest,
 		App:      rec.App,
 		Branch:   rec.Branch,
+		Commit:   rec.Commit,
 		Received: rec.Received,
 		At:       time.Now().UTC(),
 	})
@@ -541,6 +551,7 @@ func resumeAdmissions(ledgerPath, app string, ledger autodeploy.LedgerAppender, 
 			Digest:       p.Digest,
 			App:          p.App,
 			Branch:       p.Branch,
+			Commit:       p.Commit,
 			Received:     p.Received,
 			SupersededBy: newest.ID,
 			At:           time.Now().UTC(),
@@ -568,7 +579,11 @@ func resumeAdmissions(ledgerPath, app string, ledger autodeploy.LedgerAppender, 
 // needs credentials already configured for the server's user, or it's
 // skipped with a warning), so this can still fail on a server that was
 // never successfully cloned.
-func triggerAutoDeploy(ctx context.Context, executor ssh.Executor, app, branch, buildDir string, out io.Writer, changedFiles []string, filesKnown, strictEnv bool) error {
+//
+// commit pins the build to the commit the webhook delivery authenticated
+// (payload after/checkout_sha — C02); empty deploys the branch tip (the
+// scheduled-redeploy path, which has no event to pin to).
+func triggerAutoDeploy(ctx context.Context, executor ssh.Executor, app, branch, buildDir, commit string, out io.Writer, changedFiles []string, filesKnown, strictEnv bool) error {
 	// The lock's parent must exist before it can be acquired — a server
 	// whose app was never manually deployed has no /deployments/<app> yet.
 	if err := state.EnsureAppDir(ctx, executor, app); err != nil {
@@ -586,11 +601,8 @@ func triggerAutoDeploy(ctx context.Context, executor ssh.Executor, app, branch, 
 	if _, err := executor.Run(ctx, "mkdir -p "+ssh.ShellQuote(buildDir)); err != nil {
 		return fmt.Errorf("creating build directory: %w", err)
 	}
-	fetchCmd := fmt.Sprintf("cd %s && git fetch origin %s && git reset --hard origin/%s",
-		ssh.ShellQuote(buildDir), ssh.ShellQuote(branch), ssh.ShellQuote(branch))
-	if _, err := executor.Run(ctx, fetchCmd); err != nil {
-		return fmt.Errorf("fetching %s (is %s a valid git checkout with a fetchable 'origin' remote? this must exist before the first webhook-triggered deploy — see `teploy deploy`'s server-build mode, or clone it manually): %w",
-			branch, buildDir, err)
+	if err := fetchCheckout(ctx, executor, buildDir, branch, commit, out); err != nil {
+		return err
 	}
 
 	appCfg, err := config.LoadApp(buildDir)
@@ -695,6 +707,56 @@ func triggerAutoDeploy(ctx context.Context, executor ssh.Executor, app, branch, 
 	// the attempt that keys this deploy's env/TLS artifacts (F08).
 	att := releasemeta.MustAttempt(app, version)
 	return deployBuiltImageFenced(ctx, executor, appCfg, image, version, "localhost", false, needsBuild, lk, &att)
+}
+
+// fetchCheckout advances buildDir's origin and resets the worktree to the
+// commit the delivery authenticated, or to the branch tip when no commit is
+// known (C02: a delivery for commit A never silently builds whatever the
+// moving branch points at by fetch time). The two modes are stated in the
+// deploy output so the operator can see which ran.
+//
+// Pinning strategy: fetch the branch (brings the tip and its reachable
+// history), then best-effort fetch the commit SHA itself — on servers that
+// allow SHA fetches (GitHub, GitLab) this also pulls commits no longer
+// reachable from the tip after a force-push — then VERIFY the commit is
+// present as a commit object before resetting to it. When the commit cannot
+// be brought in at all (force-pushed away and garbage-collected, or the
+// server rejects SHA fetches), the deploy fails loudly naming both the
+// authenticated commit and where the branch is now; it never silently
+// falls back to the tip.
+func fetchCheckout(ctx context.Context, executor ssh.Executor, buildDir, branch, commit string, out io.Writer) error {
+	cd := "cd " + ssh.ShellQuote(buildDir) + " && "
+	if _, err := executor.Run(ctx, cd+"git fetch origin "+ssh.ShellQuote(branch)); err != nil {
+		return fmt.Errorf("fetching %s (is %s a valid git checkout with a fetchable 'origin' remote? this must exist before the first webhook-triggered deploy — see `teploy deploy`'s server-build mode, or clone it manually): %w",
+			branch, buildDir, err)
+	}
+	if commit == "" {
+		fmt.Fprintf(out, "Deploying tip of %s\n", branch)
+		if _, err := executor.Run(ctx, cd+"git reset --hard "+ssh.ShellQuote("origin/"+branch)); err != nil {
+			return fmt.Errorf("resetting %s to origin/%s: %w", buildDir, branch, err)
+		}
+		return nil
+	}
+
+	fmt.Fprintf(out, "Deploying %s from delivery (branch %s)\n", commit, branch)
+	// Best-effort direct fetch of the authenticated commit: failure is
+	// fine (many servers refuse SHA fetches) — the branch fetch above
+	// already brought everything reachable from the tip, and existence
+	// is verified before the reset either way.
+	_, _ = executor.Run(ctx, cd+"git fetch origin "+ssh.ShellQuote(commit))
+	if _, err := executor.Run(ctx, cd+"git cat-file -e "+ssh.ShellQuote(commit+"^{commit}")); err != nil {
+		tip, tipErr := executor.Run(ctx, cd+"git rev-parse "+ssh.ShellQuote("origin/"+branch))
+		tip = strings.TrimSpace(tip)
+		if tipErr != nil || tip == "" {
+			tip = "<unknown>"
+		}
+		return fmt.Errorf("the delivery's authenticated commit %s cannot be fetched from origin (branch %s is now at %s — the commit was force-pushed away or removed); refusing to deploy the moved tip instead. Re-push the commit or trigger a fresh deploy: %w",
+			commit, branch, tip, err)
+	}
+	if _, err := executor.Run(ctx, cd+"git reset --hard "+ssh.ShellQuote(commit)); err != nil {
+		return fmt.Errorf("resetting %s to authenticated commit %s: %w", buildDir, commit, err)
+	}
+	return nil
 }
 
 // resolveTLSFromRoot returns a COPY of tls with relative cert/key paths

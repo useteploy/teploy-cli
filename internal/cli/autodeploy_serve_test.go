@@ -77,7 +77,7 @@ func (c *countingRun) blocking(block chan struct{}) *countingRun {
 	return c
 }
 
-func (c *countingRun) run(_ []string, _ bool) {
+func (c *countingRun) run(_ []string, _ bool, _ string) {
 	c.mu.Lock()
 	c.calls = append(c.calls, time.Now())
 	block := c.block
@@ -119,7 +119,7 @@ func (c *countingRun) waitIdle(t *testing.T, q *admissionQueue) {
 
 // newAdmissionStack wires a handler + queue + ledger with an injectable
 // deploy runner, the shape runAutoDeployServe uses.
-func newAdmissionStack(secret, branch, app string, run func([]string, bool)) (http.HandlerFunc, *memLedger, *admissionQueue) {
+func newAdmissionStack(secret, branch, app string, run func([]string, bool, string)) (http.HandlerFunc, *memLedger, *admissionQueue) {
 	ledger := &memLedger{}
 	queue := newAdmissionQueue(ledger, run, func(string, ...any) {})
 	handler := newWebhookHandler(webhookHandlerConfig{
@@ -433,4 +433,72 @@ func TestResolveTLSFromRoot(t *testing.T) {
 	if in.Cert != "certs/app.crt" {
 		t.Errorf("input TLSConfig mutated: %+v", in)
 	}
+}
+
+// TestWebhookHandler_ThreadsCommitToTrigger (C02): the commit the payload
+// authenticates must reach BOTH the durable admission record and the deploy
+// trigger — the delivery is bound to its commit end to end.
+func TestWebhookHandler_ThreadsCommitToTrigger(t *testing.T) {
+	var gotCommit string
+	var gotMu sync.Mutex
+	run := func(_ []string, _ bool, commit string) {
+		gotMu.Lock()
+		gotCommit = commit
+		gotMu.Unlock()
+	}
+	handler, ledger, queue := newAdmissionStack("s3cret", "main", "myapp", run)
+
+	const sha = "0123456789abcdef0123456789abcdef01234567"
+	postSigned(t, handler, "s3cret", "delivery-1", `{"ref":"refs/heads/main","after":"`+sha+`"}`)
+	waitQueueIdle(t, queue)
+
+	admitted := ledger.byKind(autodeploy.AdmissionKindAdmitted)
+	if len(admitted) != 1 {
+		t.Fatalf("admitted records = %d, want 1", len(admitted))
+	}
+	if admitted[0].Commit != sha {
+		t.Errorf("admission record commit = %q, want %q", admitted[0].Commit, sha)
+	}
+	gotMu.Lock()
+	defer gotMu.Unlock()
+	if gotCommit != sha {
+		t.Errorf("deploy trigger received commit %q, want %q", gotCommit, sha)
+	}
+}
+
+// A delivery with NO usable commit still deploys — pinned to nothing (tip),
+// stated as such to the trigger.
+func TestWebhookHandler_NoCommitMeansTip(t *testing.T) {
+	var gotCommit string
+	var gotMu sync.Mutex
+	run := func(_ []string, _ bool, commit string) {
+		gotMu.Lock()
+		gotCommit = commit
+		gotMu.Unlock()
+	}
+	handler, _, queue := newAdmissionStack("s3cret", "main", "myapp", run)
+
+	postSigned(t, handler, "s3cret", "delivery-1", `{"ref":"refs/heads/main"}`)
+	waitQueueIdle(t, queue)
+
+	gotMu.Lock()
+	defer gotMu.Unlock()
+	if gotCommit != "" {
+		t.Errorf("payload without a commit pinned trigger to %q, want empty (tip)", gotCommit)
+	}
+}
+
+// waitQueueIdle blocks until the admission queue has no worker and no
+// pending slot (for tests whose run func is not a countingRun).
+func waitQueueIdle(t *testing.T, q *admissionQueue) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		workerLive, pending := q.snapshot()
+		if !workerLive && pending == nil {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatal("queue did not drain to idle within timeout")
 }
