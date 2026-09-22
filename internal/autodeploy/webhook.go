@@ -88,6 +88,28 @@ func (d *DeliveryDedup) SeenAndRecord(id string) bool {
 	return false
 }
 
+// RecordOnly records id as seen without reporting (used when reseeding the
+// dedup set from the durable admission ledger on restart — those events
+// were already admitted, so their digests must read as replays).
+func (d *DeliveryDedup) RecordOnly(id string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if _, ok := d.seen[id]; !ok {
+		d.seen[id] = time.Now()
+	}
+}
+
+// Unrecord removes id from the seen set — the rollback half of an
+// admission that failed to persist: the provider will retry the same
+// signed body, and that retry must go through admission again instead of
+// being swallowed as a replay of something that was never durably
+// admitted (C02).
+func (d *DeliveryDedup) Unrecord(id string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	delete(d.seen, id)
+}
+
 // Snapshot returns a JSON-serializable copy for persisting across process
 // restarts (see LoadDeliveryDedup).
 func (d *DeliveryDedup) Snapshot() ([]byte, error) {

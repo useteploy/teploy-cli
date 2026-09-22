@@ -7,7 +7,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/useteploy/teploy/internal/autodeploy"
 	"github.com/useteploy/teploy/internal/config"
@@ -19,45 +21,162 @@ func githubSign(secret string, body []byte) string {
 	return "sha256=" + hex.EncodeToString(mac.Sum(nil))
 }
 
+// memLedger is an in-memory LedgerAppender for handler tests: records every
+// append, optionally fails.
+type memLedger struct {
+	mu      sync.Mutex
+	records []autodeploy.AdmissionRecord
+	fail    error
+}
+
+func (m *memLedger) Append(rec autodeploy.AdmissionRecord) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.fail != nil {
+		return m.fail
+	}
+	m.records = append(m.records, rec)
+	return nil
+}
+
+func (m *memLedger) snapshot() []autodeploy.AdmissionRecord {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]autodeploy.AdmissionRecord, len(m.records))
+	copy(out, m.records)
+	return out
+}
+
+func (m *memLedger) byKind(kind string) []autodeploy.AdmissionRecord {
+	var out []autodeploy.AdmissionRecord
+	for _, rec := range m.snapshot() {
+		if rec.Kind == kind {
+			out = append(out, rec)
+		}
+	}
+	return out
+}
+
+// countingRun records deploy invocations. Each entry signals started
+// (the deploy was entered — even if it then blocks) and each completion
+// signals done.
+type countingRun struct {
+	mu      sync.Mutex
+	calls   []time.Time
+	started chan struct{}
+	done    chan struct{}
+	block   chan struct{} // non-nil: each call blocks until closed
+}
+
+func newCountingRun() *countingRun {
+	return &countingRun{started: make(chan struct{}, 64), done: make(chan struct{}, 64)}
+}
+
+func (c *countingRun) blocking(block chan struct{}) *countingRun {
+	c.block = block
+	return c
+}
+
+func (c *countingRun) run(_ []string, _ bool) {
+	c.mu.Lock()
+	c.calls = append(c.calls, time.Now())
+	block := c.block
+	c.mu.Unlock()
+	c.started <- struct{}{}
+	if block != nil {
+		<-block
+	}
+	c.done <- struct{}{}
+}
+
+func (c *countingRun) count() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.calls)
+}
+
+func (c *countingRun) waitCall(t *testing.T) {
+	t.Helper()
+	select {
+	case <-c.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for a deploy invocation")
+	}
+}
+
+func (c *countingRun) waitIdle(t *testing.T, q *admissionQueue) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		workerLive, pending := q.snapshot()
+		if !workerLive && pending == nil {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatal("queue did not drain to idle within timeout")
+}
+
+// newAdmissionStack wires a handler + queue + ledger with an injectable
+// deploy runner, the shape runAutoDeployServe uses.
+func newAdmissionStack(secret, branch, app string, run func([]string, bool)) (http.HandlerFunc, *memLedger, *admissionQueue) {
+	ledger := &memLedger{}
+	queue := newAdmissionQueue(ledger, run, func(string, ...any) {})
+	handler := newWebhookHandler(webhookHandlerConfig{
+		secret: secret,
+		branch: branch,
+		app:    app,
+		dedup:  autodeploy.NewDeliveryDedup(),
+		ledger: ledger,
+		queue:  queue,
+		logf:   func(string, ...any) {},
+	})
+	return handler, ledger, queue
+}
+
+func postSigned(t *testing.T, handler http.HandlerFunc, secret, delivery, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body))
+	req.Header.Set("X-Hub-Signature-256", githubSign(secret, []byte(body)))
+	if delivery != "" {
+		req.Header.Set("X-GitHub-Delivery", delivery)
+	}
+	rec := httptest.NewRecorder()
+	handler(rec, req)
+	return rec
+}
+
 // TestWebhookHandler_ValidSignatureTriggersDeployOnce is the direct
 // regression test for the old autodeploy's worst bug: the generated bash
 // listener verified the signature correctly but never called anything
 // resembling a real deploy — it only built an image and stopped. This
-// confirms a valid, well-formed webhook actually calls trigger exactly
-// once.
+// confirms a valid, well-formed webhook is durably admitted and runs the
+// deploy exactly once.
 func TestWebhookHandler_ValidSignatureTriggersDeployOnce(t *testing.T) {
-	secret := "s3cret"
-	body := []byte(`{"ref":"refs/heads/main"}`)
-	triggerCount := 0
+	run := newCountingRun()
+	handler, ledger, queue := newAdmissionStack("s3cret", "", "myapp", run.run)
 
-	handler := newWebhookHandler(webhookHandlerConfig{
-		secret:  secret,
-		dedup:   autodeploy.NewDeliveryDedup(),
-		trigger: func(_ []string, _ bool) { triggerCount++ },
-	})
-
-	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(string(body)))
-	req.Header.Set("X-Hub-Signature-256", githubSign(secret, body))
-	req.Header.Set("X-GitHub-Delivery", "delivery-1")
-	rec := httptest.NewRecorder()
-
-	handler(rec, req)
+	rec := postSigned(t, handler, "s3cret", "delivery-1", `{"ref":"refs/heads/main"}`)
 
 	if rec.Code != http.StatusOK {
 		t.Errorf("status = %d, want 200", rec.Code)
 	}
-	if triggerCount != 1 {
-		t.Errorf("trigger called %d times, want 1", triggerCount)
+	run.waitCall(t)
+	run.waitIdle(t, queue)
+	if run.count() != 1 {
+		t.Errorf("deploy ran %d times, want 1", run.count())
+	}
+	if got := len(ledger.byKind(autodeploy.AdmissionKindAdmitted)); got != 1 {
+		t.Errorf("admitted records = %d, want 1", got)
+	}
+	if got := len(ledger.byKind(autodeploy.AdmissionKindProcessed)); got != 1 {
+		t.Errorf("processed records = %d, want 1", got)
 	}
 }
 
 func TestWebhookHandler_InvalidSignatureNeverTriggers(t *testing.T) {
-	triggered := false
-	handler := newWebhookHandler(webhookHandlerConfig{
-		secret:  "s3cret",
-		dedup:   autodeploy.NewDeliveryDedup(),
-		trigger: func(_ []string, _ bool) { triggered = true },
-	})
+	run := newCountingRun()
+	handler, _, _ := newAdmissionStack("s3cret", "", "myapp", run.run)
 
 	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"ref":"refs/heads/main"}`))
 	req.Header.Set("X-Hub-Signature-256", "sha256=0000000000000000000000000000000000000000000000000000000000000000")
@@ -68,18 +187,14 @@ func TestWebhookHandler_InvalidSignatureNeverTriggers(t *testing.T) {
 	if rec.Code != http.StatusUnauthorized {
 		t.Errorf("status = %d, want 401", rec.Code)
 	}
-	if triggered {
+	if run.count() != 0 {
 		t.Error("an invalid signature must never trigger a deploy")
 	}
 }
 
 func TestWebhookHandler_NoSignatureNeverTriggers(t *testing.T) {
-	triggered := false
-	handler := newWebhookHandler(webhookHandlerConfig{
-		secret:  "s3cret",
-		dedup:   autodeploy.NewDeliveryDedup(),
-		trigger: func(_ []string, _ bool) { triggered = true },
-	})
+	run := newCountingRun()
+	handler, _, _ := newAdmissionStack("s3cret", "", "myapp", run.run)
 
 	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{}`))
 	rec := httptest.NewRecorder()
@@ -89,7 +204,7 @@ func TestWebhookHandler_NoSignatureNeverTriggers(t *testing.T) {
 	if rec.Code != http.StatusUnauthorized {
 		t.Errorf("status = %d, want 401", rec.Code)
 	}
-	if triggered {
+	if run.count() != 0 {
 		t.Error("a request with no signature header must never trigger a deploy")
 	}
 }
@@ -99,67 +214,52 @@ func TestWebhookHandler_NoSignatureNeverTriggers(t *testing.T) {
 // valid payload+signature could be replayed indefinitely to re-trigger
 // deploys.
 func TestWebhookHandler_ReplayedDeliveryIgnored(t *testing.T) {
-	secret := "s3cret"
-	body := []byte(`{"ref":"refs/heads/main"}`)
-	triggerCount := 0
-	dedup := autodeploy.NewDeliveryDedup()
+	run := newCountingRun()
+	handler, _, queue := newAdmissionStack("s3cret", "", "myapp", run.run)
 
-	handler := newWebhookHandler(webhookHandlerConfig{
-		secret:  secret,
-		dedup:   dedup,
-		trigger: func(_ []string, _ bool) { triggerCount++ },
-	})
+	rec1 := postSigned(t, handler, "s3cret", "delivery-1", `{"ref":"refs/heads/main"}`)
+	rec2 := postSigned(t, handler, "s3cret", "delivery-1", `{"ref":"refs/heads/main"}`)
 
-	makeReq := func() *http.Request {
-		req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(string(body)))
-		req.Header.Set("X-Hub-Signature-256", githubSign(secret, body))
-		req.Header.Set("X-GitHub-Delivery", "delivery-1")
-		return req
-	}
-
-	handler(httptest.NewRecorder(), makeReq())
-	rec2 := httptest.NewRecorder()
-	handler(rec2, makeReq())
-
-	if triggerCount != 1 {
-		t.Errorf("trigger called %d times across a replayed delivery, want 1", triggerCount)
+	run.waitCall(t)
+	run.waitIdle(t, queue)
+	if run.count() != 1 {
+		t.Errorf("deploy ran %d times across a replayed delivery, want 1", run.count())
 	}
 	// A replay is a no-op, not a rejection — provider shouldn't retry harder.
 	if rec2.Code != http.StatusOK {
 		t.Errorf("replayed delivery status = %d, want 200 (no-op, not a failure)", rec2.Code)
 	}
+	if !strings.Contains(rec2.Body.String(), `"duplicate"`) {
+		t.Errorf("replayed delivery body = %q, want duplicate status", rec2.Body.String())
+	}
+	if rec1.Code != http.StatusOK {
+		t.Errorf("first delivery status = %d, want 200", rec1.Code)
+	}
 }
 
 func TestWebhookHandler_GitLabToken(t *testing.T) {
-	secret := "s3cret"
-	triggerCount := 0
-	handler := newWebhookHandler(webhookHandlerConfig{
-		secret:  secret,
-		dedup:   autodeploy.NewDeliveryDedup(),
-		trigger: func(_ []string, _ bool) { triggerCount++ },
-	})
+	run := newCountingRun()
+	handler, _, queue := newAdmissionStack("s3cret", "", "myapp", run.run)
 
 	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"ref":"refs/heads/main"}`))
-	req.Header.Set("X-Gitlab-Token", secret)
+	req.Header.Set("X-Gitlab-Token", "s3cret")
 	rec := httptest.NewRecorder()
 
 	handler(rec, req)
+	run.waitCall(t)
+	run.waitIdle(t, queue)
 
 	if rec.Code != http.StatusOK {
 		t.Errorf("status = %d, want 200", rec.Code)
 	}
-	if triggerCount != 1 {
-		t.Errorf("trigger called %d times, want 1", triggerCount)
+	if run.count() != 1 {
+		t.Errorf("deploy ran %d times, want 1", run.count())
 	}
 }
 
 func TestWebhookHandler_GitLabWrongToken(t *testing.T) {
-	triggered := false
-	handler := newWebhookHandler(webhookHandlerConfig{
-		secret:  "s3cret",
-		dedup:   autodeploy.NewDeliveryDedup(),
-		trigger: func(_ []string, _ bool) { triggered = true },
-	})
+	run := newCountingRun()
+	handler, _, _ := newAdmissionStack("s3cret", "", "myapp", run.run)
 
 	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{}`))
 	req.Header.Set("X-Gitlab-Token", "wrong")
@@ -170,18 +270,14 @@ func TestWebhookHandler_GitLabWrongToken(t *testing.T) {
 	if rec.Code != http.StatusUnauthorized {
 		t.Errorf("status = %d, want 401", rec.Code)
 	}
-	if triggered {
+	if run.count() != 0 {
 		t.Error("wrong GitLab token must never trigger a deploy")
 	}
 }
 
 func TestWebhookHandler_RejectsNonPOST(t *testing.T) {
-	triggered := false
-	handler := newWebhookHandler(webhookHandlerConfig{
-		secret:  "s3cret",
-		dedup:   autodeploy.NewDeliveryDedup(),
-		trigger: func(_ []string, _ bool) { triggered = true },
-	})
+	run := newCountingRun()
+	handler, _, _ := newAdmissionStack("s3cret", "", "myapp", run.run)
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	rec := httptest.NewRecorder()
@@ -191,31 +287,48 @@ func TestWebhookHandler_RejectsNonPOST(t *testing.T) {
 	if rec.Code != http.StatusMethodNotAllowed {
 		t.Errorf("status = %d, want 405", rec.Code)
 	}
-	if triggered {
+	if run.count() != 0 {
 		t.Error("a GET request must never trigger a deploy")
 	}
 }
 
-func TestWebhookHandler_OnDedupChangedCalledOnNewDelivery(t *testing.T) {
-	secret := "s3cret"
-	body := []byte(`{}`)
+// TestWebhookHandler_OnDedupChangedCalledAfterDurableAdmission pins the
+// C02 ordering: the dedup snapshot persist fires only after the admission
+// is durable, so a dedup entry on disk always corresponds to a ledger
+// admission. Non-push events (pings, other branches) are acknowledged
+// without persisting dedup — their replay after a restart is a harmless
+// no-op ack, never a lost deploy.
+func TestWebhookHandler_OnDedupChangedCalledAfterDurableAdmission(t *testing.T) {
+	run := newCountingRun()
+	ledger := &memLedger{}
+	queue := newAdmissionQueue(ledger, run.run, func(string, ...any) {})
 	changedCount := 0
-
 	handler := newWebhookHandler(webhookHandlerConfig{
-		secret:         secret,
+		secret:         "s3cret",
+		branch:         "main",
+		app:            "myapp",
 		dedup:          autodeploy.NewDeliveryDedup(),
-		trigger:        func(_ []string, _ bool) {},
+		ledger:         ledger,
+		queue:          queue,
+		logf:           func(string, ...any) {},
 		onDedupChanged: func() { changedCount++ },
 	})
 
-	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(string(body)))
-	req.Header.Set("X-Hub-Signature-256", githubSign(secret, body))
-	req.Header.Set("X-GitHub-Delivery", "delivery-1")
-
-	handler(httptest.NewRecorder(), req)
+	postSigned(t, handler, "s3cret", "delivery-1", `{"ref":"refs/heads/main","after":"a"}`)
 	if changedCount != 1 {
-		t.Errorf("onDedupChanged called %d times, want 1", changedCount)
+		t.Errorf("onDedupChanged called %d times after durable admission, want 1", changedCount)
 	}
+	if got := len(ledger.byKind(autodeploy.AdmissionKindAdmitted)); got != 1 {
+		t.Errorf("admitted = %d before onDedupChanged fired, want 1 (persist follows durability)", got)
+	}
+
+	// A ping is acknowledged but never persisted to dedup (no admission).
+	changedCount = 0
+	postSigned(t, handler, "s3cret", "delivery-2", `{}`)
+	if changedCount != 0 {
+		t.Errorf("onDedupChanged fired %d times for a ping, want 0", changedCount)
+	}
+	run.waitIdle(t, queue)
 }
 
 // audit F40: only a push to the WATCHED branch may trigger a deploy. A ping,
@@ -223,7 +336,6 @@ func TestWebhookHandler_OnDedupChangedCalledOnNewDelivery(t *testing.T) {
 // acknowledged no-ops — each used to deploy the watched branch's current
 // state with an unrelated changed-file list.
 func TestWebhookHandler_OnlyWatchedBranchPushes(t *testing.T) {
-	secret := "s3cret"
 	cases := []struct {
 		name string
 		body string
@@ -237,20 +349,18 @@ func TestWebhookHandler_OnlyWatchedBranchPushes(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			triggered := false
-			handler := newWebhookHandler(webhookHandlerConfig{
-				secret:  secret,
-				branch:  "main",
-				dedup:   autodeploy.NewDeliveryDedup(),
-				trigger: func(_ []string, _ bool) { triggered = true },
-			})
-			body := []byte(tc.body)
-			req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(tc.body))
-			req.Header.Set("X-Hub-Signature-256", githubSign(secret, body))
-			rec := httptest.NewRecorder()
-			handler(rec, req)
-			if triggered != tc.want {
-				t.Errorf("triggered = %v, want %v (status %d)", triggered, tc.want, rec.Code)
+			run := newCountingRun()
+			handler, ledger, queue := newAdmissionStack("s3cret", "main", "myapp", run.run)
+			postSigned(t, handler, "s3cret", "", tc.body)
+			if tc.want {
+				run.waitCall(t)
+			}
+			run.waitIdle(t, queue)
+			if got := run.count() > 0; got != tc.want {
+				t.Errorf("deploy ran = %v, want %v", got, tc.want)
+			}
+			if got := len(ledger.byKind(autodeploy.AdmissionKindAdmitted)) > 0; got != tc.want {
+				t.Errorf("admitted = %v, want %v", got, tc.want)
 			}
 		})
 	}
@@ -260,40 +370,25 @@ func TestWebhookHandler_OnlyWatchedBranchPushes(t *testing.T) {
 // captured signed body under a FRESH delivery ID used to bypass the dedup.
 // Dedup must be keyed on the authenticated content digest.
 func TestWebhookHandler_ContentReplayRejected(t *testing.T) {
-	secret := "s3cret"
-	body := []byte(`{"ref":"refs/heads/main"}`)
-	triggerCount := 0
-	handler := newWebhookHandler(webhookHandlerConfig{
-		secret: secret,
-		branch: "main",
-		dedup:  autodeploy.NewDeliveryDedup(),
-		trigger: func(_ []string, _ bool) {
-			triggerCount++
-		},
-	})
+	run := newCountingRun()
+	handler, _, queue := newAdmissionStack("s3cret", "main", "myapp", run.run)
+	body := `{"ref":"refs/heads/main"}`
 
-	send := func(delivery string) *httptest.ResponseRecorder {
-		req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(string(body)))
-		req.Header.Set("X-Hub-Signature-256", githubSign(secret, body))
-		if delivery != "" {
-			req.Header.Set("X-GitHub-Delivery", delivery)
-		}
-		rec := httptest.NewRecorder()
-		handler(rec, req)
-		return rec
+	if rec := postSigned(t, handler, "s3cret", "delivery-1", body); rec.Code != http.StatusOK {
+		t.Fatalf("first delivery status = %d, want 200", rec.Code)
 	}
-
-	send("delivery-1")
+	run.waitCall(t)
 	// Same signed body, different delivery ID → replay, no second deploy.
-	if rec := send("delivery-2"); rec.Code != http.StatusOK {
+	if rec := postSigned(t, handler, "s3cret", "delivery-2", body); rec.Code != http.StatusOK {
 		t.Errorf("content replay should be a 200 no-op, got %d", rec.Code)
 	}
 	// Same signed body, NO delivery header at all → still a replay.
-	if rec := send(""); rec.Code != http.StatusOK {
+	if rec := postSigned(t, handler, "s3cret", "", body); rec.Code != http.StatusOK {
 		t.Errorf("headerless content replay should be a 200 no-op, got %d", rec.Code)
 	}
-	if triggerCount != 1 {
-		t.Errorf("trigger called %d times for one unique signed body, want 1", triggerCount)
+	run.waitIdle(t, queue)
+	if run.count() != 1 {
+		t.Errorf("deploy ran %d times for one unique signed body, want 1", run.count())
 	}
 }
 
@@ -303,33 +398,22 @@ func TestWebhookHandler_ContentReplayRejected(t *testing.T) {
 // a different signed body is a new event, and only content dedup decides
 // replays.
 func TestWebhookHandler_ReusedDeliveryIDDifferentContentNotSuppressed(t *testing.T) {
-	secret := "s3cret"
-	body1 := []byte(`{"ref":"refs/heads/main","after":"aaaa"}`)
-	body2 := []byte(`{"ref":"refs/heads/main","after":"bbbb"}`)
-	triggerCount := 0
-	handler := newWebhookHandler(webhookHandlerConfig{
-		secret: secret,
-		dedup:  autodeploy.NewDeliveryDedup(),
-		logf:   func(string, ...any) {},
-		trigger: func(_ []string, _ bool) {
-			triggerCount++
-		},
-	})
-	post := func(body []byte) {
-		req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(string(body)))
-		req.Header.Set("X-Hub-Signature-256", githubSign(secret, body))
-		req.Header.Set("X-GitHub-Delivery", "same-delivery-id")
-		handler(httptest.NewRecorder(), req)
-	}
-	post(body1)
-	post(body2)
-	if triggerCount != 2 {
-		t.Errorf("distinct authenticated content under a reused delivery ID must both deploy, got %d", triggerCount)
+	run := newCountingRun()
+	handler, _, queue := newAdmissionStack("s3cret", "", "myapp", run.run)
+
+	postSigned(t, handler, "s3cret", "same-delivery-id", `{"ref":"refs/heads/main","after":"aaaa"}`)
+	run.waitCall(t)
+	postSigned(t, handler, "s3cret", "same-delivery-id", `{"ref":"refs/heads/main","after":"bbbb"}`)
+	run.waitCall(t)
+	run.waitIdle(t, queue)
+	if run.count() != 2 {
+		t.Errorf("distinct authenticated content under a reused delivery ID must both deploy, got %d", run.count())
 	}
 	// The SAME content replays to a no-op regardless of the header.
-	post(body1)
-	if triggerCount != 2 {
-		t.Errorf("replayed content must be a no-op, got %d", triggerCount)
+	postSigned(t, handler, "s3cret", "same-delivery-id", `{"ref":"refs/heads/main","after":"aaaa"}`)
+	run.waitIdle(t, queue)
+	if run.count() != 2 {
+		t.Errorf("replayed content must be a no-op, got %d", run.count())
 	}
 }
 

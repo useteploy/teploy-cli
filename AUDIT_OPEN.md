@@ -1072,3 +1072,103 @@ precede rescheduling). Existing installed scripts keep the old
 behavior until `schedule` is re-run. Webhook admission durability,
 cancel/supersede policy and Dash/CI trigger convergence remain recorded
 C02 scope.
+
+## Product programme slice (2026-09-22, later) — C02: webhook admission durability
+
+The WEBHOOK trigger's admission contract (C02: "durable before
+acknowledgment, bound to the authenticated commit, bounded queueing,
+deduplication, cancel/supersede policy"). Base revision `01ec45c`; changes
+left uncommitted for review. Closes the A34/T24 durable-webhook-queue
+defect and the bounded-admission half of A37/T33 for this trigger path.
+
+**Recon (what was wrong, file:line at base):** the handler verified HMAC,
+checked in-memory dedup (persisted best-effort), and sent 200 with the
+trigger merely STARTED — `internal/cli/autodeploy_serve.go:293` acked
+before anything durable existed; the dedup tmp+rename at :134-141 was
+synchronous but errors were swallowed (a 200 could go out with nothing on
+disk). Worse than pileup: the per-delivery goroutine (:149) called
+`triggerAutoDeploy` → `AcquireLockFenced` (:332), which does NOT block —
+`acquireAutoLock` (state.go:479-516) returns "deploy is already in
+progress" immediately, so **every delivery arriving during a running
+deploy was acked 200 and then silently dropped** (unbounded short-lived
+goroutine spawn, zero queueing). The dedup file records
+`map["content:"+sha256(body)]time.Time` — body digest only, delivery ID
+is log metadata (A36). A serve restart lost every acked-but-unprocessed
+admission (no record existed).
+
+**Landed:**
+
+- **Admission ledger** — `internal/autodeploy/ledger.go`: append-only
+  JSONL at `/deployments/<app>/.autodeploy-ledger.jsonl` (0600, next to
+  the dedup file), one record per line (admitted / superseded / processed
+  carrying id + provider delivery id + authenticated body digest + app +
+  branch + received-at), `FileLedger.Append` = single write + fsync (the
+  sibling+fsync+rename discipline applies to whole-file replacement; an
+  append-only log durably appends). `ParseLedger` ignores a torn FINAL
+  line (crash mid-append = never fsynced = never acked) and fails closed
+  on mid-file corruption or unknown kinds; `FoldAdmissions` folds to
+  pending + digest map; `NewestPending` picks newest per app.
+- **Ack after fsync** — the handler appends the admission record and only
+  then writes 200 `{"status":"admitted","disposition":…}`; a persistence
+  failure rolls the dedup entry back (`DeliveryDedup.Unrecord` — the
+  provider's retry of the same signed body re-runs admission instead of
+  being swallowed as a replay of something never admitted) and answers
+  503 + Retry-After: never ack what isn't durable. Replays answer 200
+  `{"status":"duplicate"}`. The dedup snapshot persist
+  (`onDedupChanged`) moved to AFTER durable admission, so a dedup entry
+  on disk always corresponds to a ledger admission (a ping/tag persisting
+  dedup it never admitted was the subtle loss window; non-push acks are
+  now memory-only — their post-restart replay is a harmless no-op ack).
+- **Bounded queue with supersede** — `admissionQueue`
+  (autodeploy_serve.go): pending work is a RECORD, never a blocked
+  goroutine. One worker (the only deploy runner — replaces the
+  fire-and-forget goroutine), one newest-wins pending slot: idle →
+  `running`; worker busy + slot empty → `queued`; slot filled → the older
+  pending is marked superseded in the ledger (by-id) and replaced
+  (`superseded` disposition). The RUNNING deploy is never cancelled
+  mid-flight (cancellation propagation is deliberately out of scope; the
+  newest deploy runs next instead). Same-digest redelivery while queued =
+  dedup path (`duplicate`).
+- **Restart resume** — `resumeAdmissions` on serve start: fold the
+  ledger, reseed the replay dedup from recent admitted digests (the
+  ledger backstops the best-effort dedup file across the delivery TTL),
+  mark older pendings superseded, admit the newest per app with the
+  changed-file list unrecoverable → filesKnown=false (deploy fail-open,
+  the documented monorepo rule). Processed entries never re-trigger;
+  duplicate delivery ids / digests collapse via newest-wins.
+
+**Evidence** — TDD red against the base handler (both recorded failing):
+10 distinct-body deliveries → 10 trigger calls (want ≤2), and the
+admission response carried no disposition. Green after the rework.
+Mutation check: moving the 200 ahead of the ledger append fails
+`TestAdmission_AckWaitsForFsync` ("response written (status 200) before
+the admission fsync completed"); reverted. New coverage: ack-after-fsync
+ordering (gated ledger + response-flagging writer), persistence-failure
+→ 503 + nothing admitted + retry-after-recovery admitted, supersede (A
+marked superseded-by-B in the ledger, only B runs after the running
+deploy), 10-delivery pileup collapse (1 running / 1 queued / 8
+superseded; exactly 2 deploy invocations), crash-resume (exactly one
+re-trigger; processed never re-triggers; newest-wins over duplicate
+delivery ids; dedup reseeded), FileLedger concurrency/durability,
+torn-tail/corruption parsing, fold/newest/seed units. Gates: `go vet
+./...` clean; `go test ./... -race` all 25 packages ok; gofmt clean on
+touched files (deploy.go/secret_audit.go/update_test.go were unformatted
+at base — left alone).
+
+**Remaining C02 scope (explicitly NOT in this slice):**
+
+- **Commit-pinned builds — still open, verified**: `triggerAutoDeploy`
+  fetches and resets to `origin/<branch>` TIP (autodeploy_serve.go
+  `git fetch origin <b> && git reset --hard origin/<b>`), not the
+  authenticated payload's `after` commit — the tip IS pinned to the
+  remote ref at deploy time, but a push landing between event and fetch
+  deploys the newer commit under the older event's admission. Full
+  pinning = F40/A35/T25 (fetch + worktree checkout of the event commit).
+- **Dash/CI trigger convergence** — teploy-dash and CI-triggered deploys
+  do not go through this admission path; converging them onto the ledger
+  + queue (or the engine trigger generally) is cross-repo work.
+- **Cancellation propagation** — a supersede never interrupts a running
+  deploy; the newest runs next. Mid-deploy cancel is a deliberate
+  non-goal here (the register's stranding posture) and stays open with
+  the graceful-shutdown/bounded-admission remainder of A37/T33 (listener
+  scope, signal-time drain of the worker).
