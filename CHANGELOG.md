@@ -2,6 +2,74 @@
 
 All notable changes to teploy are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.35] - 2026-09-22
+
+### Fixed
+
+- **Compose import no longer loses the application port.** `ports:
+  ['8080:3000']` means container port 3000 bound to host 8080; the
+  importer previously used ports only to pick the web service and
+  discarded them, so the app deployed as `:80`, failed its health check
+  and rolled back. The container port now imports as the application
+  port (with bare ports, IP-prefixed bindings and IPv6 forms supported;
+  non-TCP entries preserved into `publish`), and unsupported grammar —
+  ranges, long-form port objects, multiple distinct container ports,
+  UDP-only services — is refused naming the service and the reason
+  instead of being silently reinterpreted.
+- **Compose import refuses services it cannot faithfully deploy.**
+  Previously a service built from a different context than the app's
+  (`jobs: build ./jobs` next to `web: build ./web`) was silently
+  flattened into a process of the app's image: the wrong code ran under
+  the right command and the import reported success. It is now refused
+  naming the service, its build context and the remediation (shared
+  context, prebuilt image, or teploy.yml). Same-build workers are
+  unaffected. This is a deliberate behavior change: files that imported
+  "successfully" while deploying something other than what they declared
+  now fail fast at import time.
+- **Compose fields are classified instead of silently ignored.** The
+  importer's non-strict YAML parse accepted files using `healthcheck`,
+  `networks`, `secrets`, `configs`, `profiles`, `deploy`, `env_file`,
+  `entrypoint` and security options while dropping their semantics.
+  Now: service healthchecks translate to teploy's `health:` block,
+  no-op values are tolerated, non-default profiles skip the service
+  (matching `docker compose up` semantics), metadata is ignored with
+  reasons, and everything with semantics teploy cannot preserve is
+  rejected naming the service and field. Another deliberate behavior
+  change in the same spirit as above.
+
+### Added
+
+- **Crash-recovery state table for the deploy lifecycle** (design spike
+  for the transaction work): an eight-state lattice with an exhaustive,
+  property-tested disposition function (retry / inspect / compensate /
+  manual) over crash evidence, an ADR mapping it onto the existing
+  fenced-lock and release-record machinery, and an integration-tagged
+  fault harness (`go test -tags integration ./internal/deploy/recovery`
+  with `TEPLOY_FAULT_*` env) that drives a real SSH+Docker host through
+  late-effect-after-owner-death, side-effect-without-receipt and
+  stale-holder scenarios. No deploy behavior changed in this release by
+  this table; it is the specification the recovery work implements
+  against.
+
+## [0.1.34] - 2026-09-11
+
+### Fixed
+
+- Template rendering is YAML-safe with path-keyed generated secrets and
+  a bounded, validated registry fetch; the templates corpus test renders
+  the whole catalog.
+- Homebrew formulas carry a version test block.
+- Deterministic Compose import (sorted web-service selection) and
+  exec-form command quoting that survives the container's `sh -c`
+  re-parse.
+- Registry-port image references parse correctly in backup/restore, and
+  `.env` is archived/restored at its app-level location.
+- Scheduled backups: only the archive just created is uploaded,
+  `--endpoint` applies to every aws call, `%` escapes survive crond, and
+  accessory restore uses a per-invocation temp directory; MySQL
+  dump/restore passes the root password via `MYSQL_PWD` instead of
+  argv.
+
 ## [0.1.33] - 2026-09-01
 
 ### Fixed
