@@ -665,3 +665,923 @@ services:
 		})
 	}
 }
+
+// Compose importer field classification — the declaration of the supported
+// grammar (C05: every supplied field must be preserved, explicitly
+// translated, or rejected; never silently dropped). Before this slice the
+// importer used non-strict yaml.Unmarshal, so every field below was
+// SILENTLY IGNORED: a file using healthcheck, networks, secrets, configs,
+// profiles or deploy imported "successfully" while dropping those
+// semantics.
+//
+//	Field            | Before          | Now
+//	-----------------+-----------------+------------------------------------------
+//	healthcheck      | silently ignored| TRANSLATE for the web service: exec-form
+//	                 |                 | ["CMD","curl"|"wget",...,"http://localhost:
+//	                 |                 | <app-port>/path"] maps the path to
+//	                 |                 | health.path and interval to
+//	                 |                 | health.interval_seconds. disable: true
+//	                 |                 | and test: ["NONE"] map to
+//	                 |                 | healthcheck.web.disable (--no-healthcheck).
+//	                 |                 | Workers: disable/NONE translate to
+//	                 |                 | healthcheck.<process>.disable; other tests
+//	                 |                 | are rejected (teploy has no per-process
+//	                 |                 | HTTP gate). Accessories: ignored — inert
+//	                 |                 | under teploy, which supervises accessories
+//	                 |                 | via --restart always + running-state checks
+//	                 |                 | and never queries docker health. timeout/
+//	                 |                 | retries/start_period are deliberately NOT
+//	                 |                 | translated: compose timeout is per-probe,
+//	                 |                 | teploy's health.timeout_seconds is the total
+//	                 |                 | deploy-gate window (default 30s) — setting
+//	                 |                 | it from a per-probe value would break
+//	                 |                 | slow-starting apps; retries/start_period are
+//	                 |                 | subsumed by that total window.
+//	networks         | silently ignored| TOLERATE exactly the no-op equivalent:
+//	                 |                 | ["default"] or {default: {}} — the implicit
+//	                 |                 | default network compose attaches anyway.
+//	                 |                 | Anything else REJECTED (teploy runs every
+//	                 |                 | container on its own managed network).
+//	restart          | silently ignored| TOLERATE "always"/"unless-stopped" (teploy
+//	                 |                 | runs app containers --restart unless-stopped,
+//	                 |                 | accessories --restart always; the delta for
+//	                 |                 | "always" is only after a manual stop + daemon
+//	                 |                 | restart, which teploy's lifecycle owns).
+//	                 |                 | Everything else ("no", "on-failure", ...)
+//	                 |                 | REJECTED — those change crash semantics.
+//	env_file         | silently ignored| REJECTED: an opaque file reference with
+//	                 |                 | compose-specific interpolation rules the
+//	                 |                 | importer cannot resolve; teploy's env_files
+//	                 |                 | is a deliberate teploy.yml opt-in. Empty
+//	                 |                 | values tolerated.
+//	secrets          | silently ignored| REJECTED (no secret-file model in the
+//	                 |                 | import; empty list tolerated).
+//	configs          | silently ignored| REJECTED (no config-file model in the
+//	                 |                 | import; empty list tolerated).
+//	profiles         | silently ignored| Services under non-default profiles are
+//	                 |                 | SKIPPED entirely, deliberately: `docker
+//	                 |                 | compose up` without --profile does not
+//	                 |                 | deploy them, so importing them would deploy
+//	                 |                 | something compose itself would not.
+//	extends          | silently ignored| REJECTED (inheritance cannot be resolved
+//	                 |                 | losslessly).
+//	deploy           | silently ignored| Only no-op defaults tolerated ({}, or a
+//	                 |                 | block containing just replicas: 1 and/or
+//	                 |                 | mode: replicated — compose defaults).
+//	                 |                 | Everything else (resources, replicas != 1,
+//	                 |                 | mode: global, ...) REJECTED.
+//	labels           | silently ignored| IGNORED — container metadata with no deploy
+//	                 |                 | semantics; teploy manages its own teploy.*
+//	                 |                 | labels for lifecycle.
+//	depends_on       | parsed, unused  | TOLERATED deliberately. Compose semantics
+//	                 |                 | are startup ordering; teploy ensures every
+//	                 |                 | accessory is RUNNING before any app
+//	                 |                 | container starts (cli/deploy.go "Ensure
+//	                 |                 | accessories are running" step 9,
+//	                 |                 | cli/singledeploy.go — sorted, before the
+//	                 |                 | app containers), which honors the common
+//	                 |                 | app-after-db ordering by construction. The
+//	                 |                 | delta: condition: service_healthy /
+//	                 |                 | service_completed_successfully readiness
+//	                 |                 | gates are NOT waited for — the app must
+//	                 |                 | tolerate an unreachable dependency at boot
+//	                 |                 | (teploy's deploy health gate still gates
+//	                 |                 | traffic).
+//	container_name   | silently ignored| REJECTED — teploy owns container naming
+//	                 |                 | ({app}-{process}-{version}) for lifecycle.
+//	hostname         | silently ignored| REJECTED — identity with no model home;
+//	                 |                 | software deriving identity from hostname
+//	                 |                 | would silently change behavior.
+//	working_dir      | silently ignored| REJECTED — no model home (set WORKDIR in
+//	                 |                 | the image).
+//	entrypoint       | silently ignored| REJECTED — no model home (bake into the
+//	                 |                 | image's ENTRYPOINT).
+//	privileged       | silently ignored| false (explicit default) tolerated; true
+//	                 |                 | REJECTED — security-relevant, teploy runs
+//	                 |                 | unprivileged containers.
+//	cap_add          | silently ignored| Empty list tolerated; non-empty REJECTED —
+//	                 |                 | security-relevant capabilities.
+//
+// Fields outside this table (the rest of the Compose spec) are still
+// silently ignored — full Compose breadth remains open under C05.
+func TestLoadCompose_FieldClassificationInventory(t *testing.T) {
+	tests := []struct {
+		name    string
+		compose string
+		wantErr []string // substrings the error must contain; empty = must import
+		check   func(t *testing.T, cfg *AppConfig)
+	}{
+		{
+			name: "healthcheck web translates",
+			compose: `
+services:
+  web:
+    image: example/web:v1
+    ports: ["3000:3000"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/healthz"]
+      interval: 10s
+`,
+			check: func(t *testing.T, cfg *AppConfig) {
+				if cfg.Health.Path != "/healthz" {
+					t.Errorf("health.path = %q, want /healthz", cfg.Health.Path)
+				}
+				if cfg.Health.IntervalSeconds != 10 {
+					t.Errorf("health.interval_seconds = %d, want 10", cfg.Health.IntervalSeconds)
+				}
+			},
+		},
+		{
+			name: "healthcheck web disable translates",
+			compose: `
+services:
+  web:
+    image: example/web:v1
+    ports: ["3000:3000"]
+    healthcheck:
+      disable: true
+`,
+			check: func(t *testing.T, cfg *AppConfig) {
+				if !cfg.Healthcheck["web"].Disable {
+					t.Errorf("healthcheck.web.disable = false, want true")
+				}
+			},
+		},
+		{
+			name: "networks non-default rejected",
+			compose: `
+services:
+  web:
+    image: example/web:v1
+    ports: ["3000:3000"]
+    networks: [frontend]
+`,
+			wantErr: []string{"web", "networks"},
+		},
+		{
+			name: "restart always tolerated",
+			compose: `
+services:
+  web:
+    image: example/web:v1
+    ports: ["3000:3000"]
+    restart: always
+`,
+		},
+		{
+			name: "restart no rejected",
+			compose: `
+services:
+  web:
+    image: example/web:v1
+    ports: ["3000:3000"]
+    restart: "no"
+`,
+			wantErr: []string{"web", "restart"},
+		},
+		{
+			name: "env_file rejected",
+			compose: `
+services:
+  web:
+    image: example/web:v1
+    ports: ["3000:3000"]
+    env_file: .env
+`,
+			wantErr: []string{"web", "env_file"},
+		},
+		{
+			name: "secrets rejected",
+			compose: `
+services:
+  web:
+    image: example/web:v1
+    ports: ["3000:3000"]
+    secrets: [db_password]
+`,
+			wantErr: []string{"web", "secrets"},
+		},
+		{
+			name: "configs rejected",
+			compose: `
+services:
+  web:
+    image: example/web:v1
+    ports: ["3000:3000"]
+    configs: [app_config]
+`,
+			wantErr: []string{"web", "configs"},
+		},
+		{
+			name: "profiles skipped deliberately",
+			compose: `
+services:
+  web:
+    image: example/web:v1
+    ports: ["3000:3000"]
+  migrate:
+    image: migrate/migrate:v4
+    profiles: [tools]
+`,
+			check: func(t *testing.T, cfg *AppConfig) {
+				if _, ok := cfg.Accessories["migrate"]; ok {
+					t.Errorf("profiled service must be skipped, got accessory %v", cfg.Accessories)
+				}
+			},
+		},
+		{
+			name: "extends rejected",
+			compose: `
+services:
+  web:
+    image: example/web:v1
+    ports: ["3000:3000"]
+    extends:
+      service: base
+`,
+			wantErr: []string{"web", "extends"},
+		},
+		{
+			name: "deploy resources rejected",
+			compose: `
+services:
+  web:
+    image: example/web:v1
+    ports: ["3000:3000"]
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+`,
+			wantErr: []string{"web", "deploy"},
+		},
+		{
+			name: "deploy replicas rejected",
+			compose: `
+services:
+  web:
+    image: example/web:v1
+    ports: ["3000:3000"]
+    deploy:
+      replicas: 3
+`,
+			wantErr: []string{"web", "deploy"},
+		},
+		{
+			name: "labels ignored",
+			compose: `
+services:
+  web:
+    image: example/web:v1
+    ports: ["3000:3000"]
+    labels:
+      com.example.team: platform
+`,
+		},
+		{
+			name: "depends_on tolerated",
+			compose: `
+services:
+  web:
+    image: example/web:v1
+    ports: ["3000:3000"]
+    depends_on: [db]
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: pass
+`,
+			check: func(t *testing.T, cfg *AppConfig) {
+				if _, ok := cfg.Accessories["db"]; !ok {
+					t.Fatal("expected db accessory under tolerated depends_on")
+				}
+			},
+		},
+		{
+			name: "container_name rejected",
+			compose: `
+services:
+  web:
+    image: example/web:v1
+    ports: ["3000:3000"]
+    container_name: my-app
+`,
+			wantErr: []string{"web", "container_name"},
+		},
+		{
+			name: "hostname rejected",
+			compose: `
+services:
+  web:
+    image: example/web:v1
+    ports: ["3000:3000"]
+    hostname: app-1
+`,
+			wantErr: []string{"web", "hostname"},
+		},
+		{
+			name: "working_dir rejected",
+			compose: `
+services:
+  web:
+    image: example/web:v1
+    ports: ["3000:3000"]
+    working_dir: /srv/app
+`,
+			wantErr: []string{"web", "working_dir"},
+		},
+		{
+			name: "entrypoint rejected",
+			compose: `
+services:
+  web:
+    image: example/web:v1
+    ports: ["3000:3000"]
+    entrypoint: ["/bin/sh", "-c"]
+`,
+			wantErr: []string{"web", "entrypoint"},
+		},
+		{
+			name: "privileged rejected",
+			compose: `
+services:
+  web:
+    image: example/web:v1
+    ports: ["3000:3000"]
+    privileged: true
+`,
+			wantErr: []string{"web", "privileged"},
+		},
+		{
+			name: "cap_add rejected",
+			compose: `
+services:
+  web:
+    image: example/web:v1
+    ports: ["3000:3000"]
+    cap_add: [NET_ADMIN]
+`,
+			wantErr: []string{"web", "cap_add"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			os.WriteFile(filepath.Join(dir, "docker-compose.yml"), []byte(tt.compose), 0644)
+
+			cfg, err := LoadCompose(dir)
+			if len(tt.wantErr) > 0 {
+				if err == nil {
+					t.Fatalf("expected refusal, imported: %+v", cfg)
+				}
+				for _, sub := range tt.wantErr {
+					if !strings.Contains(err.Error(), sub) {
+						t.Errorf("error must contain %q, got: %v", sub, err)
+					}
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("expected import, got: %v", err)
+			}
+			if cfg == nil {
+				t.Fatal("expected non-nil config")
+			}
+			if tt.check != nil {
+				tt.check(t, cfg)
+			}
+		})
+	}
+}
+
+// TestLoadCompose_TranslatesHealthcheck: the web service's healthcheck has
+// real homes in AppConfig — health.path/interval_seconds for an HTTP probe,
+// healthcheck.<process>.disable for the disabling forms. The translation is
+// narrow on purpose (repo precedent: ParsePublishSpec) — anything the
+// model cannot represent faithfully is refused naming the service.
+func TestLoadCompose_TranslatesHealthcheck(t *testing.T) {
+	tests := []struct {
+		name    string
+		compose string
+		wantErr []string
+		check   func(t *testing.T, cfg *AppConfig)
+	}{
+		{
+			name: "exec curl with interval, timeout deliberately not translated",
+			compose: `
+services:
+  web:
+    image: example/web:v1
+    ports: ["8080:3000"]
+    healthcheck:
+      test: ["CMD", "curl", "-fsSL", "http://localhost:3000/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+`,
+			check: func(t *testing.T, cfg *AppConfig) {
+				if cfg.Health.Path != "/healthz" {
+					t.Errorf("health.path = %q, want /healthz", cfg.Health.Path)
+				}
+				if cfg.Health.IntervalSeconds != 10 {
+					t.Errorf("health.interval_seconds = %d, want 10", cfg.Health.IntervalSeconds)
+				}
+				// compose timeout is per-probe; teploy's timeout_seconds is
+				// the TOTAL deploy-gate window — translating 5s would cap
+				// the whole gate at 5s and break slow starters.
+				if cfg.Health.TimeoutSeconds != 0 {
+					t.Errorf("health.timeout_seconds = %d, want 0 (not translated from compose per-probe timeout)", cfg.Health.TimeoutSeconds)
+				}
+			},
+		},
+		{
+			name: "exec wget spider",
+			compose: `
+services:
+  web:
+    image: example/web:v1
+    ports: ["3000:3000"]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:3000/health"]
+`,
+			check: func(t *testing.T, cfg *AppConfig) {
+				if cfg.Health.Path != "/health" {
+					t.Errorf("health.path = %q, want /health", cfg.Health.Path)
+				}
+			},
+		},
+		{
+			name: "interval as bare seconds number",
+			compose: `
+services:
+  web:
+    image: example/web:v1
+    ports: ["3000:3000"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 10
+`,
+			check: func(t *testing.T, cfg *AppConfig) {
+				if cfg.Health.IntervalSeconds != 10 {
+					t.Errorf("health.interval_seconds = %d, want 10", cfg.Health.IntervalSeconds)
+				}
+			},
+		},
+		{
+			name: "url without path maps to root",
+			compose: `
+services:
+  web:
+    image: example/web:v1
+    ports: ["3000:3000"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000"]
+`,
+			check: func(t *testing.T, cfg *AppConfig) {
+				if cfg.Health.Path != "/" {
+					t.Errorf("health.path = %q, want /", cfg.Health.Path)
+				}
+			},
+		},
+		{
+			name: "test NONE disables",
+			compose: `
+services:
+  web:
+    image: example/web:v1
+    ports: ["3000:3000"]
+    healthcheck:
+      test: ["NONE"]
+`,
+			check: func(t *testing.T, cfg *AppConfig) {
+				if !cfg.Healthcheck["web"].Disable {
+					t.Errorf("healthcheck.web.disable = false, want true")
+				}
+				if cfg.Health.Path != "" {
+					t.Errorf("health.path = %q, want empty under disabled healthcheck", cfg.Health.Path)
+				}
+			},
+		},
+		{
+			name: "worker disable translates to per-process no-healthcheck",
+			compose: `
+services:
+  web:
+    build: .
+    ports: ["3000:3000"]
+  worker:
+    build: .
+    command: npm run worker
+    healthcheck:
+      test: ["NONE"]
+`,
+			check: func(t *testing.T, cfg *AppConfig) {
+				if !cfg.Healthcheck["worker"].Disable {
+					t.Errorf("healthcheck.worker.disable = false, want true")
+				}
+			},
+		},
+		{
+			name: "accessory healthcheck inert",
+			compose: `
+services:
+  web:
+    image: example/web:v1
+    ports: ["3000:3000"]
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: pass
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+`,
+			check: func(t *testing.T, cfg *AppConfig) {
+				if cfg.Health.Path != "" || len(cfg.Healthcheck) != 0 {
+					t.Errorf("accessory healthcheck must be inert, got health=%+v healthcheck=%v", cfg.Health, cfg.Healthcheck)
+				}
+			},
+		},
+		{
+			name: "cmd-shell form refused",
+			compose: `
+services:
+  web:
+    image: example/web:v1
+    ports: ["3000:3000"]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:3000/health || exit 1"]
+`,
+			wantErr: []string{"web", "healthcheck"},
+		},
+		{
+			name: "string test form refused",
+			compose: `
+services:
+  web:
+    image: example/web:v1
+    ports: ["3000:3000"]
+    healthcheck:
+      test: curl -f http://localhost:3000/health
+`,
+			wantErr: []string{"web", "healthcheck"},
+		},
+		{
+			name: "non-http probe refused",
+			compose: `
+services:
+  web:
+    image: example/web:v1
+    ports: ["3000:3000"]
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres"]
+`,
+			wantErr: []string{"web", "healthcheck"},
+		},
+		{
+			name: "wrong port refused",
+			compose: `
+services:
+  web:
+    image: example/web:v1
+    ports: ["8080:3000"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+`,
+			wantErr: []string{"web", "healthcheck", "3000"},
+		},
+		{
+			name: "https refused",
+			compose: `
+services:
+  web:
+    image: example/web:v1
+    ports: ["3000:3000"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "https://localhost:3000/health"]
+`,
+			wantErr: []string{"web", "healthcheck"},
+		},
+		{
+			name: "external host refused",
+			compose: `
+services:
+  web:
+    image: example/web:v1
+    ports: ["3000:3000"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://example.com/health"]
+`,
+			wantErr: []string{"web", "healthcheck"},
+		},
+		{
+			name: "two urls refused",
+			compose: `
+services:
+  web:
+    image: example/web:v1
+    ports: ["3000:3000"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/a", "http://localhost:3000/b"]
+`,
+			wantErr: []string{"web", "healthcheck"},
+		},
+		{
+			name: "query string refused",
+			compose: `
+services:
+  web:
+    image: example/web:v1
+    ports: ["3000:3000"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health?ready"]
+`,
+			wantErr: []string{"web", "healthcheck"},
+		},
+		{
+			name: "sub-second interval refused",
+			compose: `
+services:
+  web:
+    image: example/web:v1
+    ports: ["3000:3000"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 500ms
+`,
+			wantErr: []string{"web", "interval"},
+		},
+		{
+			name: "worker http test refused (no per-process gate)",
+			compose: `
+services:
+  web:
+    build: .
+    ports: ["3000:3000"]
+  worker:
+    build: .
+    command: npm run worker
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+`,
+			wantErr: []string{"worker", "healthcheck"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			os.WriteFile(filepath.Join(dir, "docker-compose.yml"), []byte(tt.compose), 0644)
+
+			cfg, err := LoadCompose(dir)
+			if len(tt.wantErr) > 0 {
+				if err == nil {
+					t.Fatalf("expected refusal, imported: %+v", cfg)
+				}
+				for _, sub := range tt.wantErr {
+					if !strings.Contains(err.Error(), sub) {
+						t.Errorf("error must contain %q, got: %v", sub, err)
+					}
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("expected import, got: %v", err)
+			}
+			if tt.check != nil {
+				tt.check(t, cfg)
+			}
+		})
+	}
+}
+
+// TestLoadCompose_RejectsSemanticFields: fields whose silent loss changes
+// deployment semantics are refused BEFORE any effect, naming the service,
+// the field, why teploy cannot preserve it, and the teploy.yml alternative.
+// Accessory services get the same treatment — a network on postgres is
+// lost exactly as silently as one on web.
+func TestLoadCompose_RejectsSemanticFields(t *testing.T) {
+	tests := []struct {
+		name    string
+		compose string
+		wantErr []string
+	}{
+		{
+			name: "networks on accessory",
+			compose: `
+services:
+  web:
+    image: example/web:v1
+    ports: ["3000:3000"]
+  db:
+    image: postgres:16
+    networks: [backend]
+`,
+			wantErr: []string{"db", "networks"},
+		},
+		{
+			name: "networks map form with alias",
+			compose: `
+services:
+  web:
+    image: example/web:v1
+    ports: ["3000:3000"]
+    networks:
+      default:
+        aliases: [app-1]
+`,
+			wantErr: []string{"web", "networks"},
+		},
+		{
+			name: "secrets on accessory",
+			compose: `
+services:
+  web:
+    image: example/web:v1
+    ports: ["3000:3000"]
+  db:
+    image: postgres:16
+    secrets: [db_cert]
+`,
+			wantErr: []string{"db", "secrets"},
+		},
+		{
+			name: "restart on-failure",
+			compose: `
+services:
+  web:
+    image: example/web:v1
+    ports: ["3000:3000"]
+    restart: on-failure
+`,
+			wantErr: []string{"web", "restart", "on-failure"},
+		},
+		{
+			name: "deploy mode global",
+			compose: `
+services:
+  web:
+    image: example/web:v1
+    ports: ["3000:3000"]
+    deploy:
+      mode: global
+`,
+			wantErr: []string{"web", "deploy"},
+		},
+		{
+			name: "privileged on accessory",
+			compose: `
+services:
+  web:
+    image: example/web:v1
+    ports: ["3000:3000"]
+  sidecar:
+    image: busybox:1
+    privileged: true
+`,
+			wantErr: []string{"sidecar", "privileged"},
+		},
+		{
+			name: "entrypoint string form",
+			compose: `
+services:
+  web:
+    image: example/web:v1
+    ports: ["3000:3000"]
+    entrypoint: /docker-entrypoint.sh
+`,
+			wantErr: []string{"web", "entrypoint"},
+		},
+		{
+			name: "env_file list form",
+			compose: `
+services:
+  web:
+    image: example/web:v1
+    ports: ["3000:3000"]
+    env_file:
+      - .env.shared
+      - .env.local
+`,
+			wantErr: []string{"web", "env_file"},
+		},
+		{
+			name: "extends string form",
+			compose: `
+services:
+  web:
+    image: example/web:v1
+    ports: ["3000:3000"]
+    extends: base
+`,
+			wantErr: []string{"web", "extends"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			os.WriteFile(filepath.Join(dir, "docker-compose.yml"), []byte(tt.compose), 0644)
+
+			cfg, err := LoadCompose(dir)
+			if err == nil {
+				t.Fatalf("expected refusal, imported: %+v", cfg)
+			}
+			if !strings.Contains(err.Error(), "teploy.yml") {
+				t.Errorf("refusal must point at teploy.yml, got: %v", err)
+			}
+			for _, sub := range tt.wantErr {
+				if !strings.Contains(err.Error(), sub) {
+					t.Errorf("error must contain %q, got: %v", sub, err)
+				}
+			}
+		})
+	}
+}
+
+// TestLoadCompose_ToleratesNoOpEquivalents: values that are exact no-ops
+// under Compose semantics import unchanged — this is deliberate
+// tolerance of the DEFAULT case only, not acceptance of the field.
+func TestLoadCompose_ToleratesNoOpEquivalents(t *testing.T) {
+	compose := `
+services:
+  web:
+    image: example/web:v1
+    ports: ["3000:3000"]
+    networks: [default]
+    restart: unless-stopped
+    privileged: false
+    cap_add: []
+    secrets: []
+    configs: []
+    env_file: []
+    deploy:
+      replicas: 1
+      mode: replicated
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: pass
+    networks:
+      default: {}
+    restart: always
+    deploy: {}
+`
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "docker-compose.yml"), []byte(compose), 0644)
+
+	cfg, err := LoadCompose(dir)
+	if err != nil {
+		t.Fatalf("no-op equivalents must import, got: %v", err)
+	}
+	if cfg.Port != 3000 {
+		t.Errorf("port = %d, want 3000", cfg.Port)
+	}
+	if _, ok := cfg.Accessories["db"]; !ok {
+		t.Fatal("expected db accessory")
+	}
+}
+
+// TestLoadCompose_IgnoresMetadataFields: labels and depends_on have no
+// deployment semantics teploy loses — labels are container metadata, and
+// depends_on's startup ordering is honored by construction (accessories
+// are ensured running before any app container starts; see
+// cli/deploy.go "Ensure accessories are running"). The readiness-condition
+// delta is documented in the classification table above.
+func TestLoadCompose_IgnoresMetadataFields(t *testing.T) {
+	compose := `
+services:
+  web:
+    build: .
+    ports: ["3000:3000"]
+    labels:
+      - "com.example.owner=platform"
+      - "com.example.service=web"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: pass
+  redis:
+    image: redis:7
+`
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "docker-compose.yml"), []byte(compose), 0644)
+
+	cfg, err := LoadCompose(dir)
+	if err != nil {
+		t.Fatalf("metadata fields must import, got: %v", err)
+	}
+	if _, ok := cfg.Accessories["db"]; !ok {
+		t.Fatal("expected db accessory")
+	}
+	if _, ok := cfg.Accessories["redis"]; !ok {
+		t.Fatal("expected redis accessory")
+	}
+	if cfg.Processes["web"] != "" || len(cfg.Processes) != 0 {
+		t.Errorf("processes = %v, want collapsed single empty-command web (nil map)", cfg.Processes)
+	}
+}

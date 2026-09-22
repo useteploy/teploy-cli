@@ -808,3 +808,47 @@ intended reason. Real Docker port behavior remains a later journey
 gate (J05); no remote deployment was performed. The preview collision
 and full Compose breadth stay open under the product programme
 (`_internal/TEPLOY_PRODUCT_EXCELLENCE_PROGRAMME_2026-09-21.md` C05/C06).
+
+- **Compose field contract (preserve / translate / reject)** — the
+  C05 defect class removed for the highest-impact fields: the importer
+  decoded with non-strict yaml.Unmarshal, so unknown Compose keys were
+  SILENTLY IGNORED — a file using healthcheck, networks, secrets,
+  configs, profiles, deploy.resources or env_file imported
+  "successfully" while dropping those semantics. The pass is bounded to
+  the inventoried fields; the classification table is declared as the
+  grammar in `TestLoadCompose_FieldClassificationInventory`
+  (compose_test.go) and on the LoadCompose/composeAppPort doc comments.
+
+  | Compose field | Decision |
+  |---|---|
+  | healthcheck | TRANSLATE (web): exec-form `["CMD","curl"/"wget",...,"http://localhost:<app-port>/<path>"]` → `health.path` + `health.interval_seconds`; `disable: true` / `test: ["NONE"]` → `healthcheck.web.disable` (--no-healthcheck). Workers: only the disabling forms translate; other tests rejected (no per-process HTTP gate). Accessories: ignored — inert (teploy supervises via `--restart always` + running-state, never queries docker health). timeout/retries/start_period deliberately NOT translated: compose timeout is per-probe, teploy `health.timeout_seconds` is the TOTAL gate window (translating would break slow starters); retries/start_period subsumed by that window. CMD-SHELL/string forms, non-HTTP probes, wrong port, https, non-localhost hosts, query strings, sub-second intervals: rejected naming the service. |
+  | networks | REJECT except exact no-op (`[default]`, `{default: {}}`) — teploy runs every container on its own managed network |
+  | restart | TOLERATE `always`/`unless-stopped` (teploy runs app containers `--restart unless-stopped`, docker.go; accessories `--restart always`; the `always` delta is only after manual stop + daemon restart, which teploy's lifecycle owns); `no`/`on-failure`/other REJECTED (crash-semantics change) |
+  | env_file | REJECT (opaque file reference with compose-specific interpolation the importer cannot resolve; teploy `env_files` is a deliberate teploy.yml opt-in); empty tolerated |
+  | secrets / configs | REJECT (no model); empty tolerated |
+  | profiles | non-default-profile services SKIPPED entirely — `docker compose up` without `--profile` does not deploy them, so importing them would deploy something compose would not |
+  | extends | REJECT (inheritance not losslessly resolvable) |
+  | deploy | only no-op defaults tolerated (`{}`, `replicas: 1`, `mode: replicated`); resources/replicas≠1/global REJECTED |
+  | labels | IGNORE (container metadata; teploy manages its own teploy.* labels) |
+  | depends_on | TOLERATED deliberately: parsed, unused — teploy ensures every accessory is RUNNING before any app container starts (cli/deploy.go "Ensure accessories are running" step, cli/singledeploy.go), honoring the common ordering by construction; the delta (condition: service_healthy readiness gates not waited for) is documented in the table |
+  | container_name | REJECT (teploy owns naming, {app}-{process}-{version}) |
+  | hostname | REJECT (identity, no home) |
+  | working_dir / entrypoint | REJECT (no model home — bake into the image) |
+  | privileged / cap_add | false/empty tolerated; true/non-empty REJECTED (security-relevant; teploy runs unprivileged containers) |
+
+  Accessories get the same field treatment as web (a network or
+  privileged on postgres is refused exactly like one on web). Evidence:
+  42 new subtests; TDD red recorded (every reject/translate case
+  "imported successfully" against the old importer — the silent-ignore
+  defect demonstrated live), then green after the fix; mutation check —
+  making the healthcheck translation write nothing fails
+  `TestLoadCompose_TranslatesHealthcheck` and the inventory row with
+  `health.path = "", want /healthz` for the intended reason (reverted).
+  All refusals are import-time (LoadCompose is pure; errors propagate
+  through LoadApp fail-closed at deploy).
+
+  Remaining open under C05: full Compose breadth (fields outside the
+  inventory are still silently ignored — KnownFields-style strictness
+  over the whole Compose schema), multi-image build identity,
+  plan/apply. Base revision `566e291`; changes left uncommitted for
+  review.
