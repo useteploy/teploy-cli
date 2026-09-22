@@ -1052,3 +1052,23 @@ destroy-before-recreate stays as-is; expiry timer/automation beyond the
 existing deploy-piggyback prune; config propagation through a preview
 profile; network/secret isolation between previews) and any Dash-side
 changes.
+
+## Product programme slice (2026-09-22) — C02: scheduled redeploys run through the engine
+
+The scheduled-redeploy cron script reconstructed the container from
+docker inspect and did its own stop/rm/run: no lock, no fence, no
+health gate, no release record, no rollback, and a stop-to-start
+downtime window — a second, weaker deploy path next to the engine
+(C02's defect class; the script's own comment deferred this to "a v2").
+The script now performs only the cheap digest pre-check (no-op when
+unchanged) and, when the digest moved, invokes the on-server teploy
+binary's new `autodeploy redeploy` — the exact triggerAutoDeploy path
+(fenced lock, fetch, config load, env resolution, health-gated deploy)
+the webhook listener uses. `teploy autodeploy schedule` gained
+--branch, uploads the server binary, and verifies it supports
+`redeploy` before installing anything (actionable error until a
+release carries it — v0.1.35 does NOT; first release with it must
+precede rescheduling). Existing installed scripts keep the old
+behavior until `schedule` is re-run. Webhook admission durability,
+cancel/supersede policy and Dash/CI trigger convergence remain recorded
+C02 scope.

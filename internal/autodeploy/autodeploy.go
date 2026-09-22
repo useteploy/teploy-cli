@@ -281,7 +281,6 @@ func (m *Manager) allowWebhookPortInFirewall(ctx context.Context, sudo string, p
 	return nil
 }
 
-
 // SetupCaddyRoute persists the webhook route INTO THE CADDYFILE, inside
 // the app's managed site block (see internal/caddy/webhook.go — audit
 // T26/T27). The old runtime admin-API injection lived only in Caddy's
@@ -355,12 +354,18 @@ func (m *Manager) ScheduleStatus(ctx context.Context, app string) (string, error
 // the image referenced by the currently-running container, compares digests,
 // and only recreates the container if the digest changed. No new image, no
 // container restart — quiet no-op.
-func (m *Manager) Schedule(ctx context.Context, app, schedule string) error {
+func (m *Manager) Schedule(ctx context.Context, app, schedule, branch, binaryPath string) error {
 	if app == "" {
 		return fmt.Errorf("app name is required")
 	}
 	if err := ValidateSchedule(schedule); err != nil {
 		return err
+	}
+	if err := ValidateBranch(branch); err != nil {
+		return err
+	}
+	if binaryPath == "" {
+		return fmt.Errorf("teploy binary path is required (the scheduled redeploy invokes the deploy engine on the server)")
 	}
 
 	appDir := fmt.Sprintf("%s/%s", deploymentsDir, app)
@@ -371,7 +376,7 @@ func (m *Manager) Schedule(ctx context.Context, app, schedule string) error {
 	}
 
 	fmt.Fprintln(m.out, "Installing scheduled-redeploy script...")
-	script := generateScheduledRedeployScript(app)
+	script := generateScheduledRedeployScript(app, branch, binaryPath)
 	if err := m.exec.Upload(ctx, strings.NewReader(script), scriptPath, "0755"); err != nil {
 		return fmt.Errorf("uploading scheduled-redeploy script: %w", err)
 	}
@@ -397,7 +402,9 @@ func (m *Manager) Schedule(ctx context.Context, app, schedule string) error {
 
 	fmt.Fprintf(m.out, "Scheduled redeploy installed for %s\n", app)
 	fmt.Fprintf(m.out, "  Schedule: %s\n", schedule)
+	fmt.Fprintf(m.out, "  Branch:   %s\n", branch)
 	fmt.Fprintf(m.out, "  Script:   %s\n", scriptPath)
+	fmt.Fprintf(m.out, "  Engine:   %s autodeploy redeploy (locks, health gate, release record, rollback)\n", binaryPath)
 	fmt.Fprintf(m.out, "  Log:      %s/scheduled-redeploy.log\n", appDir)
 	return nil
 }
@@ -481,25 +488,29 @@ func (m *Manager) Remove(ctx context.Context, app string) error {
 //
 // We keep the same container name on purpose: Caddy's reverse_proxy upstream
 // resolves containers by their network alias / DNS name, and re-using the
-// name avoids a Caddy reconfigure step. The trade-off is a brief downtime
-// window between stop and start (typically 1-3 seconds for Forgejo-class
-// services). True zero-downtime swap belongs in a v2 that runs through
-// teploy deploy on the server side.
-func generateScheduledRedeployScript(app string) string {
+// engine entry. The script only performs the CHEAP part — find the web
+// container, pull its image tag, compare digests, and exit 0 when nothing
+// changed. When the digest DID move it invokes the on-server teploy binary's
+// `autodeploy redeploy`, which runs the exact same fenced, health-gated,
+// release-recorded deploy code as `teploy deploy` and the webhook listener
+// (C02: one execution path for every trigger). The old version of this
+// script reconstructed the container from docker inspect and did its own
+// stop/rm/run — no lock, no health gate, no release record, no rollback,
+// and a stop-to-start downtime window.
+func generateScheduledRedeployScript(app, branch, binaryPath string) string {
 	return fmt.Sprintf(`#!/bin/bash
-# Scheduled redeploy script for %[1]s
-# Pulls the image and recreates the container if (and only if) the digest changed.
+# Scheduled redeploy for %[1]s (branch %[2]s) — digest pre-check, then the full deploy engine.
 set -e
 
-APP=%[1]q
-PROCESS="web"
+APP=%[4]q
+BRANCH=%[5]q
 LOG="/deployments/$APP/scheduled-redeploy.log"
 
 ts() { date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ; }
 
-CONTAINER=$(docker ps --filter "label=teploy.app=$APP" --filter "label=teploy.process=$PROCESS" --format '{{.Names}}' | head -n 1)
+CONTAINER=$(docker ps --filter "label=teploy.app=$APP" --filter "label=teploy.process=web" --format '{{.Names}}' | head -n 1)
 if [ -z "$CONTAINER" ]; then
-    echo "$(ts) [skip] no running container for $APP/$PROCESS" >> "$LOG"
+    echo "$(ts) [skip] no running container for $APP/web" >> "$LOG"
     exit 0
 fi
 
@@ -524,67 +535,9 @@ if [ "$CURRENT_DIGEST" = "$NEW_DIGEST" ]; then
     exit 0
 fi
 
-echo "$(ts) [redeploy] new digest for $IMAGE — recreating $CONTAINER" >> "$LOG"
-
-# Snapshot config from the running container before we tear it down.
-ENV_FILE=$(mktemp)
-docker inspect --format='{{range .Config.Env}}{{println .}}{{end}}' "$CONTAINER" > "$ENV_FILE"
-
-VOL_ARGS=()
-while IFS= read -r line; do
-    [ -z "$line" ] && continue
-    VOL_ARGS+=("-v" "$line")
-done < <(docker inspect --format='{{range .Mounts}}{{if eq .Type "volume"}}{{.Name}}:{{.Destination}}
-{{else if eq .Type "bind"}}{{.Source}}:{{.Destination}}
-{{end}}{{end}}' "$CONTAINER")
-
-LABEL_ARGS=()
-NEW_VERSION=$(date +%%s)
-while IFS= read -r line; do
-    [ -z "$line" ] && continue
-    KEY="${line%%%%=*}"
-    VAL="${line#*=}"
-    if [ "$KEY" = "teploy.version" ]; then
-        VAL="$NEW_VERSION"
-    fi
-    LABEL_ARGS+=("--label" "$KEY=$VAL")
-done < <(docker inspect --format='{{range $k, $v := .Config.Labels}}{{$k}}={{$v}}
-{{end}}' "$CONTAINER")
-
-PORT_ARGS=()
-while IFS= read -r line; do
-    [ -z "$line" ] && continue
-    PORT_ARGS+=("-p" "$line")
-done < <(docker inspect --format='{{range $port, $bindings := .NetworkSettings.Ports}}{{range $bindings}}{{.HostIp}}:{{.HostPort}}:{{$port}}
-{{end}}{{end}}' "$CONTAINER" | sed 's|/tcp||;s|/udp||')
-
-NETWORK=$(docker inspect --format='{{range $n, $v := .NetworkSettings.Networks}}{{$n}}{{end}}' "$CONTAINER" | head -n 1)
-RESTART=$(docker inspect --format='{{.HostConfig.RestartPolicy.Name}}' "$CONTAINER")
-[ -z "$RESTART" ] && RESTART=no
-
-# Tear down the old container.
-docker stop "$CONTAINER" >> "$LOG" 2>&1 || true
-docker rm "$CONTAINER" >> "$LOG" 2>&1 || true
-
-# Recreate with the same name and config + new image.
-NEW_ID=$(docker run -d \
-    --name "$CONTAINER" \
-    --network "${NETWORK:-bridge}" \
-    --restart "$RESTART" \
-    --env-file "$ENV_FILE" \
-    "${LABEL_ARGS[@]}" \
-    "${VOL_ARGS[@]}" \
-    "${PORT_ARGS[@]}" \
-    "$IMAGE" 2>>"$LOG") || {
-        echo "$(ts) [error] docker run failed — container is down" >> "$LOG"
-        rm -f "$ENV_FILE"
-        exit 1
-    }
-
-rm -f "$ENV_FILE"
-
-echo "$(ts) [ok] $CONTAINER redeployed (id=${NEW_ID:0:12} version=$NEW_VERSION)" >> "$LOG"
-`, app)
+echo "$(ts) [redeploy] new digest for $IMAGE — running the deploy engine" >> "$LOG"
+%[3]q autodeploy redeploy --app "$APP" --branch "$BRANCH" >> "$LOG" 2>&1
+`, app, branch, binaryPath, app, branch)
 }
 
 // generateService renders the systemd unit that runs execStart (the full

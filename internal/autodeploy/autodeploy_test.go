@@ -445,7 +445,7 @@ func TestSchedule(t *testing.T) {
 
 	var buf bytes.Buffer
 	mgr := NewManager(mock, &buf)
-	err := mgr.Schedule(context.Background(), "myapp", "0 4 * * 0")
+	err := mgr.Schedule(context.Background(), "myapp", "0 4 * * 0", "main", "/deployments/.bin/teploy")
 	if err != nil {
 		t.Fatalf("Schedule: %v", err)
 	}
@@ -454,17 +454,26 @@ func TestSchedule(t *testing.T) {
 	if !ok {
 		t.Fatal("scheduled-redeploy.sh not uploaded")
 	}
+	// The C02 contract: the cheap digest pre-check stays, but the actual
+	// redeploy runs through the on-server engine — never a script-side
+	// container reconstruction (no docker run/stop/rm).
 	for _, want := range []string{
 		`APP="myapp"`,
+		`BRANCH="main"`,
 		"docker pull",
 		"docker inspect",
 		"teploy.app=$APP",
-		"teploy.process=$PROCESS",
 		"CURRENT_DIGEST",
 		"NEW_DIGEST",
+		`"/deployments/.bin/teploy" autodeploy redeploy --app "$APP" --branch "$BRANCH"`,
 	} {
 		if !strings.Contains(string(script), want) {
 			t.Errorf("scheduled-redeploy.sh missing %q", want)
+		}
+	}
+	for _, forbidden := range []string{"docker run", "docker stop", "docker rm"} {
+		if strings.Contains(string(script), forbidden) {
+			t.Errorf("scheduled-redeploy.sh must not reconstruct containers itself (%q present) — the redeploy goes through the engine", forbidden)
 		}
 	}
 
@@ -474,13 +483,16 @@ func TestSchedule(t *testing.T) {
 	if !strings.Contains(buf.String(), "0 4 * * 0") {
 		t.Error("expected cron schedule in output")
 	}
+	if !strings.Contains(buf.String(), "main") {
+		t.Error("expected branch in output")
+	}
 }
 
 func TestSchedule_RejectsBadCron(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4")
 	mgr := NewManager(mock, &bytes.Buffer{})
 
-	err := mgr.Schedule(context.Background(), "myapp", "0 4 * * 0; echo pwned")
+	err := mgr.Schedule(context.Background(), "myapp", "0 4 * * 0; echo pwned", "main", "/deployments/.bin/teploy")
 	if err == nil {
 		t.Fatal("expected validation error for shell-metachar cron string")
 	}
@@ -490,7 +502,7 @@ func TestSchedule_RejectsEmptyApp(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4")
 	mgr := NewManager(mock, &bytes.Buffer{})
 
-	if err := mgr.Schedule(context.Background(), "", "0 4 * * 0"); err == nil {
+	if err := mgr.Schedule(context.Background(), "", "0 4 * * 0", "main", "/deployments/.bin/teploy"); err == nil {
 		t.Fatal("expected error for empty app name")
 	}
 }
@@ -541,21 +553,44 @@ func TestScheduleStatus_Active(t *testing.T) {
 }
 
 func TestGenerateScheduledRedeployScript(t *testing.T) {
-	script := generateScheduledRedeployScript("myapp")
+	script := generateScheduledRedeployScript("myapp", "release", "/deployments/.bin/teploy")
 	for _, want := range []string{
 		`APP="myapp"`,
-		`PROCESS="web"`,
+		`BRANCH="release"`,
 		"docker pull",
-		"teploy.version",
 		"docker inspect",
-		"docker run -d",
-		"--name \"$CONTAINER\"", // preserve same name to avoid Caddy reconfig
-		"date +%s",              // new version timestamp
+		"CURRENT_DIGEST",
+		"NEW_DIGEST",
+		`"/deployments/.bin/teploy" autodeploy redeploy --app "$APP" --branch "$BRANCH"`,
 		"$(ts) [redeploy]",
 	} {
 		if !strings.Contains(script, want) {
 			t.Errorf("scheduled redeploy script missing %q", want)
 		}
+	}
+	// C02: the script must never reconstruct the container itself — the
+	// redeploy runs through the engine (locks, health gate, records).
+	for _, forbidden := range []string{"docker run", "docker stop", "docker rm"} {
+		if strings.Contains(script, forbidden) {
+			t.Errorf("scheduled redeploy script must not contain %q — container reconstruction bypasses the engine", forbidden)
+		}
+	}
+}
+
+// TestSchedule_RejectsBadBranch: the branch lands inside a server-side
+// script, so an invalid one is refused before anything is installed.
+func TestSchedule_RejectsBadBranch(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4")
+	var buf bytes.Buffer
+	mgr := NewManager(mock, &buf)
+	if err := mgr.Schedule(context.Background(), "myapp", "0 4 * * 0", "main; rm -rf /", "/deployments/.bin/teploy"); err == nil {
+		t.Fatal("expected an error for a branch with shell metacharacters")
+	}
+	if err := mgr.Schedule(context.Background(), "myapp", "0 4 * * 0", "", "/deployments/.bin/teploy"); err == nil {
+		t.Fatal("expected an error for an empty branch")
+	}
+	if err := mgr.Schedule(context.Background(), "myapp", "0 4 * * 0", "main", ""); err == nil {
+		t.Fatal("expected an error for an empty binary path")
 	}
 }
 
@@ -570,7 +605,7 @@ func TestSchedule_FailedCrontabReadAborts(t *testing.T) {
 	)
 	var buf bytes.Buffer
 	mgr := NewManager(mock, &buf)
-	if err := mgr.Schedule(context.Background(), "myapp", "0 4 * * 0"); err == nil {
+	if err := mgr.Schedule(context.Background(), "myapp", "0 4 * * 0", "main", "/deployments/.bin/teploy"); err == nil {
 		t.Fatal("a failed crontab read must abort the install, never replace the crontab")
 	}
 	for _, c := range mock.Calls {

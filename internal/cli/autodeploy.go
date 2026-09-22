@@ -29,6 +29,7 @@ func newAutoDeployCmd(flags *Flags) *cobra.Command {
 	cmd.AddCommand(newAutoDeployScheduleCmd(flags))
 	cmd.AddCommand(newAutoDeployUnscheduleCmd(flags))
 	cmd.AddCommand(newAutoDeployServeCmd())
+	cmd.AddCommand(newAutoDeployRedeployCmd())
 
 	return cmd
 }
@@ -269,29 +270,40 @@ func newAutoDeployScheduleCmd(flags *Flags) *cobra.Command {
 		Use:   "schedule <cron>",
 		Short: "Schedule periodic redeploys to refresh the image",
 		Long: `Installs a cron job on the server that periodically pulls the image
-referenced by the running container and redeploys only if a newer
-digest is available. No-op when the image is already current.
+referenced by the running container and, only when a newer digest is
+available, redeploys through the full teploy engine — the same fenced,
+health-gated, release-recorded deploy as ` + "`teploy deploy`" + ` and the
+webhook listener (one execution path for every trigger). No-op when
+the image is already current.
 
 Use this when the image tag is pinned to a major version (e.g. :14)
 and you want to receive its patch releases automatically.
 
+The server needs a teploy binary that supports ` + "`autodeploy redeploy`" + `;
+this command installs one and verifies it.
+
 Examples:
-  teploy autodeploy schedule "0 4 * * 0"      # Sundays at 4am
-  teploy autodeploy schedule "0 */6 * * *"    # every 6 hours`,
+  teploy autodeploy schedule "0 4 * * 0"                 # Sundays at 4am, branch main
+  teploy autodeploy schedule --branch release "0 */6 * * *"  # every 6 hours`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runAutoDeploySchedule(flags, args[0])
+			branch, _ := cmd.Flags().GetString("branch")
+			return runAutoDeploySchedule(flags, args[0], branch)
 		},
 	}
+	cmd.Flags().String("branch", "main", "branch the scheduled redeploy fetches and deploys")
 	return cmd
 }
 
-func runAutoDeploySchedule(flags *Flags, schedule string) error {
+func runAutoDeploySchedule(flags *Flags, schedule, branch string) error {
 	appCfg, err := config.LoadApp(".")
 	if err != nil {
 		return err
 	}
 	if err := autodeploy.ValidateSchedule(schedule); err != nil {
+		return err
+	}
+	if err := autodeploy.ValidateBranch(branch); err != nil {
 		return err
 	}
 
@@ -304,8 +316,65 @@ func runAutoDeploySchedule(flags *Flags, schedule string) error {
 	}
 	defer executor.Close()
 
+	// The scheduled script triggers the on-server deploy engine rather
+	// than reconstructing the container itself (C02), so the server needs
+	// a teploy binary that speaks `autodeploy redeploy`.
+	const teployBinaryPath = "/deployments/.bin/teploy"
+	if _, err := deployTeployBinaryToServer(ctx, executor, teployBinaryPath); err != nil {
+		return fmt.Errorf("installing the teploy binary on the server: %w", err)
+	}
+	if _, err := executor.Run(ctx, fmt.Sprintf("%s autodeploy redeploy --help >/dev/null 2>&1", ssh.ShellQuote(teployBinaryPath))); err != nil {
+		return fmt.Errorf("the server's teploy binary does not support 'autodeploy redeploy' (the scheduled redeploy now runs the full engine through it); release a teploy version that includes it, then re-run this command: %w", err)
+	}
+
 	mgr := autodeploy.NewManager(executor, os.Stdout)
-	return mgr.Schedule(ctx, appCfg.App, schedule)
+	return mgr.Schedule(ctx, appCfg.App, schedule, branch, teployBinaryPath)
+}
+
+// newAutoDeployRedeployCmd is the one-shot engine trigger the scheduled
+// redeploy invokes ON THE SERVER. It runs the exact same fenced,
+// health-gated, release-recorded deploy code as `teploy deploy` and the
+// webhook listener's triggerAutoDeploy — C02's one execution path. It
+// needs no webhook listener, no secret and no local checkout; the
+// server-side build directory (created by `teploy deploy`'s server-build
+// mode or `autodeploy setup`) is fetched to the branch tip before
+// deploying.
+func newAutoDeployRedeployCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "redeploy",
+		Short: "One-shot engine deploy (server-side; used by the scheduled redeploy)",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			app, _ := cmd.Flags().GetString("app")
+			branch, _ := cmd.Flags().GetString("branch")
+			strictEnv, _ := cmd.Flags().GetBool("strict-env")
+			return runAutoDeployRedeploy(app, branch, strictEnv)
+		},
+	}
+	cmd.Flags().String("app", "", "app name (required)")
+	cmd.Flags().String("branch", "main", "branch to fetch and deploy")
+	cmd.Flags().Bool("strict-env", false, "fail the deploy when env: references an unset ${VAR} (also enabled by TEPLOY_STRICT_ENV=1)")
+	return cmd
+}
+
+func runAutoDeployRedeploy(app, branch string, strictEnv bool) error {
+	if err := config.ValidateName(app); err != nil {
+		return err
+	}
+	if err := autodeploy.ValidateBranch(branch); err != nil {
+		return err
+	}
+	if !strictEnv && os.Getenv("TEPLOY_STRICT_ENV") == "1" {
+		strictEnv = true
+	}
+
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer cancel()
+
+	executor := ssh.NewLocalExecutor()
+	defer executor.Close()
+
+	return triggerAutoDeploy(ctx, executor, app, branch, autodeploy.BuildDir(app), os.Stdout, nil, false, strictEnv)
 }
 
 func newAutoDeployUnscheduleCmd(flags *Flags) *cobra.Command {
