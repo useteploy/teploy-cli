@@ -852,3 +852,101 @@ and full Compose breadth stay open under the product programme
   over the whole Compose schema), multi-image build identity,
   plan/apply. Base revision `566e291`; changes left uncommitted for
   review.
+
+## Programme slice (2026-09-21) — C01 crash-recovery state table
+
+Workstream C01 (P0): the implementation handoff's crash-recovery design
+obligations landed as a bounded DESIGN+CODE slice. Base revision `f2e8c19`;
+changes left uncommitted for review. No deploy code path was modified.
+
+**Landed:**
+
+- **The transition table as tested code** — `internal/deploy/recovery`:
+  the eight lifecycle states (admitted → prepared → candidates-running →
+  readiness-passed → traffic-switched → authoritative-state-committed →
+  predecessor-retired → terminal-receipt-persisted), the transition
+  lattice with per-transition durable-evidence citations (exact container
+  names/labels, Caddy marker-block + reload + delivery receipts, fenced
+  state.json rename, releasemeta record refs, attempt dirs), and
+  `Decide(from, observation)` — a pure, total crash-window disposition
+  function (RETRY / INSPECT / COMPENSATE / MANUAL) over tri-state
+  evidence. Tested exhaustively: every state × every 3^10 evidence
+  combination with cross-cutting safety invariants, plus canonical
+  per-window dispositions and the handoff's named conflicts (candidate
+  running with route never switched → INSPECT; predecessor already
+  retired under uncommitted traffic → MANUAL; unknown container names →
+  MANUAL). The exhaustive invariants caught two real rule-ordering
+  defects during development (record/target mismatch upgrading the
+  proven-dark window from MANUAL to INSPECT; unreadable side evidence
+  overriding proven-dark) — the ordering is now R0-R7 with the
+  proven-dark MANUAL ahead of both.
+- **ADR** — `docs/C01_RECOVERY_STATE_TABLE.md`: mermaid lattice,
+  disposition rules, the mapping onto the existing fenced-lock /
+  releasemeta / attempt machinery (what already agrees), the multi-host
+  rule (sequence of recorded outcomes + per-generation compensation; no
+  global atomic commit), the lock-ordering rule (per-host app fences +
+  short shared-proxy commit lock; never hold one host's lock waiting on
+  another — current code complies), and the findings below.
+- **Fault-prototype harness** —
+  `internal/deploy/recovery/harness_integration_test.go`
+  (`//go:build integration`, the repo's first integration-tagged test):
+  drives a real SSH+Docker host (TEPLOY_FAULT_HOST/USER/KEY; skips with
+  a clear message when unset) through the handoff's decisive scenarios —
+  (a) a nohup'd docker effect landing after owner death and a genuine
+  stale-break acquisition by a new owner (asserts the reconciliation
+  decision differs from the quiescence assumption), (b) candidate
+  running with no state/record (asserts INSPECT, never invented
+  success), (c) a stale holder's guarded effect AND fenced state commit
+  refused by the EXISTING fence machinery (ErrFenceLost, nothing on
+  disk). Prints a scenario × observed × decision × correctness table.
+  NOT executed in this slice (no fixture host available): it compiles
+  (`go vet -tags integration` clean), its decision logic is the
+  exhaustively-tested unit code, and it skips cleanly.
+
+**Disagreements found between current code dispositions and the table**
+(full detail with file:line in the ADR; these feed C01's implementation
+slices):
+
+- C01-1 lock acquisition is treated as quiescence — nothing reconciles
+  the dead holder's in-flight effects after a stale break
+  (state.go:479-516; deploy.go:414-453 handles only the same-version
+  rename case).
+- C01-2 pre-commit effects are check-then-act (`lk.Check` separate from
+  the effect: deploy.go:570, 661, 712) — only WriteFenced composes
+  guard+effect; a broken holder's candidate/route effects can land inside
+  the new owner's window (A05/T01's consequence, now stated as a
+  disposition).
+- C01-3 the shared Caddy lock is ownerless/unfenced (caddy.go:684-697) —
+  conflicting-route evidence (→ INSPECT) has no producer or consumer
+  today.
+- C01-4 no durable readiness receipt exists — ReadinessPassed is
+  unobservable post-crash and collapses into CandidatesRunning's INSPECT
+  (health.go; deploy.go:646-658).
+- C01-5 the terminal receipt logs Success:true even when predecessor
+  retirement partially failed (deploy.go:976-989 warnings +
+  deploy.go:934 success log; LogEntry has no degraded field) — a
+  fleet-rollback decision keyed on the log would skip a host still
+  running the superseded generation.
+- C01-6 record-write failure degrades silently; the table's promised
+  RETRY-convergence has no reconciler (recordRelease warns,
+  deploy.go:1230-1232; backfill fires only from rollback/recreate).
+- C01-7 compensation reconstructs the predecessor route from config +
+  live inspect instead of the recorded receipt (deploy.go:1097-1137;
+  A12/T05 — the table requires undo-to-known-predecessor).
+- C01-8 same-version running `_replaced` defers to the operator (MANUAL)
+  where the table says INSPECT→compensable (deploy.go:438-451; needs
+  F04/A09 generation identities — deliberate A08 containment, recorded
+  as disagreement not defect).
+- C01-9 candidate names are version-keyed, not attempt-keyed
+  (docker.go:82-117) — two attempts of one hash are not attributable by
+  evidence; F08 attempt ids are the existing keying surface.
+- C01-10 the predecessor snapshot is in-memory only (deploy.go:464-473)
+  — retirement re-derives correctly but loses the removed-worker
+  capture on crash; the journal slice should persist it.
+
+**Open:** harness execution against a real fixture host (next slice);
+the ten findings above as C01 implementation work. Gates: `go vet ./...`
+clean; `go vet -tags integration ./internal/deploy/recovery` clean;
+`go test ./... -race` all packages ok (integration-tagged code excluded
+by default); `go test -tags integration …TestFaultHarness` skips cleanly
+with env unset; gofmt clean.
