@@ -964,3 +964,91 @@ write — the EXISTING fence machinery refused both the guarded effect
 and the fenced state commit (ErrFenceLost). Result table preserved in
 the session receipt. The design spike's executable-proof obligation is
 met; the C01-1..C01-10 disagreement implementations remain open.
+
+## Programme slice (2026-09-22) — C06 preview canonical identity
+
+The product evaluation's branch-identity probe
+(`_internal/evals/2026-09-21/probe_cli_contracts.py`,
+TestMarketEvalPreviewBranchIdentityIsDistinct) demonstrated the C06 defect
+live: `previewStatePath("market-eval", "feature/login")` ==
+`previewStatePath(..., "feature-login")` because SanitizeBranch strips both
+`/` and `-` to the same slug — and the slug was the IDENTIFIER everywhere:
+state file, container name/process, Caddy route key, and DNS label. Two
+branches whose slugs collide silently shared (or fought over) one preview:
+the second deploy destroyed the first's container and overwrote its record
+and route. Base revision `22ae801`; changes left uncommitted for review.
+
+**Canonical ID design** (`internal/preview/preview.go`):
+
+- `PreviewID(app, branch)` = `<app>-p-<8hex>`, 8hex = first 8 hex chars of
+  `sha256(app + NUL + full branch ref)`. The app IS the canonical repo
+  identity as teploy knows it (all server state is namespaced by it; one
+  app = one repo's deployment identity). The git remote URL is recorded
+  per-record as provenance but deliberately NOT hashed into the ID: remote
+  URLs change on repo renames and protocol switches, which would silently
+  orphan every existing preview. `previewIDHex` is pinned by
+  TestPreviewIDGolden so the scheme cannot drift unnoticed.
+- Sanitized slugs are DISPLAY names only: they remain the human-readable
+  prefix of the preview subdomain, which now carries the ID suffix for
+  uniqueness — `preview-<slug≤46>-<8hex>.<domain>` (whole DNS label ≤ 63).
+  Two colliding branches therefore get distinct hostnames; without this,
+  coexistence would still break at the Caddy site block (one hostname, one
+  site). The slug never keys state, containers, or routes for new
+  resources; its remaining uses are the read-only legacy lookup and the
+  legacy-era route-key fallback.
+- `State` records the full identity going forward: `id` (canonical),
+  `branch` (full, unsanitized — always was), `repo` (trivially normalized
+  origin remote: scheme/credentials stripped, `.git` dropped, scp-form
+  rewritten — `normalizeRepoURL`, internal/cli/preview.go), and `route`
+  (the Caddy route key / network alias this preview's artifacts live
+  under, making records self-describing instead of re-derived).
+
+**Identifier paths migrated** — state file `previewStatePath`
+(preview.go:150), container name/process + network alias (Deploy, was
+`<app>-preview-<slug>-<ver>`, now `<app>-preview-p-<hex>-<ver>`), Caddy
+route key (SetRoute/RemoveRoute via `routeApp`/`previewRouteKey`),
+preview domain (`previewDomain`), prune/cleanup enumeration (Prune/Destroy
+resolve through the same keys), and the CLI create path records repo
+identity (runPreviewDeploy → DeployConfig.Repo). Destroy-before-recreate
+lifecycle behavior is unchanged this slice (separate recorded C06 item).
+
+**Legacy contract** (`resolveRecord`, preview.go):
+
+| Situation | Behavior |
+|---|---|
+| Legacy slug-keyed record, stored full Branch == requested (repo agrees when both record one) | ADOPT: Deploy migrates it under the canonical key with data preserved (full Branch, ID, Repo added), then tears down the artifacts the record itself names (stored Container, slug-era route key — `Route` empty marks the era); Destroy/Prune tear down those artifacts directly and remove the legacy file |
+| Legacy record at the shared slug names a DIFFERENT branch (the collision), or repo mismatch when both record one | `*AmbiguousPreviewError` naming stored branch, requested branch, record path and remediation (`teploy preview destroy <stored-branch>` or manual rename/remove). NOTHING mutated — no container stop, no file removal, no route edit; verified by asserting the call log and file state stay empty/intact |
+| Canonical record exists AND a mismatched legacy file sits at the shared slug | The legacy file belongs to the OTHER colliding branch: left untouched, does not block the operation (deploying/destroying this branch proceeds) |
+| Canonical record exists AND a matching legacy duplicate exists | Interrupted-migration leftover of THIS branch (full-Branch match proves it): stale duplicate removed, canonical wins |
+| Legacy record, unrelated slug | Keeps working untouched (TestPrune_OnlyDestroysExpired's fixtures are legacy records; TestLegacyOtherBranchNotBlocked covers cross-branch coexistence) |
+
+Destroy/Prune adopt on full-Branch match alone (they carry no repo
+identity); repo participates wherever it is known (Deploy). A
+present-but-unparseable record fails closed naming the path rather than
+being treated as absent.
+
+**Evidence** — TDD: probe verified RED before the work
+(TestMarketEvalPreviewBranchIdentityIsDistinct:
+"feature/login" and "feature-login" → same record path), GREEN after;
+probe suite fully green (compose contracts unchanged). New tests cover the
+handoff's list, not just hash strings: coexistence (distinct state paths,
+containers, routes, domains; neither deploy stops the other's container),
+update-one-leaves-other, destroy-one-leaves-other, expire/prune-one
+(modern + legacy fixtures), legacy adoption on Deploy (legacy file
+migrated away, canonical record carries full Branch/ID/Repo/Route, legacy
+container + slug route torn down), legacy collision ambiguity on Deploy
+AND Destroy (record byte-identical after, zero mutation calls), repo
+mismatch ambiguity, other-branch-not-blocked (including that branch's own
+destroy still finding its legacy record), List over mixed-era records.
+Mutation checks: constant ID suffix → identity/coexistence/golden tests
+fail (colliding paths/domains/processes); removing the adoption
+Branch-match → all three ambiguity tests fail (adopted instead of
+refusing). Both reverted; gates after revert: `go vet ./...` clean,
+`go test ./... -race` all packages ok, gofmt clean on touched files.
+
+**Remaining C06 scope (explicitly NOT in this slice)** — preview
+lifecycle behavior (old preview serving until the new one is ready —
+destroy-before-recreate stays as-is; expiry timer/automation beyond the
+existing deploy-piggyback prune; config propagation through a preview
+profile; network/secret isolation between previews) and any Dash-side
+changes.

@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"os/signal"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -103,6 +105,10 @@ func runPreviewDeploy(flags *Flags, branch, ttlStr, image string) error {
 		image = appCfg.App + "-build-" + version
 	}
 
+	// Repo identity recorded in the preview record (provenance + legacy
+	// disambiguation). Not part of the preview ID — see gitRepoIdentity.
+	repo := gitRepoIdentity(".")
+
 	mgr := preview.NewManager(executor, os.Stdout)
 
 	// Prune expired previews for this app before deploying a new one.
@@ -128,6 +134,7 @@ func runPreviewDeploy(flags *Flags, branch, ttlStr, image string) error {
 		Image:   image,
 		Version: version,
 		TTL:     ttl,
+		Repo:    repo,
 	})
 
 	if n := buildNotifier(appCfg); n != nil {
@@ -276,4 +283,55 @@ func runPreviewPrune(flags *Flags) error {
 		fmt.Printf("Pruned %d expired preview(s)\n", n)
 	}
 	return nil
+}
+
+// gitRepoIdentity returns the trivially normalized origin remote URL of the
+// checkout at dir, or "" when it cannot be resolved (no git repo, no
+// origin remote). The value is recorded in preview records as repo
+// provenance and is compared when adopting legacy records; it is
+// deliberately NOT hashed into the canonical preview ID — remote URLs
+// change on repo renames and protocol switches, and keying identity on
+// them would silently orphan every existing preview.
+func gitRepoIdentity(dir string) string {
+	out, err := exec.Command("git", "-C", dir, "config", "--get", "remote.origin.url").Output()
+	if err != nil {
+		return ""
+	}
+	return normalizeRepoURL(string(out))
+}
+
+// normalizeRepoURL applies teploy's trivial repo-URL normalization: strip
+// surrounding whitespace and a trailing ".git", strip the scheme and any
+// user:token@ credentials, and rewrite the scp-like form to host/path —
+// so https://git@github.com/o/r.git, git@github.com:o/r.git and
+// ssh://git@github.com/o/r all record as github.com/o/r. This collapses
+// the common spellings of one remote; anything else is recorded verbatim.
+func normalizeRepoURL(raw string) string {
+	s := strings.TrimSuffix(strings.TrimSpace(raw), ".git")
+	if s == "" {
+		return ""
+	}
+	if i := strings.Index(s, "://"); i >= 0 {
+		s = s[i+3:]
+		if slash := strings.IndexByte(s, '/'); slash >= 0 {
+			authority, path := s[:slash], s[slash:]
+			if at := strings.LastIndexByte(authority, '@'); at >= 0 {
+				authority = authority[at+1:]
+			}
+			s = authority + path
+		} else if at := strings.LastIndexByte(s, '@'); at >= 0 {
+			s = s[at+1:]
+		}
+		return s
+	}
+	// scp-like form: [user@]host:path — the first colon before any slash
+	// separates host from path.
+	if i := strings.IndexByte(s, ':'); i > 0 && !strings.Contains(s[:i], "/") {
+		host := s[:i]
+		if at := strings.LastIndexByte(host, '@'); at >= 0 {
+			host = host[at+1:]
+		}
+		return host + "/" + s[i+1:]
+	}
+	return s
 }
