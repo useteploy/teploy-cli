@@ -1172,3 +1172,21 @@ at base — left alone).
   non-goal here (the register's stranding posture) and stays open with
   the graceful-shutdown/bounded-admission remainder of A37/T33 (listener
   scope, signal-time drain of the worker).
+
+## Finding from live use (2026-09-22) — SSH host-key algorithm coverage reads as "key mismatch"
+
+Reported from teploy-ship's S14 trusted-copy provisioning (third wave,
+85f44bf receipt). A known_hosts carrying only the host's ed25519 line makes
+every connection fail with `ssh: handshake failed: knownhosts: key mismatch`
+when the negotiated connection presents a different algorithm (this host
+also has rsa + ecdsa host keys). The operator-facing failure names neither
+the algorithm presented nor the algorithms on file, so it reads as a MITM
+alarm rather than the coverage gap it is — the natural first reaction
+(re-scan with `-t ed25519`, per most docs) is exactly what produces the
+state.
+
+Status: OPEN (ergonomics/diagnostics, not correctness — failing closed is
+right). Candidate fix: include the presented key type and the on-file types
+in the error, or document "scan without -t" in the error string. Found
+while provisioning the ship delivery worker; worked around by scanning all
+algorithms.
