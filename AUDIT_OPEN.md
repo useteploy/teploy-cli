@@ -950,3 +950,17 @@ clean; `go vet -tags integration ./internal/deploy/recovery` clean;
 `go test ./... -race` all packages ok (integration-tagged code excluded
 by default); `go test -tags integration …TestFaultHarness` skips cleanly
 with env unset; gofmt clean.
+
+### C01 spike — executed against a real target (2026-09-21, later)
+
+The fault harness ran against a real SSH+Docker fixture (colima VM,
+Linux aarch64, Docker server 29.5.2, /deployments provisioned): scenario
+(a) late effect after owner death — new owner acquired the lock, the
+dead owner's container landed AFTER acquisition, decision = MANUAL
+("lock acquisition proves quiescence" would have said RETRY); (b) side
+effect without receipt — running candidate, no state/route/record,
+decision = INSPECT, never invented success; (c) stale holder's late
+write — the EXISTING fence machinery refused both the guarded effect
+and the fenced state commit (ErrFenceLost). Result table preserved in
+the session receipt. The design spike's executable-proof obligation is
+met; the C01-1..C01-10 disagreement implementations remain open.
