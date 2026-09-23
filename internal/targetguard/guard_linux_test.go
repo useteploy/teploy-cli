@@ -31,7 +31,7 @@ func (e *localExecutor) Run(_ context.Context, cmd string) (string, error) {
 	e.saw = append(e.saw, cmd)
 	e.mu.Unlock()
 	cmd = strings.ReplaceAll(cmd, helperRemote, filepath.Join(e.root, "teploy-guard.sh"))
-	full := fmt.Sprintf("TEPLOY_DEPLOYMENTS_ROOT=%s; %s", e.root, cmd)
+	full := fmt.Sprintf("export TEPLOY_DEPLOYMENTS_ROOT=%s; %s", e.root, cmd)
 	script := filepath.Join(e.root, "run.sh")
 	if err := os.WriteFile(script, []byte(full), 0755); err != nil {
 		return "", err
@@ -45,7 +45,7 @@ func (e *localExecutor) RunStream(_ context.Context, cmd string, stdout, stderr 
 	e.saw = append(e.saw, cmd)
 	e.mu.Unlock()
 	cmd = strings.ReplaceAll(cmd, helperRemote, filepath.Join(e.root, "teploy-guard.sh"))
-	full := fmt.Sprintf("TEPLOY_DEPLOYMENTS_ROOT=%s; %s", e.root, cmd)
+	full := fmt.Sprintf("export TEPLOY_DEPLOYMENTS_ROOT=%s; %s", e.root, cmd)
 	script := filepath.Join(e.root, "run.sh")
 	if err := os.WriteFile(script, []byte(full), 0755); err != nil {
 		return err
@@ -61,7 +61,7 @@ func (e *localExecutor) RunInput(_ context.Context, cmd string, stdin io.Reader)
 	e.saw = append(e.saw, cmd)
 	e.mu.Unlock()
 	cmd = strings.ReplaceAll(cmd, helperRemote, filepath.Join(e.root, "teploy-guard.sh"))
-	full := fmt.Sprintf("TEPLOY_DEPLOYMENTS_ROOT=%s; %s", e.root, cmd)
+	full := fmt.Sprintf("export TEPLOY_DEPLOYMENTS_ROOT=%s; %s", e.root, cmd)
 	script := filepath.Join(e.root, "run.sh")
 	if err := os.WriteFile(script, []byte(full), 0755); err != nil {
 		return err
