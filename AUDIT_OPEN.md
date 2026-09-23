@@ -1429,3 +1429,84 @@ attributable by evidence (F04/A09). C01-6 (record-write convergence has
 no reconciler) and C01-7 (compensation reconstructs the predecessor
 route instead of using a receipt) also remain, with their register items
 (A12/T05 standing for C01-7).
+
+## Programme slice (2026-09-22, latest) — C01 implementation: record-repair debt + receipt-driven route compensation
+
+The two remaining contained C01 findings landed as bounded slices (spec:
+docs/C01_RECOVERY_STATE_TABLE.md findings 6 and 7; recovery.Decide and its
+exhaustive suite untouched). Base revision `cce0726` (v0.1.37); changes
+left uncommitted for review.
+
+- **C01-6 — record-write failure now converges.** A releasemeta record
+  write that fails after the live commit still never fails the deploy
+  (deliberate degradation — record failure must not roll back live
+  traffic), but the debt is now DURABLE and visible:
+  `internal/deploy/repairdebt.go` persists a marker at
+  `/deployments/<app>/repair-debt.json` (atomic 0600, identity-validated
+  on read, T56 parity) naming app, release, attempt, what failed, when,
+  and the failed write/repair attempt count. The NEXT deploy repairs it
+  BEFORE its own work (DeployFenced step 1b, under the app lock): if the
+  record already exists (a rollback/backfill converged it meanwhile) the
+  marker is just cleared; otherwise the record is rebuilt from the live
+  containers via releasemeta.Backfill — the table's transition-7
+  convergence — and the marker cleared on success (reported in output);
+  a repeated failure keeps the marker with an incremented count and says
+  so (never a deploy failure — the debt describes the previous deploy).
+  A re-failing record write of the SAME release bumps the existing
+  marker instead of resetting its history. `teploy status` (writeStatus,
+  extracted from runStatus for testability) reports outstanding debt in
+  text and JSON (`repair_debt`), an unreadable marker is reported rather
+  than hidden, and no marker means zero output noise.
+- **C01-7 — route compensation uses the recorded receipt.**
+  `restorePreviousRoute` (deploy.go, both abortStateCommit call sites)
+  now renders the previous route from the predecessor release's F14
+  RECORD — domain, replica upstream names, the recorded primary
+  container port (TCL-14), TLS/caddy_extra/cache/firewall/access, and
+  the LB health path — consulting zero live inspect (the record is
+  authoritative for what teploy switched away FROM; compensating from
+  cfg+inspect compensates to the wrong block exactly when config
+  drifted). Reconstruct-from-inspection survives only as the documented
+  fallback for legacy installs (no record), unreadable records, or
+  records with no designated primary port — and every fallback is
+  announced in the output ("restoring the previous route from live
+  inspection"). rollback's restoreRollbackRoute (the failed-ROLLBACK
+  compensation over running containers) is NOT this path and stays with
+  the A12/T05 register item, as does the exact-block compare-and-swap
+  design on ParseSites/ExtractPolicy.
+
+Evidence — TDD red first per finding: C01-6's tests failed at compile
+(RepairDebt absent) and behaviorally after stubbing (marker never
+written; next deploy never repaired; count never bumped); C01-7's four
+tests failed against the inspect-driven base for the finding's own
+reasons (route rendered from inspect against a record, silent fallback,
+a SUCCEEDING disagreeing inspect winning 8080-over-3000). New coverage:
+marker content/order (app, release, attempt id, reason, count, timing),
+next-deploy repair + clear + report ordering (repair precedes
+"Deploying"), persistent-failure count bump, no-marker silence, status
+text+JSON+unreadable, receipt rendering (exact hosts/upstream/TLS/health
+path from the record, `_replaced` same-version naming, multi-replica
+upstreams, zero NetworkSettings inspects), loud legacy fallback.
+Mutation checks (in-place, reverted): removing the DeployFenced repair
+call fails the repair test ("must rebuild the failed record") and the
+count test ("got 1"); swapping restorePreviousRoute precedence to
+inspect-first fails all three receipt tests (route from inspect,
+disagreeing inspect wins, fallback message fires on the record path).
+Gates after revert: `go vet ./...` clean; `go test ./... -race -count=1`
+all 25 packages ok; gofmt clean on touched files; contract probes 5/5
+PASS. No push performed.
+
+**Residual C01 list (explicit, updated):** C01-1 lock acquisition is
+treated as quiescence — the replacement owner must run Decide over
+observed evidence after a stale break (ADR: the locking-protocol
+redesign). C01-2 pre-commit effects are check-then-act, not guarded — a
+broken holder's candidate/route effects can land inside the new owner's
+window (ADR: guarded single-command effects, WriteFenced's shape
+generalized). C01-3 the shared Caddy lock is ownerless/unfenced —
+conflicting-route evidence has no producer/consumer (ADR: fenced
+short-lived proxy-commit lock or an owner-tagged equivalent). C01-8
+same-version running `_replaced` stays MANUAL — deliberate A08
+containment; the INSPECT→adopt continuation needs F04 generation
+identities (ADR: attempt-keyed container identities). C01-9 candidate
+names are version-keyed, not attempt-keyed — two attempts of one hash
+are not attributable by evidence (ADR: F08 attempt ids as the keying
+surface for candidate names). C01-6 and C01-7 are LANDED (this slice).

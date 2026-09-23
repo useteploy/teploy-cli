@@ -181,7 +181,13 @@ table's, with the register item it belongs to.
    (`internal/deploy/rollback.go:582-587`). The table says transition 7 is
    RETRY-convergent — correct — but no reconciler exists: `status`/`drift`
    do not heal a missing record, so the convergence the table promises is
-   latent until the next deploy.
+   latent until the next deploy. **LANDED 2026-09-22** (see AUDIT_OPEN's
+   C01 record-repair-debt slice): a repair-debt marker
+   (`/deployments/<app>/repair-debt.json`) is persisted on the post-commit
+   record-write failure; the NEXT deploy repairs it before its own work
+   (record rebuilt from live containers via Backfill, marker cleared,
+   reported — repeated failure keeps the marker with an incremented count);
+   `teploy status` reports outstanding debt.
 
 7. **C01-7 — Compensation reconstructs the predecessor instead of using a
    receipt.** `restorePreviousRoute` (`internal/deploy/deploy.go:1097-1137`)
@@ -191,7 +197,15 @@ table's, with the register item it belongs to.
    block/spec (F14 record, `ParseSites`/`ExtractPolicy`
    `internal/caddy/routes.go:89,429`) — not an inference that can
    compensate to the wrong block when config drifted. Register: A12/T05
-   standing; the table sharpen the disposition language.
+   standing; the table sharpens the disposition language. **LANDED
+   2026-09-22 for the deploy-side traffic-switch rollback** (see
+   AUDIT_OPEN's C01 record-repair-debt slice): `restorePreviousRoute`
+   renders from the predecessor release's F14 record (domain, replica
+   upstreams, recorded primary port, TLS/extra/cache/firewall/access,
+   health path; zero live inspect), with reconstruct-from-inspection only
+   as the announced legacy fallback. Still open under A12/T05:
+   rollback's `restoreRollbackRoute` and the exact-block
+   receipt/compare-and-swap restore on ParseSites/ExtractPolicy.
 
 8. **C01-8 — Same-version `_replaced` handling is MANUAL where the table
    says INSPECT→compensable.** The running-`_replaced` refusal
@@ -320,11 +334,13 @@ Executed against a real fixture 2026-09-21 (see AUDIT_OPEN).
 
 Implementation slices: **C01-4, C01-5, C01-10 landed 2026-09-22**
 (attempt-journal receipts + honest degraded log outcome; evidence in
-AUDIT_OPEN's C01 implementation-slice section). Remaining findings:
-C01-1/2/3 (the locking-protocol redesign — replacement-owner
+AUDIT_OPEN's C01 implementation-slice section) and **C01-6, C01-7 landed
+2026-09-22** (record-repair debt reconciler + receipt-driven route
+compensation; evidence in AUDIT_OPEN's latest C01 slice). Remaining
+findings: C01-1/2/3 (the locking-protocol redesign — replacement-owner
 reconciliation on acquisition, guarded pre-commit effects, fenced shared
 Caddy lock), C01-8 (same-version `_replaced` MANUAL — deliberate A08
-containment until F04 generation identities exist), C01-9
-(attempt-scoped candidate identities — F04/A09), and C01-6/C01-7
-(record-write convergence reconciler; receipt-driven route compensation)
-which stay with their register items.
+containment until F04 generation identities exist), and C01-9
+(attempt-scoped candidate identities — F04/A09). The A12/T05 remainder
+of C01-7 (rollback's restoreRollbackRoute + the exact-block
+compare-and-swap restore) stays with its register item.

@@ -313,6 +313,16 @@ func (d *Deployer) DeployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 		return fmt.Errorf("refusing to deploy with unreadable state for %s: %w", cfg.App, err)
 	}
 
+	// 1b. Converge outstanding record repair debt (C01-6): a previous
+	// deploy whose releasemeta record write failed after the live commit
+	// left a repair-debt marker. Rebuild that record from the live
+	// containers BEFORE this deploy's own work and clear the marker —
+	// under the same lock every other state mutation here holds. Never a
+	// deploy failure: the debt describes the previous deploy, and on its
+	// own failure the marker stays (with the count bumped) for the next
+	// one.
+	d.repairOutstandingRecordDebt(ctx, cfg.App, current)
+
 	// 4. Determine host ports for all web replicas.
 	var ports []int
 	if cfg.ingressHost() {
@@ -830,8 +840,9 @@ func (d *Deployer) DeployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 	// 13b. Record the release metadata (F14). The containers are live and
 	// the route/state are committed — a record failure is a degraded
 	// rollback window, not a failed deploy, and it converges on the next
-	// deploy or backfill. Never abort into abortStateCommit from here.
-	d.recordRelease(ctx, cfg, newState, ports, webBindHost, webContainerName)
+	// deploy via the repair-debt marker (C01-6). Never abort into
+	// abortStateCommit from here.
+	d.recordRelease(ctx, cfg, assetAttempt, newState, ports, webBindHost, webContainerName)
 
 	// 13c. Prune superseded attempts (F08): attempt directories (build
 	// contexts, env files, TLS certs) are dead weight once their release
@@ -1179,6 +1190,16 @@ func (d *Deployer) abortStateCommit(ctx context.Context, cfg Config, current *st
 	return fmt.Errorf("committing authoritative applied state after route switch: %w; the previous route was restored, the old workload was left running, and the uncommitted workload was stopped", commitErr)
 }
 
+// restorePreviousRoute compensates a failed deploy's traffic switch by
+// putting the PREVIOUS release's route back (C01-7/A12/T05). The F14 record
+// of the predecessor release is the receipt of what teploy switched away
+// FROM, and it is AUTHORITATIVE: domain, replica upstream names, the
+// recorded primary container port, TLS/extra/cache/firewall/access, and the
+// LB health path all come from the record — never from the current config
+// or a live inspect, which can disagree with the receipt precisely when
+// config drifted (and compensating to a drifted block is compensating to
+// the wrong route). Reconstruct-from-inspection remains only as the
+// documented fallback for legacy installs without a record — and it says so.
 func (d *Deployer) restorePreviousRoute(ctx context.Context, cfg Config, current *state.AppState) error {
 	if current == nil || current.CurrentHash == "" {
 		return d.caddy.RemoveRoute(ctx, cfg.App)
@@ -1187,6 +1208,87 @@ func (d *Deployer) restorePreviousRoute(ctx context.Context, cfg Config, current
 		return d.caddy.RemoveRoute(ctx, cfg.App)
 	}
 
+	rec, recErr := releasemeta.Read(ctx, d.exec, cfg.App, current.CurrentHash)
+	switch {
+	case recErr != nil:
+		fmt.Fprintf(d.out, "Warning: the release record for %s@%s could not be read (%v) — restoring the previous route from live inspection instead of the recorded receipt\n", cfg.App, current.CurrentHash, recErr)
+	case rec == nil:
+		fmt.Fprintf(d.out, "Warning: no release record for %s@%s (pre-F14 install) — restoring the previous route from live inspection instead of the recorded receipt\n", cfg.App, current.CurrentHash)
+	default:
+		if port, ok := releasemeta.PrimaryContainerPort(rec); ok {
+			return d.restoreRouteFromReceipt(ctx, cfg, current, rec, port)
+		}
+		// A record without a designated primary port (a backfilled record
+		// whose bindings identified none) cannot render the receipt's
+		// upstream port; that piece falls back to inspection, loudly.
+		fmt.Fprintf(d.out, "Warning: the release record for %s@%s names no primary container port — restoring the previous route from live inspection instead of the recorded receipt\n", cfg.App, current.CurrentHash)
+	}
+	return d.restoreRouteFromInspection(ctx, cfg, current)
+}
+
+// restoreRouteFromReceipt renders the predecessor route from the recorded
+// receipt. The upstream NAMES are deterministic per release (the same
+// derivation every deploy uses), so the record's replica count plus the
+// recorded primary container port reproduce the exact upstreams without a
+// single live inspect. Edge-config overlays come from the record when it
+// carries them; a backfilled record cannot (nothing recoverable from
+// containers), and the CLI-passed config stays the fallback for it exactly
+// like rollback's applyRecordToRollback.
+func (d *Deployer) restoreRouteFromReceipt(ctx context.Context, cfg Config, current *state.AppState, rec *releasemeta.Record, containerPort int) error {
+	replicas := rec.Replicas
+	if replicas <= 0 {
+		replicas = 1
+	}
+	names := make([]string, replicas)
+	upstreams := make([]caddy.Upstream, replicas)
+	for i := range replicas {
+		name := docker.ReplicaContainerName(cfg.App, "web", current.CurrentHash, i+1, replicas)
+		if current.CurrentHash == cfg.Version {
+			name += "_replaced"
+		}
+		names[i] = name
+		upstreams[i] = caddy.Upstream{Dial: fmt.Sprintf("%s:%d", name, containerPort)}
+	}
+
+	domain := rec.Domain
+	if domain == "" {
+		domain = current.Domain
+	}
+	if domain == "" {
+		domain = cfg.Domain
+	}
+
+	tls := caddy.TLS{Cert: cfg.TLSCert, Key: cfg.TLSKey, Internal: cfg.TLSInternal}
+	caddyExtra := cfg.CaddyExtra
+	cache := cfg.Cache
+	fw := cfg.Firewall
+	access := cfg.Access
+	if rec.Caddy != nil {
+		tls = caddy.TLS{Cert: rec.Caddy.TLSCert, Key: rec.Caddy.TLSKey, Internal: rec.Caddy.TLSInternal}
+		caddyExtra = rec.Caddy.CaddyExtra
+		cache = rec.Caddy.Cache
+		if rec.Caddy.Firewall != nil {
+			fw = *rec.Caddy.Firewall
+		}
+		if rec.Caddy.Access != nil {
+			access = *rec.Caddy.Access
+		}
+	}
+	healthPath := cfg.Health.withDefaults().Path
+	if rec.Health != nil && rec.Health.Path != "" {
+		healthPath = rec.Health.Path
+	}
+
+	if replicas > 1 {
+		return d.caddy.SetLoadBalancerHealth(ctx, cfg.App, domain, upstreams, healthPath, tls, caddyExtra, cache, fw, access)
+	}
+	return d.caddy.SetRoute(ctx, cfg.App, domain, names[0], containerPort, tls, caddyExtra, cache, fw, access)
+}
+
+// restoreRouteFromInspection is the legacy fallback (pre-F14 installs, or a
+// record that cannot name its route): reconstruct the previous block from
+// the current config plus a live inspect of the predecessor containers.
+func (d *Deployer) restoreRouteFromInspection(ctx context.Context, cfg Config, current *state.AppState) error {
 	replicas := len(current.CurrentPorts)
 	if replicas == 0 {
 		replicas = 1
@@ -1246,8 +1348,10 @@ func (d *Deployer) logDeploy(ctx context.Context, cfg Config, success bool, degr
 // binding plus every publish entry); env records the references (server-side
 // env-file paths + the plaintext env map), never resolved secrets. The
 // primary web container's full RecreateSpec is embedded from docker's own
-// view of it. Every failure is a warning — see the call site.
-func (d *Deployer) recordRelease(ctx context.Context, cfg Config, applied *state.AppState, ports []int, webBindHost, webContainerName string) {
+// view of it. A write failure is deliberate degradation (the deploy stays
+// live) made durable and convergent: the repair-debt marker it records
+// (C01-6) drives the next deploy's rebuild and `status`'s reporting.
+func (d *Deployer) recordRelease(ctx context.Context, cfg Config, att releasemeta.Attempt, applied *state.AppState, ports []int, webBindHost, webContainerName string) {
 	containerPort := cfg.ContainerPort
 	if containerPort == 0 {
 		containerPort = 80
@@ -1321,7 +1425,8 @@ func (d *Deployer) recordRelease(ctx context.Context, cfg Config, applied *state
 		fmt.Fprintf(d.out, "Warning: could not capture the recreate spec for %s: %v (recreate falls back to live inspect)\n", webContainerName, err)
 	}
 	if err := releasemeta.Write(ctx, d.exec, rec); err != nil {
-		fmt.Fprintf(d.out, "Warning: could not record release metadata for %s@%s: %v (rollback for this release falls back to live inspection)\n", cfg.App, cfg.Version, err)
+		fmt.Fprintf(d.out, "Warning: could not record release metadata for %s@%s: %v — the deploy stays live; repair debt recorded (the next deploy rebuilds the record)\n", cfg.App, cfg.Version, err)
+		d.recordRepairDebt(ctx, att, err)
 	}
 }
 
