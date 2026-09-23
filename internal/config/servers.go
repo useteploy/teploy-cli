@@ -1,6 +1,8 @@
 package config
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -15,11 +17,30 @@ import (
 // consumers — notably the teploy-dash frontend, which is case-sensitive — can
 // read. Without them Go would emit capitalized field names (Host/User/…).
 type Server struct {
+	// ID is the server's stable identity (X02 §1.3): minted once when the
+	// entry is created, preserved by rename/update and by AddServer's
+	// upsert, and never re-derived. Empty on legacy entries written before
+	// the field existed — consumers (teploy-dash) fall back to their
+	// name-derived hash for those; minting on re-add would silently re-key
+	// every id-based reference, which is the exact hazard the field removes.
+	ID    string            `yaml:"id,omitempty" json:"id,omitempty"`
 	Host  string            `yaml:"host" json:"host"`
 	User  string            `yaml:"user,omitempty" json:"user,omitempty"`     // default: root
 	Role  string            `yaml:"role,omitempty" json:"role,omitempty"`     // app, lb, or empty (single-server)
 	Tags  map[string]string `yaml:"tags,omitempty" json:"tags,omitempty"`     // per-host env vars injected during deploy
 	VpnIP string            `yaml:"vpn_ip,omitempty" json:"vpn_ip,omitempty"` // VPN mesh IP (tailscale, headscale, netbird)
+}
+
+// newServerID mints a random stable server identity: "srv-" + 16 hex chars.
+// Random (not name-derived) because the ID names a registration, not content
+// that must be re-derivable — a rename must not change it, which no hash of
+// the name can guarantee (X02 §1.2).
+func newServerID() (string, error) {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", fmt.Errorf("generating server id: %w", err)
+	}
+	return "srv-" + hex.EncodeToString(b[:]), nil
 }
 
 // ServersConfig is the top-level structure of ~/.teploy/servers.yml.
@@ -303,13 +324,14 @@ func AddServer(path, name, host, user, role, vpnIP string) error {
 	// hand-edited in servers.yml) and cleared VpnIP/Role/User. Tags drive
 	// per-host env injection at deploy time, so losing them broke deploys. Keep
 	// existing values; only overwrite an optional field when a new value is given.
-	existing := cfg.Servers[name]
+	existing, existed := cfg.Servers[name]
 	merged := Server{
 		Host:  host,
 		User:  user,
 		Role:  role,
 		VpnIP: vpnIP,
 		Tags:  existing.Tags, // settable only via servers.yml — never drop on re-add
+		ID:    existing.ID,   // preserved on re-add; minted below only for new entries
 	}
 	if merged.Host == "" {
 		merged.Host = existing.Host
@@ -322,6 +344,13 @@ func AddServer(path, name, host, user, role, vpnIP string) error {
 	}
 	if merged.VpnIP == "" {
 		merged.VpnIP = existing.VpnIP
+	}
+	if !existed {
+		id, err := newServerID()
+		if err != nil {
+			return err
+		}
+		merged.ID = id
 	}
 	cfg.Servers[name] = merged
 
