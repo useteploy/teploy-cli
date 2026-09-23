@@ -202,6 +202,25 @@ processes:
   web: "npm start"
   worker: "npm run worker"
 
+# Readiness gate — what "healthy" means before traffic switches, and how
+# long to wait. mode selects the probe:
+#   http — status-based only: GET path, 200 = ready. A 404/redirect FAILS
+#          (no fallback). Best when the app has a real health endpoint.
+#   tcp  — a TCP dial against the published port; nothing is fetched.
+#          For apps with no HTTP surface (game servers, TCP brokers).
+#          Setting `path` alongside is rejected — nothing would fetch it.
+#   auto — compatibility default (also what an omitted mode means): HTTP
+#          GET first; a 404/3xx falls back to a TCP dial. The historical
+#          behavior, kept so existing configs deploy identically.
+# timeout_seconds is the TOTAL deadline for the gate (not per-try); the
+# deploy output states the mode and deadline before the gate runs, e.g.
+# "Readiness: HTTP GET /healthz (30s deadline)".
+health:
+  mode: http                  # http | tcp | auto (default auto/compat)
+  path: /healthz              # default /health (http/auto only)
+  timeout_seconds: 30         # total gate deadline (default 30)
+  interval_seconds: 1         # time between attempts (default 1)
+
 # Per-process HEALTHCHECK overrides. disable: true passes --no-healthcheck
 # so the container ignores the image's HEALTHCHECK — useful when a worker
 # shares an image with web but has no HTTP listener for the inherited probe.
@@ -316,6 +335,7 @@ teploy log                                # deploy history
 teploy exec <server> <cmd>                # run a command on the server (SSH)
 teploy app exec -- <cmd>                  # run a command in the app container (migrations, etc.)
 teploy validate                           # check config and server readiness
+teploy doctor [--server <name>]           # read-only diagnostics: toolchain, SSH, Docker, registry, Caddy, disk, compatibility, repair debt (--json for machines; exit 1 if any check fails, never 2)
 teploy scale <count>                      # multi-server deploy + LB update
 teploy version / update                   # version info and self-update
 ```

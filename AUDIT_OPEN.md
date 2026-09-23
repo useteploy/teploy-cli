@@ -173,8 +173,10 @@ defect could corrupt data today.
   structured route representation — LANDED 2026-09-18, see the family
   section; the transaction design itself remains open and can now be
   built on ParseSites/ExtractPolicy).
-- F47 — Explicit HTTP/TCP/auto probe modes (compat fallback is
-  deliberate and documented).
+- F47 — RESOLVED 2026-09-22 (see the C03 readiness-modes slice at the
+  bottom): explicit `health.mode: http | tcp | auto` with config-grammar
+  validation, pre-gate surfacing, record/receipt forwarding, and the
+  auto fallback named as documented compat.
 - F48 — RESOLVED 2026-09-18 (see the F16/F08/F48/F49/F57 family section
   at the bottom): maintenance preserves the site's TLS directive and
   access gate, extracted from the parsed current block; plus a pre-write
@@ -344,8 +346,9 @@ into each rather than duplicated as new work items.
 - TCL-15 — port allocation redesign (Docker-ephemeral publish + inspect).
   Unblocked by F14 (the record now carries the resolved port allocation
   per release), design remains.
-- TCL-17 — F47 tail (explicit HTTP/TCP/auto probe modes; the 404/3xx TCP
-  fallback is documented deliberate compat).
+- TCL-17 — RESOLVED 2026-09-22 with F47 (C03 readiness-modes slice at the
+  bottom): the 404/3xx TCP fallback is now the NAMED `auto` compat mode,
+  selectable and surfaced, no longer an undocumented default.
 - TCL-24 — RESOLVED 2026-09-18 with F49 (family section at the bottom):
   adoption is parser-based; brace counting is gone.
 - TCL-28 — F50 (split the public static tree from /deployments).
@@ -602,8 +605,9 @@ all packages ok. No push performed.
 - A16 — F04 external-ingress handoff (candidates reachable via the stable
   alias before readiness).
 - A20 — TCL-15 port allocation redesign.
-- A22 — F47/TCL-17 explicit HTTP/TCP probe modes (the 404/3xx TCP
-  fallback stays documented compat).
+- A22 — RESOLVED 2026-09-22 (C03 readiness-modes slice at the bottom):
+  F47/TCL-17 explicit probe modes landed; the 404/3xx TCP fallback stays
+  as `auto`, the documented compat mode.
 - A24 — F17 standing: Cmd remains a deliberate operator-authored shell
   string at the docker-run sink.
 - A29 — TCL-55 session-open bounding (needs a dedicated connection per
@@ -1340,3 +1344,555 @@ containers), the enforcement TIMER (nothing server-side schedules
 pruning — `preview prune` is cron-able but teploy ships no daemon, by
 design), the same-version shared-alias window above, and Dash-side
 changes.
+
+## Programme slice (2026-09-22, latest) — C01 implementation: attempt journal + honest degraded outcome
+
+Three contained C01 findings landed as their own coherent changes (the
+spec is docs/C01_RECOVERY_STATE_TABLE.md's findings list; the decision
+function internal/deploy/recovery.Decide is UNCHANGED — its exhaustive
+tests pass untouched; this slice produces the EVIDENCE its inputs model).
+Base revision `c0efd26`; changes left uncommitted for review. New file
+`internal/deploy/journal.go` is the attempt journal: receipts persisted
+into the F08 attempt namespace (`meta/att/<hash>.<id>/`, write-once,
+0600 atomic, identity-validated on read — T56 parity).
+
+- **C01-10 — durable predecessor snapshot.** `predecessors.json`
+  (exact container IDs/names/labels + the predecessor release identity +
+  same-version flag) is persisted at the RENAME PHASE — after the 6b
+  listing, before the recreate displacement or any new container starts
+  (test pins the write's call index below the first `docker stop` and
+  `docker run`). On the recovery paths the instruction names
+  (`restoreDisplacedAndStarted`, `abortStateCommit`), when the in-memory
+  displaced list is absent, `displacedFromSnapshot` reads the receipt and
+  restores exactly the recorded web containers that are no longer running
+  (blue/green predecessors and same-version `_replaced` renames inspect
+  as running and are skipped by construction). abortStateCommit takes the
+  attempt as a parameter for this. TDD red: both tests failed "no
+  predecessor snapshot persisted" before journal.go existed. Mutation:
+  removing the write fails both tests for that reason (reverted). The
+  write-then-crash-then-recover test drives a NEW executor seeded with
+  only the crashed attempt's file state and asserts the exact recorded
+  name is recreated while a stopped same-release WORKER the name-derived
+  fallback would touch is never inspected.
+- **C01-4 — durable readiness receipt.** `readiness.json` (exact
+  candidate container IDs from docker run + names, per-replica probe
+  host/port/path, outcome, timestamp) is written EXACTLY when the health
+  gate passes and BEFORE the traffic switch begins (test pins the
+  ordering: after the last probe, before the Caddyfile transaction's
+  first command; a health-failing deploy leaves no receipt). The
+  Decide-side wiring is the evidence derivation `attemptReadinessState`
+  (receipt present → recovery.ReadinessPassed; confirmed absent →
+  CandidatesRunning — the ADR's collapse, un-collapsed) and
+  `candidateAttribution` (running candidate-shaped containers are
+  PROVABLY the crashed attempt's only on receipt ID/name match → Present;
+  without a receipt, or with IDs that provably belong to another attempt
+  of the same release, → Unknown — R4's never-auto-decide class). Tests
+  assert through recovery.Decide: the crash-after-readiness world
+  (traffic switched, uncommitted, predecessor serving) is COMPENSATE with
+  the receipt and INSPECT without. Mutations: writing the receipt before
+  the gate fails both ordering tests; receipt-independent attribution
+  fails the Decide distinction ("without the receipt the same world must
+  INSPECT, got COMPENSATE") — both reverted. In-tree consumers are the
+  derivation helpers; the recovery OWNER that reads them on lock
+  acquisition is C01-1's slice (recorded).
+- **C01-5 — honest degraded outcome.** `state.LogEntry` gains
+  `Degraded` + `DegradedReason` (omitempty — old entries parse
+  unchanged). Step-14 retirement collects its incompleteness
+  (stopPredecessorSnapshot now returns what escaped — stop/remove
+  failures, fence-loss interruptions, skipped cleanup, name-fallback
+  errors) and `logDeploy(ctx, cfg, true, reason, start)` records
+  Success=true AND Degraded=true: traffic IS switched (not a deploy
+  failure) but the outcome is not clean success. The Success-filtering
+  consumer in-repo, `teploy log` rendering (internal/cli/log.go), shows
+  DEGRADED + reason, and --json carries the field for dash/machine
+  readers; the consumer test also models the fleet-rollback selector
+  (Success alone targets the degraded host as clean; Success && !Degraded
+  separates it). TDD red: tests failed to compile against the field-less
+  LogEntry; mutation: emptying the degraded population at the success
+  call site fails "DegradedReason must name the escaped container"
+  (reverted — note this check ran before an accidental `git checkout`
+  required re-applying the same edits; the re-applied code is identical
+  and all tests re-ran green).
+
+Gates: `go vet ./...` clean; `go vet -tags integration
+./internal/deploy/recovery` clean; `go test ./... -race` all 25 packages
+ok; recovery exhaustive suite green and byte-identical semantics; gofmt
+clean on touched files; contract probes 5/5 PASS. No push performed.
+
+**Residual C01 list (explicit):** C01-1 lock acquisition is treated as
+quiescence — the replacement owner must run Decide over observed
+evidence after a stale break (the locking-protocol redesign). C01-2
+pre-commit effects are check-then-act, not guarded — a broken holder's
+candidate/route effects can land inside the new owner's window. C01-3
+the shared Caddy lock is ownerless/unfenced — conflicting-route evidence
+has no producer/consumer. C01-8 same-version running `_replaced` stays
+MANUAL — deliberate A08 containment; automating the INSPECT→adopt
+continuation needs generation-scoped identities. C01-9 candidate names
+are version-keyed, not attempt-keyed — two attempts of one hash are not
+attributable by evidence (F04/A09). C01-6 (record-write convergence has
+no reconciler) and C01-7 (compensation reconstructs the predecessor
+route instead of using a receipt) also remain, with their register items
+(A12/T05 standing for C01-7).
+
+## Programme slice (2026-09-22, latest) — C01 implementation: record-repair debt + receipt-driven route compensation
+
+The two remaining contained C01 findings landed as bounded slices (spec:
+docs/C01_RECOVERY_STATE_TABLE.md findings 6 and 7; recovery.Decide and its
+exhaustive suite untouched). Base revision `cce0726` (v0.1.37); changes
+left uncommitted for review.
+
+- **C01-6 — record-write failure now converges.** A releasemeta record
+  write that fails after the live commit still never fails the deploy
+  (deliberate degradation — record failure must not roll back live
+  traffic), but the debt is now DURABLE and visible:
+  `internal/deploy/repairdebt.go` persists a marker at
+  `/deployments/<app>/repair-debt.json` (atomic 0600, identity-validated
+  on read, T56 parity) naming app, release, attempt, what failed, when,
+  and the failed write/repair attempt count. The NEXT deploy repairs it
+  BEFORE its own work (DeployFenced step 1b, under the app lock): if the
+  record already exists (a rollback/backfill converged it meanwhile) the
+  marker is just cleared; otherwise the record is rebuilt from the live
+  containers via releasemeta.Backfill — the table's transition-7
+  convergence — and the marker cleared on success (reported in output);
+  a repeated failure keeps the marker with an incremented count and says
+  so (never a deploy failure — the debt describes the previous deploy).
+  A re-failing record write of the SAME release bumps the existing
+  marker instead of resetting its history. `teploy status` (writeStatus,
+  extracted from runStatus for testability) reports outstanding debt in
+  text and JSON (`repair_debt`), an unreadable marker is reported rather
+  than hidden, and no marker means zero output noise.
+- **C01-7 — route compensation uses the recorded receipt.**
+  `restorePreviousRoute` (deploy.go, both abortStateCommit call sites)
+  now renders the previous route from the predecessor release's F14
+  RECORD — domain, replica upstream names, the recorded primary
+  container port (TCL-14), TLS/caddy_extra/cache/firewall/access, and
+  the LB health path — consulting zero live inspect (the record is
+  authoritative for what teploy switched away FROM; compensating from
+  cfg+inspect compensates to the wrong block exactly when config
+  drifted). Reconstruct-from-inspection survives only as the documented
+  fallback for legacy installs (no record), unreadable records, or
+  records with no designated primary port — and every fallback is
+  announced in the output ("restoring the previous route from live
+  inspection"). rollback's restoreRollbackRoute (the failed-ROLLBACK
+  compensation over running containers) is NOT this path and stays with
+  the A12/T05 register item, as does the exact-block compare-and-swap
+  design on ParseSites/ExtractPolicy.
+
+Evidence — TDD red first per finding: C01-6's tests failed at compile
+(RepairDebt absent) and behaviorally after stubbing (marker never
+written; next deploy never repaired; count never bumped); C01-7's four
+tests failed against the inspect-driven base for the finding's own
+reasons (route rendered from inspect against a record, silent fallback,
+a SUCCEEDING disagreeing inspect winning 8080-over-3000). New coverage:
+marker content/order (app, release, attempt id, reason, count, timing),
+next-deploy repair + clear + report ordering (repair precedes
+"Deploying"), persistent-failure count bump, no-marker silence, status
+text+JSON+unreadable, receipt rendering (exact hosts/upstream/TLS/health
+path from the record, `_replaced` same-version naming, multi-replica
+upstreams, zero NetworkSettings inspects), loud legacy fallback.
+Mutation checks (in-place, reverted): removing the DeployFenced repair
+call fails the repair test ("must rebuild the failed record") and the
+count test ("got 1"); swapping restorePreviousRoute precedence to
+inspect-first fails all three receipt tests (route from inspect,
+disagreeing inspect wins, fallback message fires on the record path).
+Gates after revert: `go vet ./...` clean; `go test ./... -race -count=1`
+all 25 packages ok; gofmt clean on touched files; contract probes 5/5
+PASS. No push performed.
+
+**Residual C01 list (explicit, updated):** C01-1 lock acquisition is
+treated as quiescence — the replacement owner must run Decide over
+observed evidence after a stale break (ADR: the locking-protocol
+redesign). C01-2 pre-commit effects are check-then-act, not guarded — a
+broken holder's candidate/route effects can land inside the new owner's
+window (ADR: guarded single-command effects, WriteFenced's shape
+generalized). C01-3 the shared Caddy lock is ownerless/unfenced —
+conflicting-route evidence has no producer/consumer (ADR: fenced
+short-lived proxy-commit lock or an owner-tagged equivalent). C01-8
+same-version running `_replaced` stays MANUAL — deliberate A08
+containment; the INSPECT→adopt continuation needs F04 generation
+identities (ADR: attempt-keyed container identities). C01-9 candidate
+names are version-keyed, not attempt-keyed — two attempts of one hash are
+not attributable by evidence (ADR: F08 attempt ids as the keying
+surface for candidate names). C01-6 and C01-7 are LANDED (this slice).
+
+## Programme slice (2026-09-22, latest) — C03: explicit readiness probe modes
+
+Closes the F47/TCL-17/A22 standing deferral — the first bounded C03 slice
+(P0: "Support HTTP, TCP, container and operator-defined readiness with
+clear defaults and deadlines; retain `auto` only as an explicit
+compatibility mode"). Base revision `a914631`; changes left uncommitted
+for review. Drain/graceful-stop semantics, the LB health-path rendering
+(5bf5594), and Caddy are untouched (next slices / explicit stay-out).
+
+**Design:**
+
+- **Grammar** — `health.mode: http | tcp | auto` in teploy.yml/TOML
+  (`config.AppHealthConfig.Mode`). Empty/absent = `auto`, the compat
+  default: HTTP GET first, exactly a 404/3xx falls back to the TCP dial —
+  the verbatim historical behavior (preserved in `checkHealth`, now
+  NAMED). `http` is status-based only (200 = ready; 404/3xx fails the
+  attempt, no fallback). `tcp` dials the published port and never speaks
+  HTTP. Unknown mode is rejected at config load AND at the shared
+  execution-plan validator (`deploy.Config.validate` — direct
+  construction via fleet/preview/autodeploy bypasses parsing, TCL-18
+  parity). Field agreement: `mode: tcp` with a `path` set is REJECTED at
+  config load (decision: reject, not warn — a path nothing fetches is a
+  config that lies about what the gate does); `http`/`auto` without a
+  path keep the `/health` default. A mode-only destination overlay
+  replaces the whole health block (F57 semantics extended: Mode joined
+  the presence detection); the normalized manifest carries
+  `mode` (defaulted to auto) for drift identity.
+- **Dispatch** — `probeOnce` (internal/deploy/health.go) switches on the
+  normalized mode per attempt; `httpStatus` (extracted from the old
+  monolithic attempt) returns the observed code so `checkHealth`'s
+  fallback condition is byte-identical to before (an interim refactor
+  that dialed on ANY non-200 was caught and corrected during the slice —
+  auto must stay exactly today's behavior). `HealthCheckPublic` /
+  `HealthCheckAt` (on-demand `teploy health`) keep the auto default.
+- **Surfacing** — deploy (step 9) and rollback (step 3) print the gate
+  BEFORE it runs: `Readiness: HTTP GET /healthz (30s deadline)` /
+  `Readiness: TCP :3000 (30s)` / `Readiness: auto — HTTP then TCP
+  fallback (compat, 30s deadline)` (tcp names the first replica's port;
+  failures name replica + port as before).
+- **Deadline verified** — `health.Timeout` was already a TOTAL deadline:
+  `healthCheck` wraps the context in `WithTimeout`, the retry loop
+  selects on ctx.Done, each HTTP attempt is curl-bounded
+  (--connect-timeout 2 / --max-time 5), and the remote executor cancels
+  the session at deadline (SIGTERM + close, RunStream). There was NO
+  unbounded retry loop to bound; a regression test now pins it (a
+  never-responding probe — an executor whose commands hang until context
+  death — must fail within deadline + slack, not hang).
+- **Forwarding** — the F14 release record (`releasemeta.Health.Mode`) and
+  the C01-4 readiness receipt (`readinessProbe.Mode`) carry the effective
+  mode; `applyRecordToRollback` overlays it (a modeless legacy record
+  leaves the config's mode — compat). Rollback probes the way the target
+  release was actually gated.
+
+**Evidence** — TDD: red level 1 recorded as compile failure (Mode field
+nowhere existed), red level 2 after plumbing-only (fields + passthrough,
+no behavior): dispatch tests failed with mode ignored (http-mode deploy
+passed via the TCP fallback; tcp-mode healthCheck timed out on an
+unregistered curl; auto-explicit never dialed), unknown mode and tcp+path
+were accepted, the surfaced lines were absent, the record carried no
+mode. Green after the implementation. Mutation checks (in-place,
+reverted, gates re-run green after each): (1) dispatch removed — always
+http — fails TestHealthCheck_TCPMode* (curl issued / dial never run),
+TestHealthCheck_AutoModeExplicitFallsBack (no dial), and the tcp-mode
+DEPLOY test (gate times out); (2) readinessSummary collapsed to the http
+line fails the tcp/auto surfaced-line tests; (3) removing the
+`context.WithTimeout` total deadline hangs the never-responding-probe
+test to the test-binary timeout. Gates: `go vet ./...` clean;
+`go test ./... -race -count=1` all 25 packages ok; gofmt clean on every
+touched file (pre-existing base strays in cli/deploy.go's fleet-rollback
+region, deploy_test.go, f14_wiring_test.go, plan_a_test.go,
+config/app_test.go left alone, consistent with the C02 posture); contract
+probes 5/5 PASS. No push performed.
+
+**C03 remainder (explicit):** request drain + graceful stop (stop_timeout
+wiring, SIGTERM→SIGKILL ladder — deliberately this slice's stay-out), the
+liveness-vs-readiness distinction (post-switch continuous probing; today
+only the container HEALTHCHECK directive approximates it), multi-host
+partial-wave readiness states (canary-wave aggregate gating beyond the
+existing success/fail rollback), and WebSocket/SSE/long-request drain
+verification at the traffic switch. Registered interactions to decide in
+those slices: `mode: tcp` × the Caddy LB active health check (the LB
+block's HTTP path probe would mark a non-HTTP upstream down — LB
+rendering is 5bf5594's fixed surface, untouched here), and preview's
+readiness gate (internal/preview) which mirrors the auto shape and has
+no mode surface of its own.
+
+## Programme slice (2026-09-22, latest) — C04: build provenance + plan/receipt equality
+
+First bounded C04 slice (base revision `6a1142d`; changes left uncommitted
+for review). Contract addressed: "Resolve Git revision, build context,
+Dockerfile, platform and immutable image digest BEFORE execution... image
+digest and effective configuration shown in plan equal the deployed
+receipt; response-loss retries do not build a different source; changed
+mutable tags behave according to selected policy." Commit pinning itself
+was P0-done in C02 (webhook builds reset to the authenticated commit;
+this slice records what every path resolved).
+
+**Design:**
+
+- `releasemeta.Provenance` (new internal/releasemeta/provenance.go) is the
+  plan-time record: revision (full HEAD sha via the SourceRevision
+  threading both trigger paths already had), a Dirty flag, build context
+  path + context fingerprint, Dockerfile identity (path + content sha),
+  target platform, requested image ref, the immutable digest resolved
+  BEFORE execution, a DigestPinned-vs-mutable flag, and the
+  effective-config (manifest) digest. Persisted as `provenance.json` in
+  the F08 attempt namespace (`meta/att/<hash>.<id>/`, write-once, atomic
+  0600, identity-validated on read — the journal discipline) by the shared
+  post-build orchestration: `deployBuiltImageFenced` (manual + ad-hoc +
+  autodeploy, new `sourceRoot` param: "." vs the fetched checkout) and
+  `singleServerDeployer.deployApp` (multi-server/scale) — all three
+  engine entry paths.
+- Recon finding: the build package did NOT already compute a context
+  fingerprint — the only tree-hash machinery was the static deployer's
+  unexported `hashDir` (static-only semantics, symlink-rejecting). Added
+  `build.ContextFingerprint(dir, excludes)` with hashDir's v3 typed/
+  length-prefixed record encoding (F51/TCL-38 discipline) but
+  symlink-INCLUSIVE (hashed by target: rsync -a preserves links into the
+  context, so a link is build input), excludes applied (DefaultIgnore +
+  .teployignore — the fingerprint describes the synced tree). Also
+  extracted `build.EffectiveLocalPlatform` from localBuildDockerfile's
+  inline rule (behavior-preserving) so the record names the platform the
+  local build actually targets.
+- Plan/receipt equality: `Deployer.DeployFenced` prints a plan block
+  BEFORE any effect (image digest — not just tag, with pinned/mutable
+  stated; revision, flagging a dirty worktree as "building uncommitted
+  changes"; context fingerprint; Dockerfile identity; platform; manifest
+  digest). The F14 record gains `ManifestSHA256` + embedded `Provenance`,
+  and `recordRelease` returns it. A closing verification (step 17, after
+  the live commit) asserts record digest == plan digest and reports
+  equality explicitly; a mismatch is a loud warning + the C01-6
+  repair-debt marker (next deploy reconciles) — never a failed live
+  deploy. `plannedImageDigest` applies ONE like-for-like rule on both
+  sides: a digest-pinned ref is identified by its manifest digest,
+  everything else by docker's resolved content ID (`ImageDigestFromRef`,
+  now exported) — otherwise a pinned ref's plan (manifest digest) and
+  record (image ID) could never agree by construction.
+- Retry stability verified + pinned: the attempt machinery gives each
+  invocation a fresh write-once namespace, so a retry lands BESIDE the
+  first receipt (test); source stability is resolution purity —
+  `resolveDeployProvenance` is a pure function of (config, tree, image),
+  no time- or attempt-dependent fields (they are stamped at write) —
+  pinned by a DeepEqual double-resolution test; webhook retries
+  additionally re-pin to the ledger commit (C02, unchanged).
+
+**Evidence** — TDD red first: all four new test files failed to compile
+against the absent machinery (undefined Provenance/WriteAttemptProvenance/
+ContextFingerprint/Config.Provenance...). New coverage: provenance
+round-trip + write-time foreign-identity refusal + read-time identity
+mismatch refusal + absent-is-nil-nil; distinct immutable receipts for two
+attempts of one release; fingerprint determinism/sensitivity (content at
+constant size, rename, empty-dir structure, symlink retarget) +
+exclude-honoring; resolution field capture for build/prebuilt/mutable-tag
+paths; dirty-worktree flag; retry stability; plan output (digest,
+revision, "building uncommitted changes", fingerprint, manifest digest —
+and printed before the first container starts); record embedding
+provenance + manifest digest; mismatch → loud warning naming both digests
++ repair-debt marker + deploy still succeeds; provenance/deploy identity
+mismatch refused pre-effect; no plan digest → no false alarm. Mutation
+checks (in-place, all reverted): equality check disabled → mismatch test
+fails; provenance fields dropped from the plan print → plan test fails on
+the missing fingerprint; dirty suffix severed → "building uncommitted
+changes" assertion fails; record stops embedding provenance → record test
+fails; fingerprint made content-blind (digest zeroed, size kept, against
+a same-size content edit) → sensitivity test fails. Gates after revert:
+`go vet ./...` clean; `go test ./... -race -count=1` all 25 packages ok;
+gofmt clean on every touched hunk (cli/deploy.go's pre-existing
+fleet-rollback region stray left alone, consistent with the C02/C03
+posture); contract probes 5/5 PASS. No push performed.
+
+**C04 remainder (explicit):** registry authentication provenance (recording
+WHICH credential identity pulled/built — nothing today names the docker
+config/secret used); scan/attestation separation (trivy's gate currently
+FAILS the deploy on scan error — the contract wants scan failures distinct
+from build failures, and attestation is unmodelled); the ARM64/AMD64
+packaging matrix (cross-platform build verification on supported targets —
+`platform` is now RECORDED everywhere but not matrix-tested); offline
+fallback as an explicit pull POLICY (today's behavior — digest-pinned
+cache reuse, mutable always-pull, warned local fallback — is now recorded
+as provenance facts, not yet a selectable policy); build records for
+`teploy build` outside deploys; cache diagnostics; secret-safe build-input
+attestation. Changed-mutable-tag POLICY (beyond recording pinned-vs-
+mutable + the mismatch warning) lands with the offline/pull-policy slice.
+
+## Programme slice (2026-09-23) — X02 S1: versioned machine interface + S3-lite error envelope
+
+First X02 slice (ADR
+`../_internal/X02_RESOURCE_CONTRACT_ADR_2026-09-22.md` §2.1-2.3, adopted
+by `../_internal/DELEGATED_DECISIONS_2026-09-23.md` decisions 1/4/7/8/9 —
+D8 single-integer MI, D9 capability advertisement, D10 exit codes
+unchanged). Base revision `6faefc4`; changes left uncommitted for review.
+
+**Landed:**
+
+- **Machine-interface version 1** (`internal/cli/machineinterface.go`):
+  `MachineInterface = 1` at the root of `version --json` (new
+  `{"version","machine_interface","capabilities"}` envelope), `app list
+  --json` (appListDTO), and `server status --json` (serverStatusDTO) —
+  additive fields; dash's Go decoders ignore unknown fields, verified
+  against dash's actual decode sites. Versioning rules on the constant's
+  doc comment: additive changes never bump; removal/rename/type or
+  semantic change bumps. **Verified exclusion:** `server list --json`
+  emits a bare map-of-servers root (dash decodes
+  `map[string]{host,user}` at server.go:1641) — there is no envelope
+  object to carry the field additively, and injecting a
+  `machine_interface` KEY would materialize as a phantom server in
+  dash's fleet; reshaping it is a non-additive change recorded as S2
+  follow-up (needs a coordinated dash decode change).
+- **Capability registry** (15 stable tokens, the doc-comment block in
+  machineinterface.go IS the registry): `env-set-stdin`, `kv-set-stdin`,
+  `template-var-stdin` (cb7c0fc), `server-rename`, `server-update`
+  (72c57f9), `autodeploy-redeploy`, `health-modes` (C03),
+  `provenance-records` (C04), `readiness-receipts` (C01-4),
+  `preview-canonical-id`, `preview-blue-green` (C06), `repair-debt`
+  (C01-6), `error-envelope` (this slice), `app-list-machine`,
+  `server-status-machine`. Every token names a LANDED contract;
+  `server-list-ids` deliberately absent (S4 not landed).
+  TestCapabilityTokenRegistry pins the exact sorted set — rename or
+  removal fails it.
+- **S3-lite structured error envelope** (`internal/cli/errevelope.go`):
+  on any command failure under `--json`, one document
+  `{"machine_interface","code","message","detail"}` on STDERR (stdout
+  stays the data channel); without `--json` the historical plain-text
+  stderr line is byte-identical. Code taxonomy v1 defined as the closed
+  registry: config-invalid, target-unreachable, unsupported, conflict,
+  uncertain-outcome, degraded, internal (unknown → internal,
+  forward-safe). **Wired classes:** config-load failures
+  (`config.ErrInvalidConfig` sentinel — a no-text-change wrapper so
+  errors.Is classifies while every message stays verbatim — wrapped at
+  all LoadApp/LoadAppWithDestination/Compose-propagation returns) and
+  deploy admission refusals (the dash-hit ad-hoc path's pre-effect
+  validations, `--version` grammar, no-server, tag-filter parse —
+  `errDeployAdmission` marker, same no-text-change discipline); both
+  classify config-invalid. `Execute` reports through
+  `reportExecutionError` before the unchanged `os.Exit(1)`; drift's exit
+  2 extracted into `driftExitCode` so the 0/1/2 semantics are pinned in
+  code (2 only with `--exit-code` AND drift found).
+
+**Evidence** — TDD red level 1 recorded (all new test symbols undefined
+at compile: MachineInterface, writeVersion, reportExecutionError,
+ErrInvalidConfig, errDeployAdmission, driftExitCode), green after
+implementation. New coverage: version JSON exact shape (3 keys, MI 1,
+capabilities verbatim) + human output unchanged + cobra end-to-end;
+registry completeness (golden list + per-constant membership +
+uniqueness/sortedness); app list + server status envelopes carry
+machine_interface; config-load envelope through a REAL failing `deploy
+--json` (code, stable message, detail naming teploy.yml); admission
+envelope through a real invalid `--app` ad-hoc deploy; envelope ABSENT
+without --json (plain error text, no leak); unclassified → internal; exit
+semantics pinned. Binary smoke: exact envelope JSON on stderr, exit 1,
+human path unchanged. Mutation checks (in-place, all reverted):
+suppressing the envelope under --json (`if false && jsonMode`) fails both
+wired-class tests for the intended reason; renaming a token value fails
+the registry test; removing a token from the advertised list fails it
+(count + membership). Gates after revert: `go vet ./...` clean;
+`go test ./... -race -count=1` all packages ok; gofmt clean on every
+touched hunk (deploy.go's pre-existing fleet-rollback stray left alone,
+consistent with the C02-C04 posture); contract probes 5/5 PASS. No push
+performed.
+
+**S2 + error-site migration list (recorded follow-ups):**
+
+- `server list --json` reshape to an envelope root (coordinated dash
+  decode change — the one non-additive MI bump candidate).
+- target-unreachable: the ssh.Connect failure returns across commands
+  (app list/server status "connecting to", deploy step 6).
+- conflict: `preview.AmbiguousPreviewError` (typed and ready — one
+  errors.As), `config.ErrServerExists`/`ErrServerNotFound` (dash
+  currently matches message text; the envelope gives it a stable code).
+- uncertain-outcome / degraded: the C01 journal outcomes (recovery
+  dispositions), the T57 "backends deployed but load-balancer activation
+  failed" class, LogEntry Degraded rendering.
+- unsupported: version-skew refusals (e.g. autodeploy schedule's
+  server-binary-lacks-redeploy error).
+- Generalizing per-command envelopes for the remaining --json verbs
+  (health/log/drift/stats/plan/validate/registry/template/accessory
+  lists) is S2's `contracts/` skeleton work, not error-site migration.
+
+## Programme slice (2026-09-23) — C09: `teploy doctor`
+
+First bounded C09 slice (base revision `dda4911`; changes left
+committed-free for review, per instruction). Contract addressed:
+"`doctor` should diagnose local toolchain, SSH, Docker, registry, proxy,
+disk and compatibility without causing deployment. Human progress goes to
+the appropriate diagnostic stream; versioned JSON/events and stable exit
+codes serve automation."
+
+**Landed** (`internal/cli/doctor.go`, `teploy doctor [--json]
+[--server <name>]`):
+
+- **Nine stable checks** (fixed order, pinned by test): `git` (local
+  PATH probe — missing git is a WARN, not a fail: git-less boxes deploy
+  prebuilt images fine), `config` (the same `config.LoadApp` loader
+  deploy uses, so the C05 Compose field contracts, C03 health-mode
+  grammar, publish specs and overlay rules surface verbatim in detail;
+  ErrNoConfig → fail with a `teploy init` remediation), `ssh` (the
+  EXISTING connect path — `ssh.Connect` errors carry the key/auth hints
+  and the 078f610 known_hosts algorithm naming, so the doctor detail
+  names the presented/on-file algorithms verbatim), `docker` (daemon
+  reachability via `docker version --format '{{.Server.Version}}'`),
+  `disk` (root-filesystem headroom from `df -B1 -P /`: fail < 2 GiB,
+  warn < 10 GiB or ≥ 85% used), `registry` (`docker manifest inspect` of
+  the configured ref — a pure registry query that touches no local image
+  state, unlike a pull; auth class DISTINGUISHED from unreachable from
+  missing, each with its own remediation; build-from-source apps are
+  ok-skips), `caddy` (admin API probe inside the caddy container — the
+  same command `server status` uses; host/external ingress are ok-skips
+  by design), `compatibility` (local version vs the server's
+  `/deployments/.bin/teploy` if present — absent is ok (optional
+  infrastructure), skew is a warn naming both versions), and
+  `repair-debt` (the C01-6 marker via `deploy.ReadRepairDebt` —
+  outstanding debt is a warn naming release+attempts; an UNREADABLE
+  marker is a visible warn, never hidden).
+- **No deployment effects**: every remote command is read-only
+  (`docker version`, `docker manifest inspect`, the caddy admin wget,
+  `df`, the server binary's `version`, the framed repair-debt read).
+  Skip semantics are two-class and deliberate: skipped-because-not-
+  applicable (host/external ingress, build app, no server binary, no
+  app identity) = ok; skipped-because-input-unavailable (SSH down,
+  config unreadable) = fail with the reason. Tests assert the mock's
+  ENTIRE call log against a read-only allowlist on both the all-healthy
+  and the every-remote-check-failing runs, plus that no files are ever
+  uploaded.
+- **Output contract**: human table on stdout (check/result/detail rows,
+  indented `fix:` remediation lines, closing summary); `--json` emits
+  the MI-1 envelope `{machine_interface, checks:[{name, result,
+  detail, remediation}], summary:{ok, warn, fail}}` — all four check
+  keys ALWAYS present (no omitempty: a stable shape means consumers
+  never probe for optional keys), `result` closed to ok|warn|fail,
+  summary counts machine-checked against the checks array. Exit codes:
+  0 with no fail (warnings included), 1 with any fail, and never 2 —
+  that stays `drift --exit-code`'s CI signal (X02 D10); documented in
+  the command's help text and README. The report is the successful
+  OUTPUT of the command — a failing diagnosis never renders the error
+  envelope, stdout stays the data channel.
+- **Capability token**: `doctor-diagnostics` added to the MI registry
+  (additive, no MI bump); the golden list in
+  TestCapabilityTokenRegistry updated to force the addition to stay
+  deliberate.
+
+**Evidence** — TDD red level 1 recorded (all new symbols undefined at
+compile), green after implementation. New coverage (doctor_test.go, 17
+test functions / 30+ subtests): all-healthy run (9 ok, stable order,
+read-only call log), exact JSON shape (3 top-level keys, 4 check keys,
+enum-closed results, summary cross-check), human table + remediation
+lines + summary, per-check pass/fail/warn paths (config grammar from
+teploy.yml AND Compose, git missing, ssh unreachable with the
+known_hosts algorithm diagnostics carried through, no target, docker
+daemon down, disk fail/warn/ok thresholds + parser robustness, registry
+auth/missing/unreachable classes + classifier, caddy ok/fail/host/
+external skips, compat agree/skew/absent/unreadable, repair-debt
+absent/present/unreadable/no-app), the no-effects assertion on a
+maximally failing run, exit-code semantics, and a cobra-wired end-to-
+end all-OK run. Mutation checks (in-place, all reverted, gates re-run
+green after each): a failing check reported ok (docker failure branch
+forced to ok) fails TestDoctorDockerCheck and the human-table summary;
+doctorExitCode forced to 0 fails all three exit-code assertions;
+collapsing the registry auth class into unreachable fails the
+auth-distinguished remediation and the classifier. Binary smoke: real
+`teploy doctor` / `doctor --json` in an empty directory — table and
+envelope as specified, exit 1, no stderr envelope, token advertised by
+`version --json`.
+
+Gates: `go vet ./...` clean; `go test ./... -race -count=1` all 25
+packages ok; gofmt clean on touched files (pre-existing strays in
+deploy.go/secret_audit.go/update_test.go left alone, consistent with
+the C02-C04 posture); contract probes 5/5 PASS. No push performed.
+
+**C09 remainder (explicit):** per-command next-recovery-action strings
+(doctor's remediation field covers the diagnostic surface; every OTHER
+failure path still renders free-text errors — the S2 error-envelope
+migration is the machinery, this is the content), shell completion
+(cobra completion for the command tree, including doctor's --server
+values from servers.yml), config examples executability (README/
+docs config snippets that cannot load under the current grammar —
+a docs-vs-loader drift sweep), and the doctor surface itself has
+natural follow-ons recorded here rather than hidden: multi-server
+fleet diagnosis (doctor currently diagnoses ONE resolved target),
+DNS/health-path diagnostics, and machine-event streaming (the
+"versioned JSON/events" contract's events half — doctor emits one
+versioned JSON document per run, not a stream).

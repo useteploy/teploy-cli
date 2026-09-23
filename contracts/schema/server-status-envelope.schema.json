@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://teploy.github.io/contracts/schema/server-status-envelope.schema.json",
+  "title": "server status --json envelope (MI 1, appStatusDTO root)",
+  "allOf": [
+    {
+      "type": "object",
+      "required": [
+        "app",
+        "domain",
+        "type",
+        "ingress",
+        "current_release",
+        "previous_release",
+        "containers",
+        "processes",
+        "lock",
+        "maintenance",
+        "observed_at",
+        "errors",
+        "machine_interface"
+      ],
+      "properties": {
+        "app": {
+          "type": "string"
+        },
+        "domain": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string"
+        },
+        "ingress": {
+          "type": "string"
+        },
+        "current_release": {
+          "$ref": "#/$defs/release"
+        },
+        "previous_release": {
+          "$ref": "#/$defs/release"
+        },
+        "containers": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/container"
+          }
+        },
+        "processes": {
+          "type": "array"
+        },
+        "lock": {
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "maintenance": {
+          "type": "boolean"
+        },
+        "observed_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "errors": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/machineError"
+          }
+        },
+        "machine_interface": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    }
+  ]
+}

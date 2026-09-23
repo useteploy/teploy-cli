@@ -194,11 +194,22 @@ type ProcessHealth struct {
 	Disable bool `yaml:"disable,omitempty" toml:"disable"`
 }
 
-// AppHealthConfig configures the teploy-level deploy health check: the HTTP
-// poll that gates the traffic switch after a deploy. Distinct from the
-// container HEALTHCHECK directive (which is per-process, in Healthcheck map).
+// AppHealthConfig configures the teploy-level deploy readiness gate.
+// Distinct from the container HEALTHCHECK directive (which is per-process,
+// in the Healthcheck map).
 type AppHealthConfig struct {
-	// Path is the URL path polled for a 200 response. Default: "/health".
+	// Mode selects the readiness probe:
+	//
+	//   http — status-based only: HTTP GET path, 200 = ready. A 404/3xx
+	//          FAILS the gate (no fallback).
+	//   tcp  — a TCP dial against the published port; nothing is fetched.
+	//          Setting path alongside is rejected (nothing would fetch it).
+	//   auto — compatibility (the default when unset): HTTP GET first, a
+	//          404/3xx falls back to the TCP dial — the exact behavior
+	//          every deploy used before modes existed (F47/TCL-17/A22).
+	Mode string `yaml:"mode,omitempty" toml:"mode"`
+	// Path is the URL path polled for a 200 response in http/auto mode.
+	// Default: "/health". Not valid with mode: tcp.
 	Path string `yaml:"path,omitempty" toml:"path"`
 	// TimeoutSeconds is the total time to wait for a healthy response before
 	// the deploy fails and rolls back. Default: 30. Raise this for
@@ -280,6 +291,19 @@ type NetworkConfig struct {
 const (
 	TypeContainer = "container"
 	TypeStatic    = "static"
+)
+
+// Health readiness-gate modes (the `health.mode` grammar). Empty and "auto"
+// both mean the compatibility default: HTTP GET first, a 404/3xx answer
+// falls back to a TCP dial — the behavior every deploy used before modes
+// existed. "http" is status-based only (200 = ready, no fallback); "tcp"
+// dials the published port and never speaks HTTP. The deploy-side probe
+// dispatch mirrors these in internal/deploy/health.go (deploy cannot share
+// these constants: it imports this package).
+const (
+	HealthModeHTTP = "http"
+	HealthModeTCP  = "tcp"
+	HealthModeAuto = "auto"
 )
 
 // Ingress modes. Empty string and "caddy" both mean Teploy manages the
@@ -979,6 +1003,18 @@ func (c *AppConfig) validate() error {
 	if c.Health.IntervalSeconds < 0 {
 		return fmt.Errorf("'health.interval_seconds' must be >= 0 (got %d)", c.Health.IntervalSeconds)
 	}
+	// Empty mode means auto (the documented compat default, applied at
+	// deploy time), so the enum accepts it here.
+	switch c.Health.Mode {
+	case "", HealthModeHTTP, HealthModeTCP, HealthModeAuto:
+	default:
+		return fmt.Errorf("'health.mode' must be one of: http, tcp, auto (got %q)", c.Health.Mode)
+	}
+	// A path under tcp mode is a field nothing fetches — reject the lying
+	// config at load instead of deploying a gate that ignores it silently.
+	if c.Health.Mode == HealthModeTCP && c.Health.Path != "" {
+		return fmt.Errorf("'health.path' has no effect with 'health.mode: tcp' (TCP readiness dials the port; nothing is fetched) — remove the path or use mode http/auto")
+	}
 	for name, dest := range c.Volumes {
 		if !validName.MatchString(name) && !IsHostBindVolume(name) {
 			return fmt.Errorf("volume name %q must be lowercase alphanumeric with hyphens, or an absolute host path for a bind mount", name)
@@ -1126,6 +1162,31 @@ func unmarshalAppYAML(data []byte, out *AppConfig) error {
 // Callers match it with errors.Is to offer interactive first-run setup.
 var ErrNoConfig = errors.New("no teploy.yml, teploy.toml, or docker-compose file found")
 
+// ErrInvalidConfig is the machine-facing sentinel for every failure to
+// load, merge, or validate a teploy.yml/TOML/destination/Compose
+// configuration (X02 §2.3's config-invalid error class). Failures wrap it
+// WITHOUT altering their message text or unwrap chain:
+// errors.Is(err, ErrInvalidConfig) is the classification contract used by
+// the CLI's machine error envelope.
+var ErrInvalidConfig = errors.New("invalid config")
+
+type invalidConfigError struct{ err error }
+
+func (e *invalidConfigError) Error() string { return e.err.Error() }
+func (e *invalidConfigError) Unwrap() error { return e.err }
+func (e *invalidConfigError) Is(target error) bool {
+	return target == ErrInvalidConfig
+}
+
+// invalidConfig marks err as a config failure, preserving its text and
+// chain verbatim.
+func invalidConfig(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &invalidConfigError{err: err}
+}
+
 func LoadApp(dir string) (*AppConfig, error) {
 	for _, name := range []string{"teploy.yml", "teploy.yaml", "teploy.toml"} {
 		path := filepath.Join(dir, name)
@@ -1137,21 +1198,21 @@ func LoadApp(dir string) (*AppConfig, error) {
 			if errors.Is(err, os.ErrNotExist) {
 				continue
 			}
-			return nil, fmt.Errorf("reading %s: %w", path, err)
+			return nil, invalidConfig(fmt.Errorf("reading %s: %w", path, err))
 		}
 
 		var cfg AppConfig
 		if strings.HasSuffix(name, ".toml") {
 			if err := unmarshalAppTOML(data, &cfg); err != nil {
-				return nil, fmt.Errorf("parsing %s: %w", name, err)
+				return nil, invalidConfig(fmt.Errorf("parsing %s: %w", name, err))
 			}
 		} else {
 			if err := unmarshalAppYAML(data, &cfg); err != nil {
-				return nil, fmt.Errorf("parsing %s: %w", name, err)
+				return nil, invalidConfig(fmt.Errorf("parsing %s: %w", name, err))
 			}
 		}
 		if err := cfg.validate(); err != nil {
-			return nil, fmt.Errorf("invalid %s: %w", name, err)
+			return nil, invalidConfig(fmt.Errorf("invalid %s: %w", name, err))
 		}
 		return &cfg, nil
 	}
@@ -1159,7 +1220,7 @@ func LoadApp(dir string) (*AppConfig, error) {
 	// No teploy config — try docker-compose auto-detection.
 	composeCfg, err := LoadCompose(dir)
 	if err != nil {
-		return nil, err
+		return nil, invalidConfig(err)
 	}
 	if composeCfg != nil {
 		return composeCfg, nil
@@ -1199,19 +1260,19 @@ func LoadAppWithDestination(dir, dest string, opts OverlayOptions) (*AppConfig, 
 			if errors.Is(err, os.ErrNotExist) {
 				continue
 			}
-			return nil, fmt.Errorf("reading %s: %w", path, err)
+			return nil, invalidConfig(fmt.Errorf("reading %s: %w", path, err))
 		}
 
 		var overlay AppConfig
 		var present map[string]any
 		if ext == ".toml" {
 			if err := unmarshalAppTOML(data, &overlay); err != nil {
-				return nil, fmt.Errorf("parsing %s: %w", name, err)
+				return nil, invalidConfig(fmt.Errorf("parsing %s: %w", name, err))
 			}
 			present = tomlTopLevelKeys(data)
 		} else {
 			if err := unmarshalAppYAML(data, &overlay); err != nil {
-				return nil, fmt.Errorf("parsing %s: %w", name, err)
+				return nil, invalidConfig(fmt.Errorf("parsing %s: %w", name, err))
 			}
 			present = yamlTopLevelKeys(data)
 		}
@@ -1221,12 +1282,12 @@ func LoadAppWithDestination(dir, dest string, opts OverlayOptions) (*AppConfig, 
 		}
 		mergeConfigs(base, &overlay)
 		if err := base.validate(); err != nil {
-			return nil, fmt.Errorf("invalid config after merging %s: %w", name, err)
+			return nil, invalidConfig(fmt.Errorf("invalid config after merging %s: %w", name, err))
 		}
 		return base, nil
 	}
 
-	return nil, fmt.Errorf("destination %q not found — expected teploy.%s.yml or teploy.%s.toml", dest, dest, dest)
+	return nil, invalidConfig(fmt.Errorf("destination %q not found — expected teploy.%s.yml or teploy.%s.toml", dest, dest, dest))
 }
 
 // clearExplicitEmpties implements the strict-mode half of presence-aware
@@ -1396,7 +1457,7 @@ func mergeConfigs(base, overlay *AppConfig) {
 	}
 	// F57: the whole health object, not just Path, and the security/policy
 	// blocks a production-only overlay previously set to silently nothing.
-	if overlay.Health.Path != "" || overlay.Health.TimeoutSeconds != 0 || overlay.Health.IntervalSeconds != 0 {
+	if overlay.Health.Path != "" || overlay.Health.Mode != "" || overlay.Health.TimeoutSeconds != 0 || overlay.Health.IntervalSeconds != 0 {
 		base.Health = overlay.Health
 	}
 	if !overlay.Access.IsZero() {

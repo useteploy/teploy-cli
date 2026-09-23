@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://teploy.github.io/contracts/schema/observation-envelope.schema.json",
+  "title": "observation envelope - standard shape for any observed resource (X02 S2.4; PRODUCER = teploy-dash)",
+  "$comment": "Schema shared via this corpus but the emitting code lives in teploy-dash (S6). Fixtures for this artifact are dash-side until S6 lands its encoder.",
+  "type": "object",
+  "required": ["resource", "observed_at", "status"],
+  "properties": {
+    "resource": {"type": "object", "required": ["kind", "id"],
+      "properties": {"kind": {"type": "string"}, "id": {"type": "string"}}},
+    "observed_at": {"type": "string", "format": "date-time"},
+    "status": {"type": "string", "enum": ["evaluated", "unavailable", "invalid", "unknown"]},
+    "last_known": {"type": ["object", "null"]},
+    "reason": {"type": "string"}
+  }
+}

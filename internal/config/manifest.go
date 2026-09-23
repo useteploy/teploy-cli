@@ -139,6 +139,10 @@ func sortedMapKeys[V any](values map[string]V) []string {
 }
 
 func normalizedHealth(health AppHealthConfig) map[string]any {
+	mode := health.Mode
+	if mode == "" {
+		mode = HealthModeAuto
+	}
 	path := health.Path
 	if path == "" {
 		path = "/health"
@@ -151,7 +155,7 @@ func normalizedHealth(health AppHealthConfig) map[string]any {
 	if interval == 0 {
 		interval = 1
 	}
-	return map[string]any{"path": path, "timeout_seconds": timeout, "interval_seconds": interval}
+	return map[string]any{"mode": mode, "path": path, "timeout_seconds": timeout, "interval_seconds": interval}
 }
 
 func normalizedAccessories(accessories map[string]AccessoryConfig) map[string]any {

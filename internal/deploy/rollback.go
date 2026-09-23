@@ -349,6 +349,11 @@ func Rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg Rollbac
 			healthBindHost = dk.HostBindIP(ctx, c.Name)
 		}
 	}
+	// Surface the gate before it runs (C03): which probe mode — from the
+	// target release's recorded spec when one exists — and what deadline.
+	if len(healthPorts) > 0 {
+		fmt.Fprintf(out, "  Readiness: %s\n", readinessSummary(healthCfg, healthPorts[0]))
+	}
 	for _, p := range healthPorts {
 		if err := deployer.healthCheck(ctx, p, healthCfg, healthBindHost); err != nil {
 			// Stop what we started and bail.
@@ -364,7 +369,6 @@ func Rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg Rollbac
 		}
 	}
 	fmt.Fprintln(out, "  Health check passed")
-
 	// 4. Route traffic to the target container(s).
 	// Use the explicit container name(s) rather than the app network alias
 	// so Docker DNS doesn't briefly round-robin to the current (about-to-
@@ -607,6 +611,9 @@ func applyRecordToRollback(cfg *RollbackConfig, rec *releasemeta.Record, healthC
 		cfg.Domain = rec.Domain
 	}
 	if rec.Health != nil {
+		if rec.Health.Mode != "" {
+			healthCfg.Mode = rec.Health.Mode
+		}
 		if rec.Health.Path != "" {
 			healthCfg.Path = rec.Health.Path
 		}

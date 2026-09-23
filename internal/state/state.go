@@ -111,6 +111,17 @@ type LogEntry struct {
 	// for entries with no image (heal, lifecycle, static), so old log lines
 	// parse unchanged.
 	Image string `json:"image,omitempty"`
+	// Degraded marks a deploy that switched traffic and committed
+	// successfully but whose post-commit predecessor retirement (or its
+	// fallback) partially failed (C01-5): the app serves the new
+	// generation, yet a superseded container escaped retirement. Success
+	// stays true — this is not a deploy failure — but consumers filtering
+	// on Success alone (fleet rollback targeting keyed on the log, log
+	// rendering, dash reads) must not mistake it for a clean outcome: a
+	// degraded host is still running part of the superseded generation.
+	Degraded bool `json:"degraded,omitempty"`
+	// DegradedReason itemizes what escaped retirement when Degraded is set.
+	DegradedReason string `json:"degraded_reason,omitempty"`
 }
 
 // ReadRemoteFile returns the file's contents and whether it exists. Absence

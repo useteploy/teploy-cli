@@ -73,10 +73,11 @@ type Port struct {
 	Fixed bool `json:"fixed,omitempty"`
 }
 
-// Health records the deploy-time health gate so a rollback probes the path
+// Health records the deploy-time health gate so a rollback probes the way
 // the target release was actually deployed with, not whatever the current
 // teploy.yml says.
 type Health struct {
+	Mode            string `json:"mode,omitempty"`
 	Path            string `json:"path,omitempty"`
 	TimeoutSeconds  int    `json:"timeout_seconds,omitempty"`
 	IntervalSeconds int    `json:"interval_seconds,omitempty"`
@@ -86,13 +87,13 @@ type Health struct {
 // so rollback restores the target release's edge config instead of the
 // current config file's.
 type CaddyRoute struct {
-	TLSCert      string            `json:"tls_cert,omitempty"`
-	TLSKey       string            `json:"tls_key,omitempty"`
-	TLSInternal  bool              `json:"tls_internal,omitempty"`
-	CaddyExtra   string            `json:"caddy_extra,omitempty"`
-	Cache        map[string]string `json:"cache,omitempty"`
-	Firewall     *caddy.Firewall   `json:"firewall,omitempty"`
-	Access       *caddy.Access     `json:"access,omitempty"`
+	TLSCert     string            `json:"tls_cert,omitempty"`
+	TLSKey      string            `json:"tls_key,omitempty"`
+	TLSInternal bool              `json:"tls_internal,omitempty"`
+	CaddyExtra  string            `json:"caddy_extra,omitempty"`
+	Cache       map[string]string `json:"cache,omitempty"`
+	Firewall    *caddy.Firewall   `json:"firewall,omitempty"`
+	Access      *caddy.Access     `json:"access,omitempty"`
 }
 
 // Static records a type:static release's serving configuration — the piece
@@ -125,6 +126,14 @@ type Record struct {
 
 	ImageRef    string `json:"image_ref,omitempty"`
 	ImageDigest string `json:"image_digest,omitempty"`
+	// ManifestSHA256 is the effective-config digest (config.
+	// NormalizeAndDigest) the release deployed under — the plan/receipt
+	// equality surface (C04).
+	ManifestSHA256 string `json:"manifest_sha256,omitempty"`
+	// Provenance is the plan-time provenance the deploy resolved to
+	// (C04): revision, worktree cleanliness, build context fingerprint,
+	// Dockerfile identity, platform, image digest and mutability.
+	Provenance *Provenance `json:"provenance,omitempty"`
 
 	Replicas    int               `json:"replicas,omitempty"`
 	Processes   map[string]string `json:"processes,omitempty"`

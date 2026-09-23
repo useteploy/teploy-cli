@@ -10,7 +10,10 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
+	"github.com/useteploy/teploy/internal/config"
+	"github.com/useteploy/teploy/internal/deploy"
 	"github.com/useteploy/teploy/internal/docker"
+	"github.com/useteploy/teploy/internal/ssh"
 	"github.com/useteploy/teploy/internal/state"
 )
 
@@ -37,9 +40,30 @@ func runStatus(flags *Flags, appName string) error {
 		return err
 	}
 	defer executor.Close()
+	return writeStatus(ctx, flags, appCfg, executor, os.Stdout)
+}
 
+// formatRepairDebt renders the operator-facing sentence for outstanding
+// release-record repair debt (C01-6), or "" when there is none — absence
+// must be silent.
+func formatRepairDebt(app string, debt *deploy.RepairDebt) string {
+	if debt == nil {
+		return ""
+	}
+	return fmt.Sprintf("release record for %s@%s is missing (record write failed %d attempt(s): %s) — the next deploy rebuilds it", app, debt.Release, debt.Attempts, debt.Reason)
+}
+
+// writeStatus renders the app's server-side state. Split from runStatus so
+// the state-read surface (state, containers, and now repair debt) is
+// testable against a mock executor.
+func writeStatus(ctx context.Context, flags *Flags, appCfg *config.AppConfig, executor ssh.Executor, out io.Writer) error {
 	// Read deploy state.
 	current, _ := state.Read(ctx, executor, appCfg.App)
+
+	// Outstanding release-record repair debt (C01-6): a previous deploy
+	// whose record write failed after the live commit. Unreadable markers
+	// are visible too — an unhealable debt must not be an invisible one.
+	debt, debtErr := deploy.ReadRepairDebt(ctx, executor, appCfg.App)
 
 	// List containers.
 	dk := docker.NewClient(executor)
@@ -49,33 +73,39 @@ func runStatus(flags *Flags, appName string) error {
 	}
 
 	if flags.JSON {
-		return json.NewEncoder(os.Stdout).Encode(map[string]interface{}{
-			"app":        appCfg.App,
-			"server":     executor.Host(),
-			"state":      current,
-			"containers": containers,
+		return json.NewEncoder(out).Encode(map[string]interface{}{
+			"app":         appCfg.App,
+			"server":      executor.Host(),
+			"state":       current,
+			"repair_debt": debt,
+			"containers":  containers,
 		})
 	}
 
-	fmt.Printf("App:     %s\n", appCfg.App)
-	fmt.Printf("Server:  %s\n", executor.Host())
+	fmt.Fprintf(out, "App:     %s\n", appCfg.App)
+	fmt.Fprintf(out, "Server:  %s\n", executor.Host())
 	if current != nil {
-		fmt.Printf("Version: %s (port %d)\n", current.CurrentHash, current.CurrentPort)
+		fmt.Fprintf(out, "Version: %s (port %d)\n", current.CurrentHash, current.CurrentPort)
 		if current.PreviousHash != "" {
-			fmt.Printf("Previous: %s (port %d)\n", current.PreviousHash, current.PreviousPort)
+			fmt.Fprintf(out, "Previous: %s (port %d)\n", current.PreviousHash, current.PreviousPort)
 		}
 	} else {
-		fmt.Println("Version: not deployed")
+		fmt.Fprintln(out, "Version: not deployed")
+	}
+	if debtErr != nil {
+		fmt.Fprintf(out, "Repair debt: marker could not be read — %v\n", debtErr)
+	} else if line := formatRepairDebt(appCfg.App, debt); line != "" {
+		fmt.Fprintf(out, "Repair debt: %s\n", line)
 	}
 
 	if len(containers) == 0 {
-		fmt.Println("\nNo containers")
+		fmt.Fprintln(out, "\nNo containers")
 		return nil
 	}
 
-	fmt.Printf("\n%-35s  %-25s  %-10s  %s\n", "CONTAINER", "IMAGE", "STATE", "STATUS")
+	fmt.Fprintf(out, "\n%-35s  %-25s  %-10s  %s\n", "CONTAINER", "IMAGE", "STATE", "STATUS")
 	for _, c := range containers {
-		fmt.Printf("%-35s  %-25s  %-10s  %s\n", c.Name, c.Image, c.State, c.Status)
+		fmt.Fprintf(out, "%-35s  %-25s  %-10s  %s\n", c.Name, c.Image, c.State, c.Status)
 	}
 	return nil
 }

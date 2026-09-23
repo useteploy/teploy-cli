@@ -70,10 +70,11 @@ type appStatusDTO struct {
 }
 
 type appListDTO struct {
-	Host       string         `json:"host"`
-	Apps       []appStatusDTO `json:"apps"`
-	ObservedAt time.Time      `json:"observed_at"`
-	Errors     []machineError `json:"errors"`
+	MachineInterface int            `json:"machine_interface"`
+	Host             string         `json:"host"`
+	Apps             []appStatusDTO `json:"apps"`
+	ObservedAt       time.Time      `json:"observed_at"`
+	Errors           []machineError `json:"errors"`
 }
 
 func newAppListCmd(flags *Flags) *cobra.Command {
@@ -124,10 +125,11 @@ func runAppList(flags *Flags, out io.Writer) error {
 
 func collectAppList(ctx context.Context, executor ssh.Executor, observedAt time.Time) appListDTO {
 	result := appListDTO{
-		Host:       executor.Host(),
-		Apps:       []appStatusDTO{},
-		ObservedAt: observedAt,
-		Errors:     []machineError{},
+		MachineInterface: MachineInterface,
+		Host:             executor.Host(),
+		Apps:             []appStatusDTO{},
+		ObservedAt:       observedAt,
+		Errors:           []machineError{},
 	}
 	out, err := executor.Run(ctx, `for f in /deployments/*/state.json /deployments/*/state; do [ -f "$f" ] && basename "$(dirname "$f")"; done | sort -u`)
 	if err != nil {
@@ -303,16 +305,17 @@ type caddyObservationDTO struct {
 }
 
 type serverStatusDTO struct {
-	Server     string              `json:"server"`
-	Host       string              `json:"host"`
-	Uptime     uptimeDTO           `json:"uptime"`
-	Load       loadDTO             `json:"load"`
-	Memory     memoryDTO           `json:"memory"`
-	Disks      []diskDTO           `json:"disks"`
-	Docker     dockerInventoryDTO  `json:"docker"`
-	Caddy      caddyObservationDTO `json:"caddy"`
-	ObservedAt time.Time           `json:"observed_at"`
-	Errors     []machineError      `json:"errors"`
+	MachineInterface int                 `json:"machine_interface"`
+	Server           string              `json:"server"`
+	Host             string              `json:"host"`
+	Uptime           uptimeDTO           `json:"uptime"`
+	Load             loadDTO             `json:"load"`
+	Memory           memoryDTO           `json:"memory"`
+	Disks            []diskDTO           `json:"disks"`
+	Docker           dockerInventoryDTO  `json:"docker"`
+	Caddy            caddyObservationDTO `json:"caddy"`
+	ObservedAt       time.Time           `json:"observed_at"`
+	Errors           []machineError      `json:"errors"`
 }
 
 func newServerStatusCmd(flags *Flags) *cobra.Command {
@@ -356,7 +359,8 @@ func runServerStatus(flags *Flags, target string, out io.Writer) error {
 
 func collectServerStatus(ctx context.Context, executor ssh.Executor, server string, observedAt time.Time) serverStatusDTO {
 	result := serverStatusDTO{
-		Server: server, Host: executor.Host(), ObservedAt: observedAt,
+		MachineInterface: MachineInterface,
+		Server:           server, Host: executor.Host(), ObservedAt: observedAt,
 		Disks: []diskDTO{}, Errors: []machineError{},
 		Docker: dockerInventoryDTO{Containers: []containerDTO{}, Images: []imageDTO{}},
 		Caddy:  caddyObservationDTO{Routes: []caddyRouteDTO{}},

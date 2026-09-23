@@ -2,6 +2,38 @@
 
 All notable changes to teploy are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.37] - 2026-09-22
+
+### Fixed
+
+- **Webhook deploys build the authenticated commit.** A delivery now
+  pins the build to the payload's exact commit (fetch-verify-reset);
+  if that commit was force-pushed away the deploy fails loudly naming
+  both commits instead of silently building the moving branch tip.
+  The pin rides the durable admission ledger through supersede and
+  crash-resume.
+- **Preview updates no longer take the preview down.** A preview update
+  now runs blue/green: the candidate starts under a version-suffixed
+  name with its own network alias, passes a readiness gate, the route
+  switches, and only then is the predecessor retired — a failed
+  candidate leaves the old preview serving. `teploy preview prune`
+  prunes expired previews across all apps (both record eras,
+  idempotent, 72h default TTL) and is cron-able; the deploy-time prune
+  uses the same core.
+- **SSH host-key mismatches now name what was presented and what
+  known_hosts holds** (key algorithms included), instead of a bare
+  mismatch error (found via ship's delivery provisioning).
+
+### Added
+
+- **Crash-recovery evidence for deploys (C01 design obligations):**
+  readiness receipts (exact candidate IDs + probe outcomes) and
+  predecessor snapshots (exact container IDs) persist per attempt at
+  the moment they become true, so recovery can distinguish
+  compensable states from inspect-only ones and restore exactly what
+  was displaced; the deploy log records DEGRADED outcomes (traffic
+  switched but retirement partially failed) instead of clean success.
+
 ## [0.1.36] - 2026-09-22
 
 ### Fixed

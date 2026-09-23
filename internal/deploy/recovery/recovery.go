@@ -45,9 +45,11 @@ const (
 	// {app}-{process}-{version}[-{index}] with teploy.* labels
 	// (internal/docker/docker.go:82-117, internal/deploy/deploy.go:573-607).
 	CandidatesRunning
-	// ReadinessPassed: the health gate passed. NO durable receipt exists
-	// today (internal/deploy/health.go probes are ephemeral) — see ADR
-	// finding on the readiness receipt.
+	// ReadinessPassed: the health gate passed. The durable receipt is the
+	// attempt-scoped readiness.json (internal/deploy/journal.go, C01-4),
+	// written exactly on pass and before the traffic switch; the evidence
+	// derivation that turns it into this state and Candidates attribution
+	// lives alongside it (attemptReadinessState / candidateAttribution).
 	ReadinessPassed
 	// TrafficSwitched: the edge routes name the candidates — the managed
 	// marker block in /deployments/caddy/Caddyfile plus reload + delivery
@@ -410,10 +412,10 @@ func Lattice() []Transition {
 		{
 			From: CandidatesRunning, To: ReadinessPassed,
 			Evidence: []string{
-				"NONE DURABLE — health-gate results are ephemeral (deploy/health.go)",
+				"readiness receipt /deployments/<app>/meta/att/<hash>.<id>/readiness.json — exact candidate IDs + probes + outcome, written on pass before the switch (deploy/journal.go, C01-4; internal/deploy/health.go probes remain ephemeral)",
 			},
 			CrashDisposition: Inspect,
-			Note:             "the only transition with no receipt today; a recovery owner must re-probe. ADR finding: readiness receipt is a design obligation",
+			Note:             "receipt LANDED (C01-4): its presence derives ReadinessPassed and attributes the running candidates (attemptReadinessState/candidateAttribution → Decide); its absence keeps the window INSPECT. Wiring a recovery OWNER that reads it on acquisition is the C01-1 slice",
 		},
 		{
 			From: ReadinessPassed, To: TrafficSwitched,
@@ -441,7 +443,7 @@ func Lattice() []Transition {
 				"absence of predecessor names in docker ps label inventory (docker/docker.go:568-571)",
 			},
 			CrashDisposition: Retry,
-			Note:             "retryable: retirement re-derives from the inventory; failures are reported, never silent. ADR finding: the success log entry records no degraded flag",
+			Note:             "retryable: retirement re-derives from the inventory; failures are reported, never silent — and since C01-5 the terminal log entry records them as a DEGRADED success instead of clean success; the durable predecessor snapshot (deploy/journal.go, C01-10) preserves the exact retirement set across crashes",
 		},
 		{
 			From: PredecessorRetired, To: TerminalReceiptPersisted,

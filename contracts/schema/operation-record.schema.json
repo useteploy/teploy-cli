@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://teploy.github.io/contracts/schema/operation-record.schema.json",
+  "title": "Dash persistedOperation (R2/D02; PRODUCER = teploy-dash)",
+  "$comment": "Schema shared via this corpus; emitting code lives in teploy-dash. Fixtures arrive with S5/S6 dash slices. Pre-D02 records carry null reconciliation - the legacy fixture class.",
+  "type": "object",
+  "required": ["id", "kind", "status", "created_at"],
+  "properties": {
+    "id": {"type": "string", "minLength": 1},
+    "kind": {"type": "string"},
+    "status": {"type": "string"},
+    "created_at": {"type": "string", "format": "date-time"},
+    "principal": {"type": "string"},
+    "idempotency_key": {"type": ["string", "null"]},
+    "record_version": {"type": ["integer", "null"]},
+    "reconciliation": {"type": ["object", "null"]}
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://teploy.github.io/contracts/schema/version-handshake.schema.json",
+  "title": "teploy version --json handshake (X02 S1, MI 1)",
+  "type": "object",
+  "required": ["version", "machine_interface", "capabilities"],
+  "additionalProperties": false,
+  "properties": {
+    "version": {"type": "string", "minLength": 1},
+    "machine_interface": {"type": "integer", "minimum": 1, "maximum": 1},
+    "capabilities": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1},
+      "uniqueItems": true
+    }
+  }
+}

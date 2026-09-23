@@ -77,6 +77,7 @@ func NewRootCmd(version string) *cobra.Command {
 	root.AddCommand(newUnlockCmd(flags))
 	root.AddCommand(newInitCmd())
 	root.AddCommand(newValidateCmd(flags))
+	root.AddCommand(newDoctorCmd(flags, version))
 	root.AddCommand(newPlanCmd(flags))
 	root.AddCommand(newDriftCmd(flags))
 	root.AddCommand(newHealCmd(flags))
@@ -90,7 +91,7 @@ func NewRootCmd(version string) *cobra.Command {
 	root.AddCommand(newAutoDeployCmd(flags))
 	root.AddCommand(newMaintenanceCmd(flags))
 	root.AddCommand(newUpdateCmd(version))
-	root.AddCommand(newVersionCmd(version))
+	root.AddCommand(newVersionCmd(flags, version))
 
 	return root
 }
@@ -98,7 +99,7 @@ func NewRootCmd(version string) *cobra.Command {
 func Execute(version string) {
 	root := NewRootCmd(version)
 	if err := root.Execute(); err != nil {
-		fmt.Fprintln(os.Stderr, err)
+		reportExecutionError(root, err, os.Stderr)
 		os.Exit(1)
 	}
 }

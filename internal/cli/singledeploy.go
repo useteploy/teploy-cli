@@ -269,8 +269,15 @@ func (s *singleServerDeployer) deployApp(ctx context.Context, appCfg *config.App
 	if err != nil {
 		return fmt.Errorf("normalizing applied manifest: %w", err)
 	}
+	// Plan-time provenance (C04), same as the single-server path: resolved
+	// before execution and filed into THIS server's attempt namespace.
+	prov := resolveDeployProvenance(ctx, s.exec, s.out, appCfg, ".", image, version, manifestSHA256, needsBuild)
+	if err := releasemeta.WriteAttemptProvenance(ctx, s.exec, att, prov); err != nil {
+		fmt.Fprintf(s.out, "Warning: could not persist the deploy provenance receipt for %s@%s: %v\n", appCfg.App, version, err)
+	}
 	deployer := deploy.NewDeployer(s.exec, s.out)
 	deployCfg := deployConfigFromApp(appCfg, image, version, envFiles, volumes, tlsCert, tlsKey, tlsInternal, appliedManifest, manifestSHA256)
+	deployCfg.Provenance = prov
 
 	// Vulnerability gate (see deploy.go): fixable CRITICALs block before
 	// containers start. Per-server, so every box in a multi-server deploy
