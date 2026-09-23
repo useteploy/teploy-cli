@@ -1896,3 +1896,22 @@ fleet diagnosis (doctor currently diagnoses ONE resolved target),
 DNS/health-path diagnostics, and machine-event streaming (the
 "versioned JSON/events" contract's events half — doctor emits one
 versioned JSON document per run, not a stream).
+
+## X02 S7 acceptance sweep — 2026-09-23
+
+`scripts/x02-acceptance-sweep.sh` (this repo's executable harness, ADR §6
+S7). Legs and evidence (exit 0, all PASS, non-vacuous — each pattern is
+verified to match >=1 test before running):
+
+| Leg | Package | Tests | Result |
+|---|---|---|---|
+| rename | ./internal/config | 5 (rename/update/re-add preserve id; legacy stays id-less; mint shape) | PASS |
+| duplicate-identity | ./internal/preview | 2 (preview ID golden; branch identity distinct) | PASS |
+| release-identity | ./internal/releasemeta | 2 (absent/present/unreadable; round-trip + path validation) | PASS |
+| repeated-request | ./internal/cli | 3 (version/release/attempt-name corpus goldens) | PASS |
+| response-loss | ./internal/deploy | 4 (Decide Compensate-vs-Inspect; attribution; predecessor snapshots) | PASS |
+| rollback | ./internal/deploy | 4 (state-commit failure restores old workload/route; rollback from recorded spec; fixed-port displacement) | PASS |
+
+The harness fails on any leg failing OR matching no tests (a vacuous pass
+is a broken pin). Re-run and paste fresh output here on any contract
+change.
