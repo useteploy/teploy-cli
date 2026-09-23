@@ -69,11 +69,13 @@ func TestContractsAppListEnvelopeGolden(t *testing.T) {
 	writeFixture(t, "app-list-envelope/valid/mi1.json", appListDTO{
 		MachineInterface: MachineInterface,
 		Host:             "srv.example.com",
+		Errors:           []machineError{},
 		Apps: []appStatusDTO{{
 			App: "myapp", Domain: "myapp.example.com", Type: "container",
 			Ingress: "caddy", CurrentRelease: releaseStatusDTO{Version: "3", Ports: []int{3000}},
 			Containers: []containerDTO{{ID: "9f31c02", Name: "myapp-web-3", Image: "nginx:1.27", State: "running", Status: "Up 4 minutes", CreatedAt: "2026-09-23T11:55:00Z", Process: "web", Version: "3"}},
-			Lock:       nil, ObservedAt: ts, Errors: nil,
+			Processes:  []processDTO{},
+			Lock:       nil, ObservedAt: ts, Errors: []machineError{},
 		}},
 		ObservedAt: ts,
 	})
@@ -83,7 +85,7 @@ func TestContractsAppListEnvelopeGolden(t *testing.T) {
 	// legacy, not as MI 0.
 	var legacy map[string]any
 	raw, err := json.Marshal(appListDTO{
-		Host: "srv.example.com", Apps: []appStatusDTO{}, ObservedAt: ts,
+		Host: "srv.example.com", Apps: []appStatusDTO{}, ObservedAt: ts, Errors: []machineError{},
 	})
 	if err != nil {
 		t.Fatalf("marshal legacy: %v", err)

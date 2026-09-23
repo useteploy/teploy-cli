@@ -10,6 +10,7 @@ Neutron/Nucleus dependency and a public mirror.
 
 | Corpus rev | Emitting CLI | Machine Interface | Notes |
 |---|---|---|---|
+| 3 (amended) | main (C05 plan-record corpus + defect fix) | 1 | C05 added the plan-record artifact + plan-apply token (see git history); amendment: server-status schema now carries its own $defs (its $refs never resolved), and app-list fixtures emit [] where the encoder emits [] (null fixtures failed schema + the real dash decode - found by dash's new contracts CI job, fixed here). |
 | 1 | post-v0.1.37 main (S2 skeleton) | 1 | First goldens: version handshake, app-list envelope (MI + pre-MI legacy), error envelope (config-invalid, internal, invalid-code), release-record, attempt-name grammar, preview-state eras. |
 | 2 | post-v0.1.37 main (S6) | 1 | observation-envelope: schema corrected from the S2 draft shape to the ADR §2.4 canonical form (resource/collected_at/freshness tri-state/error/source/last_known) before any consumer existed; fixtures generated from teploy-dash's real constructors (fresh, stale, unknown-unreachable, unreachable-last-known). |
 | 3 | post-v0.1.37 main (C05) | 1 | plan-record: the `teploy plan --out` / `teploy apply` binding record (build + prebuilt-digest valid fixtures, tampered-id invalid fixture); `plan-apply` capability token added to the version handshake (additive). |

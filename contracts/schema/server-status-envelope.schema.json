@@ -73,5 +73,141 @@
         }
       }
     }
-  ]
+  ],
+  "$defs": {
+    "machineError": {
+      "type": "object",
+      "required": [
+        "scope",
+        "message"
+      ],
+      "properties": {
+        "scope": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        }
+      }
+    },
+    "container": {
+      "type": "object",
+      "required": [
+        "id",
+        "name",
+        "image",
+        "state",
+        "status"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "image": {
+          "type": "string"
+        },
+        "state": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string"
+        },
+        "created_at": {
+          "type": "string"
+        },
+        "process": {
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        }
+      }
+    },
+    "release": {
+      "type": "object",
+      "required": [
+        "version",
+        "ports"
+      ],
+      "properties": {
+        "version": {
+          "type": "string"
+        },
+        "ports": {
+          "type": "array",
+          "items": {
+            "type": "integer"
+          }
+        }
+      }
+    },
+    "appStatus": {
+      "type": "object",
+      "required": [
+        "app",
+        "domain",
+        "type",
+        "ingress",
+        "current_release",
+        "previous_release",
+        "containers",
+        "processes",
+        "lock",
+        "maintenance",
+        "observed_at",
+        "errors"
+      ],
+      "properties": {
+        "app": {
+          "type": "string"
+        },
+        "domain": {
+          "type": "string"
+        },
+        "type": {
+          "type": "string"
+        },
+        "ingress": {
+          "type": "string"
+        },
+        "current_release": {
+          "$ref": "#/$defs/release"
+        },
+        "previous_release": {
+          "$ref": "#/$defs/release"
+        },
+        "containers": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/container"
+          }
+        },
+        "processes": {
+          "type": "array"
+        },
+        "lock": {
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "maintenance": {
+          "type": "boolean"
+        },
+        "observed_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "errors": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/machineError"
+          }
+        }
+      }
+    }
+  }
 }
