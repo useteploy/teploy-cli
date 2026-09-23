@@ -472,6 +472,23 @@ func (d *Deployer) DeployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 		}
 	}
 
+	// 6c. Persist the predecessor snapshot into this attempt's immutable
+	// artifact namespace (C01-10), still BEFORE any new container starts
+	// and before the recreate-strategy displacement stops the fixed-port
+	// workload: a crash after candidates start loses the in-memory
+	// snapshot, and with it the exact knowledge of what this attempt must
+	// compensate or retire — re-derivation from a post-crash inventory
+	// selects by the NEW authoritative release (TCL-02's hazard) and the
+	// name fallback cannot see removed workers (T63). The attempt dir is
+	// write-once per F08, so the snapshot is immutable once written. A
+	// persistence failure degrades crash-safety only (warned); the
+	// in-memory snapshot keeps this deploy correct.
+	if predecessorsListed {
+		if err := d.persistPredecessorSnapshot(ctx, assetAttempt, current.CurrentHash, sameVersion, predecessors); err != nil {
+			fmt.Fprintf(d.out, "Warning: could not persist the predecessor snapshot for crash recovery: %v\n", err)
+		}
+	}
+
 	// Host ingress and publish-apps recreate rather than blue/green: the new
 	// container reuses the old one's fixed host port(s), so stop the running
 	// web container first to free them. Keep the stopped container until
@@ -516,6 +533,10 @@ func (d *Deployer) DeployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 	// returned without either, orphaning the first replica and leaving a
 	// host-ingress app down (audit F05).
 	var started []string
+	// candidateIDs collects the container IDs docker run returned for the
+	// web candidates — the exact identities the readiness receipt records
+	// (C01-4) and the strongest attribution evidence a recovery owner has.
+	candidateIDs := make([]string, replicas)
 	webContainerNames := make([]string, replicas)
 	restoreDisplacedAndStarted := func(reason error) error {
 		// Cleanup runs detached from the (possibly cancelled) deploy context,
@@ -536,8 +557,17 @@ func (d *Deployer) DeployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 				cleanupFailures = append(cleanupFailures, fmt.Sprintf("remove %s: %v", n, err))
 			}
 		}
-		restored := len(displacedHostWeb) == 0
-		for _, old := range displacedHostWeb {
+		// The displaced list is the in-memory one when this process did
+		// the displacing; a process recovering a crashed attempt arrives
+		// with it empty, and the durable predecessor snapshot (C01-10)
+		// restores exactly that knowledge — snapshot web containers that
+		// are no longer running were displaced by the attempt.
+		displaced := displacedHostWeb
+		if len(displaced) == 0 {
+			displaced = d.displacedFromSnapshot(recoveryCtx, assetAttempt)
+		}
+		restored := len(displaced) == 0
+		for _, old := range displaced {
 			if err := d.docker.Restart(recoveryCtx, old, nil); err != nil {
 				cleanupFailures = append(cleanupFailures, fmt.Sprintf("restore %s: %v", old, err))
 				fmt.Fprintf(d.out, "  WARNING: could not restore displaced container %s: %v\n", old, err)
@@ -553,8 +583,8 @@ func (d *Deployer) DeployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 		if len(cleanupFailures) > 0 {
 			fmt.Fprintf(d.out, "  WARNING: cleanup incomplete after failure — %s\n", strings.Join(cleanupFailures, "; "))
 		}
-		d.logDeploy(recoveryCtx, cfg, false, start)
-		if len(displacedHostWeb) > 0 && !restored {
+		d.logDeploy(recoveryCtx, cfg, false, "", start)
+		if len(displaced) > 0 && !restored {
 			return fmt.Errorf("%w — recovery also failed: no predecessor could be restarted; %s needs manual attention (%s)", reason, cfg.App, strings.Join(cleanupFailures, "; "))
 		}
 		if len(cleanupFailures) > 0 {
@@ -603,6 +633,7 @@ func (d *Deployer) DeployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 			return restoreDisplacedAndStarted(fmt.Errorf("starting container %s: %w", name, err))
 		}
 		started = append(started, name)
+		candidateIDs[i] = containerID
 		fmt.Fprintf(d.out, "  Container %s started\n", containerID[:min(12, len(containerID))])
 	}
 
@@ -655,6 +686,30 @@ func (d *Deployer) DeployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 		fmt.Fprintf(d.out, "  All %d replicas healthy\n", replicas)
 	} else {
 		fmt.Fprintln(d.out, "  Health check passed")
+	}
+
+	// 9b. Persist the readiness receipt (C01-4) — exactly now: the gate
+	// has passed, the traffic switch has NOT begun. The receipt (exact
+	// candidate container IDs + what was probed + when) is what lets a
+	// recovery owner distinguish "crashed during readiness" (no receipt:
+	// INSPECT) from "readiness held, crash before/while switching
+	// traffic" (the COMPENSATE class) — see attemptReadinessState /
+	// candidateAttribution for the Decide-side derivation. A write
+	// failure warns: the receipt is recovery evidence, not a deploy
+	// precondition.
+	{
+		probeHost := healthProbeHost(webBindHost)
+		cands := make([]receiptCandidate, len(webContainerNames))
+		probes := make([]readinessProbe, len(ports))
+		for i, name := range webContainerNames {
+			cands[i] = receiptCandidate{Name: name, ID: candidateIDs[i]}
+		}
+		for i, p := range ports {
+			probes[i] = readinessProbe{Container: webContainerNames[i], Host: probeHost, Port: p, Path: healthCfg.Path}
+		}
+		if err := d.persistReadinessReceipt(ctx, assetAttempt, cfg.Version, cands, probes); err != nil {
+			fmt.Fprintf(d.out, "Warning: could not persist the readiness receipt for crash recovery: %v\n", err)
+		}
 	}
 
 	// 10. Start non-web process containers (workers, etc. — no replicas, one each).
@@ -769,7 +824,7 @@ func (d *Deployer) DeployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 	// this deploy authoritative is a guarded effect, so a broken holder
 	// commits nothing.
 	if err := state.WriteFenced(ctx, d.exec, cfg.App, newState, lk); err != nil {
-		return d.abortStateCommit(ctx, cfg, current, started, displacedHostWeb, start, err)
+		return d.abortStateCommit(ctx, cfg, current, started, displacedHostWeb, assetAttempt, start, err)
 	}
 
 	// 13b. Record the release metadata (F14). The containers are live and
@@ -836,8 +891,15 @@ func (d *Deployer) DeployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 	// reported success. Only a still-failing inventory degrades to names —
 	// now with every stop/remove failure reported (T63's honest-retirement
 	// half).
+	//
+	// Every incomplete retirement is collected (C01-5): the deploy stays
+	// successful (traffic is switched, the app serves), but the terminal
+	// log entry records the degraded outcome instead of clean success —
+	// a fleet rollback keyed on the log must not skip a host still
+	// running part of the superseded generation.
+	var retireIncomplete []string
 	if predecessorsListed {
-		d.stopPredecessorSnapshot(ctx, predecessors, sameVersion, stopTimeout, lk)
+		retireIncomplete = d.stopPredecessorSnapshot(ctx, predecessors, sameVersion, stopTimeout, lk)
 	} else if current != nil && current.CurrentHash != "" {
 		// Fence (F16): post-commit cleanup never interleaves with a new
 		// holder.
@@ -845,16 +907,18 @@ func (d *Deployer) DeployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 		if lk != nil {
 			if err := lk.Check(ctx, d.exec); err != nil {
 				fmt.Fprintf(d.out, "Warning: predecessor cleanup skipped — %v\n", err)
+				retireIncomplete = append(retireIncomplete, fmt.Sprintf("cleanup skipped: %v", err))
 				fenceOK = false
 			}
 		}
 		if fenceOK {
 			if inv, invErr := d.docker.ListContainers(ctx, cfg.App); invErr == nil {
-				d.stopPredecessorSnapshot(ctx, selectPredecessors(inv, current, sameVersion), sameVersion, stopTimeout, lk)
+				retireIncomplete = append(retireIncomplete, d.stopPredecessorSnapshot(ctx, selectPredecessors(inv, current, sameVersion), sameVersion, stopTimeout, lk)...)
 			} else {
 				fmt.Fprintf(d.out, "Warning: container inventory still unreadable (%v) — cleaning up by derived names; a removed worker process may escape retirement\n", invErr)
 				if err := stopOldWorkloadsByName(ctx, d.docker, d.out, cfg, current, processes, stopTimeout); err != nil {
 					fmt.Fprintf(d.out, "Warning: name-based cleanup incomplete: %v\n", err)
+					retireIncomplete = append(retireIncomplete, err.Error())
 				}
 			}
 		}
@@ -930,8 +994,13 @@ func (d *Deployer) DeployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 		}
 	}
 
-	// 16. Log success.
-	d.logDeploy(ctx, cfg, true, start)
+	// 16. Log the real outcome (C01-5): clean success only when
+	// retirement completed; a partial retirement is a degraded success.
+	degradedReason := strings.Join(retireIncomplete, "; ")
+	d.logDeploy(ctx, cfg, true, degradedReason, start)
+	if degradedReason != "" {
+		fmt.Fprintf(d.out, "Warning: deployed, but predecessor retirement is incomplete — %s\n", degradedReason)
+	}
 
 	duration := time.Since(start)
 	fmt.Fprintf(d.out, "\nDeployed %s version %s in %s\n", cfg.App, cfg.Version, duration.Round(time.Millisecond))
@@ -960,15 +1029,19 @@ func selectPredecessors(inv []docker.Container, current *state.AppState, sameVer
 	return out
 }
 
-// stopPredecessorSnapshot retires exactly the snapshotted predecessor set.
+// stopPredecessorSnapshot retires exactly the snapshotted predecessor set
+// and returns what escaped retirement (C01-5: the caller records it as a
+// degraded outcome — never clean success, never a failed deploy).
 // Fence checks precede each stop: the deploy is already committed, and a
 // fence loss mid-cleanup means another operation owns the app — refuse
 // further stops (loudly) rather than interleaving.
-func (d *Deployer) stopPredecessorSnapshot(ctx context.Context, predecessors []docker.Container, sameVersion bool, stopTimeout int, lk *state.Lock) {
+func (d *Deployer) stopPredecessorSnapshot(ctx context.Context, predecessors []docker.Container, sameVersion bool, stopTimeout int, lk *state.Lock) []string {
+	var incomplete []string
 	for _, ct := range predecessors {
 		if lk != nil {
 			if err := lk.Check(ctx, d.exec); err != nil {
 				fmt.Fprintf(d.out, "Warning: predecessor cleanup stopped — %v\n", err)
+				incomplete = append(incomplete, fmt.Sprintf("cleanup interrupted before %s (fence lost)", ct.Name))
 				break
 			}
 		}
@@ -979,14 +1052,17 @@ func (d *Deployer) stopPredecessorSnapshot(ctx context.Context, predecessors []d
 			// deploy — but it must be reported, never silent (TCL-19):
 			// a leftover old worker keeps consuming jobs.
 			fmt.Fprintf(d.out, "Warning: could not stop old container %s: %v\n", ct.Name, err)
+			incomplete = append(incomplete, fmt.Sprintf("stop %s: %v", ct.Name, err))
 			continue
 		}
 		if sameVersion {
 			if err := d.docker.Remove(ctx, ct.Name); err != nil {
 				fmt.Fprintf(d.out, "Warning: could not remove old container %s: %v\n", ct.Name, err)
+				incomplete = append(incomplete, fmt.Sprintf("remove %s: %v", ct.Name, err))
 			}
 		}
 	}
+	return incomplete
 }
 
 // stopOldWorkloadsByName is the name-derived fallback for old-workload
@@ -1033,20 +1109,29 @@ func stopOldWorkloadsByName(ctx context.Context, dk *docker.Client, out io.Write
 	return errors.Join(failures...)
 }
 
-func (d *Deployer) abortStateCommit(ctx context.Context, cfg Config, current *state.AppState, started, displacedHostWeb []string, start time.Time, commitErr error) error {
+func (d *Deployer) abortStateCommit(ctx context.Context, cfg Config, current *state.AppState, started, displacedHostWeb []string, att releasemeta.Attempt, start time.Time, commitErr error) error {
 	// Compensation runs on a DETACHED bounded context (A11): if the commit
 	// failed because the deploy context was cancelled, reusing that context
 	// would skip the very stops/restarts/route restores that undo the
 	// deploy — leaving the app dark while the error text claims recovery.
 	recoveryCtx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
-	d.logDeploy(recoveryCtx, cfg, false, start)
+	d.logDeploy(recoveryCtx, cfg, false, "", start)
+
+	// The displaced fixed-port workload: the in-memory list when this
+	// process did the displacing; a process recovering a crashed attempt
+	// reads it from the durable predecessor snapshot (C01-10) — exactly
+	// the recorded container identities, never a re-derivation.
+	displaced := displacedHostWeb
+	if len(displaced) == 0 {
+		displaced = d.displacedFromSnapshot(recoveryCtx, att)
+	}
 
 	if cfg.ingressHost() || len(cfg.Publish) > 0 {
 		for _, name := range started {
 			d.docker.Stop(recoveryCtx, name, 5)
 		}
-		for _, old := range displacedHostWeb {
+		for _, old := range displaced {
 			if err := d.docker.Restart(recoveryCtx, old, nil); err != nil {
 				for _, name := range started {
 					d.docker.Start(recoveryCtx, name)
@@ -1072,7 +1157,7 @@ func (d *Deployer) abortStateCommit(ctx context.Context, cfg Config, current *st
 		for _, name := range started {
 			d.docker.Remove(recoveryCtx, name)
 		}
-		if len(displacedHostWeb) == 0 {
+		if len(displaced) == 0 {
 			return fmt.Errorf("committing authoritative applied state after starting the first host-ingress workload: %w; the uncommitted workload was stopped and removed", commitErr)
 		}
 		return fmt.Errorf("committing authoritative applied state after replacing the fixed-port host workload: %w; the original workload was restored and the uncommitted workload was removed", commitErr)
@@ -1136,15 +1221,23 @@ func (d *Deployer) restorePreviousRoute(ctx context.Context, cfg Config, current
 	return d.caddy.SetRoute(ctx, cfg.App, domain, names[0], primaryPort, tls, cfg.CaddyExtra, cfg.Cache, cfg.Firewall, cfg.Access)
 }
 
-func (d *Deployer) logDeploy(ctx context.Context, cfg Config, success bool, start time.Time) {
+// logDeploy appends the terminal receipt for a deploy attempt. success
+// records whether traffic switched and committed; degradedReason (empty
+// for clean outcomes and failures) itemizes post-commit retirement that
+// partially failed — a degraded success is still serving the new
+// generation, and the log must let Success-filtering consumers tell it
+// apart from a clean one (C01-5).
+func (d *Deployer) logDeploy(ctx context.Context, cfg Config, success bool, degradedReason string, start time.Time) {
 	state.AppendLog(ctx, d.exec, state.LogEntry{
-		Timestamp:  time.Now().UTC(),
-		App:        cfg.App,
-		Type:       "deploy",
-		Hash:       cfg.Version,
-		Image:      cfg.Image,
-		Success:    success,
-		DurationMs: time.Since(start).Milliseconds(),
+		Timestamp:      time.Now().UTC(),
+		App:            cfg.App,
+		Type:           "deploy",
+		Hash:           cfg.Version,
+		Image:          cfg.Image,
+		Success:        success,
+		Degraded:       success && degradedReason != "",
+		DegradedReason: degradedReason,
+		DurationMs:     time.Since(start).Milliseconds(),
 	})
 }
 

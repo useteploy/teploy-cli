@@ -90,11 +90,17 @@ func writeLogEntries(out io.Writer, entries []state.LogEntry, jsonOutput bool, e
 		return nil
 	}
 
-	fmt.Fprintf(out, "%-20s  %-10s  %-8s  %-7s  %s\n", "TIMESTAMP", "TYPE", "VERSION", "STATUS", "DURATION")
+	fmt.Fprintf(out, "%-20s  %-10s  %-8s  %-8s  %s\n", "TIMESTAMP", "TYPE", "VERSION", "STATUS", "DURATION")
 	for _, e := range entries {
 		status := "ok"
 		if !e.Success {
 			status = "FAILED"
+		} else if e.Degraded {
+			// C01-5: traffic switched and the app serves, but predecessor
+			// retirement partially failed — neither clean nor failed, and
+			// Success-filtering consumers (fleet rollback targeting keyed
+			// on the log) must be able to tell it apart from "ok".
+			status = "DEGRADED"
 		}
 		ts := e.Timestamp.Format("2006-01-02 15:04:05")
 		hash := e.Hash
@@ -105,7 +111,11 @@ func writeLogEntries(out io.Writer, entries []state.LogEntry, jsonOutput bool, e
 		if e.DurationMs == 0 {
 			dur = "-"
 		}
-		fmt.Fprintf(out, "%-20s  %-10s  %-8s  %-7s  %s\n", ts, e.Type, hash, status, dur)
+		fmt.Fprintf(out, "%-20s  %-10s  %-8s  %-8s  %s", ts, e.Type, hash, status, dur)
+		if e.DegradedReason != "" {
+			fmt.Fprintf(out, "  (%s)", e.DegradedReason)
+		}
+		fmt.Fprintln(out)
 	}
 	return nil
 }

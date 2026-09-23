@@ -41,7 +41,7 @@ that dies inside the transition's window. Also encoded as data in
 |---|---|---|---|---|
 | 1 | admitted → prepared | attempt dir `/deployments/<app>/meta/att/<hash>.<id>/` (`internal/releasemeta/attempt.go:107-116`); owner token in `.lock/info` (`internal/state/lock.go:86-92`, `internal/state/state.go:522-533`) | **RETRY** | attempt paths are random-id write-once; a fresh attempt collides with nothing |
 | 2 | prepared → candidates-running | container IDs from docker run (`internal/deploy/deploy.go:577-607`); names `{app}-{process}-{version}[-{index}]` + `teploy.*` labels (`internal/docker/docker.go:82-117,160-165`) | **INSPECT** | a running candidate with no receipt is never success; corpses are reconciled by the next attempt (`deploy.go:1282-1292`) |
-| 3 | candidates-running → readiness-passed | **none — no durable receipt exists** (`internal/deploy/health.go` probes are ephemeral) | **INSPECT** | unobservable post-crash; the owner must re-probe (finding C01-4) |
+| 3 | candidates-running → readiness-passed | readiness receipt `meta/att/<hash>.<id>/readiness.json` — exact candidate IDs + probes + outcome, written on pass before the switch (`internal/deploy/journal.go`, **LANDED 2026-09-22, C01-4**) | **INSPECT** | without the receipt the window is unobservable post-crash; the owner must re-probe. With it, `attemptReadinessState`/`candidateAttribution` derive `ReadinessPassed` + attributable candidates for `Decide` |
 | 4 | readiness-passed → traffic-switched | managed marker block `# TEPLOY BEGIN <app>`…`END` naming candidate upstreams (`internal/caddy/caddy.go:20-21,584-625`); reload receipt (`caddy.go:29-32`); delivery verification md5 host-vs-container (`caddy.go:523-550`) | **COMPENSATE** | traffic on an uncommitted generation; undo via the recorded/serving predecessor (`abortStateCommit`, `deploy.go:1036-1095`). MANUAL when the predecessor is gone |
 | 5 | traffic-switched → authoritative-state-committed | fenced rename of `state.json` naming the release (`internal/state/lock.go:353-381`); `Generation`/`OperationID` (`internal/state/state.go:68-95`) | **COMPENSATE** | the commit is the single fenced atomic effect; before it, traffic is uncommitted |
 | 6 | authoritative-state-committed → predecessor-retired | predecessor snapshot stopped (`internal/deploy/deploy.go:839-861,963-989`); absence in the label inventory (`internal/docker/docker.go:568-571`) | **RETRY** | retirement re-derives from the inventory; failures reported, never silent |
@@ -156,7 +156,11 @@ table's, with the register item it belongs to.
    ReadinessPassed is unobservable post-crash and its recovery disposition
    collapses into CandidatesRunning's INSPECT. A receipt (attempt-scoped
    marker recording the probed port/time/result) is a design obligation
-   for the helper/journal slice.
+   for the helper/journal slice. **LANDED 2026-09-22** (see AUDIT_OPEN's
+   C01 implementation slice): `meta/att/<hash>.<id>/readiness.json`,
+   written exactly on pass before the switch, with the
+   `attemptReadinessState`/`candidateAttribution` evidence derivation
+   asserted through `recovery.Decide` (COMPENSATE with, INSPECT without).
 
 5. **C01-5 — The terminal receipt records success on incomplete
    retirement.** Predecessor stop/remove failures are warnings
@@ -166,7 +170,10 @@ table's, with the register item it belongs to.
    degraded/partial field. The table (and the multi-host rule below)
    requires recorded outcomes to be the real outcomes — a fleet rollback
    decision keyed on that log would skip a host that is still running the
-   superseded generation.
+   superseded generation. **LANDED 2026-09-22** (see AUDIT_OPEN's C01
+   implementation slice): `LogEntry.Degraded`/`DegradedReason` populated
+   from step-14 retirement incompleteness; `teploy log` renders DEGRADED
+   and the JSON carries the field for log-keyed consumers.
 
 6. **C01-6 — Record-write failure degrades silently.** `recordRelease`
    warns (`internal/deploy/deploy.go:1230-1232`) and nothing schedules
@@ -209,7 +216,11 @@ table's, with the register item it belongs to.
     but a crash loses it; retirement re-derives via `selectPredecessors`
     (TCL-02-correct) at the cost of the removed-worker capture property.
     The journal slice should persist the snapshot with the attempt
-    artifacts.
+    artifacts. **LANDED 2026-09-22** (see AUDIT_OPEN's C01 implementation
+    slice): `meta/att/<hash>.<id>/predecessors.json` at the rename phase
+    (before any new container starts); `restoreDisplacedAndStarted` and
+    `abortStateCommit` read it when the in-memory displaced list is
+    absent and compensate exactly the recorded identities.
 
 ## Multi-host rule
 
@@ -305,8 +316,15 @@ Scenarios (each prints a scenario × observed × decision × correctness row):
 
 Landed in this slice: the table (tested, exhaustive), this ADR, the
 harness (compiles, unit-tested decision logic, skips without a fixture).
-Open: **execution against a real fixture** (next slice, once the fixture
-host exists), and the ten disagreement findings above feed C01's
-implementation slices (recovery owner on acquisition, guarded pre-commit
-effects, readiness receipt, honest terminal receipts, receipt-driven
-compensation, attempt-scoped identities).
+Executed against a real fixture 2026-09-21 (see AUDIT_OPEN).
+
+Implementation slices: **C01-4, C01-5, C01-10 landed 2026-09-22**
+(attempt-journal receipts + honest degraded log outcome; evidence in
+AUDIT_OPEN's C01 implementation-slice section). Remaining findings:
+C01-1/2/3 (the locking-protocol redesign — replacement-owner
+reconciliation on acquisition, guarded pre-commit effects, fenced shared
+Caddy lock), C01-8 (same-version `_replaced` MANUAL — deliberate A08
+containment until F04 generation identities exist), C01-9
+(attempt-scoped candidate identities — F04/A09), and C01-6/C01-7
+(record-write convergence reconciler; receipt-driven route compensation)
+which stay with their register items.

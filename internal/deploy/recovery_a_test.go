@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/useteploy/teploy/internal/releasemeta"
 	"github.com/useteploy/teploy/internal/ssh"
 	"github.com/useteploy/teploy/internal/state"
 )
@@ -113,7 +114,7 @@ func TestAbortStateCommit_CancelledContextStillRunsCompensation(t *testing.T) {
 		ContainerPort: 8080,
 	}
 	started := []string{"fency-web-abc123"}
-	err := d.abortStateCommit(ctx, cfg, nil, started, nil, time.Now(), errBoom)
+	err := d.abortStateCommit(ctx, cfg, nil, started, nil, releasemeta.MustAttempt(app, cfg.Version), time.Now(), errBoom)
 	if err == nil {
 		t.Fatal("expected the commit error to be returned")
 	}
@@ -159,7 +160,7 @@ func TestAbortStateCommit_CaddyPublishAppRestoresRoute(t *testing.T) {
 		Health:  HealthConfig{Timeout: 5 * time.Second, Interval: 10 * time.Millisecond},
 	}
 	started := []string{"fency-web-abc123"}
-	err := d.abortStateCommit(context.Background(), cfg, current, started, nil, time.Now(), errBoom)
+	err := d.abortStateCommit(context.Background(), cfg, current, started, nil, releasemeta.MustAttempt(app, cfg.Version), time.Now(), errBoom)
 	if err == nil {
 		t.Fatal("expected the commit error to surface")
 	}
@@ -228,7 +229,7 @@ func TestLogDeploy_RecordsImage(t *testing.T) {
 		ssh.MockCommand{Match: "printf %s", Output: ""},
 	)
 	d := &Deployer{exec: mock, out: &bytes.Buffer{}}
-	d.logDeploy(context.Background(), Config{App: "myapp", Image: "myapp:latest", Version: "abc123"}, true, time.Now())
+	d.logDeploy(context.Background(), Config{App: "myapp", Image: "myapp:latest", Version: "abc123"}, true, "", time.Now())
 	var line string
 	for _, c := range mock.Calls {
 		if strings.HasPrefix(c, "printf %s '") {
@@ -251,4 +252,3 @@ func TestLogDeploy_RecordsImage(t *testing.T) {
 		t.Errorf("log entry image: got %q want myapp:latest", entry.Image)
 	}
 }
-

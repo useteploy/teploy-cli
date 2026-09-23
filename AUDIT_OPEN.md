@@ -1340,3 +1340,92 @@ containers), the enforcement TIMER (nothing server-side schedules
 pruning — `preview prune` is cron-able but teploy ships no daemon, by
 design), the same-version shared-alias window above, and Dash-side
 changes.
+
+## Programme slice (2026-09-22, latest) — C01 implementation: attempt journal + honest degraded outcome
+
+Three contained C01 findings landed as their own coherent changes (the
+spec is docs/C01_RECOVERY_STATE_TABLE.md's findings list; the decision
+function internal/deploy/recovery.Decide is UNCHANGED — its exhaustive
+tests pass untouched; this slice produces the EVIDENCE its inputs model).
+Base revision `c0efd26`; changes left uncommitted for review. New file
+`internal/deploy/journal.go` is the attempt journal: receipts persisted
+into the F08 attempt namespace (`meta/att/<hash>.<id>/`, write-once,
+0600 atomic, identity-validated on read — T56 parity).
+
+- **C01-10 — durable predecessor snapshot.** `predecessors.json`
+  (exact container IDs/names/labels + the predecessor release identity +
+  same-version flag) is persisted at the RENAME PHASE — after the 6b
+  listing, before the recreate displacement or any new container starts
+  (test pins the write's call index below the first `docker stop` and
+  `docker run`). On the recovery paths the instruction names
+  (`restoreDisplacedAndStarted`, `abortStateCommit`), when the in-memory
+  displaced list is absent, `displacedFromSnapshot` reads the receipt and
+  restores exactly the recorded web containers that are no longer running
+  (blue/green predecessors and same-version `_replaced` renames inspect
+  as running and are skipped by construction). abortStateCommit takes the
+  attempt as a parameter for this. TDD red: both tests failed "no
+  predecessor snapshot persisted" before journal.go existed. Mutation:
+  removing the write fails both tests for that reason (reverted). The
+  write-then-crash-then-recover test drives a NEW executor seeded with
+  only the crashed attempt's file state and asserts the exact recorded
+  name is recreated while a stopped same-release WORKER the name-derived
+  fallback would touch is never inspected.
+- **C01-4 — durable readiness receipt.** `readiness.json` (exact
+  candidate container IDs from docker run + names, per-replica probe
+  host/port/path, outcome, timestamp) is written EXACTLY when the health
+  gate passes and BEFORE the traffic switch begins (test pins the
+  ordering: after the last probe, before the Caddyfile transaction's
+  first command; a health-failing deploy leaves no receipt). The
+  Decide-side wiring is the evidence derivation `attemptReadinessState`
+  (receipt present → recovery.ReadinessPassed; confirmed absent →
+  CandidatesRunning — the ADR's collapse, un-collapsed) and
+  `candidateAttribution` (running candidate-shaped containers are
+  PROVABLY the crashed attempt's only on receipt ID/name match → Present;
+  without a receipt, or with IDs that provably belong to another attempt
+  of the same release, → Unknown — R4's never-auto-decide class). Tests
+  assert through recovery.Decide: the crash-after-readiness world
+  (traffic switched, uncommitted, predecessor serving) is COMPENSATE with
+  the receipt and INSPECT without. Mutations: writing the receipt before
+  the gate fails both ordering tests; receipt-independent attribution
+  fails the Decide distinction ("without the receipt the same world must
+  INSPECT, got COMPENSATE") — both reverted. In-tree consumers are the
+  derivation helpers; the recovery OWNER that reads them on lock
+  acquisition is C01-1's slice (recorded).
+- **C01-5 — honest degraded outcome.** `state.LogEntry` gains
+  `Degraded` + `DegradedReason` (omitempty — old entries parse
+  unchanged). Step-14 retirement collects its incompleteness
+  (stopPredecessorSnapshot now returns what escaped — stop/remove
+  failures, fence-loss interruptions, skipped cleanup, name-fallback
+  errors) and `logDeploy(ctx, cfg, true, reason, start)` records
+  Success=true AND Degraded=true: traffic IS switched (not a deploy
+  failure) but the outcome is not clean success. The Success-filtering
+  consumer in-repo, `teploy log` rendering (internal/cli/log.go), shows
+  DEGRADED + reason, and --json carries the field for dash/machine
+  readers; the consumer test also models the fleet-rollback selector
+  (Success alone targets the degraded host as clean; Success && !Degraded
+  separates it). TDD red: tests failed to compile against the field-less
+  LogEntry; mutation: emptying the degraded population at the success
+  call site fails "DegradedReason must name the escaped container"
+  (reverted — note this check ran before an accidental `git checkout`
+  required re-applying the same edits; the re-applied code is identical
+  and all tests re-ran green).
+
+Gates: `go vet ./...` clean; `go vet -tags integration
+./internal/deploy/recovery` clean; `go test ./... -race` all 25 packages
+ok; recovery exhaustive suite green and byte-identical semantics; gofmt
+clean on touched files; contract probes 5/5 PASS. No push performed.
+
+**Residual C01 list (explicit):** C01-1 lock acquisition is treated as
+quiescence — the replacement owner must run Decide over observed
+evidence after a stale break (the locking-protocol redesign). C01-2
+pre-commit effects are check-then-act, not guarded — a broken holder's
+candidate/route effects can land inside the new owner's window. C01-3
+the shared Caddy lock is ownerless/unfenced — conflicting-route evidence
+has no producer/consumer. C01-8 same-version running `_replaced` stays
+MANUAL — deliberate A08 containment; automating the INSPECT→adopt
+continuation needs generation-scoped identities. C01-9 candidate names
+are version-keyed, not attempt-keyed — two attempts of one hash are not
+attributable by evidence (F04/A09). C01-6 (record-write convergence has
+no reconciler) and C01-7 (compensation reconstructs the predecessor
+route instead of using a receipt) also remain, with their register items
+(A12/T05 standing for C01-7).
