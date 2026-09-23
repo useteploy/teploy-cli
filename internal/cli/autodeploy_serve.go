@@ -708,7 +708,7 @@ func triggerAutoDeploy(ctx context.Context, executor ssh.Executor, app, branch, 
 	// checkout is the provenance source root (C04): revision and context
 	// fingerprint describe the fetched tree this deploy builds.
 	att := releasemeta.MustAttempt(app, version)
-	return deployBuiltImageFenced(ctx, executor, appCfg, image, version, "localhost", false, needsBuild, buildDir, lk, &att)
+	return deployBuiltImageFenced(ctx, executor, appCfg, image, version, "localhost", false, needsBuild, buildDir, lk, &att, "")
 }
 
 // fetchCheckout advances buildDir's origin and resets the worktree to the

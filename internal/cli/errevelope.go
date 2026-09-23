@@ -85,10 +85,14 @@ func refuseAdmission(err error) error {
 // classifyMachineError maps a failed command's error to a taxonomy code.
 // Wired classes (this slice): config-load failures and deploy admission
 // refusals → config-invalid; an absent config is a config failure for a
-// machine caller the same way a malformed one is. Everything else is
-// internal until its site is migrated (S2 generalization).
+// machine caller the same way a malformed one is. A plan/apply drift
+// refusal (C05) → conflict — the request is coherent, the world moved.
+// Everything else is internal until its site is migrated (S2
+// generalization).
 func classifyMachineError(err error) string {
 	switch {
+	case errors.Is(err, errPlanDrift):
+		return codeConflict
 	case errors.Is(err, config.ErrInvalidConfig),
 		errors.Is(err, config.ErrNoConfig),
 		errors.Is(err, errDeployAdmission):
@@ -108,6 +112,8 @@ func writeMachineErrorEnvelope(out io.Writer, err error) error {
 		if errors.Is(err, errDeployAdmission) {
 			message = "deploy request refused"
 		}
+	case codeConflict:
+		message = "plan no longer valid"
 	}
 	return json.NewEncoder(out).Encode(machineErrorEnvelope{
 		MachineInterface: MachineInterface,
