@@ -1,0 +1,14 @@
+{
+  "resource": {
+    "type": "server",
+    "id": "srv-bbbbbbbbbbbbbbbb"
+  },
+  "collected_at": "2026-09-23T12:00:00Z",
+  "freshness": "unknown",
+  "error": "dial tcp 10.0.0.2:22: connect: connection refused",
+  "last_known": {
+    "server": "edge",
+    "host": "10.0.0.2",
+    "apps": []
+  }
+}
