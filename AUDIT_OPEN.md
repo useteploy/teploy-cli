@@ -1896,3 +1896,50 @@ fleet diagnosis (doctor currently diagnoses ONE resolved target),
 DNS/health-path diagnostics, and machine-event streaming (the
 "versioned JSON/events" contract's events half — doctor emits one
 versioned JSON document per run, not a stream).
+
+## X02 S7 acceptance sweep — 2026-09-23
+
+`scripts/x02-acceptance-sweep.sh` (this repo's executable harness, ADR §6
+S7). Legs and evidence (exit 0, all PASS, non-vacuous — each pattern is
+verified to match >=1 test before running):
+
+| Leg | Package | Tests | Result |
+|---|---|---|---|
+| rename | ./internal/config | 5 (rename/update/re-add preserve id; legacy stays id-less; mint shape) | PASS |
+| duplicate-identity | ./internal/preview | 2 (preview ID golden; branch identity distinct) | PASS |
+| release-identity | ./internal/releasemeta | 2 (absent/present/unreadable; round-trip + path validation) | PASS |
+| repeated-request | ./internal/cli | 3 (version/release/attempt-name corpus goldens) | PASS |
+| response-loss | ./internal/deploy | 4 (Decide Compensate-vs-Inspect; attribution; predecessor snapshots) | PASS |
+| rollback | ./internal/deploy | 4 (state-commit failure restores old workload/route; rollback from recorded spec; fixed-port displacement) | PASS |
+
+The harness fails on any leg failing OR matching no tests (a vacuous pass
+is a broken pin). Re-run and paste fresh output here on any contract
+change.
+
+## C01-1 slice 1 — target-side critical section (2026-09-23, `3a28454`)
+
+`internal/targetguard`: the on-demand helper (flock + generation fencing +
+stdout protocol) and its Go wrapper, live-proven in podman on Debian
+bookworm-slim and alpine 3.20:
+
+| Invariant | Evidence |
+|---|---|
+| serialization | timestamped ABAB (one full critical section, then the other's) on both distros |
+| generation fencing | gen 7 committed vs plan-expects-3 → GUARD_FENCED, effect file never created |
+| death-release | killed helper (SIGKILL, exit 137) → next guarded effect proceeds |
+| current generation | gen-7 plan against gen-7 target → GUARD_OK |
+| unfit target | no flock OR flock failing the one-time serialization self-test → GUARD_UNFIT (never lock-free, never falsely-locked) |
+
+Process note recorded for the next sessions: the investigation's first
+harness read ABAB as "interleaved" — the exact inversion (serialized =
+ABAB; interleaved = AABB). The timestamped rerun caught it. The busybox
+FILE-form portability doubt that motivated the self-test was never
+reproduced with timestamps and may itself have been harness-instrument
+error; the self-test stays regardless (it prices at ~1.2s once per app
+dir and closes a real class).
+
+REMAINS (C01-1 slice 2): guarded-effect integration into the deploy path
+(state commit + predecessor retirement under the guard; the .generation
+sidecar written by the state commit), the two-clients/delayed-SSH/clock
+-change acceptance matrix against the real deploy path, and the
+documented app-lock/shared-proxy acquisition order.
