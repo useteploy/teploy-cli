@@ -21,6 +21,10 @@ type MockExecutor struct {
 	mu    sync.Mutex
 	Calls []string          // records every command executed
 	Files map[string][]byte // records uploaded file contents by path
+	// Inputs records the stdin payload of every RunInput invocation in
+	// call order, so tests can assert secret material traveled by stdin
+	// and NOT in the command string (the C08 secret-transport pins).
+	Inputs []string
 
 	// GuardTransportFailures, when > 0, makes the next that-many GUARDED
 	// commands (the fence-guard shape) fail with a plain transport error
@@ -291,12 +295,51 @@ func (m *MockExecutor) RunStream(ctx context.Context, cmd string, stdout, stderr
 }
 
 func (m *MockExecutor) RunInput(ctx context.Context, cmd string, stdin io.Reader) error {
-	_, err := io.Copy(io.Discard, stdin)
-	if err != nil {
-		return err
+	if stdin != nil {
+		data, err := io.ReadAll(stdin)
+		if err != nil {
+			return err
+		}
+		m.mu.Lock()
+		m.Inputs = append(m.Inputs, string(data))
+		m.mu.Unlock()
 	}
-	_, err = m.Run(ctx, cmd)
+	_, err := m.Run(ctx, cmd)
 	return err
+}
+
+// runDetailed is MockExecutor's native structured capture: the
+// registered Output/Err become Stdout/ExitCode exactly as the real
+// executors report them (an error carrying "exit status N" is a command
+// failure with that code; an error without one is a transport failure).
+func (m *MockExecutor) runDetailed(ctx context.Context, cmd string, stdin io.Reader, limit int64) Result {
+	if res, done := contextFailureResult(ctx); done {
+		return res
+	}
+	var out string
+	var err error
+	if stdin != nil {
+		err = m.RunInput(ctx, cmd, stdin)
+	} else {
+		out, err = m.Run(ctx, cmd)
+	}
+	res := Result{ExitCode: -1}
+	if limit > 0 && int64(len(out)) > limit {
+		out = out[:limit]
+		res.Truncated = true
+	}
+	res.Stdout = []byte(out)
+	if err == nil {
+		res.ExitCode = 0
+		return res
+	}
+	if code, ok := exitCodeFromError(err); ok {
+		res.ExitCode = code
+		res.Stderr = []byte(err.Error())
+		return res
+	}
+	res.Err = err
+	return res
 }
 
 func (m *MockExecutor) Upload(ctx context.Context, content io.Reader, remotePath string, mode string) error {

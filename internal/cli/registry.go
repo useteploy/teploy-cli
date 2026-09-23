@@ -166,14 +166,14 @@ func runRegistryList(flags *Flags, serverName string) error {
 	}
 	defer executor.Close()
 
-	output, err := executor.Run(ctx, "cat ~/.docker/config.json 2>/dev/null || echo '{}'")
+	// A read failure must not become empty state (C08): the old
+	// `cat config 2>/dev/null || echo '{}'` turned an unreadable config
+	// (permissions, I/O error) into "No registries configured". The
+	// framed form distinguishes confirmed absence (no config file — the
+	// fresh-docker case) from a real read failure, which errors.
+	entries, err := registryListFromServer(ctx, executor)
 	if err != nil {
 		return err
-	}
-
-	entries, err := parseDockerAuths(output)
-	if err != nil {
-		return fmt.Errorf("parsing ~/.docker/config.json: %w", err)
 	}
 
 	// --json is a documented, working global flag on every other
@@ -230,6 +230,30 @@ func runRegistryRemove(flags *Flags, registry, serverName string) error {
 
 	fmt.Printf("Removed credentials for %s\n", registry)
 	return nil
+}
+
+// registryListFromServer reads the server's ~/.docker/config.json and
+// returns its registry entries. Confirmed absence of the file is the
+// normal no-registries state (empty slice); a file that exists but
+// cannot be read is an error — never an empty list masquerading as
+// "nothing configured".
+func registryListFromServer(ctx context.Context, executor ssh.Executor) ([]RegistryEntry, error) {
+	res := ssh.RunDetailed(ctx, executor, "if [ ! -f ~/.docker/config.json ]; then printf 'absent\\n'; else cat ~/.docker/config.json; fi")
+	if res.Err != nil {
+		return nil, res.Err
+	}
+	if res.ExitCode != 0 {
+		return nil, fmt.Errorf("reading ~/.docker/config.json on the server: %s", res.ExitErrorText())
+	}
+	output := res.TrimmedStdout()
+	if output == "absent" {
+		return nil, nil
+	}
+	entries, err := parseDockerAuths(output)
+	if err != nil {
+		return nil, fmt.Errorf("parsing ~/.docker/config.json: %w", err)
+	}
+	return entries, nil
 }
 
 // connectForRegistry establishes SSH connection using server flag, app config, or flags.

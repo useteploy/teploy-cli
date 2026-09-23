@@ -176,6 +176,71 @@ func (e *RemoteExecutor) RunInput(ctx context.Context, cmd string, stdin io.Read
 	}
 }
 
+// runDetailed is RemoteExecutor's native structured capture: separate
+// bounded stdout/stderr buffers, the remote exit status from the SSH
+// channel's exit-status request, and the context's cancellation vs
+// deadline distinction. See Result for the field contract.
+func (e *RemoteExecutor) runDetailed(ctx context.Context, cmd string, stdin io.Reader, limit int64) Result {
+	if res, done := contextFailureResult(ctx); done {
+		return res
+	}
+	session, err := e.client.NewSession()
+	if err != nil {
+		return Result{ExitCode: -1, Err: fmt.Errorf("creating SSH session: %w", err)}
+	}
+	defer session.Close()
+
+	var stdout, stderr limitedBuffer
+	stdout.limit, stderr.limit = limit, limit
+	session.Stdout = &stdout
+	session.Stderr = &stderr
+	if stdin != nil {
+		session.Stdin = stdin
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- session.Run(cmd)
+	}()
+
+	select {
+	case err := <-done:
+		res := Result{
+			Stdout:    stdout.bytes(),
+			Stderr:    stderr.bytes(),
+			ExitCode:  0,
+			Truncated: stdout.overflow || stderr.overflow,
+		}
+		if err == nil {
+			return res
+		}
+		var exitErr *gossh.ExitError
+		if errors.As(err, &exitErr) {
+			res.ExitCode = exitErr.Waitmsg.ExitStatus()
+			return res
+		}
+		// No exit status arrived: the command did not complete (channel
+		// torn down, connection lost).
+		res.ExitCode = -1
+		res.Err = err
+		return res
+	case <-ctx.Done():
+		_ = session.Signal(gossh.SIGTERM)
+		_ = session.Close()
+		<-done
+		res := Result{
+			Stdout:    stdout.bytes(),
+			Stderr:    stderr.bytes(),
+			ExitCode:  -1,
+			Truncated: stdout.overflow || stderr.overflow,
+		}
+		res.Canceled = errors.Is(ctx.Err(), context.Canceled)
+		res.TimedOut = errors.Is(ctx.Err(), context.DeadlineExceeded)
+		res.Err = ctx.Err()
+		return res
+	}
+}
+
 // Upload streams content into a securely created sibling temporary file and
 // atomically renames it over remotePath.
 //

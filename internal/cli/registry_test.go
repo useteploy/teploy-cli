@@ -1,9 +1,14 @@
 package cli
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"sort"
+	"strings"
 	"testing"
+
+	"github.com/useteploy/teploy/internal/ssh"
 )
 
 // TestParseDockerAuths_RealConfigStructure reproduces the shape of a real
@@ -73,4 +78,50 @@ func TestParseDockerAuths_ProducesValidJSON(t *testing.T) {
 	if len(roundTrip) != 1 || roundTrip[0].Server != "ghcr.io" {
 		t.Errorf("round-tripped entries = %+v", roundTrip)
 	}
+}
+
+// TestRegistryListFromServer_ReadFailureIsNotEmptyState pins the C08
+// acceptance for reads: a config.json that EXISTS but cannot be read is
+// an error, never an empty list that reports "No registries
+// configured"; confirmed absence of the file is the legitimate empty
+// state.
+func TestRegistryListFromServer_ReadFailureIsNotEmptyState(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("absent file is the empty state", func(t *testing.T) {
+		mock := ssh.NewMockExecutor("h",
+			ssh.MockCommand{Match: "if [ ! -f ~/.docker/config.json ]", Output: "absent"})
+		entries, err := registryListFromServer(ctx, mock)
+		if err != nil || len(entries) != 0 {
+			t.Fatalf("absent config = %v, %v; want empty, nil", entries, err)
+		}
+	})
+
+	t.Run("read failure errors", func(t *testing.T) {
+		mock := ssh.NewMockExecutor("h",
+			ssh.MockCommand{Match: "if [ ! -f ~/.docker/config.json ]", Err: errors.New("exit status 1: cat: /root/.docker/config.json: Permission denied")})
+		if _, err := registryListFromServer(ctx, mock); err == nil {
+			t.Fatal("an unreadable config.json must error, not read as no-registries")
+		}
+	})
+
+	t.Run("present config parses", func(t *testing.T) {
+		mock := ssh.NewMockExecutor("h",
+			ssh.MockCommand{Match: "if [ ! -f ~/.docker/config.json ]", Output: `{"auths":{"ghcr.io":{"auth":"dTpw"}}}`})
+		entries, err := registryListFromServer(ctx, mock)
+		if err != nil || len(entries) != 1 || entries[0].Server != "ghcr.io" {
+			t.Fatalf("present config = %v, %v", entries, err)
+		}
+	})
+
+	t.Run("framed read touches the server once", func(t *testing.T) {
+		mock := ssh.NewMockExecutor("h",
+			ssh.MockCommand{Match: "if [ ! -f ~/.docker/config.json ]", Output: "absent"})
+		if _, err := registryListFromServer(ctx, mock); err != nil {
+			t.Fatal(err)
+		}
+		if len(mock.Calls) != 1 || !strings.HasPrefix(mock.Calls[0], "if [ ! -f ~/.docker/config.json ]") {
+			t.Fatalf("unexpected command shape: %v", mock.Calls)
+		}
+	})
 }

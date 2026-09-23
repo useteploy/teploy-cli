@@ -2,9 +2,11 @@ package ssh
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"os/user"
 	"path/filepath"
 	"strconv"
@@ -52,6 +54,70 @@ func (e *LocalExecutor) RunInput(ctx context.Context, cmd string, stdin io.Reade
 	c.Stdout = io.Discard
 	c.Stderr = io.Discard
 	return c.Run()
+}
+
+// runDetailed is LocalExecutor's native structured capture: separate
+// bounded stdout/stderr buffers and the process exit status, with the
+// process-group kill semantics localCommand already provides. See
+// Result for the field contract.
+func (e *LocalExecutor) runDetailed(ctx context.Context, cmd string, stdin io.Reader, limit int64) Result {
+	if res, done := contextFailureResult(ctx); done {
+		return res
+	}
+	c := localCommand(ctx, cmd)
+	var stdout, stderr limitedBuffer
+	stdout.limit, stderr.limit = limit, limit
+	c.Stdout = &stdout
+	c.Stderr = &stderr
+	if stdin != nil {
+		c.Stdin = stdin
+	}
+	done := make(chan error, 1)
+	if err := c.Start(); err != nil {
+		return Result{ExitCode: -1, Err: fmt.Errorf("starting command: %w", err)}
+	}
+	go func() {
+		done <- c.Wait()
+	}()
+
+	select {
+	case err := <-done:
+		res := Result{
+			Stdout:    stdout.bytes(),
+			Stderr:    stderr.bytes(),
+			ExitCode:  0,
+			Truncated: stdout.overflow || stderr.overflow,
+		}
+		if err == nil {
+			return res
+		}
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			res.ExitCode = exitErr.ExitCode()
+			return res
+		}
+		res.ExitCode = -1
+		res.Err = err
+		return res
+	case <-ctx.Done():
+		// exec.CommandContext's cancellation hook fires localCommand's
+		// Cancel (process-group SIGKILL); WaitDelay bounds the wait on
+		// any descendant that slipped past, so <-done returns.
+		if c.Cancel != nil {
+			_ = c.Cancel()
+		}
+		<-done
+		res := Result{
+			Stdout:    stdout.bytes(),
+			Stderr:    stderr.bytes(),
+			ExitCode:  -1,
+			Truncated: stdout.overflow || stderr.overflow,
+		}
+		res.Canceled = errors.Is(ctx.Err(), context.Canceled)
+		res.TimedOut = errors.Is(ctx.Err(), context.DeadlineExceeded)
+		res.Err = ctx.Err()
+		return res
+	}
 }
 
 // Upload writes content to a local file atomically, mirroring
