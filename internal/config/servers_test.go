@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"testing"
 )
 
@@ -266,6 +267,125 @@ func TestAddServer(t *testing.T) {
 	}
 	if cfg.Servers["prod"].Role != "app" {
 		t.Fatalf("expected role app, got %s", cfg.Servers["prod"].Role)
+	}
+}
+
+// serverIDRE is the X02 §1.3 stable-id shape: "srv-" + 16 lowercase hex.
+var serverIDRE = regexp.MustCompile(`^srv-[0-9a-f]{16}$`)
+
+func TestAddServer_MintsIDForNewEntry(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "servers.yml")
+
+	if err := AddServer(path, "prod", "1.2.3.4", "root", "app", ""); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadServers(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := cfg.Servers["prod"].ID
+	if !serverIDRE.MatchString(id) {
+		t.Fatalf("expected minted srv-<16hex> id, got %q", id)
+	}
+
+	// Distinct entries mint distinct ids — random, not name-derived.
+	if err := AddServer(path, "other", "1.2.3.4", "root", "app", ""); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _ = LoadServers(path)
+	if cfg.Servers["other"].ID == id {
+		t.Fatalf("two servers share id %q", id)
+	}
+}
+
+func TestAddServer_ReAddPreservesID(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "servers.yml")
+
+	if err := AddServer(path, "prod", "1.2.3.4", "root", "app", ""); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := LoadServers(path)
+	id := before.Servers["prod"].ID
+
+	// Upsert with a changed host must not re-mint: id-based references
+	// would be silently re-keyed (X02 §1.3's silent-re-key prohibition).
+	if err := AddServer(path, "prod", "10.0.0.1", "admin", "lb", ""); err != nil {
+		t.Fatal(err)
+	}
+	after, _ := LoadServers(path)
+	if got := after.Servers["prod"].ID; got != id {
+		t.Fatalf("re-add re-keyed id: before %q after %q", id, got)
+	}
+}
+
+func TestAddServer_LegacyEntryStaysIDLess(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "servers.yml")
+	legacy := "servers:\n  prod:\n    host: 1.2.3.4\n    role: app\n"
+	if err := os.WriteFile(path, []byte(legacy), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// A pre-existing id-less entry stays id-less on upsert: minting here
+	// would flip dash's fallback (name-hash) identity underneath live
+	// references — adoption is the consumer's explicit decision, not a
+	// side effect of `server add`.
+	if err := AddServer(path, "prod", "10.0.0.1", "", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	cfg, _ := LoadServers(path)
+	if got := cfg.Servers["prod"].ID; got != "" {
+		t.Fatalf("legacy entry gained id %q on re-add — silent re-key", got)
+	}
+}
+
+func TestRenameServer_PreservesID(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "servers.yml")
+
+	if err := AddServer(path, "prod", "1.2.3.4", "root", "app", ""); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := LoadServers(path)
+	id := before.Servers["prod"].ID
+	if id == "" {
+		t.Fatal("expected a minted id to preserve")
+	}
+
+	if err := RenameServer(path, "prod", "production"); err != nil {
+		t.Fatal(err)
+	}
+	after, _ := LoadServers(path)
+	if got := after.Servers["production"].ID; got != id {
+		t.Fatalf("rename changed id: before %q after %q", id, got)
+	}
+	if _, exists := after.Servers["prod"]; exists {
+		t.Fatal("old name still present after rename")
+	}
+}
+
+func TestUpdateServer_PreservesID(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "servers.yml")
+
+	if err := AddServer(path, "prod", "1.2.3.4", "root", "app", ""); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := LoadServers(path)
+	id := before.Servers["prod"].ID
+
+	newVpn := "100.64.1.2"
+	if err := UpdateServer(path, "prod", ServerUpdates{VpnIP: &newVpn}); err != nil {
+		t.Fatal(err)
+	}
+	after, _ := LoadServers(path)
+	if got := after.Servers["prod"].ID; got != id {
+		t.Fatalf("update changed id: before %q after %q", id, got)
+	}
+	if after.Servers["prod"].VpnIP != newVpn {
+		t.Fatalf("update lost vpn_ip: got %q", after.Servers["prod"].VpnIP)
 	}
 }
 
