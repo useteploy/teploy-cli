@@ -1943,3 +1943,114 @@ REMAINS (C01-1 slice 2): guarded-effect integration into the deploy path
 sidecar written by the state commit), the two-clients/delayed-SSH/clock
 -change acceptance matrix against the real deploy path, and the
 documented app-lock/shared-proxy acquisition order.
+## Programme slice (2026-09-23) — C05: plan/apply binding + build identity
+
+The plan/apply remainder of C05 ("plan should distinguish known
+effects from unresolved image/build data, cover routing/env/storage/
+resource changes, and bind apply to the reviewed config/target
+version; drift invalidates stale plans"). The two Compose probe
+defects and the field-classification table landed earlier (2026-09-21
+slice above); this slice builds on them.
+
+**Design:**
+
+- **AppliedManifestView** (internal/config/appliedview.go): the read
+  side of the manifest NormalizeAndDigest writes into release state —
+  the deployed half of every plan diff. Lives next to the writer so
+  the shape has one home; malformed manifests refuse (never guessed
+  from), null sections parse as absent (static/legacy representable).
+- **Plan effect set** (internal/cli/planeffects.go, pure functions):
+  routing (domain set order/case-normalized, ingress mode, the
+  application port the Caddy route AND health gate probe, extra
+  publishes — diffed against AppState identity + recorded manifest),
+  env (KEY presence; values redacted by the manifest contract — only
+  key/env-file-reference changes are plannable, stated in the effect),
+  storage (volume add/remove/mount-change; the managed host path
+  named through plannedVolumeMounts — extracted from
+  deployBuiltImageFenced so plan and deploy share ONE volume
+  resolution), resources (replicas/memory/cpu), accessories
+  (set + image changes).
+- **Known-vs-unresolved image classification**
+  (planImageIdentity, reusing resolveDeployProvenance — the C04 path
+  — so plan and deploy cannot disagree about what the build inputs
+  are): resolved-by-digest (pinned ref), resolved-by-image-id (mutable
+  ref, content resolved at plan time; recorded NOT bound — the
+  changed-mutable-tag policy is C04's open tail), unresolved-mutable-
+  tag, unresolved-awaiting-build (the plan binds context fingerprint +
+  Dockerfile sha instead of an image that does not exist yet).
+- **PlanRecord** (internal/cli/planrecord.go): schema-versioned,
+  plan id = pure hash of the binding inputs (app/server/user/
+  destination/target version/config digest/build-input identities/
+  state generation+hash — WrittenAt deliberately outside it, the
+  provenance retry-stability rule), atomic 0600 write, load-time
+  self-consistency gate (tampered/future-schema plans refuse).
+  Config digest is NormalizeAndDigest over the plan's image reference
+  ("" for builds): recomputable BEFORE execution, unlike the receipt
+  digest which names the built image — the plan id stamped into the
+  receipt is the tie between the two.
+- **`teploy apply`** (internal/cli/apply.go): re-derives config
+  (loader + recorded overlay + resolveDeployEnv — extracted from
+  runDeploy so applied and direct deploys share ONE env resolution),
+  version (explicit binds as-is; derived must re-derive), build
+  inputs (catches dirty-tree edits a version cannot see), identity,
+  and target state (the generation any deploy/rollback increments);
+  every mismatch refuses naming what moved + the remedy (re-plan).
+  Execution goes through deployAppConfig — the same function a
+  direct deploy runs (planID threaded to deployBuiltImageFenced; all
+  other callers pass ""). releasemeta.Provenance gains plan_id
+  (additive). Floating-tag plans refuse outright (unpredictable
+  version = unbindable). Drift refusals classify as the error
+  envelope's conflict code under --json — the taxonomy's first wired
+  conflict site; the plan-apply capability token is advertised
+  (registry + version-handshake golden regenerated, corpus rev 3,
+  plan-record schema + fixtures added).
+- **plan --json compatibility**: the pre-plan/apply keys (app/server/
+  target_version/version_known/same_version/changes) ride unchanged
+  in a compat envelope with the record fields additive — no MI bump.
+
+**Finding fixed en route:** the Compose importer silently DROPPED the
+web service's `environment:` and `volumes:` (only accessories were
+parsed) — a plan over an imported stack showed no env/storage effects
+because the import had emptied them. Both now translate (web host
+binds keep their full path; parseWebVolumes does not basename).
+Regression: TestLoadCompose_WebServiceEnvAndVolumesPreserved.
+
+**Evidence** — new coverage: manifest view round-trips + refusal set
+(config); plan id stability/sensitivity (10 mutation subtests); plan
+file round-trip + tamper/schema refusals; binding verification for
+every drift kind (config, overlay flip incl. strict presence-aware
+clears, target-version incl. explicit-vs-derived, build-inputs
+naming both fingerprints, target-state incl. generation move /
+removed-since / deployed-since, identity); drift error-envelope
+conflict classification; the C05 acceptance fixtures as tests —
+config-changed-between-plan-and-apply refuses naming both digests,
+deploy-happened-in-between refuses naming the generation move
+(7 -> 8), nothing-moved verifies clean; an engine-level apply run
+(the real deployBuiltImageFenced over a mock executor) asserting the
+stamped provenance.json in the attempt namespace AND the committed
+release state; Compose plan conformance (build → unresolved-awaiting-
+build with bound fingerprint, digest-pinned → resolved-by-digest,
+unresolved mutable tag, effect set survives import, refused shapes
+never plan). Mutation checks (in-place, all reverted, gates re-run
+green): dropping prov.PlanID assignment fails the engine stamp test;
+removing the generation comparison from verifyPlanBinding fails
+TestApplyDrift_DeployHappenedInBetween; making computePlanID ignore
+the config digest fails the sensitivity table; reverting the web-env
+translation fails TestComposePlan_EffectSetSurvivesImport and the
+importer regression.
+
+**C05 remainder (explicit):** stack resource breadth (multi-image
+stacks still refuse at import — the single-image process model is
+unchanged; the first-class stack resource is P1); Coolify/Dokploy-
+scale Compose breadth (fields outside the classification inventory
+remain silently ignored); plan/apply is single-target (multi-server
+fleet apply via the scale path would need per-server plan records);
+static deploys verify+execute but write no provenance receipt, so no
+plan-id stamp (runStaticDeploy predates provenance); env VALUES are
+outside the binding by design (manifest redaction) — a changed .env
+value between plan and apply is not drift, only key/reference changes
+are; accessory volume import basenames host-bind sources (parseServiceVolumes
+— pre-existing, untouched; the web translator preserves them
+properly and the accessory behavior is recorded here as a finding).
+
+Gates: `go build ./...` clean; `go vet ./...` clean; `go test ./... -race -count=1` all 25 packages ok; gofmt clean on every touched hunk (pre-existing strays in deploy.go/secret_audit.go/update_test.go/contracts_golden_test.go left alone, consistent with the C02-C04 posture); contracts corpus regenerated deliberately (corpus rev 3) and the non-update test run pins it.

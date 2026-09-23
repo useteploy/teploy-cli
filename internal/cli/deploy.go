@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -127,7 +128,7 @@ func runAdHocDeploy(flags *Flags, serverName, appName, image, domain string, por
 		Server: serverName,
 	}
 
-	return deployAppConfig(flags, appCfg, serverName, image, version, skipDNSCheck, migrateVolumes)
+	return deployAppConfig(flags, appCfg, serverName, image, version, skipDNSCheck, migrateVolumes, "")
 }
 
 func runDeploy(flags *Flags, serverName, image, version string, skipDNSCheck bool, parallel int, destination string, migrateVolumes bool, role string, tags map[string]string) error {
@@ -175,15 +176,32 @@ func runDeploy(flags *Flags, serverName, image, version string, skipDNSCheck boo
 	// Resolve env_files (SOPS/age-encrypted or plain, decrypted locally)
 	// once, before dispatch — both the single- and multi-server paths then
 	// pick them up from appCfg.Env. Explicit env: keys win over file values.
-	//
-	// ${VAR} interpolation applies ONLY to the explicit YAML env: templates,
-	// expanded exactly once HERE — before file values merge in. Decrypting a
-	// file whose password contains a literal $ used to hand it to
-	// os.Expand at serialization time and silently alter it based on the
-	// operator's environment (audit F59); file/secret values are literal.
-	// --strict-env (F57/TCL-32) turns an unset ${VAR} into a listed failure
-	// instead of a silent empty expansion.
-	if err := expandEnvTemplates(appCfg.Env, flags.StrictEnv); err != nil {
+	if err := resolveDeployEnv(ctx, appCfg, flags.StrictEnv); err != nil {
+		return err
+	}
+
+	// Multi-server deploy: if teploy.yml lists multiple servers and no explicit
+	// server argument was provided, deploy to all of them in parallel.
+	if len(appCfg.Servers) > 1 && serverName == "" {
+		return runMultiDeploy(flags, appCfg, image, version, skipDNSCheck, parallel, migrateVolumes)
+	}
+
+	return deployAppConfig(flags, appCfg, serverName, image, version, skipDNSCheck, migrateVolumes, "")
+}
+
+// resolveDeployEnv resolves the app config's environment exactly as
+// `deploy` does: ${VAR} interpolation applies ONLY to the explicit YAML
+// env: templates, expanded exactly once HERE — before file values merge
+// in. Decrypting a file whose password contains a literal $ used to hand
+// it to os.Expand at serialization time and silently alter it based on
+// the operator's environment (audit F59); file/secret values are literal.
+// --strict-env (F57/TCL-32) turns an unset ${VAR} into a listed failure
+// instead of a silent empty expansion. Explicit env: keys win over file
+// values. The apply path (C05) shares this so an applied plan deploys
+// with the same env a direct deploy would resolve — one resolution
+// semantics, not a fork.
+func resolveDeployEnv(ctx context.Context, appCfg *config.AppConfig, strict bool) error {
+	if err := expandEnvTemplates(appCfg.Env, strict); err != nil {
 		return err
 	}
 	if len(appCfg.EnvFiles) > 0 {
@@ -200,14 +218,7 @@ func runDeploy(flags *Flags, serverName, image, version string, skipDNSCheck boo
 			}
 		}
 	}
-
-	// Multi-server deploy: if teploy.yml lists multiple servers and no explicit
-	// server argument was provided, deploy to all of them in parallel.
-	if len(appCfg.Servers) > 1 && serverName == "" {
-		return runMultiDeploy(flags, appCfg, image, version, skipDNSCheck, parallel, migrateVolumes)
-	}
-
-	return deployAppConfig(flags, appCfg, serverName, image, version, skipDNSCheck, migrateVolumes)
+	return nil
 }
 
 // parseTagFilters parses repeated "key=value" flag values into a map.
@@ -287,8 +298,9 @@ func selectServersByRoleTag(names []string, all map[string]config.Server, role s
 }
 
 // deployAppConfig runs a single-server deploy from an already-loaded AppConfig.
-// Used by both runDeploy (from teploy.yml) and runTemplateInstall (from template).
-func deployAppConfig(flags *Flags, appCfg *config.AppConfig, serverName, image, version string, skipDNSCheck, migrateVolumes bool) error {
+// Used by runDeploy (from teploy.yml), runTemplateInstall (from template),
+// and runApply (a verified C05 plan record — planID stamps the receipt).
+func deployAppConfig(flags *Flags, appCfg *config.AppConfig, serverName, image, version string, skipDNSCheck, migrateVolumes bool, planID string) error {
 	var err error
 
 	// 2. Resolve server (single-server deploy).
@@ -495,7 +507,7 @@ func deployAppConfig(flags *Flags, appCfg *config.AppConfig, serverName, image, 
 		}
 	}
 
-	return deployBuiltImageFenced(ctx, executor, appCfg, image, version, host, migrateVolumes, needsBuild, ".", lk, &att)
+	return deployBuiltImageFenced(ctx, executor, appCfg, image, version, host, migrateVolumes, needsBuild, ".", lk, &att, planID)
 }
 
 // deployBuiltImage runs the shared post-build deploy orchestration:
@@ -513,7 +525,7 @@ func deployAppConfig(flags *Flags, appCfg *config.AppConfig, serverName, image, 
 // string for the notification payload (a hostname for the SSH path,
 // "localhost" for the resident-server path).
 func deployBuiltImage(ctx context.Context, executor ssh.Executor, appCfg *config.AppConfig, image, version, serverDisplay string, migrateVolumes, needsBuild bool) error {
-	return deployBuiltImageFenced(ctx, executor, appCfg, image, version, serverDisplay, migrateVolumes, needsBuild, "", nil, nil)
+	return deployBuiltImageFenced(ctx, executor, appCfg, image, version, serverDisplay, migrateVolumes, needsBuild, "", nil, nil, "")
 }
 
 // deployBuiltImageFenced is deployBuiltImage with the caller's lease and
@@ -523,8 +535,11 @@ func deployBuiltImage(ctx context.Context, executor ssh.Executor, appCfg *config
 // acquires the lock itself (att must still be non-nil for the env file).
 // sourceRoot is the directory the source was synced/built from ("." for
 // manual deploys, the fetched checkout for autodeploy) — it keys the
-// plan-time provenance (C04); empty means no build provenance.
-func deployBuiltImageFenced(ctx context.Context, executor ssh.Executor, appCfg *config.AppConfig, image, version, serverDisplay string, migrateVolumes, needsBuild bool, sourceRoot string, lk *state.Lock, att *releasemeta.Attempt) error {
+// plan-time provenance (C04); empty means no build provenance. planID,
+// when non-empty, is the C05 plan record the caller verified before
+// executing; it is stamped into the provenance receipt so releasemeta
+// ties the release back to the reviewed plan.
+func deployBuiltImageFenced(ctx context.Context, executor ssh.Executor, appCfg *config.AppConfig, image, version, serverDisplay string, migrateVolumes, needsBuild bool, sourceRoot string, lk *state.Lock, att *releasemeta.Attempt, planID string) error {
 	if att == nil {
 		attVal := releasemeta.MustAttempt(appCfg.App, version)
 		att = &attVal
@@ -542,6 +557,7 @@ func deployBuiltImageFenced(ctx context.Context, executor ssh.Executor, appCfg *
 	// describes. Best-effort resolution, but the receipt itself must
 	// land: a missing provenance file is an unwitnessed plan (warned).
 	prov := resolveDeployProvenance(ctx, executor, os.Stdout, appCfg, sourceRoot, image, version, manifestSHA256, needsBuild)
+	prov.PlanID = planID
 	if err := releasemeta.WriteAttemptProvenance(ctx, executor, *att, prov); err != nil {
 		fmt.Printf("Warning: could not persist the deploy provenance receipt for %s@%s: %v\n", appCfg.App, version, err)
 	}
@@ -594,18 +610,9 @@ func deployBuiltImageFenced(ctx context.Context, executor ssh.Executor, appCfg *
 	// 10. Resolve persistent volumes.
 	var volumes map[string]string
 	if len(appCfg.Volumes) > 0 {
-		volumes = make(map[string]string, len(appCfg.Volumes))
-		for name, containerPath := range appCfg.Volumes {
-			// A host bind mounts a directory the operator owns, exactly as
-			// given — teploy never creates or relocates it (it may hold a
-			// clone with credentials, or anything else that is not app data).
-			if config.IsHostBindVolume(name) {
-				volumes[name] = containerPath
-				continue
-			}
-			hostPath := fmt.Sprintf("/deployments/%s/volumes/%s", appCfg.App, name)
-			volumes[hostPath] = containerPath
-			if _, err := executor.Run(ctx, fmt.Sprintf("mkdir -p %s", hostPath)); err != nil {
+		volumes = plannedVolumeMounts(appCfg.App, appCfg.Volumes)
+		for _, hostPath := range managedVolumeHostPaths(appCfg.App, appCfg.Volumes) {
+			if _, err := executor.Run(ctx, "mkdir -p "+hostPath); err != nil {
 				return fmt.Errorf("creating volume directory %s: %w", hostPath, err)
 			}
 		}
@@ -716,6 +723,40 @@ func deployBuiltImageFenced(ctx context.Context, executor ssh.Executor, appCfg *
 	}
 
 	return nil
+}
+
+// plannedVolumeMounts resolves config volume declarations to the docker
+// mount map a deploy uses: a host bind (name starting with "/") mounts a
+// directory the operator owns, exactly as given — teploy never creates or
+// relocates it (it may hold a clone with credentials, or anything else
+// that is not app data); every other name is a teploy-managed volume at
+// /deployments/<app>/volumes/<name>. Single home: the deploy path and the
+// plan storage effects both resolve through it, so a plan can never
+// describe a different host layout than the deploy creates.
+func plannedVolumeMounts(app string, cfgVolumes map[string]string) map[string]string {
+	volumes := make(map[string]string, len(cfgVolumes))
+	for name, containerPath := range cfgVolumes {
+		if config.IsHostBindVolume(name) {
+			volumes[name] = containerPath
+			continue
+		}
+		volumes[fmt.Sprintf("/deployments/%s/volumes/%s", app, name)] = containerPath
+	}
+	return volumes
+}
+
+// managedVolumeHostPaths lists the teploy-managed host paths behind
+// named volumes (the ones the deploy mkdir's). Host binds are absent —
+// they are the operator's directories.
+func managedVolumeHostPaths(app string, cfgVolumes map[string]string) []string {
+	var paths []string
+	for name := range cfgVolumes {
+		if !config.IsHostBindVolume(name) {
+			paths = append(paths, fmt.Sprintf("/deployments/%s/volumes/%s", app, name))
+		}
+	}
+	sort.Strings(paths)
+	return paths
 }
 
 // imageTagPattern is Docker's tag grammar. Version strings are interpolated

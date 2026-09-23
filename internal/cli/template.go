@@ -292,7 +292,7 @@ func runTemplateInstall(flags *Flags, name, domain, server string, port int, ext
 	fmt.Printf("  Server: %s\n", server)
 
 	// Templates are first-deploys by definition, so volume mismatch can't apply yet.
-	if err := deployAppConfig(flags, appCfg, server, appCfg.Image, "", false, false); err != nil {
+	if err := deployAppConfig(flags, appCfg, server, appCfg.Image, "", false, false, ""); err != nil {
 		return err
 	}
 	// Unlike `template deploy` (which writes the rendered content, secrets
