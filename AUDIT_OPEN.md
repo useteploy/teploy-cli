@@ -1943,3 +1943,343 @@ REMAINS (C01-1 slice 2): guarded-effect integration into the deploy path
 sidecar written by the state commit), the two-clients/delayed-SSH/clock
 -change acceptance matrix against the real deploy path, and the
 documented app-lock/shared-proxy acquisition order.
+## Programme slice (2026-09-23) — C05: plan/apply binding + build identity
+
+The plan/apply remainder of C05 ("plan should distinguish known
+effects from unresolved image/build data, cover routing/env/storage/
+resource changes, and bind apply to the reviewed config/target
+version; drift invalidates stale plans"). The two Compose probe
+defects and the field-classification table landed earlier (2026-09-21
+slice above); this slice builds on them.
+
+**Design:**
+
+- **AppliedManifestView** (internal/config/appliedview.go): the read
+  side of the manifest NormalizeAndDigest writes into release state —
+  the deployed half of every plan diff. Lives next to the writer so
+  the shape has one home; malformed manifests refuse (never guessed
+  from), null sections parse as absent (static/legacy representable).
+- **Plan effect set** (internal/cli/planeffects.go, pure functions):
+  routing (domain set order/case-normalized, ingress mode, the
+  application port the Caddy route AND health gate probe, extra
+  publishes — diffed against AppState identity + recorded manifest),
+  env (KEY presence; values redacted by the manifest contract — only
+  key/env-file-reference changes are plannable, stated in the effect),
+  storage (volume add/remove/mount-change; the managed host path
+  named through plannedVolumeMounts — extracted from
+  deployBuiltImageFenced so plan and deploy share ONE volume
+  resolution), resources (replicas/memory/cpu), accessories
+  (set + image changes).
+- **Known-vs-unresolved image classification**
+  (planImageIdentity, reusing resolveDeployProvenance — the C04 path
+  — so plan and deploy cannot disagree about what the build inputs
+  are): resolved-by-digest (pinned ref), resolved-by-image-id (mutable
+  ref, content resolved at plan time; recorded NOT bound — the
+  changed-mutable-tag policy is C04's open tail), unresolved-mutable-
+  tag, unresolved-awaiting-build (the plan binds context fingerprint +
+  Dockerfile sha instead of an image that does not exist yet).
+- **PlanRecord** (internal/cli/planrecord.go): schema-versioned,
+  plan id = pure hash of the binding inputs (app/server/user/
+  destination/target version/config digest/build-input identities/
+  state generation+hash — WrittenAt deliberately outside it, the
+  provenance retry-stability rule), atomic 0600 write, load-time
+  self-consistency gate (tampered/future-schema plans refuse).
+  Config digest is NormalizeAndDigest over the plan's image reference
+  ("" for builds): recomputable BEFORE execution, unlike the receipt
+  digest which names the built image — the plan id stamped into the
+  receipt is the tie between the two.
+- **`teploy apply`** (internal/cli/apply.go): re-derives config
+  (loader + recorded overlay + resolveDeployEnv — extracted from
+  runDeploy so applied and direct deploys share ONE env resolution),
+  version (explicit binds as-is; derived must re-derive), build
+  inputs (catches dirty-tree edits a version cannot see), identity,
+  and target state (the generation any deploy/rollback increments);
+  every mismatch refuses naming what moved + the remedy (re-plan).
+  Execution goes through deployAppConfig — the same function a
+  direct deploy runs (planID threaded to deployBuiltImageFenced; all
+  other callers pass ""). releasemeta.Provenance gains plan_id
+  (additive). Floating-tag plans refuse outright (unpredictable
+  version = unbindable). Drift refusals classify as the error
+  envelope's conflict code under --json — the taxonomy's first wired
+  conflict site; the plan-apply capability token is advertised
+  (registry + version-handshake golden regenerated, corpus rev 3,
+  plan-record schema + fixtures added).
+- **plan --json compatibility**: the pre-plan/apply keys (app/server/
+  target_version/version_known/same_version/changes) ride unchanged
+  in a compat envelope with the record fields additive — no MI bump.
+
+**Finding fixed en route:** the Compose importer silently DROPPED the
+web service's `environment:` and `volumes:` (only accessories were
+parsed) — a plan over an imported stack showed no env/storage effects
+because the import had emptied them. Both now translate (web host
+binds keep their full path; parseWebVolumes does not basename).
+Regression: TestLoadCompose_WebServiceEnvAndVolumesPreserved.
+
+**Evidence** — new coverage: manifest view round-trips + refusal set
+(config); plan id stability/sensitivity (10 mutation subtests); plan
+file round-trip + tamper/schema refusals; binding verification for
+every drift kind (config, overlay flip incl. strict presence-aware
+clears, target-version incl. explicit-vs-derived, build-inputs
+naming both fingerprints, target-state incl. generation move /
+removed-since / deployed-since, identity); drift error-envelope
+conflict classification; the C05 acceptance fixtures as tests —
+config-changed-between-plan-and-apply refuses naming both digests,
+deploy-happened-in-between refuses naming the generation move
+(7 -> 8), nothing-moved verifies clean; an engine-level apply run
+(the real deployBuiltImageFenced over a mock executor) asserting the
+stamped provenance.json in the attempt namespace AND the committed
+release state; Compose plan conformance (build → unresolved-awaiting-
+build with bound fingerprint, digest-pinned → resolved-by-digest,
+unresolved mutable tag, effect set survives import, refused shapes
+never plan). Mutation checks (in-place, all reverted, gates re-run
+green): dropping prov.PlanID assignment fails the engine stamp test;
+removing the generation comparison from verifyPlanBinding fails
+TestApplyDrift_DeployHappenedInBetween; making computePlanID ignore
+the config digest fails the sensitivity table; reverting the web-env
+translation fails TestComposePlan_EffectSetSurvivesImport and the
+importer regression.
+
+**C05 remainder (explicit):** stack resource breadth (multi-image
+stacks still refuse at import — the single-image process model is
+unchanged; the first-class stack resource is P1); Coolify/Dokploy-
+scale Compose breadth (fields outside the classification inventory
+remain silently ignored); plan/apply is single-target (multi-server
+fleet apply via the scale path would need per-server plan records);
+static deploys verify+execute but write no provenance receipt, so no
+plan-id stamp (runStaticDeploy predates provenance); env VALUES are
+outside the binding by design (manifest redaction) — a changed .env
+value between plan and apply is not drift, only key/reference changes
+are; accessory volume import basenames host-bind sources (parseServiceVolumes
+— pre-existing, untouched; the web translator preserves them
+properly and the accessory behavior is recorded here as a finding).
+
+Gates: `go build ./...` clean; `go vet ./...` clean; `go test ./... -race -count=1` all 25 packages ok; gofmt clean on every touched hunk (pre-existing strays in deploy.go/secret_audit.go/update_test.go/contracts_golden_test.go left alone, consistent with the C02-C04 posture); contracts corpus regenerated deliberately (corpus rev 3) and the non-update test run pins it.
+||||||| 0c1fe5d
+## Programme slice (2026-09-23) — C01-1: replacement-owner reconciliation on acquisition
+
+Closes the C01-1 disagreement (docs/C01_RECOVERY_STATE_TABLE.md finding 1):
+lock acquisition used to be treated as quiescence — `acquireAutoLock` broke
+a stale lock and the deploy proceeded with no observation of the dead
+holder's leftover world. Base revision `0c1fe5d`.
+
+**Design:**
+
+- **Takeover signal** — `state.acquireAutoLock` now reports whether the
+  acquisition broke a stale auto/heal lock; `state.Lock.TookOver()` exposes
+  it (nil lock: false). Fresh acquisitions are unchanged.
+- **Productionized observer** — `deploy.Observe` (internal/deploy/
+  reconcile.go) is the fault harness's evidence collector as production
+  code: docker label inventory, state.json, the managed Caddyfile, the
+  per-release record → recovery.Observation, exact names, read failures map
+  to Unknown (the never-auto-decide grade). The decision stays the pure
+  table's (recovery.Decide); the observer imports the effectful packages,
+  not the reverse.
+- **Reconciliation gate** — DeployFenced step 1c: when TookOver, run
+  `ReconcileAfterTakeover` BEFORE the deploy's first effect. RETRY is the
+  only proceed disposition (surfaced to the operator); INSPECT gets ONE
+  bounded re-observation (R4's transient-read reconcile trigger) then
+  refuses; COMPENSATE/MANUAL refuse immediately. Every refusal carries the
+  observed evidence classes and the inspect commands. Deliberately NOT an
+  auto-compensator: compensation automation is the F04-keyed recovery-owner
+  continuation; refusing with evidence is the safe subset the table
+  permits. The reconciliation precedes the first docker run, so a refusal
+  has nothing to undo.
+
+**Evidence** — mock tests (internal/deploy/reconcile_test.go): takeover
+with a foreign running workload refuses MANUAL with zero `docker run`/state
+commits; clean-world takeover proceeds (a crash must not make the app
+undeployable); same-version disagreement (state.json names the deploying
+release) refuses INSPECT per R6; running-candidate-without-receipts INSPECT;
+traffic-on-uncommitted-generation COMPENSATE; persistent unreadable stays
+INSPECT; a transient inventory failure recovers via the single
+re-observation; Observe classification pinned (_replaced rename = serving
+predecessor, stopped = restorable, corpse ≠ running candidate, unreadable =
+Unknown). Fixture-verified for real (internal/deploy/
+reconcile_integration_test.go, colima docker 29.5.2): owner A's nohup'd
+delayed candidate lands after owner B's genuine stale-break acquisition;
+TookOver reports true; the production reconciler refuses MANUAL — the
+quiescence assumption's RETRY is proven dead in production shape. The
+pre-existing fault harness passes unchanged against the same fixture.
+Gates: build/vet clean; `go test ./... -count=1` all packages ok (one
+pre-existing load-sensitive timing test, cli TestAdmission_NoGoroutinePileup,
+flaked once under full-suite parallel load and passes repeatedly in
+isolation and in two follow-up full runs — not touched by this slice).
+
+**Residual C01 list (updated):** C01-2/3 remain (guarded pre-commit
+effects, fenced shared Caddy lock); C01-8/C01-9 unchanged (F04-keyed).
+
+## Programme slice (2026-09-23) — C01-2: guarded pre-commit effects
+
+Closes the C01-2 disagreement (docs/C01_RECOVERY_STATE_TABLE.md finding
+2): candidate starts, worker starts and the route switch ran `lk.Check`
+as a command SEPARATE from the effect — only the state commit composed
+guard+effect (WriteFenced). Between check and effect a takeover could
+occur, letting a broken holder's effects land inside the new owner's
+window. Base revision `194130c`.
+
+**Design:**
+
+- **Composition surface** — `state.Lock.GuardPrefix()` returns the shell
+  prefix that refuses (TEPLOY_FENCE_LOST marker, exit 75) when the lock
+  no longer names the holder; `state.FenceLost(err)` matches refusals
+  across packages. docker and caddy consume the PREFIX, not the Lock —
+  no new package coupling.
+- **Container starts** — `docker.RunGuarded(ctx, cfg, guardPrefix)`
+  composes the guard with the docker run in ONE remote command;
+  DeployFenced's web-candidate and worker starts use it (the separate
+  pre-effect Checks at those sites are superseded). A refused start maps
+  to `state.ErrFenceLost` and enters the existing recovery handlers
+  (restoreDisplacedAndStarted / fail); the reactive
+  name-already-in-use clearing also runs under the guard.
+- **Route switch** — `caddy.Client.WithCommitGuard(prefix)` returns a
+  client whose Caddyfile COMMIT (the rename that makes new contents
+  authoritative) runs composed under the guard. mutate was restructured:
+  stage the new Caddyfile to an inert random sibling (upload, no
+  effect), then one guarded `mv -fT` commit; reload and delivery
+  verification stay separate commands (the commit is the traffic-switch
+  instant — a refused commit means the edit never became authoritative,
+  and a post-commit reload is idempotent). Rollback restores are
+  deliberately never fenced (cleanup is never fenced, F16's rule).
+  Wired through deploy's step 11, rollback, and all three static
+  SetStaticRoute sites (each holds its own fence).
+
+**Evidence** — mock tests: happy path asserts the web+worker runs and the
+Caddyfile commit execute composed under the guard (guard+effect in one
+command); a takeover fired at the health gate (lock info rewritten
+mid-deploy by a test executor wrapper) refuses the route switch — no
+Caddyfile lands, no reload runs, deploy errors ErrFenceLost; the same
+takeover refuses the worker start in-shell with no executed worker run;
+the pre-existing late-holder test now asserts on EXECUTED (bare) docker
+runs — a refused start appears only as the composed command the guard
+rejected, which is the C01-2 shape, not a regression. Caddy-side: a
+guarded client whose lock names another owner has its edit refused
+(nothing lands, no reload, lock still acquired/released around the
+attempt); the legitimate holder's composed commit is byte-identical in
+effect to today's write. All pre-existing caddy/docker/deploy/rollback/
+static/preview tests unchanged and green. Gates: build/vet clean;
+`go test ./... -count=1` all packages ok; gofmt clean on touched files
+(docker_test.go/recreate.go pre-existing strays left alone).
+
+**Residual C01 list (updated):** C01-3 remains (fenced shared Caddy
+lock); C01-8/C01-9 unchanged (F04-keyed).
+
+## Programme slice (2026-09-23) — C01-3: owner-tagged fenced shared Caddy lock + conflicting-route reconciliation
+
+Closes the C01-3 disagreement (docs/C01_RECOVERY_STATE_TABLE.md finding
+3): the shared-proxy lock was a bare ownerless mkdir broken by DIRECTORY
+MTIME after 120s, so a slow-but-alive orphaned editor could interleave
+its Caddyfile edit with the new owner's mutate, and the table's
+"conflicting route evidence → INSPECT" had no producer or consumer. Base
+revision `13c7dd9`.
+
+**Design:**
+
+- **Owner-tagged lock** — caddy.acquireLock writes a caddy-edit info
+  file (owner token + RFC3339 ts, mirroring the app locks' shape).
+  Staleness is measured from the INFO timestamp (unparseable = stale);
+  a legacy no-info dir falls back to the old mtime check. No renewal:
+  an edit session is seconds, far below any renewal interval. TTL stays
+  120s.
+- **Fenced commit** — the Caddyfile commit's composed command now chains
+  the CADDY-LOCK guard after the app-fence guard (C01-2's prefix): a
+  holder whose lock was stale-broken has its late edit refused in-shell
+  (TEPLOY_FENCE_LOST / exit 75), so a broken editor cannot interleave
+  with the successor. Acquisition order documented and test-pinned:
+  app guard FIRST (long-held), caddy guard SECOND (brief) — never the
+  inverse, never across hosts.
+- **Conditional release** — releaseLock removes the lock only when its
+  info still names the releaser (the app locks' A04 lesson): a stale
+  holder's deferred release can no longer delete the successor's lock
+  and admit a third editor.
+- **The missing reconciliation** — deploy.Observe now classifies the
+  route evidence exactly: a managed block naming the attempted
+  candidates or the predecessor's containers is provable; a managed
+  block naming a THIRD generation (the dead-holder late-route-edit
+  shape) is CONFLICTING (Unknown), which Decide routes to INSPECT (R4)
+  — previously it collapsed into a false "route to predecessor" that
+  could yield a blind RETRY. No managed block at all is clean absence.
+
+**Evidence** — caddy tests: acquisition writes owner info and breaks a
+stale holder BY INFO AGE; a fresh (sub-TTL) holder is never broken; a
+broken holder's composed commit is refused and nothing lands; release
+against a successor-owned lock deletes nothing. Deploy test pins the
+app-guard-before-caddy-guard order on the commit command. Reconcile
+test: a third-generation route under predecessor authority yields
+Unknown route evidence → INSPECT; no managed block stays clean absence.
+The mock executor evaluates CHAINED guards (every guard must hold) and
+the stateful caddy fake gained the same evaluation. All pre-existing
+suites updated for the conditional-release command shape (assertions
+moved from `rmdir` to the conditional) and green. Gates: build/vet
+clean; `go test ./... -count=1` all packages ok; gofmt clean on touched
+files.
+
+**C01 locking-protocol redesign (C01-1/2/3) is now closed.** Residual
+C01: C01-8/C01-9 (F04 generation identities — deliberate containment),
+the A12/T05 rollback-route remainder of C01-7.
+
+## Programme slice (2026-09-23) — C03: request drain + the readiness/liveness/stop/drain distinction
+
+First bounded slice of C03's ingress-behavior half (the readiness-mode
+half landed earlier as the F47/TCL-17/A22 slice). Closes the recorded
+C03 remainder "request drain + graceful stop": the drain WINDOW between
+the traffic switch and predecessor retirement, the stop policy surfaced
+distinct from readiness, and the declared blue/green fixture proving
+zero failed requests. Base revision `90f356c`.
+
+**Design:**
+
+- **Grammar** — `drain_seconds: N` in teploy.yml/TOML (0..600; 0 = the
+  historical stop-immediately default, documented compat). Flows through
+  the destination overlay and the effective-config manifest (drift
+  identity — a changed drain window is a config change), mapped into
+  deploy.Config / RollbackConfig at the single config→deploy seam plus
+  rollback and scale.
+- **Deploy** — after the route switch and state commit, before
+  predecessor retirement: the configured window elapses while the
+  predecessor keeps serving IN-FLIGHT requests on its existing
+  connections (new traffic is on the candidates). Only a caddy-routed
+  blue/green switch drains: external ingress is the operator's edge,
+  the recreate strategy already stopped the fixed-port workload before
+  the candidates started. Cancellation cuts the window short and
+  proceeds to retirement (the operator asked to stop).
+- **Rollback** — the same window between the route switch back to the
+  target and stopping the superseded generation.
+- **Surfaced distinction** — deploy prints the gate AND the stop policy
+  before the switch: readiness (health mode + total deadline), graceful
+  stop (stop_timeout's SIGTERM→SIGKILL ladder), request drain (the
+  window), liveness (the container HEALTHCHECK directive). The deploy
+  plan now states all four separately.
+- **Honesty** — Caddy's config-level routing CANNOT count in-flight
+  requests per upstream (no per-upstream concurrency endpoint, and
+  teploy's blocks do not enable access logging), so the drain POLICY is
+  the time window plus the ladder — documented in README, the config
+  comment, and the deploy output. Nothing promises request counting.
+
+**Evidence** — mock tests: the draining deploy proves reload→window→stop
+ordering, the window elapses (elapsed >= drain_seconds), the policy
+lines surface, drain 0 adds no window (compat), and external ingress
+never drains. Config tests: parse, bounds (0/1/600 ok; -1/601 rejected
+naming the field), overlay, manifest identity. Rollback test: window
+between switch-back and superseded stop. REAL fixture (colima docker
+29.5.2, real caddy:2-alpine, the PRODUCTION caddy.Client switch path —
+lock, adapt gate, guarded commit, reload, delivery verification):
+TestDrainIntegration_BlueGreenZeroFailedRequests drives 90 requests
+across the switch with a 3.5s request in flight, drains 5s, stops blue
+with -t 5 — ZERO failed requests, the long request completes
+end-to-end on blue inside the window, post-switch traffic serves green.
+TestDrainIntegration_NoDrainKillsLongRequest is the negative control:
+stop -t 0 immediately after the switch breaks the in-flight request
+(caddy 502) — the fixture can detect a broken promise, so the window is
+what saves it. Integration tests also taught the close-vs-cleanup lesson
+(SSH sessions close AFTER t.Cleanup work, LIFO — a plain defer raced
+the fixture cleanups silently). Gates: build/vet clean;
+`go test ./... -count=1` all packages ok; gofmt clean on touched files
+(pre-existing strays untouched); integration battery green against the
+colima fixture.
+
+**C03 remainder (explicit):** liveness-vs-readiness as post-switch
+continuous probing (today only the container HEALTHCHECK approximates
+it), multi-host partial-wave readiness states (canary aggregate gating),
+WebSocket/SSE drain verification beyond the long-request proof, and the
+registered interactions (tcp mode × the Caddy LB active check; preview's
+gate has no drain surface).

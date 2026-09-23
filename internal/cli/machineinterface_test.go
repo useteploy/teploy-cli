@@ -89,6 +89,7 @@ func TestCapabilityTokenRegistry(t *testing.T) {
 		"error-envelope",
 		"health-modes",
 		"kv-set-stdin",
+		"plan-apply",
 		"preview-blue-green",
 		"preview-canonical-id",
 		"provenance-records",
@@ -124,7 +125,7 @@ func TestCapabilityTokenRegistry(t *testing.T) {
 		CapHealthModes, CapProvenanceRecords, CapReadinessReceipts,
 		CapPreviewCanonicalID, CapRepairDebt, CapPreviewBlueGreen,
 		CapErrorEnvelope, CapAppListMachine, CapServerStatusMachine,
-		CapDoctorDiagnostics,
+		CapDoctorDiagnostics, CapPlanApply,
 	} {
 		if !member[token] {
 			t.Fatalf("capability constant %q is not advertised", token)

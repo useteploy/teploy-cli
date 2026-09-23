@@ -57,6 +57,9 @@ const provenanceFile = "provenance.json"
 //     keys on.
 //   - ManifestSHA256: the effective-config digest (config.
 //     NormalizeAndDigest) — plan and receipt compare THIS too.
+//   - PlanID: when the deploy executed a reviewed plan (C05
+//     `teploy apply`), the plan record's id — the tie-back from the
+//     receipt to the plan that was verified. Empty for direct deploys.
 type Provenance struct {
 	SchemaVersion int       `json:"schema_version"`
 	App           string    `json:"app"`
@@ -77,6 +80,7 @@ type Provenance struct {
 	ImageDigest    string `json:"image_digest,omitempty"`
 	DigestPinned   bool   `json:"digest_pinned,omitempty"`
 	ManifestSHA256 string `json:"manifest_sha256,omitempty"`
+	PlanID         string `json:"plan_id,omitempty"`
 }
 
 // AttemptProvenancePath is the receipt's location in the attempt namespace.

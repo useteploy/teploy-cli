@@ -122,6 +122,12 @@ port: 3000
 build_local: true
 platform: linux/amd64
 stop_timeout: 30
+drain_seconds: 10             # request drain: keep the old container serving in-flight
+                              # requests this long AFTER the traffic switch, before it is
+                              # stopped (0 = stop immediately, the default). The full graceful
+                              # budget is drain_seconds + stop_timeout. Teploy's Caddy routing
+                              # cannot count in-flight requests per upstream, so the window IS
+                              # the drain policy — size it to your longest normal request.
 memory: 2g                    # cgroup RAM cap (docker units: 512m, 2g). Unset = unlimited.
 cpu: "1.5"                    # CPU cap in cores. Unset = unlimited.
 keep_versions: 3              # auto-prune older versions after deploy (0 = keep all, default)
@@ -336,6 +342,9 @@ teploy exec <server> <cmd>                # run a command on the server (SSH)
 teploy app exec -- <cmd>                  # run a command in the app container (migrations, etc.)
 teploy validate                           # check config and server readiness
 teploy doctor [--server <name>]           # read-only diagnostics: toolchain, SSH, Docker, registry, Caddy, disk, compatibility, repair debt (--json for machines; exit 1 if any check fails, never 2)
+teploy plan                               # preview what a deploy would change (containers, routing, env, storage, resources; read-only)
+teploy plan --out plan.json               # write a bound plan record (config digest + target identity + generation)
+teploy apply plan.json                    # execute a reviewed plan; refuses naming what drifted since it was made
 teploy scale <count>                      # multi-server deploy + LB update
 teploy version / update                   # version info and self-update
 ```

@@ -64,8 +64,17 @@ type Config struct {
 	// Publish adds extra verbatim docker -p mappings beyond ContainerPort's own
 	// (e.g. "0.0.0.0:3001:3001"), for an app with a second listener that needs
 	// its own host port. See AppConfig.Publish.
-	Publish       []string
-	StopTimeout   int // graceful shutdown seconds (default 10)
+	Publish     []string
+	StopTimeout int // graceful shutdown seconds (default 10)
+	// DrainSeconds is the request-drain window between the traffic switch
+	// and predecessor retirement (C03): the predecessor keeps serving
+	// in-flight requests on its existing connections while new traffic
+	// goes to the candidates. Zero (default) stops immediately after the
+	// switch — the historical behavior. The window is time-based: the
+	// Caddy adapter cannot count in-flight requests per upstream, so the
+	// drain POLICY is this window plus StopTimeout's SIGTERM→SIGKILL
+	// ladder; size it to the longest normal request.
+	DrainSeconds  int
 	Replicas      int // web process replicas per server (default 1)
 	Health        HealthConfig
 	PreDeploy     string // hook: runs in web container before traffic switch (failure aborts)
@@ -190,6 +199,9 @@ func (c Config) validate() error {
 	}
 	if c.StopTimeout < 0 {
 		return fmt.Errorf("stop timeout cannot be negative (got %ds)", c.StopTimeout)
+	}
+	if c.DrainSeconds < 0 || c.DrainSeconds > 600 {
+		return fmt.Errorf("drain seconds must be in 0..600 (got %d)", c.DrainSeconds)
 	}
 	// Health probe mode enum (C03): config-file parsing enforces the fuller
 	// grammar (tcp rejects a path); the shared execution validator covers
@@ -353,6 +365,19 @@ func (d *Deployer) DeployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 	// own failure the marker stays (with the count bumped) for the next
 	// one.
 	d.repairOutstandingRecordDebt(ctx, cfg.App, current)
+
+	// 1c. Replacement-owner reconciliation (C01-1): when this deploy's
+	// lock acquisition BROKE a stale predecessor's lock, the previous
+	// holder may have left in-flight effects on the target — acquisition
+	// is never proof of quiescence. Decide over the observed evidence
+	// BEFORE this deploy's first effect; anything but a clean retry
+	// refuses with the evidence so the leftover generation is reconciled
+	// deliberately, never blindly redeployed over.
+	if lk.TookOver() {
+		if err := d.ReconcileAfterTakeover(ctx, cfg, current); err != nil {
+			return err
+		}
+	}
 
 	// 4. Determine host ports for all web replicas.
 	var ports []int
@@ -635,17 +660,18 @@ func (d *Deployer) DeployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 	}
 
 	// 6. Start web container(s).
-	// Fence (F16): container creation is an effect. A lost fence here must
-	// still restore whatever this deploy displaced (recovery is never
-	// fenced — see DeployFenced's doc).
-	if err := lk.Check(ctx, d.exec); err != nil {
-		return restoreDisplacedAndStarted(err)
-	}
+	// Fence (F16, C01-2 composition): container creation runs as a guarded
+	// effect — the holdership check and the docker run are ONE remote
+	// command, so no transport window exists in which a takeover lets this
+	// (possibly broken) holder's starts land inside a new owner's window.
+	// A lost fence here must still restore whatever this deploy displaced
+	// (recovery is never fenced — see DeployFenced's doc).
+	guardPrefix := lk.GuardPrefix()
 	for i := 0; i < replicas; i++ {
 		name := docker.ReplicaContainerName(cfg.App, "web", cfg.Version, i+1, replicas)
 		webContainerNames[i] = name
 		fmt.Fprintf(d.out, "Starting container %s (port %d)...\n", name, ports[i])
-		containerID, err := d.docker.Run(ctx, docker.RunConfig{
+		containerID, err := d.docker.RunGuarded(ctx, docker.RunConfig{
 			App:           cfg.App,
 			Process:       "web",
 			Version:       cfg.Version,
@@ -662,8 +688,16 @@ func (d *Deployer) DeployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 			CPU:           cfg.CPU,
 			Name:          name,
 			NoHealthcheck: cfg.NoHealthcheck["web"],
-		})
+		}, guardPrefix)
 		if err != nil {
+			if state.FenceLost(err) {
+				// The guard refused the run: the lock no longer names this
+				// operation, and docker never executed. Restore displaced
+				// work (unfenced), exactly like the old pre-loop Check
+				// failure — no partial-run reconciliation needed because
+				// nothing ran.
+				return restoreDisplacedAndStarted(fmt.Errorf("%w: refusing to start %s's containers", state.ErrFenceLost, cfg.App))
+			}
 			// Docker can CREATE a container and still fail the run (port
 			// binding, for one) — that corpse is not in `started`, so it
 			// would outlive this deploy and collide with the next one's
@@ -722,6 +756,12 @@ func (d *Deployer) DeployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 	if len(ports) > 0 {
 		fmt.Fprintf(d.out, "  Readiness: %s\n", readinessSummary(healthCfg, ports[0]))
 	}
+	// C03's distinction, surfaced: readiness (above — the gate before the
+	// switch), graceful stop (docker stop's SIGTERM→SIGKILL ladder) and
+	// request drain (the window the predecessor keeps serving in-flight
+	// requests after the switch) are SEPARATE policies. Liveness remains
+	// the container's HEALTHCHECK directive.
+	fmt.Fprintf(d.out, "  Stop policy: graceful stop after %ds (SIGTERM then SIGKILL); drain %s\n", stopTimeout, drainSummary(cfg.DrainSeconds))
 	for i, p := range ports {
 		if err := d.healthCheck(ctx, p, healthCfg, webBindHost); err != nil {
 			fmt.Fprintf(d.out, "  Health check failed for replica %d (port %d): %v\n", i+1, p, err)
@@ -759,16 +799,15 @@ func (d *Deployer) DeployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 	}
 
 	// 10. Start non-web process containers (workers, etc. — no replicas, one each).
-	if err := lk.Check(ctx, d.exec); err != nil {
-		return fail(err)
-	}
+	// Fence (F16, C01-2 composition): same guarded-effect shape as the web
+	// candidates above — the run is refused in-shell when the fence is lost.
 	for _, process := range sortedProcessNames(processes) {
 		if process == "web" {
 			continue
 		}
 		name := docker.ContainerName(cfg.App, process, cfg.Version)
 		fmt.Fprintf(d.out, "Starting %s...\n", name)
-		_, err := d.docker.Run(ctx, docker.RunConfig{
+		_, err := d.docker.RunGuarded(ctx, docker.RunConfig{
 			App:           cfg.App,
 			Process:       process,
 			Version:       cfg.Version,
@@ -781,8 +820,11 @@ func (d *Deployer) DeployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 			Memory:        cfg.Memory,
 			CPU:           cfg.CPU,
 			NoHealthcheck: cfg.NoHealthcheck[process],
-		})
+		}, guardPrefix)
 		if err != nil {
+			if state.FenceLost(err) {
+				return fail(fmt.Errorf("%w: refusing to start %s's %s process", state.ErrFenceLost, cfg.App, process))
+			}
 			d.reconcilePartialRun(name)
 			return fail(fmt.Errorf("starting %s: %w", name, err))
 		}
@@ -807,12 +849,13 @@ func (d *Deployer) DeployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 	// teploy docker network, so Teploy has nothing to do here.
 	if cfg.usesCaddy() {
 		fmt.Fprintln(d.out, "Updating routes...")
-		// Fence (F16): the route switch commits traffic to this deploy's
-		// containers; a late write here would hijack a newer operation's
-		// route.
-		if err := lk.Check(ctx, d.exec); err != nil {
-			return fail(err)
-		}
+		// Fence (F16, C01-2 composition): the route switch commits traffic
+		// to this deploy's containers. The Caddyfile COMMIT (the rename
+		// that makes the new block authoritative) runs under this deploy's
+		// fence guard in the same shell — a late write from a broken holder
+		// cannot hijack a newer operation's route. The pre-switch Check is
+		// superseded by the composed commit.
+		cad := d.caddy.WithCommitGuard(guardPrefix)
 		tls := caddy.TLS{Cert: cfg.TLSCert, Key: cfg.TLSKey, Internal: cfg.TLSInternal}
 		if replicas > 1 {
 			upstreams := make([]caddy.Upstream, replicas)
@@ -821,12 +864,18 @@ func (d *Deployer) DeployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 			}
 			// Caddy's active upstream checks probe the SAME path the deploy
 			// readiness gate used (F47) — the block used to hardcode /up.
-			if err := d.caddy.SetLoadBalancerHealth(ctx, cfg.App, cfg.Domain, upstreams, healthCfg.Path, tls, cfg.CaddyExtra, cfg.Cache, cfg.Firewall, cfg.Access); err != nil {
+			if err := cad.SetLoadBalancerHealth(ctx, cfg.App, cfg.Domain, upstreams, healthCfg.Path, tls, cfg.CaddyExtra, cfg.Cache, cfg.Firewall, cfg.Access); err != nil {
+				if state.FenceLost(err) {
+					return fail(fmt.Errorf("%w: refusing to switch %s's route", state.ErrFenceLost, cfg.App))
+				}
 				return fail(fmt.Errorf("updating load balancer route: %w", err))
 			}
 			fmt.Fprintf(d.out, "  Traffic load-balanced across %d replicas\n", replicas)
 		} else {
-			if err := d.caddy.SetRoute(ctx, cfg.App, cfg.Domain, webContainerName, containerPort, tls, cfg.CaddyExtra, cfg.Cache, cfg.Firewall, cfg.Access); err != nil {
+			if err := cad.SetRoute(ctx, cfg.App, cfg.Domain, webContainerName, containerPort, tls, cfg.CaddyExtra, cfg.Cache, cfg.Firewall, cfg.Access); err != nil {
+				if state.FenceLost(err) {
+					return fail(fmt.Errorf("%w: refusing to switch %s's route", state.ErrFenceLost, cfg.App))
+				}
 				return fail(fmt.Errorf("updating route: %w", err))
 			}
 			fmt.Fprintln(d.out, "  Traffic routed to new container")
@@ -920,6 +969,28 @@ func (d *Deployer) DeployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 					fmt.Fprintf(d.out, "Warning: could not prune superseded attempt artifacts: %v\n", err)
 				}
 			}
+		}
+	}
+
+	// 13z. Request drain (C03): the route switched to the candidates in
+	// step 11; the predecessor still holds IN-FLIGHT requests on its
+	// existing connections (downloads, SSE, streaming uploads). Hold the
+	// configured window before retiring it so those requests complete —
+	// Caddy's config-level routing cannot count in-flight requests per
+	// upstream, so the window IS the drain policy (plus the graceful-stop
+	// ladder inside docker stop). Only a caddy-routed blue/green switch
+	// has a serving predecessor to drain: external ingress is the
+	// operator's edge (nothing to drain here), and the recreate strategy
+	// already stopped the fixed-port workload before the candidates
+	// started (its downtime is the recreate tradeoff, advertised at the
+	// plan). Skipped when there is nothing to retire or the window is 0
+	// (the historical behavior).
+	if cfg.DrainSeconds > 0 && cfg.usesCaddy() && predecessorsListed && len(predecessors) > 0 {
+		fmt.Fprintf(d.out, "Draining %s's predecessor for %ds (in-flight requests complete; new traffic serves %s)...\n", cfg.App, cfg.DrainSeconds, cfg.Version)
+		select {
+		case <-ctx.Done():
+			fmt.Fprintf(d.out, "  Drain window cut short (%v) — proceeding to predecessor retirement\n", ctx.Err())
+		case <-time.After(time.Duration(cfg.DrainSeconds) * time.Second):
 		}
 	}
 

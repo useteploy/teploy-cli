@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -68,11 +69,14 @@ func TestContractsAppListEnvelopeGolden(t *testing.T) {
 	writeFixture(t, "app-list-envelope/valid/mi1.json", appListDTO{
 		MachineInterface: MachineInterface,
 		Host:             "srv.example.com",
+		Errors:           []machineError{},
 		Apps: []appStatusDTO{{
 			App: "myapp", Domain: "myapp.example.com", Type: "container",
 			Ingress: "caddy", CurrentRelease: releaseStatusDTO{Version: "3", Ports: []int{3000}},
+			PreviousRelease: releaseStatusDTO{Version: "2", Ports: []int{3000}},
 			Containers: []containerDTO{{ID: "9f31c02", Name: "myapp-web-3", Image: "nginx:1.27", State: "running", Status: "Up 4 minutes", CreatedAt: "2026-09-23T11:55:00Z", Process: "web", Version: "3"}},
-			Lock:       nil, ObservedAt: ts, Errors: nil,
+			Processes:  []processDTO{},
+			Lock:       nil, ObservedAt: ts, Errors: []machineError{},
 		}},
 		ObservedAt: ts,
 	})
@@ -82,7 +86,7 @@ func TestContractsAppListEnvelopeGolden(t *testing.T) {
 	// legacy, not as MI 0.
 	var legacy map[string]any
 	raw, err := json.Marshal(appListDTO{
-		Host: "srv.example.com", Apps: []appStatusDTO{}, ObservedAt: ts,
+		Host: "srv.example.com", Apps: []appStatusDTO{}, ObservedAt: ts, Errors: []machineError{},
 	})
 	if err != nil {
 		t.Fatalf("marshal legacy: %v", err)
@@ -135,4 +139,69 @@ func TestContractsAttemptNameGolden(t *testing.T) {
 		"abc1234.deadb17ecafef00",  // 15 hex chars
 		"../escape.attempt0000000", // path characters
 	})
+}
+
+// TestContractsPlanRecordGolden pins the C05 plan-record shape through
+// the REAL record construction: plan id computed by computePlanID,
+// marshaled with the PlanRecord's own tags (the same encoder savePlanFile
+// uses). Two representative records: a build plan (image
+// unresolved-awaiting-build, bound by build inputs) and a prebuilt
+// digest-pinned plan (resolved-by-digest) — the known-vs-unresolved
+// classification a consumer reads before trusting an apply.
+func TestContractsPlanRecordGolden(t *testing.T) {
+	buildPlan := &PlanRecord{
+		SchemaVersion: PlanRecordSchemaVersion,
+		App:           "myapp",
+		Server:        "srv.example.com",
+		User:          "root",
+		ServerName:    "prod",
+		TargetVersion: "abc1234",
+		VersionKnown:  true,
+		ConfigDigest:  "3f2a9c11d8e4b7065a1c9f0e2b8d7a64c5e3f1b9a0d8c7e6f5a4b3c2d1e0f9a8",
+		Image: PlanImageIdentity{
+			NeedsBuild:         true,
+			Resolution:         imageUnresolvedAwaitingBuild,
+			ContextPath:        ".",
+			ContextFingerprint: "c0ffee11aa22bb33",
+			Dockerfile:         "Dockerfile",
+			DockerfileSHA256:   "deadbeef11",
+			Platform:           "linux/amd64",
+		},
+		TargetState: PlanTargetState{Deployed: true, Generation: 4, CurrentHash: "old1234", ManifestSHA256: "aa11bb22"},
+		Effects: PlanEffects{
+			Containers: []planChange{{Action: "create", Name: "myapp-web-abc1234", Detail: "web container"}},
+			Routing:    []planEffect{{Action: "change", Name: "domain", From: "old.example.com", To: "new.example.com", Detail: "routes served by this deployment"}},
+		},
+		Unresolved: []string{"image unresolved — built at deploy time; the plan binds the build inputs (context . fingerprint c0ffee11aa22bb..., Dockerfile Dockerfile sha deadbeef11...)"},
+	}
+	buildPlan.PlanID = computePlanID(buildPlan)
+	writeFixture(t, "plan-record/valid/build.json", buildPlan)
+
+	digest := "sha256:" + strings.Repeat("ab", 32)
+	digestPlan := &PlanRecord{
+		SchemaVersion: PlanRecordSchemaVersion,
+		App:           "myapp",
+		Server:        "srv.example.com",
+		ServerName:    "prod",
+		TargetVersion: "sha256-aaaaaaaaaaaa",
+		VersionKnown:  true,
+		ConfigDigest:  "7d1e0f9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d10",
+		Image: PlanImageIdentity{
+			Ref:        "registry.example.com/myapp@" + digest,
+			Resolution: imageResolvedByDigest,
+			Digest:     digest,
+		},
+		TargetState: PlanTargetState{Deployed: false},
+		Effects:     PlanEffects{Containers: []planChange{{Action: "create", Name: "myapp-web-sha256-aaaaaaaaaaaa", Detail: "web container"}}},
+	}
+	digestPlan.PlanID = computePlanID(digestPlan)
+	writeFixture(t, "plan-record/valid/prebuilt-digest.json", digestPlan)
+
+	// Invalid: a record whose plan id does not recompute from its
+	// identity — loadPlanFile refuses it (the schema's pattern cannot
+	// see inside the hash, so this fixture pins the REFUSAL, not just
+	// the shape).
+	tampered := *digestPlan
+	tampered.ConfigDigest = "0000000000000000000000000000000000000000000000000000000000000000"
+	writeFixture(t, "plan-record/invalid/tampered-id.json", tampered)
 }

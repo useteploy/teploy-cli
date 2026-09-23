@@ -78,6 +78,12 @@ const (
 	// stable check names, ok/warn/fail results, remediations, and 0/1
 	// exit semantics — 2 never (that stays drift's) (C09).
 	CapDoctorDiagnostics = "doctor-diagnostics"
+	// `teploy plan --out` / `teploy apply <file>`: plans carry a binding
+	// identity (effective-config digest, target version, build inputs,
+	// server/app, state generation) and apply refuses — naming what
+	// drifted — when anything moved since the plan (C05). Applied
+	// releases carry provenance.plan_id.
+	CapPlanApply = "plan-apply"
 )
 
 // MachineCapabilities returns every capability token this build
@@ -100,6 +106,7 @@ func MachineCapabilities() []string {
 		CapAppListMachine,
 		CapServerStatusMachine,
 		CapDoctorDiagnostics,
+		CapPlanApply,
 	}
 	sort.Strings(tokens)
 	return tokens

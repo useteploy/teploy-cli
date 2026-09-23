@@ -248,6 +248,17 @@ func readinessSummary(cfg HealthConfig, port int) string {
 	}
 }
 
+// drainSummary renders the request-drain half of the surfaced stop policy
+// (C03): 0 keeps the historical stop-immediately behavior; N names the
+// window the predecessor keeps serving in-flight requests after the
+// traffic switch.
+func drainSummary(drainSeconds int) string {
+	if drainSeconds <= 0 {
+		return "disabled — the predecessor stops immediately after the switch"
+	}
+	return fmt.Sprintf("%ds window before predecessor retirement", drainSeconds)
+}
+
 // checkTCP verifies that a TCP connection can be established to the port.
 // The /dev/tcp redirection runs inside a single-quoted bash -c argument, so
 // neither the host nor the port can break out of it.

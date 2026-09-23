@@ -1,0 +1,81 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://teploy.github.io/contracts/schema/plan-record.schema.json",
+  "title": "C05 plan record (teploy plan --out; cli/planrecord.go PlanRecord)",
+  "type": "object",
+  "required": ["schema_version", "plan_id", "app", "server", "target_version", "version_known", "config_digest", "image", "target_state", "effects"],
+  "properties": {
+    "schema_version": {"type": "integer", "minimum": 1},
+    "plan_id": {"type": "string", "pattern": "^[a-f0-9]{16}$"},
+    "app": {"type": "string", "minLength": 1},
+    "server": {"type": "string", "minLength": 1},
+    "user": {"type": "string"},
+    "server_name": {"type": "string"},
+    "destination": {"type": "string"},
+    "target_version": {"type": "string"},
+    "version_known": {"type": "boolean"},
+    "version_explicit": {"type": "boolean"},
+    "config_digest": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "image": {
+      "type": "object",
+      "required": ["resolution"],
+      "properties": {
+        "ref": {"type": "string"},
+        "needs_build": {"type": "boolean"},
+        "resolution": {"type": "string", "enum": ["resolved-by-digest", "resolved-by-image-id", "unresolved-mutable-tag", "unresolved-awaiting-build"]},
+        "digest": {"type": "string"},
+        "context_path": {"type": "string"},
+        "context_fingerprint": {"type": "string"},
+        "dockerfile": {"type": "string"},
+        "dockerfile_sha256": {"type": "string"},
+        "platform": {"type": "string"}
+      }
+    },
+    "target_state": {
+      "type": "object",
+      "required": ["deployed", "generation"],
+      "properties": {
+        "deployed": {"type": "boolean"},
+        "generation": {"type": "integer", "minimum": 0},
+        "current_hash": {"type": "string"},
+        "manifest_sha256": {"type": "string"}
+      }
+    },
+    "effects": {
+      "type": "object",
+      "required": ["containers"],
+      "properties": {
+        "containers": {"type": "array", "items": {"$ref": "#/$defs/planChange"}},
+        "routing": {"type": "array", "items": {"$ref": "#/$defs/planEffect"}},
+        "env": {"type": "array", "items": {"$ref": "#/$defs/planEffect"}},
+        "storage": {"type": "array", "items": {"$ref": "#/$defs/planEffect"}},
+        "resources": {"type": "array", "items": {"$ref": "#/$defs/planEffect"}},
+        "accessories": {"type": "array", "items": {"$ref": "#/$defs/planEffect"}}
+      }
+    },
+    "unresolved": {"type": "array", "items": {"type": "string"}},
+    "written_at": {"type": "string", "format": "date-time"}
+  },
+  "$defs": {
+    "planChange": {
+      "type": "object",
+      "required": ["action", "name"],
+      "properties": {
+        "action": {"type": "string", "enum": ["create", "stop", "unchanged"]},
+        "name": {"type": "string"},
+        "detail": {"type": "string"}
+      }
+    },
+    "planEffect": {
+      "type": "object",
+      "required": ["action", "name"],
+      "properties": {
+        "action": {"type": "string", "enum": ["add", "remove", "change"]},
+        "name": {"type": "string"},
+        "from": {"type": "string"},
+        "to": {"type": "string"},
+        "detail": {"type": "string"}
+      }
+    }
+  }
+}

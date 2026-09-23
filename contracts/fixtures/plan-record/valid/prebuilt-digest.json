@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "plan_id": "e6e098f1e0322e3f",
+  "app": "myapp",
+  "server": "srv.example.com",
+  "server_name": "prod",
+  "target_version": "sha256-aaaaaaaaaaaa",
+  "version_known": true,
+  "config_digest": "7d1e0f9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d10",
+  "image": {
+    "ref": "registry.example.com/myapp@sha256:abababababababababababababababababababababababababababababababab",
+    "resolution": "resolved-by-digest",
+    "digest": "sha256:abababababababababababababababababababababababababababababababab"
+  },
+  "target_state": {
+    "deployed": false,
+    "generation": 0
+  },
+  "effects": {
+    "containers": [
+      {
+        "action": "create",
+        "name": "myapp-web-sha256-aaaaaaaaaaaa",
+        "detail": "web container"
+      }
+    ]
+  },
+  "written_at": "0001-01-01T00:00:00Z"
+}

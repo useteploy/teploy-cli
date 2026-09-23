@@ -84,19 +84,20 @@ func runRollback(flags *Flags, toHash string) error {
 	}
 
 	rollbackErr := deploy.Rollback(ctx, executor, os.Stdout, deploy.RollbackConfig{
-		App:         appCfg.App,
-		Domain:      appCfg.Domain,
-		StopTimeout: appCfg.StopTimeout,
-		ToHash:      toHash,
-		Health:      healthConfigFrom(appCfg.Health),
-		TLSCert:     tlsCert,
-		TLSKey:      tlsKey,
-		TLSInternal: tlsInternal,
-		CaddyExtra:  appCfg.CaddyExtra,
-		Cache:       appCfg.Cache,
-		Firewall:    caddyFirewall(appCfg.Firewall),
-		Access:      caddyAccess(appCfg.Access),
-		Ingress:     appCfg.Ingress,
+		App:          appCfg.App,
+		Domain:       appCfg.Domain,
+		StopTimeout:  appCfg.StopTimeout,
+		DrainSeconds: appCfg.DrainSeconds,
+		ToHash:       toHash,
+		Health:       healthConfigFrom(appCfg.Health),
+		TLSCert:      tlsCert,
+		TLSKey:       tlsKey,
+		TLSInternal:  tlsInternal,
+		CaddyExtra:   appCfg.CaddyExtra,
+		Cache:        appCfg.Cache,
+		Firewall:     caddyFirewall(appCfg.Firewall),
+		Access:       caddyAccess(appCfg.Access),
+		Ingress:      appCfg.Ingress,
 	})
 
 	// Fire notification (best-effort). buildNotifier, not NewNotifier: this path

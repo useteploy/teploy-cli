@@ -198,17 +198,18 @@ func rollbackSingleServer(ctx context.Context, appCfg *config.AppConfig, target 
 	}
 
 	return deploy.Rollback(ctx, executor, out, deploy.RollbackConfig{
-		App:         appCfg.App,
-		Domain:      appCfg.Domain,
-		StopTimeout: appCfg.StopTimeout,
-		TLSCert:     tlsCert,
-		TLSKey:      tlsKey,
-		TLSInternal: tlsInternal,
-		CaddyExtra:  appCfg.CaddyExtra,
-		Cache:       appCfg.Cache,
-		Firewall:    caddyFirewall(appCfg.Firewall),
-		Access:      caddyAccess(appCfg.Access),
-		Ingress:     appCfg.Ingress,
+		App:          appCfg.App,
+		Domain:       appCfg.Domain,
+		StopTimeout:  appCfg.StopTimeout,
+		DrainSeconds: appCfg.DrainSeconds,
+		TLSCert:      tlsCert,
+		TLSKey:       tlsKey,
+		TLSInternal:  tlsInternal,
+		CaddyExtra:   appCfg.CaddyExtra,
+		Cache:        appCfg.Cache,
+		Firewall:     caddyFirewall(appCfg.Firewall),
+		Access:       caddyAccess(appCfg.Access),
+		Ingress:      appCfg.Ingress,
 	})
 }
 
