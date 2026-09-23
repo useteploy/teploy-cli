@@ -72,7 +72,7 @@ swapping traffic.`,
 			}
 			tags, err := parseTagFilters(tagFilters)
 			if err != nil {
-				return err
+				return refuseAdmission(err)
 			}
 			return runDeploy(flags, serverName, image, version, skipDNSCheck, parallel, destination, migrateVolumes, role, tags)
 		},
@@ -97,23 +97,23 @@ swapping traffic.`,
 // and scripting. Requires --app and --image at minimum.
 func runAdHocDeploy(flags *Flags, serverName, appName, image, domain string, port int, version string, skipDNSCheck, migrateVolumes bool) error {
 	if image == "" {
-		return fmt.Errorf("--image is required for ad-hoc deploy (no teploy.yml)")
+		return refuseAdmission(fmt.Errorf("--image is required for ad-hoc deploy (no teploy.yml)"))
 	}
 	// This path builds an AppConfig directly instead of going through
 	// config.LoadApp, so it never reaches AppConfig.validate() — app and
 	// domain must be validated explicitly here before either one reaches
 	// the network (state paths, remote shell commands, Caddyfile content).
 	if err := config.ValidateName(appName); err != nil {
-		return err
+		return refuseAdmission(err)
 	}
 	if err := config.ValidateDomain(domain, false); err != nil {
-		return err
+		return refuseAdmission(err)
 	}
 	if serverName == "" {
 		serverName = flags.Host
 	}
 	if serverName == "" {
-		return fmt.Errorf("server is required — use 'teploy deploy <server> --app ...' or --host")
+		return refuseAdmission(fmt.Errorf("server is required — use 'teploy deploy <server> --app ...' or --host"))
 	}
 	if port <= 0 {
 		port = 80
@@ -301,7 +301,7 @@ func deployAppConfig(flags *Flags, appCfg *config.AppConfig, serverName, image, 
 		}
 	}
 	if serverName == "" {
-		return fmt.Errorf("no server specified — use 'teploy deploy <server>' or set 'server' in teploy.yml")
+		return refuseAdmission(fmt.Errorf("no server specified — use 'teploy deploy <server>' or set 'server' in teploy.yml"))
 	}
 
 	host, user, key, err := config.ResolveServer(serverName, flags.Host, flags.User, flags.Key)
@@ -347,7 +347,7 @@ func deployAppConfig(flags *Flags, appCfg *config.AppConfig, serverName, image, 
 			}
 		}
 	} else if err := validateVersionArg(version); err != nil {
-		return err
+		return refuseAdmission(err)
 	}
 
 	// 5. Detect build mode (when no pre-built image). Honors the optional

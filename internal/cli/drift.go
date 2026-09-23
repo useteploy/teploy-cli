@@ -152,10 +152,20 @@ func runDrift(flags *Flags, appName string, exitCode bool) error {
 	}
 	// --exit-code makes drift observable to CI/monitoring without treating it
 	// as a command failure. Executor is already closed above so os.Exit is safe.
-	if exitCode && driftFound {
-		os.Exit(2)
+	if code := driftExitCode(exitCode, driftFound); code != 0 {
+		os.Exit(code)
 	}
 	return nil
+}
+
+// driftExitCode preserves the documented exit semantics (X02 D10): 2 only
+// when --exit-code is set AND drift was found — a CI signal, never a
+// failure. Everything else stays 0.
+func driftExitCode(exitCode, driftFound bool) int {
+	if exitCode && driftFound {
+		return 2
+	}
+	return 0
 }
 
 func reportDrift(ctx context.Context, flags *Flags, appCfg *config.AppConfig, executor ssh.Executor, fromState bool) (bool, error) {

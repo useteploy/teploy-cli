@@ -1698,3 +1698,97 @@ as provenance facts, not yet a selectable policy); build records for
 `teploy build` outside deploys; cache diagnostics; secret-safe build-input
 attestation. Changed-mutable-tag POLICY (beyond recording pinned-vs-
 mutable + the mismatch warning) lands with the offline/pull-policy slice.
+
+## Programme slice (2026-09-23) — X02 S1: versioned machine interface + S3-lite error envelope
+
+First X02 slice (ADR
+`../_internal/X02_RESOURCE_CONTRACT_ADR_2026-09-22.md` §2.1-2.3, adopted
+by `../_internal/DELEGATED_DECISIONS_2026-09-23.md` decisions 1/4/7/8/9 —
+D8 single-integer MI, D9 capability advertisement, D10 exit codes
+unchanged). Base revision `6faefc4`; changes left uncommitted for review.
+
+**Landed:**
+
+- **Machine-interface version 1** (`internal/cli/machineinterface.go`):
+  `MachineInterface = 1` at the root of `version --json` (new
+  `{"version","machine_interface","capabilities"}` envelope), `app list
+  --json` (appListDTO), and `server status --json` (serverStatusDTO) —
+  additive fields; dash's Go decoders ignore unknown fields, verified
+  against dash's actual decode sites. Versioning rules on the constant's
+  doc comment: additive changes never bump; removal/rename/type or
+  semantic change bumps. **Verified exclusion:** `server list --json`
+  emits a bare map-of-servers root (dash decodes
+  `map[string]{host,user}` at server.go:1641) — there is no envelope
+  object to carry the field additively, and injecting a
+  `machine_interface` KEY would materialize as a phantom server in
+  dash's fleet; reshaping it is a non-additive change recorded as S2
+  follow-up (needs a coordinated dash decode change).
+- **Capability registry** (15 stable tokens, the doc-comment block in
+  machineinterface.go IS the registry): `env-set-stdin`, `kv-set-stdin`,
+  `template-var-stdin` (cb7c0fc), `server-rename`, `server-update`
+  (72c57f9), `autodeploy-redeploy`, `health-modes` (C03),
+  `provenance-records` (C04), `readiness-receipts` (C01-4),
+  `preview-canonical-id`, `preview-blue-green` (C06), `repair-debt`
+  (C01-6), `error-envelope` (this slice), `app-list-machine`,
+  `server-status-machine`. Every token names a LANDED contract;
+  `server-list-ids` deliberately absent (S4 not landed).
+  TestCapabilityTokenRegistry pins the exact sorted set — rename or
+  removal fails it.
+- **S3-lite structured error envelope** (`internal/cli/errevelope.go`):
+  on any command failure under `--json`, one document
+  `{"machine_interface","code","message","detail"}` on STDERR (stdout
+  stays the data channel); without `--json` the historical plain-text
+  stderr line is byte-identical. Code taxonomy v1 defined as the closed
+  registry: config-invalid, target-unreachable, unsupported, conflict,
+  uncertain-outcome, degraded, internal (unknown → internal,
+  forward-safe). **Wired classes:** config-load failures
+  (`config.ErrInvalidConfig` sentinel — a no-text-change wrapper so
+  errors.Is classifies while every message stays verbatim — wrapped at
+  all LoadApp/LoadAppWithDestination/Compose-propagation returns) and
+  deploy admission refusals (the dash-hit ad-hoc path's pre-effect
+  validations, `--version` grammar, no-server, tag-filter parse —
+  `errDeployAdmission` marker, same no-text-change discipline); both
+  classify config-invalid. `Execute` reports through
+  `reportExecutionError` before the unchanged `os.Exit(1)`; drift's exit
+  2 extracted into `driftExitCode` so the 0/1/2 semantics are pinned in
+  code (2 only with `--exit-code` AND drift found).
+
+**Evidence** — TDD red level 1 recorded (all new test symbols undefined
+at compile: MachineInterface, writeVersion, reportExecutionError,
+ErrInvalidConfig, errDeployAdmission, driftExitCode), green after
+implementation. New coverage: version JSON exact shape (3 keys, MI 1,
+capabilities verbatim) + human output unchanged + cobra end-to-end;
+registry completeness (golden list + per-constant membership +
+uniqueness/sortedness); app list + server status envelopes carry
+machine_interface; config-load envelope through a REAL failing `deploy
+--json` (code, stable message, detail naming teploy.yml); admission
+envelope through a real invalid `--app` ad-hoc deploy; envelope ABSENT
+without --json (plain error text, no leak); unclassified → internal; exit
+semantics pinned. Binary smoke: exact envelope JSON on stderr, exit 1,
+human path unchanged. Mutation checks (in-place, all reverted):
+suppressing the envelope under --json (`if false && jsonMode`) fails both
+wired-class tests for the intended reason; renaming a token value fails
+the registry test; removing a token from the advertised list fails it
+(count + membership). Gates after revert: `go vet ./...` clean;
+`go test ./... -race -count=1` all packages ok; gofmt clean on every
+touched hunk (deploy.go's pre-existing fleet-rollback stray left alone,
+consistent with the C02-C04 posture); contract probes 5/5 PASS. No push
+performed.
+
+**S2 + error-site migration list (recorded follow-ups):**
+
+- `server list --json` reshape to an envelope root (coordinated dash
+  decode change — the one non-additive MI bump candidate).
+- target-unreachable: the ssh.Connect failure returns across commands
+  (app list/server status "connecting to", deploy step 6).
+- conflict: `preview.AmbiguousPreviewError` (typed and ready — one
+  errors.As), `config.ErrServerExists`/`ErrServerNotFound` (dash
+  currently matches message text; the envelope gives it a stable code).
+- uncertain-outcome / degraded: the C01 journal outcomes (recovery
+  dispositions), the T57 "backends deployed but load-balancer activation
+  failed" class, LogEntry Degraded rendering.
+- unsupported: version-skew refusals (e.g. autodeploy schedule's
+  server-binary-lacks-redeploy error).
+- Generalizing per-command envelopes for the remaining --json verbs
+  (health/log/drift/stats/plan/validate/registry/template/accessory
+  lists) is S2's `contracts/` skeleton work, not error-site migration.

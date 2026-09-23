@@ -1162,6 +1162,31 @@ func unmarshalAppYAML(data []byte, out *AppConfig) error {
 // Callers match it with errors.Is to offer interactive first-run setup.
 var ErrNoConfig = errors.New("no teploy.yml, teploy.toml, or docker-compose file found")
 
+// ErrInvalidConfig is the machine-facing sentinel for every failure to
+// load, merge, or validate a teploy.yml/TOML/destination/Compose
+// configuration (X02 §2.3's config-invalid error class). Failures wrap it
+// WITHOUT altering their message text or unwrap chain:
+// errors.Is(err, ErrInvalidConfig) is the classification contract used by
+// the CLI's machine error envelope.
+var ErrInvalidConfig = errors.New("invalid config")
+
+type invalidConfigError struct{ err error }
+
+func (e *invalidConfigError) Error() string { return e.err.Error() }
+func (e *invalidConfigError) Unwrap() error { return e.err }
+func (e *invalidConfigError) Is(target error) bool {
+	return target == ErrInvalidConfig
+}
+
+// invalidConfig marks err as a config failure, preserving its text and
+// chain verbatim.
+func invalidConfig(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &invalidConfigError{err: err}
+}
+
 func LoadApp(dir string) (*AppConfig, error) {
 	for _, name := range []string{"teploy.yml", "teploy.yaml", "teploy.toml"} {
 		path := filepath.Join(dir, name)
@@ -1173,21 +1198,21 @@ func LoadApp(dir string) (*AppConfig, error) {
 			if errors.Is(err, os.ErrNotExist) {
 				continue
 			}
-			return nil, fmt.Errorf("reading %s: %w", path, err)
+			return nil, invalidConfig(fmt.Errorf("reading %s: %w", path, err))
 		}
 
 		var cfg AppConfig
 		if strings.HasSuffix(name, ".toml") {
 			if err := unmarshalAppTOML(data, &cfg); err != nil {
-				return nil, fmt.Errorf("parsing %s: %w", name, err)
+				return nil, invalidConfig(fmt.Errorf("parsing %s: %w", name, err))
 			}
 		} else {
 			if err := unmarshalAppYAML(data, &cfg); err != nil {
-				return nil, fmt.Errorf("parsing %s: %w", name, err)
+				return nil, invalidConfig(fmt.Errorf("parsing %s: %w", name, err))
 			}
 		}
 		if err := cfg.validate(); err != nil {
-			return nil, fmt.Errorf("invalid %s: %w", name, err)
+			return nil, invalidConfig(fmt.Errorf("invalid %s: %w", name, err))
 		}
 		return &cfg, nil
 	}
@@ -1195,7 +1220,7 @@ func LoadApp(dir string) (*AppConfig, error) {
 	// No teploy config — try docker-compose auto-detection.
 	composeCfg, err := LoadCompose(dir)
 	if err != nil {
-		return nil, err
+		return nil, invalidConfig(err)
 	}
 	if composeCfg != nil {
 		return composeCfg, nil
@@ -1235,19 +1260,19 @@ func LoadAppWithDestination(dir, dest string, opts OverlayOptions) (*AppConfig, 
 			if errors.Is(err, os.ErrNotExist) {
 				continue
 			}
-			return nil, fmt.Errorf("reading %s: %w", path, err)
+			return nil, invalidConfig(fmt.Errorf("reading %s: %w", path, err))
 		}
 
 		var overlay AppConfig
 		var present map[string]any
 		if ext == ".toml" {
 			if err := unmarshalAppTOML(data, &overlay); err != nil {
-				return nil, fmt.Errorf("parsing %s: %w", name, err)
+				return nil, invalidConfig(fmt.Errorf("parsing %s: %w", name, err))
 			}
 			present = tomlTopLevelKeys(data)
 		} else {
 			if err := unmarshalAppYAML(data, &overlay); err != nil {
-				return nil, fmt.Errorf("parsing %s: %w", name, err)
+				return nil, invalidConfig(fmt.Errorf("parsing %s: %w", name, err))
 			}
 			present = yamlTopLevelKeys(data)
 		}
@@ -1257,12 +1282,12 @@ func LoadAppWithDestination(dir, dest string, opts OverlayOptions) (*AppConfig, 
 		}
 		mergeConfigs(base, &overlay)
 		if err := base.validate(); err != nil {
-			return nil, fmt.Errorf("invalid config after merging %s: %w", name, err)
+			return nil, invalidConfig(fmt.Errorf("invalid config after merging %s: %w", name, err))
 		}
 		return base, nil
 	}
 
-	return nil, fmt.Errorf("destination %q not found — expected teploy.%s.yml or teploy.%s.toml", dest, dest, dest)
+	return nil, invalidConfig(fmt.Errorf("destination %q not found — expected teploy.%s.yml or teploy.%s.toml", dest, dest, dest))
 }
 
 // clearExplicitEmpties implements the strict-mode half of presence-aware
