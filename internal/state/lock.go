@@ -134,6 +134,30 @@ func (l *Lock) guardFragment() string {
 	return fmt.Sprintf("grep -q %s %s", ssh.ShellQuote(l.owner), ssh.ShellQuote(lockInfoPath(l.app)))
 }
 
+// GuardPrefix returns the shell prefix that composes the holdership guard
+// with an effect command into ONE remote invocation:
+//
+//	<prefix><effect>
+//
+// where the prefix refuses (marker on stderr, exit 75) when the lock no
+// longer names this operation. Effect sites outside this package (docker
+// runs, the Caddyfile commit) use it to close the check-then-act window
+// C01-2 documents; map refusals with FenceLost. A nil lock yields "" (the
+// caller runs the effect unguarded — the pre-F16 shape).
+func (l *Lock) GuardPrefix() string {
+	if l == nil {
+		return ""
+	}
+	return l.guardFragment() + " || { printf '" + fenceLostMarker + `\n' >&2; exit 75; }; `
+}
+
+// FenceLost reports whether err is a fence refusal — the guard fragment's
+// marker or its exit status surfaced by either executor flavor — including
+// for effects composed by other packages through Lock.GuardPrefix.
+func FenceLost(err error) bool {
+	return fenceLostErr(err)
+}
+
 // Check verifies the server still names this operation as the lock holder.
 // Any failure — including transport failure, because an unreachable answer
 // cannot prove holdership — reports ErrFenceLost. Call before effectful

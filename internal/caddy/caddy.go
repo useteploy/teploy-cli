@@ -2,6 +2,8 @@ package caddy
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"fmt"
 	"net"
 	"net/url"
@@ -187,11 +189,31 @@ type SelectionPolicy struct {
 // can't load.
 type Client struct {
 	exec ssh.Executor
+	// commitGuardPrefix, when set, composes a fence guard (the APP lock's,
+	// state.Lock.GuardPrefix) into the same shell command as the Caddyfile
+	// commit rename (C01-2): a deploy whose app lock was broken mid-mutate
+	// has its route edit refused (exit 75) instead of landing inside the
+	// new owner's window. Empty = unguarded commits (the receiver shared
+	// by callers that hold no app fence). Set through WithCommitGuard.
+	commitGuardPrefix string
 }
 
 // NewClient creates a Caddy client backed by the given SSH executor.
 func NewClient(exec ssh.Executor) *Client {
 	return &Client{exec: exec}
+}
+
+// WithCommitGuard returns a client whose Caddyfile commits run composed
+// under the given fence-guard prefix in the same shell as the commit
+// rename (C01-2). Callers that hold an app-level fence (deploy, rollback,
+// static) pass their lock's GuardPrefix so the traffic switch — the
+// finding's third check-then-act site — is guard+effect in one command.
+// The receiver is unchanged: clients without a guard keep today's
+// behavior.
+func (c *Client) WithCommitGuard(guardPrefix string) *Client {
+	cp := *c
+	cp.commitGuardPrefix = guardPrefix
+	return &cp
 }
 
 // SetRoute adds or updates a reverse proxy route for the given app, serving the
@@ -433,7 +455,12 @@ func (c *Client) RemoveMaintenance(ctx context.Context, app string) error {
 // mutate serializes a Caddyfile edit + reload behind the server lock. transform
 // receives the current Caddyfile and returns the new contents. If the reload
 // fails (e.g. the new config is invalid), the on-disk file is rolled back so
-// Caddy never persists a config it can't boot from.
+// Caddy never persists a config it can't boot from. The COMMIT (the rename
+// that makes the new contents authoritative) runs composed under the client's
+// fence guard when one is set (C01-2): a stale lock holder's edit is refused
+// instead of interleaving; the rollback restore is deliberately never fenced
+// (refusing to clean up one's own partial effects is how a fencing design
+// strands an app).
 func (c *Client) mutate(ctx context.Context, transform func(prev string) (string, error)) error {
 	if err := c.acquireLock(ctx); err != nil {
 		return err
@@ -465,9 +492,25 @@ func (c *Client) mutate(ctx context.Context, transform func(prev string) (string
 		return fmt.Errorf("refusing to write a Caddyfile the server's caddy rejects: %w", err)
 	}
 
-	if err := c.writeCaddyfile(ctx, updated); err != nil {
+	// Stage (inert) then commit under the fence guard in one shell — the
+	// C01-2 composition for the route switch. A refused commit propagates
+	// the fence error; the staged file is cleaned up here (bounded).
+	tmp, err := c.stageCaddyfile(ctx, updated)
+	if err != nil {
 		return err
 	}
+	committed := false
+	defer func() {
+		if !committed {
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			c.exec.Run(cleanupCtx, "rm -f -- "+ssh.ShellQuote(tmp))
+			cancel()
+		}
+	}()
+	if err := c.commitCaddyfile(ctx, tmp, c.commitGuardPrefix); err != nil {
+		return err
+	}
+	committed = true
 	if err := c.reload(ctx); err != nil {
 		// Roll back so a bad config is never left on disk to break the next
 		// boot. The restore runs on a DETACHED bounded context — the deploy
@@ -660,15 +703,68 @@ func managedBlockHosts(content, app string) []string {
 // mount (-v /deployments/caddy:/etc/caddy). verifyDelivered catches an
 // un-migrated box and aborts the deploy loudly before any damage.
 func (c *Client) writeCaddyfile(ctx context.Context, content string) error {
-	// Staged random SIBLING inside /deployments/caddy, then an atomic
-	// same-filesystem rename — replacing the old fixed /tmp staging path,
-	// which was shared (any concurrent process could race it), followed a
-	// pre-existing symlink at that path, and crossed filesystems for the
-	// final mv, losing rename atomicity (audit F46).
-	if err := ssh.UploadAtomic(ctx, c.exec, strings.NewReader(content), caddyfilePath, "0644"); err != nil {
-		return fmt.Errorf("writing caddyfile: %w", err)
+	tmp, err := c.stageCaddyfile(ctx, content)
+	if err != nil {
+		return err
+	}
+	if err := c.commitCaddyfile(ctx, tmp, ""); err != nil {
+		// The staged file is inert; leave nothing behind (bounded).
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		c.exec.Run(cleanupCtx, "rm -f -- "+ssh.ShellQuote(tmp))
+		cancel()
+		return err
 	}
 	return nil
+}
+
+// stageCaddyfile uploads content to a random inert SIBLING of the
+// Caddyfile (F46's discipline: random sibling, same filesystem, no shared
+// staging name). Staging has no effect: a file nothing commits is dead
+// weight. The commit instant is commitCaddyfile's rename.
+func (c *Client) stageCaddyfile(ctx context.Context, content string) (string, error) {
+	var suffix [8]byte
+	if _, err := rand.Read(suffix[:]); err != nil {
+		return "", fmt.Errorf("generating staging path: %w", err)
+	}
+	tmpPath := caddyfilePath + ".tmp-" + hex.EncodeToString(suffix[:])
+	if err := c.exec.Upload(ctx, strings.NewReader(content), tmpPath, "0644"); err != nil {
+		return "", fmt.Errorf("staging caddyfile: %w", err)
+	}
+	return tmpPath, nil
+}
+
+// commitCaddyfile renames the staged file into place — the instant the
+// new config becomes authoritative on disk. guardPrefix (when set)
+// composes the holdership check into the SAME shell command (C01-2):
+// between a separate check and this rename a lock takeover could occur,
+// letting a broken holder's route edit land inside the new owner's
+// window; under composition the stale holder's edit is refused (exit 75,
+// the TEPLOY_FENCE_LOST marker) and the staged bytes never become
+// authoritative. A refusal is identified and rewrapped so callers can
+// match it (state.FenceLost over the error string, or the message).
+func (c *Client) commitCaddyfile(ctx context.Context, tmpPath, guardPrefix string) error {
+	cmd := guardPrefix + "mv -fT -- " + ssh.ShellQuote(tmpPath) + " " + ssh.ShellQuote(caddyfilePath)
+	_, err := c.exec.Run(ctx, cmd)
+	if err != nil && guardPrefix != "" && fenceRefused(err) {
+		return fmt.Errorf("caddyfile commit refused — the deploy lock fence was lost, the route edit did not land: %w", err)
+	}
+	if err != nil {
+		return fmt.Errorf("committing caddyfile: %w", err)
+	}
+	return nil
+}
+
+// fenceRefused reports whether a commit-command error is the composed
+// guard refusing the effect (marker on stderr or exit status 75) rather
+// than the rename itself failing.
+func fenceRefused(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "TEPLOY_FENCE_LOST") ||
+		strings.Contains(msg, "status 75") ||
+		strings.Contains(msg, "exit status 75")
 }
 
 func (c *Client) reload(ctx context.Context) error {

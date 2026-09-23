@@ -696,3 +696,53 @@ func TestNoCacheRulesRendersNothing(t *testing.T) {
 		t.Fatalf("expected empty output for empty cache, got %q", got)
 	}
 }
+
+// TestSetRoute_GuardedCommitRefusedWhenFenceLost (C01-2): with a commit
+// guard set, the Caddyfile commit rename runs composed under the guard —
+// when the guarded lock names another owner, the edit is REFUSED in-shell:
+// nothing lands in the Caddyfile, no reload runs, and the error says the
+// fence was lost.
+func TestSetRoute_GuardedCommitRefusedWhenFenceLost(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4", lockCmds("{\n\tadmin 127.0.0.1:2019\n}\n")...)
+	guard := "grep -q 'deadowner' '/deployments/myapp/.lock/info' || { printf 'TEPLOY_FENCE_LOST\\n' >&2; exit 75; }; "
+	mock.Files["/deployments/myapp/.lock/info"] = []byte(`{"type":"auto","owner":"someoneelse"}`)
+
+	client := NewClient(mock).WithCommitGuard(guard)
+	err := client.SetRoute(context.Background(), "myapp", "myapp.com", "myapp-v1", 80, TLS{}, "", nil, Firewall{}, Access{})
+	if err == nil {
+		t.Fatal("expected the guarded commit to be refused")
+	}
+	if !strings.Contains(err.Error(), "fence was lost") {
+		t.Fatalf("expected a fence-loss error, got: %v", err)
+	}
+	if _, ok := mock.Files[caddyfilePath]; ok {
+		t.Error("a refused commit must not write the Caddyfile")
+	}
+	if calledWith(mock, reloadCmd) {
+		t.Error("no reload may run after a refused commit")
+	}
+	// The lock is still acquired/released around the refused edit.
+	if !calledWith(mock, "mkdir "+lockDir) || !calledWith(mock, "rmdir "+lockDir) {
+		t.Error("expected the caddy lock to be acquired and released")
+	}
+}
+
+// TestSetRoute_GuardedCommitHoldsUnderRightOwner: the same composed
+// command with the guard naming us commits and reloads normally —
+// composition changes nothing for the legitimate holder.
+func TestSetRoute_GuardedCommitHoldsUnderRightOwner(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4", lockCmds("{\n\tadmin 127.0.0.1:2019\n}\n")...)
+	guard := "grep -q 'me' '/deployments/myapp/.lock/info' || { printf 'TEPLOY_FENCE_LOST\\n' >&2; exit 75; }; "
+	mock.Files["/deployments/myapp/.lock/info"] = []byte(`{"type":"auto","owner":"me"}`)
+
+	client := NewClient(mock).WithCommitGuard(guard)
+	if err := client.SetRoute(context.Background(), "myapp", "myapp.com", "myapp-v1", 80, TLS{}, "", nil, Firewall{}, Access{}); err != nil {
+		t.Fatalf("SetRoute under a held guard: %v", err)
+	}
+	if !strings.Contains(string(mock.Files[caddyfilePath]), "reverse_proxy myapp-v1:80") {
+		t.Errorf("expected the guarded commit to land the block, got:\n%s", mock.Files[caddyfilePath])
+	}
+	if !calledWith(mock, reloadCmd) {
+		t.Error("expected a reload after the guarded commit")
+	}
+}

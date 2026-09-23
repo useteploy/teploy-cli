@@ -149,6 +149,16 @@ table's, with the register item it belongs to.
    new owner's window — the table treats "effect lands after owner death"
    as INSPECT-at-best evidence, which nothing today generates. Register:
    A05/T01 standing; the table now states the disposition consequence.
+   **LANDED 2026-09-23** (see AUDIT_OPEN's C01 guarded-effects slice):
+   `docker.RunGuarded` composes the holdership guard with the container
+   creation in one remote command (deploy's candidate and worker starts;
+   `state.Lock.GuardPrefix`/`state.FenceLost` are the composition
+   surface), and the Caddyfile commit rename runs under the same guard
+   (`caddy.Client.WithCommitGuard`, threaded through deploy, rollback and
+   the static paths). A mid-flight takeover is refused in-shell: no
+   container starts, no route edit lands, no reload runs. The separate
+   pre-effect Checks at those three sites are superseded by the
+   composition.
 
 3. **C01-3 — The shared Caddy lock is ownerless and unfenced.**
    `internal/caddy/caddy.go:684-697` breaks any caddy lock older than 120s
@@ -346,9 +356,11 @@ AUDIT_OPEN's C01 implementation-slice section) and **C01-6, C01-7 landed
 2026-09-22** (record-repair debt reconciler + receipt-driven route
 compensation; evidence in AUDIT_OPEN's latest C01 slice), and **C01-1
 landed 2026-09-23** (replacement-owner reconciliation on acquisition;
-`internal/deploy/reconcile.go`, fixture-verified). Remaining findings:
-C01-2/3 (guarded pre-commit effects, fenced shared Caddy lock — the
-locking-protocol remainder), C01-8 (same-version `_replaced` MANUAL —
+`internal/deploy/reconcile.go`, fixture-verified) and **C01-2 landed
+2026-09-23** (guarded pre-commit effects: RunGuarded container starts +
+the guarded Caddyfile commit; see AUDIT_OPEN). Remaining findings:
+C01-3 (fenced shared Caddy lock — the locking-protocol remainder),
+C01-8 (same-version `_replaced` MANUAL —
 deliberate A08 containment until F04 generation identities exist), and
 C01-9 (attempt-scoped candidate identities — F04/A09). The A12/T05
 remainder of C01-7 (rollback's restoreRollbackRoute + the exact-block

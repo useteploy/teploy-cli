@@ -239,7 +239,7 @@ func (d *StaticDeployer) Deploy(ctx context.Context, cfg StaticConfig) error {
 		}
 		return fmt.Errorf("fence check: %w; the prior static release was restored", err)
 	}
-	if err := d.caddy.SetStaticRoute(ctx, cfg.App, cfg.Domain, caddy.StaticBlockOpts{
+	if err := d.caddy.WithCommitGuard(lk.GuardPrefix()).SetStaticRoute(ctx, cfg.App, cfg.Domain, caddy.StaticBlockOpts{
 		Root:        fmt.Sprintf("%s/%s/current", cfg.MountBase, cfg.App),
 		SPA:         cfg.SPA,
 		SPAFallback: cfg.SPAFallback,
@@ -694,7 +694,7 @@ func (d *StaticDeployer) Rollback(ctx context.Context, cfg StaticRollbackConfig)
 		}
 		return fmt.Errorf("fence check: %w; release %s was restored", err, prior.CurrentHash)
 	}
-	if err := d.caddy.SetStaticRoute(ctx, cfg.App, cfg.Domain, caddy.StaticBlockOpts{
+	if err := d.caddy.WithCommitGuard(lk.GuardPrefix()).SetStaticRoute(ctx, cfg.App, cfg.Domain, caddy.StaticBlockOpts{
 		Root:        fmt.Sprintf("%s/%s/current", cfg.MountBase, cfg.App),
 		SPA:         cfg.SPA,
 		SPAFallback: cfg.SPAFallback,
@@ -802,7 +802,7 @@ func (d *StaticDeployer) RollbackStateOnly(ctx context.Context, app, toHash stri
 		}
 		return fmt.Errorf("fence check: %w; release %s was restored", err, prior.CurrentHash)
 	}
-	if err := d.caddy.SetStaticRoute(ctx, app, domain, caddy.StaticBlockOpts{
+	if err := d.caddy.WithCommitGuard(lk.GuardPrefix()).SetStaticRoute(ctx, app, domain, caddy.StaticBlockOpts{
 		Root:        fmt.Sprintf("%s/%s/current", DefaultStaticMount, app),
 		SPA:         st.SPA,
 		SPAFallback: st.SPAFallback,

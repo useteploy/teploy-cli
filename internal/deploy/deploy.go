@@ -648,17 +648,18 @@ func (d *Deployer) DeployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 	}
 
 	// 6. Start web container(s).
-	// Fence (F16): container creation is an effect. A lost fence here must
-	// still restore whatever this deploy displaced (recovery is never
-	// fenced — see DeployFenced's doc).
-	if err := lk.Check(ctx, d.exec); err != nil {
-		return restoreDisplacedAndStarted(err)
-	}
+	// Fence (F16, C01-2 composition): container creation runs as a guarded
+	// effect — the holdership check and the docker run are ONE remote
+	// command, so no transport window exists in which a takeover lets this
+	// (possibly broken) holder's starts land inside a new owner's window.
+	// A lost fence here must still restore whatever this deploy displaced
+	// (recovery is never fenced — see DeployFenced's doc).
+	guardPrefix := lk.GuardPrefix()
 	for i := 0; i < replicas; i++ {
 		name := docker.ReplicaContainerName(cfg.App, "web", cfg.Version, i+1, replicas)
 		webContainerNames[i] = name
 		fmt.Fprintf(d.out, "Starting container %s (port %d)...\n", name, ports[i])
-		containerID, err := d.docker.Run(ctx, docker.RunConfig{
+		containerID, err := d.docker.RunGuarded(ctx, docker.RunConfig{
 			App:           cfg.App,
 			Process:       "web",
 			Version:       cfg.Version,
@@ -675,8 +676,16 @@ func (d *Deployer) DeployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 			CPU:           cfg.CPU,
 			Name:          name,
 			NoHealthcheck: cfg.NoHealthcheck["web"],
-		})
+		}, guardPrefix)
 		if err != nil {
+			if state.FenceLost(err) {
+				// The guard refused the run: the lock no longer names this
+				// operation, and docker never executed. Restore displaced
+				// work (unfenced), exactly like the old pre-loop Check
+				// failure — no partial-run reconciliation needed because
+				// nothing ran.
+				return restoreDisplacedAndStarted(fmt.Errorf("%w: refusing to start %s's containers", state.ErrFenceLost, cfg.App))
+			}
 			// Docker can CREATE a container and still fail the run (port
 			// binding, for one) — that corpse is not in `started`, so it
 			// would outlive this deploy and collide with the next one's
@@ -772,16 +781,15 @@ func (d *Deployer) DeployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 	}
 
 	// 10. Start non-web process containers (workers, etc. — no replicas, one each).
-	if err := lk.Check(ctx, d.exec); err != nil {
-		return fail(err)
-	}
+	// Fence (F16, C01-2 composition): same guarded-effect shape as the web
+	// candidates above — the run is refused in-shell when the fence is lost.
 	for _, process := range sortedProcessNames(processes) {
 		if process == "web" {
 			continue
 		}
 		name := docker.ContainerName(cfg.App, process, cfg.Version)
 		fmt.Fprintf(d.out, "Starting %s...\n", name)
-		_, err := d.docker.Run(ctx, docker.RunConfig{
+		_, err := d.docker.RunGuarded(ctx, docker.RunConfig{
 			App:           cfg.App,
 			Process:       process,
 			Version:       cfg.Version,
@@ -794,8 +802,11 @@ func (d *Deployer) DeployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 			Memory:        cfg.Memory,
 			CPU:           cfg.CPU,
 			NoHealthcheck: cfg.NoHealthcheck[process],
-		})
+		}, guardPrefix)
 		if err != nil {
+			if state.FenceLost(err) {
+				return fail(fmt.Errorf("%w: refusing to start %s's %s process", state.ErrFenceLost, cfg.App, process))
+			}
 			d.reconcilePartialRun(name)
 			return fail(fmt.Errorf("starting %s: %w", name, err))
 		}
@@ -820,12 +831,13 @@ func (d *Deployer) DeployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 	// teploy docker network, so Teploy has nothing to do here.
 	if cfg.usesCaddy() {
 		fmt.Fprintln(d.out, "Updating routes...")
-		// Fence (F16): the route switch commits traffic to this deploy's
-		// containers; a late write here would hijack a newer operation's
-		// route.
-		if err := lk.Check(ctx, d.exec); err != nil {
-			return fail(err)
-		}
+		// Fence (F16, C01-2 composition): the route switch commits traffic
+		// to this deploy's containers. The Caddyfile COMMIT (the rename
+		// that makes the new block authoritative) runs under this deploy's
+		// fence guard in the same shell — a late write from a broken holder
+		// cannot hijack a newer operation's route. The pre-switch Check is
+		// superseded by the composed commit.
+		cad := d.caddy.WithCommitGuard(guardPrefix)
 		tls := caddy.TLS{Cert: cfg.TLSCert, Key: cfg.TLSKey, Internal: cfg.TLSInternal}
 		if replicas > 1 {
 			upstreams := make([]caddy.Upstream, replicas)
@@ -834,12 +846,18 @@ func (d *Deployer) DeployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 			}
 			// Caddy's active upstream checks probe the SAME path the deploy
 			// readiness gate used (F47) — the block used to hardcode /up.
-			if err := d.caddy.SetLoadBalancerHealth(ctx, cfg.App, cfg.Domain, upstreams, healthCfg.Path, tls, cfg.CaddyExtra, cfg.Cache, cfg.Firewall, cfg.Access); err != nil {
+			if err := cad.SetLoadBalancerHealth(ctx, cfg.App, cfg.Domain, upstreams, healthCfg.Path, tls, cfg.CaddyExtra, cfg.Cache, cfg.Firewall, cfg.Access); err != nil {
+				if state.FenceLost(err) {
+					return fail(fmt.Errorf("%w: refusing to switch %s's route", state.ErrFenceLost, cfg.App))
+				}
 				return fail(fmt.Errorf("updating load balancer route: %w", err))
 			}
 			fmt.Fprintf(d.out, "  Traffic load-balanced across %d replicas\n", replicas)
 		} else {
-			if err := d.caddy.SetRoute(ctx, cfg.App, cfg.Domain, webContainerName, containerPort, tls, cfg.CaddyExtra, cfg.Cache, cfg.Firewall, cfg.Access); err != nil {
+			if err := cad.SetRoute(ctx, cfg.App, cfg.Domain, webContainerName, containerPort, tls, cfg.CaddyExtra, cfg.Cache, cfg.Firewall, cfg.Access); err != nil {
+				if state.FenceLost(err) {
+					return fail(fmt.Errorf("%w: refusing to switch %s's route", state.ErrFenceLost, cfg.App))
+				}
 				return fail(fmt.Errorf("updating route: %w", err))
 			}
 			fmt.Fprintln(d.out, "  Traffic routed to new container")

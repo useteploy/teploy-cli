@@ -1968,3 +1968,58 @@ isolation and in two follow-up full runs — not touched by this slice).
 
 **Residual C01 list (updated):** C01-2/3 remain (guarded pre-commit
 effects, fenced shared Caddy lock); C01-8/C01-9 unchanged (F04-keyed).
+
+## Programme slice (2026-09-23) — C01-2: guarded pre-commit effects
+
+Closes the C01-2 disagreement (docs/C01_RECOVERY_STATE_TABLE.md finding
+2): candidate starts, worker starts and the route switch ran `lk.Check`
+as a command SEPARATE from the effect — only the state commit composed
+guard+effect (WriteFenced). Between check and effect a takeover could
+occur, letting a broken holder's effects land inside the new owner's
+window. Base revision `194130c`.
+
+**Design:**
+
+- **Composition surface** — `state.Lock.GuardPrefix()` returns the shell
+  prefix that refuses (TEPLOY_FENCE_LOST marker, exit 75) when the lock
+  no longer names the holder; `state.FenceLost(err)` matches refusals
+  across packages. docker and caddy consume the PREFIX, not the Lock —
+  no new package coupling.
+- **Container starts** — `docker.RunGuarded(ctx, cfg, guardPrefix)`
+  composes the guard with the docker run in ONE remote command;
+  DeployFenced's web-candidate and worker starts use it (the separate
+  pre-effect Checks at those sites are superseded). A refused start maps
+  to `state.ErrFenceLost` and enters the existing recovery handlers
+  (restoreDisplacedAndStarted / fail); the reactive
+  name-already-in-use clearing also runs under the guard.
+- **Route switch** — `caddy.Client.WithCommitGuard(prefix)` returns a
+  client whose Caddyfile COMMIT (the rename that makes new contents
+  authoritative) runs composed under the guard. mutate was restructured:
+  stage the new Caddyfile to an inert random sibling (upload, no
+  effect), then one guarded `mv -fT` commit; reload and delivery
+  verification stay separate commands (the commit is the traffic-switch
+  instant — a refused commit means the edit never became authoritative,
+  and a post-commit reload is idempotent). Rollback restores are
+  deliberately never fenced (cleanup is never fenced, F16's rule).
+  Wired through deploy's step 11, rollback, and all three static
+  SetStaticRoute sites (each holds its own fence).
+
+**Evidence** — mock tests: happy path asserts the web+worker runs and the
+Caddyfile commit execute composed under the guard (guard+effect in one
+command); a takeover fired at the health gate (lock info rewritten
+mid-deploy by a test executor wrapper) refuses the route switch — no
+Caddyfile lands, no reload runs, deploy errors ErrFenceLost; the same
+takeover refuses the worker start in-shell with no executed worker run;
+the pre-existing late-holder test now asserts on EXECUTED (bare) docker
+runs — a refused start appears only as the composed command the guard
+rejected, which is the C01-2 shape, not a regression. Caddy-side: a
+guarded client whose lock names another owner has its edit refused
+(nothing lands, no reload, lock still acquired/released around the
+attempt); the legitimate holder's composed commit is byte-identical in
+effect to today's write. All pre-existing caddy/docker/deploy/rollback/
+static/preview tests unchanged and green. Gates: build/vet clean;
+`go test ./... -count=1` all packages ok; gofmt clean on touched files
+(docker_test.go/recreate.go pre-existing strays left alone).
+
+**Residual C01 list (updated):** C01-3 remains (fenced shared Caddy
+lock); C01-8/C01-9 unchanged (F04-keyed).

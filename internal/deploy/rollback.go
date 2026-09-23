@@ -104,6 +104,10 @@ func Rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg Rollbac
 	}
 	defer state.ReleaseLockFenced(exec, lk, cfg.App)
 	lk.StartRenewal(exec)
+	// The traffic switch back runs as a guarded Caddyfile commit (C01-2):
+	// a rollback whose lock was broken mid-flight must not land its route
+	// edit inside the new owner's window.
+	cd = cd.WithCommitGuard(lk.GuardPrefix())
 
 	// 2. Read state and resolve the rollback target — under the lock.
 	current, err := state.Read(ctx, exec, cfg.App)
