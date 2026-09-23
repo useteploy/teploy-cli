@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -594,18 +595,9 @@ func deployBuiltImageFenced(ctx context.Context, executor ssh.Executor, appCfg *
 	// 10. Resolve persistent volumes.
 	var volumes map[string]string
 	if len(appCfg.Volumes) > 0 {
-		volumes = make(map[string]string, len(appCfg.Volumes))
-		for name, containerPath := range appCfg.Volumes {
-			// A host bind mounts a directory the operator owns, exactly as
-			// given — teploy never creates or relocates it (it may hold a
-			// clone with credentials, or anything else that is not app data).
-			if config.IsHostBindVolume(name) {
-				volumes[name] = containerPath
-				continue
-			}
-			hostPath := fmt.Sprintf("/deployments/%s/volumes/%s", appCfg.App, name)
-			volumes[hostPath] = containerPath
-			if _, err := executor.Run(ctx, fmt.Sprintf("mkdir -p %s", hostPath)); err != nil {
+		volumes = plannedVolumeMounts(appCfg.App, appCfg.Volumes)
+		for _, hostPath := range managedVolumeHostPaths(appCfg.App, appCfg.Volumes) {
+			if _, err := executor.Run(ctx, "mkdir -p "+hostPath); err != nil {
 				return fmt.Errorf("creating volume directory %s: %w", hostPath, err)
 			}
 		}
@@ -716,6 +708,40 @@ func deployBuiltImageFenced(ctx context.Context, executor ssh.Executor, appCfg *
 	}
 
 	return nil
+}
+
+// plannedVolumeMounts resolves config volume declarations to the docker
+// mount map a deploy uses: a host bind (name starting with "/") mounts a
+// directory the operator owns, exactly as given — teploy never creates or
+// relocates it (it may hold a clone with credentials, or anything else
+// that is not app data); every other name is a teploy-managed volume at
+// /deployments/<app>/volumes/<name>. Single home: the deploy path and the
+// plan storage effects both resolve through it, so a plan can never
+// describe a different host layout than the deploy creates.
+func plannedVolumeMounts(app string, cfgVolumes map[string]string) map[string]string {
+	volumes := make(map[string]string, len(cfgVolumes))
+	for name, containerPath := range cfgVolumes {
+		if config.IsHostBindVolume(name) {
+			volumes[name] = containerPath
+			continue
+		}
+		volumes[fmt.Sprintf("/deployments/%s/volumes/%s", app, name)] = containerPath
+	}
+	return volumes
+}
+
+// managedVolumeHostPaths lists the teploy-managed host paths behind
+// named volumes (the ones the deploy mkdir's). Host binds are absent —
+// they are the operator's directories.
+func managedVolumeHostPaths(app string, cfgVolumes map[string]string) []string {
+	var paths []string
+	for name := range cfgVolumes {
+		if !config.IsHostBindVolume(name) {
+			paths = append(paths, fmt.Sprintf("/deployments/%s/volumes/%s", app, name))
+		}
+	}
+	sort.Strings(paths)
+	return paths
 }
 
 // imageTagPattern is Docker's tag grammar. Version strings are interpolated
