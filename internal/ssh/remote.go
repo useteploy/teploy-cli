@@ -30,6 +30,9 @@ type RemoteExecutor struct {
 	// acceptNewHost records the host-key policy this connection was created
 	// with, so secondary channels (e.g. static-deploy rsync) can mirror it.
 	acceptNewHost bool
+	// commandTimeout bounds each command when the caller's context has
+	// no earlier deadline (ConnectConfig.CommandTimeout, C08).
+	commandTimeout time.Duration
 }
 
 // ConnectConfig holds the parameters for establishing an SSH connection.
@@ -39,6 +42,14 @@ type ConnectConfig struct {
 	KeyPath       string // Path to SSH private key (optional, tries defaults)
 	Password      string // if set, use password auth instead of/in addition to key auth
 	AcceptNewHost bool   // if true, auto-accept unknown host keys and save to known_hosts
+	// CommandTimeout, when > 0, bounds EVERY command run on this
+	// connection: a context with no deadline (or a later one) gets this
+	// one, so a hung remote command dies at a deadline instead of
+	// hanging the CLI forever (C08 bounded subprocess lifetime). A
+	// caller-supplied EARLIER deadline always wins. 0 keeps the historic
+	// caller-controlled behavior. Long-running work (deploys, log
+	// tails) should pass explicit deadlines rather than raise this.
+	CommandTimeout time.Duration
 }
 
 // Connect establishes an SSH connection and returns a RemoteExecutor.
@@ -108,10 +119,25 @@ func Connect(ctx context.Context, cfg ConnectConfig) (*RemoteExecutor, error) {
 		return nil, fmt.Errorf("connecting to %s: %w", cfg.Host, err)
 	}
 
-	return &RemoteExecutor{client: client, host: cfg.Host, user: cfg.User, acceptNewHost: cfg.AcceptNewHost}, nil
+	return &RemoteExecutor{client: client, host: cfg.Host, user: cfg.User, acceptNewHost: cfg.AcceptNewHost, commandTimeout: cfg.CommandTimeout}, nil
+}
+
+// boundCtx applies the connection's CommandTimeout when the caller's
+// context has no deadline (or a later one). A caller-supplied earlier
+// deadline always wins; CommandTimeout 0 leaves the context untouched.
+func (e *RemoteExecutor) boundCtx(ctx context.Context) (context.Context, context.CancelFunc) {
+	if e.commandTimeout <= 0 {
+		return ctx, func() {}
+	}
+	if d, ok := ctx.Deadline(); ok && d.Before(time.Now().Add(e.commandTimeout)) {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, e.commandTimeout)
 }
 
 func (e *RemoteExecutor) Run(ctx context.Context, cmd string) (string, error) {
+	ctx, cancel := e.boundCtx(ctx)
+	defer cancel()
 	var stdout, stderr bytes.Buffer
 	if err := e.RunStream(ctx, cmd, &stdout, &stderr); err != nil {
 		if stderr.Len() > 0 {
@@ -123,6 +149,8 @@ func (e *RemoteExecutor) Run(ctx context.Context, cmd string) (string, error) {
 }
 
 func (e *RemoteExecutor) RunStream(ctx context.Context, cmd string, stdout, stderr io.Writer) error {
+	ctx, cancel := e.boundCtx(ctx)
+	defer cancel()
 	session, err := e.client.NewSession()
 	if err != nil {
 		return fmt.Errorf("creating SSH session: %w", err)
@@ -152,6 +180,8 @@ func (e *RemoteExecutor) RunStream(ctx context.Context, cmd string, stdout, stde
 }
 
 func (e *RemoteExecutor) RunInput(ctx context.Context, cmd string, stdin io.Reader) error {
+	ctx, cancel := e.boundCtx(ctx)
+	defer cancel()
 	session, err := e.client.NewSession()
 	if err != nil {
 		return fmt.Errorf("creating SSH session: %w", err)
@@ -181,6 +211,8 @@ func (e *RemoteExecutor) RunInput(ctx context.Context, cmd string, stdin io.Read
 // channel's exit-status request, and the context's cancellation vs
 // deadline distinction. See Result for the field contract.
 func (e *RemoteExecutor) runDetailed(ctx context.Context, cmd string, stdin io.Reader, limit int64) Result {
+	ctx, cancel := e.boundCtx(ctx)
+	defer cancel()
 	if res, done := contextFailureResult(ctx); done {
 		return res
 	}
