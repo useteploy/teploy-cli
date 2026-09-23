@@ -2,16 +2,17 @@ package cli
 
 import "sort"
 
-// Machine-interface contract, version 1 (X02 S1 — versioned resource and
-// operation contracts, _internal/X02_RESOURCE_CONTRACT_ADR_2026-09-22.md
+// Machine-interface contract, version 2 (X02 S1/S2 — versioned resource
+// and operation contracts, _internal/X02_RESOURCE_CONTRACT_ADR_2026-09-22.md
 // §2.1-2.2, adopted by DELEGATED_DECISIONS_2026-09-23 D8/D9).
 //
 // MachineInterface is the version of teploy's machine-readable output
 // contract. It rides at the root of every --json envelope a machine
-// consumer parses — `version --json`, `app list --json`, and
-// `server status --json` — so a consumer (teploy-dash) can fail closed on
-// an interface newer than the one it supports BEFORE submitting any
-// mutation, instead of discovering the skew after the fact.
+// consumer parses — `version --json`, `app list --json`,
+// `server status --json`, and `server list --json` — so a consumer
+// (teploy-dash) can fail closed on an interface newer than the one it
+// supports BEFORE submitting any mutation, instead of discovering the
+// skew after the fact.
 //
 // Versioning rules (D8):
 //   - additive changes (new fields, new capability tokens) do NOT bump;
@@ -19,12 +20,22 @@ import "sort"
 //     change, capability-token removal or redefinition) bump it.
 //
 // MI 1 is assigned to the envelope shapes as implemented at v0.1.37 plus
-// this field itself — assigning it is the compatibility commitment X01
-// lacked. Known exclusion: `server list --json` emits a bare
-// map-of-servers root with no envelope object, so it cannot carry the
-// field additively; reshaping it is recorded as S2 follow-up work
-// (requires a coordinated dash decode change).
-const MachineInterface = 1
+// the field itself — assigning it is the compatibility commitment X01
+// lacked. MI 1's one recorded exclusion (`server list --json` emitted a
+// bare map-of-servers root with no envelope object, so the field could
+// not be added) is resolved by MI 2.
+//
+// MI 2 = MI 1 + the server-list envelope reshape, and NOTHING else:
+// `server list --json` now emits {machine_interface, servers[],
+// observed_at} with the per-server fields carried over (name, host,
+// user, role, tags, vpn_ip, id), where it previously emitted the bare
+// map-of-servers root. Removing the bare map from the wire is
+// non-additive, and per D8 a non-additive change to ONE command's
+// envelope bumps the interface for the whole binary — every envelope
+// (version, app list, server status, server list, error) now reports
+// machine_interface 2. No capability token was added, removed, or
+// redefined; no other envelope shape changed.
+const MachineInterface = 2
 
 // Capability tokens advertised by `teploy version --json` (X02 §2.2).
 // THIS BLOCK IS THE REGISTRY — the single source of the token set.

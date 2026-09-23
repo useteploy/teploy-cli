@@ -81,21 +81,30 @@ func TestMachineJSONListOutputs(t *testing.T) {
 	})
 
 	t.Run("server", func(t *testing.T) {
+		observedAt := time.Date(2026, 9, 23, 12, 0, 0, 0, time.UTC)
 		var out bytes.Buffer
-		if err := writeServerList(&out, nil, true); err != nil {
+		if err := writeServerList(&out, nil, true, observedAt); err != nil {
 			t.Fatal(err)
 		}
-		assertJSONEqual(t, out.Bytes(), map[string]any{})
+		assertJSONEqual(t, out.Bytes(), map[string]any{
+			"machine_interface": MachineInterface,
+			"servers":           []any{},
+			"observed_at":       observedAt.Format(time.RFC3339Nano),
+		})
 
 		out.Reset()
 		servers := map[string]config.Server{
 			"prod": {Host: "192.0.2.10", User: "deploy", Role: "app"},
 		}
-		if err := writeServerList(&out, servers, true); err != nil {
+		if err := writeServerList(&out, servers, true, observedAt); err != nil {
 			t.Fatal(err)
 		}
 		assertJSONEqual(t, out.Bytes(), map[string]any{
-			"prod": map[string]any{"host": "192.0.2.10", "user": "deploy", "role": "app"},
+			"machine_interface": MachineInterface,
+			"servers": []any{map[string]any{
+				"name": "prod", "host": "192.0.2.10", "user": "deploy", "role": "app",
+			}},
+			"observed_at": observedAt.Format(time.RFC3339Nano),
 		})
 	})
 
@@ -128,7 +137,16 @@ func TestServerListJSONWithoutConfigFile(t *testing.T) {
 	if err := runServerList(&Flags{JSON: true}, &out); err != nil {
 		t.Fatalf("runServerList: %v", err)
 	}
-	assertJSONEqual(t, out.Bytes(), map[string]any{})
+	var decoded struct {
+		MachineInterface int   `json:"machine_interface"`
+		Servers          []any `json:"servers"`
+	}
+	if err := json.Unmarshal(out.Bytes(), &decoded); err != nil {
+		t.Fatalf("invalid JSON %q: %v", out.Bytes(), err)
+	}
+	if decoded.MachineInterface != MachineInterface || decoded.Servers == nil || len(decoded.Servers) != 0 {
+		t.Fatalf("server list without config = %s, want an empty MI-%d envelope", out.String(), MachineInterface)
+	}
 }
 
 func TestLogsCommandFollowModes(t *testing.T) {
