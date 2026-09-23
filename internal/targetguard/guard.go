@@ -64,7 +64,11 @@ func Run(ctx context.Context, exec ssh.Executor, app string, expectedGeneration 
 	if err := ensureUploaded(ctx, exec); err != nil {
 		return "", fmt.Errorf("uploading target guard: %w", err)
 	}
-	invoke := fmt.Sprintf("sh %s %s %d -- %s", helperRemote, shQuote(app), expectedGeneration, cmd)
+	// cmd is quoted as ONE argument: unquoted, an effect's `;`/`>>` would
+	// execute at the INVOCATION level — outside the guard, before the
+	// helper has even created its directories (caught by CI's linux runner
+	// after the mac-side build-tag gap hid it).
+	invoke := fmt.Sprintf("sh %s %s %d -- %s", helperRemote, shQuote(app), expectedGeneration, shQuote(cmd))
 	out, runErr := exec.Run(ctx, invoke)
 	if runErr != nil {
 		return "", fmt.Errorf("invoking target guard: %w", errDetail(runErr, out))
