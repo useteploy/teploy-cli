@@ -1,0 +1,22 @@
+{
+  "capabilities": [
+    "app-list-machine",
+    "autodeploy-redeploy",
+    "doctor-diagnostics",
+    "env-set-stdin",
+    "error-envelope",
+    "health-modes",
+    "kv-set-stdin",
+    "preview-blue-green",
+    "preview-canonical-id",
+    "provenance-records",
+    "readiness-receipts",
+    "repair-debt",
+    "server-rename",
+    "server-status-machine",
+    "server-update",
+    "template-var-stdin"
+  ],
+  "machine_interface": 1,
+  "version": "v0.0.0-contracts"
+}

@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://teploy.github.io/contracts/schema/release-record.schema.json",
+  "title": "releasemeta Record (F14; releasemeta.go Record)",
+  "type": "object",
+  "required": ["schema_version", "app", "hash", "created_at", "deployment_type", "ingress_mode"],
+  "properties": {
+    "schema_version": {"type": "integer", "minimum": 1},
+    "app": {"type": "string", "minLength": 1},
+    "hash": {"type": "string", "pattern": "^[a-f0-9]{7}(\\.[a-f0-9]{16})?$"},
+    "created_at": {"type": "string", "format": "date-time"},
+    "backfilled": {"type": "boolean"},
+    "generation": {"type": "integer", "minimum": 0},
+    "deployment_type": {"type": "string", "enum": ["container", "static"]},
+    "ingress_mode": {"type": "string"},
+    "domain": {"type": "string"},
+    "image_ref": {"type": "string"},
+    "image_digest": {"type": "string"},
+    "manifest_sha256": {"type": "string"},
+    "provenance": {"type": ["object", "null"]}
+  }
+}

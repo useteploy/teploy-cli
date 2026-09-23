@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://teploy.github.io/contracts/schema/preview-state.schema.json",
+  "title": "preview identity eras (C06): canonical <app>-p-<hex8>, legacy slug, ambiguous",
+  "oneOf": [
+    {"$comment": "canonical era", "type": "object",
+     "required": ["id", "era", "app", "branch"],
+     "properties": {
+       "id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]*-p-[a-f0-9]{8}$"},
+       "era": {"const": "canonical"},
+       "app": {"type": "string"},
+       "branch": {"type": "string"}}},
+    {"$comment": "legacy slug-keyed era; readable, adoptable when unambiguous", "type": "object",
+     "required": ["id", "era", "app"],
+     "properties": {
+       "id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]*-p-[a-z0-9][a-z0-9-]*$"},
+       "era": {"const": "legacy"},
+       "app": {"type": "string"}}}
+  ]
+}

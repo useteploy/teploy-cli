@@ -1,0 +1,6 @@
+{
+  "machine_interface": 1,
+  "code": "internal",
+  "message": "command failed",
+  "detail": "dial tcp: connection refused"
+}

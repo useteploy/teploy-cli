@@ -1,0 +1,7 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://teploy.github.io/contracts/schema/attempt-name.schema.json",
+  "title": "deploy attempt directory name grammar: <hash>.<16hex> (F08)",
+  "type": "string",
+  "pattern": "^[a-f0-9]{7}\\.[a-f0-9]{16}$"
+}

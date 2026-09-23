@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://teploy.github.io/contracts/schema/error-envelope.schema.json",
+  "title": "structured error envelope on stderr under --json (X02 S3)",
+  "type": "object",
+  "required": ["machine_interface", "code", "message"],
+  "additionalProperties": false,
+  "properties": {
+    "machine_interface": {"type": "integer", "minimum": 1},
+    "code": {"type": "string", "enum": ["config-invalid", "internal", "conflict", "uncertain-outcome", "degraded", "unsupported"]},
+    "message": {"type": "string", "minLength": 1},
+    "detail": {"type": "string"}
+  }
+}

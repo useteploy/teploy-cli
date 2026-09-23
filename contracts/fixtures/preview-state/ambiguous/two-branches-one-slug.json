@@ -1,0 +1,10 @@
+{
+  "id": "myapp-p-feature-login",
+  "era": "legacy",
+  "app": "myapp",
+  "candidates": [
+    {"branch": "feature/login", "canonical_id": "myapp-p-08e81639"},
+    {"branch": "feature-login", "canonical_id": "myapp-p-cb4bdf9a"}
+  ],
+  "rule": "refuse adoption; require explicit binding (C06 ambiguity contract - never auto-adopt)"
+}
