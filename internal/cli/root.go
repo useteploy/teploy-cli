@@ -77,6 +77,7 @@ func NewRootCmd(version string) *cobra.Command {
 	root.AddCommand(newUnlockCmd(flags))
 	root.AddCommand(newInitCmd())
 	root.AddCommand(newValidateCmd(flags))
+	root.AddCommand(newDoctorCmd(flags, version))
 	root.AddCommand(newPlanCmd(flags))
 	root.AddCommand(newDriftCmd(flags))
 	root.AddCommand(newHealCmd(flags))

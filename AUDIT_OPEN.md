@@ -1792,3 +1792,107 @@ performed.
 - Generalizing per-command envelopes for the remaining --json verbs
   (health/log/drift/stats/plan/validate/registry/template/accessory
   lists) is S2's `contracts/` skeleton work, not error-site migration.
+
+## Programme slice (2026-09-23) — C09: `teploy doctor`
+
+First bounded C09 slice (base revision `dda4911`; changes left
+committed-free for review, per instruction). Contract addressed:
+"`doctor` should diagnose local toolchain, SSH, Docker, registry, proxy,
+disk and compatibility without causing deployment. Human progress goes to
+the appropriate diagnostic stream; versioned JSON/events and stable exit
+codes serve automation."
+
+**Landed** (`internal/cli/doctor.go`, `teploy doctor [--json]
+[--server <name>]`):
+
+- **Nine stable checks** (fixed order, pinned by test): `git` (local
+  PATH probe — missing git is a WARN, not a fail: git-less boxes deploy
+  prebuilt images fine), `config` (the same `config.LoadApp` loader
+  deploy uses, so the C05 Compose field contracts, C03 health-mode
+  grammar, publish specs and overlay rules surface verbatim in detail;
+  ErrNoConfig → fail with a `teploy init` remediation), `ssh` (the
+  EXISTING connect path — `ssh.Connect` errors carry the key/auth hints
+  and the 078f610 known_hosts algorithm naming, so the doctor detail
+  names the presented/on-file algorithms verbatim), `docker` (daemon
+  reachability via `docker version --format '{{.Server.Version}}'`),
+  `disk` (root-filesystem headroom from `df -B1 -P /`: fail < 2 GiB,
+  warn < 10 GiB or ≥ 85% used), `registry` (`docker manifest inspect` of
+  the configured ref — a pure registry query that touches no local image
+  state, unlike a pull; auth class DISTINGUISHED from unreachable from
+  missing, each with its own remediation; build-from-source apps are
+  ok-skips), `caddy` (admin API probe inside the caddy container — the
+  same command `server status` uses; host/external ingress are ok-skips
+  by design), `compatibility` (local version vs the server's
+  `/deployments/.bin/teploy` if present — absent is ok (optional
+  infrastructure), skew is a warn naming both versions), and
+  `repair-debt` (the C01-6 marker via `deploy.ReadRepairDebt` —
+  outstanding debt is a warn naming release+attempts; an UNREADABLE
+  marker is a visible warn, never hidden).
+- **No deployment effects**: every remote command is read-only
+  (`docker version`, `docker manifest inspect`, the caddy admin wget,
+  `df`, the server binary's `version`, the framed repair-debt read).
+  Skip semantics are two-class and deliberate: skipped-because-not-
+  applicable (host/external ingress, build app, no server binary, no
+  app identity) = ok; skipped-because-input-unavailable (SSH down,
+  config unreadable) = fail with the reason. Tests assert the mock's
+  ENTIRE call log against a read-only allowlist on both the all-healthy
+  and the every-remote-check-failing runs, plus that no files are ever
+  uploaded.
+- **Output contract**: human table on stdout (check/result/detail rows,
+  indented `fix:` remediation lines, closing summary); `--json` emits
+  the MI-1 envelope `{machine_interface, checks:[{name, result,
+  detail, remediation}], summary:{ok, warn, fail}}` — all four check
+  keys ALWAYS present (no omitempty: a stable shape means consumers
+  never probe for optional keys), `result` closed to ok|warn|fail,
+  summary counts machine-checked against the checks array. Exit codes:
+  0 with no fail (warnings included), 1 with any fail, and never 2 —
+  that stays `drift --exit-code`'s CI signal (X02 D10); documented in
+  the command's help text and README. The report is the successful
+  OUTPUT of the command — a failing diagnosis never renders the error
+  envelope, stdout stays the data channel.
+- **Capability token**: `doctor-diagnostics` added to the MI registry
+  (additive, no MI bump); the golden list in
+  TestCapabilityTokenRegistry updated to force the addition to stay
+  deliberate.
+
+**Evidence** — TDD red level 1 recorded (all new symbols undefined at
+compile), green after implementation. New coverage (doctor_test.go, 17
+test functions / 30+ subtests): all-healthy run (9 ok, stable order,
+read-only call log), exact JSON shape (3 top-level keys, 4 check keys,
+enum-closed results, summary cross-check), human table + remediation
+lines + summary, per-check pass/fail/warn paths (config grammar from
+teploy.yml AND Compose, git missing, ssh unreachable with the
+known_hosts algorithm diagnostics carried through, no target, docker
+daemon down, disk fail/warn/ok thresholds + parser robustness, registry
+auth/missing/unreachable classes + classifier, caddy ok/fail/host/
+external skips, compat agree/skew/absent/unreadable, repair-debt
+absent/present/unreadable/no-app), the no-effects assertion on a
+maximally failing run, exit-code semantics, and a cobra-wired end-to-
+end all-OK run. Mutation checks (in-place, all reverted, gates re-run
+green after each): a failing check reported ok (docker failure branch
+forced to ok) fails TestDoctorDockerCheck and the human-table summary;
+doctorExitCode forced to 0 fails all three exit-code assertions;
+collapsing the registry auth class into unreachable fails the
+auth-distinguished remediation and the classifier. Binary smoke: real
+`teploy doctor` / `doctor --json` in an empty directory — table and
+envelope as specified, exit 1, no stderr envelope, token advertised by
+`version --json`.
+
+Gates: `go vet ./...` clean; `go test ./... -race -count=1` all 25
+packages ok; gofmt clean on touched files (pre-existing strays in
+deploy.go/secret_audit.go/update_test.go left alone, consistent with
+the C02-C04 posture); contract probes 5/5 PASS. No push performed.
+
+**C09 remainder (explicit):** per-command next-recovery-action strings
+(doctor's remediation field covers the diagnostic surface; every OTHER
+failure path still renders free-text errors — the S2 error-envelope
+migration is the machinery, this is the content), shell completion
+(cobra completion for the command tree, including doctor's --server
+values from servers.yml), config examples executability (README/
+docs config snippets that cannot load under the current grammar —
+a docs-vs-loader drift sweep), and the doctor surface itself has
+natural follow-ons recorded here rather than hidden: multi-server
+fleet diagnosis (doctor currently diagnoses ONE resolved target),
+DNS/health-path diagnostics, and machine-event streaming (the
+"versioned JSON/events" contract's events half — doctor emits one
+versioned JSON document per run, not a stream).

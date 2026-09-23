@@ -84,6 +84,7 @@ func TestCapabilityTokenRegistry(t *testing.T) {
 	want := []string{
 		"app-list-machine",
 		"autodeploy-redeploy",
+		"doctor-diagnostics",
 		"env-set-stdin",
 		"error-envelope",
 		"health-modes",
@@ -123,6 +124,7 @@ func TestCapabilityTokenRegistry(t *testing.T) {
 		CapHealthModes, CapProvenanceRecords, CapReadinessReceipts,
 		CapPreviewCanonicalID, CapRepairDebt, CapPreviewBlueGreen,
 		CapErrorEnvelope, CapAppListMachine, CapServerStatusMachine,
+		CapDoctorDiagnostics,
 	} {
 		if !member[token] {
 			t.Fatalf("capability constant %q is not advertised", token)

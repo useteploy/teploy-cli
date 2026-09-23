@@ -335,6 +335,7 @@ teploy log                                # deploy history
 teploy exec <server> <cmd>                # run a command on the server (SSH)
 teploy app exec -- <cmd>                  # run a command in the app container (migrations, etc.)
 teploy validate                           # check config and server readiness
+teploy doctor [--server <name>]           # read-only diagnostics: toolchain, SSH, Docker, registry, Caddy, disk, compatibility, repair debt (--json for machines; exit 1 if any check fails, never 2)
 teploy scale <count>                      # multi-server deploy + LB update
 teploy version / update                   # version info and self-update
 ```

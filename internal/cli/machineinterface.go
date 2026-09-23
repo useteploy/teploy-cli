@@ -74,6 +74,10 @@ const (
 	CapAppListMachine = "app-list-machine"
 	// `server status --json` emits the MI-1 machine envelope.
 	CapServerStatusMachine = "server-status-machine"
+	// `teploy doctor [--json] [--server]`: read-only diagnostics with
+	// stable check names, ok/warn/fail results, remediations, and 0/1
+	// exit semantics — 2 never (that stays drift's) (C09).
+	CapDoctorDiagnostics = "doctor-diagnostics"
 )
 
 // MachineCapabilities returns every capability token this build
@@ -95,6 +99,7 @@ func MachineCapabilities() []string {
 		CapErrorEnvelope,
 		CapAppListMachine,
 		CapServerStatusMachine,
+		CapDoctorDiagnostics,
 	}
 	sort.Strings(tokens)
 	return tokens
