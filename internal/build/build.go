@@ -9,7 +9,6 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
-	"runtime"
 	"strings"
 
 	"github.com/useteploy/teploy/internal/ssh"
@@ -237,12 +236,11 @@ func LocalBuild(ctx context.Context, cfg LocalBuildConfig, stdout io.Writer) (st
 func localBuildDockerfile(ctx context.Context, tag, dir, contextSub, dockerfile, platform string, stdout io.Writer) error {
 	args := []string{"build", "-t", tag}
 
-	if platform != "" {
-		// Explicit platform from config.
-		args = append(args, "--platform", platform)
-	} else if runtime.GOOS == "darwin" && runtime.GOARCH == "arm64" {
-		// Cross-compile for linux/amd64 when building on macOS ARM.
-		args = append(args, "--platform", "linux/amd64")
+	// Explicit config, else the shared local-build default (Apple silicon
+	// cross-compiles for linux/amd64) — one rule for the build and its
+	// C04 provenance record.
+	if p := EffectiveLocalPlatform(platform); p != "" {
+		args = append(args, "--platform", p)
 	}
 
 	// exec.Command takes an argv, so no shell quoting is needed here.

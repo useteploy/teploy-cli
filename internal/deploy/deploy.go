@@ -89,6 +89,13 @@ type Config struct {
 	ManifestSHA256  string
 	AppliedManifest json.RawMessage
 	SourceRevision  string
+	// Provenance is the plan-time provenance record (C04) the CLI
+	// resolved before execution: revision, worktree cleanliness, build
+	// context fingerprint, Dockerfile identity, platform, image digest
+	// and mutability. Optional (direct construction without provenance
+	// skips the plan/receipt equality machinery); when present its
+	// identity must match the deploy's own.
+	Provenance *releasemeta.Provenance
 }
 
 // Deployer orchestrates zero-downtime deploys.
@@ -193,6 +200,12 @@ func (c Config) validate() error {
 	case "", HealthModeHTTP, HealthModeTCP, HealthModeAuto:
 	default:
 		return fmt.Errorf("unknown health mode %q (expected http, tcp, or auto)", c.Health.Mode)
+	}
+	// Provenance identity (C04): a record describing another deploy than
+	// the Config it rides on is a lie that would corrupt the plan/receipt
+	// equality surfaces — refused before any effect.
+	if c.Provenance != nil && (c.Provenance.App != c.App || c.Provenance.Release != c.Version) {
+		return fmt.Errorf("provenance identity mismatch: provenance describes %s@%s, deploy is %s@%s", c.Provenance.App, c.Provenance.Release, c.App, c.Version)
 	}
 	return nil
 }
@@ -311,6 +324,14 @@ func (d *Deployer) DeployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 	} else {
 		fmt.Fprintf(d.out, "Deploying %s (version %s)...\n", cfg.App, cfg.Version)
 	}
+
+	// 0b. Surface the execution plan (C04): the immutable image identity
+	// this deploy will create containers from, the source revision it
+	// builds, and the effective-config digest — BEFORE any effect. The
+	// same values are verified against the deployed receipt after the
+	// live commit (step 17).
+	planDigest := plannedImageDigest(cfg.Image, runImage, cfg.Provenance)
+	printDeployPlan(d.out, cfg, planDigest)
 
 	// 1. Read current state. A read failure must stop the deploy — treating
 	// an unreadable state file as "no state" loses rollback bookkeeping and
@@ -836,7 +857,7 @@ func (d *Deployer) DeployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 	newState.AppliedManifest = append(json.RawMessage(nil), cfg.AppliedManifest...)
 	newState.SourceRevision = cfg.SourceRevision
 	newState.ImageRef = cfg.Image
-	newState.ImageDigest = imageDigestFromRef(cfg.Image)
+	newState.ImageDigest = ImageDigestFromRef(cfg.Image)
 	if newState.ImageDigest == "" {
 		newState.ImageDigest, _ = d.docker.ContainerImageDigest(ctx, webContainerName)
 	}
@@ -856,8 +877,9 @@ func (d *Deployer) DeployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 	// the route/state are committed — a record failure is a degraded
 	// rollback window, not a failed deploy, and it converges on the next
 	// deploy via the repair-debt marker (C01-6). Never abort into
-	// abortStateCommit from here.
-	d.recordRelease(ctx, cfg, assetAttempt, newState, ports, webBindHost, webContainerName)
+	// abortStateCommit from here. The written record is returned for the
+	// closing plan/receipt verification (17).
+	rec := d.recordRelease(ctx, cfg, assetAttempt, newState, ports, webBindHost, webContainerName)
 
 	// 13c. Prune superseded attempts (F08): attempt directories (build
 	// contexts, env files, TLS certs) are dead weight once their release
@@ -1029,7 +1051,16 @@ func (d *Deployer) DeployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 	}
 
 	duration := time.Since(start)
+
+	// 17. Closing verification (C04): after the live commit, assert the
+	// deployed record's image digest equals the digest the plan showed —
+	// and report the receipt's identity triple explicitly. A mismatch is
+	// a loud warning plus repair debt (the C01-6 marker the next deploy
+	// reconciles); live traffic is never failed over a bookkeeping gap.
+	d.verifyPlanReceiptEquality(ctx, cfg, rec, assetAttempt, planDigest)
+
 	fmt.Fprintf(d.out, "\nDeployed %s version %s in %s\n", cfg.App, cfg.Version, duration.Round(time.Millisecond))
+	printDeployReceipt(d.out, cfg, rec)
 	return nil
 }
 
@@ -1363,10 +1394,14 @@ func (d *Deployer) logDeploy(ctx context.Context, cfg Config, success bool, degr
 // binding plus every publish entry); env records the references (server-side
 // env-file paths + the plaintext env map), never resolved secrets. The
 // primary web container's full RecreateSpec is embedded from docker's own
-// view of it. A write failure is deliberate degradation (the deploy stays
-// live) made durable and convergent: the repair-debt marker it records
-// (C01-6) drives the next deploy's rebuild and `status`'s reporting.
-func (d *Deployer) recordRelease(ctx context.Context, cfg Config, att releasemeta.Attempt, applied *state.AppState, ports []int, webBindHost, webContainerName string) {
+// view of it, and the plan-time provenance + effective-config digest ride
+// along (C04) so the receipt names what the plan promised. A write failure
+// is deliberate degradation (the deploy stays live) made durable and
+// convergent: the repair-debt marker it records (C01-6) drives the next
+// deploy's rebuild and `status`'s reporting. The in-memory record is
+// returned even on a write failure — the closing verification compares
+// against what was attempted.
+func (d *Deployer) recordRelease(ctx context.Context, cfg Config, att releasemeta.Attempt, applied *state.AppState, ports []int, webBindHost, webContainerName string) *releasemeta.Record {
 	containerPort := cfg.ContainerPort
 	if containerPort == 0 {
 		containerPort = 80
@@ -1382,6 +1417,7 @@ func (d *Deployer) recordRelease(ctx context.Context, cfg Config, att releasemet
 		Domain:         cfg.Domain,
 		ImageRef:       cfg.Image,
 		ImageDigest:    applied.ImageDigest,
+		ManifestSHA256: cfg.ManifestSHA256,
 		Replicas:       len(ports),
 		Processes:      maps.Clone(cfg.Processes),
 		Cmd:            cfg.Cmd,
@@ -1440,10 +1476,19 @@ func (d *Deployer) recordRelease(ctx context.Context, cfg Config, att releasemet
 	} else {
 		fmt.Fprintf(d.out, "Warning: could not capture the recreate spec for %s: %v (recreate falls back to live inspect)\n", webContainerName, err)
 	}
+	// Embed the plan-time provenance (C04): the record is the deployed
+	// receipt — it must carry the digest, revision and config the plan
+	// showed, verbatim. A copy, so the caller's struct is never aliased
+	// into the persisted record.
+	if cfg.Provenance != nil {
+		provCopy := *cfg.Provenance
+		rec.Provenance = &provCopy
+	}
 	if err := releasemeta.Write(ctx, d.exec, rec); err != nil {
 		fmt.Fprintf(d.out, "Warning: could not record release metadata for %s@%s: %v — the deploy stays live; repair debt recorded (the next deploy rebuilds the record)\n", cfg.App, cfg.Version, err)
 		d.recordRepairDebt(ctx, att, err)
 	}
+	return rec
 }
 
 // sortedProcessNames returns process names with "web" first, then alphabetical.
@@ -1480,7 +1525,14 @@ func containerPort(c Config) int {
 	return c.ContainerPort
 }
 
-func imageDigestFromRef(image string) string {
+// ImageDigestFromRef extracts the digest of a digest-pinned image
+// reference ("repo@sha256:<64hex>"), or "" for every other reference
+// shape. Exported for the CLI's plan-time provenance, which must apply
+// the SAME like-for-like rule the deployed record applies (a pinned ref
+// is identified by its manifest digest, a mutable ref by docker's
+// resolved content ID) or plan/receipt equality compares apples to
+// oranges.
+func ImageDigestFromRef(image string) string {
 	if _, digest, ok := strings.Cut(image, "@"); ok && strings.HasPrefix(digest, "sha256:") && len(digest) == len("sha256:")+64 {
 		return digest
 	}

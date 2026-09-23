@@ -495,7 +495,7 @@ func deployAppConfig(flags *Flags, appCfg *config.AppConfig, serverName, image, 
 		}
 	}
 
-	return deployBuiltImageFenced(ctx, executor, appCfg, image, version, host, migrateVolumes, needsBuild, lk, &att)
+	return deployBuiltImageFenced(ctx, executor, appCfg, image, version, host, migrateVolumes, needsBuild, ".", lk, &att)
 }
 
 // deployBuiltImage runs the shared post-build deploy orchestration:
@@ -513,7 +513,7 @@ func deployAppConfig(flags *Flags, appCfg *config.AppConfig, serverName, image, 
 // string for the notification payload (a hostname for the SSH path,
 // "localhost" for the resident-server path).
 func deployBuiltImage(ctx context.Context, executor ssh.Executor, appCfg *config.AppConfig, image, version, serverDisplay string, migrateVolumes, needsBuild bool) error {
-	return deployBuiltImageFenced(ctx, executor, appCfg, image, version, serverDisplay, migrateVolumes, needsBuild, nil, nil)
+	return deployBuiltImageFenced(ctx, executor, appCfg, image, version, serverDisplay, migrateVolumes, needsBuild, "", nil, nil)
 }
 
 // deployBuiltImageFenced is deployBuiltImage with the caller's lease and
@@ -521,7 +521,10 @@ func deployBuiltImage(ctx context.Context, executor ssh.Executor, appCfg *config
 // lease and the resident autodeploy path — audits F07/F08) and att keys the
 // attempt-scoped artifacts (env file, TLS). lk == nil means Deployer.Deploy
 // acquires the lock itself (att must still be non-nil for the env file).
-func deployBuiltImageFenced(ctx context.Context, executor ssh.Executor, appCfg *config.AppConfig, image, version, serverDisplay string, migrateVolumes, needsBuild bool, lk *state.Lock, att *releasemeta.Attempt) error {
+// sourceRoot is the directory the source was synced/built from ("." for
+// manual deploys, the fetched checkout for autodeploy) — it keys the
+// plan-time provenance (C04); empty means no build provenance.
+func deployBuiltImageFenced(ctx context.Context, executor ssh.Executor, appCfg *config.AppConfig, image, version, serverDisplay string, migrateVolumes, needsBuild bool, sourceRoot string, lk *state.Lock, att *releasemeta.Attempt) error {
 	if att == nil {
 		attVal := releasemeta.MustAttempt(appCfg.App, version)
 		att = &attVal
@@ -529,6 +532,18 @@ func deployBuiltImageFenced(ctx context.Context, executor ssh.Executor, appCfg *
 	appliedManifest, manifestSHA256, err := config.NormalizeAndDigest(appCfg, image)
 	if err != nil {
 		return fmt.Errorf("normalizing applied manifest: %w", err)
+	}
+
+	// 8b. Capture and persist the plan-time provenance (C04): revision,
+	// worktree cleanliness, build-context fingerprint, Dockerfile
+	// identity, platform, the resolved image digest, and the mutability
+	// of the requested ref — resolved BEFORE execution and filed into the
+	// attempt's write-once namespace, next to the build context it
+	// describes. Best-effort resolution, but the receipt itself must
+	// land: a missing provenance file is an unwitnessed plan (warned).
+	prov := resolveDeployProvenance(ctx, executor, os.Stdout, appCfg, sourceRoot, image, version, manifestSHA256, needsBuild)
+	if err := releasemeta.WriteAttemptProvenance(ctx, executor, *att, prov); err != nil {
+		fmt.Printf("Warning: could not persist the deploy provenance receipt for %s@%s: %v\n", appCfg.App, version, err)
 	}
 
 	// 9. Ensure accessories are running.
@@ -647,6 +662,7 @@ func deployBuiltImageFenced(ctx context.Context, executor ssh.Executor, appCfg *
 	// 11. Deploy.
 	deployer := deploy.NewDeployer(executor, os.Stdout)
 	deployCfg := deployConfigFromApp(appCfg, image, version, envFiles, volumes, tlsCert, tlsKey, tlsInternal, appliedManifest, manifestSHA256)
+	deployCfg.Provenance = prov
 
 	// Vulnerability gate: scan the image on the server before any container
 	// starts — fixable CRITICALs block the deploy.

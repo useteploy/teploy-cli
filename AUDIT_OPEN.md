@@ -1600,3 +1600,101 @@ block's HTTP path probe would mark a non-HTTP upstream down — LB
 rendering is 5bf5594's fixed surface, untouched here), and preview's
 readiness gate (internal/preview) which mirrors the auto shape and has
 no mode surface of its own.
+
+## Programme slice (2026-09-22, latest) — C04: build provenance + plan/receipt equality
+
+First bounded C04 slice (base revision `6a1142d`; changes left uncommitted
+for review). Contract addressed: "Resolve Git revision, build context,
+Dockerfile, platform and immutable image digest BEFORE execution... image
+digest and effective configuration shown in plan equal the deployed
+receipt; response-loss retries do not build a different source; changed
+mutable tags behave according to selected policy." Commit pinning itself
+was P0-done in C02 (webhook builds reset to the authenticated commit;
+this slice records what every path resolved).
+
+**Design:**
+
+- `releasemeta.Provenance` (new internal/releasemeta/provenance.go) is the
+  plan-time record: revision (full HEAD sha via the SourceRevision
+  threading both trigger paths already had), a Dirty flag, build context
+  path + context fingerprint, Dockerfile identity (path + content sha),
+  target platform, requested image ref, the immutable digest resolved
+  BEFORE execution, a DigestPinned-vs-mutable flag, and the
+  effective-config (manifest) digest. Persisted as `provenance.json` in
+  the F08 attempt namespace (`meta/att/<hash>.<id>/`, write-once, atomic
+  0600, identity-validated on read — the journal discipline) by the shared
+  post-build orchestration: `deployBuiltImageFenced` (manual + ad-hoc +
+  autodeploy, new `sourceRoot` param: "." vs the fetched checkout) and
+  `singleServerDeployer.deployApp` (multi-server/scale) — all three
+  engine entry paths.
+- Recon finding: the build package did NOT already compute a context
+  fingerprint — the only tree-hash machinery was the static deployer's
+  unexported `hashDir` (static-only semantics, symlink-rejecting). Added
+  `build.ContextFingerprint(dir, excludes)` with hashDir's v3 typed/
+  length-prefixed record encoding (F51/TCL-38 discipline) but
+  symlink-INCLUSIVE (hashed by target: rsync -a preserves links into the
+  context, so a link is build input), excludes applied (DefaultIgnore +
+  .teployignore — the fingerprint describes the synced tree). Also
+  extracted `build.EffectiveLocalPlatform` from localBuildDockerfile's
+  inline rule (behavior-preserving) so the record names the platform the
+  local build actually targets.
+- Plan/receipt equality: `Deployer.DeployFenced` prints a plan block
+  BEFORE any effect (image digest — not just tag, with pinned/mutable
+  stated; revision, flagging a dirty worktree as "building uncommitted
+  changes"; context fingerprint; Dockerfile identity; platform; manifest
+  digest). The F14 record gains `ManifestSHA256` + embedded `Provenance`,
+  and `recordRelease` returns it. A closing verification (step 17, after
+  the live commit) asserts record digest == plan digest and reports
+  equality explicitly; a mismatch is a loud warning + the C01-6
+  repair-debt marker (next deploy reconciles) — never a failed live
+  deploy. `plannedImageDigest` applies ONE like-for-like rule on both
+  sides: a digest-pinned ref is identified by its manifest digest,
+  everything else by docker's resolved content ID (`ImageDigestFromRef`,
+  now exported) — otherwise a pinned ref's plan (manifest digest) and
+  record (image ID) could never agree by construction.
+- Retry stability verified + pinned: the attempt machinery gives each
+  invocation a fresh write-once namespace, so a retry lands BESIDE the
+  first receipt (test); source stability is resolution purity —
+  `resolveDeployProvenance` is a pure function of (config, tree, image),
+  no time- or attempt-dependent fields (they are stamped at write) —
+  pinned by a DeepEqual double-resolution test; webhook retries
+  additionally re-pin to the ledger commit (C02, unchanged).
+
+**Evidence** — TDD red first: all four new test files failed to compile
+against the absent machinery (undefined Provenance/WriteAttemptProvenance/
+ContextFingerprint/Config.Provenance...). New coverage: provenance
+round-trip + write-time foreign-identity refusal + read-time identity
+mismatch refusal + absent-is-nil-nil; distinct immutable receipts for two
+attempts of one release; fingerprint determinism/sensitivity (content at
+constant size, rename, empty-dir structure, symlink retarget) +
+exclude-honoring; resolution field capture for build/prebuilt/mutable-tag
+paths; dirty-worktree flag; retry stability; plan output (digest,
+revision, "building uncommitted changes", fingerprint, manifest digest —
+and printed before the first container starts); record embedding
+provenance + manifest digest; mismatch → loud warning naming both digests
++ repair-debt marker + deploy still succeeds; provenance/deploy identity
+mismatch refused pre-effect; no plan digest → no false alarm. Mutation
+checks (in-place, all reverted): equality check disabled → mismatch test
+fails; provenance fields dropped from the plan print → plan test fails on
+the missing fingerprint; dirty suffix severed → "building uncommitted
+changes" assertion fails; record stops embedding provenance → record test
+fails; fingerprint made content-blind (digest zeroed, size kept, against
+a same-size content edit) → sensitivity test fails. Gates after revert:
+`go vet ./...` clean; `go test ./... -race -count=1` all 25 packages ok;
+gofmt clean on every touched hunk (cli/deploy.go's pre-existing
+fleet-rollback region stray left alone, consistent with the C02/C03
+posture); contract probes 5/5 PASS. No push performed.
+
+**C04 remainder (explicit):** registry authentication provenance (recording
+WHICH credential identity pulled/built — nothing today names the docker
+config/secret used); scan/attestation separation (trivy's gate currently
+FAILS the deploy on scan error — the contract wants scan failures distinct
+from build failures, and attestation is unmodelled); the ARM64/AMD64
+packaging matrix (cross-platform build verification on supported targets —
+`platform` is now RECORDED everywhere but not matrix-tested); offline
+fallback as an explicit pull POLICY (today's behavior — digest-pinned
+cache reuse, mutable always-pull, warned local fallback — is now recorded
+as provenance facts, not yet a selectable policy); build records for
+`teploy build` outside deploys; cache diagnostics; secret-safe build-input
+attestation. Changed-mutable-tag POLICY (beyond recording pinned-vs-
+mutable + the mismatch warning) lands with the offline/pull-policy slice.

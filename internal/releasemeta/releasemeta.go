@@ -126,6 +126,14 @@ type Record struct {
 
 	ImageRef    string `json:"image_ref,omitempty"`
 	ImageDigest string `json:"image_digest,omitempty"`
+	// ManifestSHA256 is the effective-config digest (config.
+	// NormalizeAndDigest) the release deployed under — the plan/receipt
+	// equality surface (C04).
+	ManifestSHA256 string `json:"manifest_sha256,omitempty"`
+	// Provenance is the plan-time provenance the deploy resolved to
+	// (C04): revision, worktree cleanliness, build context fingerprint,
+	// Dockerfile identity, platform, image digest and mutability.
+	Provenance *Provenance `json:"provenance,omitempty"`
 
 	Replicas    int               `json:"replicas,omitempty"`
 	Processes   map[string]string `json:"processes,omitempty"`
