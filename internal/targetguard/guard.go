@@ -69,12 +69,24 @@ func Run(ctx context.Context, exec ssh.Executor, app string, expectedGeneration 
 	if runErr != nil {
 		return "", fmt.Errorf("invoking target guard: %w", errDetail(runErr, out))
 	}
-	lines := strings.SplitN(out, "\n", 2)
-	head := strings.TrimSpace(lines[0])
-	rest := ""
-	if len(lines) > 1 {
-		rest = strings.TrimRight(lines[1], "\n")
+	// The protocol line is the first GUARD_-prefixed line — not necessarily
+	// line 1: the target's shell may emit job-control notices first (bash
+	// prints "Killed" to stdout when the effect is SIGKILLed, observed on
+	// CI runners 2026-09-23).
+	lines := strings.Split(out, "\n")
+	head := ""
+	headIdx := -1
+	for i, line := range lines {
+		if strings.HasPrefix(strings.TrimSpace(line), "GUARD_") {
+			head = strings.TrimSpace(line)
+			headIdx = i
+			break
+		}
 	}
+	if headIdx == -1 {
+		return "", fmt.Errorf("target guard protocol violation (no GUARD_ line in %q)", firstLine(out))
+	}
+	rest := strings.TrimRight(strings.Join(lines[headIdx+1:], "\n"), "\n")
 	fields := strings.Fields(head)
 	switch {
 	case fields[0] == "GUARD_OK":
@@ -113,6 +125,13 @@ func errDetail(err error, out string) error {
 		return fmt.Errorf("%w: %s", err, t)
 	}
 	return err
+}
+
+func firstLine(out string) string {
+	if i := strings.IndexByte(out, '\n'); i >= 0 {
+		return out[:i]
+	}
+	return out
 }
 
 // shQuote quotes one word for the POSIX shell the helper runs under.

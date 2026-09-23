@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -24,32 +25,43 @@ type localExecutor struct {
 	root string
 	mu   sync.Mutex
 	saw  []string
+	seq  int64
+	once sync.Once
 }
 
-func (e *localExecutor) Run(_ context.Context, cmd string) (string, error) {
+func (e *localExecutor) scriptPath() string {
+	n := atomic.AddInt64(&e.seq, 1)
+	return filepath.Join(e.root, fmt.Sprintf("run-%d.sh", n))
+}
+
+func (e *localExecutor) wrap(cmd string) (string, error) {
 	e.mu.Lock()
 	e.saw = append(e.saw, cmd)
 	e.mu.Unlock()
 	cmd = strings.ReplaceAll(cmd, helperRemote, filepath.Join(e.root, "teploy-guard.sh"))
-	full := fmt.Sprintf("export TEPLOY_DEPLOYMENTS_ROOT=%s; %s", e.root, cmd)
-	script := filepath.Join(e.root, "run.sh")
-	if err := os.WriteFile(script, []byte(full), 0755); err != nil {
+	script := e.scriptPath()
+	if err := os.WriteFile(script, []byte("export TEPLOY_DEPLOYMENTS_ROOT="+e.root+"; "+cmd), 0755); err != nil {
+		return "", err
+	}
+	return script, nil
+}
+
+func (e *localExecutor) Run(_ context.Context, cmd string) (string, error) {
+	script, err := e.wrap(cmd)
+	if err != nil {
 		return "", err
 	}
 	out, err := exec.Command("/bin/sh", script).CombinedOutput()
+	_ = os.Remove(script)
 	return string(out), err
 }
 
 func (e *localExecutor) RunStream(_ context.Context, cmd string, stdout, stderr io.Writer) error {
-	e.mu.Lock()
-	e.saw = append(e.saw, cmd)
-	e.mu.Unlock()
-	cmd = strings.ReplaceAll(cmd, helperRemote, filepath.Join(e.root, "teploy-guard.sh"))
-	full := fmt.Sprintf("export TEPLOY_DEPLOYMENTS_ROOT=%s; %s", e.root, cmd)
-	script := filepath.Join(e.root, "run.sh")
-	if err := os.WriteFile(script, []byte(full), 0755); err != nil {
+	script, err := e.wrap(cmd)
+	if err != nil {
 		return err
 	}
+	defer os.Remove(script)
 	proc := exec.Command("/bin/sh", script)
 	proc.Stdout = stdout
 	proc.Stderr = stderr
@@ -57,15 +69,11 @@ func (e *localExecutor) RunStream(_ context.Context, cmd string, stdout, stderr 
 }
 
 func (e *localExecutor) RunInput(_ context.Context, cmd string, stdin io.Reader) error {
-	e.mu.Lock()
-	e.saw = append(e.saw, cmd)
-	e.mu.Unlock()
-	cmd = strings.ReplaceAll(cmd, helperRemote, filepath.Join(e.root, "teploy-guard.sh"))
-	full := fmt.Sprintf("export TEPLOY_DEPLOYMENTS_ROOT=%s; %s", e.root, cmd)
-	script := filepath.Join(e.root, "run.sh")
-	if err := os.WriteFile(script, []byte(full), 0755); err != nil {
+	script, err := e.wrap(cmd)
+	if err != nil {
 		return err
 	}
+	defer os.Remove(script)
 	proc := exec.Command("/bin/sh", script)
 	proc.Stdin = stdin
 	proc.Stdout = io.Discard
@@ -74,12 +82,17 @@ func (e *localExecutor) RunInput(_ context.Context, cmd string, stdin io.Reader)
 }
 
 func (e *localExecutor) Upload(_ context.Context, content io.Reader, remotePath string, mode string) error {
-	data, err := io.ReadAll(content)
-	if err != nil {
-		return err
-	}
-	local := filepath.Join(e.root, filepath.Base(remotePath))
-	return os.WriteFile(local, data, 0755)
+	var uploadErr error
+	e.once.Do(func() {
+		data, readErr := io.ReadAll(content)
+		if readErr != nil {
+			uploadErr = readErr
+			return
+		}
+		local := filepath.Join(e.root, filepath.Base(remotePath))
+		uploadErr = os.WriteFile(local, data, 0755)
+	})
+	return uploadErr
 }
 
 func (e *localExecutor) Close() error      { return nil }
