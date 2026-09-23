@@ -167,7 +167,16 @@ table's, with the register item it belongs to.
    "conflicting route evidence → INSPECT" has no producer/consumer today
    (nobody reconciles a Caddyfile that names containers no inventory can
    attribute). Register: T03 documents the design as deliberate; the
-   finding is the missing reconciliation, not the lock's shape.
+   finding is the missing reconciliation, not the lock's shape. **LANDED
+   2026-09-23** (see AUDIT_OPEN's C01 shared-proxy-lock slice): the lock
+   carries an owner-tagged info file (staleness from its timestamp, not
+   directory mtime; legacy no-info dirs keep the mtime fallback), the
+   commit is fenced by the lock's own guard composed AFTER the app-fence
+   guard, release is conditional on ownership (the app locks' A04
+   lesson), and the missing producer/consumer exists:
+   `deploy.Observe` classifies a managed block naming a third generation
+   as CONFLICTING (Unknown) route evidence, which `Decide` sends to
+   INSPECT (R4) instead of the old false "route to predecessor".
 
 4. **C01-4 — No durable readiness receipt.** The health gate
    (`internal/deploy/health.go`, `deploy.go:646-658`) persists nothing, so
@@ -287,9 +296,17 @@ Two lock layers, never nested across hosts:
    renewal): serialize an app's lifecycle on ONE target. Held for the
    whole lifecycle, but only ever against one host.
 2. **The shared-proxy commit lock** (`/deployments/caddy/.lock`,
-   `internal/caddy/caddy.go:684-707`): short-lived, ownerless by design
-   (T03), held only for the brief Caddyfile edit+reload+verify inside one
-   host's traffic-switch step.
+   `internal/caddy/caddy.go`): short-lived, held only for the brief
+   Caddyfile edit+reload+verify inside one host's traffic-switch step.
+   Since C01-3 (2026-09-23) it is OWNER-TAGGED and FENCED like the app
+   locks: acquisition writes an owner info file, staleness is measured
+   from that info's timestamp (not directory mtime), the Caddyfile
+   commit runs under the lock's own guard composed after the app-fence
+   guard, and release removes the lock only when its info still names
+   the releaser. Acquisition order on the commit command is therefore
+   APP GUARD THEN CADDY GUARD — app lock first (long-held), shared
+   commit lock second (brief); never the inverse, and a holder that
+   loses either fence has its commit refused in-shell.
 
 **Never hold one host's app lock while waiting on another host's.** The
 current code complies: locks are acquired inside each host's
@@ -358,8 +375,10 @@ compensation; evidence in AUDIT_OPEN's latest C01 slice), and **C01-1
 landed 2026-09-23** (replacement-owner reconciliation on acquisition;
 `internal/deploy/reconcile.go`, fixture-verified) and **C01-2 landed
 2026-09-23** (guarded pre-commit effects: RunGuarded container starts +
-the guarded Caddyfile commit; see AUDIT_OPEN). Remaining findings:
-C01-3 (fenced shared Caddy lock — the locking-protocol remainder),
+the guarded Caddyfile commit; see AUDIT_OPEN) and **C01-3 landed
+2026-09-23** (owner-tagged fenced shared Caddy lock + the
+conflicting-route-evidence producer/consumer; see AUDIT_OPEN). The
+locking-protocol redesign (C01-1/2/3) is closed. Remaining findings:
 C01-8 (same-version `_replaced` MANUAL —
 deliberate A08 containment until F04 generation identities exist), and
 C01-9 (attempt-scoped candidate identities — F04/A09). The A12/T05

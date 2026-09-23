@@ -2023,3 +2023,57 @@ static/preview tests unchanged and green. Gates: build/vet clean;
 
 **Residual C01 list (updated):** C01-3 remains (fenced shared Caddy
 lock); C01-8/C01-9 unchanged (F04-keyed).
+
+## Programme slice (2026-09-23) — C01-3: owner-tagged fenced shared Caddy lock + conflicting-route reconciliation
+
+Closes the C01-3 disagreement (docs/C01_RECOVERY_STATE_TABLE.md finding
+3): the shared-proxy lock was a bare ownerless mkdir broken by DIRECTORY
+MTIME after 120s, so a slow-but-alive orphaned editor could interleave
+its Caddyfile edit with the new owner's mutate, and the table's
+"conflicting route evidence → INSPECT" had no producer or consumer. Base
+revision `13c7dd9`.
+
+**Design:**
+
+- **Owner-tagged lock** — caddy.acquireLock writes a caddy-edit info
+  file (owner token + RFC3339 ts, mirroring the app locks' shape).
+  Staleness is measured from the INFO timestamp (unparseable = stale);
+  a legacy no-info dir falls back to the old mtime check. No renewal:
+  an edit session is seconds, far below any renewal interval. TTL stays
+  120s.
+- **Fenced commit** — the Caddyfile commit's composed command now chains
+  the CADDY-LOCK guard after the app-fence guard (C01-2's prefix): a
+  holder whose lock was stale-broken has its late edit refused in-shell
+  (TEPLOY_FENCE_LOST / exit 75), so a broken editor cannot interleave
+  with the successor. Acquisition order documented and test-pinned:
+  app guard FIRST (long-held), caddy guard SECOND (brief) — never the
+  inverse, never across hosts.
+- **Conditional release** — releaseLock removes the lock only when its
+  info still names the releaser (the app locks' A04 lesson): a stale
+  holder's deferred release can no longer delete the successor's lock
+  and admit a third editor.
+- **The missing reconciliation** — deploy.Observe now classifies the
+  route evidence exactly: a managed block naming the attempted
+  candidates or the predecessor's containers is provable; a managed
+  block naming a THIRD generation (the dead-holder late-route-edit
+  shape) is CONFLICTING (Unknown), which Decide routes to INSPECT (R4)
+  — previously it collapsed into a false "route to predecessor" that
+  could yield a blind RETRY. No managed block at all is clean absence.
+
+**Evidence** — caddy tests: acquisition writes owner info and breaks a
+stale holder BY INFO AGE; a fresh (sub-TTL) holder is never broken; a
+broken holder's composed commit is refused and nothing lands; release
+against a successor-owned lock deletes nothing. Deploy test pins the
+app-guard-before-caddy-guard order on the commit command. Reconcile
+test: a third-generation route under predecessor authority yields
+Unknown route evidence → INSPECT; no managed block stays clean absence.
+The mock executor evaluates CHAINED guards (every guard must hold) and
+the stateful caddy fake gained the same evaluation. All pre-existing
+suites updated for the conditional-release command shape (assertions
+moved from `rmdir` to the conditional) and green. Gates: build/vet
+clean; `go test ./... -count=1` all packages ok; gofmt clean on touched
+files.
+
+**C01 locking-protocol redesign (C01-1/2/3) is now closed.** Residual
+C01: C01-8/C01-9 (F04 generation identities — deliberate containment),
+the A12/T05 rollback-route remainder of C01-7.

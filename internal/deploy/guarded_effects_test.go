@@ -162,3 +162,45 @@ func TestDeployFenced_WorkerStartRefusedOnTakeover(t *testing.T) {
 		}
 	}
 }
+
+// TestDeployFenced_CommitGuardOrder documents and pins the lock
+// ACQUISITION ORDER on the traffic-switch commit (C01-3): the app-level
+// fence guard precedes the short-lived shared-proxy (caddy) lock guard in
+// the composed command — app lock held for the whole lifecycle, caddy
+// commit lock held only for the brief edit+reload, never the inverse,
+// never across hosts.
+func TestDeployFenced_CommitGuardOrder(t *testing.T) {
+	app := "fency"
+	mock := ssh.NewMockExecutor("1.2.3.4", fenceHappyPathMocks(app)...)
+	lk, err := state.AcquireLockFenced(context.Background(), mock, app)
+	if err != nil {
+		t.Fatalf("AcquireLockFenced: %v", err)
+	}
+	var out strings.Builder
+	d := NewDeployer(mock, &out)
+	if err := d.DeployFenced(context.Background(), Config{
+		App:     app,
+		Domain:  "fency.com",
+		Image:   "fency:latest",
+		Version: "abc123",
+		Health:  HealthConfig{Timeout: 5 * time.Second, Interval: 10 * time.Millisecond},
+	}, lk); err != nil {
+		t.Fatalf("DeployFenced: %v", err)
+	}
+	guard := lk.GuardPrefix()
+	for _, c := range mock.Calls {
+		if !strings.Contains(c, "mv -fT -- ") || !strings.Contains(c, "/deployments/caddy/Caddyfile") {
+			continue
+		}
+		appIdx := strings.Index(c, guard)
+		caddyIdx := strings.Index(c, "/deployments/caddy/.lock/info")
+		if appIdx < 0 || caddyIdx < 0 {
+			t.Fatalf("commit command missing a guard:\n%s", c)
+		}
+		if appIdx > caddyIdx {
+			t.Fatalf("caddy lock guard must FOLLOW the app fence guard (documented acquisition order):\n%s", c)
+		}
+		return
+	}
+	t.Fatal("no composed Caddyfile commit found")
+}

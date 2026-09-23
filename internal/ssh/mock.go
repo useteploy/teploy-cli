@@ -142,25 +142,42 @@ func (m *MockExecutor) Run(ctx context.Context, cmd string) (string, error) {
 	return "", fmt.Errorf("mock: unexpected command: %s", cmd)
 }
 
-// evalFenceGuard recognizes the guard fragment produced by state.Lock. It
-// returns the remaining effect command ("" for a bare guard), whether the
-// guard holds against the recorded files, and whether cmd was a guard at
-// all. Must be called with m.mu held.
+// evalFenceGuard recognizes guard fragments produced by state.Lock and
+// the caddy lock (C01-3) — possibly CHAINED (an app-fence guard followed
+// by the caddy-lock guard on one commit command, C01-2/C01-3
+// composition). It returns the remaining effect command ("" for a bare
+// guard), whether EVERY guard holds against the recorded files, and
+// whether cmd carried at least one guard at all. Must be called with m.mu
+// held.
 func evalFenceGuard(files map[string][]byte, cmd string) (rest string, held, ok bool) {
 	const guardSep = " || { printf 'TEPLOY_FENCE_LOST\\n' >&2; exit 75; }; "
 	if !strings.HasPrefix(cmd, "grep -q ") {
 		return "", false, false
 	}
-	guard, effect := cmd, ""
-	if i := strings.Index(cmd, guardSep); i >= 0 {
-		guard, effect = cmd[:i], cmd[i+len(guardSep):]
+	effect := ""
+	held = true
+	ok = false
+	for strings.HasPrefix(cmd, "grep -q ") {
+		guard := cmd
+		if i := strings.Index(cmd, guardSep); i >= 0 {
+			guard, effect = cmd[:i], cmd[i+len(guardSep):]
+		} else {
+			effect = ""
+		}
+		owner, path, parsed := parseFenceGuard(guard)
+		if !parsed {
+			break
+		}
+		ok = true
+		data, present := files[path]
+		if !present || !bytes.Contains(data, []byte(owner)) {
+			held = false
+		}
+		cmd = effect
 	}
-	owner, path, parsed := parseFenceGuard(guard)
-	if !parsed {
+	if !ok {
 		return "", false, false
 	}
-	data, present := files[path]
-	held = present && bytes.Contains(data, []byte(owner))
 	return effect, held, true
 }
 

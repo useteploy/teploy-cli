@@ -110,10 +110,37 @@ func Observe(ctx context.Context, exec ssh.Executor, app, attempted, predecessor
 		o.RouteToCandidate, o.RouteToPredecessor = recovery.Unknown, recovery.Unknown
 	case !present:
 		o.RouteToCandidate, o.RouteToPredecessor = recovery.Absent, recovery.Absent
-	case strings.Contains(string(caddyfile), fmt.Sprintf("%s-web-%s", app, attempted)):
-		o.RouteToCandidate = recovery.Present
 	default:
-		o.RouteToPredecessor = recovery.Present
+		// C01-3's missing producer: classify the managed block EXACTLY.
+		// A block naming the attempted candidates (or the predecessor's
+		// containers) is provable evidence; a managed block that names
+		// NEITHER — a third generation no inventory can attribute, the
+		// dead-holder-late-route-edit shape — is CONFLICTING evidence
+		// (Unknown), which Decide routes to INSPECT (R4/R5), never a
+		// blind RETRY. No managed block for the app at all is clean
+		// absence. The old default (anything else = "route to
+		// predecessor") misread a foreign-generation route as the known
+		// predecessor's.
+		content := string(caddyfile)
+		candUpstream := fmt.Sprintf("%s-web-%s", app, attempted)
+		toCandidate := strings.Contains(content, candUpstream)
+		var toPredecessor bool
+		if predecessor != "" {
+			toPredecessor = strings.Contains(content, fmt.Sprintf("%s-web-%s", app, predecessor))
+		}
+		switch {
+		case toCandidate:
+			o.RouteToCandidate = recovery.Present
+			if toPredecessor {
+				o.RouteToPredecessor = recovery.Present
+			}
+		case toPredecessor:
+			o.RouteToPredecessor = recovery.Present
+		case strings.Contains(content, fmt.Sprintf("# TEPLOY BEGIN %s\n", app)):
+			o.RouteToCandidate, o.RouteToPredecessor = recovery.Unknown, recovery.Unknown
+		default:
+			o.RouteToCandidate, o.RouteToPredecessor = recovery.Absent, recovery.Absent
+		}
 	}
 
 	rec, err := releasemeta.Read(ctx, exec, app, attempted)

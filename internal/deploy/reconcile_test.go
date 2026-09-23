@@ -318,3 +318,37 @@ func mustReadState(t *testing.T, mock *ssh.MockExecutor, app string) *state.AppS
 	}
 	return st
 }
+
+// TestObserve_ForeignGenerationRouteIsConflicting: a managed Caddy block
+// naming a THIRD generation (neither the attempted release's candidates
+// nor the predecessor's containers — the dead-holder late-route-edit
+// shape) is CONFLICTING evidence (Unknown), which Decide sends to INSPECT
+// — the C01-3 producer/consumer for "conflicting route evidence" that
+// previously collapsed into a false "route to predecessor" and could
+// yield a blind RETRY.
+func TestObserve_ForeignGenerationRouteIsConflicting(t *testing.T) {
+	app := "fency"
+	thirdGen := "# TEPLOY BEGIN fency\nfency.com {\n\treverse_proxy fency-web-evilgen:80\n}\n# TEPLOY END fency\n"
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "docker ps --all --filter label=teploy.app='fency'", Output: containerJSON(app, "fency-web-old123", "old123", "running")},
+	)
+	mock.Files["/deployments/"+app+"/state.json"] = []byte(`{"schema_version":2,"deployment_type":"container","ingress_mode":"caddy","current_hash":"old123","updated_at":"2026-09-23T00:00:00Z"}`)
+	mock.Files["/deployments/caddy/Caddyfile"] = []byte(thirdGen)
+	o := Observe(context.Background(), mock, app, "newgen", "old123")
+	if o.RouteToCandidate != recovery.Unknown || o.RouteToPredecessor != recovery.Unknown {
+		t.Fatalf("expected conflicting route evidence (Unknown), got candidate=%v predecessor=%v", o.RouteToCandidate, o.RouteToPredecessor)
+	}
+	if disp := recovery.Decide(recovery.Admitted, o); disp != recovery.Inspect {
+		t.Fatalf("expected INSPECT over conflicting route evidence, got %v", disp)
+	}
+
+	// No managed block for the app at all is clean absence, not conflict.
+	mock2 := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "docker ps --all --filter label=teploy.app='fency'", Output: ""},
+	)
+	mock2.Files["/deployments/caddy/Caddyfile"] = []byte("other.com {\n\trespond 200\n}\n")
+	o2 := Observe(context.Background(), mock2, app, "newgen", "old123")
+	if o2.RouteToCandidate != recovery.Absent || o2.RouteToPredecessor != recovery.Absent {
+		t.Fatalf("expected absent route evidence without a managed block, got candidate=%v predecessor=%v", o2.RouteToCandidate, o2.RouteToPredecessor)
+	}
+}

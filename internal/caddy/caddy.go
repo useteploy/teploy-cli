@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/url"
@@ -14,6 +15,12 @@ import (
 
 	"github.com/useteploy/teploy/internal/ssh"
 )
+
+// fenceLostMarker mirrors state's guard marker (unexported there): the
+// stderr sentinel a composed guard emits when refusing an effect. Shared
+// by value so the caddy lock's guard is refusal-identifiable by the same
+// string handling (state.FenceLost matches it in error text).
+const fenceLostMarker = "TEPLOY_FENCE_LOST"
 
 const (
 	caddyfilePath = "/deployments/caddy/Caddyfile"
@@ -462,10 +469,11 @@ func (c *Client) RemoveMaintenance(ctx context.Context, app string) error {
 // (refusing to clean up one's own partial effects is how a fencing design
 // strands an app).
 func (c *Client) mutate(ctx context.Context, transform func(prev string) (string, error)) error {
-	if err := c.acquireLock(ctx); err != nil {
+	lockOwner, err := c.acquireLock(ctx)
+	if err != nil {
 		return err
 	}
-	defer c.releaseLock(ctx)
+	defer c.releaseLock(ctx, lockOwner)
 
 	prev, err := c.exec.Run(ctx, "cat "+caddyfilePath)
 	if err != nil {
@@ -492,9 +500,13 @@ func (c *Client) mutate(ctx context.Context, transform func(prev string) (string
 		return fmt.Errorf("refusing to write a Caddyfile the server's caddy rejects: %w", err)
 	}
 
-	// Stage (inert) then commit under the fence guard in one shell — the
-	// C01-2 composition for the route switch. A refused commit propagates
-	// the fence error; the staged file is cleaned up here (bounded).
+	// Stage (inert) then commit under the fence guards in one shell — the
+	// C01-2/C01-3 composition: the APP fence (when the caller holds one)
+	// and the CADDY-LOCK fence (this mutation's own lock, owner-tagged)
+	// both precede the rename, so a broken app holder's route edit AND a
+	// stale-broken editor's late write are refused in-shell. A refused
+	// commit propagates the fence error; the staged file is cleaned up
+	// here (bounded).
 	tmp, err := c.stageCaddyfile(ctx, updated)
 	if err != nil {
 		return err
@@ -507,7 +519,7 @@ func (c *Client) mutate(ctx context.Context, transform func(prev string) (string
 			cancel()
 		}
 	}()
-	if err := c.commitCaddyfile(ctx, tmp, c.commitGuardPrefix); err != nil {
+	if err := c.commitCaddyfile(ctx, tmp, c.commitGuardPrefix+caddyGuardFragment(lockOwner)); err != nil {
 		return err
 	}
 	committed = true
@@ -746,7 +758,7 @@ func (c *Client) commitCaddyfile(ctx context.Context, tmpPath, guardPrefix strin
 	cmd := guardPrefix + "mv -fT -- " + ssh.ShellQuote(tmpPath) + " " + ssh.ShellQuote(caddyfilePath)
 	_, err := c.exec.Run(ctx, cmd)
 	if err != nil && guardPrefix != "" && fenceRefused(err) {
-		return fmt.Errorf("caddyfile commit refused — the deploy lock fence was lost, the route edit did not land: %w", err)
+		return fmt.Errorf("caddyfile commit refused — a lock fence was lost (app lock or caddy lock no longer names this operation), the route edit did not land: %w", err)
 	}
 	if err != nil {
 		return fmt.Errorf("committing caddyfile: %w", err)
@@ -774,32 +786,120 @@ func (c *Client) reload(ctx context.Context) error {
 	return nil
 }
 
-// acquireLock takes a mkdir-based mutex on the Caddyfile, breaking a stale lock
-// left by a crashed deploy. Held only for the brief edit+reload, so contention
-// is rare and short.
-func (c *Client) acquireLock(ctx context.Context) error {
-	for i := 0; i < lockWaitTries; i++ {
-		if _, err := c.exec.Run(ctx, "mkdir "+lockDir); err == nil {
-			return nil
-		}
-		// Break a stale lock (older than staleLockSeconds), then wait and retry.
-		c.exec.Run(ctx, fmt.Sprintf(
-			"[ -d %s ] && [ $(( $(date +%%s) - $(stat -c %%Y %s 2>/dev/null || echo 0) )) -gt %d ] && rm -rf %s || true",
-			lockDir, lockDir, staleLockSeconds, lockDir,
-		))
-		c.exec.Run(ctx, "sleep 0.5")
-	}
-	return fmt.Errorf("timed out acquiring caddy lock %s", lockDir)
+// caddyLockInfo is the shared-proxy commit lock's identity file (C01-3).
+// Pre-C01-3 the lock was a bare mkdir with no owner: any mutator broke it
+// after staleLockSeconds by DIRECTORY MTIME and a slow-but-alive orphaned
+// editor could interleave its Caddyfile edit+reload with the new owner's
+// mutate. The shape mirrors the app locks (state.LockInfo): an owner
+// token, and staleness measured from the info's own timestamp. The TTL
+// stays short (edits are seconds); there is no renewal — an edit session
+// is far shorter than any plausible renewal interval.
+type caddyLockInfo struct {
+	Type  string `json:"type"`
+	Owner string `json:"owner"`
+	TS    string `json:"ts"`
 }
 
-func (c *Client) releaseLock(ctx context.Context) {
-	// A detached, bounded context: releasing with the operation's context
-	// let a cancelled deploy skip the rmdir entirely, leaving the lock dir
-	// behind to block every subsequent Caddy mutation for the stale window
-	// (TCL-05 containment — the release must survive caller cancellation).
+// newCaddyOwner mints the lock's fencing token.
+func newCaddyOwner() string {
+	var b [16]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// crypto/rand failing is catastrophic-environment territory; a
+		// time-derived token still unique-ifies this process's edits.
+		return fmt.Sprintf("caddy-%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b[:])
+}
+
+// acquireLock takes the shared-proxy commit lock (mkdir + owner-tagged
+// info), breaking a STALE holder's lock first. Staleness is measured from
+// the info file's timestamp when one exists (C01-3); a legacy lock dir
+// with no info falls back to the directory-mtime age check. The returned
+// owner token fences the commit: a holder whose lock was broken (or whose
+// info no longer names it) has its Caddyfile commit refused by the
+// composed guard instead of interleaving with the new owner's edit.
+func (c *Client) acquireLock(ctx context.Context) (string, error) {
+	owner := newCaddyOwner()
+	for i := 0; i < lockWaitTries; i++ {
+		if _, err := c.exec.Run(ctx, "mkdir "+lockDir); err == nil {
+			if err := c.writeCaddyLockInfo(ctx, owner); err != nil {
+				// Our own fresh lock with no successor possible: an
+				// unconditional release is correct here.
+				c.exec.Run(ctx, "rm -rf "+lockDir)
+				return "", err
+			}
+			return owner, nil
+		}
+		if c.caddyLockStale(ctx) {
+			c.exec.Run(ctx, "rm -rf "+lockDir)
+			continue
+		}
+		c.exec.Run(ctx, "sleep 0.5")
+	}
+	return "", fmt.Errorf("timed out acquiring caddy lock %s", lockDir)
+}
+
+// caddyLockStale reports whether the existing lock may be broken: an
+// info-carrying lock (C01-3) is stale when its OWN timestamp is older
+// than staleLockSeconds (unparseable timestamp = stale — the app locks'
+// rule); a legacy no-info dir is stale by directory mtime, the pre-C01-3
+// behavior.
+func (c *Client) caddyLockStale(ctx context.Context) bool {
+	if out, err := c.exec.Run(ctx, "cat "+lockDir+"/info 2>/dev/null"); err == nil && strings.TrimSpace(out) != "" {
+		var info caddyLockInfo
+		if err := json.Unmarshal([]byte(strings.TrimSpace(out)), &info); err != nil {
+			return true
+		}
+		ts, err := time.Parse(time.RFC3339, info.TS)
+		if err != nil {
+			return true
+		}
+		return time.Since(ts) > staleLockSeconds*time.Second
+	}
+	// Legacy dir (no info): the old mtime-based break.
+	out, err := c.exec.Run(ctx, fmt.Sprintf(
+		"[ -d %s ] && [ $(( $(date +%%s) - $(stat -c %%Y %s 2>/dev/null || echo 0) )) -gt %d ] && echo stale || echo fresh",
+		lockDir, lockDir, staleLockSeconds,
+	))
+	return err == nil && strings.TrimSpace(out) == "stale"
+}
+
+func (c *Client) writeCaddyLockInfo(ctx context.Context, owner string) error {
+	info, err := json.Marshal(caddyLockInfo{
+		Type:  "caddy-edit",
+		Owner: owner,
+		TS:    time.Now().UTC().Format(time.RFC3339),
+	})
+	if err != nil {
+		return err
+	}
+	if err := c.exec.Upload(ctx, strings.NewReader(string(info)), lockDir+"/info", "0644"); err != nil {
+		return fmt.Errorf("writing caddy lock info: %w", err)
+	}
+	return nil
+}
+
+// caddyGuardFragment is the caddy lock's holdership guard — the same
+// shape as the app lock's (state.Lock.guardFragment) so transport-level
+// refusal handling and the mock executor treat both identically.
+func caddyGuardFragment(owner string) string {
+	return fmt.Sprintf("grep -q %s %s || { printf '%s\\n' >&2; exit 75; }; ",
+		ssh.ShellQuote(owner), ssh.ShellQuote(lockDir+"/info"), fenceLostMarker)
+}
+
+// releaseLock removes the caddy lock ONLY when its info still names this
+// owner (C01-3, the app locks' A04 lesson): after a stale break and
+// re-acquire, an unconditional rmdir would delete the SUCCESSOR's lock
+// and admit a third editor. A lock naming someone else is left strictly
+// alone; a detached bounded context keeps the release alive past caller
+// cancellation (TCL-05).
+func (c *Client) releaseLock(ctx context.Context, owner string) {
 	rctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	c.exec.Run(rctx, "rmdir "+lockDir+" 2>/dev/null || true")
+	c.exec.Run(rctx, fmt.Sprintf(
+		"if [ -d %s ] && grep -q %s %s 2>/dev/null; then rm -rf -- %s; fi",
+		ssh.ShellQuote(lockDir), ssh.ShellQuote(owner), ssh.ShellQuote(lockDir+"/info"), ssh.ShellQuote(lockDir),
+	))
 }
 
 // removeForeignHostBlocks' whole-block rule moved to routes.go's
