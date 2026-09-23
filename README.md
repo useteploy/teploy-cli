@@ -336,6 +336,9 @@ teploy exec <server> <cmd>                # run a command on the server (SSH)
 teploy app exec -- <cmd>                  # run a command in the app container (migrations, etc.)
 teploy validate                           # check config and server readiness
 teploy doctor [--server <name>]           # read-only diagnostics: toolchain, SSH, Docker, registry, Caddy, disk, compatibility, repair debt (--json for machines; exit 1 if any check fails, never 2)
+teploy plan                               # preview what a deploy would change (containers, routing, env, storage, resources; read-only)
+teploy plan --out plan.json               # write a bound plan record (config digest + target identity + generation)
+teploy apply plan.json                    # execute a reviewed plan; refuses naming what drifted since it was made
 teploy scale <count>                      # multi-server deploy + LB update
 teploy version / update                   # version info and self-update
 ```
