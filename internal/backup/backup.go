@@ -574,12 +574,22 @@ func (c *Client) AccessoryBackup(ctx context.Context, app, name, image string, e
 	case isDBType(image, "mysql"), isDBType(image, "mariadb"):
 		db := mysqlDB(app, env)
 		s3Key = fmt.Sprintf("s3://%s/%s/accessories/%s/%s.sql.gz", s3.Bucket, app, name, timestamp)
-		// Root password via MYSQL_PWD container env, never a command-line
-		// flag: mysqldump/mysql argv is visible in `ps` inside the
-		// container. Absent = current behavior (passwordless root).
+		// Root password via a 0600 env-file consumed by `docker exec
+		// --env-file`, never on any argv. The old `-e MYSQL_PWD=<pwd>`
+		// form kept the secret off the mysqldump argv but left it on the
+		// DOCKER EXEC argv — visible in the host's `ps` for the life of
+		// the dump (C08). The file lives in the 0700 backup workspace
+		// and dies with it on every path (cleanup removes the workspace
+		// on failure and success alike). Absent = current behavior
+		// (passwordless root).
 		execEnv := ""
 		if pwd := mysqlRootPassword(env); pwd != "" {
-			execEnv = " -e MYSQL_PWD=" + ssh.ShellQuote(pwd)
+			envFile := workDir + "/mysql.env"
+			if err := c.exec.Upload(ctx, strings.NewReader("MYSQL_PWD="+pwd+"\n"), envFile, "0600"); err != nil {
+				cleanup()
+				return fmt.Errorf("staging the mysql credential file for %s (no dump was run): %w", name, err)
+			}
+			execEnv = " --env-file " + ssh.ShellQuote(envFile)
 		}
 		dumpCmd = fmt.Sprintf("docker exec%s %s mysqldump -u root %s > %s && gzip -c %s > %s",
 			execEnv, qContainer, ssh.ShellQuote(db), ssh.ShellQuote(dumpTmp), ssh.ShellQuote(dumpTmp), ssh.ShellQuote(dumpPath))
@@ -707,10 +717,18 @@ func (c *Client) AccessoryRestore(ctx context.Context, app, name, image, date st
 		// restore was deterministically broken (audit F31).
 		s3Key = fmt.Sprintf("s3://%s/%s/accessories/%s/%s.sql.gz", s3.Bucket, app, name, date)
 		restorePath = tmpdir + "/restore.sql.gz"
-		// Same MYSQL_PWD env injection as the backup path (see there).
+		// Same 0600 env-file credential transport as the backup path
+		// (see there) — the password rides in no argv. The restore
+		// failure path DELIBERATELY keeps tmpdir for inspection, so the
+		// credential file must be removed by name there: keep the SQL,
+		// never the secret (C08).
 		execEnv := ""
 		if pwd := mysqlRootPassword(env); pwd != "" {
-			execEnv = " -e MYSQL_PWD=" + ssh.ShellQuote(pwd)
+			envFile := tmpdir + "/mysql.env"
+			if err := c.exec.Upload(ctx, strings.NewReader("MYSQL_PWD="+pwd+"\n"), envFile, "0600"); err != nil {
+				return keepTmp(fmt.Errorf("staging the mysql credential file for %s: %w", name, err))
+			}
+			execEnv = " --env-file " + ssh.ShellQuote(envFile)
 		}
 		// Same pipeline-to-redirect shape as postgres (mysql itself exits
 		// nonzero on SQL errors when reading a script, but gunzip's failure
@@ -718,6 +736,12 @@ func (c *Client) AccessoryRestore(ctx context.Context, app, name, image, date st
 		sqlPath := tmpdir + "/restore.sql"
 		restoreCmd = fmt.Sprintf("gunzip -c %s > %s && docker exec -i%s %s mysql -u root %s < %s",
 			ssh.ShellQuote(restorePath), ssh.ShellQuote(sqlPath), execEnv, qContainer, ssh.ShellQuote(db), ssh.ShellQuote(sqlPath))
+		// The kept-on-failure scratch dir must never keep the credential.
+		innerKeep := keepTmp
+		keepTmp = func(err error) error {
+			c.exec.Run(context.WithoutCancel(ctx), "rm -f "+ssh.ShellQuote(tmpdir+"/mysql.env"))
+			return innerKeep(err)
+		}
 	case isDBType(image, "mongo"):
 		s3Key = fmt.Sprintf("s3://%s/%s/accessories/%s/%s.archive.gz", s3.Bucket, app, name, date)
 		restorePath = tmpdir + "/restore.archive.gz"
@@ -951,9 +975,10 @@ func mysqlDB(app string, env map[string]string) string {
 
 // mysqlRootPassword resolves the root password the mysql/mariadb containers
 // themselves honor (MYSQL_ROOT_PASSWORD, falling back to MYSQL_PASSWORD).
-// Used to inject MYSQL_PWD into docker exec as container env — never as a
-// command-line argument, which would expose the password in `ps` output.
-// Empty means no password configured; callers keep the bare command.
+// Used to stage MYSQL_PWD in a 0600 env-file consumed by `docker exec
+// --env-file` — never on any argv, which would expose the password in
+// the host's `ps` output. Empty means no password configured; callers
+// keep the bare command.
 func mysqlRootPassword(env map[string]string) string {
 	if pwd := env["MYSQL_ROOT_PASSWORD"]; pwd != "" {
 		return pwd

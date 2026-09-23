@@ -3,10 +3,12 @@ package cli
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
 
+	"github.com/useteploy/teploy/internal/network"
 	"github.com/useteploy/teploy/internal/ssh"
 )
 
@@ -468,5 +470,149 @@ func TestSetupServer_UFWActive(t *testing.T) {
 
 	if !strings.Contains(buf.String(), "Opened ports 80 and 443") {
 		t.Error("should report ports opened")
+	}
+}
+
+// TestInstallSudoViaSu_SecretTransport pins the C08 transport for the
+// root password: it travels the session stdin (recorded in Inputs),
+// never a command string, and no /tmp script artifact is uploaded.
+func TestInstallSudoViaSu_SecretTransport(t *testing.T) {
+	mock := ssh.NewMockExecutor("h",
+		ssh.MockCommand{Match: "su -c", Output: "TEPLOY_SUDO_OK\n"},
+	)
+	err := installSudoViaSu(context.Background(), mock, "tyler", "root-pw-123")
+	if err != nil {
+		t.Fatalf("installSudoViaSu: %v", err)
+	}
+	for _, call := range mock.Calls {
+		if strings.Contains(call, "root-pw-123") {
+			t.Errorf("root password in command argv: %s", call)
+		}
+		if strings.HasPrefix(call, "UPLOAD:") && strings.Contains(call, "/tmp/") {
+			t.Errorf("the su path must not stage a script artifact: %s", call)
+		}
+	}
+	if len(mock.Inputs) != 1 || mock.Inputs[0] != "root-pw-123\n" {
+		t.Fatalf("root password must ride stdin as one line, inputs: %v", mock.Inputs)
+	}
+	if call := mock.Calls[0]; !strings.HasPrefix(call, "su -c ") || !strings.Contains(call, "TEPLOY_SUDO_OK") {
+		t.Fatalf("unexpected su command shape: %s", call)
+	}
+}
+
+// TestInstallSudoViaSu_WrongPassword keeps the actionable failure.
+func TestInstallSudoViaSu_WrongPassword(t *testing.T) {
+	mock := ssh.NewMockExecutor("h",
+		ssh.MockCommand{Match: "su -c", Err: errors.New("exit status 1: su: Authentication failure")},
+	)
+	err := installSudoViaSu(context.Background(), mock, "tyler", "nope")
+	if err == nil || !strings.Contains(err.Error(), "wrong root password") {
+		t.Fatalf("wrong password = %v, want wrong-root-password error", err)
+	}
+}
+
+// TestVPNJoinCommand_NoCredentialInArgv pins the join shape: the key
+// file is read, removed, and fed via the provider env var — the literal
+// credential appears nowhere in the command.
+func TestVPNJoinCommand_NoCredentialInArgv(t *testing.T) {
+	cfg := network.Config{Provider: "tailscale", AuthKey: "tskey-auth-secret123"}
+	cmd := vpnJoinCommand("tailscale", cfg, "sudo ", "/tmp/teploy-vpn-key-abc")
+	if strings.Contains(cmd, "tskey-auth-secret123") {
+		t.Fatalf("auth key leaked into the join command: %s", cmd)
+	}
+	for _, want := range []string{
+		"nohup sh -c ",
+		"k=$(cat /tmp/teploy-vpn-key-abc)",
+		"rm -f -- /tmp/teploy-vpn-key-abc",
+		`export TS_AUTHKEY="$k"`,
+		"exec tailscale up --accept-routes",
+	} {
+		if !strings.Contains(cmd, want) {
+			t.Errorf("join command missing %q:\n%s", want, cmd)
+		}
+	}
+
+	headscale := network.Config{Provider: "headscale", AuthKey: "tskey-secret", Server: "https://hs.example.com"}
+	cmd = vpnJoinCommand("headscale", headscale, "", "/tmp/k")
+	if strings.Contains(cmd, "tskey-secret") {
+		t.Fatalf("headscale auth key leaked: %s", cmd)
+	}
+	if !strings.Contains(cmd, "--login-server=") || !strings.Contains(cmd, "https://hs.example.com") {
+		t.Errorf("headscale login server missing: %s", cmd)
+	}
+
+	nb := network.Config{Provider: "netbird", SetupKey: "nb-secret"}
+	cmd = vpnJoinCommand("netbird", nb, "", "/tmp/k")
+	if strings.Contains(cmd, "nb-secret") {
+		t.Fatalf("netbird setup key leaked: %s", cmd)
+	}
+	if !strings.Contains(cmd, `export NB_SETUP_KEY="$k"`) || !strings.Contains(cmd, "exec netbird up") {
+		t.Errorf("netbird join shape wrong: %s", cmd)
+	}
+}
+
+// TestJoinVPNMesh_StagesPrivateFileAndCleansUp pins the staging
+// mechanics: the credential is uploaded 0600 exactly once, and the join
+// command references that path.
+func TestJoinVPNMesh_StagesPrivateFileAndCleansUp(t *testing.T) {
+	mock := ssh.NewMockExecutor("h",
+		ssh.MockCommand{Match: "nohup sh -c", Output: ""},
+	)
+	cfg := network.Config{Provider: "tailscale", AuthKey: "tskey-auth-x"}
+	if err := joinVPNMesh(context.Background(), mock, "", "tailscale", cfg); err != nil {
+		t.Fatalf("joinVPNMesh: %v", err)
+	}
+	uploads := 0
+	for _, call := range mock.Calls {
+		if strings.HasPrefix(call, "UPLOAD:") {
+			uploads++
+			if !strings.Contains(call, "mode 0600") || !strings.Contains(call, "/tmp/teploy-vpn-key-") {
+				t.Errorf("credential must upload 0600 to the key path: %s", call)
+			}
+		}
+		if strings.Contains(call, "tskey-auth-x") {
+			t.Errorf("credential in command argv: %s", call)
+		}
+	}
+	if uploads != 1 {
+		t.Fatalf("expected exactly one credential upload, got %d (calls: %v)", uploads, mock.Calls)
+	}
+}
+
+// TestRegistryLoginOnServer_PasswordNeverInArgv pins the registry login
+// transport: the password rides stdin (docker --password-stdin), and no
+// command string — including the printf pipe form — carries it.
+func TestRegistryLoginOnServer_PasswordNeverInArgv(t *testing.T) {
+	mock := ssh.NewMockExecutor("h",
+		ssh.MockCommand{Match: "docker login", Output: "Login Succeeded"},
+	)
+	if err := registryLoginOnServer(context.Background(), mock, "ghcr.io", "user", "pw-hunter2"); err != nil {
+		t.Fatalf("registryLoginOnServer: %v", err)
+	}
+	if len(mock.Calls) != 1 {
+		t.Fatalf("expected one command, got %v", mock.Calls)
+	}
+	call := mock.Calls[0]
+	if !strings.HasPrefix(call, "docker login 'ghcr.io' -u 'user' --password-stdin") || strings.Contains(call, "printf") {
+		t.Errorf("login command shape wrong: %s", call)
+	}
+	if strings.Contains(call, "pw-hunter2") {
+		t.Errorf("password in command argv: %s", call)
+	}
+	if len(mock.Inputs) != 1 || mock.Inputs[0] != "pw-hunter2" {
+		t.Fatalf("password must ride stdin verbatim, inputs: %v", mock.Inputs)
+	}
+}
+
+// TestRegistryLoginOnServer_FailureSurfacesDiagnostics pins that a
+// refused login names docker's own stderr (RunInput's discard-both
+// contract used to hide it).
+func TestRegistryLoginOnServer_FailureSurfacesDiagnostics(t *testing.T) {
+	mock := ssh.NewMockExecutor("h",
+		ssh.MockCommand{Match: "docker login", Err: errors.New("exit status 1: Error response from daemon: unauthorized")},
+	)
+	err := registryLoginOnServer(context.Background(), mock, "ghcr.io", "user", "bad")
+	if err == nil || !strings.Contains(err.Error(), "unauthorized") {
+		t.Fatalf("refused login = %v, want docker's stderr surfaced", err)
 	}
 }

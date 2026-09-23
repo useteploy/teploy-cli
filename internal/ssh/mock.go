@@ -319,7 +319,18 @@ func (m *MockExecutor) runDetailed(ctx context.Context, cmd string, stdin io.Rea
 	var out string
 	var err error
 	if stdin != nil {
-		err = m.RunInput(ctx, cmd, stdin)
+		// Record the payload (the secret-transport pins read Inputs),
+		// then evaluate the command with the same output contract as the
+		// non-stdin path — RunInput's error-only signature would lose
+		// the output the structured caller exists to see.
+		data, readErr := io.ReadAll(stdin)
+		if readErr != nil {
+			return Result{ExitCode: -1, Err: readErr}
+		}
+		m.mu.Lock()
+		m.Inputs = append(m.Inputs, string(data))
+		m.mu.Unlock()
+		out, err = m.Run(ctx, cmd)
 	} else {
 		out, err = m.Run(ctx, cmd)
 	}

@@ -2,6 +2,8 @@ package cli
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -152,22 +154,14 @@ func runSetup(flags *Flags, host string, name string, noHarden bool, networkProv
 			}
 			rootExec.Close()
 		} else {
-			// Root SSH denied — use expect-style su via the existing tyler connection.
-			// Write a helper script that uses su with the password from a file.
-			script := fmt.Sprintf(`#!/bin/bash
-exec 2>&1
-echo '%s' | su -c 'DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq sudo >/dev/null 2>&1 && usermod -aG sudo %s && echo "%s ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/%s && chmod 440 /etc/sudoers.d/%s && echo TEPLOY_SUDO_OK' - root 2>&1
-`, strings.ReplaceAll(rootPass, "'", "'\"'\"'"), user, user, user, user)
-			if err := executor.Upload(ctx, strings.NewReader(script), "/tmp/teploy_install_sudo.sh", "0700"); err != nil {
-				return fmt.Errorf("uploading sudo installer: %w", err)
-			}
-			out, err := executor.Run(ctx, "/tmp/teploy_install_sudo.sh")
-			executor.Run(ctx, "rm -f /tmp/teploy_install_sudo.sh")
-			if err != nil || !strings.Contains(out, "TEPLOY_SUDO_OK") {
-				if strings.Contains(out, "Authentication failure") {
-					return fmt.Errorf("wrong root password")
-				}
-				return fmt.Errorf("installing sudo via su failed: %s", out)
+			// Root SSH denied — run su over the existing connection.
+			// The root password travels the session's stdin and nowhere
+			// else: the old path embedded it in a script uploaded to
+			// /tmp (an on-disk artifact) whose removal was best-effort —
+			// a failed run could leave the root password sitting in
+			// /tmp (C08).
+			if err := installSudoViaSu(ctx, executor, user, rootPass); err != nil {
+				return err
 			}
 		}
 		fmt.Printf("  sudo installed, %s added to sudo group\n", user)
@@ -238,6 +232,30 @@ echo '%s' | su -c 'DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_F
 	return nil
 }
 
+// installSudoViaSu installs sudo + configures passwordless sudo for
+// user by feeding su the root password over the session's stdin. No
+// temp file, no password in any command string (C08). Success is the
+// TEPLOY_SUDO_OK marker — su's own exit status alone does not prove the
+// whole chain ran.
+func installSudoViaSu(ctx context.Context, executor ssh.Executor, user, rootPass string) error {
+	inner := fmt.Sprintf(
+		`DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq sudo >/dev/null 2>&1 && usermod -aG sudo %s && printf '%%s\n' %s > /etc/sudoers.d/%s && chmod 440 /etc/sudoers.d/%s && echo TEPLOY_SUDO_OK`,
+		user, ssh.ShellQuote(user+" ALL=(ALL) NOPASSWD:ALL"), user, user)
+	cmd := "su -c " + ssh.ShellQuote(inner) + " - root"
+	res := ssh.RunInputDetailed(ctx, executor, cmd, strings.NewReader(rootPass+"\n"))
+	combined := string(res.Stdout) + "\n" + string(res.Stderr)
+	if res.Err == nil && strings.Contains(combined, "TEPLOY_SUDO_OK") {
+		return nil
+	}
+	if strings.Contains(combined, "Authentication failure") {
+		return fmt.Errorf("wrong root password")
+	}
+	if res.Err != nil {
+		return fmt.Errorf("installing sudo via su: %w", res.Err)
+	}
+	return fmt.Errorf("installing sudo via su failed: %s", strings.TrimSpace(combined))
+}
+
 // setupNetwork installs the VPN provider, joins the mesh, and returns the VPN IP.
 func setupNetwork(ctx context.Context, exec ssh.Executor, w io.Writer, providerName string, authKeyFlag string) (string, error) {
 	cfg, err := resolveNetworkConfig(providerName, authKeyFlag)
@@ -290,18 +308,9 @@ func setupNetwork(ctx context.Context, exec ssh.Executor, w io.Writer, providerN
 	// Tailscale/Headscale modifies iptables which can kill the SSH connection,
 	// so we detach the command and poll from the local machine instead.
 	fmt.Fprintf(w, "Joining %s mesh...\n", providerName)
-	var joinCmd string
-	// Single-quote user-provided mesh credentials (auth keys, login server) so a
-	// value with a shell metacharacter can't break out of the join command.
-	switch providerName {
-	case "tailscale":
-		joinCmd = fmt.Sprintf(sudo+"nohup tailscale up --authkey=%s --accept-routes >/dev/null 2>&1 &", ssh.ShellQuote(cfg.AuthKey))
-	case "headscale":
-		joinCmd = fmt.Sprintf(sudo+"nohup tailscale up --login-server=%s --authkey=%s --accept-routes >/dev/null 2>&1 &", ssh.ShellQuote(cfg.Server), ssh.ShellQuote(cfg.AuthKey))
-	case "netbird":
-		joinCmd = fmt.Sprintf(sudo+"nohup netbird up --setup-key %s >/dev/null 2>&1 &", ssh.ShellQuote(cfg.SetupKey))
+	if err := joinVPNMesh(ctx, exec, sudo, providerName, cfg); err != nil {
+		return "", err
 	}
-	exec.Run(ctx, joinCmd) // ignore error — connection may die
 
 	// Poll locally for the node to appear on our tailnet.
 	fmt.Fprintf(w, "  Waiting for node to appear on tailnet...\n")
@@ -331,6 +340,68 @@ func setupNetwork(ctx context.Context, exec ssh.Executor, w io.Writer, providerN
 
 	fmt.Fprintf(w, "  VPN IP: %s\n", vpnIP)
 	return vpnIP, nil
+}
+
+// vpnCredential resolves the provider's join credential and the env var
+// its CLI documents for it (tailscale up reads TS_AUTHKEY, netbird up
+// reads NB_SETUP_KEY).
+func vpnCredential(providerName string, cfg network.Config) (envVar, value string, err error) {
+	switch providerName {
+	case "tailscale", "headscale":
+		return "TS_AUTHKEY", cfg.AuthKey, nil
+	case "netbird":
+		return "NB_SETUP_KEY", cfg.SetupKey, nil
+	default:
+		return "", "", fmt.Errorf("unknown network provider: %q", providerName)
+	}
+}
+
+// joinVPNMesh stages the join credential in a private file and fires the
+// detached provider join. The credential never enters any command
+// string: the detached shell reads the file into the provider's env
+// var, removes the file BEFORE exec'ing the provider, then execs (C08).
+// Failure semantics: an upload failure aborts setup with the file path
+// named (nothing was joined); a join failure after that surfaces
+// through the tailnet wait below, and the key file is gone regardless —
+// its only reader is the rm-ing shell itself.
+func joinVPNMesh(ctx context.Context, exec ssh.Executor, sudo, providerName string, cfg network.Config) error {
+	_, credential, err := vpnCredential(providerName, cfg)
+	if err != nil {
+		return err
+	}
+	if credential == "" {
+		return fmt.Errorf("%s join credential is empty", providerName)
+	}
+	var suffix [8]byte
+	if _, err := rand.Read(suffix[:]); err != nil {
+		return fmt.Errorf("generating key file name: %w", err)
+	}
+	keyPath := fmt.Sprintf("/tmp/teploy-vpn-key-%s", hex.EncodeToString(suffix[:]))
+	if err := exec.Upload(ctx, strings.NewReader(credential), keyPath, "0600"); err != nil {
+		return fmt.Errorf("staging the %s join credential at %s: %w", providerName, keyPath, err)
+	}
+	_, _ = exec.Run(ctx, vpnJoinCommand(providerName, cfg, sudo, keyPath))
+	return nil
+}
+
+// vpnJoinCommand renders the detached join: `cat` the key file into the
+// provider's env var, remove the file, then exec the provider. The
+// login-server URL (headscale) is not a secret and stays a plain flag.
+func vpnJoinCommand(providerName string, cfg network.Config, sudo, keyPath string) string {
+	envVar, credential, _ := vpnCredential(providerName, cfg)
+	_ = credential
+	// keyPath needs no inner-shell quoting: it is generated here
+	// (/tmp/teploy-vpn-key- + hex), never operator-supplied.
+	inner := fmt.Sprintf(`k=$(cat %s) && rm -f -- %s && export %s="$k" && exec `, keyPath, keyPath, envVar)
+	switch providerName {
+	case "tailscale":
+		inner += "tailscale up --accept-routes"
+	case "headscale":
+		inner += "tailscale up --login-server=" + ssh.ShellQuote(cfg.Server) + " --accept-routes"
+	case "netbird":
+		inner += "netbird up"
+	}
+	return sudo + "nohup sh -c " + ssh.ShellQuote(inner) + " >/dev/null 2>&1 &"
 }
 
 // runLocal executes a command on the local machine and returns its output.

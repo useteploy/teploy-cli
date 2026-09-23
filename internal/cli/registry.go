@@ -87,17 +87,33 @@ func runRegistryLogin(flags *Flags, registry, serverName, username, password str
 		}
 	}
 
-	// Single-quote every value so the remote shell can't expand or execute it.
-	// `echo %q` used double quotes, under which $/backticks in the password (or
-	// registry/username) still expand — a shell-injection running as the SSH
-	// user. printf '%s' emits the password literally to docker --password-stdin.
-	cmd := fmt.Sprintf("printf '%%s' %s | docker login %s -u %s --password-stdin",
-		ssh.ShellQuote(password), ssh.ShellQuote(registry), ssh.ShellQuote(username))
-	if _, err := executor.Run(ctx, cmd); err != nil {
-		return fmt.Errorf("docker login failed: %w", err)
+	// The password travels over the SSH session's stdin, never in the
+	// command string: the old `printf '%s' '<password>' | docker login
+	// --password-stdin` put the secret in the session shell's argv —
+	// visible in the server's process list for the life of the login
+	// and in any command-bearing error output. docker reads it from
+	// stdin either way; only the transport channel changed (C08).
+	if err := registryLoginOnServer(ctx, executor, registry, username, password); err != nil {
+		return err
 	}
 
 	fmt.Printf("Logged in to %s on server\n", registry)
+	return nil
+}
+
+// registryLoginOnServer runs `docker login` on the server with the
+// password streamed over stdin. Split from runRegistryLogin so the
+// transport contract is pinnable without standing up the connect path.
+func registryLoginOnServer(ctx context.Context, executor ssh.Executor, registry, username, password string) error {
+	cmd := fmt.Sprintf("docker login %s -u %s --password-stdin",
+		ssh.ShellQuote(registry), ssh.ShellQuote(username))
+	res := ssh.RunInputDetailed(ctx, executor, cmd, strings.NewReader(password))
+	if res.Err != nil {
+		return fmt.Errorf("docker login failed: %w", res.Err)
+	}
+	if res.ExitCode != 0 {
+		return fmt.Errorf("docker login failed: %s", res.ExitErrorText())
+	}
 	return nil
 }
 
