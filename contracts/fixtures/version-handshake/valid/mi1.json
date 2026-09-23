@@ -7,6 +7,7 @@
     "error-envelope",
     "health-modes",
     "kv-set-stdin",
+    "plan-apply",
     "preview-blue-green",
     "preview-canonical-id",
     "provenance-records",

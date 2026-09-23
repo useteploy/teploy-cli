@@ -2,6 +2,34 @@
 
 All notable changes to teploy are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+
+- **Plan/apply with drift invalidation (C05).** `teploy plan` now renders
+  the full effect set — routing (domain/ingress/port/publishes),
+  environment keys, storage volumes, resource limits, accessories —
+  alongside the container diff, and classifies image data honestly:
+  resolved-by-digest, mutable-tag-resolved-at-plan-time, or
+  unresolved-awaiting-build (a build plan binds its build inputs —
+  context fingerprint + Dockerfile identity — instead of guessing).
+  `teploy plan --out FILE` records a plan identity (effective-config
+  digest, target version, server/app, deployed-state generation).
+  `teploy apply FILE` re-derives every binding input and refuses,
+  naming what drifted (config edit, overlay flip, moved git version,
+  changed build inputs, or any deploy/rollback in between — the state
+  generation), then executes through the normal deploy engine with the
+  plan id stamped into the release's provenance receipt. A floating-tag
+  plan (timestamp version) is refused outright — it can never be
+  bound. Under `--json` a drift refusal classifies as the error
+  envelope's `conflict` code; the `plan-apply` capability token is
+  advertised.
+- **Compose import: the web service's `environment:` and `volumes:` are
+  now translated** into `env:`/`volumes:` (host binds keep their full
+  path). Both were silently DROPPED — only accessories were parsed —
+  so an imported stack deployed without any of the web service's
+  environment or storage.
+
 ## [0.1.37] - 2026-09-22
 
 ### Fixed

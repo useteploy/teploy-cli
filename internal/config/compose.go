@@ -231,6 +231,25 @@ func mapCompose(dir string, compose composeFile) (*AppConfig, error) {
 		cfg.Publish = extraPublish
 	}
 
+	// Web service environment translates verbatim into teploy.yml env:
+	// keys and values carry (values pass teploy's deploy-time ${VAR}
+	// expansion, matching Compose's interpolation intent for the common
+	// literal case). Previously this block was silently DROPPED — only
+	// accessories ever had their environment parsed — so a web
+	// environment imported "successfully" while deploying without any of
+	// it (the C05 preserve/translate/reject contract violated by
+	// omission; found by the plan conformance suite).
+	if env := parseEnvironment(webService.Environment); len(env) > 0 {
+		cfg.Env = env
+	}
+
+	// Web service volumes translate into teploy.yml volumes: a source
+	// starting with "/" is a host bind and stays one (teploy mounts it
+	// as-is); anything else is a named volume teploy manages at
+	// /deployments/<app>/volumes/<name>. Like environment, these were
+	// silently dropped before.
+	cfg.Volumes = parseWebVolumes(webService.Volumes)
+
 	// Web service field contract: the same preserve/translate/reject pass
 	// every other service gets, plus the healthcheck translation that only
 	// has a home for the web process.
@@ -795,6 +814,28 @@ func parseServiceVolumes(vols []string) map[string]string {
 				name = filepath.Base(name)
 			}
 			result[name] = parts[1]
+		}
+	}
+	if len(result) == 0 {
+		return nil
+	}
+	return result
+}
+
+// parseWebVolumes maps the WEB service's volume declarations: an
+// absolute source path ("/srv/data:/container/path") is a HOST BIND and
+// keeps its full path as the teploy volume key (IsHostBindVolume's
+// contract — teploy mounts the operator's directory as-is); a bare name
+// ("uploads:/container/path") is a named volume teploy manages. Unlike
+// parseServiceVolumes (the accessory translator, whose basename behavior
+// predates this), host binds must NOT lose their path here — the web
+// service's data location is the app's, not an implementation detail.
+func parseWebVolumes(vols []string) map[string]string {
+	result := make(map[string]string)
+	for _, v := range vols {
+		parts := strings.SplitN(v, ":", 2)
+		if len(parts) == 2 {
+			result[parts[0]] = parts[1]
 		}
 	}
 	if len(result) == 0 {

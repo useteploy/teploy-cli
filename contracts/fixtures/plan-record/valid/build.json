@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "plan_id": "f5f4997ca665419e",
+  "app": "myapp",
+  "server": "srv.example.com",
+  "user": "root",
+  "server_name": "prod",
+  "target_version": "abc1234",
+  "version_known": true,
+  "config_digest": "3f2a9c11d8e4b7065a1c9f0e2b8d7a64c5e3f1b9a0d8c7e6f5a4b3c2d1e0f9a8",
+  "image": {
+    "needs_build": true,
+    "resolution": "unresolved-awaiting-build",
+    "context_path": ".",
+    "context_fingerprint": "c0ffee11aa22bb33",
+    "dockerfile": "Dockerfile",
+    "dockerfile_sha256": "deadbeef11",
+    "platform": "linux/amd64"
+  },
+  "target_state": {
+    "deployed": true,
+    "generation": 4,
+    "current_hash": "old1234",
+    "manifest_sha256": "aa11bb22"
+  },
+  "effects": {
+    "containers": [
+      {
+        "action": "create",
+        "name": "myapp-web-abc1234",
+        "detail": "web container"
+      }
+    ],
+    "routing": [
+      {
+        "action": "change",
+        "name": "domain",
+        "from": "old.example.com",
+        "to": "new.example.com",
+        "detail": "routes served by this deployment"
+      }
+    ]
+  },
+  "unresolved": [
+    "image unresolved — built at deploy time; the plan binds the build inputs (context . fingerprint c0ffee11aa22bb..., Dockerfile Dockerfile sha deadbeef11...)"
+  ],
+  "written_at": "0001-01-01T00:00:00Z"
+}

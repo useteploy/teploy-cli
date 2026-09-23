@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/useteploy/teploy/internal/ssh"
 )
@@ -21,7 +22,6 @@ func lockCmds(caddyfile string) []ssh.MockCommand {
 		{Match: reloadCmd, Output: ""},
 		// Post-reload delivery check: container's file matches what we wrote.
 		{Match: "a=$(docker exec caddy md5sum", Output: deliveredOK},
-		{Match: "rmdir " + lockDir, Output: ""},
 	}
 }
 
@@ -51,7 +51,7 @@ func TestSetRoute_WritesBlockAndReloads(t *testing.T) {
 	if !calledWith(mock, reloadCmd) {
 		t.Error("expected caddy reload to be called")
 	}
-	if !calledWith(mock, "mkdir "+lockDir) || !calledWith(mock, "rmdir "+lockDir) {
+	if !calledWith(mock, "mkdir "+lockDir) || !calledWith(mock, "if [ -d '"+lockDir+"'") {
 		t.Error("expected the Caddy lock to be acquired and released")
 	}
 }
@@ -127,7 +127,6 @@ func TestSetRoute_ReloadFailureRollsBack(t *testing.T) {
 		// First reload (new config) fails; rollback reload then succeeds.
 		ssh.MockCommand{Match: reloadCmd, Err: fmt.Errorf("invalid config"), Once: true},
 		ssh.MockCommand{Match: reloadCmd, Output: ""},
-		ssh.MockCommand{Match: "rmdir " + lockDir, Output: ""},
 	)
 
 	client := NewClient(mock)
@@ -153,7 +152,6 @@ func TestSetRoute_StaleDeliveryFailsLoudly(t *testing.T) {
 		ssh.MockCommand{Match: "mv -f -- ", Output: ""},
 		ssh.MockCommand{Match: reloadCmd, Output: ""},
 		ssh.MockCommand{Match: "a=$(docker exec caddy md5sum", Output: deliveredStale},
-		ssh.MockCommand{Match: "rmdir " + lockDir, Output: ""},
 	)
 
 	client := NewClient(mock)
@@ -164,7 +162,7 @@ func TestSetRoute_StaleDeliveryFailsLoudly(t *testing.T) {
 	if !strings.Contains(err.Error(), "directory mount") {
 		t.Errorf("expected a stale-delivery error pointing at the directory-mount recreate, got: %v", err)
 	}
-	if !calledWith(mock, "rmdir "+lockDir) {
+	if !calledWith(mock, "if [ -d '"+lockDir+"'") {
 		t.Error("expected the caddy lock to be released after a failed delivery check")
 	}
 }
@@ -694,5 +692,162 @@ func TestNoCacheRulesRendersNothing(t *testing.T) {
 	}
 	if got := renderCacheRules(map[string]string{}); got != "" {
 		t.Fatalf("expected empty output for empty cache, got %q", got)
+	}
+}
+
+// TestSetRoute_GuardedCommitRefusedWhenFenceLost (C01-2): with a commit
+// guard set, the Caddyfile commit rename runs composed under the guard —
+// when the guarded lock names another owner, the edit is REFUSED in-shell:
+// nothing lands in the Caddyfile, no reload runs, and the error says the
+// fence was lost.
+func TestSetRoute_GuardedCommitRefusedWhenFenceLost(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4", lockCmds("{\n\tadmin 127.0.0.1:2019\n}\n")...)
+	guard := "grep -q 'deadowner' '/deployments/myapp/.lock/info' || { printf 'TEPLOY_FENCE_LOST\\n' >&2; exit 75; }; "
+	mock.Files["/deployments/myapp/.lock/info"] = []byte(`{"type":"auto","owner":"someoneelse"}`)
+
+	client := NewClient(mock).WithCommitGuard(guard)
+	err := client.SetRoute(context.Background(), "myapp", "myapp.com", "myapp-v1", 80, TLS{}, "", nil, Firewall{}, Access{})
+	if err == nil {
+		t.Fatal("expected the guarded commit to be refused")
+	}
+	if !strings.Contains(err.Error(), "fence was lost") {
+		t.Fatalf("expected a fence-loss error, got: %v", err)
+	}
+	if _, ok := mock.Files[caddyfilePath]; ok {
+		t.Error("a refused commit must not write the Caddyfile")
+	}
+	if calledWith(mock, reloadCmd) {
+		t.Error("no reload may run after a refused commit")
+	}
+	// The lock is still acquired/released around the refused edit.
+	if !calledWith(mock, "mkdir "+lockDir) || !calledWith(mock, "if [ -d '"+lockDir+"'") {
+		t.Error("expected the caddy lock to be acquired and released")
+	}
+}
+
+// TestSetRoute_GuardedCommitHoldsUnderRightOwner: the same composed
+// command with the guard naming us commits and reloads normally —
+// composition changes nothing for the legitimate holder.
+func TestSetRoute_GuardedCommitHoldsUnderRightOwner(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4", lockCmds("{\n\tadmin 127.0.0.1:2019\n}\n")...)
+	guard := "grep -q 'me' '/deployments/myapp/.lock/info' || { printf 'TEPLOY_FENCE_LOST\\n' >&2; exit 75; }; "
+	mock.Files["/deployments/myapp/.lock/info"] = []byte(`{"type":"auto","owner":"me"}`)
+
+	client := NewClient(mock).WithCommitGuard(guard)
+	if err := client.SetRoute(context.Background(), "myapp", "myapp.com", "myapp-v1", 80, TLS{}, "", nil, Firewall{}, Access{}); err != nil {
+		t.Fatalf("SetRoute under a held guard: %v", err)
+	}
+	if !strings.Contains(string(mock.Files[caddyfilePath]), "reverse_proxy myapp-v1:80") {
+		t.Errorf("expected the guarded commit to land the block, got:\n%s", mock.Files[caddyfilePath])
+	}
+	if !calledWith(mock, reloadCmd) {
+		t.Error("expected a reload after the guarded commit")
+	}
+}
+
+// --- C01-3: the shared-proxy commit lock is owner-tagged and fenced ---
+
+// TestCaddyLock_OwnerTaggedAndStaleBrokenByInfoAge: acquisition writes an
+// owner-tagged info file; a holder's lock whose info TIMESTAMP exceeds
+// staleLockSeconds is broken (not by directory mtime — the info is the
+// authority), and the new holder's info replaces it.
+func TestCaddyLock_OwnerTaggedAndStaleBrokenByInfoAge(t *testing.T) {
+	stale := time.Now().UTC().Add(-2 * time.Duration(staleLockSeconds) * time.Second).Format(time.RFC3339)
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "mkdir " + lockDir, Err: fmt.Errorf("exists"), Once: true},
+		ssh.MockCommand{Match: "mkdir " + lockDir, Output: ""},
+		ssh.MockCommand{Match: "cat " + lockDir + "/info", Output: fmt.Sprintf(`{"type":"caddy-edit","owner":"deadone","ts":%q}`, stale)},
+	)
+	client := NewClient(mock)
+	owner, err := client.acquireLock(context.Background())
+	if err != nil {
+		t.Fatalf("acquireLock after stale break: %v", err)
+	}
+	if owner == "" || owner == "deadone" {
+		t.Fatalf("expected a fresh owner token, got %q", owner)
+	}
+	info, ok := mock.Files[lockDir+"/info"]
+	if !ok {
+		t.Fatal("acquisition must write the lock info")
+	}
+	if !strings.Contains(string(info), owner) {
+		t.Errorf("lock info does not name the acquiring owner: %s", info)
+	}
+	client.releaseLock(context.Background(), owner)
+	if _, still := mock.Files[lockDir+"/info"]; still {
+		t.Error("conditional release must remove our own lock")
+	}
+}
+
+// TestCaddyLock_FreshHolderIsNotBroken: a lock younger than the stale
+// window blocks acquisition (times out) instead of being broken — the
+// interleave the old mtime break allowed.
+func TestCaddyLock_FreshHolderIsNotBroken(t *testing.T) {
+	fresh := time.Now().UTC().Format(time.RFC3339)
+	var broke bool
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "mkdir " + lockDir, Err: fmt.Errorf("exists")},
+		ssh.MockCommand{Match: "cat " + lockDir + "/info", Output: fmt.Sprintf(`{"type":"caddy-edit","owner":"liveone","ts":%q}`, fresh)},
+		ssh.MockCommand{Match: "rm -rf " + lockDir, Output: ""},
+	)
+	client := NewClient(mock)
+	// Shorten the wait loop via the context: acquireLock polls ~30s; run
+	// it on a context that dies after a moment and treat the deadline as
+	// "not broken" evidence.
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	_, err := client.acquireLock(ctx)
+	if err == nil {
+		t.Fatal("acquiring against a fresh holder must not succeed")
+	}
+	for _, c := range mock.Calls {
+		if strings.HasPrefix(c, "rm -rf "+lockDir) {
+			broke = true
+		}
+	}
+	if broke {
+		t.Error("a fresh (younger than staleLockSeconds) caddy lock must not be broken")
+	}
+}
+
+// TestCaddyLock_BrokenHoldersCommitRefused: after a stale break and
+// re-acquire, the DEAD holder's composed commit is refused by its own
+// guard — the info no longer names it — so its late Caddyfile edit cannot
+// interleave with the new holder's mutate (the C01-3 core property).
+func TestCaddyLock_BrokenHoldersCommitRefused(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "mkdir " + lockDir, Err: fmt.Errorf("exists"), Once: true},
+		ssh.MockCommand{Match: "mkdir " + lockDir, Output: ""},
+	)
+	stale := time.Now().UTC().Add(-2 * time.Duration(staleLockSeconds) * time.Second).Format(time.RFC3339)
+	mock.Files[lockDir+"/info"] = []byte(fmt.Sprintf(`{"type":"caddy-edit","owner":"deadone","ts":%q}`, stale))
+
+	client := NewClient(mock)
+	newOwner, err := client.acquireLock(context.Background())
+	if err != nil {
+		t.Fatalf("acquireLock: %v", err)
+	}
+	// The dead holder attempts its late commit with its own guard.
+	deadGuard := caddyGuardFragment("deadone")
+	err = client.commitCaddyfile(context.Background(), "/deployments/caddy/Caddyfile.tmp-dead", deadGuard)
+	if err == nil || !strings.Contains(err.Error(), "fence was lost") {
+		t.Fatalf("expected the broken holder's commit to be refused, got: %v", err)
+	}
+	if _, ok := mock.Files[caddyfilePath]; ok {
+		t.Error("a refused late commit must not write the Caddyfile")
+	}
+	_ = newOwner
+}
+
+// TestCaddyLock_ReleaseNeverDeletesSuccessorsLock: a holder whose lock
+// was broken and re-acquired must not delete the SUCCESSOR's lock on
+// release — the app locks' A04 lesson applied to the shared proxy lock.
+func TestCaddyLock_ReleaseNeverDeletesSuccessorsLock(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4")
+	mock.Files[lockDir+"/info"] = []byte(`{"type":"caddy-edit","owner":"successor","ts":"` + time.Now().UTC().Format(time.RFC3339) + `"}`)
+	client := NewClient(mock)
+	client.releaseLock(context.Background(), "staleholder")
+	if _, ok := mock.Files[lockDir+"/info"]; !ok {
+		t.Error("a stale holder's release deleted the successor's caddy lock")
 	}
 }

@@ -1585,3 +1585,45 @@ services:
 		t.Errorf("processes = %v, want collapsed single empty-command web (nil map)", cfg.Processes)
 	}
 }
+
+// TestLoadCompose_WebServiceEnvAndVolumesPreserved pins the web
+// service's environment/volumes translation (previously silently
+// DROPPED — only accessories were parsed; found by the C05 plan
+// conformance suite: a plan over an imported stack showed no env or
+// storage effects because the import had emptied them).
+func TestLoadCompose_WebServiceEnvAndVolumesPreserved(t *testing.T) {
+	dir := t.TempDir()
+	compose := `
+services:
+  web:
+    build: .
+    ports: ["3000:3000"]
+    environment:
+      DATABASE_URL: postgres://db/blog
+      SESSION_SECRET: literal-$-value
+    volumes:
+      - uploads:/app/uploads
+      - /srv/shared-assets:/app/assets
+`
+	os.WriteFile(filepath.Join(dir, "docker-compose.yml"), []byte(compose), 0644)
+
+	cfg, err := LoadCompose(dir)
+	if err != nil {
+		t.Fatalf("LoadCompose: %v", err)
+	}
+	if cfg.Env["DATABASE_URL"] != "postgres://db/blog" {
+		t.Errorf("web environment dropped: %v", cfg.Env)
+	}
+	if cfg.Env["SESSION_SECRET"] != "literal-$-value" {
+		t.Errorf("web environment value mangled: %v", cfg.Env)
+	}
+	if cfg.Volumes["uploads"] != "/app/uploads" {
+		t.Errorf("named volume dropped: %v", cfg.Volumes)
+	}
+	if cfg.Volumes["/srv/shared-assets"] != "/app/assets" {
+		t.Errorf("host bind lost its path: %v", cfg.Volumes)
+	}
+	if !IsHostBindVolume("/srv/shared-assets") || IsHostBindVolume("uploads") {
+		t.Errorf("bind classification broken for the imported keys")
+	}
+}

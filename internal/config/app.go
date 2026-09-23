@@ -380,8 +380,19 @@ type AppConfig struct {
 	// unlimited.
 	CPU         string `yaml:"cpu,omitempty" toml:"cpu"`
 	StopTimeout int    `yaml:"stop_timeout,omitempty" toml:"stop_timeout"`
-	Parallel    int    `yaml:"parallel,omitempty" toml:"parallel"`
-	Replicas    int    `yaml:"replicas,omitempty" toml:"replicas"`
+	// DrainSeconds is how long the PREDECESSOR workload keeps running
+	// after the traffic switch and before it is stopped (C03 request
+	// drain): the route no longer sends new requests to it, but in-flight
+	// requests (downloads, SSE, streaming uploads) finish on their
+	// existing connections inside the window. Zero (default) keeps the
+	// historical behavior — stop immediately after the switch. The full
+	// graceful budget is drain_seconds + stop_timeout (the SIGTERM→SIGKILL
+	// ladder). Caddy's config-level routing cannot count in-flight
+	// requests per upstream, so the window is the promised mechanism —
+	// size it to your longest normal request.
+	DrainSeconds int `yaml:"drain_seconds,omitempty" toml:"drain_seconds"`
+	Parallel     int `yaml:"parallel,omitempty" toml:"parallel"`
+	Replicas     int `yaml:"replicas,omitempty" toml:"replicas"`
 	// Rollout gates multi-server deploys: a canary wave that must succeed
 	// before the rest of the fleet deploys, and a bounded failure tolerance
 	// for the main wave. Absent (nil) = existing behavior (parallel batches,
@@ -1065,6 +1076,9 @@ func (c *AppConfig) validate() error {
 	if c.KeepVersions < 0 {
 		return fmt.Errorf("'keep_versions' must be >= 0 (got %d)", c.KeepVersions)
 	}
+	if c.DrainSeconds < 0 || c.DrainSeconds > 600 {
+		return fmt.Errorf("'drain_seconds' must be in 0..600 (got %d)", c.DrainSeconds)
+	}
 	// Build-context fields only apply when teploy builds the image itself.
 	if c.Dockerfile != "" || c.Context != "" {
 		if c.Image != "" {
@@ -1399,6 +1413,9 @@ func mergeConfigs(base, overlay *AppConfig) {
 	}
 	if overlay.StopTimeout != 0 {
 		base.StopTimeout = overlay.StopTimeout
+	}
+	if overlay.DrainSeconds != 0 {
+		base.DrainSeconds = overlay.DrainSeconds
 	}
 	if overlay.Parallel != 0 {
 		base.Parallel = overlay.Parallel
