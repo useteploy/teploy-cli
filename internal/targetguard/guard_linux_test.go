@@ -40,6 +40,39 @@ func (e *localExecutor) Run(_ context.Context, cmd string) (string, error) {
 	return string(out), err
 }
 
+func (e *localExecutor) RunStream(_ context.Context, cmd string, stdout, stderr io.Writer) error {
+	e.mu.Lock()
+	e.saw = append(e.saw, cmd)
+	e.mu.Unlock()
+	cmd = strings.ReplaceAll(cmd, helperRemote, filepath.Join(e.root, "teploy-guard.sh"))
+	full := fmt.Sprintf("TEPLOY_DEPLOYMENTS_ROOT=%s; %s", e.root, cmd)
+	script := filepath.Join(e.root, "run.sh")
+	if err := os.WriteFile(script, []byte(full), 0755); err != nil {
+		return err
+	}
+	proc := exec.Command("/bin/sh", script)
+	proc.Stdout = stdout
+	proc.Stderr = stderr
+	return proc.Run()
+}
+
+func (e *localExecutor) RunInput(_ context.Context, cmd string, stdin io.Reader) error {
+	e.mu.Lock()
+	e.saw = append(e.saw, cmd)
+	e.mu.Unlock()
+	cmd = strings.ReplaceAll(cmd, helperRemote, filepath.Join(e.root, "teploy-guard.sh"))
+	full := fmt.Sprintf("TEPLOY_DEPLOYMENTS_ROOT=%s; %s", e.root, cmd)
+	script := filepath.Join(e.root, "run.sh")
+	if err := os.WriteFile(script, []byte(full), 0755); err != nil {
+		return err
+	}
+	proc := exec.Command("/bin/sh", script)
+	proc.Stdin = stdin
+	proc.Stdout = io.Discard
+	proc.Stderr = io.Discard
+	return proc.Run()
+}
+
 func (e *localExecutor) Upload(_ context.Context, content io.Reader, remotePath string, mode string) error {
 	data, err := io.ReadAll(content)
 	if err != nil {
@@ -48,6 +81,10 @@ func (e *localExecutor) Upload(_ context.Context, content io.Reader, remotePath 
 	local := filepath.Join(e.root, filepath.Base(remotePath))
 	return os.WriteFile(local, data, 0755)
 }
+
+func (e *localExecutor) Close() error      { return nil }
+func (e *localExecutor) Host() string      { return "local" }
+func (e *localExecutor) User() string      { return "root" }
 
 // The three C01-1 acceptance invariants, for real:
 //
