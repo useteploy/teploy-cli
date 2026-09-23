@@ -493,64 +493,8 @@ func dialWithContext(ctx context.Context, network, addr string, config *gossh.Cl
 	return gossh.NewClient(c, chans, reqs), nil
 }
 
-// acceptNewHostKeyCallback returns a host key callback that accepts unknown
-// host keys (appending them to known_hosts) but rejects every verification
-// failure that is NOT "host simply unknown": key mismatches (any algorithm),
-// revoked keys, and an unreadable/malformed known_hosts database all fail
-// closed. Trust-on-first-use must mean "unknown host", never "verification
-// was inconvenient" — the previous version treated a known_hosts parse
-// failure as "nothing is known" (accepting whatever key was presented) and
-// let knownhosts.RevokedError fall through the unknown-host branch.
-func acceptNewHostKeyCallback(knownHostsPath string) gossh.HostKeyCallback {
-	existing, existingErr := knownhosts.New(knownHostsPath)
-	if existingErr != nil && errors.Is(existingErr, fs.ErrNotExist) {
-		// A missing known_hosts is the fresh-box case: nothing is known, so
-		// every host is unknown and TOFU-enrollable. Only a file that EXISTS
-		// but cannot be read or parsed fails closed below.
-		existing, existingErr = nil, nil
-	}
-	return func(hostname string, remote net.Addr, key gossh.PublicKey) error {
-		if existingErr != nil {
-			return fmt.Errorf("cannot verify host key: reading %s failed: %w", knownHostsPath, existingErr)
-		}
-		if existing != nil {
-			err := existing(hostname, remote, key)
-			if err == nil {
-				return nil // known and matches
-			}
-			// Only a genuinely unknown host (empty Want list) may be enrolled.
-			// Any non-KeyError (revocation, database problem) and any mismatch
-			// against a known host (nonempty Want, same or different algorithm)
-			// is rejected.
-			var keyErr *knownhosts.KeyError
-			if !errors.As(err, &keyErr) || len(keyErr.Want) != 0 {
-				return mismatchHint(hostname, key, err)
-			}
-		}
-		// Append to known_hosts. Ensure the parent directory exists first (a
-		// fresh box may have no ~/.ssh at all) so a merely-missing directory
-		// doesn't get treated the same as a genuine write failure below.
-		if err := os.MkdirAll(filepath.Dir(knownHostsPath), 0700); err != nil {
-			return fmt.Errorf("creating %s: %w", filepath.Dir(knownHostsPath), err)
-		}
-		line := knownhosts.Line([]string{knownhosts.Normalize(hostname)}, key)
-		f, err := os.OpenFile(knownHostsPath, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0644)
-		if err != nil {
-			// Previously returned nil here — accepting the key anyway when it
-			// couldn't be recorded. That silently disables TOFU protection: every
-			// later connection looks like another first connection, so a key
-			// change (MITM) is never detected. Fail the connection instead; a
-			// read-only home or full disk is rare enough that failing loudly
-			// beats a permanently-unprotected connection.
-			return fmt.Errorf("recording host key in %s: %w", knownHostsPath, err)
-		}
-		defer f.Close()
-		if _, err := f.WriteString(line + "\n"); err != nil {
-			return fmt.Errorf("recording host key in %s: %w", knownHostsPath, err)
-		}
-		return nil
-	}
-}
+// acceptNewHostKeyCallback, the TOFU enrollment machinery, and the
+// mismatch / change-vs-rename distinction live in hostkey.go (C08).
 
 // PublicKeyBytes returns the authorized-key line for the identity the
 // caller will actually authenticate with (audit A32): for an explicit key

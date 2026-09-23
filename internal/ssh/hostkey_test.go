@@ -2,10 +2,12 @@ package ssh
 
 import (
 	"bytes"
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/rsa"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"os/exec"
@@ -13,17 +15,17 @@ import (
 	"strings"
 	"testing"
 
-	"golang.org/x/crypto/ssh"
+	gossh "golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/knownhosts"
 )
 
-func testPublicKey(t *testing.T) ssh.PublicKey {
+func testPublicKey(t *testing.T) gossh.PublicKey {
 	t.Helper()
 	pub, _, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
 		t.Fatalf("generating test key: %v", err)
 	}
-	sshPub, err := ssh.NewPublicKey(pub)
+	sshPub, err := gossh.NewPublicKey(pub)
 	if err != nil {
 		t.Fatalf("wrapping test key: %v", err)
 	}
@@ -118,7 +120,7 @@ func TestHostKeyMismatchNamesAlgorithms(t *testing.T) {
 	if err != nil {
 		t.Fatalf("generating rsa test key: %v", err)
 	}
-	presented, err := ssh.NewPublicKey(&rsaPriv.PublicKey)
+	presented, err := gossh.NewPublicKey(&rsaPriv.PublicKey)
 	if err != nil {
 		t.Fatalf("wrapping rsa test key: %v", err)
 	}
@@ -213,5 +215,162 @@ func TestPublicKeyBytes_DerivesFromPrivateKey(t *testing.T) {
 	}
 	if _, err := PublicKeyPath(key); err == nil {
 		t.Error("an explicit key without .pub must not select an unrelated default public key")
+	}
+}
+
+// TestTOFU_ConcurrentFirstConnects pins C08's concurrency requirement
+// at the callback level: many simultaneous first connects to the same
+// unknown host must all succeed, enroll the key EXACTLY once, and leave
+// a known_hosts that still parses (no torn lines, no duplicated
+// entries). The old callback captured its knownhosts database at
+// Connect() time and appended without a lock — every racing process saw
+// "unknown", enrolled, and duplicated.
+func TestTOFU_ConcurrentFirstConnects(t *testing.T) {
+	dir := t.TempDir()
+	knownHostsPath := filepath.Join(dir, ".ssh", "known_hosts")
+	callback := acceptNewHostKeyCallback(knownHostsPath)
+	key := testPublicKey(t)
+
+	const n = 16
+	errs := make(chan error, n)
+	for i := 0; i < n; i++ {
+		go func() {
+			errs <- callback("203.0.113.10:22", fakeAddr{}, key)
+		}()
+	}
+	for i := 0; i < n; i++ {
+		if err := <-errs; err != nil {
+			t.Fatalf("a concurrent first connect failed: %v", err)
+		}
+	}
+
+	data, err := os.ReadFile(knownHostsPath)
+	if err != nil {
+		t.Fatalf("known_hosts not written: %v", err)
+	}
+	if got := strings.Count(string(data), "203.0.113.10"); got != 1 {
+		t.Fatalf("host enrolled %d times, want exactly 1:\n%s", got, data)
+	}
+	// The file must remain parseable — a torn line would lock out every
+	// future connection.
+	if _, err := knownhosts.New(knownHostsPath); err != nil {
+		t.Fatalf("known_hosts no longer parses after concurrent enrollment: %v", err)
+	}
+	// A verify against the enrolled state must now succeed (the second
+	// generation sees the key as known).
+	if err := callback("203.0.113.10:22", fakeAddr{}, key); err != nil {
+		t.Fatalf("post-enrollment verify failed: %v", err)
+	}
+}
+
+// TestTOFU_ConcurrentDistinctHosts pins that simultaneous first
+// connects to DIFFERENT hosts do not lose each other's enrollments
+// (the write is read-modify-write under the lock, not a blind append).
+func TestTOFU_ConcurrentDistinctHosts(t *testing.T) {
+	dir := t.TempDir()
+	knownHostsPath := filepath.Join(dir, ".ssh", "known_hosts")
+
+	const n = 8
+	errs := make(chan error, n)
+	for i := 0; i < n; i++ {
+		i := i
+		go func() {
+			cb := acceptNewHostKeyCallback(knownHostsPath)
+			errs <- cb(fmt.Sprintf("203.0.113.%d:22", 20+i), fakeAddr{}, testPublicKey(t))
+		}()
+	}
+	for i := 0; i < n; i++ {
+		if err := <-errs; err != nil {
+			t.Fatalf("concurrent enrollment failed: %v", err)
+		}
+	}
+	data, err := os.ReadFile(knownHostsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < n; i++ {
+		if !strings.Contains(string(data), fmt.Sprintf("203.0.113.%d", 20+i)) {
+			t.Fatalf("host %d lost to a concurrent enrollment:\n%s", i, data)
+		}
+	}
+}
+
+// TestTOFU_RenameVsChange pins the distinction C08 requires: the SAME
+// key presented for a NEW hostname is a rename/re-address of a machine
+// already trusted — enrolled, with a note, without alarm. A DIFFERENT
+// key for a KNOWN hostname is an identity change and fails closed (the
+// v0.1.37 mismatch diagnostics).
+func TestTOFU_RenameVsChange(t *testing.T) {
+	dir := t.TempDir()
+	knownHostsPath := filepath.Join(dir, ".ssh", "known_hosts")
+	callback := acceptNewHostKeyCallback(knownHostsPath)
+
+	key := testPublicKey(t)
+	if err := callback("198.51.100.1:22", fakeAddr{}, key); err != nil {
+		t.Fatalf("first use: %v", err)
+	}
+
+	// Same key, new name: rename — accepted, both names trusted.
+	if err := callback("198.51.100.2:22", fakeAddr{}, key); err != nil {
+		t.Fatalf("rename must enroll the new name, got: %v", err)
+	}
+	data, _ := os.ReadFile(knownHostsPath)
+	if !strings.Contains(string(data), "198.51.100.1") || !strings.Contains(string(data), "198.51.100.2") {
+		t.Fatalf("both names must be trusted after a rename:\n%s", data)
+	}
+
+	// Different key, known name: identity change — refused, file
+	// unchanged by the refusal.
+	before, _ := os.ReadFile(knownHostsPath)
+	if err := callback("198.51.100.1:22", fakeAddr{}, testPublicKey(t)); err == nil {
+		t.Fatal("an identity change for a known host must fail closed")
+	}
+	after, _ := os.ReadFile(knownHostsPath)
+	if !bytes.Equal(before, after) {
+		t.Fatal("a rejected identity change must not modify known_hosts")
+	}
+}
+
+// TestTOFU_RealConcurrentFirstConnects drives two full Connect()s
+// against the in-process SSH server simultaneously, sharing one fresh
+// $HOME — the end-to-end version of the callback-level race pin.
+func TestTOFU_RealConcurrentFirstConnects(t *testing.T) {
+	if testing.Short() {
+		t.Skip("network + processes")
+	}
+	addr := startTestSSHServer(t, func(cmd string, ch gossh.Channel) int { return 0 })
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	const n = 2
+	errs := make(chan error, n)
+	for i := 0; i < n; i++ {
+		go func() {
+			_, err := Connect(context.Background(), ConnectConfig{
+				Host: addr, User: "root", KeyPath: writeClientKeyFile(t), AcceptNewHost: true,
+			})
+			errs <- err
+		}()
+	}
+	for i := 0; i < n; i++ {
+		if err := <-errs; err != nil {
+			t.Fatalf("a simultaneous first connect failed: %v", err)
+		}
+	}
+
+	knownHostsPath := filepath.Join(home, ".ssh", "known_hosts")
+	data, err := os.ReadFile(knownHostsPath)
+	if err != nil {
+		t.Fatalf("known_hosts not written: %v", err)
+	}
+	host, _, serr := SplitHostPort(addr)
+	if serr != nil || host == "" {
+		host = addr
+	}
+	if got := strings.Count(string(data), host); got != 1 {
+		t.Fatalf("host enrolled %d times, want exactly 1:\n%s", got, data)
+	}
+	if _, err := knownhosts.New(knownHostsPath); err != nil {
+		t.Fatalf("known_hosts does not parse after the race: %v", err)
 	}
 }
