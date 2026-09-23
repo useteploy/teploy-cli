@@ -1191,11 +1191,15 @@ alarm rather than the coverage gap it is — the natural first reaction
 (re-scan with `-t ed25519`, per most docs) is exactly what produces the
 state.
 
-Status: OPEN (ergonomics/diagnostics, not correctness — failing closed is
-right). Candidate fix: include the presented key type and the on-file types
-in the error, or document "scan without -t" in the error string. Found
-while provisioning the ship delivery worker; worked around by scanning all
-algorithms.
+Status: CLOSED 2026-09-22, fixed in `078f610`: both host-key callback
+paths (default and accept-new) wrap a knownhosts mismatch with the host,
+the presented key type, the on-file key types and the remediation —
+`host key mismatch for <host>: server presented ssh-rsa, known_hosts has
+no matching entry (has ssh-ed25519) — scan all algorithms (ssh-keyscan
+without -t), not just one`. Failing closed is unchanged; the enriched
+error still unwraps to `*knownhosts.KeyError`
+(TestHostKeyMismatchNamesAlgorithms). Found while provisioning the ship
+delivery worker; worked around by scanning all algorithms.
 
 ## Programme slice (2026-09-22, later still) — C02: commit-pinned builds
 
