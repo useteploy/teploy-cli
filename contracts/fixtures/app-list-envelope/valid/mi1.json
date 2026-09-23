@@ -14,8 +14,10 @@
         ]
       },
       "previous_release": {
-        "version": "",
-        "ports": null
+        "version": "2",
+        "ports": [
+          3000
+        ]
       },
       "containers": [
         {

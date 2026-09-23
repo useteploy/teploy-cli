@@ -73,6 +73,7 @@ func TestContractsAppListEnvelopeGolden(t *testing.T) {
 		Apps: []appStatusDTO{{
 			App: "myapp", Domain: "myapp.example.com", Type: "container",
 			Ingress: "caddy", CurrentRelease: releaseStatusDTO{Version: "3", Ports: []int{3000}},
+			PreviousRelease: releaseStatusDTO{Version: "2", Ports: []int{3000}},
 			Containers: []containerDTO{{ID: "9f31c02", Name: "myapp-web-3", Image: "nginx:1.27", State: "running", Status: "Up 4 minutes", CreatedAt: "2026-09-23T11:55:00Z", Process: "web", Version: "3"}},
 			Processes:  []processDTO{},
 			Lock:       nil, ObservedAt: ts, Errors: []machineError{},
