@@ -72,6 +72,10 @@ const (
 type Lock struct {
 	app   string
 	owner string
+	// tookOver records that acquiring this lock BROKE a stale predecessor
+	// (C01-1): the previous holder died somewhere inside its lifecycle and
+	// its effects may still be landing. Exposed via TookOver.
+	tookOver bool
 
 	mu        sync.Mutex
 	lost      bool
@@ -85,10 +89,22 @@ type Lock struct {
 // that ignore the handle get exactly the old behavior.
 func AcquireLockFenced(ctx context.Context, exec ssh.Executor, app string) (*Lock, error) {
 	owner := newOperationID()
-	if err := acquireAutoLock(ctx, exec, app, owner); err != nil {
+	tookOver, err := acquireAutoLock(ctx, exec, app, owner)
+	if err != nil {
 		return nil, err
 	}
-	return &Lock{app: app, owner: owner}, nil
+	return &Lock{app: app, owner: owner, tookOver: tookOver}, nil
+}
+
+// TookOver reports whether this lock's acquisition broke a stale
+// predecessor's lock (C01-1). A replacement owner must reconcile the
+// observed target — never treat acquisition as proof of quiescence; the
+// dead holder's Docker/route effects can still be in flight.
+func (l *Lock) TookOver() bool {
+	if l == nil {
+		return false
+	}
+	return l.tookOver
 }
 
 func lockInfoPath(app string) string {
@@ -324,29 +340,29 @@ func ReleaseLockFenced(exec ssh.Executor, lk *Lock, app string) {
 			fmt.Fprintf(os.Stderr, "teploy: refusing to release %s's lock with a lease held for %s\n", app, lk.App())
 			return
 		}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	lockDir := fmt.Sprintf("%s/%s/.lock", deploymentsDir, app)
-	_, err := lk.Guarded(ctx, exec, "rm -rf -- "+ssh.ShellQuote(lockDir))
-	if err != nil && !fenceLostErr(err) {
-		// The guarded release failed ambiguously (transport timeout, for
-		// one): the release MAY have completed, and a successor may have
-		// acquired the path in the meantime. An unconditional detached
-		// release here can delete the SUCCESSOR's lock (audit T02) — but
-		// never releasing strands the app for a full staleLockTTL. Resolve
-		// the ambiguity with one shell-level conditional: remove the lock
-		// only when it still names THIS operation, or when it is already
-		// gone. A lock that names someone else is left strictly alone.
-		conditional := fmt.Sprintf(
-			"if [ -d %s ] && grep -q %s %s 2>/dev/null; then rm -rf -- %s; fi",
-			ssh.ShellQuote(lockDir), ssh.ShellQuote(lk.owner), ssh.ShellQuote(lockInfoPath(app)), ssh.ShellQuote(lockDir),
-		)
-		if _, cerr := exec.Run(ctx, conditional); cerr != nil {
-			fmt.Fprintf(os.Stderr, "teploy: could not confirm release of %s's deploy lock: %v (the lock will self-heal after the stale window if abandoned)\n", app, cerr)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		lockDir := fmt.Sprintf("%s/%s/.lock", deploymentsDir, app)
+		_, err := lk.Guarded(ctx, exec, "rm -rf -- "+ssh.ShellQuote(lockDir))
+		if err != nil && !fenceLostErr(err) {
+			// The guarded release failed ambiguously (transport timeout, for
+			// one): the release MAY have completed, and a successor may have
+			// acquired the path in the meantime. An unconditional detached
+			// release here can delete the SUCCESSOR's lock (audit T02) — but
+			// never releasing strands the app for a full staleLockTTL. Resolve
+			// the ambiguity with one shell-level conditional: remove the lock
+			// only when it still names THIS operation, or when it is already
+			// gone. A lock that names someone else is left strictly alone.
+			conditional := fmt.Sprintf(
+				"if [ -d %s ] && grep -q %s %s 2>/dev/null; then rm -rf -- %s; fi",
+				ssh.ShellQuote(lockDir), ssh.ShellQuote(lk.owner), ssh.ShellQuote(lockInfoPath(app)), ssh.ShellQuote(lockDir),
+			)
+			if _, cerr := exec.Run(ctx, conditional); cerr != nil {
+				fmt.Fprintf(os.Stderr, "teploy: could not confirm release of %s's deploy lock: %v (the lock will self-heal after the stale window if abandoned)\n", app, cerr)
+			}
 		}
+		return
 	}
-	return
-}
 	ReleaseLockDetached(exec, app)
 }
 

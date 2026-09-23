@@ -1915,3 +1915,56 @@ verified to match >=1 test before running):
 The harness fails on any leg failing OR matching no tests (a vacuous pass
 is a broken pin). Re-run and paste fresh output here on any contract
 change.
+
+## Programme slice (2026-09-23) — C01-1: replacement-owner reconciliation on acquisition
+
+Closes the C01-1 disagreement (docs/C01_RECOVERY_STATE_TABLE.md finding 1):
+lock acquisition used to be treated as quiescence — `acquireAutoLock` broke
+a stale lock and the deploy proceeded with no observation of the dead
+holder's leftover world. Base revision `0c1fe5d`.
+
+**Design:**
+
+- **Takeover signal** — `state.acquireAutoLock` now reports whether the
+  acquisition broke a stale auto/heal lock; `state.Lock.TookOver()` exposes
+  it (nil lock: false). Fresh acquisitions are unchanged.
+- **Productionized observer** — `deploy.Observe` (internal/deploy/
+  reconcile.go) is the fault harness's evidence collector as production
+  code: docker label inventory, state.json, the managed Caddyfile, the
+  per-release record → recovery.Observation, exact names, read failures map
+  to Unknown (the never-auto-decide grade). The decision stays the pure
+  table's (recovery.Decide); the observer imports the effectful packages,
+  not the reverse.
+- **Reconciliation gate** — DeployFenced step 1c: when TookOver, run
+  `ReconcileAfterTakeover` BEFORE the deploy's first effect. RETRY is the
+  only proceed disposition (surfaced to the operator); INSPECT gets ONE
+  bounded re-observation (R4's transient-read reconcile trigger) then
+  refuses; COMPENSATE/MANUAL refuse immediately. Every refusal carries the
+  observed evidence classes and the inspect commands. Deliberately NOT an
+  auto-compensator: compensation automation is the F04-keyed recovery-owner
+  continuation; refusing with evidence is the safe subset the table
+  permits. The reconciliation precedes the first docker run, so a refusal
+  has nothing to undo.
+
+**Evidence** — mock tests (internal/deploy/reconcile_test.go): takeover
+with a foreign running workload refuses MANUAL with zero `docker run`/state
+commits; clean-world takeover proceeds (a crash must not make the app
+undeployable); same-version disagreement (state.json names the deploying
+release) refuses INSPECT per R6; running-candidate-without-receipts INSPECT;
+traffic-on-uncommitted-generation COMPENSATE; persistent unreadable stays
+INSPECT; a transient inventory failure recovers via the single
+re-observation; Observe classification pinned (_replaced rename = serving
+predecessor, stopped = restorable, corpse ≠ running candidate, unreadable =
+Unknown). Fixture-verified for real (internal/deploy/
+reconcile_integration_test.go, colima docker 29.5.2): owner A's nohup'd
+delayed candidate lands after owner B's genuine stale-break acquisition;
+TookOver reports true; the production reconciler refuses MANUAL — the
+quiescence assumption's RETRY is proven dead in production shape. The
+pre-existing fault harness passes unchanged against the same fixture.
+Gates: build/vet clean; `go test ./... -count=1` all packages ok (one
+pre-existing load-sensitive timing test, cli TestAdmission_NoGoroutinePileup,
+flaked once under full-suite parallel load and passes repeatedly in
+isolation and in two follow-up full runs — not touched by this slice).
+
+**Residual C01 list (updated):** C01-2/3 remain (guarded pre-commit
+effects, fenced shared Caddy lock); C01-8/C01-9 unchanged (F04-keyed).

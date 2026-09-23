@@ -481,13 +481,21 @@ func (l *LockInfo) IsStale() bool {
 // fencing handle (audit F16) use AcquireLockFenced; the lock taken is the
 // same — this is that call with the handle discarded.
 func AcquireLock(ctx context.Context, exec ssh.Executor, app string) error {
-	return acquireAutoLock(ctx, exec, app, newOperationID())
+	_, err := acquireAutoLock(ctx, exec, app, newOperationID())
+	return err
 }
 
 // acquireAutoLock is the shared "auto" lock acquisition. Every acquire
 // carries a unique owner token (F16) so effect sites can refuse a broken
 // holder's late writes; the token is opaque to everything pre-F16.
-func acquireAutoLock(ctx context.Context, exec ssh.Executor, app, owner string) error {
+//
+// The returned takeover flag is true when this acquisition BROKE a stale
+// (or stale-heal) lock to take the path — the C01-1 signal that the
+// previous holder may have left in-flight effects on the target: a
+// replacement owner must reconcile the observed world before its own
+// effects, never treat acquisition as quiescence.
+func acquireAutoLock(ctx context.Context, exec ssh.Executor, app, owner string) (bool, error) {
+	tookOver := false
 	lockPath := fmt.Sprintf("%s/%s/.lock", deploymentsDir, app)
 	if _, err := tryMkdirLock(ctx, exec, lockPath); err != nil {
 		info, _ := ReadLock(ctx, exec, app)
@@ -497,7 +505,7 @@ func acquireAutoLock(ctx context.Context, exec ssh.Executor, app, owner string) 
 				msg += fmt.Sprintf(": '%s'", info.Message)
 			}
 			msg += fmt.Sprintf(". Locked at %s. Use 'teploy unlock' to release.", info.TS)
-			return fmt.Errorf("%s", msg)
+			return false, fmt.Errorf("%s", msg)
 		}
 		if info != nil && info.Type == "auto" && isStale(info.TS, info.RenewTS) {
 			ReleaseLock(ctx, exec, app)
@@ -505,9 +513,10 @@ func acquireAutoLock(ctx context.Context, exec ssh.Executor, app, owner string) 
 				// Someone else's deploy won the race to re-acquire right
 				// after we broke the stale lock — fall through to the
 				// normal "in progress" error below.
-				return fmt.Errorf("deploy is already in progress for %s", app)
+				return false, fmt.Errorf("deploy is already in progress for %s", app)
 			}
-			return writeLockInfo(ctx, exec, lockPath, app, owner)
+			tookOver = true
+			return tookOver, writeLockInfo(ctx, exec, lockPath, app, owner)
 		}
 		// A crashed heal can leave its short-lived "heal" lock behind. A deploy
 		// (authoritative) may break a STALE heal lock so it isn't blocked — but
@@ -517,13 +526,14 @@ func acquireAutoLock(ctx context.Context, exec ssh.Executor, app, owner string) 
 		if info != nil && info.Type == "heal" && isHealStale(info.TS) {
 			ReleaseLock(ctx, exec, app)
 			if _, retryErr := tryMkdirLock(ctx, exec, lockPath); retryErr != nil {
-				return fmt.Errorf("deploy is already in progress for %s", app)
+				return false, fmt.Errorf("deploy is already in progress for %s", app)
 			}
-			return writeLockInfo(ctx, exec, lockPath, app, owner)
+			tookOver = true
+			return tookOver, writeLockInfo(ctx, exec, lockPath, app, owner)
 		}
-		return fmt.Errorf("deploy is already in progress for %s", app)
+		return false, fmt.Errorf("deploy is already in progress for %s", app)
 	}
-	return writeLockInfo(ctx, exec, lockPath, app, owner)
+	return false, writeLockInfo(ctx, exec, lockPath, app, owner)
 }
 
 func tryMkdirLock(ctx context.Context, exec ssh.Executor, lockPath string) (string, error) {

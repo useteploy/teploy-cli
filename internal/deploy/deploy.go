@@ -354,6 +354,19 @@ func (d *Deployer) DeployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 	// one.
 	d.repairOutstandingRecordDebt(ctx, cfg.App, current)
 
+	// 1c. Replacement-owner reconciliation (C01-1): when this deploy's
+	// lock acquisition BROKE a stale predecessor's lock, the previous
+	// holder may have left in-flight effects on the target — acquisition
+	// is never proof of quiescence. Decide over the observed evidence
+	// BEFORE this deploy's first effect; anything but a clean retry
+	// refuses with the evidence so the leftover generation is reconciled
+	// deliberately, never blindly redeployed over.
+	if lk.TookOver() {
+		if err := d.ReconcileAfterTakeover(ctx, cfg, current); err != nil {
+			return err
+		}
+	}
+
 	// 4. Determine host ports for all web replicas.
 	var ports []int
 	if cfg.ingressHost() {
