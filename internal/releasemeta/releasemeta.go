@@ -73,10 +73,11 @@ type Port struct {
 	Fixed bool `json:"fixed,omitempty"`
 }
 
-// Health records the deploy-time health gate so a rollback probes the path
+// Health records the deploy-time health gate so a rollback probes the way
 // the target release was actually deployed with, not whatever the current
 // teploy.yml says.
 type Health struct {
+	Mode            string `json:"mode,omitempty"`
 	Path            string `json:"path,omitempty"`
 	TimeoutSeconds  int    `json:"timeout_seconds,omitempty"`
 	IntervalSeconds int    `json:"interval_seconds,omitempty"`
@@ -86,13 +87,13 @@ type Health struct {
 // so rollback restores the target release's edge config instead of the
 // current config file's.
 type CaddyRoute struct {
-	TLSCert      string            `json:"tls_cert,omitempty"`
-	TLSKey       string            `json:"tls_key,omitempty"`
-	TLSInternal  bool              `json:"tls_internal,omitempty"`
-	CaddyExtra   string            `json:"caddy_extra,omitempty"`
-	Cache        map[string]string `json:"cache,omitempty"`
-	Firewall     *caddy.Firewall   `json:"firewall,omitempty"`
-	Access       *caddy.Access     `json:"access,omitempty"`
+	TLSCert     string            `json:"tls_cert,omitempty"`
+	TLSKey      string            `json:"tls_key,omitempty"`
+	TLSInternal bool              `json:"tls_internal,omitempty"`
+	CaddyExtra  string            `json:"caddy_extra,omitempty"`
+	Cache       map[string]string `json:"cache,omitempty"`
+	Firewall    *caddy.Firewall   `json:"firewall,omitempty"`
+	Access      *caddy.Access     `json:"access,omitempty"`
 }
 
 // Static records a type:static release's serving configuration — the piece

@@ -210,7 +210,12 @@ type readinessProbe struct {
 	Container string `json:"container,omitempty"`
 	Host      string `json:"host,omitempty"`
 	Port      int    `json:"port"`
-	Path      string `json:"path,omitempty"`
+	// Path is the URL path probed in http/auto mode; empty when the record
+	// predates modes and none was resolvable.
+	Path string `json:"path,omitempty"`
+	// Mode is the probe mode that was in effect (http / tcp / auto) — what
+	// a recovery owner should re-run to reproduce the gate.
+	Mode string `json:"mode,omitempty"`
 }
 
 // readinessReceiptPath is the receipt's location in the attempt

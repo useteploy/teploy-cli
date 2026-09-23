@@ -173,8 +173,10 @@ defect could corrupt data today.
   structured route representation — LANDED 2026-09-18, see the family
   section; the transaction design itself remains open and can now be
   built on ParseSites/ExtractPolicy).
-- F47 — Explicit HTTP/TCP/auto probe modes (compat fallback is
-  deliberate and documented).
+- F47 — RESOLVED 2026-09-22 (see the C03 readiness-modes slice at the
+  bottom): explicit `health.mode: http | tcp | auto` with config-grammar
+  validation, pre-gate surfacing, record/receipt forwarding, and the
+  auto fallback named as documented compat.
 - F48 — RESOLVED 2026-09-18 (see the F16/F08/F48/F49/F57 family section
   at the bottom): maintenance preserves the site's TLS directive and
   access gate, extracted from the parsed current block; plus a pre-write
@@ -344,8 +346,9 @@ into each rather than duplicated as new work items.
 - TCL-15 — port allocation redesign (Docker-ephemeral publish + inspect).
   Unblocked by F14 (the record now carries the resolved port allocation
   per release), design remains.
-- TCL-17 — F47 tail (explicit HTTP/TCP/auto probe modes; the 404/3xx TCP
-  fallback is documented deliberate compat).
+- TCL-17 — RESOLVED 2026-09-22 with F47 (C03 readiness-modes slice at the
+  bottom): the 404/3xx TCP fallback is now the NAMED `auto` compat mode,
+  selectable and surfaced, no longer an undocumented default.
 - TCL-24 — RESOLVED 2026-09-18 with F49 (family section at the bottom):
   adoption is parser-based; brace counting is gone.
 - TCL-28 — F50 (split the public static tree from /deployments).
@@ -602,8 +605,9 @@ all packages ok. No push performed.
 - A16 — F04 external-ingress handoff (candidates reachable via the stable
   alias before readiness).
 - A20 — TCL-15 port allocation redesign.
-- A22 — F47/TCL-17 explicit HTTP/TCP probe modes (the 404/3xx TCP
-  fallback stays documented compat).
+- A22 — RESOLVED 2026-09-22 (C03 readiness-modes slice at the bottom):
+  F47/TCL-17 explicit probe modes landed; the 404/3xx TCP fallback stays
+  as `auto`, the documented compat mode.
 - A24 — F17 standing: Cmd remains a deliberate operator-authored shell
   string at the docker-run sink.
 - A29 — TCL-55 session-open bounding (needs a dedicated connection per
@@ -1507,6 +1511,92 @@ short-lived proxy-commit lock or an owner-tagged equivalent). C01-8
 same-version running `_replaced` stays MANUAL — deliberate A08
 containment; the INSPECT→adopt continuation needs F04 generation
 identities (ADR: attempt-keyed container identities). C01-9 candidate
-names are version-keyed, not attempt-keyed — two attempts of one hash
-are not attributable by evidence (ADR: F08 attempt ids as the keying
+names are version-keyed, not attempt-keyed — two attempts of one hash are
+not attributable by evidence (ADR: F08 attempt ids as the keying
 surface for candidate names). C01-6 and C01-7 are LANDED (this slice).
+
+## Programme slice (2026-09-22, latest) — C03: explicit readiness probe modes
+
+Closes the F47/TCL-17/A22 standing deferral — the first bounded C03 slice
+(P0: "Support HTTP, TCP, container and operator-defined readiness with
+clear defaults and deadlines; retain `auto` only as an explicit
+compatibility mode"). Base revision `a914631`; changes left uncommitted
+for review. Drain/graceful-stop semantics, the LB health-path rendering
+(5bf5594), and Caddy are untouched (next slices / explicit stay-out).
+
+**Design:**
+
+- **Grammar** — `health.mode: http | tcp | auto` in teploy.yml/TOML
+  (`config.AppHealthConfig.Mode`). Empty/absent = `auto`, the compat
+  default: HTTP GET first, exactly a 404/3xx falls back to the TCP dial —
+  the verbatim historical behavior (preserved in `checkHealth`, now
+  NAMED). `http` is status-based only (200 = ready; 404/3xx fails the
+  attempt, no fallback). `tcp` dials the published port and never speaks
+  HTTP. Unknown mode is rejected at config load AND at the shared
+  execution-plan validator (`deploy.Config.validate` — direct
+  construction via fleet/preview/autodeploy bypasses parsing, TCL-18
+  parity). Field agreement: `mode: tcp` with a `path` set is REJECTED at
+  config load (decision: reject, not warn — a path nothing fetches is a
+  config that lies about what the gate does); `http`/`auto` without a
+  path keep the `/health` default. A mode-only destination overlay
+  replaces the whole health block (F57 semantics extended: Mode joined
+  the presence detection); the normalized manifest carries
+  `mode` (defaulted to auto) for drift identity.
+- **Dispatch** — `probeOnce` (internal/deploy/health.go) switches on the
+  normalized mode per attempt; `httpStatus` (extracted from the old
+  monolithic attempt) returns the observed code so `checkHealth`'s
+  fallback condition is byte-identical to before (an interim refactor
+  that dialed on ANY non-200 was caught and corrected during the slice —
+  auto must stay exactly today's behavior). `HealthCheckPublic` /
+  `HealthCheckAt` (on-demand `teploy health`) keep the auto default.
+- **Surfacing** — deploy (step 9) and rollback (step 3) print the gate
+  BEFORE it runs: `Readiness: HTTP GET /healthz (30s deadline)` /
+  `Readiness: TCP :3000 (30s)` / `Readiness: auto — HTTP then TCP
+  fallback (compat, 30s deadline)` (tcp names the first replica's port;
+  failures name replica + port as before).
+- **Deadline verified** — `health.Timeout` was already a TOTAL deadline:
+  `healthCheck` wraps the context in `WithTimeout`, the retry loop
+  selects on ctx.Done, each HTTP attempt is curl-bounded
+  (--connect-timeout 2 / --max-time 5), and the remote executor cancels
+  the session at deadline (SIGTERM + close, RunStream). There was NO
+  unbounded retry loop to bound; a regression test now pins it (a
+  never-responding probe — an executor whose commands hang until context
+  death — must fail within deadline + slack, not hang).
+- **Forwarding** — the F14 release record (`releasemeta.Health.Mode`) and
+  the C01-4 readiness receipt (`readinessProbe.Mode`) carry the effective
+  mode; `applyRecordToRollback` overlays it (a modeless legacy record
+  leaves the config's mode — compat). Rollback probes the way the target
+  release was actually gated.
+
+**Evidence** — TDD: red level 1 recorded as compile failure (Mode field
+nowhere existed), red level 2 after plumbing-only (fields + passthrough,
+no behavior): dispatch tests failed with mode ignored (http-mode deploy
+passed via the TCP fallback; tcp-mode healthCheck timed out on an
+unregistered curl; auto-explicit never dialed), unknown mode and tcp+path
+were accepted, the surfaced lines were absent, the record carried no
+mode. Green after the implementation. Mutation checks (in-place,
+reverted, gates re-run green after each): (1) dispatch removed — always
+http — fails TestHealthCheck_TCPMode* (curl issued / dial never run),
+TestHealthCheck_AutoModeExplicitFallsBack (no dial), and the tcp-mode
+DEPLOY test (gate times out); (2) readinessSummary collapsed to the http
+line fails the tcp/auto surfaced-line tests; (3) removing the
+`context.WithTimeout` total deadline hangs the never-responding-probe
+test to the test-binary timeout. Gates: `go vet ./...` clean;
+`go test ./... -race -count=1` all 25 packages ok; gofmt clean on every
+touched file (pre-existing base strays in cli/deploy.go's fleet-rollback
+region, deploy_test.go, f14_wiring_test.go, plan_a_test.go,
+config/app_test.go left alone, consistent with the C02 posture); contract
+probes 5/5 PASS. No push performed.
+
+**C03 remainder (explicit):** request drain + graceful stop (stop_timeout
+wiring, SIGTERM→SIGKILL ladder — deliberately this slice's stay-out), the
+liveness-vs-readiness distinction (post-switch continuous probing; today
+only the container HEALTHCHECK directive approximates it), multi-host
+partial-wave readiness states (canary-wave aggregate gating beyond the
+existing success/fail rollback), and WebSocket/SSE/long-request drain
+verification at the traffic switch. Registered interactions to decide in
+those slices: `mode: tcp` × the Caddy LB active health check (the LB
+block's HTTP path probe would mark a non-HTTP upstream down — LB
+rendering is 5bf5594's fixed surface, untouched here), and preview's
+readiness gate (internal/preview) which mirrors the auto shape and has
+no mode surface of its own.

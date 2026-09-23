@@ -1248,9 +1248,10 @@ func disabledHealthchecks(hc map[string]config.ProcessHealth) map[string]bool {
 // block. Zero TimeoutSeconds/IntervalSeconds map to zero time.Duration,
 // which HealthConfig.withDefaults() (internal/deploy/health.go) fills in
 // as 30s/1s — so unset fields are zero behavior change from before these
-// were configurable.
+// were configurable. Mode passes through: "" means auto (compat).
 func healthConfigFrom(h config.AppHealthConfig) deploy.HealthConfig {
 	return deploy.HealthConfig{
+		Mode:     h.Mode,
 		Path:     h.Path,
 		Timeout:  time.Duration(h.TimeoutSeconds) * time.Second,
 		Interval: time.Duration(h.IntervalSeconds) * time.Second,

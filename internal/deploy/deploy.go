@@ -184,6 +184,16 @@ func (c Config) validate() error {
 	if c.StopTimeout < 0 {
 		return fmt.Errorf("stop timeout cannot be negative (got %ds)", c.StopTimeout)
 	}
+	// Health probe mode enum (C03): config-file parsing enforces the fuller
+	// grammar (tcp rejects a path); the shared execution validator covers
+	// the enum so directly constructed Configs (fleet, preview, autodeploy)
+	// cannot carry an unknown mode into the gate dispatch. Empty = auto
+	// (documented compat).
+	switch c.Health.Mode {
+	case "", HealthModeHTTP, HealthModeTCP, HealthModeAuto:
+	default:
+		return fmt.Errorf("unknown health mode %q (expected http, tcp, or auto)", c.Health.Mode)
+	}
 	return nil
 }
 
@@ -683,9 +693,14 @@ func (d *Deployer) DeployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 		fmt.Fprintln(d.out, "  Pre-deploy hook passed")
 	}
 
-	// 9. Health check all web replicas.
+	// 9. Health check all web replicas. The gate is surfaced BEFORE it
+	// runs: the operator sees which probe mode and what total deadline is
+	// in effect (C03) — not just the verdict after the wait.
 	fmt.Fprintln(d.out, "Running health check...")
 	healthCfg := cfg.Health.withDefaults()
+	if len(ports) > 0 {
+		fmt.Fprintf(d.out, "  Readiness: %s\n", readinessSummary(healthCfg, ports[0]))
+	}
 	for i, p := range ports {
 		if err := d.healthCheck(ctx, p, healthCfg, webBindHost); err != nil {
 			fmt.Fprintf(d.out, "  Health check failed for replica %d (port %d): %v\n", i+1, p, err)
@@ -715,7 +730,7 @@ func (d *Deployer) DeployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 			cands[i] = receiptCandidate{Name: name, ID: candidateIDs[i]}
 		}
 		for i, p := range ports {
-			probes[i] = readinessProbe{Container: webContainerNames[i], Host: probeHost, Port: p, Path: healthCfg.Path}
+			probes[i] = readinessProbe{Container: webContainerNames[i], Host: probeHost, Port: p, Path: healthCfg.Path, Mode: healthCfg.Mode}
 		}
 		if err := d.persistReadinessReceipt(ctx, assetAttempt, cfg.Version, cands, probes); err != nil {
 			fmt.Fprintf(d.out, "Warning: could not persist the readiness receipt for crash recovery: %v\n", err)
@@ -1379,6 +1394,7 @@ func (d *Deployer) recordRelease(ctx context.Context, cfg Config, att releasemet
 		StopTimeout:    cfg.StopTimeout,
 		Bind:           cfg.Bind,
 		Health: &releasemeta.Health{
+			Mode:            healthCfg.Mode,
 			Path:            healthCfg.Path,
 			TimeoutSeconds:  int(healthCfg.Timeout.Seconds()),
 			IntervalSeconds: int(healthCfg.Interval.Seconds()),

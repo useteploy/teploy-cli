@@ -13,11 +13,33 @@ import (
 	"github.com/useteploy/teploy/internal/ssh"
 )
 
+// Health probe modes (C03). The mode selects what the readiness gate runs;
+// every mode shares the same total deadline and interval semantics.
+//
+// auto is the compatibility mode and the default when mode is unset: HTTP
+// GET first, and a 404/3xx answer falls back to a TCP dial — the exact
+// behavior every teploy deploy used before modes existed (register
+// F47/TCL-17/A22). http is status-based only (200 = ready, no fallback);
+// tcp dials the port and never speaks HTTP.
+const (
+	HealthModeHTTP = "http"
+	HealthModeTCP  = "tcp"
+	HealthModeAuto = "auto"
+)
+
 // HealthConfig configures health check behavior.
 type HealthConfig struct {
-	Path     string        // URL path to check (default "/health")
-	Timeout  time.Duration // total time to wait for healthy (default 30s)
-	Interval time.Duration // time between checks (default 1s)
+	// Mode selects the probe: HealthModeHTTP, HealthModeTCP, or
+	// HealthModeAuto. Empty means auto (documented compat default).
+	Mode string
+	// Path is the URL path checked in http/auto mode. Default: "/health".
+	// Irrelevant (and rejected at config load) in tcp mode.
+	Path string
+	// Timeout is the TOTAL time to wait for healthy (default 30s) — not a
+	// per-attempt bound: the gate fails at this deadline however many
+	// attempts fit inside it.
+	Timeout  time.Duration
+	Interval time.Duration
 }
 
 // defaultHealthConfig returns a HealthConfig with all default values applied.
@@ -28,6 +50,9 @@ func defaultHealthConfig() HealthConfig {
 func (h HealthConfig) withDefaults() HealthConfig {
 	if h.Path == "" {
 		h.Path = "/health"
+	}
+	if h.Mode == "" {
+		h.Mode = HealthModeAuto
 	}
 	if h.Timeout == 0 {
 		h.Timeout = 30 * time.Second
@@ -58,28 +83,45 @@ func healthProbeHost(bindHost string) string {
 	}
 }
 
-// healthCheck polls the container until it responds healthy or the timeout expires.
+// healthCheck polls the container until it reports ready or the timeout
+// expires. cfg.Timeout is the TOTAL deadline: the loop stops there however
+// many attempts fit, each HTTP attempt is additionally bounded by curl's
+// --connect-timeout/--max-time, and the executor cancels the remote command
+// when the deadline context dies — there is no unbounded retry.
 //
-// Strategy:
-//  1. HTTP GET to {host}:{port}{path} — 200 means healthy.
-//  2. If the endpoint returns 404, fall back to a TCP port check.
-//  3. Connection refused means the app hasn't started yet — retry.
+// The probe itself is selected by cfg.Mode (see HealthMode* constants):
+// http runs the status check only, tcp the dial only, and auto (the
+// historical behavior, now named) runs the status check with the 404/3xx
+// TCP fallback.
 func (d *Deployer) healthCheck(ctx context.Context, port int, cfg HealthConfig, bindHost string) error {
+	cfg = cfg.withDefaults()
 	ctx, cancel := context.WithTimeout(ctx, cfg.Timeout)
 	defer cancel()
 
 	host := healthProbeHost(bindHost)
 	for {
-		if d.checkHealth(ctx, host, port, cfg.Path) {
+		if d.probeOnce(ctx, host, port, cfg) {
 			return nil
 		}
 
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("timeout after %s waiting for health check on %s:%d", cfg.Timeout, host, port)
+			return fmt.Errorf("timeout after %s waiting for health check (mode %s) on %s:%d", cfg.Timeout, cfg.Mode, host, port)
 		case <-time.After(cfg.Interval):
 			// retry
 		}
+	}
+}
+
+// probeOnce runs ONE readiness attempt under the configured mode.
+func (d *Deployer) probeOnce(ctx context.Context, host string, port int, cfg HealthConfig) bool {
+	switch cfg.Mode {
+	case HealthModeHTTP:
+		return d.checkHTTP(ctx, host, port, cfg.Path)
+	case HealthModeTCP:
+		return d.checkTCP(ctx, host, port)
+	default:
+		return d.checkHealth(ctx, host, port, cfg.Path)
 	}
 }
 
@@ -104,7 +146,35 @@ func (d *Deployer) HealthCheckAt(ctx context.Context, port int, containerName st
 	return d.healthCheck(ctx, port, defaultHealthConfig(), bindHost)
 }
 
-// checkHealth performs a single health check attempt.
+// checkHealth performs a single AUTO-mode attempt (the compatibility
+// strategy): the HTTP status check, with exactly a 404 or a 3xx falling
+// back to a TCP dial — every other answer (5xx, no response, malformed
+// probe) is retried until the deadline. This is the historical behavior,
+// preserved verbatim as the named compat mode.
+func (d *Deployer) checkHealth(ctx context.Context, host string, port int, path string) bool {
+	code := d.httpStatus(ctx, host, port, path)
+	if code == "200" {
+		return true
+	}
+	// A 404 (no /health endpoint) or a 3xx redirect means the app is
+	// listening but the health path isn't a 200 — for example WordPress
+	// 301-redirects /health to its canonical HTTPS URL. Fall back to a TCP
+	// check rather than failing the deploy.
+	if code == "404" || strings.HasPrefix(code, "3") {
+		return d.checkTCP(ctx, host, port)
+	}
+	return false
+}
+
+// checkHTTP performs a single HTTP-mode attempt: true only on a 200. No
+// fallback — a 404/3xx fails the attempt and the gate retries or times out.
+func (d *Deployer) checkHTTP(ctx context.Context, host string, port int, path string) bool {
+	return d.httpStatus(ctx, host, port, path) == "200"
+}
+
+// httpStatus issues one bounded curl request and reports the HTTP status
+// code it observed, or "" when the request could not be made or answered
+// (unbuildable URL, transport error, empty reply).
 //
 // The URL is built with net.JoinHostPort (bracketing IPv6 literals) and
 // validated before it reaches the remote shell, then passed as ONE
@@ -116,31 +186,20 @@ func (d *Deployer) HealthCheckAt(ctx context.Context, port int, containerName st
 // readiness timeout. --noproxy '*' (audit T20's contained half) makes the
 // host-local probe ignore ambient proxy configuration — an inherited
 // HTTP_PROXY made the probe ask a proxy about a loopback address.
-func (d *Deployer) checkHealth(ctx context.Context, host string, port int, path string) bool {
+func (d *Deployer) httpStatus(ctx context.Context, host string, port int, path string) string {
 	url, ok := probeURL(host, port, path)
 	if !ok {
-		return false
+		return ""
 	}
 	cmd := fmt.Sprintf(
 		"curl -s -o /dev/null --noproxy '*' --globoff --connect-timeout 2 --max-time 5 -w '%%{http_code}' --url %s",
 		ssh.ShellQuote(url),
 	)
 	output, err := d.exec.Run(ctx, cmd)
-	if err == nil {
-		code := strings.TrimSpace(output)
-		if code == "200" {
-			return true
-		}
-		// A 404 (no /health endpoint) or a 3xx redirect means the app is
-		// listening but the health path isn't a 200 — for example WordPress
-		// 301-redirects /health to its canonical HTTPS URL. Fall back to a TCP
-		// check rather than failing the deploy. A 5xx or "000" (no response)
-		// falls through and is retried until the timeout.
-		if code == "404" || strings.HasPrefix(code, "3") {
-			return d.checkTCP(ctx, host, port)
-		}
+	if err != nil {
+		return ""
 	}
-	return false
+	return strings.TrimSpace(output)
 }
 
 // probeURL renders the health-check URL and validates its inputs. The host
@@ -172,6 +231,21 @@ func probeURL(host string, port int, path string) (string, bool) {
 		RawQuery: p.RawQuery,
 	}
 	return u.String(), true
+}
+
+// readinessSummary renders the one-line description of the readiness gate
+// surfaced in deploy/rollback output BEFORE the gate runs, so the operator
+// knows what is being gated and for how long. cfg must already carry its
+// defaults (withDefaults).
+func readinessSummary(cfg HealthConfig, port int) string {
+	switch cfg.Mode {
+	case HealthModeHTTP:
+		return fmt.Sprintf("HTTP GET %s (%s deadline)", cfg.Path, cfg.Timeout)
+	case HealthModeTCP:
+		return fmt.Sprintf("TCP :%d (%s)", port, cfg.Timeout)
+	default:
+		return fmt.Sprintf("auto — HTTP then TCP fallback (compat, %s deadline)", cfg.Timeout)
+	}
 }
 
 // checkTCP verifies that a TCP connection can be established to the port.

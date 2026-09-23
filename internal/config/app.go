@@ -194,11 +194,22 @@ type ProcessHealth struct {
 	Disable bool `yaml:"disable,omitempty" toml:"disable"`
 }
 
-// AppHealthConfig configures the teploy-level deploy health check: the HTTP
-// poll that gates the traffic switch after a deploy. Distinct from the
-// container HEALTHCHECK directive (which is per-process, in Healthcheck map).
+// AppHealthConfig configures the teploy-level deploy readiness gate.
+// Distinct from the container HEALTHCHECK directive (which is per-process,
+// in the Healthcheck map).
 type AppHealthConfig struct {
-	// Path is the URL path polled for a 200 response. Default: "/health".
+	// Mode selects the readiness probe:
+	//
+	//   http — status-based only: HTTP GET path, 200 = ready. A 404/3xx
+	//          FAILS the gate (no fallback).
+	//   tcp  — a TCP dial against the published port; nothing is fetched.
+	//          Setting path alongside is rejected (nothing would fetch it).
+	//   auto — compatibility (the default when unset): HTTP GET first, a
+	//          404/3xx falls back to the TCP dial — the exact behavior
+	//          every deploy used before modes existed (F47/TCL-17/A22).
+	Mode string `yaml:"mode,omitempty" toml:"mode"`
+	// Path is the URL path polled for a 200 response in http/auto mode.
+	// Default: "/health". Not valid with mode: tcp.
 	Path string `yaml:"path,omitempty" toml:"path"`
 	// TimeoutSeconds is the total time to wait for a healthy response before
 	// the deploy fails and rolls back. Default: 30. Raise this for
@@ -280,6 +291,19 @@ type NetworkConfig struct {
 const (
 	TypeContainer = "container"
 	TypeStatic    = "static"
+)
+
+// Health readiness-gate modes (the `health.mode` grammar). Empty and "auto"
+// both mean the compatibility default: HTTP GET first, a 404/3xx answer
+// falls back to a TCP dial — the behavior every deploy used before modes
+// existed. "http" is status-based only (200 = ready, no fallback); "tcp"
+// dials the published port and never speaks HTTP. The deploy-side probe
+// dispatch mirrors these in internal/deploy/health.go (deploy cannot share
+// these constants: it imports this package).
+const (
+	HealthModeHTTP = "http"
+	HealthModeTCP  = "tcp"
+	HealthModeAuto = "auto"
 )
 
 // Ingress modes. Empty string and "caddy" both mean Teploy manages the
@@ -979,6 +1003,18 @@ func (c *AppConfig) validate() error {
 	if c.Health.IntervalSeconds < 0 {
 		return fmt.Errorf("'health.interval_seconds' must be >= 0 (got %d)", c.Health.IntervalSeconds)
 	}
+	// Empty mode means auto (the documented compat default, applied at
+	// deploy time), so the enum accepts it here.
+	switch c.Health.Mode {
+	case "", HealthModeHTTP, HealthModeTCP, HealthModeAuto:
+	default:
+		return fmt.Errorf("'health.mode' must be one of: http, tcp, auto (got %q)", c.Health.Mode)
+	}
+	// A path under tcp mode is a field nothing fetches — reject the lying
+	// config at load instead of deploying a gate that ignores it silently.
+	if c.Health.Mode == HealthModeTCP && c.Health.Path != "" {
+		return fmt.Errorf("'health.path' has no effect with 'health.mode: tcp' (TCP readiness dials the port; nothing is fetched) — remove the path or use mode http/auto")
+	}
 	for name, dest := range c.Volumes {
 		if !validName.MatchString(name) && !IsHostBindVolume(name) {
 			return fmt.Errorf("volume name %q must be lowercase alphanumeric with hyphens, or an absolute host path for a bind mount", name)
@@ -1396,7 +1432,7 @@ func mergeConfigs(base, overlay *AppConfig) {
 	}
 	// F57: the whole health object, not just Path, and the security/policy
 	// blocks a production-only overlay previously set to silently nothing.
-	if overlay.Health.Path != "" || overlay.Health.TimeoutSeconds != 0 || overlay.Health.IntervalSeconds != 0 {
+	if overlay.Health.Path != "" || overlay.Health.Mode != "" || overlay.Health.TimeoutSeconds != 0 || overlay.Health.IntervalSeconds != 0 {
 		base.Health = overlay.Health
 	}
 	if !overlay.Access.IsZero() {

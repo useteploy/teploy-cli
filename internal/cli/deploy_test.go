@@ -40,6 +40,15 @@ func TestHealthConfigFrom_UnsetFieldsStayZero(t *testing.T) {
 	}
 }
 
+func TestHealthConfigFrom_CarriesMode(t *testing.T) {
+	for _, mode := range []string{"http", "tcp", "auto", ""} {
+		got := healthConfigFrom(config.AppHealthConfig{Mode: mode})
+		if got.Mode != mode {
+			t.Errorf("mode %q: Mode = %q, want passthrough", mode, got.Mode)
+		}
+	}
+}
+
 func pullAttempted(mock *ssh.MockExecutor) bool {
 	for _, c := range mock.Calls {
 		if strings.HasPrefix(c, "docker pull") {
