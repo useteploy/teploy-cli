@@ -1,16 +1,20 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://teploy.github.io/contracts/schema/observation-envelope.schema.json",
-  "title": "observation envelope - standard shape for any observed resource (X02 S2.4; PRODUCER = teploy-dash)",
-  "$comment": "Schema shared via this corpus but the emitting code lives in teploy-dash (S6). Fixtures for this artifact are dash-side until S6 lands its encoder.",
+  "title": "observation envelope - standard shape for any observed resource (X02 §2.4; PRODUCER = teploy-dash)",
+  "$comment": "Canonical shape adopted by the ADR §2.4 / decision D13. The S2 skeleton carried a status-enum draft shape before any consumer existed; corpus rev 2 corrects it to the adopted form. Fixtures are generated from teploy-dash's real constructors (internal/server/observation_contracts_test.go, TEPLOY_UPDATE_CONTRACTS=1).",
   "type": "object",
-  "required": ["resource", "observed_at", "status"],
+  "required": ["resource", "collected_at", "freshness", "last_known"],
   "properties": {
-    "resource": {"type": "object", "required": ["kind", "id"],
-      "properties": {"kind": {"type": "string"}, "id": {"type": "string"}}},
-    "observed_at": {"type": "string", "format": "date-time"},
-    "status": {"type": "string", "enum": ["evaluated", "unavailable", "invalid", "unknown"]},
-    "last_known": {"type": ["object", "null"]},
-    "reason": {"type": "string"}
+    "resource": {"type": "object", "required": ["type", "id"],
+      "properties": {"type": {"type": "string"}, "id": {"type": "string"}}},
+    "last_success_at": {"type": "string", "format": "date-time"},
+    "collected_at": {"type": "string", "format": "date-time"},
+    "freshness": {"type": "string", "enum": ["fresh", "stale", "unknown"]},
+    "error": {"type": "string"},
+    "source": {"type": "string"},
+    "last_known": {"type": "object",
+      "required": ["server", "apps"],
+      "properties": {"server": {"type": "string"}, "host": {"type": "string"}, "apps": {"type": "array"}}}
   }
 }
