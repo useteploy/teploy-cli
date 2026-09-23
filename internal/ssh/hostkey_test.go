@@ -1,8 +1,11 @@
 package ssh
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/rsa"
+	"errors"
 	"net"
 	"os"
 	"os/exec"
@@ -11,6 +14,7 @@ import (
 	"testing"
 
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/knownhosts"
 )
 
 func testPublicKey(t *testing.T) ssh.PublicKey {
@@ -83,6 +87,83 @@ func TestAcceptNewHostKeyCallback_WriteSuccessRecordsKey(t *testing.T) {
 }
 
 var _ = net.Addr(fakeAddr{}) // compile-time interface check
+
+// 2026-09-22 live finding (ship S14 trusted-copy provisioning): a
+// known_hosts carrying only the host's ed25519 line made every connection
+// presenting a different algorithm fail with a bare "knownhosts: key
+// mismatch" — the error named neither the algorithm presented nor the ones
+// on file, so an algorithm-coverage gap read as a MITM alarm. Both callback
+// paths must name the host, the presented algorithm, the on-file algorithms
+// and the scan-without--t remediation, while still failing closed (and
+// remaining classifiable as *knownhosts.KeyError by callers).
+func TestHostKeyMismatchNamesAlgorithms(t *testing.T) {
+	dir := t.TempDir()
+	sshDir := filepath.Join(dir, ".ssh")
+	if err := os.MkdirAll(sshDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	knownHostsPath := filepath.Join(sshDir, "known_hosts")
+
+	enrolled := testPublicKey(t)
+	line := knownhosts.Line([]string{knownhosts.Normalize("203.0.113.7:22")}, enrolled)
+	if err := os.WriteFile(knownHostsPath, []byte(line+"\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(knownHostsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rsaPriv, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("generating rsa test key: %v", err)
+	}
+	presented, err := ssh.NewPublicKey(&rsaPriv.PublicKey)
+	if err != nil {
+		t.Fatalf("wrapping rsa test key: %v", err)
+	}
+
+	assertEnriched := func(name string, err error) {
+		t.Helper()
+		if err == nil {
+			t.Fatalf("%s: expected a mismatch error, got nil", name)
+		}
+		for _, want := range []string{
+			"203.0.113.7:22",
+			"ssh-rsa",
+			"ssh-ed25519",
+			"ssh-keyscan without -t",
+		} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("%s: error does not name %q:\n%s", name, want, err)
+			}
+		}
+		var keyErr *knownhosts.KeyError
+		if !errors.As(err, &keyErr) {
+			t.Errorf("%s: wrapped error no longer unwraps to *knownhosts.KeyError: %v", name, err)
+		}
+	}
+
+	t.Setenv("HOME", dir)
+	strict, err := defaultHostKeyCallback()
+	if err != nil {
+		t.Fatalf("defaultHostKeyCallback: %v", err)
+	}
+	assertEnriched("defaultHostKeyCallback", strict("203.0.113.7:22", fakeAddr{}, presented))
+
+	acceptNew := acceptNewHostKeyCallback(knownHostsPath)
+	assertEnriched("acceptNewHostKeyCallback", acceptNew("203.0.113.7:22", fakeAddr{}, presented))
+
+	// Failing closed is unchanged: the mismatch must not enroll the presented
+	// key (accept-new) or alter known_hosts in any way.
+	after, err := os.ReadFile(knownHostsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Error("known_hosts was modified by a rejected host key — a mismatch must not enroll anything")
+	}
+}
 
 // TestPublicKeyBytes_DerivesFromPrivateKey is the A32 regression: with an
 // explicit identity and NO .pub file, the public key is DERIVED from the

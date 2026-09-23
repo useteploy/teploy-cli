@@ -19,7 +19,6 @@ import (
 	"golang.org/x/term"
 )
 
-
 // Compile-time check: RemoteExecutor implements Executor.
 var _ Executor = (*RemoteExecutor)(nil)
 
@@ -255,7 +254,39 @@ func defaultHostKeyCallback() (gossh.HostKeyCallback, error) {
 	if err != nil {
 		return nil, fmt.Errorf("parsing known_hosts: %w", err)
 	}
-	return callback, nil
+	return func(hostname string, remote net.Addr, key gossh.PublicKey) error {
+		if err := callback(hostname, remote, key); err != nil {
+			return mismatchHint(hostname, key, err)
+		}
+		return nil
+	}, nil
+}
+
+// mismatchHint enriches a knownhosts mismatch error with what the raw
+// "knownhosts: key mismatch" omits: the host, the algorithm the server
+// presented, and the algorithms known_hosts holds for that host. A
+// known_hosts scanned for a single algorithm (ssh-keyscan -t <one>, the
+// shape most guides produce) makes every connection that negotiates a
+// different algorithm fail without naming either side — which reads as a
+// MITM alarm rather than the algorithm-coverage gap it is (2026-09-22 live
+// finding from ship's delivery provisioning). Verification is unchanged —
+// every mismatch still fails closed; only the message gains context.
+// Non-mismatch failures (revoked keys, database problems) pass through.
+func mismatchHint(hostname string, key gossh.PublicKey, err error) error {
+	var keyErr *knownhosts.KeyError
+	if !errors.As(err, &keyErr) || len(keyErr.Want) == 0 {
+		return err
+	}
+	onFile := make([]string, 0, len(keyErr.Want))
+	seen := make(map[string]bool, len(keyErr.Want))
+	for _, known := range keyErr.Want {
+		if t := known.Key.Type(); !seen[t] {
+			seen[t] = true
+			onFile = append(onFile, t)
+		}
+	}
+	return fmt.Errorf("host key mismatch for %s: server presented %s, known_hosts has no matching entry (has %s) — scan all algorithms (ssh-keyscan without -t), not just one: %w",
+		hostname, key.Type(), strings.Join(onFile, ", "), err)
 }
 
 // resolveSigners finds and loads SSH private keys. For an EXPLICIT key path,
@@ -396,7 +427,7 @@ func acceptNewHostKeyCallback(knownHostsPath string) gossh.HostKeyCallback {
 			// is rejected.
 			var keyErr *knownhosts.KeyError
 			if !errors.As(err, &keyErr) || len(keyErr.Want) != 0 {
-				return err
+				return mismatchHint(hostname, key, err)
 			}
 		}
 		// Append to known_hosts. Ensure the parent directory exists first (a
