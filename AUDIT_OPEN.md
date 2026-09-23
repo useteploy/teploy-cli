@@ -2077,3 +2077,70 @@ files.
 **C01 locking-protocol redesign (C01-1/2/3) is now closed.** Residual
 C01: C01-8/C01-9 (F04 generation identities — deliberate containment),
 the A12/T05 rollback-route remainder of C01-7.
+
+## Programme slice (2026-09-23) — C03: request drain + the readiness/liveness/stop/drain distinction
+
+First bounded slice of C03's ingress-behavior half (the readiness-mode
+half landed earlier as the F47/TCL-17/A22 slice). Closes the recorded
+C03 remainder "request drain + graceful stop": the drain WINDOW between
+the traffic switch and predecessor retirement, the stop policy surfaced
+distinct from readiness, and the declared blue/green fixture proving
+zero failed requests. Base revision `90f356c`.
+
+**Design:**
+
+- **Grammar** — `drain_seconds: N` in teploy.yml/TOML (0..600; 0 = the
+  historical stop-immediately default, documented compat). Flows through
+  the destination overlay and the effective-config manifest (drift
+  identity — a changed drain window is a config change), mapped into
+  deploy.Config / RollbackConfig at the single config→deploy seam plus
+  rollback and scale.
+- **Deploy** — after the route switch and state commit, before
+  predecessor retirement: the configured window elapses while the
+  predecessor keeps serving IN-FLIGHT requests on its existing
+  connections (new traffic is on the candidates). Only a caddy-routed
+  blue/green switch drains: external ingress is the operator's edge,
+  the recreate strategy already stopped the fixed-port workload before
+  the candidates started. Cancellation cuts the window short and
+  proceeds to retirement (the operator asked to stop).
+- **Rollback** — the same window between the route switch back to the
+  target and stopping the superseded generation.
+- **Surfaced distinction** — deploy prints the gate AND the stop policy
+  before the switch: readiness (health mode + total deadline), graceful
+  stop (stop_timeout's SIGTERM→SIGKILL ladder), request drain (the
+  window), liveness (the container HEALTHCHECK directive). The deploy
+  plan now states all four separately.
+- **Honesty** — Caddy's config-level routing CANNOT count in-flight
+  requests per upstream (no per-upstream concurrency endpoint, and
+  teploy's blocks do not enable access logging), so the drain POLICY is
+  the time window plus the ladder — documented in README, the config
+  comment, and the deploy output. Nothing promises request counting.
+
+**Evidence** — mock tests: the draining deploy proves reload→window→stop
+ordering, the window elapses (elapsed >= drain_seconds), the policy
+lines surface, drain 0 adds no window (compat), and external ingress
+never drains. Config tests: parse, bounds (0/1/600 ok; -1/601 rejected
+naming the field), overlay, manifest identity. Rollback test: window
+between switch-back and superseded stop. REAL fixture (colima docker
+29.5.2, real caddy:2-alpine, the PRODUCTION caddy.Client switch path —
+lock, adapt gate, guarded commit, reload, delivery verification):
+TestDrainIntegration_BlueGreenZeroFailedRequests drives 90 requests
+across the switch with a 3.5s request in flight, drains 5s, stops blue
+with -t 5 — ZERO failed requests, the long request completes
+end-to-end on blue inside the window, post-switch traffic serves green.
+TestDrainIntegration_NoDrainKillsLongRequest is the negative control:
+stop -t 0 immediately after the switch breaks the in-flight request
+(caddy 502) — the fixture can detect a broken promise, so the window is
+what saves it. Integration tests also taught the close-vs-cleanup lesson
+(SSH sessions close AFTER t.Cleanup work, LIFO — a plain defer raced
+the fixture cleanups silently). Gates: build/vet clean;
+`go test ./... -count=1` all packages ok; gofmt clean on touched files
+(pre-existing strays untouched); integration battery green against the
+colima fixture.
+
+**C03 remainder (explicit):** liveness-vs-readiness as post-switch
+continuous probing (today only the container HEALTHCHECK approximates
+it), multi-host partial-wave readiness states (canary aggregate gating),
+WebSocket/SSE drain verification beyond the long-request proof, and the
+registered interactions (tcp mode × the Caddy LB active check; preview's
+gate has no drain surface).

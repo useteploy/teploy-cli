@@ -29,7 +29,12 @@ type RollbackConfig struct {
 	App         string
 	Domain      string
 	StopTimeout int
-	Health      HealthConfig
+	// DrainSeconds is the request-drain window between the route switch
+	// back to the target and stopping the superseded generation (C03) —
+	// the rollback-side twin of deploy.Config.DrainSeconds. Zero (default)
+	// keeps the historical stop-immediately behavior.
+	DrainSeconds int
+	Health       HealthConfig
 	// ToHash rolls back to a specific version instead of just the
 	// immediately previous one, mirroring type:static's existing --to
 	// support (internal/cli/rollback.go). Empty means the immediately
@@ -515,7 +520,18 @@ func Rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg Rollbac
 	// now be stopped (match by version label — see step 2). A fence loss
 	// here (F16) means another operation owns the app: refuse further
 	// stops loudly rather than interleave — leaving the superseded workload
-	// running is degraded but visible.
+	// running is degraded but visible. The request-drain window (C03)
+	// applies first when configured: the route already switched back to
+	// the target, and the superseded generation may still hold in-flight
+	// requests on its connections.
+	if cfg.DrainSeconds > 0 && cfg.usesCaddy() {
+		fmt.Fprintf(out, "Draining %s's superseded generation for %ds (in-flight requests complete; traffic serves %s)...\n", cfg.App, cfg.DrainSeconds, target)
+		select {
+		case <-ctx.Done():
+			fmt.Fprintf(out, "  Drain window cut short (%v) — proceeding to retirement\n", ctx.Err())
+		case <-time.After(time.Duration(cfg.DrainSeconds) * time.Second):
+		}
+	}
 	for _, c := range containers {
 		if lk != nil {
 			if err := lk.Check(ctx, exec); err != nil {

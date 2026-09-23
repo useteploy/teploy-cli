@@ -65,7 +65,9 @@ func TestReconcileIntegration_LateEffectAfterTakeoverIsRefused(t *testing.T) {
 	if err != nil {
 		t.Fatalf("connecting probe session: %v", err)
 	}
-	defer probe.Close()
+	// Close AFTER the cleanup work (LIFO): see exec's note in the drain
+	// fixture — a plain defer races the resource cleanups.
+	t.Cleanup(func() { probe.Close() })
 	if out, err := probe.Run(ctx, "docker version --format '{{.Server.Version}}'"); err != nil {
 		t.Skipf("fixture host has no reachable docker daemon (%v)", err)
 	} else {
@@ -108,7 +110,7 @@ func TestReconcileIntegration_LateEffectAfterTakeoverIsRefused(t *testing.T) {
 	if err != nil {
 		t.Fatalf("connecting owner B: %v", err)
 	}
-	defer ownerB.Close()
+	t.Cleanup(func() { ownerB.Close() }) // after the release cleanup (LIFO)
 	old := time.Now().UTC().Add(-31 * time.Minute).Format(time.RFC3339)
 	info := fmt.Sprintf("{\"type\":\"auto\",\"owner\":%q,\"ts\":%q}\n", lkA.Owner(), old)
 	if err := ownerB.Upload(ctx, strings.NewReader(info), fmt.Sprintf("/deployments/%s/.lock/info", app), "0644"); err != nil {

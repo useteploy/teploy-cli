@@ -64,8 +64,17 @@ type Config struct {
 	// Publish adds extra verbatim docker -p mappings beyond ContainerPort's own
 	// (e.g. "0.0.0.0:3001:3001"), for an app with a second listener that needs
 	// its own host port. See AppConfig.Publish.
-	Publish       []string
-	StopTimeout   int // graceful shutdown seconds (default 10)
+	Publish     []string
+	StopTimeout int // graceful shutdown seconds (default 10)
+	// DrainSeconds is the request-drain window between the traffic switch
+	// and predecessor retirement (C03): the predecessor keeps serving
+	// in-flight requests on its existing connections while new traffic
+	// goes to the candidates. Zero (default) stops immediately after the
+	// switch — the historical behavior. The window is time-based: the
+	// Caddy adapter cannot count in-flight requests per upstream, so the
+	// drain POLICY is this window plus StopTimeout's SIGTERM→SIGKILL
+	// ladder; size it to the longest normal request.
+	DrainSeconds  int
 	Replicas      int // web process replicas per server (default 1)
 	Health        HealthConfig
 	PreDeploy     string // hook: runs in web container before traffic switch (failure aborts)
@@ -190,6 +199,9 @@ func (c Config) validate() error {
 	}
 	if c.StopTimeout < 0 {
 		return fmt.Errorf("stop timeout cannot be negative (got %ds)", c.StopTimeout)
+	}
+	if c.DrainSeconds < 0 || c.DrainSeconds > 600 {
+		return fmt.Errorf("drain seconds must be in 0..600 (got %d)", c.DrainSeconds)
 	}
 	// Health probe mode enum (C03): config-file parsing enforces the fuller
 	// grammar (tcp rejects a path); the shared execution validator covers
@@ -744,6 +756,12 @@ func (d *Deployer) DeployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 	if len(ports) > 0 {
 		fmt.Fprintf(d.out, "  Readiness: %s\n", readinessSummary(healthCfg, ports[0]))
 	}
+	// C03's distinction, surfaced: readiness (above — the gate before the
+	// switch), graceful stop (docker stop's SIGTERM→SIGKILL ladder) and
+	// request drain (the window the predecessor keeps serving in-flight
+	// requests after the switch) are SEPARATE policies. Liveness remains
+	// the container's HEALTHCHECK directive.
+	fmt.Fprintf(d.out, "  Stop policy: graceful stop after %ds (SIGTERM then SIGKILL); drain %s\n", stopTimeout, drainSummary(cfg.DrainSeconds))
 	for i, p := range ports {
 		if err := d.healthCheck(ctx, p, healthCfg, webBindHost); err != nil {
 			fmt.Fprintf(d.out, "  Health check failed for replica %d (port %d): %v\n", i+1, p, err)
@@ -951,6 +969,28 @@ func (d *Deployer) DeployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 					fmt.Fprintf(d.out, "Warning: could not prune superseded attempt artifacts: %v\n", err)
 				}
 			}
+		}
+	}
+
+	// 13z. Request drain (C03): the route switched to the candidates in
+	// step 11; the predecessor still holds IN-FLIGHT requests on its
+	// existing connections (downloads, SSE, streaming uploads). Hold the
+	// configured window before retiring it so those requests complete —
+	// Caddy's config-level routing cannot count in-flight requests per
+	// upstream, so the window IS the drain policy (plus the graceful-stop
+	// ladder inside docker stop). Only a caddy-routed blue/green switch
+	// has a serving predecessor to drain: external ingress is the
+	// operator's edge (nothing to drain here), and the recreate strategy
+	// already stopped the fixed-port workload before the candidates
+	// started (its downtime is the recreate tradeoff, advertised at the
+	// plan). Skipped when there is nothing to retire or the window is 0
+	// (the historical behavior).
+	if cfg.DrainSeconds > 0 && cfg.usesCaddy() && predecessorsListed && len(predecessors) > 0 {
+		fmt.Fprintf(d.out, "Draining %s's predecessor for %ds (in-flight requests complete; new traffic serves %s)...\n", cfg.App, cfg.DrainSeconds, cfg.Version)
+		select {
+		case <-ctx.Done():
+			fmt.Fprintf(d.out, "  Drain window cut short (%v) — proceeding to predecessor retirement\n", ctx.Err())
+		case <-time.After(time.Duration(cfg.DrainSeconds) * time.Second):
 		}
 	}
 
