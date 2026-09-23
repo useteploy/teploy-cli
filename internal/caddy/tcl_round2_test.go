@@ -32,6 +32,30 @@ func newFakeStatefulExecutor(initial map[string]string) *fakeStatefulExecutor {
 func (f *fakeStatefulExecutor) Run(ctx context.Context, cmd string) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	// Composed fence guards (C01-2/C01-3): evaluate every chained guard
+	// against the recorded files (the caddy lock info uploaded at acquire
+	// names the mutating owner), then dispatch the remaining effect. A
+	// guard whose info no longer names the owner refuses exactly like the
+	// real shell would.
+	const guardSep = " || { printf 'TEPLOY_FENCE_LOST\\n' >&2; exit 75; }; "
+	for strings.HasPrefix(cmd, "grep -q ") {
+		i := strings.Index(cmd, guardSep)
+		if i < 0 {
+			break
+		}
+		guard, rest := cmd[:i], cmd[i+len(guardSep):]
+		fields := strings.Fields(guard) // grep -q 'owner' 'path'
+		if len(fields) != 4 {
+			break
+		}
+		owner := strings.Trim(fields[2], "'")
+		path := strings.Trim(fields[3], "'")
+		data, ok := f.files[path]
+		if !ok || !strings.Contains(string(data), owner) {
+			return "", fmt.Errorf("exit status 75: TEPLOY_FENCE_LOST")
+		}
+		cmd = rest
+	}
 	switch {
 	case cmd == "cat "+caddyfilePath:
 		data, ok := f.files[caddyfilePath]
@@ -62,7 +86,8 @@ func (f *fakeStatefulExecutor) Run(ctx context.Context, cmd string) (string, err
 			return "", f.adaptErr
 		}
 		return "", nil
-	case strings.HasPrefix(cmd, "mkdir "+lockDir), strings.HasPrefix(cmd, "rmdir "+lockDir):
+	case strings.HasPrefix(cmd, "mkdir "+lockDir), strings.HasPrefix(cmd, "if [ -d "+lockDir),
+		strings.HasPrefix(cmd, "cat "+lockDir+"/info"), strings.HasPrefix(cmd, "sleep 0.5"):
 		return "", nil
 	case cmd == reloadCmd:
 		return "", nil

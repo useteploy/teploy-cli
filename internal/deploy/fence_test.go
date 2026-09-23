@@ -99,8 +99,14 @@ func TestDeployFenced_LateHolderRefusedToStartContainers(t *testing.T) {
 	if !errors.Is(err, state.ErrFenceLost) {
 		t.Fatalf("expected ErrFenceLost, got %v", err)
 	}
+	// C01-2: the guard is composed into the same shell as the docker run,
+	// so a REFUSED start appears only as `grep ...; docker run ...` (the
+	// composed command the guard rejected). An EXECUTED start appears as a
+	// bare `docker run` command — the mock appends the effect-only form
+	// when the guard holds. Only that form is a container actually
+	// starting.
 	for _, c := range mock.Calls {
-		if strings.Contains(c, "docker run") {
+		if strings.HasPrefix(c, "docker run") {
 			t.Errorf("late holder's container start must be refused, saw: %s", c)
 		}
 	}

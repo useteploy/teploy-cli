@@ -46,6 +46,7 @@ func NormalizeAndDigest(cfg *AppConfig, appliedImage string) (json.RawMessage, s
 			"port":             port,
 			"replicas":         replicas,
 			"stop_timeout":     stopTimeout,
+			"drain_seconds":    cfg.DrainSeconds,
 			"bind":             defaultString(cfg.Bind, ingress == IngressHost, "0.0.0.0"),
 			"platform":         cfg.Platform,
 			"build_local":      cfg.BuildLocal,

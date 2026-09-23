@@ -128,6 +128,21 @@ func NewClient(exec ssh.Executor) *Client {
 
 // Run starts a new container and returns its ID.
 func (c *Client) Run(ctx context.Context, cfg RunConfig) (string, error) {
+	return c.run(ctx, cfg, "")
+}
+
+// RunGuarded is Run with the container creation composed under a fence
+// guard prefix (state.Lock.GuardPrefix) in the SAME remote command — the
+// C01-2 composition: no transport window exists between the holdership
+// check and the docker run, so a broken lock holder's late container
+// starts are refused by the guard instead of landing inside the new
+// owner's window. An empty prefix runs the effect unguarded (pre-F16
+// shape). A refused run's error matches state.FenceLost.
+func (c *Client) RunGuarded(ctx context.Context, cfg RunConfig, guardPrefix string) (string, error) {
+	return c.run(ctx, cfg, guardPrefix)
+}
+
+func (c *Client) run(ctx context.Context, cfg RunConfig, guardPrefix string) (string, error) {
 	if cfg.App == "" || cfg.Process == "" || cfg.Version == "" || cfg.Image == "" {
 		return "", fmt.Errorf("run config requires app, process, version, and image")
 	}
@@ -256,7 +271,7 @@ func (c *Client) Run(ctx context.Context, cfg RunConfig) (string, error) {
 		args = append(args, cfg.Cmd)
 	}
 
-	cmd := strings.Join(args, " ")
+	cmd := guardPrefix + strings.Join(args, " ")
 	output, err := c.exec.Run(ctx, cmd)
 	if err != nil && nameAlreadyInUse(output, err) {
 		// A container already holds this exact name. That happens routinely after

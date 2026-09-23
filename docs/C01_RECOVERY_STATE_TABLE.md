@@ -129,7 +129,15 @@ table's, with the register item it belongs to.
    table requires: a replacement owner runs `Decide` over observed
    evidence after acquisition. Register: A05/T01 adjacent but distinct —
    fencing refuses stale *check-then-act* holders; this is the new owner's
-   side (nobody observes the leftover world).
+   side (nobody observes the leftover world). **LANDED 2026-09-23** (see
+   AUDIT_OPEN's C01 replacement-owner-reconciliation slice): acquisitions
+   report takeover (`Lock.TookOver`), `DeployFenced` runs the
+   productionized observer + `Decide` (`internal/deploy/reconcile.go`)
+   before its first effect, RETRY is the only proceed disposition, and
+   every other one refuses with the observed evidence. The observer is
+   the harness's evidence collector made production code; verified
+   against the real fixture (late effect after takeover → MANUAL
+   refusal).
 
 2. **C01-2 — Pre-commit effects are check-then-act, not guarded.**
    `lk.Check` runs as a separate command from the effect it guards:
@@ -141,6 +149,16 @@ table's, with the register item it belongs to.
    new owner's window — the table treats "effect lands after owner death"
    as INSPECT-at-best evidence, which nothing today generates. Register:
    A05/T01 standing; the table now states the disposition consequence.
+   **LANDED 2026-09-23** (see AUDIT_OPEN's C01 guarded-effects slice):
+   `docker.RunGuarded` composes the holdership guard with the container
+   creation in one remote command (deploy's candidate and worker starts;
+   `state.Lock.GuardPrefix`/`state.FenceLost` are the composition
+   surface), and the Caddyfile commit rename runs under the same guard
+   (`caddy.Client.WithCommitGuard`, threaded through deploy, rollback and
+   the static paths). A mid-flight takeover is refused in-shell: no
+   container starts, no route edit lands, no reload runs. The separate
+   pre-effect Checks at those three sites are superseded by the
+   composition.
 
 3. **C01-3 — The shared Caddy lock is ownerless and unfenced.**
    `internal/caddy/caddy.go:684-697` breaks any caddy lock older than 120s
@@ -149,7 +167,16 @@ table's, with the register item it belongs to.
    "conflicting route evidence → INSPECT" has no producer/consumer today
    (nobody reconciles a Caddyfile that names containers no inventory can
    attribute). Register: T03 documents the design as deliberate; the
-   finding is the missing reconciliation, not the lock's shape.
+   finding is the missing reconciliation, not the lock's shape. **LANDED
+   2026-09-23** (see AUDIT_OPEN's C01 shared-proxy-lock slice): the lock
+   carries an owner-tagged info file (staleness from its timestamp, not
+   directory mtime; legacy no-info dirs keep the mtime fallback), the
+   commit is fenced by the lock's own guard composed AFTER the app-fence
+   guard, release is conditional on ownership (the app locks' A04
+   lesson), and the missing producer/consumer exists:
+   `deploy.Observe` classifies a managed block naming a third generation
+   as CONFLICTING (Unknown) route evidence, which `Decide` sends to
+   INSPECT (R4) instead of the old false "route to predecessor".
 
 4. **C01-4 — No durable readiness receipt.** The health gate
    (`internal/deploy/health.go`, `deploy.go:646-658`) persists nothing, so
@@ -269,9 +296,17 @@ Two lock layers, never nested across hosts:
    renewal): serialize an app's lifecycle on ONE target. Held for the
    whole lifecycle, but only ever against one host.
 2. **The shared-proxy commit lock** (`/deployments/caddy/.lock`,
-   `internal/caddy/caddy.go:684-707`): short-lived, ownerless by design
-   (T03), held only for the brief Caddyfile edit+reload+verify inside one
-   host's traffic-switch step.
+   `internal/caddy/caddy.go`): short-lived, held only for the brief
+   Caddyfile edit+reload+verify inside one host's traffic-switch step.
+   Since C01-3 (2026-09-23) it is OWNER-TAGGED and FENCED like the app
+   locks: acquisition writes an owner info file, staleness is measured
+   from that info's timestamp (not directory mtime), the Caddyfile
+   commit runs under the lock's own guard composed after the app-fence
+   guard, and release removes the lock only when its info still names
+   the releaser. Acquisition order on the commit command is therefore
+   APP GUARD THEN CADDY GUARD — app lock first (long-held), shared
+   commit lock second (brief); never the inverse, and a holder that
+   loses either fence has its commit refused in-shell.
 
 **Never hold one host's app lock while waiting on another host's.** The
 current code complies: locks are acquired inside each host's
@@ -336,11 +371,16 @@ Implementation slices: **C01-4, C01-5, C01-10 landed 2026-09-22**
 (attempt-journal receipts + honest degraded log outcome; evidence in
 AUDIT_OPEN's C01 implementation-slice section) and **C01-6, C01-7 landed
 2026-09-22** (record-repair debt reconciler + receipt-driven route
-compensation; evidence in AUDIT_OPEN's latest C01 slice). Remaining
-findings: C01-1/2/3 (the locking-protocol redesign — replacement-owner
-reconciliation on acquisition, guarded pre-commit effects, fenced shared
-Caddy lock), C01-8 (same-version `_replaced` MANUAL — deliberate A08
-containment until F04 generation identities exist), and C01-9
-(attempt-scoped candidate identities — F04/A09). The A12/T05 remainder
-of C01-7 (rollback's restoreRollbackRoute + the exact-block
+compensation; evidence in AUDIT_OPEN's latest C01 slice), and **C01-1
+landed 2026-09-23** (replacement-owner reconciliation on acquisition;
+`internal/deploy/reconcile.go`, fixture-verified) and **C01-2 landed
+2026-09-23** (guarded pre-commit effects: RunGuarded container starts +
+the guarded Caddyfile commit; see AUDIT_OPEN) and **C01-3 landed
+2026-09-23** (owner-tagged fenced shared Caddy lock + the
+conflicting-route-evidence producer/consumer; see AUDIT_OPEN). The
+locking-protocol redesign (C01-1/2/3) is closed. Remaining findings:
+C01-8 (same-version `_replaced` MANUAL —
+deliberate A08 containment until F04 generation identities exist), and
+C01-9 (attempt-scoped candidate identities — F04/A09). The A12/T05
+remainder of C01-7 (rollback's restoreRollbackRoute + the exact-block
 compare-and-swap restore) stays with its register item.

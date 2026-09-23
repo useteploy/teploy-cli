@@ -122,6 +122,12 @@ port: 3000
 build_local: true
 platform: linux/amd64
 stop_timeout: 30
+drain_seconds: 10             # request drain: keep the old container serving in-flight
+                              # requests this long AFTER the traffic switch, before it is
+                              # stopped (0 = stop immediately, the default). The full graceful
+                              # budget is drain_seconds + stop_timeout. Teploy's Caddy routing
+                              # cannot count in-flight requests per upstream, so the window IS
+                              # the drain policy — size it to your longest normal request.
 memory: 2g                    # cgroup RAM cap (docker units: 512m, 2g). Unset = unlimited.
 cpu: "1.5"                    # CPU cap in cores. Unset = unlimited.
 keep_versions: 3              # auto-prune older versions after deploy (0 = keep all, default)
