@@ -95,6 +95,11 @@ const (
 	// drifted — when anything moved since the plan (C05). Applied
 	// releases carry provenance.plan_id.
 	CapPlanApply = "plan-apply"
+	// `preview deploy --base-domain/--http-only/--allow-ip`: tailnet
+	// preview mode, persisted in the preview record (inherited by
+	// updates); `preview list --json` rows carry url with the served
+	// scheme (DELEGATED_DECISIONS §10).
+	CapPreviewExposure = "preview-exposure"
 )
 
 // MachineCapabilities returns every capability token this build
@@ -118,6 +123,7 @@ func MachineCapabilities() []string {
 		CapServerStatusMachine,
 		CapDoctorDiagnostics,
 		CapPlanApply,
+		CapPreviewExposure,
 	}
 	sort.Strings(tokens)
 	return tokens

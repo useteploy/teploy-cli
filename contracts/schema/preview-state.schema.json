@@ -1,9 +1,25 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://teploy.github.io/contracts/schema/preview-state.schema.json",
-  "title": "preview identity eras (C06): canonical <app>-p-<hex8>, legacy slug, ambiguous",
+  "title": "preview identity eras (C06): canonical <app>-p-<hex8>, legacy slug, ambiguous; optional record/list-row fields (rev 6)",
+  "$defs": {
+    "recordFields": {
+      "$comment": "rev 6, additive: fields a preview record / `preview list --json` row may carry. Absent exposure fields = default preview (app-domain host, automatic HTTPS, no IP gate). url's scheme is the one the route serves: http:// iff http_only.",
+      "properties": {
+        "domain": {"type": "string", "minLength": 1},
+        "url": {"type": "string", "pattern": "^https?://[^/]+$"},
+        "base_domain": {"type": "string", "minLength": 1},
+        "http_only": {"type": "boolean"},
+        "allow_ips": {"type": "array", "items": {"type": "string", "minLength": 1}}
+      },
+      "if": {"required": ["http_only"], "properties": {"http_only": {"const": true}}},
+      "then": {"properties": {"url": {"pattern": "^http://"}}},
+      "else": {"properties": {"url": {"pattern": "^https://"}}}
+    }
+  },
   "oneOf": [
     {"$comment": "canonical era", "type": "object",
+     "allOf": [{"$ref": "#/$defs/recordFields"}],
      "required": ["id", "era", "app", "branch"],
      "properties": {
        "id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]*-p-[a-f0-9]{8}$"},
@@ -11,6 +27,7 @@
        "app": {"type": "string"},
        "branch": {"type": "string"}}},
     {"$comment": "legacy slug-keyed era; readable, adoptable when unambiguous", "type": "object",
+     "allOf": [{"$ref": "#/$defs/recordFields"}],
      "required": ["id", "era", "app"],
      "properties": {
        "id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]*-p-[a-z0-9][a-z0-9-]*$"},

@@ -1,0 +1,15 @@
+{
+  "app": "myapp",
+  "branch": "feature/login",
+  "container": "myapp-preview-p-08e81639-abc1234",
+  "created_at": "2026-09-24T12:00:00Z",
+  "domain": "preview-feature-login-08e81639.myapp.com",
+  "era": "canonical",
+  "expires_at": "2026-09-27T12:00:00Z",
+  "id": "myapp-p-08e81639",
+  "image": "myapp-build-abc1234",
+  "port": 49200,
+  "repo": "github.com/example/myapp",
+  "route": "myapp-preview-p-08e81639",
+  "url": "https://preview-feature-login-08e81639.myapp.com"
+}

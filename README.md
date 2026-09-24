@@ -438,6 +438,19 @@ teploy preview deploy fix/login-500 --image app-build-abc1234 --ttl 24h
 Requires Teploy-managed Caddy: previews provision a `preview-<branch>.<domain>`
 route on demand, which an external ingress cannot do.
 
+Tailnet-only previews skip the domain and the certificate: the hostname sits
+under the target's Tailscale IP via sslip.io, Caddy serves it on plain HTTP,
+and only tailnet addresses get through.
+
+```
+teploy preview deploy fix/login-500 --image app-build-abc1234 \
+  --base-domain 100-64-1-2.sslip.io --http-only --allow-ip 100.64.0.0/10
+# http://preview-fix-login-500-<id>.100-64-1-2.sslip.io
+```
+
+The mode is recorded with the preview, so redeploying the branch keeps it.
+`preview list --json` rows carry a `url` with the scheme actually served.
+
 ### Backups
 ```
 teploy backup create               # backup volumes to S3
