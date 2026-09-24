@@ -106,7 +106,7 @@ func TestTailscaleJoin_AlreadyConnected(t *testing.T) {
 func TestTailscaleJoin_Fresh(t *testing.T) {
 	mock := ssh.NewMockExecutor("server1",
 		ssh.MockCommand{Match: "tailscale status --json", Err: fmt.Errorf("not running")},
-		ssh.MockCommand{Match: "nohup tailscale up", Output: ""},
+		ssh.MockCommand{Match: "nohup sh -c", Output: ""},
 	)
 
 	p := &TailscaleProvider{AuthKey: "tskey-auth-xxx"}
@@ -116,18 +116,39 @@ func TestTailscaleJoin_Fresh(t *testing.T) {
 
 	var foundUp bool
 	for _, call := range mock.Calls {
-		if strings.Contains(call, "nohup tailscale up") {
+		if strings.Contains(call, "nohup sh -c") {
 			foundUp = true
-			if !strings.Contains(call, "--authkey=") || !strings.Contains(call, "tskey-auth-xxx") {
-				t.Errorf("tailscale up should include authkey, got: %s", call)
+			if strings.Contains(call, "tskey-auth-xxx") || strings.Contains(call, "--authkey=") {
+				t.Errorf("the auth key must never ride the argv (C08), got: %s", call)
 			}
-			if !strings.Contains(call, "--accept-routes") {
-				t.Errorf("tailscale up should include --accept-routes, got: %s", call)
+			if !strings.Contains(call, `export TS_AUTHKEY="$k"`) {
+				t.Errorf("the key must ride TS_AUTHKEY from the staged file, got: %s", call)
+			}
+			if !strings.Contains(call, "exec tailscale up --accept-routes") {
+				t.Errorf("join must exec tailscale up with --accept-routes, got: %s", call)
 			}
 		}
 	}
 	if !foundUp {
-		t.Error("expected 'nohup tailscale up' call")
+		t.Error("expected the detached join call")
+	}
+	// The credential landed in a 0600 staged file, exactly once.
+	uploads := 0
+	for _, call := range mock.Calls {
+		if strings.HasPrefix(call, "UPLOAD:") {
+			uploads++
+			if !strings.Contains(call, "mode 0600") || !strings.Contains(call, "/tmp/teploy-vpn-key-") {
+				t.Errorf("credential must stage 0600 at the key path: %s", call)
+			}
+		}
+	}
+	if uploads != 1 {
+		t.Fatalf("expected exactly one credential upload, got %d (calls: %v)", uploads, mock.Calls)
+	}
+	for path, content := range mock.Files {
+		if strings.HasPrefix(path, "/tmp/teploy-vpn-key-") && string(content) != "tskey-auth-xxx" {
+			t.Errorf("staged credential content = %q", content)
+		}
 	}
 }
 
@@ -164,7 +185,7 @@ func TestHeadscaleInstall_AlreadyInstalled(t *testing.T) {
 func TestHeadscaleJoin_UsesLoginServer(t *testing.T) {
 	mock := ssh.NewMockExecutor("server1",
 		ssh.MockCommand{Match: "tailscale status --json", Err: fmt.Errorf("not running")},
-		ssh.MockCommand{Match: "nohup tailscale up", Output: ""},
+		ssh.MockCommand{Match: "nohup sh -c", Output: ""},
 	)
 
 	p := &HeadscaleProvider{Server: "https://headscale.example.com", AuthKey: "key123"}
@@ -174,18 +195,21 @@ func TestHeadscaleJoin_UsesLoginServer(t *testing.T) {
 
 	var foundUp bool
 	for _, call := range mock.Calls {
-		if strings.Contains(call, "nohup tailscale up") {
+		if strings.Contains(call, "nohup sh -c") {
 			foundUp = true
 			if !strings.Contains(call, "--login-server=") || !strings.Contains(call, "headscale.example.com") {
 				t.Errorf("should use --login-server, got: %s", call)
 			}
-			if !strings.Contains(call, "--authkey=") || !strings.Contains(call, "key123") {
-				t.Errorf("should include authkey, got: %s", call)
+			if strings.Contains(call, "key123") || strings.Contains(call, "--authkey=") {
+				t.Errorf("the auth key must never ride the argv (C08), got: %s", call)
+			}
+			if !strings.Contains(call, `export TS_AUTHKEY="$k"`) {
+				t.Errorf("the key must ride TS_AUTHKEY from the staged file, got: %s", call)
 			}
 		}
 	}
 	if !foundUp {
-		t.Error("expected 'nohup tailscale up' call")
+		t.Error("expected the detached join call")
 	}
 }
 
@@ -240,7 +264,7 @@ func TestNetbirdJoin_AlreadyConnected(t *testing.T) {
 func TestNetbirdJoin_Fresh(t *testing.T) {
 	mock := ssh.NewMockExecutor("server1",
 		ssh.MockCommand{Match: "netbird status", Err: fmt.Errorf("not running")},
-		ssh.MockCommand{Match: "netbird up", Output: ""},
+		ssh.MockCommand{Match: "sh -c", Output: ""},
 	)
 
 	p := &NetbirdProvider{SetupKey: "nb-setup-xxx"}
@@ -250,10 +274,13 @@ func TestNetbirdJoin_Fresh(t *testing.T) {
 
 	var foundUp bool
 	for _, call := range mock.Calls {
-		if strings.HasPrefix(call, "netbird up") {
+		if strings.HasPrefix(call, "sh -c ") {
 			foundUp = true
-			if !strings.Contains(call, "--setup-key") || !strings.Contains(call, "nb-setup-xxx") {
-				t.Errorf("should include setup key, got: %s", call)
+			if strings.Contains(call, "nb-setup-xxx") || strings.Contains(call, "--setup-key") {
+				t.Errorf("the setup key must never ride the argv (C08), got: %s", call)
+			}
+			if !strings.Contains(call, `export NB_SETUP_KEY="$k"`) || !strings.Contains(call, "exec netbird up") {
+				t.Errorf("the key must ride NB_SETUP_KEY into netbird up, got: %s", call)
 			}
 		}
 	}

@@ -2,7 +2,6 @@ package openbao
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -60,20 +59,37 @@ func (c *Client) EnableDatabaseSecrets(ctx context.Context, opts DBSetupOptions)
 
 	// 2. Configure the connection. The admin creds are used only to create/drop
 	// the ephemeral roles; {{username}}/{{password}} are OpenBao's templating.
+	// The whole config — including the admin password — rides stdin as JSON
+	// (`write <path> -`), never the docker exec argv (C08).
 	connURL := fmt.Sprintf("postgresql://{{username}}:{{password}}@%s:5432/%s?sslmode=disable", dbHost, opts.DBName)
-	cfg := fmt.Sprintf("write database/config/%s plugin_name=postgresql-database-plugin allowed_roles=%s connection_url=%s username=%s password=%s",
-		dbConnName(opts.App), shellSingleQuote(dbRoleName(opts.App)),
-		shellSingleQuote(connURL), shellSingleQuote(opts.AdminUser), shellSingleQuote(opts.AdminPass))
-	if out, err := c.bao(ctx, container, root, cfg); err != nil {
+	cfg, err := json.Marshal(map[string]string{
+		"plugin_name":     "postgresql-database-plugin",
+		"allowed_roles":   dbRoleName(opts.App),
+		"connection_url":  connURL,
+		"username":        opts.AdminUser,
+		"password":        opts.AdminPass,
+	})
+	if err != nil {
+		return fmt.Errorf("encoding db connection config: %w", err)
+	}
+	if out, err := c.baoInput(ctx, container, root, "write database/config/"+dbConnName(opts.App)+" -", string(cfg)); err != nil {
 		return fmt.Errorf("configuring db connection: %s", truncate(out, 200))
 	}
 
 	// 3. Role: each cred request mints a login role granted SELECT, expiring at
-	// the lease end. Least privilege — read-only by default.
+	// the lease end. Least privilege — read-only by default. Same stdin JSON
+	// transport (creation_statements is arbitrary SQL — no quoting surface).
 	creation := `CREATE ROLE "{{name}}" WITH LOGIN PASSWORD '{{password}}' VALID UNTIL '{{expiration}}'; GRANT SELECT ON ALL TABLES IN SCHEMA public TO "{{name}}";`
-	role := fmt.Sprintf("write database/roles/%s db_name=%s creation_statements=%s default_ttl=%s max_ttl=%s",
-		dbRoleName(opts.App), dbConnName(opts.App), shellSingleQuote(creation), opts.TTL, opts.MaxTTL)
-	if out, err := c.bao(ctx, container, root, role); err != nil {
+	role, err := json.Marshal(map[string]string{
+		"db_name":             dbConnName(opts.App),
+		"creation_statements": creation,
+		"default_ttl":         opts.TTL,
+		"max_ttl":             opts.MaxTTL,
+	})
+	if err != nil {
+		return fmt.Errorf("encoding db role config: %w", err)
+	}
+	if out, err := c.baoInput(ctx, container, root, "write database/roles/"+dbRoleName(opts.App)+" -", string(role)); err != nil {
 		return fmt.Errorf("creating db role: %s", truncate(out, 200))
 	}
 
@@ -134,17 +150,32 @@ func (c *Client) EnableStaticRole(ctx context.Context, opts StaticRoleOptions) e
 		return fmt.Errorf("enabling database engine: %s", truncate(out, 160))
 	}
 	// Connection with allowed_roles "*" so dynamic + static roles both work.
+	// Same stdin JSON transport as the dynamic path — the admin password
+	// never enters an argv (C08).
 	connURL := fmt.Sprintf("postgresql://{{username}}:{{password}}@%s:5432/%s?sslmode=disable", dbHost, opts.DBName)
-	cfg := fmt.Sprintf("write database/config/%s plugin_name=postgresql-database-plugin allowed_roles=* connection_url=%s username=%s password=%s",
-		dbConnName(opts.App), shellSingleQuote(connURL), shellSingleQuote(opts.AdminUser), shellSingleQuote(opts.AdminPass))
-	if out, err := c.bao(ctx, container, root, cfg); err != nil {
+	cfg, err := json.Marshal(map[string]string{
+		"plugin_name":    "postgresql-database-plugin",
+		"allowed_roles":  "*",
+		"connection_url": connURL,
+		"username":       opts.AdminUser,
+		"password":       opts.AdminPass,
+	})
+	if err != nil {
+		return fmt.Errorf("encoding db connection config: %w", err)
+	}
+	if out, err := c.baoInput(ctx, container, root, "write database/config/"+dbConnName(opts.App)+" -", string(cfg)); err != nil {
 		return fmt.Errorf("configuring db connection: %s", truncate(out, 200))
 	}
 	// Static role: OpenBao rotates opts.Username's password every RotationPeriod.
-	role := fmt.Sprintf("write database/static-roles/%s db_name=%s username=%s rotation_period=%s",
-		staticRoleName(opts.App, opts.Username), dbConnName(opts.App),
-		shellSingleQuote(opts.Username), opts.RotationPeriod)
-	if out, err := c.bao(ctx, container, root, role); err != nil {
+	role, err := json.Marshal(map[string]string{
+		"db_name":         dbConnName(opts.App),
+		"username":        opts.Username,
+		"rotation_period": opts.RotationPeriod,
+	})
+	if err != nil {
+		return fmt.Errorf("encoding static role config: %w", err)
+	}
+	if out, err := c.baoInput(ctx, container, root, "write database/static-roles/"+staticRoleName(opts.App, opts.Username)+" -", string(role)); err != nil {
 		return fmt.Errorf("creating static role: %s", truncate(out, 200))
 	}
 	// Grant the app read on its rotating static creds.
@@ -199,16 +230,13 @@ func (c *Client) DBCreds(ctx context.Context, app, accessory string) (map[string
 
 // writeAppPolicy (re)writes the app's read policy. When withDB is true it also
 // grants read on the dynamic database creds path. Single source of truth for
-// the policy so EnsureAppRole and EnableDatabaseSecrets stay consistent.
+// the policy so EnsureAppRole and EnableDatabaseSecrets stay consistent. The
+// token (line 1) and the raw HCL policy ride stdin — the old form put the
+// root token directly in the docker exec argv (C08), and the base64 dance
+// existed only to survive argv quoting, which the pipe no longer needs.
 func (c *Client) writeAppPolicy(ctx context.Context, container, root, app string, withDB bool) error {
-	policy := AppReadPolicy(app, withDB)
-	// Pipe the policy via base64 rather than a heredoc: it avoids all quoting/
-	// terminator interactions across the docker-exec + sh -c layers (a heredoc
-	// terminator can't share its line with the 2>&1 the bao helper appends).
-	b64 := base64.StdEncoding.EncodeToString([]byte(policy))
-	cmd := fmt.Sprintf("echo %s | base64 -d | env BAO_ADDR=%s BAO_TOKEN=%s bao policy write %s-read -",
-		b64, containerAPIAddr, root, app)
-	if _, err := c.docker.Exec(ctx, container, cmd); err != nil {
+	inner := `IFS= read -r teploy_tok; export BAO_ADDR=` + containerAPIAddr + ` BAO_TOKEN="$teploy_tok"; exec bao policy write ` + app + `-read -`
+	if _, err := c.docker.ExecInput(ctx, container, inner, strings.NewReader(root+"\n"+AppReadPolicy(app, withDB))); err != nil {
 		return fmt.Errorf("writing policy: %w", err)
 	}
 	return nil

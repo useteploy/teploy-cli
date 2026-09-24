@@ -73,6 +73,7 @@ func NewRootCmd(version string) *cobra.Command {
 	root.AddCommand(newStatsCmd(flags))
 	root.AddCommand(newHealthCmd(flags))
 	root.AddCommand(newBackupCmd(flags))
+	root.AddCommand(newDRCmd(flags, version))
 	root.AddCommand(newLockCmd(flags))
 	root.AddCommand(newUnlockCmd(flags))
 	root.AddCommand(newInitCmd())

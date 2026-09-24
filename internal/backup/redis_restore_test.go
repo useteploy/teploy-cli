@@ -98,9 +98,9 @@ func (e *redisRestoreExec) Upload(ctx context.Context, content io.Reader, remote
 	return nil
 }
 
-func (e *redisRestoreExec) Close() error    { return nil }
-func (e *redisRestoreExec) Host() string    { return "1.2.3.4" }
-func (e *redisRestoreExec) User() string    { return "root" }
+func (e *redisRestoreExec) Close() error { return nil }
+func (e *redisRestoreExec) Host() string { return "1.2.3.4" }
+func (e *redisRestoreExec) User() string { return "root" }
 
 // writeDockerStub writes the stub docker binary the restore script drives.
 // Scenario knobs (env): HAVE_DUMP=yes/no, FAIL_BASELINE=transport,

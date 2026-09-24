@@ -87,17 +87,33 @@ func runRegistryLogin(flags *Flags, registry, serverName, username, password str
 		}
 	}
 
-	// Single-quote every value so the remote shell can't expand or execute it.
-	// `echo %q` used double quotes, under which $/backticks in the password (or
-	// registry/username) still expand — a shell-injection running as the SSH
-	// user. printf '%s' emits the password literally to docker --password-stdin.
-	cmd := fmt.Sprintf("printf '%%s' %s | docker login %s -u %s --password-stdin",
-		ssh.ShellQuote(password), ssh.ShellQuote(registry), ssh.ShellQuote(username))
-	if _, err := executor.Run(ctx, cmd); err != nil {
-		return fmt.Errorf("docker login failed: %w", err)
+	// The password travels over the SSH session's stdin, never in the
+	// command string: the old `printf '%s' '<password>' | docker login
+	// --password-stdin` put the secret in the session shell's argv —
+	// visible in the server's process list for the life of the login
+	// and in any command-bearing error output. docker reads it from
+	// stdin either way; only the transport channel changed (C08).
+	if err := registryLoginOnServer(ctx, executor, registry, username, password); err != nil {
+		return err
 	}
 
 	fmt.Printf("Logged in to %s on server\n", registry)
+	return nil
+}
+
+// registryLoginOnServer runs `docker login` on the server with the
+// password streamed over stdin. Split from runRegistryLogin so the
+// transport contract is pinnable without standing up the connect path.
+func registryLoginOnServer(ctx context.Context, executor ssh.Executor, registry, username, password string) error {
+	cmd := fmt.Sprintf("docker login %s -u %s --password-stdin",
+		ssh.ShellQuote(registry), ssh.ShellQuote(username))
+	res := ssh.RunInputDetailed(ctx, executor, cmd, strings.NewReader(password))
+	if res.Err != nil {
+		return fmt.Errorf("docker login failed: %w", res.Err)
+	}
+	if res.ExitCode != 0 {
+		return fmt.Errorf("docker login failed: %s", res.ExitErrorText())
+	}
 	return nil
 }
 
@@ -166,14 +182,14 @@ func runRegistryList(flags *Flags, serverName string) error {
 	}
 	defer executor.Close()
 
-	output, err := executor.Run(ctx, "cat ~/.docker/config.json 2>/dev/null || echo '{}'")
+	// A read failure must not become empty state (C08): the old
+	// `cat config 2>/dev/null || echo '{}'` turned an unreadable config
+	// (permissions, I/O error) into "No registries configured". The
+	// framed form distinguishes confirmed absence (no config file — the
+	// fresh-docker case) from a real read failure, which errors.
+	entries, err := registryListFromServer(ctx, executor)
 	if err != nil {
 		return err
-	}
-
-	entries, err := parseDockerAuths(output)
-	if err != nil {
-		return fmt.Errorf("parsing ~/.docker/config.json: %w", err)
 	}
 
 	// --json is a documented, working global flag on every other
@@ -230,6 +246,30 @@ func runRegistryRemove(flags *Flags, registry, serverName string) error {
 
 	fmt.Printf("Removed credentials for %s\n", registry)
 	return nil
+}
+
+// registryListFromServer reads the server's ~/.docker/config.json and
+// returns its registry entries. Confirmed absence of the file is the
+// normal no-registries state (empty slice); a file that exists but
+// cannot be read is an error — never an empty list masquerading as
+// "nothing configured".
+func registryListFromServer(ctx context.Context, executor ssh.Executor) ([]RegistryEntry, error) {
+	res := ssh.RunDetailed(ctx, executor, "if [ ! -f ~/.docker/config.json ]; then printf 'absent\\n'; else cat ~/.docker/config.json; fi")
+	if res.Err != nil {
+		return nil, res.Err
+	}
+	if res.ExitCode != 0 {
+		return nil, fmt.Errorf("reading ~/.docker/config.json on the server: %s", res.ExitErrorText())
+	}
+	output := res.TrimmedStdout()
+	if output == "absent" {
+		return nil, nil
+	}
+	entries, err := parseDockerAuths(output)
+	if err != nil {
+		return nil, fmt.Errorf("parsing ~/.docker/config.json: %w", err)
+	}
+	return entries, nil
 }
 
 // connectForRegistry establishes SSH connection using server flag, app config, or flags.

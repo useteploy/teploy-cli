@@ -360,6 +360,25 @@ func (c *Client) ExecStream(ctx context.Context, name, command string, stdout, s
 	return c.exec.RunStream(ctx, cmd, stdout, stderr)
 }
 
+// ExecInput runs a command inside a running container with stdin streamed
+// from stdin, capturing stdout — the container-exec analogue of the
+// Executor.RunInput secret-transport contract (C08): secret material
+// (tokens, values) must ride the stdin pipe, not the docker exec argv,
+// where the host's process list would show it. The returned string on
+// failure is the command's stderr (the diagnostics callers classify),
+// mirroring Exec's error-text contract.
+func (c *Client) ExecInput(ctx context.Context, name, command string, stdin io.Reader) (string, error) {
+	cmd := fmt.Sprintf("docker exec -i %s sh -c %s", ssh.ShellQuote(name), ssh.ShellQuote(command))
+	res := ssh.RunInputDetailed(ctx, c.exec, cmd, stdin)
+	if res.Err != nil {
+		return res.ExitErrorText(), fmt.Errorf("exec in container %s: %w", name, res.Err)
+	}
+	if res.ExitCode != 0 {
+		return string(res.Stdout), fmt.Errorf("exec in container %s: exit status %d: %s", name, res.ExitCode, res.ExitErrorText())
+	}
+	return string(res.Stdout), nil
+}
+
 // RunningContainer returns the name of a running container for the app's given
 // process (e.g. "web"). For a multi-replica process it returns the first
 // replica. Used by `app exec` to pick a target to run a one-off command in.

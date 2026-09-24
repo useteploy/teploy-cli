@@ -450,6 +450,28 @@ func extractToStagingThenPromote(ctx context.Context, exec ssh.Executor, archive
 		}
 	}
 
+	recoveryDir, err := promoteStaged(ctx, exec, stageDir, liveDir, out, stageDir, archivePath)
+	if err != nil {
+		// A recovery-incomplete failure retains its artifacts INSIDE the
+		// staged tree — the caller's cleanup must not delete what the
+		// error just described as kept (TCL-43).
+		if !errors.Is(err, errRecoveryIncomplete) {
+			cleanup()
+		}
+		return recoveryDir, err
+	}
+	cleanup()
+	return recoveryDir, nil
+}
+
+// promoteStaged copies an already-extracted staged tree over liveDir's
+// contents using the two-phase recovery discipline (see
+// extractToStagingThenPromote): originals are moved aside first, so a
+// failure at ANY point is recoverable and never destroys the only copy.
+// retainedPaths name the staged tree (and archive) that a
+// recovery-incomplete error must tell the operator about; the CALLER owns
+// their cleanup. Shared by volume-archive restore and the DR cutover path.
+func promoteStaged(ctx context.Context, exec ssh.Executor, stageDir, liveDir string, out io.Writer, retainedPaths ...string) (string, error) {
 	fmt.Fprintf(out, "Restoring to %s...\n", liveDir)
 	if _, err := exec.Run(ctx, "mkdir -p "+ssh.ShellQuote(liveDir)); err != nil {
 		return "", fmt.Errorf("preparing %s: %w", liveDir, err)
@@ -473,9 +495,8 @@ func extractToStagingThenPromote(ctx context.Context, exec ssh.Executor, archive
 			ssh.ShellQuote(recoveryDir), ssh.ShellQuote(liveDir))
 		if _, rbErr := exec.Run(context.WithoutCancel(ctx), moveBack); rbErr != nil {
 			return recoveryDir, fmt.Errorf("%w: moving current contents aside for %s: %v — original entries preserved split across %s and %s, staged restore kept in %s",
-				errRecoveryIncomplete, liveDir, err, liveDir, recoveryDir, stageDir)
+				errRecoveryIncomplete, liveDir, err, liveDir, recoveryDir, strings.Join(retainedPaths, ", "))
 		}
-		cleanup()
 		exec.Run(context.WithoutCancel(ctx), "rm -rf "+ssh.ShellQuote(recoveryDir))
 		return "", fmt.Errorf("moving current contents aside for %s: %w — previous contents restored, live directory untouched",
 			liveDir, err)
@@ -490,15 +511,13 @@ func extractToStagingThenPromote(ctx context.Context, exec ssh.Executor, archive
 			ssh.ShellQuote(liveDir), ssh.ShellQuote(recoveryDir), ssh.ShellQuote(liveDir))
 		if _, rbErr := exec.Run(context.WithoutCancel(ctx), rollbackCmd); rbErr != nil {
 			return recoveryDir, fmt.Errorf("%w: promoting staged restore into %s: %v — rollback failed too; previous contents kept in %s, staged restore kept in %s",
-				errRecoveryIncomplete, liveDir, err, recoveryDir, stageDir)
+				errRecoveryIncomplete, liveDir, err, recoveryDir, strings.Join(retainedPaths, ", "))
 		}
-		cleanup()
 		exec.Run(context.WithoutCancel(ctx), "rm -rf "+ssh.ShellQuote(recoveryDir))
 		return "", fmt.Errorf("promoting staged restore into %s: %w — previous contents restored, staged restore discarded",
 			liveDir, err)
 	}
 
-	cleanup()
 	return recoveryDir, nil
 }
 
@@ -541,7 +560,6 @@ func (c *Client) AccessoryBackup(ctx context.Context, app, name, image string, e
 		return err
 	}
 	containerName := app + "-" + name
-	qContainer := ssh.ShellQuote(containerName)
 
 	runOut, err := c.exec.Run(ctx, "umask 077; mktemp -d /tmp/teploy-backup.XXXXXXXX")
 	if err != nil {
@@ -552,96 +570,18 @@ func (c *Client) AccessoryBackup(ctx context.Context, app, name, image string, e
 		c.exec.Run(context.WithoutCancel(ctx), "rm -rf "+ssh.ShellQuote(workDir))
 	}
 
-	dumpPath := workDir + "/dump.out.gz"
-	// dumpTmp is redirected into with `>`, not piped into gzip: a shell
-	// pipeline's exit status is its LAST command's (gzip, which "succeeds"
-	// compressing an empty stream even when pg_dump/mysqldump errored to
-	// stderr) — `| gzip > path` would silently swallow a real dump
-	// failure. Confirmed live: a wrong db name (see postgresDBAndUser)
-	// produced a 20-byte gzip of nothing while the old `| gzip` version of
-	// this command reported "Backup complete". Redirecting to a plain
-	// file with `>` preserves the dump command's own exit code, which
-	// c.exec.Run already surfaces (with captured stderr) as a real error.
-	dumpTmp := workDir + "/dump.out"
-	var dumpCmd string
-	s3Key := ""
-	switch {
-	case isDBType(image, "postgres"):
-		db, user := postgresDBAndUser(app, env)
-		s3Key = fmt.Sprintf("s3://%s/%s/accessories/%s/%s.sql.gz", s3.Bucket, app, name, timestamp)
-		dumpCmd = fmt.Sprintf("docker exec %s pg_dump -U %s %s > %s && gzip -c %s > %s",
-			qContainer, ssh.ShellQuote(user), ssh.ShellQuote(db), ssh.ShellQuote(dumpTmp), ssh.ShellQuote(dumpTmp), ssh.ShellQuote(dumpPath))
-	case isDBType(image, "mysql"), isDBType(image, "mariadb"):
-		db := mysqlDB(app, env)
-		s3Key = fmt.Sprintf("s3://%s/%s/accessories/%s/%s.sql.gz", s3.Bucket, app, name, timestamp)
-		// Root password via MYSQL_PWD container env, never a command-line
-		// flag: mysqldump/mysql argv is visible in `ps` inside the
-		// container. Absent = current behavior (passwordless root).
-		execEnv := ""
-		if pwd := mysqlRootPassword(env); pwd != "" {
-			execEnv = " -e MYSQL_PWD=" + ssh.ShellQuote(pwd)
-		}
-		dumpCmd = fmt.Sprintf("docker exec%s %s mysqldump -u root %s > %s && gzip -c %s > %s",
-			execEnv, qContainer, ssh.ShellQuote(db), ssh.ShellQuote(dumpTmp), ssh.ShellQuote(dumpTmp), ssh.ShellQuote(dumpPath))
-	case isDBType(image, "mongo"):
-		s3Key = fmt.Sprintf("s3://%s/%s/accessories/%s/%s.archive.gz", s3.Bucket, app, name, timestamp)
-		dumpCmd = fmt.Sprintf("docker exec %s mongodump --archive --gzip > %s", qContainer, ssh.ShellQuote(dumpPath))
-	case isDBType(image, "redis"):
-		s3Key = fmt.Sprintf("s3://%s/%s/accessories/%s/%s.rdb.gz", s3.Bucket, app, name, timestamp)
-		// Redis: trigger bgsave, wait for an ACKNOWLEDGED new save, then
-		// copy dump.rdb. The old one-liner polled LASTSAVE in a loop whose
-		// exhaustion still exited 0 (the last `sleep` won), so docker cp
-		// ran with the PREVIOUS dump and uploaded it as a fresh backup
-		// (audit F36). This script fails closed: BGSAVE refusal (other
-		// than an already-running save, whose completion still moves
-		// LASTSAVE), a poll timeout, or a failed copy all abort before
-		// anything is uploaded.
-		redisTmp := workDir + "/dump.rdb"
-		dumpCmd = strings.Join([]string{
-			"set -eu",
-			// AOF-enabled Redis persists to the append-only file; backing
-			// up only dump.rdb captures a stale or empty dataset. Fail
-			// closed rather than uploading a wrong-point-in-time artifact
-			// (TCL-42).
-			// AOF gate (A40): the old `config get appendonly | tail -n 1`
-			// pipeline masked a failed docker exec (empty output fell
-			// through as "not yes") and only refused on a substring
-			// match. The reply must be a proven `appendonly no` —
-			// anything else (auth error, empty, unexpected) refuses.
-			fmt.Sprintf("aof=$(docker exec %s redis-cli --raw config get appendonly)", qContainer),
-			`set -- $aof`,
-			`if [ "${1:-}" != appendonly ] || [ "${2:-}" != no ]; then echo 'cannot confirm redis appendonly=no (got: '"$aof"') — teploy backup captures dump.rdb only; refusing' >&2; exit 1; fi`,
-			fmt.Sprintf("ls=$(docker exec %s redis-cli lastsave)", qContainer),
-			fmt.Sprintf("bgs=$(docker exec %s redis-cli bgsave 2>&1) || true", qContainer),
-			`case "$bgs" in *ERR*) case "$bgs" in *"in progress"*) ;; *) printf 'redis BGSAVE failed: %s\n' "$bgs" >&2; exit 1;; esac;; esac`,
-			"saved=no; i=0",
-			`while [ "$i" -lt 60 ]; do`,
-			fmt.Sprintf("cur=$(docker exec %s redis-cli lastsave)", qContainer),
-			`if [ "$cur" != "$ls" ]; then saved=yes; break; fi`,
-			"sleep 1; i=$((i+1))",
-			"done",
-			`if [ "$saved" != yes ]; then echo 'timed out waiting for Redis BGSAVE to complete' >&2; exit 1; fi`,
-			fmt.Sprintf("docker cp %s:/data/dump.rdb %s", qContainer, ssh.ShellQuote(redisTmp)),
-			fmt.Sprintf("gzip -c %s > %s", ssh.ShellQuote(redisTmp), ssh.ShellQuote(dumpPath)),
-			fmt.Sprintf("rm -f %s", ssh.ShellQuote(redisTmp)),
-		}, "\n")
-	default:
-		// Generic: tar the volume directory. For a LIVE engine (nucleus and
-		// anything else that mutates its files during the read) this is a
-		// crash-consistent snapshot: GNU tar exits 1 with "file changed" /
-		// "file shrank" warnings when a WAL rotates or checkpoints mid-read.
-		// That shape is exactly what crash recovery is built for (torn-tail
-		// truncation + CRC skip), so tolerate exit 1 — real failures
-		// (unreadable dir, ENOSPC) exit 2. `accessory verify-backup` is the
-		// correctness gate: it boots the archive in a scratch container.
-		accDir := fmt.Sprintf("%s/%s/accessories/%s", deploymentsDir, app, name)
-		dumpPath = workDir + "/dump.tar.gz"
-		s3Key = fmt.Sprintf("s3://%s/%s/accessories/%s/%s.tar.gz", s3.Bucket, app, name, timestamp)
-		dumpCmd = fmt.Sprintf("tar -czf %s -C %s . || [ $? -eq 1 ]", ssh.ShellQuote(dumpPath), ssh.ShellQuote(accDir))
+	// Consistency classification + the dump command come from the shared
+	// planner (also used by the DR bundle path) so the two snapshot paths
+	// can never drift apart.
+	plan := planAccessoryDump(app, name, image, env, workDir)
+	dumpPath := plan.artifactPath
+	s3Key := fmt.Sprintf("s3://%s/%s/accessories/%s/%s%s", s3.Bucket, app, name, timestamp, plan.ext)
+	if err := plan.stage(ctx, c.exec); err != nil {
+		cleanup()
+		return fmt.Errorf("staging the mysql credential file for %s (no dump was run): %w", name, err)
 	}
-
 	fmt.Fprintf(c.out, "Backing up %s...\n", containerName)
-	if _, err := c.exec.Run(ctx, dumpCmd); err != nil {
+	if _, err := c.exec.Run(ctx, plan.cmd); err != nil {
 		// Never leave partial backups around: they're disk-fillers at best,
 		// restore-bait at worst.
 		cleanup()
@@ -665,9 +605,6 @@ func (c *Client) AccessoryRestore(ctx context.Context, app, name, image, date st
 		return err
 	}
 
-	containerName := app + "-" + name
-	qContainer := ssh.ShellQuote(containerName)
-
 	// All restore scratch files live under one per-invocation temp dir. The
 	// old fixed names (/tmp/restore.sql.gz, …, and the generic branch's
 	// /tmp/<app>-<name>-restore-stage) were shared by every restore: two
@@ -690,27 +627,30 @@ func (c *Client) AccessoryRestore(ctx context.Context, app, name, image, date st
 
 	switch {
 	case isDBType(image, "postgres"):
-		db, user := postgresDBAndUser(app, env)
 		s3Key = fmt.Sprintf("s3://%s/%s/accessories/%s/%s.sql.gz", s3.Bucket, app, name, date)
 		restorePath = tmpdir + "/restore.sql.gz"
-		// Decompress to a file first and feed psql via stdin redirect: a
-		// pipeline reports only the LAST command's status, so `gunzip | psql`
-		// succeeded on a corrupt archive (empty stdin) and — without
-		// ON_ERROR_STOP — on SQL errors too. Same convention as verify.go.
-		sqlPath := tmpdir + "/restore.sql"
-		restoreCmd = fmt.Sprintf("gunzip -c %s > %s && docker exec -i %s psql -v ON_ERROR_STOP=1 -U %s %s < %s",
-			ssh.ShellQuote(restorePath), ssh.ShellQuote(sqlPath), qContainer, ssh.ShellQuote(user), ssh.ShellQuote(db), ssh.ShellQuote(sqlPath))
+		db, user := postgresDBAndUser(app, env)
+		restoreCmd = postgresRestoreCmd(app+"-"+name, user, db, restorePath, tmpdir+"/restore.sql")
 	case isDBType(image, "mysql"), isDBType(image, "mariadb"):
-		db := mysqlDB(app, env)
 		// The old branch never assigned s3Key/restorePath, so the download
 		// and gunzip below operated on empty arguments — every MySQL/MariaDB
 		// restore was deterministically broken (audit F31).
 		s3Key = fmt.Sprintf("s3://%s/%s/accessories/%s/%s.sql.gz", s3.Bucket, app, name, date)
 		restorePath = tmpdir + "/restore.sql.gz"
-		// Same MYSQL_PWD env injection as the backup path (see there).
+		qContainer := ssh.ShellQuote(app + "-" + name)
+		db := mysqlDB(app, env)
+		// Same 0600 env-file credential transport as the backup path
+		// (see there) — the password rides in no argv. The restore
+		// failure path DELIBERATELY keeps tmpdir for inspection, so the
+		// credential file must be removed by name there: keep the SQL,
+		// never the secret (C08).
 		execEnv := ""
 		if pwd := mysqlRootPassword(env); pwd != "" {
-			execEnv = " -e MYSQL_PWD=" + ssh.ShellQuote(pwd)
+			envFile := tmpdir + "/mysql.env"
+			if err := c.exec.Upload(ctx, strings.NewReader("MYSQL_PWD="+pwd+"\n"), envFile, "0600"); err != nil {
+				return keepTmp(fmt.Errorf("staging the mysql credential file for %s: %w", name, err))
+			}
+			execEnv = " --env-file " + ssh.ShellQuote(envFile)
 		}
 		// Same pipeline-to-redirect shape as postgres (mysql itself exits
 		// nonzero on SQL errors when reading a script, but gunzip's failure
@@ -718,74 +658,28 @@ func (c *Client) AccessoryRestore(ctx context.Context, app, name, image, date st
 		sqlPath := tmpdir + "/restore.sql"
 		restoreCmd = fmt.Sprintf("gunzip -c %s > %s && docker exec -i%s %s mysql -u root %s < %s",
 			ssh.ShellQuote(restorePath), ssh.ShellQuote(sqlPath), execEnv, qContainer, ssh.ShellQuote(db), ssh.ShellQuote(sqlPath))
+		// The kept-on-failure scratch dir must never keep the credential.
+		innerKeep := keepTmp
+		keepTmp = func(err error) error {
+			c.exec.Run(context.WithoutCancel(ctx), "rm -f "+ssh.ShellQuote(tmpdir+"/mysql.env"))
+			return innerKeep(err)
+		}
 	case isDBType(image, "mongo"):
 		s3Key = fmt.Sprintf("s3://%s/%s/accessories/%s/%s.archive.gz", s3.Bucket, app, name, date)
 		restorePath = tmpdir + "/restore.archive.gz"
-		restoreCmd = fmt.Sprintf("docker exec -i %s mongorestore --archive --gzip --drop < %s", qContainer, ssh.ShellQuote(restorePath))
+		restoreCmd = mongoRestoreCmd(app+"-"+name, restorePath)
 	case isDBType(image, "redis"):
-		// AccessoryBackup stores redis as <date>.rdb.gz; without this case the
-		// default branch looked for a .tar.gz that doesn't exist, so redis
-		// restores always failed. Stop redis first so its shutdown save can't
-		// overwrite the snapshot we copy in, then start so it loads dump.rdb.
-		//
-		// The old `gunzip && stop && cp && start` chain could leave the
-		// accessory STOPPED forever when docker cp failed after a successful
-		// stop (audit F38). This script decompresses FIRST (no downtime while
-		// validating the artifact), saves the current dump, and restores +
-		// restarts the original on any failure after the stop.
+		// AccessoryBackup stores redis as <date>.rdb.gz; without this case
+		// the default branch looked for a .tar.gz that doesn't exist, so
+		// redis restores always failed. Stop redis first so its shutdown
+		// save can't overwrite the snapshot we copy in, then start so it
+		// loads dump.rdb (full reasoning on redisRestoreScript).
 		s3Key = fmt.Sprintf("s3://%s/%s/accessories/%s/%s.rdb.gz", s3.Bucket, app, name, date)
 		restorePath = tmpdir + "/restore.rdb.gz"
-		rdbPath := tmpdir + "/restore.rdb"
-		oldRdb := tmpdir + "/old-dump.rdb"
-		// A40: the AOF gate is a Go-level preflight so a failed or
-		// unexpected reply (auth error, empty output, anything but a
-		// proven `appendonly no`) refuses BEFORE any stop or copy — the
-		// old `config get appendonly | tail -n 1` pipeline masked a failed
-		// docker exec as "not yes" and fell through to the destructive
-		// replacement. ("Not proven yes" is not "proven no".)
-		aofOut, aofErr := c.exec.Run(ctx, fmt.Sprintf("docker exec %s redis-cli --raw config get appendonly", qContainer))
-		if aofErr != nil {
-			return keepTmp(fmt.Errorf("cannot establish the Redis persistence mode for %s: %w", containerName, aofErr))
+		if err := c.redisAOFPreflight(ctx, app, name); err != nil {
+			return keepTmp(err)
 		}
-		if aofFields := strings.Fields(aofOut); len(aofFields) != 2 || aofFields[0] != "appendonly" || aofFields[1] != "no" {
-			return keepTmp(fmt.Errorf("cannot confirm appendonly=no for %s (got %q) — an AOF-enabled Redis would load the append-only file on restart and teploy's dump.rdb restore would be a no-op; an explicit restore plan is required", containerName, strings.TrimSpace(aofOut)))
-		}
-		// A41 ordering + T37/T38 arming: restore_original is defined (and
-		// the old-dump capture attempted) AFTER the stop — a graceful redis
-		// shutdown writes a final RDB, so the pre-stop existence flag could
-		// miss data present at shutdown. The baseline copy itself
-		// distinguishes "no such file" (nothing to preserve) from every
-		// other failure, and ANY failure after the stop restarts the
-		// container before aborting: the old script's `set -e` exit on a
-		// failed docker cp left Redis stopped with no recovery attempt.
-		restoreCmd = strings.Join([]string{
-			"set -eu",
-			fmt.Sprintf("gunzip -c %s > %s", ssh.ShellQuote(restorePath), ssh.ShellQuote(rdbPath)),
-			"had=no",
-			fmt.Sprintf(`restore_original() { if [ "$had" = yes ] && [ -f %s ]; then docker cp %s %s:/data/dump.rdb || true; fi; docker start %s || true; }`,
-				ssh.ShellQuote(oldRdb), ssh.ShellQuote(oldRdb), qContainer, qContainer),
-			fmt.Sprintf("docker stop %s", qContainer),
-			// Post-stop baseline (docker cp works on a stopped container):
-			// success -> had=yes; a proven not-found -> nothing to
-			// preserve; anything else -> restart + abort.
-			`cperr=$(mktemp)`,
-			fmt.Sprintf(`if docker cp %s:/data/dump.rdb %s 2>"$cperr"; then had=yes; elif grep -qi 'no such' "$cperr"; then had=no; else cat "$cperr" >&2; rm -f "$cperr"; restore_original; echo 'capturing the pre-restore dump failed; the container was restarted' >&2; exit 1; fi`,
-				qContainer, ssh.ShellQuote(oldRdb)),
-			`rm -f "$cperr"`,
-			"ok=yes",
-			fmt.Sprintf("docker cp %s %s:/data/dump.rdb || ok=no", ssh.ShellQuote(rdbPath), qContainer),
-			`if [ "$ok" != yes ]; then`,
-			`  restore_original`,
-			"  echo 'redis restore failed after stopping the container; the original dump was restored when available' >&2",
-			"  exit 1",
-			"fi",
-			fmt.Sprintf("if ! docker start %s; then", qContainer),
-			`  restore_original`,
-			"  echo 'redis container failed to start after the restore; the original dump was put back — verify the accessory' >&2",
-			"  exit 1",
-			"fi",
-			fmt.Sprintf("rm -f %s", ssh.ShellQuote(rdbPath)),
-		}, "\n")
+		restoreCmd = redisRestoreScript(app+"-"+name, restorePath, tmpdir+"/restore.rdb", tmpdir+"/old-dump.rdb")
 	default:
 		// Generic: extract tar to accessory directory.
 		s3Key = fmt.Sprintf("s3://%s/%s/accessories/%s/%s.tar.gz", s3.Bucket, app, name, date)
@@ -895,6 +789,246 @@ func (c *Client) ensureAWSCLI(ctx context.Context) error {
 // turned "registry.example:5000/postgres:16" into "registry.example" and
 // silently routed real databases through the generic tar backup/restore
 // branch.
+// accessoryDumpPlan is the single source of truth for how one accessory is
+// snapshotted: the engine classification, the consistency the artifact can
+// honestly claim, and the exact server-side command that produces it.
+// AccessoryBackup (single-accessory S3 backups) and the DR bundle path both
+// build on it, so the two flows cannot drift into different dump semantics.
+type accessoryDumpPlan struct {
+	engine      string // postgres|mysql|mariadb|mongo|redis|generic
+	method      string // pg_dump|mysqldump|mongodump|redis-bgsave|tar
+	consistency string // engine-consistent | crash-consistent
+	ext         string // .sql.gz | .archive.gz | .rdb.gz | .tar.gz
+	// artifactPath is where the plan's command writes its artifact:
+	// <workDir>/dump.out.gz for engine dumps, <workDir>/dump.tar.gz for
+	// the generic tar branch.
+	artifactPath string
+	cmd          string
+	// credential, when non-nil, is a secret the plan's command needs via a
+	// 0600 env-file (--env-file) rather than argv: the CALLER must upload
+	// it before running cmd and ensure it never survives a kept scratch
+	// dir (C08 transport contract).
+	credential *planCredential
+}
+
+// planCredential is the staged env-file contract between the planner and
+// its callers: content uploaded at path with mode 0600.
+type planCredential struct {
+	path    string
+	content string
+}
+
+// stage uploads the plan's credential file (no-op when the plan carries
+// none). Errors are pre-effect: no dump command has run yet.
+func (p accessoryDumpPlan) stage(ctx context.Context, exec ssh.Executor) error {
+	if p.credential == nil {
+		return nil
+	}
+	return exec.Upload(ctx, strings.NewReader(p.credential.content), p.credential.path, "0600")
+}
+
+// Consistency level labels recorded in DR bundle manifests. A raw tar of a
+// live database volume is NOT a consistent backup, and these labels are how
+// the code refuses to present it as one (C07).
+const (
+	consistencyEngineDump = "engine-consistent" // engine-native dump tooling (pg_dump, mysqldump, mongodump)
+	consistencySnapshot   = "engine-snapshot"   // engine-acknowledged point-in-time file snapshot (redis BGSAVE)
+	consistencyCrash      = "crash-consistent"  // raw file copy of a live writer; only crash recovery is guaranteed
+	consistencyQuiesced   = "quiesced"          // writer stopped before the copy (operator or teploy did it)
+)
+
+// planAccessoryDump classifies an accessory image and builds the command that
+// dumps it into workDir. The commands are byte-identical to the historical
+// AccessoryBackup switch (behavior pinned by existing tests); extraction into
+// a shared planner exists so the DR bundle path reuses them rather than
+// forking a second backup system.
+func planAccessoryDump(app, name, image string, env map[string]string, workDir string) accessoryDumpPlan {
+	containerName := app + "-" + name
+	qContainer := ssh.ShellQuote(containerName)
+
+	// dumpTmp is redirected into with `>`, not piped into gzip: a shell
+	// pipeline's exit status is its LAST command's (gzip, which "succeeds"
+	// compressing an empty stream even when pg_dump/mysqldump errored to
+	// stderr) — `| gzip > path` would silently swallow a real dump
+	// failure. Redirecting to a plain file with `>` preserves the dump
+	// command's own exit code, which exec.Run already surfaces (with
+	// captured stderr) as a real error.
+	dumpPath := workDir + "/dump.out.gz"
+	dumpTmp := workDir + "/dump.out"
+
+	switch {
+	case isDBType(image, "postgres"):
+		db, user := postgresDBAndUser(app, env)
+		return accessoryDumpPlan{
+			engine: "postgres", method: "pg_dump", consistency: consistencyEngineDump, ext: ".sql.gz",
+			artifactPath: dumpPath,
+			cmd: fmt.Sprintf("docker exec %s pg_dump -U %s %s > %s && gzip -c %s > %s",
+				qContainer, ssh.ShellQuote(user), ssh.ShellQuote(db), ssh.ShellQuote(dumpTmp), ssh.ShellQuote(dumpTmp), ssh.ShellQuote(dumpPath)),
+		}
+	case isDBType(image, "mysql"), isDBType(image, "mariadb"):
+		engine := "mysql"
+		if isDBType(image, "mariadb") {
+			engine = "mariadb"
+		}
+		db := mysqlDB(app, env)
+		// Root password rides a 0600 env-file consumed by --env-file, never
+		// argv (mysqldump argv is visible in `ps` inside the container, and
+		// -e MYSQL_PWD puts the secret in the docker CLI's own argv on the
+		// host). Absent = current behavior (passwordless root).
+		execEnv := ""
+		var cred *planCredential
+		if pwd := mysqlRootPassword(env); pwd != "" {
+			envFile := workDir + "/mysql.env"
+			cred = &planCredential{path: envFile, content: "MYSQL_PWD=" + pwd + "\n"}
+			execEnv = " --env-file " + ssh.ShellQuote(envFile)
+		}
+		return accessoryDumpPlan{
+			engine: engine, method: "mysqldump", consistency: consistencyEngineDump, ext: ".sql.gz",
+			artifactPath: dumpPath,
+			cmd: fmt.Sprintf("docker exec%s %s mysqldump -u root %s > %s && gzip -c %s > %s",
+				execEnv, qContainer, ssh.ShellQuote(db), ssh.ShellQuote(dumpTmp), ssh.ShellQuote(dumpTmp), ssh.ShellQuote(dumpPath)),
+			credential: cred,
+		}
+	case isDBType(image, "mongo"):
+		return accessoryDumpPlan{
+			engine: "mongo", method: "mongodump", consistency: consistencyEngineDump, ext: ".archive.gz",
+			artifactPath: dumpPath,
+			cmd:          fmt.Sprintf("docker exec %s mongodump --archive --gzip > %s", qContainer, ssh.ShellQuote(dumpPath)),
+		}
+	case isDBType(image, "redis"):
+		// Redis: trigger bgsave, wait for an ACKNOWLEDGED new save, then
+		// copy dump.rdb. The script fails closed: BGSAVE refusal (other
+		// than an already-running save, whose completion still moves
+		// LASTSAVE), a poll timeout, or a failed copy all abort before an
+		// artifact is produced (audit F36, TCL-42, A40 — see the history
+		// in git for the incidents behind each guard).
+		redisTmp := workDir + "/dump.rdb"
+		return accessoryDumpPlan{
+			engine: "redis", method: "redis-bgsave", consistency: consistencySnapshot, ext: ".rdb.gz",
+			artifactPath: dumpPath,
+			cmd: strings.Join([]string{
+				"set -eu",
+				// AOF-enabled Redis persists to the append-only file; backing
+				// up only dump.rdb captures a stale or empty dataset — the
+				// reply must be a proven `appendonly no`.
+				fmt.Sprintf("aof=$(docker exec %s redis-cli --raw config get appendonly)", qContainer),
+				`set -- $aof`,
+				`if [ "${1:-}" != appendonly ] || [ "${2:-}" != no ]; then echo 'cannot confirm redis appendonly=no (got: '"$aof"') — teploy backup captures dump.rdb only; refusing' >&2; exit 1; fi`,
+				fmt.Sprintf("ls=$(docker exec %s redis-cli lastsave)", qContainer),
+				fmt.Sprintf("bgs=$(docker exec %s redis-cli bgsave 2>&1) || true", qContainer),
+				`case "$bgs" in *ERR*) case "$bgs" in *"in progress"*) ;; *) printf 'redis BGSAVE failed: %s\n' "$bgs" >&2; exit 1;; esac;; esac`,
+				"saved=no; i=0",
+				`while [ "$i" -lt 60 ]; do`,
+				fmt.Sprintf("cur=$(docker exec %s redis-cli lastsave)", qContainer),
+				`if [ "$cur" != "$ls" ]; then saved=yes; break; fi`,
+				"sleep 1; i=$((i+1))",
+				"done",
+				`if [ "$saved" != yes ]; then echo 'timed out waiting for Redis BGSAVE to complete' >&2; exit 1; fi`,
+				fmt.Sprintf("docker cp %s:/data/dump.rdb %s", qContainer, ssh.ShellQuote(redisTmp)),
+				fmt.Sprintf("gzip -c %s > %s", ssh.ShellQuote(redisTmp), ssh.ShellQuote(dumpPath)),
+				fmt.Sprintf("rm -f %s", ssh.ShellQuote(redisTmp)),
+			}, "\n"),
+		}
+	default:
+		// Generic: tar the volume directory. For a LIVE engine (nucleus and
+		// anything else that mutates its files during the read) this is a
+		// crash-consistent snapshot: GNU tar exits 1 with "file changed" /
+		// "file shrank" warnings when a WAL rotates or checkpoints mid-read.
+		// That shape is exactly what crash recovery is built for (torn-tail
+		// truncation + CRC skip), so tolerate exit 1 — real failures
+		// (unreadable dir, ENOSPC) exit 2. The DR bundle manifest labels
+		// this branch crash-consistent; it is never presented as an
+		// engine-consistent backup (C07).
+		accDir := fmt.Sprintf("%s/%s/accessories/%s", deploymentsDir, app, name)
+		return accessoryDumpPlan{
+			engine: "generic", method: "tar", consistency: consistencyCrash, ext: ".tar.gz",
+			artifactPath: workDir + "/dump.tar.gz",
+			cmd:          fmt.Sprintf("tar -czf %s -C %s . || [ $? -eq 1 ]", ssh.ShellQuote(workDir+"/dump.tar.gz"), ssh.ShellQuote(accDir)),
+		}
+	}
+}
+
+// Shared per-engine restore-command builders — the single source of truth
+// for how a dump artifact lands back in an engine. AccessoryRestore
+// (single-backup S3 restore) and the DR bundle paths both build on them.
+
+// postgresRestoreCmd decompresses a pg_dump artifact and pipes it into the
+// engine container's psql with ON_ERROR_STOP. gunzip writes to a plain file
+// first: a pipeline reports only the LAST command's status, so `gunzip |
+// psql` "succeeds" on a corrupt archive (empty stdin). container is the
+// docker container name (the live accessory or a validation scratch).
+func postgresRestoreCmd(container, user, db, dumpPath, sqlPath string) string {
+	return fmt.Sprintf("gunzip -c %s > %s && docker exec -i %s psql -v ON_ERROR_STOP=1 -U %s %s < %s",
+		ssh.ShellQuote(dumpPath), ssh.ShellQuote(sqlPath), ssh.ShellQuote(container), ssh.ShellQuote(user), ssh.ShellQuote(db), ssh.ShellQuote(sqlPath))
+}
+
+// mysqlRestoreCmd mirrors postgresRestoreCmd for mysql/mariadb; the root
+// password rides MYSQL_PWD container env, never argv (audit F22).
+func mysqlRestoreCmd(container, db, pwd, dumpPath, sqlPath string) string {
+	execEnv := ""
+	if pwd != "" {
+		execEnv = " -e MYSQL_PWD=" + ssh.ShellQuote(pwd)
+	}
+	return fmt.Sprintf("gunzip -c %s > %s && docker exec -i%s %s mysql -u root %s < %s",
+		ssh.ShellQuote(dumpPath), ssh.ShellQuote(sqlPath), execEnv, ssh.ShellQuote(container), ssh.ShellQuote(db), ssh.ShellQuote(sqlPath))
+}
+
+// mongoRestoreCmd streams a mongodump archive into mongorestore.
+func mongoRestoreCmd(container, dumpPath string) string {
+	return fmt.Sprintf("docker exec -i %s mongorestore --archive --gzip --drop < %s", ssh.ShellQuote(container), ssh.ShellQuote(dumpPath))
+}
+
+// redisRestoreScript stops the container (so its shutdown save cannot
+// overwrite the snapshot), captures the current dump as a baseline, copies
+// the restored one in, and restarts — restoring the original on any failure
+// after the stop (audits F38/A40/A41, T37/T38; see AccessoryRestore history).
+func redisRestoreScript(container, dumpPath, rdbPath, oldRdb string) string {
+	qContainer := ssh.ShellQuote(container)
+	return strings.Join([]string{
+		"set -eu",
+		fmt.Sprintf("gunzip -c %s > %s", ssh.ShellQuote(dumpPath), ssh.ShellQuote(rdbPath)),
+		"had=no",
+		fmt.Sprintf(`restore_original() { if [ "$had" = yes ] && [ -f %s ]; then docker cp %s %s:/data/dump.rdb || true; fi; docker start %s || true; }`,
+			ssh.ShellQuote(oldRdb), ssh.ShellQuote(oldRdb), qContainer, qContainer),
+		fmt.Sprintf("docker stop %s", qContainer),
+		// Post-stop baseline (docker cp works on a stopped container):
+		// success -> had=yes; a proven not-found -> nothing to preserve;
+		// anything else -> restart + abort.
+		`cperr=$(mktemp)`,
+		fmt.Sprintf(`if docker cp %s:/data/dump.rdb %s 2>"$cperr"; then had=yes; elif grep -qi 'no such' "$cperr"; then had=no; else cat "$cperr" >&2; rm -f "$cperr"; restore_original; echo 'capturing the pre-restore dump failed; the container was restarted' >&2; exit 1; fi`,
+			qContainer, ssh.ShellQuote(oldRdb)),
+		`rm -f "$cperr"`,
+		"ok=yes",
+		fmt.Sprintf("docker cp %s %s:/data/dump.rdb || ok=no", ssh.ShellQuote(rdbPath), qContainer),
+		`if [ "$ok" != yes ]; then`,
+		`  restore_original`,
+		"  echo 'redis restore failed after stopping the container; the original dump was restored when available' >&2",
+		"  exit 1",
+		"fi",
+		fmt.Sprintf("if ! docker start %s; then", qContainer),
+		`  restore_original`,
+		"  echo 'redis container failed to start after the restore; the original dump was put back — verify the accessory' >&2",
+		"  exit 1",
+		"fi",
+		fmt.Sprintf("rm -f %s", ssh.ShellQuote(rdbPath)),
+	}, "\n")
+}
+
+// redisAOFPreflight proves the accessory redis is appendonly=no before any
+// stop/copy (A40): "not proven yes" is not "proven no", and an AOF-enabled
+// redis would ignore a dump.rdb restore on restart.
+func (c *Client) redisAOFPreflight(ctx context.Context, app, name string) error {
+	containerName := app + "-" + name
+	aofOut, aofErr := c.exec.Run(ctx, fmt.Sprintf("docker exec %s redis-cli --raw config get appendonly", ssh.ShellQuote(containerName)))
+	if aofErr != nil {
+		return fmt.Errorf("cannot establish the Redis persistence mode for %s: %w", containerName, aofErr)
+	}
+	if aofFields := strings.Fields(aofOut); len(aofFields) != 2 || aofFields[0] != "appendonly" || aofFields[1] != "no" {
+		return fmt.Errorf("cannot confirm appendonly=no for %s (got %q) — an AOF-enabled Redis would load the append-only file on restart and teploy's dump.rdb restore would be a no-op; an explicit restore plan is required", containerName, strings.TrimSpace(aofOut))
+	}
+	return nil
+}
+
 func isDBType(image, dbType string) bool {
 	return imageName(image) == dbType
 }
@@ -951,9 +1085,10 @@ func mysqlDB(app string, env map[string]string) string {
 
 // mysqlRootPassword resolves the root password the mysql/mariadb containers
 // themselves honor (MYSQL_ROOT_PASSWORD, falling back to MYSQL_PASSWORD).
-// Used to inject MYSQL_PWD into docker exec as container env — never as a
-// command-line argument, which would expose the password in `ps` output.
-// Empty means no password configured; callers keep the bare command.
+// Used to stage MYSQL_PWD in a 0600 env-file consumed by `docker exec
+// --env-file` — never on any argv, which would expose the password in
+// the host's `ps` output. Empty means no password configured; callers
+// keep the bare command.
 func mysqlRootPassword(env map[string]string) string {
 	if pwd := env["MYSQL_ROOT_PASSWORD"]; pwd != "" {
 		return pwd

@@ -3,10 +3,12 @@ package cli
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
 
+	"github.com/useteploy/teploy/internal/network"
 	"github.com/useteploy/teploy/internal/ssh"
 )
 
@@ -468,5 +470,357 @@ func TestSetupServer_UFWActive(t *testing.T) {
 
 	if !strings.Contains(buf.String(), "Opened ports 80 and 443") {
 		t.Error("should report ports opened")
+	}
+}
+
+// TestInstallSudoViaSu_SecretTransport pins the C08 transport for the
+// root password: it travels the session stdin (recorded in Inputs),
+// never a command string, and no /tmp script artifact is uploaded.
+func TestInstallSudoViaSu_SecretTransport(t *testing.T) {
+	mock := ssh.NewMockExecutor("h",
+		ssh.MockCommand{Match: "su -c", Output: "TEPLOY_SUDO_OK\n"},
+	)
+	err := installSudoViaSu(context.Background(), mock, "tyler", "root-pw-123")
+	if err != nil {
+		t.Fatalf("installSudoViaSu: %v", err)
+	}
+	for _, call := range mock.Calls {
+		if strings.Contains(call, "root-pw-123") {
+			t.Errorf("root password in command argv: %s", call)
+		}
+		if strings.HasPrefix(call, "UPLOAD:") && strings.Contains(call, "/tmp/") {
+			t.Errorf("the su path must not stage a script artifact: %s", call)
+		}
+	}
+	if len(mock.Inputs) != 1 || mock.Inputs[0] != "root-pw-123\n" {
+		t.Fatalf("root password must ride stdin as one line, inputs: %v", mock.Inputs)
+	}
+	if call := mock.Calls[0]; !strings.HasPrefix(call, "su -c ") || !strings.Contains(call, "TEPLOY_SUDO_OK") {
+		t.Fatalf("unexpected su command shape: %s", call)
+	}
+}
+
+// TestInstallSudoViaSu_WrongPassword keeps the actionable failure.
+func TestInstallSudoViaSu_WrongPassword(t *testing.T) {
+	mock := ssh.NewMockExecutor("h",
+		ssh.MockCommand{Match: "su -c", Err: errors.New("exit status 1: su: Authentication failure")},
+	)
+	err := installSudoViaSu(context.Background(), mock, "tyler", "nope")
+	if err == nil || !strings.Contains(err.Error(), "wrong root password") {
+		t.Fatalf("wrong password = %v, want wrong-root-password error", err)
+	}
+}
+
+// TestVPNJoinCommand_NoCredentialInArgv pins the join shape: the key
+// file is read, removed, and fed via the provider env var — the literal
+// credential appears nowhere in the command.
+func TestVPNJoinCommand_NoCredentialInArgv(t *testing.T) {
+	cfg := network.Config{Provider: "tailscale", AuthKey: "tskey-auth-secret123"}
+	cmd := vpnJoinCommand("tailscale", cfg, "sudo ", "/tmp/teploy-vpn-key-abc")
+	if strings.Contains(cmd, "tskey-auth-secret123") {
+		t.Fatalf("auth key leaked into the join command: %s", cmd)
+	}
+	for _, want := range []string{
+		"nohup sh -c ",
+		"k=$(cat /tmp/teploy-vpn-key-abc)",
+		"rm -f -- /tmp/teploy-vpn-key-abc",
+		`export TS_AUTHKEY="$k"`,
+		"exec tailscale up --accept-routes",
+	} {
+		if !strings.Contains(cmd, want) {
+			t.Errorf("join command missing %q:\n%s", want, cmd)
+		}
+	}
+
+	headscale := network.Config{Provider: "headscale", AuthKey: "tskey-secret", Server: "https://hs.example.com"}
+	cmd = vpnJoinCommand("headscale", headscale, "", "/tmp/k")
+	if strings.Contains(cmd, "tskey-secret") {
+		t.Fatalf("headscale auth key leaked: %s", cmd)
+	}
+	if !strings.Contains(cmd, "--login-server=") || !strings.Contains(cmd, "https://hs.example.com") {
+		t.Errorf("headscale login server missing: %s", cmd)
+	}
+
+	nb := network.Config{Provider: "netbird", SetupKey: "nb-secret"}
+	cmd = vpnJoinCommand("netbird", nb, "", "/tmp/k")
+	if strings.Contains(cmd, "nb-secret") {
+		t.Fatalf("netbird setup key leaked: %s", cmd)
+	}
+	if !strings.Contains(cmd, `export NB_SETUP_KEY="$k"`) || !strings.Contains(cmd, "exec netbird up") {
+		t.Errorf("netbird join shape wrong: %s", cmd)
+	}
+}
+
+// TestJoinVPNMesh_StagesPrivateFileAndCleansUp pins the staging
+// mechanics: the credential is uploaded 0600 exactly once, and the join
+// command references that path.
+func TestJoinVPNMesh_StagesPrivateFileAndCleansUp(t *testing.T) {
+	mock := ssh.NewMockExecutor("h",
+		ssh.MockCommand{Match: "nohup sh -c", Output: ""},
+	)
+	cfg := network.Config{Provider: "tailscale", AuthKey: "tskey-auth-x"}
+	if err := joinVPNMesh(context.Background(), mock, "", "tailscale", cfg); err != nil {
+		t.Fatalf("joinVPNMesh: %v", err)
+	}
+	uploads := 0
+	for _, call := range mock.Calls {
+		if strings.HasPrefix(call, "UPLOAD:") {
+			uploads++
+			if !strings.Contains(call, "mode 0600") || !strings.Contains(call, "/tmp/teploy-vpn-key-") {
+				t.Errorf("credential must upload 0600 to the key path: %s", call)
+			}
+		}
+		if strings.Contains(call, "tskey-auth-x") {
+			t.Errorf("credential in command argv: %s", call)
+		}
+	}
+	if uploads != 1 {
+		t.Fatalf("expected exactly one credential upload, got %d (calls: %v)", uploads, mock.Calls)
+	}
+}
+
+// TestRegistryLoginOnServer_PasswordNeverInArgv pins the registry login
+// transport: the password rides stdin (docker --password-stdin), and no
+// command string — including the printf pipe form — carries it.
+func TestRegistryLoginOnServer_PasswordNeverInArgv(t *testing.T) {
+	mock := ssh.NewMockExecutor("h",
+		ssh.MockCommand{Match: "docker login", Output: "Login Succeeded"},
+	)
+	if err := registryLoginOnServer(context.Background(), mock, "ghcr.io", "user", "pw-hunter2"); err != nil {
+		t.Fatalf("registryLoginOnServer: %v", err)
+	}
+	if len(mock.Calls) != 1 {
+		t.Fatalf("expected one command, got %v", mock.Calls)
+	}
+	call := mock.Calls[0]
+	if !strings.HasPrefix(call, "docker login 'ghcr.io' -u 'user' --password-stdin") || strings.Contains(call, "printf") {
+		t.Errorf("login command shape wrong: %s", call)
+	}
+	if strings.Contains(call, "pw-hunter2") {
+		t.Errorf("password in command argv: %s", call)
+	}
+	if len(mock.Inputs) != 1 || mock.Inputs[0] != "pw-hunter2" {
+		t.Fatalf("password must ride stdin verbatim, inputs: %v", mock.Inputs)
+	}
+}
+
+// TestRegistryLoginOnServer_FailureSurfacesDiagnostics pins that a
+// refused login names docker's own stderr (RunInput's discard-both
+// contract used to hide it).
+func TestRegistryLoginOnServer_FailureSurfacesDiagnostics(t *testing.T) {
+	mock := ssh.NewMockExecutor("h",
+		ssh.MockCommand{Match: "docker login", Err: errors.New("exit status 1: Error response from daemon: unauthorized")},
+	)
+	err := registryLoginOnServer(context.Background(), mock, "ghcr.io", "user", "bad")
+	if err == nil || !strings.Contains(err.Error(), "unauthorized") {
+		t.Fatalf("refused login = %v, want docker's stderr surfaced", err)
+	}
+}
+
+// TestSetupServer_PreflightListsStagesAndAffectedResources pins the
+// C08 preflight: before touching anything, setup states every stage
+// and what it affects — the affected-resource list the operator reads
+// before confirming a run against an existing box.
+func TestSetupServer_PreflightListsStagesAndAffectedResources(t *testing.T) {
+	stages := setupStages()
+	if len(stages) < 5 {
+		t.Fatalf("expected the provisioning plan to have stages, got %d", len(stages))
+	}
+	seen := map[string]bool{}
+	for _, s := range stages {
+		if s.name == "" || s.affects == "" {
+			t.Fatalf("every stage needs a name and an affected-resource description: %+v", s)
+		}
+		if seen[s.name] {
+			t.Fatalf("stage names must be unique for stage-named errors: %q", s.name)
+		}
+		seen[s.name] = true
+	}
+
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "whoami", Output: "root"},
+		ssh.MockCommand{Match: "docker --version", Output: "Docker version 24.0.0"},
+		ssh.MockCommand{Match: "rsync --version", Output: "rsync  version 3.2.7"},
+		ssh.MockCommand{Match: "ufw status", Err: fmt.Errorf("command not found")},
+		ssh.MockCommand{Match: "systemctl is-active firewalld", Err: fmt.Errorf("inactive")},
+		ssh.MockCommand{Match: "docker info", Output: ""},
+		ssh.MockCommand{Match: "docker network", Output: "teploy"},
+		ssh.MockCommand{Match: "mkdir", Output: ""},
+		ssh.MockCommand{Match: "chown", Output: ""},
+		ssh.MockCommand{Match: "[ -f /deployments/caddy/Caddyfile ]", Output: "absent"},
+		ssh.MockCommand{Match: "docker ps -a --filter name=", Output: ""},
+		ssh.MockCommand{Match: "docker run", Output: "caddy_id"},
+	)
+	var buf bytes.Buffer
+	if err := setupServer(context.Background(), mock, &buf, true); err != nil {
+		t.Fatalf("setupServer: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "Preflight") {
+		t.Error("the run must open with the preflight list")
+	}
+	for _, s := range stages {
+		if !strings.Contains(out, s.name+": "+s.affects) {
+			t.Errorf("preflight must list stage %q with its affected resources", s.name)
+		}
+	}
+}
+
+// TestSetupServer_InterruptedRunIsResumable pins C08's interrupted-setup
+// acceptance: a connection death mid-setup fails with the stage named,
+// and re-running setup against the SAME partially-provisioned server
+// completes by skipping what already happened — no package reinstalls,
+// no second Caddyfile write, no second container start.
+func TestSetupServer_InterruptedRunIsResumable(t *testing.T) {
+	// Phase 1: the connection dies at the docker-network stage. Every
+	// earlier stage's work (docker present, dirs created) has already
+	// happened on the server.
+	phase1 := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "whoami", Output: "root"},
+		ssh.MockCommand{Match: "docker --version", Output: "Docker version 24.0.0"},
+		ssh.MockCommand{Match: "rsync --version", Output: "rsync  version 3.2.7"},
+		ssh.MockCommand{Match: "ufw status", Err: fmt.Errorf("command not found")},
+		ssh.MockCommand{Match: "systemctl is-active firewalld", Err: fmt.Errorf("inactive")},
+		ssh.MockCommand{Match: "docker info", Output: ""},
+		ssh.MockCommand{Match: "docker network inspect teploy", Err: errors.New("ssh: connection reset by peer")},
+	)
+	var out1 bytes.Buffer
+	err := setupServer(context.Background(), phase1, &out1, true)
+	if err == nil {
+		t.Fatal("a mid-setup connection death must fail the run")
+	}
+	if !strings.Contains(err.Error(), `setup stage "docker network"`) {
+		t.Fatalf("the failure must name the stage that died, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "connection reset") {
+		t.Fatalf("the failure must carry the transport error, got: %v", err)
+	}
+
+	// Phase 2: the operator re-runs setup. The server now has docker,
+	// rsync, the teploy network, the directories, the Caddyfile, and a
+	// running modern caddy — everything the interrupted run got to.
+	phase2 := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "whoami", Output: "root"},
+		ssh.MockCommand{Match: "docker --version", Output: "Docker version 24.0.0"},
+		ssh.MockCommand{Match: "rsync --version", Output: "rsync  version 3.2.7"},
+		ssh.MockCommand{Match: "ufw status", Err: fmt.Errorf("command not found")},
+		ssh.MockCommand{Match: "systemctl is-active firewalld", Err: fmt.Errorf("inactive")},
+		ssh.MockCommand{Match: "docker info", Output: ""},
+		ssh.MockCommand{Match: "docker network inspect teploy", Output: "teploy"},
+		ssh.MockCommand{Match: "mkdir", Output: ""},
+		ssh.MockCommand{Match: "chown", Output: ""},
+		ssh.MockCommand{Match: "[ -f /deployments/caddy/Caddyfile ]", Output: "present"},
+		ssh.MockCommand{Match: "sed -i", Output: ""},
+		ssh.MockCommand{Match: "docker ps -a --filter name=", Output: "caddy"},
+		ssh.MockCommand{Match: "docker inspect -f '{{join .Config.Cmd", Output: "caddy run --config /etc/caddy/Caddyfile --adapter caddyfile"},
+		ssh.MockCommand{Match: "docker inspect -f '{{range .Mounts}}", Output: "/data /config /etc/caddy /deployments "},
+		ssh.MockCommand{Match: "docker inspect -f '{{.State.Running}}'", Output: "true"},
+	)
+	var out2 bytes.Buffer
+	if err := setupServer(context.Background(), phase2, &out2, true); err != nil {
+		t.Fatalf("the re-run must complete: %v", err)
+	}
+	for _, want := range []string{
+		"Docker already installed",
+		"rsync already installed",
+		"Existing Caddyfile preserved",
+		"Caddy already running",
+		"Server provisioned successfully",
+	} {
+		if !strings.Contains(out2.String(), want) {
+			t.Errorf("re-run output missing %q:\n%s", want, out2.String())
+		}
+	}
+	// The re-run must not redo completed work: no installer script, no
+	// package install, no Caddyfile write, no container start. (The
+	// network stage's compound `inspect || create` text always names
+	// create; the registration pins that INSPECT succeeded, so the
+	// create side never fired.)
+	for _, call := range phase2.Calls {
+		for _, forbidden := range []string{"get.docker.com", "apt-get install", "docker run"} {
+			if strings.Contains(call, forbidden) {
+				t.Errorf("the resumed run must not repeat %q: %s", forbidden, call)
+			}
+		}
+	}
+	if _, uploaded := phase2.Files["/deployments/caddy/Caddyfile"]; uploaded {
+		t.Error("the resumed run must not rewrite an existing Caddyfile")
+	}
+}
+
+// TestSetupServer_ConnectionLossRecoversMidStage pins the connection
+// recovery wiring end-to-end at the flow level: setupServer running
+// through a ReconnectingExecutor survives a one-shot transport death
+// mid-stage and completes, the dead command retried exactly once.
+// Registrations that model ran-and-failed commands carry "exit status
+// N" (the mock contract) so the wrapper classifies them as completed —
+// only the network-stage registration models a transport death.
+func TestSetupServer_ConnectionLossRecoversMidStage(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "whoami", Output: "root"},
+		ssh.MockCommand{Match: "docker --version", Output: "Docker version 24.0.0"},
+		ssh.MockCommand{Match: "rsync --version", Output: "rsync  version 3.2.7"},
+		ssh.MockCommand{Match: "ufw status", Err: fmt.Errorf("exit status 1: ufw: command not found")},
+		ssh.MockCommand{Match: "systemctl is-active firewalld", Err: fmt.Errorf("exit status 3: inactive")},
+		ssh.MockCommand{Match: "docker info", Output: ""},
+		// First attempt at the network stage dies with a transport
+		// error; the redialed retry finds the network (inspect OK).
+		ssh.MockCommand{Match: "docker network inspect teploy", Err: errors.New("ssh: connection reset by peer"), Once: true},
+		ssh.MockCommand{Match: "docker network inspect teploy", Output: "teploy"},
+		ssh.MockCommand{Match: "mkdir", Output: ""},
+		ssh.MockCommand{Match: "chown", Output: ""},
+		ssh.MockCommand{Match: "[ -f /deployments/caddy/Caddyfile ]", Output: "absent"},
+		ssh.MockCommand{Match: "docker ps -a --filter name=", Output: ""},
+		ssh.MockCommand{Match: "docker run", Output: "caddy_id"},
+	)
+	wrapper, err := ssh.NewReconnectingExecutor(context.Background(), func(ctx context.Context) (ssh.Executor, error) {
+		return mock, nil
+	}, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	if setupErr := setupServer(context.Background(), wrapper, &buf, true); setupErr != nil {
+		t.Fatalf("a one-shot connection loss mid-stage must recover, got: %v", setupErr)
+	}
+	if !strings.Contains(buf.String(), "Server provisioned successfully") {
+		t.Errorf("recovery must complete the flow:\n%s", buf.String())
+	}
+	attempts := 0
+	for _, call := range mock.Calls {
+		if strings.HasPrefix(call, "docker network inspect teploy") {
+			attempts++
+		}
+	}
+	if attempts != 2 {
+		t.Fatalf("the dead network command must be retried exactly once, attempts = %d", attempts)
+	}
+}
+
+// TestInstallAuthorizedKey_GuardedAgainstDuplicateAppend pins the
+// resumability guard for the password-path key install: the append is
+// guarded by a membership check, so an interrupted setup re-run cannot
+// stack duplicate authorized_keys entries (the old bare `echo >>`
+// appended on every attempt).
+func TestInstallAuthorizedKey_GuardedAgainstDuplicateAppend(t *testing.T) {
+	pubKey := "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIExample teploy-test"
+	mock := ssh.NewMockExecutor("h",
+		ssh.MockCommand{Match: "mkdir -p ~/.ssh", Output: ""},
+	)
+	for i := 0; i < 2; i++ { // first install, then the re-run after an interrupted setup
+		if err := installAuthorizedKey(context.Background(), mock, pubKey); err != nil {
+			t.Fatalf("installAuthorizedKey attempt %d: %v", i+1, err)
+		}
+	}
+	guarded := "mkdir -p ~/.ssh && grep -qF " + ssh.ShellQuote(pubKey) +
+		" ~/.ssh/authorized_keys 2>/dev/null || echo " + ssh.ShellQuote(pubKey) +
+		" >> ~/.ssh/authorized_keys; chmod 700 ~/.ssh && chmod 600 ~/.ssh/authorized_keys"
+	if len(mock.Calls) != 2 {
+		t.Fatalf("expected one command per attempt, calls: %v", mock.Calls)
+	}
+	for i, call := range mock.Calls {
+		if call != guarded {
+			t.Fatalf("attempt %d must use the guarded append:\ngot:  %s\nwant: %s", i+1, call, guarded)
+		}
 	}
 }
