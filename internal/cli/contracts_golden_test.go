@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/useteploy/teploy/internal/config"
+	"github.com/useteploy/teploy/internal/preview"
 	"github.com/useteploy/teploy/internal/releasemeta"
 	"github.com/useteploy/teploy/internal/ssh"
 )
@@ -304,4 +305,49 @@ func TestContractsPlanRecordGolden(t *testing.T) {
 	tampered := *digestPlan
 	tampered.ConfigDigest = "0000000000000000000000000000000000000000000000000000000000000000"
 	writeFixture(t, "plan-record/invalid/tampered-id.json", tampered)
+}
+
+// TestContractsPreviewStateListRowGolden drives the REAL `preview list
+// --json` row encoder (previewListRows over preview.State) for a default
+// and a tailnet-mode canonical preview (corpus rev 6). The row is wrapped
+// with the artifact's era classification keys (era, app) — the wire row
+// itself carries neither. The hand-authored identity fixtures (canonical,
+// legacy, ambiguous) are unchanged.
+func TestContractsPreviewStateListRowGolden(t *testing.T) {
+	created := time.Date(2026, 9, 24, 12, 0, 0, 0, time.UTC)
+	base := preview.State{
+		ID:        preview.PreviewID("myapp", "feature/login"),
+		Branch:    "feature/login",
+		Repo:      "github.com/example/myapp",
+		Route:     "myapp-preview-p-08e81639",
+		Port:      49200,
+		Container: "myapp-preview-p-08e81639-abc1234",
+		Image:     "myapp-build-abc1234",
+		CreatedAt: created,
+		ExpiresAt: created.Add(72 * time.Hour),
+	}
+	def := base
+	def.Domain = "preview-feature-login-08e81639.myapp.com"
+	tailnet := base
+	tailnet.Domain = "preview-feature-login-08e81639.100-64-1-2.sslip.io"
+	tailnet.BaseDomain = "100-64-1-2.sslip.io"
+	tailnet.HTTPOnly = true
+	tailnet.AllowIPs = []string{"100.64.0.0/10"}
+
+	for name, s := range map[string]preview.State{
+		"preview-state/valid/canonical-list-row.json":         def,
+		"preview-state/valid/canonical-list-row-tailnet.json": tailnet,
+	} {
+		data, err := json.Marshal(previewListRows([]preview.State{s})[0])
+		if err != nil {
+			t.Fatalf("marshal %s: %v", name, err)
+		}
+		var row map[string]any
+		if err := json.Unmarshal(data, &row); err != nil {
+			t.Fatalf("unmarshal %s: %v", name, err)
+		}
+		row["era"] = "canonical"
+		row["app"] = "myapp"
+		writeFixture(t, name, row)
+	}
 }

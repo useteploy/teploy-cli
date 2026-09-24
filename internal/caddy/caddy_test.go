@@ -561,6 +561,24 @@ func TestReverseProxyBlock_CustomCertKeepsRealHost(t *testing.T) {
 	}
 }
 
+// TLS.HTTPOnly (tailnet previews): a PUBLIC hostname gets the explicit
+// http:// scheme and no tls directive, so Caddy never attempts ACME for it;
+// it wins over Internal/Cert, and composes with the firewall allowlist.
+func TestReverseProxyBlock_HTTPOnly(t *testing.T) {
+	got := reverseProxyBlock([]string{"preview-main-563059ce.100.64.1.2.sslip.io"}, "myapp-preview-p-563059ce-v1", 3000,
+		TLS{HTTPOnly: true, Internal: true, Cert: "/c.crt", Key: "/c.key"}, "", nil, Firewall{AllowIPs: []string{"100.64.0.0/10"}}, Access{})
+	want := "http://preview-main-563059ce.100.64.1.2.sslip.io {\n" +
+		"\t@teploy_fw_notallow not remote_ip 100.64.0.0/10\n" +
+		"\thandle @teploy_fw_notallow {\n\t\trespond 403\n\t}\n" +
+		"\thandle {\n\t\treverse_proxy myapp-preview-p-563059ce-v1:3000\n\t}\n}"
+	if got != want {
+		t.Errorf("reverseProxyBlock with HTTPOnly:\nwant: %q\ngot:  %q", want, got)
+	}
+	if addrs := siteAddresses([]string{"a.example.com", "10.0.0.1"}, TLS{HTTPOnly: true}); addrs[0] != "http://a.example.com" || addrs[1] != "http://10.0.0.1" {
+		t.Errorf("siteAddresses with HTTPOnly = %v, want http:// on every host", addrs)
+	}
+}
+
 func TestMaintenanceBlock_NonPublicDomainGetsPlainHTTP(t *testing.T) {
 	got := maintenanceBlock([]string{"192.168.1.114"}, SitePolicy{})
 	if !strings.HasPrefix(got, "http://192.168.1.114 {") {

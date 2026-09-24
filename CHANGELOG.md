@@ -20,6 +20,20 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
 
 ### Added
 
+- **Tailnet preview mode.** `teploy preview deploy` takes
+  `--base-domain <domain>` (hostname base instead of the app domain, e.g.
+  `100-64-1-2.sslip.io`), `--http-only` (plain HTTP site, no ACME) and
+  `--allow-ip <ip|cidr>` (repeatable; everything else gets 403). The mode
+  is stored in the preview record (`base_domain`, `http_only`,
+  `allow_ips`, all omitted for default previews) and inherited by later
+  deploys of the branch unless overridden (`--http-only=false`,
+  `--allow-ip ""`), so a blue/green update never silently re-enables
+  HTTPS or drops the allowlist. `preview list --json` rows gain `url`
+  (`http://` for HTTP-only, else `https://`); `domain` is unchanged. The
+  `preview-exposure` capability token is advertised. Preview identity
+  (`<app>-p-<hex8>`) and blue/green are unchanged; records without the
+  new fields behave exactly as before.
+
 - **Plan/apply with drift invalidation (C05).** `teploy plan` now renders
   the full effect set — routing (domain/ingress/port/publishes),
   environment keys, storage volumes, resource limits, accessories —
