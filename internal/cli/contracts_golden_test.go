@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/useteploy/teploy/internal/config"
 	"github.com/useteploy/teploy/internal/releasemeta"
 )
 
@@ -58,7 +59,39 @@ func TestContractsVersionHandshakeGolden(t *testing.T) {
 	if err := json.Unmarshal(buf.Bytes(), &v); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	writeFixture(t, "version-handshake/valid/mi1.json", v)
+	writeFixture(t, "version-handshake/valid/mi2.json", v)
+}
+
+// TestContractsServerListEnvelopeGolden drives the REAL writeServerList
+// encoder (the same path `server list --json` runs) for the valid fixture,
+// and the pre-reshape bare-map encoder for the legacy class. MI 2 minted
+// by this reshape: the bare map-of-servers root is gone on the wire.
+func TestContractsServerListEnvelopeGolden(t *testing.T) {
+	servers := map[string]config.Server{
+		"prod": {
+			ID:    "srv-0123456789abcdef",
+			Host:  "192.0.2.10",
+			User:  "deploy",
+			Role:  "app",
+			Tags:  map[string]string{"region": "us-east"},
+			VpnIP: "100.64.0.7",
+		},
+		"staging": {Host: "192.0.2.20"}, // id-less legacy entry inside the envelope
+	}
+	var buf bytes.Buffer
+	if err := writeServerList(&buf, servers, true, time.Date(2026, 9, 23, 12, 0, 0, 0, time.UTC)); err != nil {
+		t.Fatalf("writeServerList: %v", err)
+	}
+	var v any
+	if err := json.Unmarshal(buf.Bytes(), &v); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	writeFixture(t, "server-list-envelope/valid/mi2.json", v)
+
+	// Legacy: the bare map-of-servers root a pre-MI-2 CLI emitted — the
+	// S1 exclusion, now a first-class legacy class. Same map encoder that
+	// era used (json tags unchanged on config.Server).
+	writeFixture(t, "server-list-envelope/legacy/bare-map.json", servers)
 }
 
 // TestContractsAppListEnvelopeGolden emits an appListDTO with one
@@ -66,7 +99,7 @@ func TestContractsVersionHandshakeGolden(t *testing.T) {
 // Offline stand-in: the DTO values are constructed, the ENCODER is real.
 func TestContractsAppListEnvelopeGolden(t *testing.T) {
 	ts := time.Date(2026, 9, 23, 12, 0, 0, 0, time.UTC)
-	writeFixture(t, "app-list-envelope/valid/mi1.json", appListDTO{
+	writeFixture(t, "app-list-envelope/valid/mi2.json", appListDTO{
 		MachineInterface: MachineInterface,
 		Host:             "srv.example.com",
 		Errors:           []machineError{},
@@ -74,9 +107,9 @@ func TestContractsAppListEnvelopeGolden(t *testing.T) {
 			App: "myapp", Domain: "myapp.example.com", Type: "container",
 			Ingress: "caddy", CurrentRelease: releaseStatusDTO{Version: "3", Ports: []int{3000}},
 			PreviousRelease: releaseStatusDTO{Version: "2", Ports: []int{3000}},
-			Containers: []containerDTO{{ID: "9f31c02", Name: "myapp-web-3", Image: "nginx:1.27", State: "running", Status: "Up 4 minutes", CreatedAt: "2026-09-23T11:55:00Z", Process: "web", Version: "3"}},
-			Processes:  []processDTO{},
-			Lock:       nil, ObservedAt: ts, Errors: []machineError{},
+			Containers:      []containerDTO{{ID: "9f31c02", Name: "myapp-web-3", Image: "nginx:1.27", State: "running", Status: "Up 4 minutes", CreatedAt: "2026-09-23T11:55:00Z", Process: "web", Version: "3"}},
+			Processes:       []processDTO{},
+			Lock:            nil, ObservedAt: ts, Errors: []machineError{},
 		}},
 		ObservedAt: ts,
 	})
@@ -133,7 +166,7 @@ func TestContractsAttemptNameGolden(t *testing.T) {
 		"9f31c02.0123456789abcdef",
 	})
 	writeFixture(t, "attempt-name/invalid/examples.json", []string{
-		"deadb17ecafef00d",        // missing the hash half
+		"deadb17ecafef00d",         // missing the hash half
 		"ABC1234.deadb17ecafef00d", // uppercase
 		"abc1234.DeadB17eCafef00d", // uppercase hex half
 		"abc1234.deadb17ecafef00",  // 15 hex chars

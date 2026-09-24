@@ -1,5 +1,5 @@
 {
-  "machine_interface": 1,
+  "machine_interface": 2,
   "code": "config-invalid",
   "message": "invalid teploy configuration",
   "detail": "teploy.yml: services.0.name: required"

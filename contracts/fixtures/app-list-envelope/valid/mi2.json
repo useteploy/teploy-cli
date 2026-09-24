@@ -1,5 +1,5 @@
 {
-  "machine_interface": 1,
+  "machine_interface": 2,
   "host": "srv.example.com",
   "apps": [
     {

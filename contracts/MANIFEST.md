@@ -10,6 +10,7 @@ Neutron/Nucleus dependency and a public mirror.
 
 | Corpus rev | Emitting CLI | Machine Interface | Notes |
 |---|---|---|---|
+| 4 | main (X02 S2 tail: server-list reshape) | 2 | **The MI 2 bump** (D8 non-additive): `server list --json` now emits the envelope `{machine_interface, servers[], observed_at}` carrying the per-server fields unchanged (name + id/host/user/role/tags/vpn_ip); the pre-reshape bare map-of-servers root is GONE on the wire and is pinned as the artifact's legacy class. New artifact server-list-envelope (schema + valid + legacy fixtures); version-handshake schema maximum 1→2 and its valid fixture renamed mi1→mi2 (app-list valid likewise — both envelopes now report MI 2). Capability tokens unchanged. Coordinated consumer: teploy-dash decodes both shapes during the transition (MaxSupportedMachineInterface 2). |
 | 3 (amended) | main (C05 plan-record corpus + defect fix) | 1 | C05 added the plan-record artifact + plan-apply token (see git history); amendment: server-status schema now carries its own $defs (its $refs never resolved), and app-list fixtures emit [] where the encoder emits [] (null fixtures failed schema + the real dash decode - found by dash's new contracts CI job, fixed here). |
 | 1 | post-v0.1.37 main (S2 skeleton) | 1 | First goldens: version handshake, app-list envelope (MI + pre-MI legacy), error envelope (config-invalid, internal, invalid-code), release-record, attempt-name grammar, preview-state eras. |
 | 2 | post-v0.1.37 main (S6) | 1 | observation-envelope: schema corrected from the S2 draft shape to the ADR §2.4 canonical form (resource/collected_at/freshness tri-state/error/source/last_known) before any consumer existed; fixtures generated from teploy-dash's real constructors (fresh, stale, unknown-unreachable, unreachable-last-known). |
@@ -21,6 +22,7 @@ Neutron/Nucleus dependency and a public mirror.
 |---|---|---|---|
 | version-handshake | yes | valid (real `writeVersion` encoder) | teploy-cli |
 | app-list-envelope | yes | valid (real DTO tags) + legacy pre-MI | teploy-cli |
+| server-list-envelope | yes (MI 2 reshape) | valid (real `writeServerList` encoder) + legacy bare-map | teploy-cli |
 | server-status-envelope | yes (appStatus root) | pending S2 tail (live `server status` capture) | teploy-cli |
 | error-envelope | yes | valid x2 + invalid code | teploy-cli |
 | release-record | yes | valid container | teploy-cli |
