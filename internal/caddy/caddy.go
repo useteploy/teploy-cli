@@ -116,12 +116,21 @@ type TLS struct {
 	// config.TLSConfig.Internal, which is where this is actually set from
 	// teploy.yml.
 	Internal bool
+	// HTTPOnly serves every host of the block on plain HTTP: each site
+	// address gets an explicit http:// scheme and no tls directive is
+	// rendered, so Caddy never attempts ACME for it. Takes precedence over
+	// Cert/Key/Internal. Used by tailnet previews (a 100.x address behind a
+	// wildcard DNS name can never complete a public ACME challenge).
+	HTTPOnly bool
 }
 
 // directive returns the indented `tls` line for a site block — `tls
 // internal` for Internal, `tls <cert> <key>` for a custom cert, or "" when
 // neither is configured (automatic HTTPS).
 func (t TLS) directive() string {
+	if t.HTTPOnly {
+		return ""
+	}
 	if t.Internal {
 		return "\ttls internal\n"
 	}
@@ -154,12 +163,13 @@ func IsPubliclyRoutable(host string) bool {
 // which case the operator has explicitly opted in and automatic-HTTPS
 // avoidance would just be wrong. See IsPubliclyRoutable for why this
 // matters: without it, Caddy attempts (and hangs on) a real ACME challenge
-// for addresses that can never complete one.
+// for addresses that can never complete one. tls.HTTPOnly forces the
+// http:// scheme on every host, public or not.
 func siteAddresses(hosts []string, tls TLS) []string {
-	wantsTLS := tls.Internal || (tls.Cert != "" && tls.Key != "")
+	wantsTLS := !tls.HTTPOnly && (tls.Internal || (tls.Cert != "" && tls.Key != ""))
 	out := make([]string, len(hosts))
 	for i, h := range hosts {
-		if !wantsTLS && !IsPubliclyRoutable(h) {
+		if tls.HTTPOnly || (!wantsTLS && !IsPubliclyRoutable(h)) {
 			out[i] = "http://" + h
 		} else {
 			out[i] = h

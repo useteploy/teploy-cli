@@ -30,9 +30,29 @@ func newPreviewCmd(flags *Flags) *cobra.Command {
 	return cmd
 }
 
+// previewDeployOpts are the parsed `preview deploy` flags. The exposure
+// fields are tri-state: a flag not given leaves its field unset (nil) so an
+// update inherits the preview's recorded mode instead of resetting it.
+type previewDeployOpts struct {
+	ttl        string
+	image      string
+	baseDomain string
+	httpOnly   *bool
+	allowIPs   []string
+}
+
 func newPreviewDeployCmd(flags *Flags) *cobra.Command {
-	var ttl string
-	var image string
+	return newPreviewDeployCmdWith(func(branch string, opts previewDeployOpts) error {
+		return runPreviewDeploy(flags, branch, opts)
+	})
+}
+
+// newPreviewDeployCmdWith builds the command around run (the test seam:
+// flag parsing and validation are the real ones).
+func newPreviewDeployCmdWith(run func(branch string, opts previewDeployOpts) error) *cobra.Command {
+	var opts previewDeployOpts
+	var httpOnly bool
+	var allowIPs []string
 
 	cmd := &cobra.Command{
 		Use:   "deploy <branch>",
@@ -46,20 +66,65 @@ touching production, which "teploy deploy" cannot do.
 Example:
   git checkout feat/new-landing
   teploy build --json          # prints the image tag
-  teploy preview deploy feat-new-landing --ttl 24h --image <tag>`,
+  teploy preview deploy feat-new-landing --ttl 24h --image <tag>
+
+Tailnet-only preview (plain HTTP, reachable only from Tailscale addresses):
+  teploy preview deploy feat-new-landing --image <tag> \
+    --base-domain 100-64-1-2.sslip.io --http-only --allow-ip 100.64.0.0/10
+
+--base-domain, --http-only and --allow-ip are recorded with the preview;
+a later deploy of the same branch keeps them unless it passes them again
+(--http-only=false turns HTTP-only off, --allow-ip "" clears the list).`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runPreviewDeploy(flags, args[0], ttl, image)
+			if err := finishPreviewDeployOpts(cmd, &opts, httpOnly, allowIPs); err != nil {
+				return err
+			}
+			return run(args[0], opts)
 		},
 	}
 
-	cmd.Flags().StringVar(&ttl, "ttl", "72h", "time-to-live before auto-expiry")
-	cmd.Flags().StringVar(&image, "image", "", "image to run (default: teploy.yml's image, else <app>-build-<git hash>)")
+	cmd.Flags().StringVar(&opts.ttl, "ttl", "72h", "time-to-live before auto-expiry")
+	cmd.Flags().StringVar(&opts.image, "image", "", "image to run (default: teploy.yml's image, else <app>-build-<git hash>)")
+	cmd.Flags().StringVar(&opts.baseDomain, "base-domain", "", "hostname base instead of the app domain (e.g. 100-64-1-2.sslip.io)")
+	cmd.Flags().BoolVar(&httpOnly, "http-only", false, "serve the preview over plain HTTP (no certificate)")
+	cmd.Flags().StringSliceVar(&allowIPs, "allow-ip", nil, "only this IP/CIDR may reach the preview (repeatable)")
 
 	return cmd
 }
 
-func runPreviewDeploy(flags *Flags, branch, ttlStr, image string) error {
+// finishPreviewDeployOpts turns the raw exposure flags into opts, keeping
+// "not given" distinct from "given as false/empty", and validates them
+// before anything connects.
+func finishPreviewDeployOpts(cmd *cobra.Command, opts *previewDeployOpts, httpOnly bool, allowIPs []string) error {
+	opts.baseDomain = strings.ToLower(strings.TrimSpace(opts.baseDomain))
+	if cmd.Flags().Changed("base-domain") {
+		if err := preview.ValidateBaseDomain(opts.baseDomain); err != nil {
+			return err
+		}
+	}
+	opts.httpOnly = nil
+	if cmd.Flags().Changed("http-only") {
+		v := httpOnly
+		opts.httpOnly = &v
+	}
+	opts.allowIPs = nil
+	if cmd.Flags().Changed("allow-ip") {
+		opts.allowIPs = []string{}
+		for _, ip := range allowIPs {
+			if ip = strings.TrimSpace(ip); ip != "" {
+				opts.allowIPs = append(opts.allowIPs, ip)
+			}
+		}
+		if err := preview.ValidateAllowIPs(opts.allowIPs); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func runPreviewDeploy(flags *Flags, branch string, opts previewDeployOpts) error {
+	ttlStr, image := opts.ttl, opts.image
 	appCfg, err := config.LoadApp(".")
 	if err != nil {
 		return err
@@ -136,6 +201,10 @@ func runPreviewDeploy(flags *Flags, branch, ttlStr, image string) error {
 		Version: version,
 		TTL:     ttl,
 		Repo:    repo,
+
+		BaseDomain: opts.baseDomain,
+		HTTPOnly:   opts.httpOnly,
+		AllowIPs:   opts.allowIPs,
 	})
 
 	if n := buildNotifier(appCfg); n != nil {
@@ -188,10 +257,7 @@ func runPreviewList(flags *Flags) error {
 		return err
 	}
 	if flags.JSON {
-		if previews == nil {
-			previews = []preview.State{}
-		}
-		return json.NewEncoder(os.Stdout).Encode(previews)
+		return json.NewEncoder(os.Stdout).Encode(previewListRows(previews))
 	}
 
 	if len(previews) == 0 {
@@ -204,11 +270,28 @@ func runPreviewList(flags *Flags) error {
 		if time.Now().UTC().After(p.ExpiresAt) {
 			expired = " (expired)"
 		}
-		fmt.Printf("  %s → https://%s%s\n", p.Branch, p.Domain, expired)
+		fmt.Printf("  %s → %s%s\n", p.Branch, p.URL(), expired)
 		fmt.Printf("    Container: %s  Port: %d  Expires: %s\n",
 			p.Container, p.Port, p.ExpiresAt.Format(time.RFC3339))
 	}
 	return nil
+}
+
+// previewListRow is one `preview list --json` row: the preview record
+// plus its url, carrying the scheme the route actually serves (http:// for
+// an HTTP-only preview).
+type previewListRow struct {
+	preview.State
+	URL string `json:"url"`
+}
+
+// previewListRows is the `preview list --json` encoder input: never null.
+func previewListRows(previews []preview.State) []previewListRow {
+	rows := make([]previewListRow, 0, len(previews))
+	for _, p := range previews {
+		rows = append(rows, previewListRow{State: p, URL: p.URL()})
+	}
+	return rows
 }
 
 func newPreviewDestroyCmd(flags *Flags) *cobra.Command {

@@ -50,6 +50,31 @@ type State struct {
 	// `teploy preview prune` (and the deploy piggyback) destroy records
 	// whose deadline has passed.
 	ExpiresAt time.Time `json:"expires_at"`
+
+	// Exposure mode (tailnet previews, DELEGATED_DECISIONS §10). All three
+	// are omitempty: a record without them is a default preview — hostname
+	// under the app's domain, automatic HTTPS, no IP gate — exactly the
+	// behavior of records written before these fields existed. Updates
+	// inherit them unless the deploy overrides them (resolveExposure), so
+	// a blue/green swap never silently re-enables HTTPS or drops the
+	// allowlist.
+	//
+	// BaseDomain is the explicit hostname base the preview was deployed
+	// under (--base-domain); empty means the app's domain.
+	BaseDomain string `json:"base_domain,omitempty"`
+	// HTTPOnly: the route serves plain HTTP (no certificate, no ACME).
+	HTTPOnly bool `json:"http_only,omitempty"`
+	// AllowIPs: when non-empty, only these IPs/CIDRs reach the route.
+	AllowIPs []string `json:"allow_ips,omitempty"`
+}
+
+// URL is the preview's address with the scheme its route actually serves:
+// http:// for an HTTP-only preview, https:// otherwise.
+func (s State) URL() string {
+	if s.HTTPOnly {
+		return "http://" + s.Domain
+	}
+	return "https://" + s.Domain
 }
 
 // DeployConfig holds parameters for creating a preview.
@@ -70,6 +95,95 @@ type DeployConfig struct {
 	// (see State.Repo). Empty is allowed: the repo is provenance, not part
 	// of the preview ID.
 	Repo string
+
+	// Exposure overrides. Each one left unset inherits the existing
+	// record's value on an update (and the default on a first deploy), so
+	// re-deploying a branch without repeating the flags keeps its mode.
+	//
+	// BaseDomain replaces Domain as the hostname base (e.g.
+	// "100-64-1-2.sslip.io"); "" = inherit, else Domain.
+	BaseDomain string
+	// HTTPOnly: nil = inherit, else the route is (not) plain HTTP.
+	HTTPOnly *bool
+	// AllowIPs: nil = inherit; non-nil replaces the allowlist (an empty
+	// non-nil slice clears it). Entries are IPs or CIDRs.
+	AllowIPs []string
+}
+
+// exposure is the resolved route mode for one Deploy.
+type exposure struct {
+	baseDomain string // base the hostname is built under
+	recorded   string // State.BaseDomain ("" = the app domain)
+	httpOnly   bool
+	allowIPs   []string
+}
+
+var validBaseDomain = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$`)
+
+// ValidateBaseDomain checks an explicit preview base domain: a lowercase
+// multi-label DNS name, short enough that the preview label still fits.
+func ValidateBaseDomain(base string) error {
+	if !validBaseDomain.MatchString(base) || len(base) > 253-64 {
+		return fmt.Errorf("invalid preview base domain %q: want a lowercase DNS name like 100-64-1-2.sslip.io", base)
+	}
+	return nil
+}
+
+// ValidateAllowIPs checks that every entry is a bare IP address or a CIDR
+// (the same rule teploy.yml's firewall.allow_ips enforces) — the values
+// are rendered verbatim into the Caddyfile.
+func ValidateAllowIPs(ips []string) error {
+	for _, ip := range ips {
+		if strings.Contains(ip, "/") {
+			if _, _, err := net.ParseCIDR(ip); err != nil {
+				return fmt.Errorf("invalid allow-ip %q: not a valid CIDR", ip)
+			}
+		} else if net.ParseIP(ip) == nil {
+			return fmt.Errorf("invalid allow-ip %q: not a valid IP address or CIDR", ip)
+		}
+	}
+	return nil
+}
+
+// resolveExposure merges the deploy's overrides over the existing record's
+// recorded mode (nil existing = first deploy: defaults).
+func resolveExposure(cfg DeployConfig, existing *State) (exposure, error) {
+	var e exposure
+	switch {
+	case cfg.BaseDomain != "":
+		e.recorded = cfg.BaseDomain
+	case existing != nil:
+		e.recorded = existing.BaseDomain
+	}
+	if e.recorded != "" {
+		if err := ValidateBaseDomain(e.recorded); err != nil {
+			return e, err
+		}
+		e.baseDomain = e.recorded
+	} else {
+		e.baseDomain = cfg.Domain
+	}
+	if e.baseDomain == "" {
+		return e, fmt.Errorf("no preview base domain: the app has no domain and no --base-domain was given")
+	}
+
+	if cfg.HTTPOnly != nil {
+		e.httpOnly = *cfg.HTTPOnly
+	} else if existing != nil {
+		e.httpOnly = existing.HTTPOnly
+	}
+
+	src := cfg.AllowIPs
+	if src == nil && existing != nil {
+		src = existing.AllowIPs
+	}
+	if len(src) > 0 {
+		e.allowIPs = append([]string(nil), src...)
+	}
+	if err := ValidateAllowIPs(e.allowIPs); err != nil {
+		return e, err
+	}
+	return e, nil
 }
 
 // Manager handles preview environment lifecycle.
@@ -324,6 +438,13 @@ func (m *Manager) Deploy(ctx context.Context, cfg DeployConfig) error {
 	if err != nil {
 		return err
 	}
+	// The exposure mode is resolved (and validated) before anything is
+	// mutated, against the record as found: an update inherits whatever
+	// the deploy does not override.
+	exp, err := resolveExposure(cfg, existing)
+	if err != nil {
+		return err
+	}
 	if existing != nil && existingPath == legacyPreviewStatePath(cfg.App, cfg.Branch) {
 		adopted := *existing
 		adopted.ID = PreviewID(cfg.App, cfg.Branch)
@@ -340,7 +461,7 @@ func (m *Manager) Deploy(ctx context.Context, cfg DeployConfig) error {
 	}
 
 	idHex := previewIDHex(cfg.App, cfg.Branch)
-	domain := previewDomain(cfg.App, cfg.Branch, cfg.Domain)
+	domain := previewDomain(cfg.App, cfg.Branch, exp.baseDomain)
 	// The process (container name component AND network alias) carries the
 	// version: each candidate gets its own alias, so the stable route can
 	// point at exactly one generation — a shared alias would round-robin
@@ -351,6 +472,9 @@ func (m *Manager) Deploy(ctx context.Context, cfg DeployConfig) error {
 
 	fmt.Fprintf(m.out, "Deploying preview for branch %q...\n", cfg.Branch)
 	fmt.Fprintf(m.out, "  Domain: %s\n", domain)
+	if len(exp.allowIPs) > 0 {
+		fmt.Fprintf(m.out, "  Allow: %s\n", strings.Join(exp.allowIPs, " "))
+	}
 
 	// Ensure preview directory exists.
 	if _, err := m.exec.Run(ctx, "mkdir -p "+previewDir(cfg.App)); err != nil {
@@ -440,24 +564,29 @@ func (m *Manager) Deploy(ctx context.Context, cfg DeployConfig) error {
 	// Switch the preview domain's route to the candidate. The route KEY
 	// (and with it the canonical identity) is stable; only the upstream
 	// container moves. Preview subdomains use Caddy automatic HTTPS (no
-	// custom cert).
-	if err := m.caddy.SetRoute(ctx, routeApp, domain, containerName, internalPort, caddy.TLS{}, "", nil, caddy.Firewall{}, caddy.Access{}); err != nil {
+	// custom cert) unless the preview is HTTP-only; an allowlist becomes
+	// the route's firewall.
+	if err := m.caddy.SetRoute(ctx, routeApp, domain, containerName, internalPort,
+		caddy.TLS{HTTPOnly: exp.httpOnly}, "", nil, caddy.Firewall{AllowIPs: exp.allowIPs}, caddy.Access{}); err != nil {
 		return abortCandidate(err, "setting preview route — the previous preview is still serving")
 	}
 
 	// Write state.
 	now := time.Now().UTC()
 	state := State{
-		ID:        PreviewID(cfg.App, cfg.Branch),
-		Branch:    cfg.Branch,
-		Repo:      cfg.Repo,
-		Route:     routeApp,
-		Domain:    domain,
-		Port:      port,
-		Container: containerName,
-		Image:     cfg.Image,
-		CreatedAt: now,
-		ExpiresAt: now.Add(cfg.TTL),
+		ID:         PreviewID(cfg.App, cfg.Branch),
+		Branch:     cfg.Branch,
+		Repo:       cfg.Repo,
+		Route:      routeApp,
+		Domain:     domain,
+		Port:       port,
+		Container:  containerName,
+		Image:      cfg.Image,
+		CreatedAt:  now,
+		ExpiresAt:  now.Add(cfg.TTL),
+		BaseDomain: exp.recorded,
+		HTTPOnly:   exp.httpOnly,
+		AllowIPs:   exp.allowIPs,
 	}
 	if err := m.writeRecord(ctx, &state, previewStatePath(cfg.App, cfg.Branch)); err != nil {
 		return fmt.Errorf("writing preview state: %w", err)
@@ -476,7 +605,7 @@ func (m *Manager) Deploy(ctx context.Context, cfg DeployConfig) error {
 		m.caddy.RemoveRoute(ctx, predecessorRoute)
 	}
 
-	fmt.Fprintf(m.out, "  Preview deployed: https://%s\n", domain)
+	fmt.Fprintf(m.out, "  Preview deployed: %s\n", state.URL())
 	fmt.Fprintf(m.out, "  Expires: %s\n", state.ExpiresAt.Format(time.RFC3339))
 	return nil
 }
