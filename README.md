@@ -217,7 +217,10 @@ processes:
 #   http — status-based only: GET path, 200 = ready. A 404/redirect FAILS
 #          (no fallback). Best when the app has a real health endpoint.
 #   tcp  — a TCP dial against the published port; nothing is fetched.
-#          For apps with no HTTP surface (game servers, TCP brokers).
+#          The connection is held ~1s: a listener that closes it at once
+#          (Docker's proxy does, when nothing in the container listens)
+#          is NOT ready. For apps with no HTTP surface (game servers, TCP
+#          brokers).
 #          Setting `path` alongside is rejected — nothing would fetch it.
 #   auto — compatibility default (also what an omitted mode means): HTTP
 #          GET first; a 404/3xx falls back to a TCP dial. The historical

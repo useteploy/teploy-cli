@@ -554,7 +554,7 @@ func TestHealthCheck_TCPFallback(t *testing.T) {
 		// curl returns 404 — no /health endpoint.
 		ssh.MockCommand{Match: "curl -s -o /dev/null", Output: "404"},
 		// TCP check succeeds.
-		ssh.MockCommand{Match: "bash -c '</dev/tcp", Output: ""},
+		ssh.MockCommand{Match: "bash -c 'exec 3<>/dev/tcp", Output: ""},
 	)
 
 	d := &Deployer{exec: mock, out: &bytes.Buffer{}}
@@ -574,7 +574,7 @@ func TestHealthCheck_RedirectFallback(t *testing.T) {
 		// curl returns 301 — app redirects /health (e.g. WordPress canonical).
 		ssh.MockCommand{Match: "curl -s -o /dev/null", Output: "301"},
 		// TCP check succeeds.
-		ssh.MockCommand{Match: "bash -c '</dev/tcp", Output: ""},
+		ssh.MockCommand{Match: "bash -c 'exec 3<>/dev/tcp", Output: ""},
 	)
 
 	d := &Deployer{exec: mock, out: &bytes.Buffer{}}
