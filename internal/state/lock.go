@@ -39,6 +39,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -394,8 +395,28 @@ func ReleaseLockFenced(exec ssh.Executor, lk *Lock, app string) {
 // staged to a unique sibling (no effect — a stale holder cannot clobber the
 // successor's staging, A06), and the atomic rename — the instant the new
 // state becomes authoritative — runs as a guarded effect. A holder that
-// lost the lock commits nothing.
+// lost the lock commits nothing. The committed-generation sidecar is
+// published in the same guarded command, right after the state rename.
 func WriteFenced(ctx context.Context, exec ssh.Executor, app string, s *AppState, lk *Lock) error {
+	return writeFenced(ctx, exec, app, s, lk, nil)
+}
+
+// WriteFencedGeneration is WriteFenced with the commit also fenced on the
+// PREDECESSOR generation (C01-8/9): the guarded command chains the holdership
+// guard, a compare-and-swap on the committed-generation sidecar (refuses when
+// the target already committed a generation newer than expectedGeneration —
+// ErrGenerationFenced), the state.json rename, and the sidecar update — one
+// remote shell, so authority and its generation fence move together. A
+// rollback or deploy that resolved the world at generation E cannot commit
+// over a successor's E+N, no matter when its commands land. The sidecar CAS
+// is defense-in-depth on top of the holdership guard: the guard refuses a
+// BROKEN holder, the CAS refuses an effect that is stale on CONTENT even
+// while the shell still holds (the in-flight/takeover-interleave window).
+func WriteFencedGeneration(ctx context.Context, exec ssh.Executor, app string, s *AppState, lk *Lock, expectedGeneration uint64) error {
+	return writeFenced(ctx, exec, app, s, lk, &expectedGeneration)
+}
+
+func writeFenced(ctx context.Context, exec ssh.Executor, app string, s *AppState, lk *Lock, expectedGeneration *uint64) error {
 	if lk == nil {
 		return Write(ctx, exec, app, s)
 	}
@@ -414,8 +435,31 @@ func WriteFenced(ctx context.Context, exec ssh.Executor, app string, s *AppState
 	if err := exec.Upload(ctx, strings.NewReader(string(data)), tmpPath, "0644"); err != nil {
 		return fmt.Errorf("uploading temporary state file: %w", err)
 	}
-	if _, err := lk.Guarded(ctx, exec, "mv -f -- "+ssh.ShellQuote(tmpPath)+" "+ssh.ShellQuote(path)); err != nil {
-		// Leave the temp file for diagnosis; it is inert.
+	// The sidecar payload is staged like the state (unique owner-scoped
+	// sibling, A06's discipline) and renamed in the SAME guarded command,
+	// after state.json: authority first, fence second — a crash between the
+	// two renames can only leave the sidecar one generation BEHIND, the
+	// permissive direction (a stale effect may pass the CAS once; nothing
+	// can ever fence against a generation that never committed).
+	sidecarPath := GenerationSidecarPath(app)
+	sidecarTmp, err := ownerTempName(sidecarPath, lk.Owner())
+	if err != nil {
+		return err
+	}
+	if err := exec.Upload(ctx, strings.NewReader(strconv.FormatUint(s.Generation, 10)+"\n"), sidecarTmp, "0644"); err != nil {
+		return fmt.Errorf("uploading temporary generation sidecar: %w", err)
+	}
+	genCAS := ""
+	if expectedGeneration != nil {
+		genCAS = GenerationCASPrefix(app, *expectedGeneration)
+	}
+	effect := genCAS + "mv -f -- " + ssh.ShellQuote(tmpPath) + " " + ssh.ShellQuote(path) +
+		" && mv -f -- " + ssh.ShellQuote(sidecarTmp) + " " + ssh.ShellQuote(sidecarPath)
+	if _, err := lk.Guarded(ctx, exec, effect); err != nil {
+		if GenerationFenced(err) {
+			return fmt.Errorf("%w: refusing to commit generation %d for %s over a newer committed generation (expected predecessor %d)", ErrGenerationFenced, s.Generation, app, *expectedGeneration)
+		}
+		// Leave the temp files for diagnosis; they are inert.
 		return err
 	}
 	return nil
