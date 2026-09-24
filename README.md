@@ -388,6 +388,11 @@ teploy secret rm KEY               # delete an encrypted secret (local store)
 teploy secret get / list / rotate  # secret management
 ```
 
+At deploy, secrets (and `secret:` references in `env:`) override
+`teploy.yml` `env:`, which overrides the server `.env` that `env set`
+writes. `env set` therefore refuses a key that is a secret (use
+`secret set`) and warns when `teploy.yml` `env:` shadows the key.
+
 ### Fleet
 ```
 teploy server add <name> <host>    # add server to ~/.teploy/servers.yml
