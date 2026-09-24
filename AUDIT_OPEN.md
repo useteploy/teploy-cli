@@ -2283,3 +2283,131 @@ it), multi-host partial-wave readiness states (canary aggregate gating),
 WebSocket/SSE drain verification beyond the long-request proof, and the
 registered interactions (tcp mode × the Caddy LB active check; preview's
 gate has no drain surface).
+
+## Programme slice (2026-09-23) — C08: transport, secrets and host lifecycle
+
+Five commits on branch `c08-transport-secrets` (base: `7e91302` → `a340bfb`
+landed by the prior session, C08-5 + the join fix landed by this one).
+Spec: TEPLOY_PRODUCT_EXCELLENCE_PROGRAMME_2026-09-21.md, "C08".
+
+**Landed (prior session):**
+
+- **C08-1 — structured executor result.** `internal/ssh.Result`:
+  bounded stdout/stderr (1 MiB/stream, Truncated flag), ExitCode 0..255
+  or -1, TimedOut/Canceled as distinct flags, Err only when the command
+  did not complete (a clean non-zero exit is a result). Native capture
+  for RemoteExecutor (separate channel streams, exit-status request),
+  LocalExecutor, MockExecutor; generic fallback for others. Call sites
+  stopped parsing failure text: doctor compat absence is exit 127 (a
+  non-127 "not found" text no longer reads as absence — pinned),
+  doctor registry classifies on the tool's stderr, registry list
+  distinguishes confirmed file absence from a read failure (a read
+  failure can no longer become "No registries configured" — pinned).
+- **C08-2 — bounded remote command lifetime.** ConnectConfig
+  .CommandTimeout bounds every command on the connection when the
+  caller's context carries no earlier deadline; expiry surfaces as
+  TimedOut. Pinned against an in-process x/crypto/ssh server (new
+  fixture `sshtest_test.go`): a never-answering command dies at the
+  deadline with the connection still usable, cancellation and timeout
+  stay distinguishable, and the local process-group kill (A28) is
+  extended to the structured path.
+- **C08-3 — stdin/private-file secret transport on the remaining
+  argv-exposed paths.** BAO_TOKEN and kv values ride stdin
+  (`docker exec -i ... read -r tok; exec bao ...`, `kv put <path> -`
+  with JSON on the pipe); db admin passwords and role SQL the same
+  (`write <path> -`); the policy write dropped its base64 argv detour;
+  registry login streams the password over the session pipe; the setup
+  su path feeds the root password over stdin (no /tmp script artifact);
+  mysql/mariadb backup+restore stage MYSQL_PWD in a 0600 env-file
+  consumed by `docker exec --env-file`, removed by name on the
+  keep-workspace-on-failure path (keep the SQL, never the secret);
+  setup's VPN join staged the key in a 0600 file read into
+  TS_AUTHKEY/NB_SETUP_KEY by an rm-then-exec shell. MockExecutor
+  records stdin payloads (Inputs) so every pin asserts BOTH halves:
+  secret absent from every recorded command, secret present on the
+  pipe. This closes the F22 deferral register items (BAO_TOKEN /
+  MYSQL_PWD docker-exec argv).
+- **C08-4 — concurrent-safe TOFU + rename-vs-change.** Verify+enroll
+  under an exclusive flock on `<known_hosts>.teploy-lock` (flock, not
+  the file itself, so stock ssh(1) never interacts with our lock;
+  never unlinked — closes the unlinked-inode race; non-Unix builds get
+  a documented O_EXCL fallback with bounded stale-lock takeover); the
+  database is re-read FRESH under the lock (the old callback captured
+  it at Connect time — the actual race); enrollment is temp+fsync+
+  rename (a crash can no longer leave a torn line that locks out every
+  future connection); an unknown host presenting a key trusted under a
+  DIFFERENT name is a rename (enrolled with a note), an unknown key for
+  a known host is an identity change (fails closed, file untouched).
+  Pinned: 16 concurrent first connects → exactly one enrollment and a
+  parseable file; concurrent distinct hosts lose nothing; rename vs
+  change; two full Connect()s against the in-process server with one
+  shared fresh $HOME.
+
+**Landed (this session):**
+
+- **C08-5 — resumable setup: preflight, stages, connection recovery.**
+  `setupServer` is an ordered list of named `setupStage`s, each
+  check-then-act idempotent, each carrying the affected-resource
+  description the preflight prints BEFORE anything runs (the
+  affected-resource list the spec requires); failures name the stage.
+  The password-path authorized_keys install is guarded (`grep -qF ||
+  echo >>`) so an interrupted-and-rerun setup cannot stack duplicates.
+  `internal/ssh`'s `ReconnectingExecutor` redials on TRANSPORT-class
+  failure only (no exit status, not cancellation) with a bounded budget
+  (3, backoff 500ms→2s) and retries exactly the dead invocation;
+  ran-and-failed commands are never retried; RunStream refuses to
+  retry once bytes reached the caller (names the byte count instead —
+  a retry would duplicate output); RunInput/Upload buffer their payload
+  so the redialed attempt resends it whole (the first attempt consumed
+  the reader); a native runDetailed delegation keeps
+  RunInputDetailed's structured fields intact through the wrapper (the
+  su path's TEPLOY_SUDO_OK classification depends on stdout). runSetup
+  routes the whole flow (provisioning, hardening, network join, VPN
+  reconnection) through the wrapper. Pins: interruption at the network
+  stage fails naming the stage; the re-run against the same
+  partially-provisioned server completes skipping everything done (no
+  installer script, no apt install, no docker run, no Caddyfile
+  rewrite); a one-shot transport death mid-flow recovers and completes
+  (the dead command retried exactly once); recovery classification,
+  budget exhaustion, cancellation, stream/output/stdin fidelity, and
+  Close semantics each pinned separately.
+- **Network-join argv exposure closed (found by this session's
+  inventory).** `teploy network <provider> join` (the provider Join
+  methods) still put the mesh credential in the detached command line —
+  the same class C08-3 fixed for setup's join, missed because it lives
+  in internal/network. The staged-file transport moved to the network
+  package (StageJoinCredential + EnvVarJoinShell) and both entry
+  points (setup's joinVPNMesh and all three provider Joins) share it;
+  the three tests that pinned the old `--authkey=`/`--setup-key` argv
+  shape now pin its absence plus the env-var/file shape.
+
+**Secrets-argv inventory (this session, after the fixes):** age store,
+env/kv/template --var-stdin, openbao seal env-file, ShipAudit token,
+generic docker exec transport — clean (as C08-3 recorded). NEWLY
+REVIEWED: backup_alert's 0700 alert script carries the HMAC secret in
+the file, not argv — private-file channel with documented trust
+boundary, accepted. accessory.go's scheduled-backup crontab line embeds
+S3 creds — root-only-readable crontab, documented same-trust-class as
+~/.aws/credentials, accepted. REMAINING (recorded, not fixed here):
+`S3Config.AWS` (internal/backup/backup.go) prefixes
+AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY onto the aws invocation — the
+session shell's argv for the life of each aws call. That file is
+backup/restore internals, owned by the C07 lane; the fix (0600 env
+file + `.` sourcing, or aws config-file staging, with the same
+explicit cleanup semantics as the mysql credential file) belongs there.
+
+**C08 remainder (explicit):** the S3Config.AWS argv exposure above
+(C07-owned); RunStream recovery is byte-count-guarded, not
+resumption-position-aware (a long streamed output that dies mid-stream
+still loses the stream — the operator re-runs; a resumable channel is
+new transport surface, not a wrapper concern); CommandTimeout defaults
+to 0 (caller-controlled) everywhere except where callers opt in —
+sweeping the remaining unbounded long-running calls is C09's
+intervention/ergonomics surface; hardening's preflight granularity is
+per-function (Harden's own steps are not individually stage-listed).
+
+Gates: `go build ./...` && `go vet ./...` clean; `go test ./... -count=1`
+26/26 packages ok; `-race` on internal/ssh, internal/cli,
+internal/network (touched this session) plus internal/backup and
+internal/openbao ok; gofmt clean on touched files (pre-existing strays
+untouched).

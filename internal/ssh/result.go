@@ -101,6 +101,8 @@ func runDetailedWithLimit(ctx context.Context, ex Executor, cmd string, stdin io
 		return v.runDetailed(ctx, cmd, stdin, limit)
 	case *MockExecutor:
 		return v.runDetailed(ctx, cmd, stdin, limit)
+	case *ReconnectingExecutor:
+		return v.runDetailed(ctx, cmd, stdin, limit)
 	default:
 		return fallbackDetailed(ctx, ex, cmd, stdin, limit)
 	}
