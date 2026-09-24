@@ -1,0 +1,15 @@
+# teploy release-verify receipt
+# version label : 0.0.0-localverify-11d0709
+# commit        : 11d0709fbe19b642739809c614d1ff64a0812e41
+# git describe  : v0.1.37-46-g11d0709
+# dirty files   : 0
+# go toolchain  : go1.26.6 (go.mod: 1.26.0)
+# build env     : CGO_ENABLED=0 GOFLAGS=
+# ldflags       : -s -w -X main.version=0.0.0-localverify-11d0709
+# recorded      : 2026-09-24T01:26:56Z on Darwin/arm64
+9b41470e71554bb6a2899a5832ae20b67af06ec27aa6b3d31a99fa07a3706329  teploy_darwin_amd64
+fa51620f2abbbdfa8d9db71c18470c327f1ce7be8065cac7fb5045c01c5eef22  teploy_darwin_arm64
+2e37ab081802d45638dd5a4d0e50f685c9ef27dd438eafcb078653539b2dcd37  teploy_linux_amd64
+1e22ca85320fdef40039a430248ac5b46366ba41904d33e449e34742f0896c73  teploy_linux_arm64
+d0b2447f61520c97f4be25e9ef57cc9bc7ab8db253a3b5672a20413708e3cc5a  teploy_windows_amd64
+7108ded33e71efc125601d7bbf93bb1beb57d51e360dbe2b763bdc8314f89bd5  teploy_windows_arm64
