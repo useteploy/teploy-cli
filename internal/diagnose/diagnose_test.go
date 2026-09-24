@@ -161,3 +161,23 @@ func TestParseListenersEmpty(t *testing.T) {
 		t.Fatal("tool-missing output must not claim knowledge")
 	}
 }
+
+// Docker's embedded DNS (127.0.0.11:<random>) is in every container on a
+// user-defined network; it must not be reported as the app's port. Live
+// capture from colima: a container that never listens.
+func TestParseListenersIgnoresDockerEmbeddedDNS(t *testing.T) {
+	out := "Active Internet connections (only servers)\nProto Recv-Q Send-Q Local Address           Foreign Address         State       \ntcp        0      0 127.0.0.11:40137        0.0.0.0:*               LISTEN\n"
+	ls, ok := ParseListeners(out)
+	if !ok || len(ls) != 0 {
+		t.Fatalf("want known-and-empty, got %v ok=%v", ls, ok)
+	}
+	fs := Diagnose(Context{State: "running", ExitCode: -1, ConfiguredPort: 18096, Listeners: ls, ListenersKnown: ok})
+	for _, f := range fs {
+		if strings.Contains(f.Summary, "40137") {
+			t.Fatalf("embedded DNS reported as the app's port: %s", f.Summary)
+		}
+	}
+	if len(fs) == 0 || !strings.Contains(fs[0].Summary, "nothing is listening") {
+		t.Fatalf("want the nothing-listening finding, got %+v", fs)
+	}
+}

@@ -71,6 +71,7 @@ func writeStatus(ctx context.Context, flags *Flags, appCfg *config.AppConfig, ex
 	if err != nil {
 		return err
 	}
+	containers = dk.ResolveImageTags(ctx, containers)
 
 	if flags.JSON {
 		return json.NewEncoder(out).Encode(map[string]interface{}{
@@ -103,9 +104,9 @@ func writeStatus(ctx context.Context, flags *Flags, appCfg *config.AppConfig, ex
 		return nil
 	}
 
-	fmt.Fprintf(out, "\n%-35s  %-25s  %-10s  %s\n", "CONTAINER", "IMAGE", "STATE", "STATUS")
+	fmt.Fprintf(out, "\n%-35s  %-35s  %-10s  %s\n", "CONTAINER", "IMAGE", "STATE", "STATUS")
 	for _, c := range containers {
-		fmt.Fprintf(out, "%-35s  %-25s  %-10s  %s\n", c.Name, c.Image, c.State, c.Status)
+		fmt.Fprintf(out, "%-35s  %-35s  %-10s  %s\n", c.Name, c.Image, c.State, c.Status)
 	}
 	return nil
 }

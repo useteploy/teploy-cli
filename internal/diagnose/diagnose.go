@@ -199,7 +199,7 @@ func nothingListeningRule(c Context) *Finding {
 	return &Finding{
 		Summary: "the container is running but nothing is listening on any TCP port yet",
 		Try: []string{
-			"if the app boots slowly (migrations, JIT warmup), raise the health timeout in teploy.yml (`health: { timeout: 90s }`)",
+			"if the app boots slowly (migrations, JIT warmup), raise the health timeout in teploy.yml (`health: { timeout_seconds: 90 }`)",
 			"confirm the process actually starts an HTTP server (worker-only images should be a `processes:` entry, not the web process)",
 		},
 	}
@@ -216,6 +216,10 @@ func permissionRule(c Context) *Finding {
 		},
 	}
 }
+
+// dockerEmbeddedDNS is the address Docker's embedded DNS server binds
+// inside containers on user-defined networks.
+const dockerEmbeddedDNS = "127.0.0.11"
 
 // ParseListeners parses `ss -tlnH` or `netstat -tln` output from inside a
 // container into listeners. ok is false when the output carries no usable
@@ -243,6 +247,16 @@ func ParseListeners(out string) (listeners []Listener, ok bool) {
 				continue
 			}
 			addr := f[:idx]
+			ok = true
+			if addr == dockerEmbeddedDNS {
+				// Docker's embedded resolver on user-defined networks
+				// listens on 127.0.0.11:<random> inside every container.
+				// It is not the app: counting it made a container with
+				// nothing listening read as "the app is listening on
+				// port 40137" (found proving the C03 tcp-gate fix on
+				// colima). Its presence still proves the tool ran.
+				break
+			}
 			loopback := addr == "127.0.0.1" || addr == "::1" || addr == "[::1]"
 			if existing, dup := seen[port]; dup {
 				// A port bound on both loopback and a public address is reachable.
@@ -253,7 +267,6 @@ func ParseListeners(out string) (listeners []Listener, ok bool) {
 				l := &Listener{Port: port, LoopbackOnly: loopback}
 				seen[port] = l
 			}
-			ok = true
 			break // first host:port field per line is the local address
 		}
 	}

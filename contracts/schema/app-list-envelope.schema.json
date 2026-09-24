@@ -70,6 +70,16 @@
         "image": {
           "type": "string"
         },
+        "image_id": {
+          "type": "string",
+          "description": "Set only for a container created by image ID: the full sha256 image ID. image then carries the first repo tag (or the ID when untagged/unresolvable)."
+        },
+        "image_tags": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
         "state": {
           "type": "string"
         },

@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/useteploy/teploy/internal/deploy"
 	"github.com/useteploy/teploy/internal/docker"
 	"github.com/useteploy/teploy/internal/ssh"
 	"github.com/useteploy/teploy/internal/state"
@@ -419,7 +420,11 @@ func probeHealthy(ctx context.Context, exec ssh.Executor, port int, path string)
 		return true
 	}
 	if code == "404" || strings.HasPrefix(code, "3") {
-		_, terr := exec.Run(ctx, fmt.Sprintf("bash -c '</dev/tcp/localhost/%d' 2>/dev/null", port))
+		cmd, ok := deploy.TCPProbeCommand("localhost", port)
+		if !ok {
+			return false
+		}
+		_, terr := exec.Run(ctx, cmd)
 		return terr == nil
 	}
 	return false

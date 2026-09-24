@@ -259,15 +259,47 @@ func drainSummary(drainSeconds int) string {
 	return fmt.Sprintf("%ds window before predecessor retirement", drainSeconds)
 }
 
-// checkTCP verifies that a TCP connection can be established to the port.
-// The /dev/tcp redirection runs inside a single-quoted bash -c argument, so
-// neither the host nor the port can break out of it.
+// checkTCP verifies that the port reaches a live listener.
+//
+// A bare connect is not enough (C03 follow-up): Docker's userland proxy
+// (docker-proxy) owns the published port and accepts every connection
+// itself, then dials the container — so a connect succeeds even when
+// nothing inside the container is listening. What gives the dead backend
+// away is what happens NEXT: the proxy's backend dial is refused and it
+// closes the client side at once. So the probe connects, then waits
+// briefly for one byte: data (a server-speaks-first protocol) or the
+// connection staying open for the window (the usual client-speaks-first
+// server) is ready; an immediate EOF/reset is not. A listener that accepts
+// and immediately closes without a byte therefore reads as not ready.
 func (d *Deployer) checkTCP(ctx context.Context, host string, port int) bool {
-	host = strings.Trim(host, "[]")
-	if host != "localhost" && net.ParseIP(host) == nil {
+	cmd, ok := TCPProbeCommand(host, port)
+	if !ok {
 		return false
 	}
-	cmd := fmt.Sprintf("bash -c '</dev/tcp/%s/%d' 2>/dev/null", host, port)
 	_, err := d.exec.Run(ctx, cmd)
 	return err == nil
 }
+
+// TCPProbeCommand renders the host-side TCP readiness probe described on
+// checkTCP; exits 0 only when the port reaches a live listener. The /dev/tcp
+// redirection runs inside a single-quoted bash -c argument, and host must be
+// an IP literal or "localhost", so neither the host nor the port can break
+// out of it. ok=false means the host was rejected (fail closed).
+func TCPProbeCommand(host string, port int) (string, bool) {
+	host = strings.Trim(host, "[]")
+	if host != "localhost" && net.ParseIP(host) == nil {
+		return "", false
+	}
+	if port < 1 || port > 65535 {
+		return "", false
+	}
+	return fmt.Sprintf("bash -c 'exec 3<>/dev/tcp/%s/%d || exit 1; "+
+		"read -r -t %d -n 1 _b <&3; rc=$?; [ $rc -eq 0 ] || [ $rc -gt 128 ]' 2>/dev/null",
+		host, port, tcpProbeHoldSeconds), true
+}
+
+// tcpProbeHoldSeconds is how long the TCP probe holds the connection
+// waiting for a byte or EOF. docker-proxy closes a dead backend's
+// connection within milliseconds; one second leaves ample margin on a
+// loaded host while keeping each attempt short.
+const tcpProbeHoldSeconds = 1
