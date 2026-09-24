@@ -2550,3 +2550,31 @@ Gates: `go build ./...` && `go vet ./...` clean; `go test ./... -count=1`
 internal/network (touched this session) plus internal/backup and
 internal/openbao ok; gofmt clean on touched files (pre-existing strays
 untouched).
+
+## 2026-09-24 nineteenth-wave defect sweep (lane L4, cli-defects)
+
+The real defects the nineteenth wave's lanes found and left open, plus two
+more found while proving them. Each landed with a pin test in the same
+commit; live proofs on the colima fixture.
+
+| Item | Outcome | Commit | Evidence |
+|---|---|---|---|
+| `teploy log` does not resolve named servers (R02 docs lane) | **fixed** | 39197d0 | Root cause was shared, not log-specific: `config.ResolveServer`'s `--host` branch took the value verbatim, so every `--app --host <name>` command (log, status, logs, health, rollback --app, ...) dialed the literal name. A `--host` naming a servers.yml entry now resolves to it (`--user`/`--key` still win; unregistered values and a missing servers.yml stay raw). Pins: config + `runLog`. Live: `teploy log --app quickstart --host colima-vm` connected to the entry's `tyler@127.0.0.1:<port>`. No written workaround existed in this repo's docs; NEXT_SESSION's mention is the only record. |
+| tcp health gates pass against docker-proxy with a dead backend (C03 follow-up) | **fixed** | 4664094 | The probe connects and holds up to 1s: a byte or an open connection is ready; the proxy's immediate close (backend refused), a refused connect, or a bad host is not. `deploy.TCPProbeCommand` is shared by the deploy gate, auto's 404/3xx fallback, and heal. Live on colima: sleep-only container on a published port — old probe rc=0, new rc=1; the deploy gate refuses it; the httpd fixture passes. Pin runs the real command against accept-then-close / silent / banner / closed listeners (red on the old probe on Linux; skipped on bash<4, where a read timeout is indistinguishable from EOF, so it fails closed). |
+| (found proving the above) port-mismatch diagnosis blamed Docker's embedded DNS | **fixed** | 79b8b5c | A container with nothing listening was diagnosed as "the app is listening on port 46107": the 127.0.0.11 resolver inside every user-network container. Skipped now; the correct "nothing is listening" finding fires. The slow-boot hint named a nonexistent `health: { timeout: 90s }`; corrected to `timeout_seconds`. |
+| ID-created containers report the ID, not the tag (Ship wave-9) | **fixed**, not display-only | ff72cb2 | `docker.ResolveImageTags` (one batched `docker image inspect`, none when no ID-form image): `status` text/--json, `app status --json`, `server status --json` report image = first tag + image_id + image_tags. **Comparison impact found and fixed:** rollback overwrote the target release record's ImageRef with the container's docker ps image, so after a rollback the state carried an unpullable short ID (DR bundle restore resolves the image from ImageRef); the release record now wins, else the resolved tag. Prune's rmi and the predecessor snapshot keep the raw value by design. Corpus rev 7 (additive): optional image_id/image_tags. Live: quickstart asserts the status tag. |
+| `teploy env set` does not feed secret-backed vars (Ship wave-9) | **by design on precedence, guarded** | 65962bd | The server `.env` is the first env file; teploy.yml `env:` + decrypted secrets + resolved `secret:` refs ride the later attempt file and win. So `env set` on a secret-backed key was a silent no-op. It now refuses (nothing written) for keys in the secret store or `secret:` references in teploy.yml, naming the remedy; a plain teploy.yml `env:` key that shadows it gets a warning. README states the precedence. |
+| X05: no maintained deployable CLI fixture app | **fixed** | 4ed08f0 | `examples/quickstart/app` (landed by C09, acf475f) is the maintained fixture; `make quickstart` now covers deploy -> verify -> redeploy -> health -> status-by-tag -> rollback -> tcp-gate refusal of a never-listening qs3 with v1 still serving. Fixture fixes: the sh-wrapped httpd ignored SIGTERM as PID 1 (every retirement waited out the 10s kill: Exited 137, ~11.5s deploys -> TERM trap, ~1.5s, Exited 0); a real 200 `/health`. Green on colima. |
+
+**Recorded, not done here:** `internal/preview`'s `probeTCP` has the same
+connect-only shape as the old gate. Left alone because the L1 lane owned
+internal/preview this wave; the fix is to switch it to
+`deploy.TCPProbeCommand`. `teploy health` probes with the default auto
+mode and not the app's configured `health.mode`/path. That is a
+pre-existing inconsistency, now visible because the fixture has a real
+`/health`.
+
+Gates: `go test ./... -count=1` 26/26 packages ok (macOS);
+internal/deploy full suite PASS on Linux (colima, bash 5.2);
+`GOOS=linux go vet ./... && GOOS=linux go build ./...` clean; `make
+quickstart` green on colima.
