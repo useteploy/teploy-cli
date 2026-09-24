@@ -71,6 +71,7 @@ func writeStatus(ctx context.Context, flags *Flags, appCfg *config.AppConfig, ex
 	if err != nil {
 		return err
 	}
+	containers = dk.ResolveImageTags(ctx, containers)
 
 	if flags.JSON {
 		return json.NewEncoder(out).Encode(map[string]interface{}{

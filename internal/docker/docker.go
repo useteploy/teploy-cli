@@ -37,6 +37,12 @@ type Container struct {
 	Status    string // human-readable, e.g. "Up 2 hours"
 	CreatedAt string // raw docker timestamp, e.g. "2026-05-28 21:33:29 -0700 PDT" — lexicographically sortable for same-TZ comparisons
 	Labels    map[string]string
+	// ImageID and ImageTags are set by ResolveImageTags for a container
+	// created by image ID (A52: web/worker containers run from the
+	// immutable ID), whose docker ps Image is that ID rather than a name.
+	// Image then carries the first repo tag; ImageID keeps the ID.
+	ImageID   string   `json:",omitempty"`
+	ImageTags []string `json:",omitempty"`
 }
 
 // RunConfig holds the parameters for starting a new container.
@@ -562,6 +568,93 @@ func (c *Client) ContainerImageDigest(ctx context.Context, container string) (st
 		return "", fmt.Errorf("docker returned no content-addressed image digest")
 	}
 	return digest, nil
+}
+
+// IsImageID reports whether ref is an image ID (full "sha256:<64 hex>",
+// bare 64 hex, or docker ps's 12-hex short form) rather than a name.
+func IsImageID(ref string) bool {
+	h := strings.TrimPrefix(ref, "sha256:")
+	if len(h) != 12 && len(h) != 64 {
+		return false
+	}
+	for _, r := range h {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// ResolveImageTags returns a copy of containers in which every container
+// created by image ID reports that image's first repo tag as Image, with the
+// ID kept in ImageID and every tag in ImageTags. Containers created by name are untouched and cost nothing
+// (no docker call when no ID-form image is present). Best-effort by design:
+// an untagged or already-removed image, or a failed inspect, leaves Image as
+// the ID — reporting must never fail because the name could not be found.
+//
+// Found by the Ship programme (wave 9): containers created by image ID
+// reported the ID, never the artifact tag, so a consumer matching the
+// deployed image against the tag it shipped never matched.
+func (c *Client) ResolveImageTags(ctx context.Context, containers []Container) []Container {
+	var ids []string
+	seen := map[string]bool{}
+	for _, ct := range containers {
+		if IsImageID(ct.Image) && !seen[ct.Image] {
+			seen[ct.Image] = true
+			ids = append(ids, ct.Image)
+		}
+	}
+	if len(ids) == 0 {
+		return containers
+	}
+	containers = append([]Container(nil), containers...)
+	quoted := make([]string, len(ids))
+	for i, id := range ids {
+		quoted[i] = ssh.ShellQuote(id)
+	}
+	// A missing image makes inspect exit non-zero while still printing the
+	// found ones; keep what it printed.
+	out, _ := c.exec.Run(ctx, "docker image inspect --format '{{.Id}} {{json .RepoTags}}' "+strings.Join(quoted, " ")+" 2>/dev/null || true")
+	type img struct {
+		id   string
+		tags []string
+	}
+	var images []img
+	for _, line := range strings.Split(out, "\n") {
+		id, raw, ok := strings.Cut(strings.TrimSpace(line), " ")
+		if !ok || !IsImageID(id) || len(strings.TrimPrefix(id, "sha256:")) != 64 {
+			continue
+		}
+		var tags []string
+		if json.Unmarshal([]byte(raw), &tags) != nil {
+			continue
+		}
+		images = append(images, img{id: id, tags: tags})
+	}
+	for i, ct := range containers {
+		if !IsImageID(ct.Image) {
+			continue
+		}
+		want := strings.TrimPrefix(ct.Image, "sha256:")
+		for _, im := range images {
+			if !strings.HasPrefix(strings.TrimPrefix(im.id, "sha256:"), want) {
+				continue
+			}
+			containers[i].ImageID = im.id
+			var tags []string
+			for _, t := range im.tags {
+				if t != "" && t != "<none>:<none>" {
+					tags = append(tags, t)
+				}
+			}
+			if len(tags) > 0 {
+				containers[i].Image = tags[0]
+				containers[i].ImageTags = tags
+			}
+			break
+		}
+	}
+	return containers
 }
 
 // Remove removes a stopped container.

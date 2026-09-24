@@ -537,7 +537,16 @@ func Rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg Rollbac
 	if current.PreviousRelease != nil && current.PreviousRelease.Hash == target {
 		newState.ApplyRelease(current.PreviousRelease)
 	}
-	newState.ImageRef = targetWeb[0].Image
+	// The target release record's ImageRef (applied just above) is the
+	// requested reference and wins. Without one, fall back to the
+	// container's image — resolved to its tag, because web containers are
+	// created by immutable image ID (A52) and docker ps then reports the
+	// bare short ID: recording that made ImageRef an unpullable 12-hex
+	// string after a rollback (a DR restore on a fresh host resolves the
+	// image from ImageRef).
+	if newState.ImageRef == "" {
+		newState.ImageRef = dk.ResolveImageTags(ctx, targetWeb[:1])[0].Image
+	}
 	if digest, digestErr := dk.ContainerImageDigest(ctx, targetWeb[0].Name); digestErr == nil {
 		newState.ImageDigest = digest
 	}

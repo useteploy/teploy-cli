@@ -29,15 +29,19 @@ type releaseStatusDTO struct {
 	Ports   []int  `json:"ports"`
 }
 
+// containerDTO: image_id/image_tags are set when the container was created
+// by image ID; image then carries the first repo tag (docker.ResolveImageTags).
 type containerDTO struct {
-	ID        string `json:"id"`
-	Name      string `json:"name"`
-	Image     string `json:"image"`
-	State     string `json:"state"`
-	Status    string `json:"status"`
-	CreatedAt string `json:"created_at"`
-	Process   string `json:"process"`
-	Version   string `json:"version"`
+	ID        string   `json:"id"`
+	Name      string   `json:"name"`
+	Image     string   `json:"image"`
+	ImageID   string   `json:"image_id,omitempty"`
+	ImageTags []string `json:"image_tags,omitempty"`
+	State     string   `json:"state"`
+	Status    string   `json:"status"`
+	CreatedAt string   `json:"created_at"`
+	Process   string   `json:"process"`
+	Version   string   `json:"version"`
 }
 
 type processDTO struct {
@@ -173,10 +177,12 @@ func collectAppStatus(ctx context.Context, executor ssh.Executor, app string, ob
 		result.PreviousRelease = releaseStatusDTO{Version: previousVersion, Ports: nonNilInts(current.PreviousPorts)}
 	}
 
-	containers, err := docker.NewClient(executor).ListContainers(ctx, app)
+	dk := docker.NewClient(executor)
+	containers, err := dk.ListContainers(ctx, app)
 	if err != nil {
 		result.Errors = append(result.Errors, machineError{Scope: "containers", Message: err.Error()})
 	} else {
+		containers = dk.ResolveImageTags(ctx, containers)
 		result.Containers = containerDTOs(containers)
 		result.Processes = processDTOs(result.Containers)
 		if len(containers) > 0 && result.Type == "" {
@@ -211,6 +217,7 @@ func containerDTOs(containers []docker.Container) []containerDTO {
 	for _, container := range containers {
 		result = append(result, containerDTO{
 			ID: container.ID, Name: container.Name, Image: container.Image,
+			ImageID: container.ImageID, ImageTags: container.ImageTags,
 			State: container.State, Status: container.Status, CreatedAt: container.CreatedAt,
 			Process: container.Labels["teploy.process"], Version: container.Labels["teploy.version"],
 		})
@@ -393,6 +400,7 @@ func collectServerStatus(ctx context.Context, executor ssh.Executor, server stri
 		if err != nil {
 			result.Errors = append(result.Errors, machineError{Scope: "docker.containers", Message: err.Error()})
 		} else {
+			containers = docker.NewClient(executor).ResolveImageTags(ctx, containers)
 			result.Docker.Containers = containerDTOs(containers)
 		}
 	}
