@@ -237,6 +237,7 @@ func drCutoverMock(receipt *RestoreReceipt, manifest *BundleManifest, extra ...s
 		{Match: "mktemp -d '/deployments", Output: "/deployments/myapp/recovery123\n"},
 		{Match: "find ", Output: ""},
 		{Match: "cp -a ", Output: ""},
+		{Match: "mv -f ", Output: ""},
 		{Match: "cp -p", Output: ""},
 		{Match: "rm -rf", Output: ""},
 		{Match: "mkdir -p '/deployments/myapp/meta' '/deployments/myapp/secrets'", Output: ""},
@@ -365,6 +366,7 @@ func TestCutover_HappyPath(t *testing.T) {
 	// Non-empty engine dir forces the pre-cutover move-aside.
 	mock := drCutoverMock(drOKReceipt(), manifest,
 		ssh.MockCommand{Match: "if [ -z \"$(ls -A", Output: "nonempty\n"},
+		ssh.MockCommand{Match: "if [ -e '/deployments/myapp/accessories/db/pgdata'", Output: "present\n"},
 		ssh.MockCommand{Match: "mktemp -d '/deployments/myapp/accessories/db.pre-cutover.XXXXXX'", Output: "/deployments/myapp/accessories/db.pre-cutover.Aa1\n"},
 	)
 	receipt, err := NewClient(mock, &bytes.Buffer{}).CutoverBundle(context.Background(),
@@ -376,7 +378,7 @@ func TestCutover_HappyPath(t *testing.T) {
 	if !strings.Contains(joined, "docker exec -i 'myapp-db' psql -v ON_ERROR_STOP=1 -U 'appuser' 'appdb'") {
 		t.Errorf("engine dump was not restored into the live accessory")
 	}
-	if !strings.Contains(joined, "find '/deployments/myapp/accessories/db' -mindepth 1 -maxdepth 1 -exec mv -t '/deployments/myapp/accessories/db.pre-cutover.Aa1'") {
+	if !strings.Contains(joined, "mv -f '/deployments/myapp/accessories/db/pgdata' '/deployments/myapp/accessories/db.pre-cutover.Aa1/pgdata'") {
 		t.Errorf("pre-cutover engine data was not preserved")
 	}
 	if len(receipt.Promoted) != 1 || receipt.Promoted[0] != "/deployments/myapp/volumes/data" {
@@ -391,6 +393,37 @@ func TestCutover_HappyPath(t *testing.T) {
 	}
 	if len(receipt.RecoveryDirs) == 0 {
 		t.Errorf("recovery dirs not recorded: %+v", receipt)
+	}
+}
+
+// TestCutover_NonEmptyAccessoryDirWithoutVolumeData: an accessory dir that
+// is nonempty (env/credential files) but has NO on-disk volume directory —
+// a volume added to teploy.yml after the bundle, or a re-run after a
+// partial failure — has nothing to preserve: the cutover proceeds, moves
+// nothing, and records no empty recovery dir.
+func TestCutover_NonEmptyAccessoryDirWithoutVolumeData(t *testing.T) {
+	manifest := drTestManifest()
+	mock := drCutoverMock(drOKReceipt(), manifest,
+		ssh.MockCommand{Match: "if [ -z \"$(ls -A", Output: "nonempty\n"},
+		ssh.MockCommand{Match: "if [ -e '/deployments/myapp/accessories/db/pgdata'", Output: "absent\n"},
+	)
+	receipt, err := NewClient(mock, &bytes.Buffer{}).CutoverBundle(context.Background(),
+		BundleRestoreOptions{App: "myapp", ID: manifest.ID, Config: drTestConfig()})
+	if err != nil {
+		t.Fatalf("CutoverBundle: %v", err)
+	}
+	for _, call := range mock.Calls {
+		if strings.HasPrefix(call, "mv -f ") || strings.Contains(call, "docker run --rm --user 0") {
+			t.Errorf("nothing existed to move aside, yet a move ran: %s", call)
+		}
+		if strings.Contains(call, "pre-cutover.XXXXXX") {
+			t.Errorf("an empty recovery dir was created: %s", call)
+		}
+	}
+	for _, d := range receipt.RecoveryDirs {
+		if strings.Contains(d, "pre-cutover") {
+			t.Errorf("empty pre-cutover recovery dir recorded: %+v", receipt.RecoveryDirs)
+		}
 	}
 }
 

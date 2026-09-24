@@ -750,7 +750,9 @@ on success.
   persistence-path discovery (dir/dbfilename assumptions).
 - T40 — NEW deferral: a versioned whole-app disaster-recovery bundle
   (release records, secret stores + age identity, TLS references) is a
-  product decision; today's archives are data-only by design.
+  product decision; today's archives are data-only by design. RESOLVED
+  2026-09-23 (see the C07 DR-bundle slices at the bottom): the versioned
+  whole-app bundle landed as the `teploy dr` family.
 - T42 — A30: errno-aware confirmed-missing reads (test -e folds EACCES
   into absence); needs the structured executor result.
 - T43 — A30: local/remote executor output semantics (stdout/stderr split,
@@ -2283,3 +2285,102 @@ it), multi-host partial-wave readiness states (canary aggregate gating),
 WebSocket/SSE drain verification beyond the long-request proof, and the
 registered interactions (tcp mode × the Caddy LB active check; preview's
 gate has no drain surface).
+
+## Programme slice (2026-09-23) — C07: recoverable applications (DR bundles)
+
+Four commits on branch c07-recovery (base `194130c`-era main): the
+schema-versioned whole-app DR bundle, the isolated restore + explicit
+cutover, the `teploy dr` command family, and a live-fixture hardening
+pass. Closes the T40 product decision (above): `teploy backup` stays the
+DATA-ONLY family; `teploy dr` is the whole-application bundle.
+
+- **Bundle (slice 1, `0867359`)** — manifest carries app state (verbatim
+  state.json), release records, the applied app manifest, secret
+  REFERENCES by default (encrypted material only on explicit
+  --include-secrets, the age key only on --include-age-key),
+  routing/TLS references, and per-snapshot consistency records.
+  Engine-aware planning is built on the EXISTING backup internals
+  (planAccessoryDump extracted from AccessoryBackup's inline switch,
+  shared restore-command builders, promoteStaged factored out of
+  extractToStagingThenPromote). Consistency honesty: engine dumps
+  record engine-consistent, redis engine-snapshot (BGSAVE-acked),
+  generic tars crash-consistent with an explicit note; /data engine
+  detection matches EXACTLY only (substring matching misclassified
+  /app/data as redis — caught by test). Stores: S3 (manifest uploaded
+  LAST as the completeness marker) or a plain server directory
+  (offline bundles).
+- **Restore + cutover (slice 2, `a3feb8a`)** — RestoreBundleIsolated
+  lands in /var/tmp/teploy-dr staging (pattern-guarded wipe), ordering
+  pinned by tests: read-only preflight (references-mode missing keys
+  abort BEFORE any staging/download/docker), gzip -t integrity on every
+  member, decrypt proof for encrypted bundles, scratch-engine
+  validation (throwaway postgres/mysql/mongo/redis containers + the
+  recorded app image), then the receipt with MEASURED RPO (restore
+  start minus bundle creation) and RTO (restore+validation wall time).
+  CutoverBundle is the only mutating step: requires a validated staged
+  receipt (ErrValidationRequired), re-runs the secrets preflight,
+  cross-checks bundle accessories/volumes against the restore-time
+  teploy.yml, and under the app fence stops live containers, preserves
+  pre-existing engine data as named recovery copies, restores dumps
+  into fresh accessories, promotes volumes through promoteStaged, and
+  installs state/records/secrets LAST.
+- **CLI (slice 3, `2fcd3ae`)** — `teploy dr create|list|show|restore|
+  cutover`; restore prints the receipt (JSON with --json) and exits
+  non-zero when validation failed; cutover refuses without a validated
+  staged restore.
+- **Hardening (slice 4, this branch's tail)** — driven by the live
+  fixture, not speculation: AppRun derivation (the app check boots the
+  deployed image WITH the newest release record's command — without
+  argv most images exit instantly and prove nothing); per-volume
+  move-aside at cutover (env/credential files stay for the fresh
+  accessory) with a root-container fallback for engine-chowned data
+  dirs a non-root deploy user cannot rename (the reconcileDataOwnership
+  pattern), and an existence guard so a configured volume key with
+  nothing on disk never aborts the cutover; DirBundleStore creates
+  member SUBDIRECTORIES before copy; the volumes workspace dir exists
+  before tar writes into it.
+
+**Live evidence** — `internal/backup/dr_integration_test.go`
+(`//go:build integration`, the C01/C03 fixture contract:
+TEPLOY_FAULT_HOST/USER/KEY, skips cleanly when unset): against colima
+(docker 29.5.2, real postgres:16-alpine, real gzip/tar, zero mocks) —
+full round trip (create from a live app with real rows, isolated
+restore validates data+app checks with measured RPO/RTO, /deployments
+proven BYTE-IDENTICAL after the restore, cutover lands the 3 rows in
+the recreated engine, replaces the drifted volume while preserving the
+pre-cutover copy in a recovery dir, reinstalls state.json), corrupt
+bundle refused before any engine boots, injected mid-promotion copy
+failure rolls the live volume back to exactly its originals with no
+leftover recovery dirs, missing references-mode key aborts before
+staging with a clean tree. All four PASS (2026-09-24 run).
+
+**Acceptance pins** — fresh-host restore checks + RPO/RTO receipt:
+TestRestoreBundleIsolated_ReceiptRPORTO (mock, injected clocks) +
+TestDRIntegration_BundleRoundTrip (live). Injected copy failure
+preserves originals: TestCutover_InjectedCopyFailurePreservesOriginals
++ TestDRIntegration_CutoverCopyFailurePreservesOriginals. Injected
+accessory start failure aborts before promotion/state install and
+restarts stopped containers:
+TestCutover_InjectedStartFailurePreservesOriginals (mock-level only —
+the live battery does not inject a start failure). Missing keys fail
+before mutation: TestRestoreBundleIsolated_MissingSecretKeysFailBeforeMutation
++ TestCutover_MissingSecretKeysRefusedBeforeMutation +
+TestDRIntegration_MissingKeysFailBeforeMutation.
+
+**C07 remainder (explicit):** scheduled DR bundle creation + bundle
+retention/pruning policy (bundles accumulate in the store today); the
+app check validates the image boots on the staged volumes with the
+recorded command, not the full app env/secret surface or health gate
+(cutover's NextStep is an explicit `teploy deploy`); per-engine
+transactional consistency at cutover stays the A42/T35 register item,
+the host-tar extractor the A43/T36 item, and restore-time writer
+quiescence the A38/T34 item (the ISOLATED restore is read-only against
+the source; cutover itself runs stopped-under-lock); multi-server
+(fleet) apps are out of scope (single-target state model, like the
+rest of the DR surface); Dash surfacing of the receipts.
+
+Gates: `go build ./...` clean; `go vet ./...` clean;
+`go vet -tags integration ./internal/backup` clean;
+`go test ./... -count=1` all 26 packages ok; gofmt clean on touched
+files (pre-existing strays elsewhere left alone); integration battery
+4/4 PASS against the live fixture.

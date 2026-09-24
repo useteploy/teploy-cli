@@ -311,6 +311,27 @@ func TestParseBundleManifest_RefusesForeignSchemaAndKind(t *testing.T) {
 	}
 }
 
+// TestDeriveAppRun_PicksNewestRecord: the app-run spec comes from state's
+// image plus the NEWEST release record's command (state.json alone cannot
+// boot an image that exits without argv).
+func TestDeriveAppRun_PicksNewestRecord(t *testing.T) {
+	records := []json.RawMessage{
+		json.RawMessage(`{"created_at":"2026-09-19T10:00:00Z","cmd":"old-cmd","image_ref":"nginx:old"}`),
+		json.RawMessage(`{"created_at":"2026-09-21T10:00:00Z","cmd":"sleep 600","image_ref":"alpine:3"}`),
+	}
+	spec := deriveAppRun([]byte(drTestState), records)
+	if spec.Image != "nginx:1.27" {
+		t.Errorf("state image must win: %+v", spec)
+	}
+	if spec.Cmd != "sleep 600" {
+		t.Errorf("newest record cmd must win: %+v", spec)
+	}
+	empty := deriveAppRun([]byte(drTestState), nil)
+	if empty.Image != "nginx:1.27" || empty.Cmd != "" {
+		t.Errorf("no records: %+v", empty)
+	}
+}
+
 // TestDirStore_ListIDs requires manifests: a prefix without a manifest
 // (partial upload) never lists as a bundle — the find in ListIDs prints
 // only directories that CONTAIN manifest.json.

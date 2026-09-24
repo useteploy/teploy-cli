@@ -23,9 +23,9 @@ func TestParseBackupEntries(t *testing.T) {
 	ls := strings.Join([]string{
 		"2024-01-01 00:00:00        100 20240101-000000.tar.gz",
 		"2024-01-02 03:04:05        100 myapp-backup-20240102-030405.tar.gz", // scheduled-shell naming
-		"2024-01-03 00:00:00        100 20240103-000000.sql.gz",             // accessory naming
-		"                           PRE nested/",                            // directory prefix — skipped
-		"garbage line no timestamp",                                         // skipped
+		"2024-01-03 00:00:00        100 20240103-000000.sql.gz",              // accessory naming
+		"                           PRE nested/",                             // directory prefix — skipped
+		"garbage line no timestamp",                                          // skipped
 	}, "\n")
 
 	entries := parseBackupEntries(ls)

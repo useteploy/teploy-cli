@@ -63,6 +63,11 @@ type BundleManifest struct {
 	State          json.RawMessage   `json:"state,omitempty"`
 	ReleaseRecords []json.RawMessage `json:"release_records,omitempty"`
 	AppManifest    json.RawMessage   `json:"app_manifest,omitempty"`
+	// AppRun is what an isolated restore boots for the application check:
+	// the deployed image plus the recorded container command (from the
+	// newest release record). Without the command many images exit
+	// instantly and prove nothing.
+	AppRun AppRunSpec `json:"app_run"`
 
 	Secrets   SecretsRecord    `json:"secrets"`
 	Routing   RoutingRecord    `json:"routing"`
@@ -108,6 +113,51 @@ type TLSRecord struct {
 	Mode string `json:"mode"` // acme | internal | custom-cert
 	Cert string `json:"cert,omitempty"`
 	Key  string `json:"key,omitempty"`
+}
+
+// AppRunSpec is the minimum needed to BOOT the app image for validation.
+type AppRunSpec struct {
+	Image string `json:"image,omitempty"`
+	Cmd   string `json:"cmd,omitempty"`
+}
+
+// deriveAppRun reads the deployed image from state and the container
+// command from the NEWEST release record (records carry created_at + cmd;
+// state.json does not). Missing records leave Cmd empty — the app check
+// then boots the bare image and reports skip/fail honestly.
+func deriveAppRun(stateBytes []byte, records []json.RawMessage) AppRunSpec {
+	var s struct {
+		ImageRef string `json:"image_ref"`
+	}
+	_ = json.Unmarshal(stateBytes, &s)
+	spec := AppRunSpec{Image: s.ImageRef}
+
+	var best struct {
+		CreatedAt time.Time `json:"created_at"`
+		Cmd       string    `json:"cmd"`
+		ImageRef  string    `json:"image_ref"`
+	}
+	best.CreatedAt = time.Time{}
+	for _, rec := range records {
+		var r struct {
+			CreatedAt time.Time `json:"created_at"`
+			Cmd       string    `json:"cmd"`
+			ImageRef  string    `json:"image_ref"`
+		}
+		if err := json.Unmarshal(rec, &r); err != nil {
+			continue
+		}
+		if r.CreatedAt.After(best.CreatedAt) {
+			best = r
+		}
+	}
+	if best.Cmd != "" {
+		spec.Cmd = best.Cmd
+	}
+	if spec.Image == "" {
+		spec.Image = best.ImageRef
+	}
+	return spec
 }
 
 // SnapshotRecord describes ONE data artifact in the bundle and — honestly —
@@ -239,7 +289,7 @@ func (d DirBundleStore) dir(app, id string) string {
 
 func (d DirBundleStore) Upload(ctx context.Context, exec ssh.Executor, app, id, member, serverPath string) error {
 	dst := d.dir(app, id) + "/" + member
-	if _, err := exec.Run(ctx, "mkdir -p "+ssh.ShellQuote(d.dir(app, id))); err != nil {
+	if _, err := exec.Run(ctx, "mkdir -p "+ssh.ShellQuote(d.dir(app, id)+"/"+dirOf(member))); err != nil {
 		return fmt.Errorf("preparing bundle dir: %w", err)
 	}
 	if _, err := exec.Run(ctx, fmt.Sprintf("cp -p %s %s", ssh.ShellQuote(serverPath), ssh.ShellQuote(dst))); err != nil {
@@ -449,6 +499,7 @@ func (c *Client) CreateBundle(ctx context.Context, opts BundleOptions, store Bun
 		cleanup()
 		return nil, err
 	}
+	m.AppRun = deriveAppRun(stateBytes, m.ReleaseRecords)
 
 	// Optional quiescence: stop the app's web containers so volume copies
 	// are quiesced rather than crash-consistent.
@@ -531,7 +582,14 @@ func (c *Client) CreateBundle(ctx context.Context, opts BundleOptions, store Bun
 		}
 	}
 
-	// App volume snapshots.
+	// App volume snapshots. The member directory must exist before tar
+	// writes into it (found live: the mock cannot catch missing paths).
+	if len(opts.Config.Volumes) > 0 {
+		if _, err := c.exec.Run(ctx, "mkdir -p "+ssh.ShellQuote(ws+"/volumes")); err != nil {
+			cleanup()
+			return nil, fmt.Errorf("preparing volumes in bundle workspace: %w", err)
+		}
+	}
 	for _, volName := range volumeNames(opts.Config) {
 		volDir := fmt.Sprintf("%s/%s/volumes/%s", deploymentsDir, opts.App, volName)
 		member := "volumes/" + volName + ".tar.gz"

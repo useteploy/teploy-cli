@@ -460,7 +460,16 @@ func (c *Client) appCheck(ctx context.Context, manifest *BundleManifest, opts Bu
 	check := DRCheckResult{Name: "app", Kind: "app"}
 
 	var appState state.AppState
-	if err := json.Unmarshal(manifest.State, &appState); err != nil || appState.ImageRef == "" {
+	if err := json.Unmarshal(manifest.State, &appState); err != nil {
+		check.Status = "skipped"
+		check.Detail = "bundle state unparseable — application check skipped (data checks still ran)"
+		return check
+	}
+	image := manifest.AppRun.Image
+	if image == "" {
+		image = appState.ImageRef
+	}
+	if image == "" {
 		check.Status = "skipped"
 		check.Detail = "bundle carries no deployed image reference — application check skipped (data checks still ran)"
 		return check
@@ -477,7 +486,14 @@ func (c *Client) appCheck(ctx context.Context, manifest *BundleManifest, opts Bu
 	for _, vol := range sortedVolumeMounts(opts.Config) {
 		args = append(args, "-v", ssh.ShellQuote(staging+"/volumes/"+vol.name+":"+vol.dest))
 	}
-	args = append(args, ssh.ShellQuote(appState.ImageRef))
+	args = append(args, ssh.ShellQuote(image))
+	// The recorded container command, element-wise quoted (a command with
+	// quoted spaces cannot be represented — recorded verbatim by deploy as
+	// a single string; splitting on fields matches how teploy.yml's legacy
+	// command: is documented).
+	for _, w := range strings.Fields(manifest.AppRun.Cmd) {
+		args = append(args, ssh.ShellQuote(w))
+	}
 
 	if _, err := c.exec.Run(ctx, strings.Join(args, " ")); err != nil {
 		// An unavailable image is a SKIP with the reason, not a silent
@@ -641,17 +657,48 @@ func (c *Client) CutoverBundle(ctx context.Context, opts BundleRestoreOptions) (
 			return fail(fmt.Errorf("inspecting accessory dir %s: %w", accDir, err))
 		}
 		if strings.TrimSpace(nonEmpty) == "nonempty" {
-			recOut, err := c.exec.Run(ctx, "mktemp -d "+ssh.ShellQuote(accDir+".pre-cutover.XXXXXX"))
-			if err != nil {
-				return fail(fmt.Errorf("creating pre-cutover copy dir for %s: %w", accDir, err))
+			// Only keys with data ON DISK are preserved — a configured key
+			// that never materialized (volume added to teploy.yml after
+			// the bundle, a re-run after a partial failure) has nothing
+			// to move, and an accDir holding only env/credential files
+			// must not abort the cutover.
+			var toMove []string
+			for _, volKey := range sortedVolumeKeys(accCfg) {
+				existsOut, err := c.exec.Run(ctx, fmt.Sprintf("if [ -e %s ]; then printf 'present\\n'; else printf 'absent\\n'; fi",
+					ssh.ShellQuote(accDir+"/"+volKey)))
+				if err != nil {
+					return fail(fmt.Errorf("inspecting %s volume dir %s: %w", snap.Name, volKey, err))
+				}
+				if strings.TrimSpace(existsOut) == "present" {
+					toMove = append(toMove, volKey)
+				}
 			}
-			recDir := strings.TrimSpace(recOut)
-			if _, err := c.exec.Run(ctx, fmt.Sprintf("find %s -mindepth 1 -maxdepth 1 -exec mv -t %s -- {} +",
-				ssh.ShellQuote(accDir), ssh.ShellQuote(recDir))); err != nil {
-				return fail(fmt.Errorf("moving aside pre-cutover data for %s: %w", snap.Name, err))
+			if len(toMove) > 0 {
+				recOut, err := c.exec.Run(ctx, "mktemp -d "+ssh.ShellQuote(accDir+".pre-cutover.XXXXXX"))
+				if err != nil {
+					return fail(fmt.Errorf("creating pre-cutover copy dir for %s: %w", accDir, err))
+				}
+				recDir := strings.TrimSpace(recOut)
+				// Move each VOLUME directory (the engine's data) aside; env
+				// files and credentials in accDir stay for the fresh accessory.
+				accParent := fmt.Sprintf("%s/%s/accessories", deploymentsDir, opts.App)
+				for _, volKey := range toMove {
+					move := fmt.Sprintf("mv -f %s %s", ssh.ShellQuote(accDir+"/"+volKey), ssh.ShellQuote(recDir+"/"+volKey))
+					if _, err := c.exec.Run(ctx, move); err != nil {
+						// Engine images chown their data dir to their own uid
+						// with mode 700 (postgres = uid 70), and a non-root
+						// deploy user may not be able to rename it. Same
+						// reality reconcileDataOwnership solves: retry
+						// through a throwaway root container (the accessory
+						// image itself provides the shell).
+						if mvErr := c.rootMoveAside(ctx, accCfg.Image, accParent, snap.Name, pathBase(recDir), volKey); mvErr != nil {
+							return fail(fmt.Errorf("moving aside pre-cutover data for %s volume %s (plain mv: %v; root move: %v)", snap.Name, volKey, err, mvErr))
+						}
+					}
+				}
+				out.RecoveryDirs = append(out.RecoveryDirs, recDir)
+				fmt.Fprintf(c.out, "Pre-cutover data for %s preserved at %s\n", snap.Name, recDir)
 			}
-			out.RecoveryDirs = append(out.RecoveryDirs, recDir)
-			fmt.Fprintf(c.out, "Pre-cutover data for %s preserved at %s\n", snap.Name, recDir)
 		}
 
 		// Start the accessory from config (fresh dirs), then pipe the dump.
@@ -738,6 +785,40 @@ func (c *Client) CutoverBundle(ctx context.Context, opts BundleRestoreOptions) (
 	fmt.Fprintf(c.out, "Cutover complete. Pre-cutover originals kept in %v\n", out.RecoveryDirs)
 	fmt.Fprintf(c.out, "Next: %s\n", out.NextStep)
 	return out, nil
+}
+
+// rootMoveAside renames mountDir/srcDir/srcName to mountDir/dstDir/srcName
+// through a throwaway root container of the accessory's own image — the
+// reconcileDataOwnership pattern for engine data dirs a non-root deploy
+// user cannot move (directory renames need write on the directory itself,
+// and engines chown their data to their own uid).
+func (c *Client) rootMoveAside(ctx context.Context, image, mountDir, srcDir, dstDir, name string) error {
+	if !safeName.MatchString(srcDir) || !safeName.MatchString(dstDir) || !safeName.MatchString(name) {
+		return fmt.Errorf("refusing root-container move of unsafe path segment (%q, %q, %q)", srcDir, dstDir, name)
+	}
+	inner := fmt.Sprintf("mv /w/%s/%s /w/%s/%s", srcDir, name, dstDir, name)
+	cmd := fmt.Sprintf("docker run --rm --user 0 -v %s:/w --entrypoint sh %s -c %s",
+		ssh.ShellQuote(mountDir), ssh.ShellQuote(image), ssh.ShellQuote(inner))
+	if _, err := c.exec.Run(ctx, cmd); err != nil {
+		return err
+	}
+	return nil
+}
+
+func sortedVolumeKeys(cfg config.AccessoryConfig) []string {
+	keys := make([]string, 0, len(cfg.Volumes))
+	for k := range cfg.Volumes {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func pathBase(p string) string {
+	if i := strings.LastIndexByte(p, '/'); i >= 0 {
+		return p[i+1:]
+	}
+	return p
 }
 
 // engineEnv merges the manifest's non-secret engine params with the running
