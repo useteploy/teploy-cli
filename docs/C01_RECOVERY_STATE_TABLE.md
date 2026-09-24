@@ -242,15 +242,48 @@ table's, with the register item it belongs to.
    INSPECT with an adopt-as-predecessor continuation; automating it
    requires generation-scoped identities (register F04/A09). The current
    code's MANUAL is the safe subset — recorded as a disagreement, not a
-   defect.
+   defect. **The generation-identity sub-slice LANDED 2026-09-24**
+   (F04/A09's contained core, see AUDIT_OPEN's C01 generation-identity
+   slice): every teploy container now carries an immutable
+   `teploy.generation` label (RunConfig.Generation; preserved across
+   Recreate), the state commit publishes a `.generation` sidecar
+   (`/deployments/<app>/.generation`, the targetguard contract) under the
+   same guarded command as state.json, and rollback — the operation the
+   finding is about — resolves an explicit `fromGeneration` identity and
+   fences every destructive effect on it: retirement stops and fixed-port
+   displacements stop by exact container ID under a composed
+   holdership+label check (`docker.StopGenerationFenced`), target
+   restarts guard their force-remove the same way
+   (`docker.RestartFenced`), and the state commit CASes on the sidecar
+   (`state.WriteFencedGeneration` refuses ErrGenerationFenced naming both
+   generations when a successor committed in between). A stale rollback
+   can no longer stop, remove, or overwrite a newer generation's
+   workloads — proven against the live fixture with a genuinely DELAYED
+   stop command (nohup) refused at execution time by the live label. The
+   INSPECT→adopt continuation for a running `_replaced` stays MANUAL
+   (A08) — the identity surface it needs now exists; the automation
+   remains the F04-keyed recovery-owner decision.
 
 9. **C01-9 — Candidate identities are version-keyed, not
-   attempt/generation-keyed.** `{app}-{process}-{version}[-{index}]`
-   (`internal/docker/docker.go:82-117`) means two attempts of the same
-   release hash share candidate names; evidence attribution between them
-   relies on the `_replaced` convention alone. The table's "exact
-   container IDs" evidence requirement points at attempt-scoped names —
-   F08's attempt ids are the existing keying surface (register F04/A09).
+    attempt/generation-keyed.** `{app}-{process}-{version}[-{index}]`
+    (`internal/docker/docker.go:82-117`) means two attempts of the same
+    release hash share candidate names; evidence attribution between them
+    relies on the `_replaced` convention alone. The table's "exact
+    container IDs" evidence requirement points at attempt-scoped names —
+    F08's attempt ids are the existing keying surface (register F04/A09).
+    **The generation-keyed sub-slice LANDED 2026-09-24**: candidates are
+    labeled `teploy.generation=<G>` (deploy stamps the generation it
+    creates; rollback's recreates preserve the label), every destructive
+    effect addresses containers by the exact ID from the operation's own
+    under-lock inventory, and the ID-bearing command reads the label AT
+    EXECUTION — the immutable identity that survives name reuse, which is
+    what closes the delayed-SSH-effect window holdership guards cannot.
+    Managed Caddy blocks carry the same identity inside the markers
+    (`# TEPLOY GENERATION <n>`), so both evidence surfaces (containers,
+    routes) are generation-attributable. Attempt-scoped NAMES remain
+    F04/A09 (the `_replaced` convention still bridges same-hash attempts;
+    renaming containers is the breaking change this slice deliberately
+    does not make).
 
 10. **C01-10 — The predecessor snapshot is in-memory only.**
     `deploy.go:464-473` snapshots predecessors before candidates start,
@@ -305,8 +338,12 @@ Two lock layers, never nested across hosts:
    guard, and release removes the lock only when its info still names
    the releaser. Acquisition order on the commit command is therefore
    APP GUARD THEN CADDY GUARD — app lock first (long-held), shared
-   commit lock second (brief); never the inverse, and a holder that
-   loses either fence has its commit refused in-shell.
+    commit lock second (brief); never the inverse, and a holder that
+    loses either fence has its commit refused in-shell. Since the
+    2026-09-24 generation-identity slice, the exact-block route CAS
+    (and, on the state commit, the `.generation` sidecar CAS) chains
+    AFTER both guards in the same command — identity fences last, so
+    they are evaluated against the world the guards just proved current.
 
 **Never hold one host's app lock while waiting on another host's.** The
 current code complies: locks are acquired inside each host's
@@ -378,9 +415,17 @@ landed 2026-09-23** (replacement-owner reconciliation on acquisition;
 the guarded Caddyfile commit; see AUDIT_OPEN) and **C01-3 landed
 2026-09-23** (owner-tagged fenced shared Caddy lock + the
 conflicting-route-evidence producer/consumer; see AUDIT_OPEN). The
-locking-protocol redesign (C01-1/2/3) is closed. Remaining findings:
-C01-8 (same-version `_replaced` MANUAL —
-deliberate A08 containment until F04 generation identities exist), and
-C01-9 (attempt-scoped candidate identities — F04/A09). The A12/T05
-remainder of C01-7 (rollback's restoreRollbackRoute + the exact-block
-compare-and-swap restore) stays with its register item.
+locking-protocol redesign (C01-1/2/3) is closed. **The generation-identity
+sub-slices of C01-8/C01-9 landed 2026-09-24** (teploy.generation labels +
+the `.generation` sidecar + rollback's explicit fromGeneration fencing +
+exact-block route CAS; see AUDIT_OPEN's C01 generation-identity slice) —
+closing the A12/T05 remainder of C01-7 with it: rollback's
+`restoreRollbackRoute` now renders from the F14 record (deploy's
+`restoreRouteFromReceipt` shape) with reconstruct-from-inspection only as
+the announced legacy fallback, and every route switch/restore runs under
+the exact-block compare-and-swap (`caddy.Client.WithRouteCAS`), whose
+refusal names both generations. What remains under the register:
+C01-8's INSPECT→adopt continuation for a running `_replaced` (deliberate
+A08 containment until the F04-keyed recovery-owner decision), C01-9's
+attempt-scoped container NAMES (F04/A09 — the breaking rename), and F04's
+RouteSwitch handoff boundary (T22/A16).
