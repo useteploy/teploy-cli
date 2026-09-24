@@ -1,0 +1,45 @@
+{
+  "machine_interface": 2,
+  "server": "staging",
+  "host": "192.0.2.20",
+  "uptime": {
+    "seconds": 86400
+  },
+  "load": {
+    "one": 0,
+    "five": 0.01,
+    "fifteen": 0.05
+  },
+  "memory": {
+    "total_bytes": 512000,
+    "used_bytes": 256000,
+    "available_bytes": 256000
+  },
+  "disks": [
+    {
+      "filesystem": "/dev/vda1",
+      "mountpoint": "/",
+      "total_bytes": 500,
+      "used_bytes": 100,
+      "available_bytes": 400,
+      "used_percent": "20%"
+    }
+  ],
+  "docker": {
+    "installed": true,
+    "version": "29.0.0",
+    "containers": [],
+    "images": []
+  },
+  "caddy": {
+    "available": false,
+    "routes": []
+  },
+  "observed_at": "2026-09-23T12:00:00Z",
+  "errors": [
+    {
+      "scope": "caddy.routes",
+      "message": "Error response from daemon: No such container: caddy"
+    }
+  ]
+}

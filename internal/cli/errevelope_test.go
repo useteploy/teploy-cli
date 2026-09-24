@@ -2,8 +2,10 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -147,6 +149,63 @@ func TestMachineErrorEnvelopeUnclassifiedIsInternal(t *testing.T) {
 	}
 	if decoded["message"] != "command failed" {
 		t.Fatalf("unclassified message = %v", decoded["message"])
+	}
+}
+
+// TestMachineErrorEnvelopeInterruptedIsUncertain: an interrupted command
+// (context canceled — the SIGINT path — or a deadline exceeded) is NOT a
+// plain failure: its outcome is unknown until reconciled (C09's
+// uncertain/canceled distinction for automation). Wrapped and chained
+// errors must classify the same way.
+func TestMachineErrorEnvelopeInterruptedIsUncertain(t *testing.T) {
+	for name, err := range map[string]error{
+		"canceled":       context.Canceled,
+		"deadline":       context.DeadlineExceeded,
+		"wrapped":        fmt.Errorf("deploying myapp: %w", context.Canceled),
+		"double-wrapped": fmt.Errorf("running docker run: %w", fmt.Errorf("build: %w", context.DeadlineExceeded)),
+	} {
+		var out bytes.Buffer
+		if writeErr := writeMachineErrorEnvelope(&out, err); writeErr != nil {
+			t.Fatal(writeErr)
+		}
+		var decoded map[string]any
+		if jsonErr := json.Unmarshal(out.Bytes(), &decoded); jsonErr != nil {
+			t.Fatalf("%s: envelope not JSON: %q", name, out.String())
+		}
+		if decoded["code"] != "uncertain-outcome" {
+			t.Fatalf("%s: code = %v, want uncertain-outcome", name, decoded["code"])
+		}
+		if decoded["message"] != "interrupted — outcome unknown until reconciled" {
+			t.Fatalf("%s: message = %v", name, decoded["message"])
+		}
+	}
+}
+
+// TestDeployInterruptedErrorNamesRecovery: the human-path error for an
+// interrupted deploy names the recovery action instead of a bare
+// "context canceled" (which reads as a clean failure), while a plain
+// deploy failure passes through unchanged.
+func TestDeployInterruptedErrorNamesRecovery(t *testing.T) {
+	interrupted := wrapDeployOutcomeError(fmt.Errorf("deploying myapp: %w", context.Canceled))
+	msg := interrupted.Error()
+	if !strings.Contains(msg, "deploy interrupted") || !strings.Contains(msg, "reconcil") || !strings.Contains(msg, "teploy status") {
+		t.Fatalf("interrupted deploy error must name the recovery action: %q", msg)
+	}
+	var out bytes.Buffer
+	if err := writeMachineErrorEnvelope(&out, interrupted); err != nil {
+		t.Fatal(err)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(out.Bytes(), &decoded); err != nil {
+		t.Fatalf("envelope not JSON: %q", out.String())
+	}
+	if decoded["code"] != "uncertain-outcome" {
+		t.Fatalf("interrupted deploy code = %v, want uncertain-outcome", decoded["code"])
+	}
+
+	plain := errors.New("image pull failed")
+	if got := wrapDeployOutcomeError(plain); got != plain {
+		t.Fatalf("plain failure must pass through unchanged: %v", got)
 	}
 }
 

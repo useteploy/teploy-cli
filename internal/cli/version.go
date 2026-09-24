@@ -21,6 +21,12 @@ func newVersionCmd(flags *Flags, version string) *cobra.Command {
 	return &cobra.Command{
 		Use:   "version",
 		Short: "Show teploy version",
+		Long: `Show teploy version.
+
+With --json, emits the machine-interface handshake instead: the version,
+the machine_interface number (fail closed if a consumer supports less),
+and the capability tokens this build advertises. One call replaces
+help-text scraping as the compatibility check.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return writeVersion(cmd.OutOrStdout(), version, flags.JSON)
 		},

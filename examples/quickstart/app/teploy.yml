@@ -1,0 +1,9 @@
+# The maintained quickstart fixture app (C09). Deployed by
+# examples/quickstart/run.sh against a local docker target; everything
+# teploy needs travels in this directory — no undocumented repair.
+app: quickstart
+server: colima-vm
+ingress: host
+port: 18080
+health:
+  mode: tcp

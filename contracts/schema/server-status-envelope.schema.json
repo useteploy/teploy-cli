@@ -1,79 +1,64 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://teploy.github.io/contracts/schema/server-status-envelope.schema.json",
-  "title": "server status --json envelope (MI 1, appStatusDTO root)",
-  "allOf": [
-    {
-      "type": "object",
-      "required": [
-        "app",
-        "domain",
-        "type",
-        "ingress",
-        "current_release",
-        "previous_release",
-        "containers",
-        "processes",
-        "lock",
-        "maintenance",
-        "observed_at",
-        "errors",
-        "machine_interface"
-      ],
-      "properties": {
-        "app": {
-          "type": "string"
-        },
-        "domain": {
-          "type": "string"
-        },
-        "type": {
-          "type": "string"
-        },
-        "ingress": {
-          "type": "string"
-        },
-        "current_release": {
-          "$ref": "#/$defs/release"
-        },
-        "previous_release": {
-          "$ref": "#/$defs/release"
-        },
-        "containers": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/container"
-          }
-        },
-        "processes": {
-          "type": "array"
-        },
-        "lock": {
-          "type": [
-            "object",
-            "null"
-          ]
-        },
-        "maintenance": {
-          "type": "boolean"
-        },
-        "observed_at": {
-          "type": "string",
-          "format": "date-time"
-        },
-        "errors": {
-          "type": "array",
-          "items": {
-            "$ref": "#/$defs/machineError"
-          }
-        },
-        "machine_interface": {
-          "type": "integer",
-          "minimum": 1
-        }
+  "title": "server status --json envelope (serverStatusDTO root)",
+  "type": "object",
+  "required": [
+    "machine_interface",
+    "server",
+    "host",
+    "uptime",
+    "load",
+    "memory",
+    "disks",
+    "docker",
+    "caddy",
+    "observed_at",
+    "errors"
+  ],
+  "properties": {
+    "machine_interface": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "server": {
+      "type": "string"
+    },
+    "host": {
+      "type": "string"
+    },
+    "uptime": {
+      "$ref": "#/$defs/uptime"
+    },
+    "load": {
+      "$ref": "#/$defs/load"
+    },
+    "memory": {
+      "$ref": "#/$defs/memory"
+    },
+    "disks": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/disk"
+      }
+    },
+    "docker": {
+      "$ref": "#/$defs/dockerInventory"
+    },
+    "caddy": {
+      "$ref": "#/$defs/caddyObservation"
+    },
+    "observed_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "errors": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/machineError"
       }
     }
-  ],
+  },
   "$defs": {
     "machineError": {
       "type": "object",
@@ -90,6 +75,96 @@
         }
       }
     },
+    "uptime": {
+      "type": "object",
+      "required": [
+        "seconds"
+      ],
+      "properties": {
+        "seconds": {
+          "type": "number",
+          "minimum": 0
+        }
+      }
+    },
+    "load": {
+      "type": "object",
+      "required": [
+        "one",
+        "five",
+        "fifteen"
+      ],
+      "properties": {
+        "one": {
+          "type": "number",
+          "minimum": 0
+        },
+        "five": {
+          "type": "number",
+          "minimum": 0
+        },
+        "fifteen": {
+          "type": "number",
+          "minimum": 0
+        }
+      }
+    },
+    "memory": {
+      "type": "object",
+      "required": [
+        "total_bytes",
+        "used_bytes",
+        "available_bytes"
+      ],
+      "properties": {
+        "total_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "used_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "available_bytes": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "disk": {
+      "type": "object",
+      "required": [
+        "filesystem",
+        "mountpoint",
+        "total_bytes",
+        "used_bytes",
+        "available_bytes",
+        "used_percent"
+      ],
+      "properties": {
+        "filesystem": {
+          "type": "string"
+        },
+        "mountpoint": {
+          "type": "string"
+        },
+        "total_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "used_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "available_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "used_percent": {
+          "type": "string"
+        }
+      }
+    },
     "container": {
       "type": "object",
       "required": [
@@ -97,7 +172,10 @@
         "name",
         "image",
         "state",
-        "status"
+        "status",
+        "created_at",
+        "process",
+        "version"
       ],
       "properties": {
         "id": {
@@ -126,58 +204,47 @@
         }
       }
     },
-    "release": {
+    "image": {
       "type": "object",
       "required": [
-        "version",
-        "ports"
+        "id",
+        "repository",
+        "tag",
+        "size",
+        "created_at"
       ],
       "properties": {
-        "version": {
+        "id": {
           "type": "string"
         },
-        "ports": {
-          "type": "array",
-          "items": {
-            "type": "integer"
-          }
+        "repository": {
+          "type": "string"
+        },
+        "tag": {
+          "type": "string"
+        },
+        "size": {
+          "type": "string"
+        },
+        "created_at": {
+          "type": "string"
         }
       }
     },
-    "appStatus": {
+    "dockerInventory": {
       "type": "object",
       "required": [
-        "app",
-        "domain",
-        "type",
-        "ingress",
-        "current_release",
-        "previous_release",
+        "installed",
+        "version",
         "containers",
-        "processes",
-        "lock",
-        "maintenance",
-        "observed_at",
-        "errors"
+        "images"
       ],
       "properties": {
-        "app": {
+        "installed": {
+          "type": "boolean"
+        },
+        "version": {
           "type": "string"
-        },
-        "domain": {
-          "type": "string"
-        },
-        "type": {
-          "type": "string"
-        },
-        "ingress": {
-          "type": "string"
-        },
-        "current_release": {
-          "$ref": "#/$defs/release"
-        },
-        "previous_release": {
-          "$ref": "#/$defs/release"
         },
         "containers": {
           "type": "array",
@@ -185,26 +252,68 @@
             "$ref": "#/$defs/container"
           }
         },
-        "processes": {
-          "type": "array"
-        },
-        "lock": {
-          "type": [
-            "object",
-            "null"
-          ]
-        },
-        "maintenance": {
-          "type": "boolean"
-        },
-        "observed_at": {
-          "type": "string",
-          "format": "date-time"
-        },
-        "errors": {
+        "images": {
           "type": "array",
           "items": {
-            "$ref": "#/$defs/machineError"
+            "$ref": "#/$defs/image"
+          }
+        }
+      }
+    },
+    "caddyRoute": {
+      "type": "object",
+      "required": [
+        "server",
+        "id",
+        "hosts",
+        "handlers",
+        "upstreams",
+        "status_code"
+      ],
+      "properties": {
+        "server": {
+          "type": "string"
+        },
+        "id": {
+          "type": "string"
+        },
+        "hosts": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "handlers": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "upstreams": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "status_code": {
+          "type": "string"
+        }
+      }
+    },
+    "caddyObservation": {
+      "type": "object",
+      "required": [
+        "available",
+        "routes"
+      ],
+      "properties": {
+        "available": {
+          "type": "boolean"
+        },
+        "routes": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/caddyRoute"
           }
         }
       }
