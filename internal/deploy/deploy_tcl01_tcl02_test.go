@@ -40,7 +40,7 @@ func TestDeploy_AcquiresLockExactlyOnce(t *testing.T) {
 		ssh.MockCommand{Match: "a=$(docker exec caddy md5sum", Output: "TEPLOY_CADDY_OK"},
 		ssh.MockCommand{Match: "UPLOAD:", Output: ""},
 		ssh.MockCommand{Match: "mv -f -- ", Output: ""},
-		ssh.MockCommand{Match: "if [ ! -e '/deployments/caddy/Caddyfile'", Err: fmt.Errorf("none")},
+		ssh.MockCommand{Match: "if [ ! -e '/deployments/caddy/Caddyfile'", Output: "present\n{\n\tadmin 0.0.0.0:2019\n}\n"},
 	)
 
 	var buf bytes.Buffer
@@ -103,7 +103,7 @@ func TestDeploy_SameVersionCleanupNeverTouchesReplacement(t *testing.T) {
 		ssh.MockCommand{Match: "a=$(docker exec caddy md5sum", Output: "TEPLOY_CADDY_OK"},
 		ssh.MockCommand{Match: "UPLOAD:", Output: ""},
 		ssh.MockCommand{Match: "mv -f -- ", Output: ""},
-		ssh.MockCommand{Match: "if [ ! -e '/deployments/caddy/Caddyfile'", Err: fmt.Errorf("none")},
+		ssh.MockCommand{Match: "if [ ! -e '/deployments/caddy/Caddyfile'", Output: "present\n{\n\tadmin 0.0.0.0:2019\n}\n"},
 	)
 
 	var buf bytes.Buffer

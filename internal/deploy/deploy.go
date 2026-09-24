@@ -356,6 +356,40 @@ func (d *Deployer) DeployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 		return fmt.Errorf("refusing to deploy with unreadable state for %s: %w", cfg.App, err)
 	}
 
+	// 1z. Resolve the generation identities this deploy prepares against
+	// (C01-8/9). Every successful operation bumps the state generation by
+	// one; the candidates this deploy starts are labeled with the NEXT
+	// generation, and its destructive effects (commit, route switch,
+	// retirement) fence on the CURRENT one — a stale operation whose
+	// commands land after a takeover can neither commit over nor stop a
+	// newer generation, no matter when its SSH effects arrive.
+	fromGeneration := uint64(0)
+	if current != nil {
+		fromGeneration = current.Generation
+	}
+	nextGeneration := fromGeneration + 1
+
+	// The exact-block route CAS expectation (A12/T05): resolve the app's
+	// managed region NOW, under the lock, before any effect — the commit
+	// of the route switch compares it and refuses if a newer writer
+	// swapped the block in between (evidence names both generations). A
+	// Caddyfile read failure is a deploy refusal exactly like the state
+	// read above: an unreadable route authority cannot be compared, and an
+	// uncomparable switch is not made.
+	resolvedRouteHash := ""
+	if cfg.usesCaddy() {
+		region, _, rerr := d.caddy.ReadManagedBlock(ctx, cfg.App)
+		if rerr != nil {
+			return fmt.Errorf("refusing to deploy %s with an unreadable route authority: %w", cfg.App, rerr)
+		}
+		resolvedRouteHash = caddy.ManagedRegionHash(region)
+	}
+	// switchedRouteHash is re-resolved after a SUCCESSFUL switch (below):
+	// the block this deploy wrote but has not yet committed — the restore
+	// path's CAS accepts exactly {resolved, switched} and refuses anything
+	// else (a successor's block).
+	switchedRouteHash := resolvedRouteHash
+
 	// 1b. Converge outstanding record repair debt (C01-6): a previous
 	// deploy whose releasemeta record write failed after the live commit
 	// left a repair-debt marker. Rebuild that record from the live
@@ -599,6 +633,12 @@ func (d *Deployer) DeployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 	// returned without either, orphaning the first replica and leaving a
 	// host-ingress app down (audit F05).
 	var started []string
+	// startedIDs carries the exact container IDs docker run returned,
+	// paired with `started`'s names — cleanup stops by ID under the
+	// generation label check (C01-9), so a takeover + same-hash redeploy
+	// cannot have this (possibly stale) holder's cleanup stop the
+	// successor's same-named containers.
+	var startedIDs []string
 	// candidateIDs collects the container IDs docker run returned for the
 	// web candidates — the exact identities the readiness receipt records
 	// (C01-4) and the strongest attribution evidence a recovery owner has.
@@ -614,12 +654,28 @@ func (d *Deployer) DeployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 		// (or one of its replicas) down — "at least one thing worked" must
 		// never read as "recovered".
 		var cleanupFailures []string
-		for _, n := range started {
-			if err := d.docker.Stop(recoveryCtx, n, 5); err != nil {
+		for i, n := range started {
+			// Stop by the EXACT identity this deploy created, fenced on
+			// the generation label (C01-9): a successor's same-hash
+			// containers carry a newer generation and are refused here —
+			// cleanup of our own effects must never destroy a newer
+			// generation's workload. Recovery is deliberately NOT
+			// holdership-fenced (A07); the generation check is identity,
+			// not holdership, and applies in recovery too.
+			ref := n
+			if i < len(startedIDs) && startedIDs[i] != "" {
+				ref = startedIDs[i]
+			}
+			expected := nextGeneration
+			if err := d.docker.StopGenerationFenced(recoveryCtx, ref, 5, expected, ""); err != nil {
+				if state.GenerationFenced(err) {
+					cleanupFailures = append(cleanupFailures, fmt.Sprintf("stop %s: refused — a newer generation owns the name", n))
+					continue
+				}
 				cleanupFailures = append(cleanupFailures, fmt.Sprintf("stop %s: %v", n, err))
 				continue
 			}
-			if err := d.docker.Remove(recoveryCtx, n); err != nil {
+			if err := d.docker.Remove(recoveryCtx, ref); err != nil {
 				cleanupFailures = append(cleanupFailures, fmt.Sprintf("remove %s: %v", n, err))
 			}
 		}
@@ -634,7 +690,16 @@ func (d *Deployer) DeployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 		}
 		restored := len(displaced) == 0
 		for _, old := range displaced {
-			if err := d.docker.Restart(recoveryCtx, old, nil); err != nil {
+			// The generation check guards the recreate's force-remove
+			// (C01-9): a successor may have re-created the name at a newer
+			// generation — restoring over it would destroy the new owner's
+			// workload, exactly what the check refuses.
+			if err := d.docker.RestartFenced(recoveryCtx, old, nil, fromGeneration, ""); err != nil {
+				if state.GenerationFenced(err) {
+					cleanupFailures = append(cleanupFailures, fmt.Sprintf("restore %s: refused — a newer generation owns the name", old))
+					fmt.Fprintf(d.out, "  WARNING: could not restore displaced container %s — a newer generation now owns the name\n", old)
+					continue
+				}
 				cleanupFailures = append(cleanupFailures, fmt.Sprintf("restore %s: %v", old, err))
 				fmt.Fprintf(d.out, "  WARNING: could not restore displaced container %s: %v\n", old, err)
 			} else {
@@ -675,6 +740,7 @@ func (d *Deployer) DeployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 			App:           cfg.App,
 			Process:       "web",
 			Version:       cfg.Version,
+			Generation:    nextGeneration,
 			Image:         runImage,
 			Port:          ports[i],
 			BindHost:      webBindHost,
@@ -708,6 +774,7 @@ func (d *Deployer) DeployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 			return restoreDisplacedAndStarted(fmt.Errorf("starting container %s: %w", name, err))
 		}
 		started = append(started, name)
+		startedIDs = append(startedIDs, containerID)
 		candidateIDs[i] = containerID
 		fmt.Fprintf(d.out, "  Container %s started\n", containerID[:min(12, len(containerID))])
 	}
@@ -807,10 +874,11 @@ func (d *Deployer) DeployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 		}
 		name := docker.ContainerName(cfg.App, process, cfg.Version)
 		fmt.Fprintf(d.out, "Starting %s...\n", name)
-		_, err := d.docker.RunGuarded(ctx, docker.RunConfig{
+		workerID, err := d.docker.RunGuarded(ctx, docker.RunConfig{
 			App:           cfg.App,
 			Process:       process,
 			Version:       cfg.Version,
+			Generation:    nextGeneration,
 			Image:         runImage,
 			Port:          0, // non-web processes don't get a port
 			EnvFiles:      cfg.EnvFiles,
@@ -829,6 +897,7 @@ func (d *Deployer) DeployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 			return fail(fmt.Errorf("starting %s: %w", name, err))
 		}
 		started = append(started, name)
+		startedIDs = append(startedIDs, workerID)
 		// A detached `docker run` proves nothing about the worker's
 		// viability — a bad command or an instantly-crashing process used
 		// to be recorded as a successful deploy while no jobs were consumed
@@ -855,7 +924,16 @@ func (d *Deployer) DeployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 		// fence guard in the same shell — a late write from a broken holder
 		// cannot hijack a newer operation's route. The pre-switch Check is
 		// superseded by the composed commit.
-		cad := d.caddy.WithCommitGuard(guardPrefix)
+		//
+		// C01-8/9 + A12/T05: the new block is STAMPED with the generation
+		// this deploy creates, and the commit runs under the exact-block
+		// compare-and-swap on the region resolved at step 1z — if a newer
+		// writer swapped the block in between, the edit is refused with
+		// both generations named (caddy.ErrRouteCAS) instead of landing
+		// over the successor's route.
+		cad := d.caddy.WithCommitGuard(guardPrefix).
+			WithGeneration(nextGeneration).
+			WithRouteCAS(cfg.App, []string{resolvedRouteHash}, fromGeneration)
 		tls := caddy.TLS{Cert: cfg.TLSCert, Key: cfg.TLSKey, Internal: cfg.TLSInternal}
 		if replicas > 1 {
 			upstreams := make([]caddy.Upstream, replicas)
@@ -868,6 +946,10 @@ func (d *Deployer) DeployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 				if state.FenceLost(err) {
 					return fail(fmt.Errorf("%w: refusing to switch %s's route", state.ErrFenceLost, cfg.App))
 				}
+				var routeCAS *caddy.ErrRouteCAS
+				if errors.As(err, &routeCAS) {
+					return fail(fmt.Errorf("%w", routeCAS))
+				}
 				return fail(fmt.Errorf("updating load balancer route: %w", err))
 			}
 			fmt.Fprintf(d.out, "  Traffic load-balanced across %d replicas\n", replicas)
@@ -876,9 +958,17 @@ func (d *Deployer) DeployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 				if state.FenceLost(err) {
 					return fail(fmt.Errorf("%w: refusing to switch %s's route", state.ErrFenceLost, cfg.App))
 				}
+				var routeCAS *caddy.ErrRouteCAS
+				if errors.As(err, &routeCAS) {
+					return fail(fmt.Errorf("%w", routeCAS))
+				}
 				return fail(fmt.Errorf("updating route: %w", err))
 			}
 			fmt.Fprintln(d.out, "  Traffic routed to new container")
+		}
+		// The switched-to region is this deploy's own uncommitted block.
+		if region, _, rerr := d.caddy.ReadManagedBlock(ctx, cfg.App); rerr == nil {
+			switchedRouteHash = caddy.ManagedRegionHash(region)
 		}
 	} else {
 		fmt.Fprintf(d.out, "Skipping Caddy route update (ingress: %s)\n", cfg.Ingress)
@@ -917,9 +1007,13 @@ func (d *Deployer) DeployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 	}
 	// The commit runs under the fence (F16): the atomic rename that makes
 	// this deploy authoritative is a guarded effect, so a broken holder
-	// commits nothing.
-	if err := state.WriteFenced(ctx, d.exec, cfg.App, newState, lk); err != nil {
-		return d.abortStateCommit(ctx, cfg, current, started, displacedHostWeb, assetAttempt, start, err)
+	// commits nothing. C01-8/9: the guard chains a compare-and-swap on the
+	// committed-generation sidecar — a deploy that resolved the world at
+	// generation G cannot commit over a successor's G+N even if its
+	// commands land inside the successor's window (WriteFencedGeneration
+	// refuses with ErrGenerationFenced naming both generations).
+	if err := state.WriteFencedGeneration(ctx, d.exec, cfg.App, newState, lk, fromGeneration); err != nil {
+		return d.abortStateCommit(ctx, cfg, current, started, startedIDs, displacedHostWeb, assetAttempt, restoreRouteCAS(resolvedRouteHash, switchedRouteHash), start, err)
 	}
 
 	// 13b. Record the release metadata (F14). The containers are live and
@@ -1018,7 +1112,7 @@ func (d *Deployer) DeployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 	// running part of the superseded generation.
 	var retireIncomplete []string
 	if predecessorsListed {
-		retireIncomplete = d.stopPredecessorSnapshot(ctx, predecessors, sameVersion, stopTimeout, lk)
+		retireIncomplete = d.stopPredecessorSnapshot(ctx, predecessors, sameVersion, stopTimeout, lk, fromGeneration, guardPrefix)
 	} else if current != nil && current.CurrentHash != "" {
 		// Fence (F16): post-commit cleanup never interleaves with a new
 		// holder.
@@ -1032,7 +1126,7 @@ func (d *Deployer) DeployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 		}
 		if fenceOK {
 			if inv, invErr := d.docker.ListContainers(ctx, cfg.App); invErr == nil {
-				retireIncomplete = append(retireIncomplete, d.stopPredecessorSnapshot(ctx, selectPredecessors(inv, current, sameVersion), sameVersion, stopTimeout, lk)...)
+				retireIncomplete = append(retireIncomplete, d.stopPredecessorSnapshot(ctx, selectPredecessors(inv, current, sameVersion), sameVersion, stopTimeout, lk, fromGeneration, guardPrefix)...)
 			} else {
 				fmt.Fprintf(d.out, "Warning: container inventory still unreadable (%v) — cleaning up by derived names; a removed worker process may escape retirement\n", invErr)
 				if err := stopOldWorkloadsByName(ctx, d.docker, d.out, cfg, current, processes, stopTimeout); err != nil {
@@ -1160,31 +1254,43 @@ func selectPredecessors(inv []docker.Container, current *state.AppState, sameVer
 // stopPredecessorSnapshot retires exactly the snapshotted predecessor set
 // and returns what escaped retirement (C01-5: the caller records it as a
 // degraded outcome — never clean success, never a failed deploy).
-// Fence checks precede each stop: the deploy is already committed, and a
-// fence loss mid-cleanup means another operation owns the app — refuse
-// further stops (loudly) rather than interleaving.
-func (d *Deployer) stopPredecessorSnapshot(ctx context.Context, predecessors []docker.Container, sameVersion bool, stopTimeout int, lk *state.Lock) []string {
+// C01-8/9: each stop is a composed guarded effect — holdership guard,
+// generation label check, and docker stop in ONE command, addressing the
+// container by its exact ID from this deploy's own under-lock snapshot. A
+// fence loss refuses further stops loudly; a generation refusal means the
+// name now belongs to a newer generation's container (a takeover with a
+// same-hash redeploy) and is skipped with the evidence, never executed —
+// the retirement of OUR predecessor may not stop the successor's workload.
+func (d *Deployer) stopPredecessorSnapshot(ctx context.Context, predecessors []docker.Container, sameVersion bool, stopTimeout int, lk *state.Lock, expectedGeneration uint64, guardPrefix string) []string {
 	var incomplete []string
 	for _, ct := range predecessors {
-		if lk != nil {
-			if err := lk.Check(ctx, d.exec); err != nil {
+		ref := ct.Name
+		if ct.ID != "" {
+			ref = ct.ID
+		}
+		if err := d.docker.StopGenerationFenced(ctx, ref, stopTimeout, expectedGeneration, guardPrefix); err != nil {
+			switch {
+			case state.GenerationFenced(err):
+				fmt.Fprintf(d.out, "Warning: retirement of %s refused — %v\n", ct.Name, err)
+				incomplete = append(incomplete, fmt.Sprintf("stop %s refused: a newer generation owns the container", ct.Name))
+				continue
+			case state.FenceLost(err):
 				fmt.Fprintf(d.out, "Warning: predecessor cleanup stopped — %v\n", err)
 				incomplete = append(incomplete, fmt.Sprintf("cleanup interrupted before %s (fence lost)", ct.Name))
-				break
+				return incomplete
+			default:
+				// Traffic is already committed to the new generation; a
+				// failed predecessor stop is degraded cleanup, not a failed
+				// deploy — but it must be reported, never silent (TCL-19):
+				// a leftover old worker keeps consuming jobs.
+				fmt.Fprintf(d.out, "Warning: could not stop old container %s: %v\n", ct.Name, err)
+				incomplete = append(incomplete, fmt.Sprintf("stop %s: %v", ct.Name, err))
+				continue
 			}
 		}
 		fmt.Fprintf(d.out, "Stopping old container %s...\n", ct.Name)
-		if err := d.docker.Stop(ctx, ct.Name, stopTimeout); err != nil {
-			// Traffic is already committed to the new generation; a
-			// failed predecessor stop is degraded cleanup, not a failed
-			// deploy — but it must be reported, never silent (TCL-19):
-			// a leftover old worker keeps consuming jobs.
-			fmt.Fprintf(d.out, "Warning: could not stop old container %s: %v\n", ct.Name, err)
-			incomplete = append(incomplete, fmt.Sprintf("stop %s: %v", ct.Name, err))
-			continue
-		}
 		if sameVersion {
-			if err := d.docker.Remove(ctx, ct.Name); err != nil {
+			if err := d.docker.Remove(ctx, ref); err != nil {
 				fmt.Fprintf(d.out, "Warning: could not remove old container %s: %v\n", ct.Name, err)
 				incomplete = append(incomplete, fmt.Sprintf("remove %s: %v", ct.Name, err))
 			}
@@ -1237,7 +1343,21 @@ func stopOldWorkloadsByName(ctx context.Context, dk *docker.Client, out io.Write
 	return errors.Join(failures...)
 }
 
-func (d *Deployer) abortStateCommit(ctx context.Context, cfg Config, current *state.AppState, started, displacedHostWeb []string, att releasemeta.Attempt, start time.Time, commitErr error) error {
+// restoreRouteCAS builds the restore path's exact-block CAS set: the
+// region this operation resolved (A), the region it switched to but has
+// not committed (B). A restore may only overwrite one of those; anything
+// else is a successor's block and the restore refuses (A12/T05 — a
+// deliberately UNFENCED compensation must not clobber a newer owner's
+// route).
+func restoreRouteCAS(resolvedHash, switchedHash string) []string {
+	set := []string{resolvedHash}
+	if switchedHash != resolvedHash {
+		set = append(set, switchedHash)
+	}
+	return set
+}
+
+func (d *Deployer) abortStateCommit(ctx context.Context, cfg Config, current *state.AppState, started, startedIDs []string, displacedHostWeb []string, att releasemeta.Attempt, routeCAS []string, start time.Time, commitErr error) error {
 	// Compensation runs on a DETACHED bounded context (A11): if the commit
 	// failed because the deploy context was cancelled, reusing that context
 	// would skip the very stops/restarts/route restores that undo the
@@ -1245,6 +1365,13 @@ func (d *Deployer) abortStateCommit(ctx context.Context, cfg Config, current *st
 	recoveryCtx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 	d.logDeploy(recoveryCtx, cfg, false, "", start)
+
+	fromGeneration := uint64(0)
+	nextGeneration := uint64(1)
+	if current != nil {
+		fromGeneration = current.Generation
+		nextGeneration = fromGeneration + 1
+	}
 
 	// The displaced fixed-port workload: the in-memory list when this
 	// process did the displacing; a process recovering a crashed attempt
@@ -1256,15 +1383,28 @@ func (d *Deployer) abortStateCommit(ctx context.Context, cfg Config, current *st
 	}
 
 	if cfg.ingressHost() || len(cfg.Publish) > 0 {
-		for _, name := range started {
-			d.docker.Stop(recoveryCtx, name, 5)
+		for i, name := range started {
+			ref := name
+			if i < len(startedIDs) && startedIDs[i] != "" {
+				ref = startedIDs[i]
+			}
+			d.docker.StopGenerationFenced(recoveryCtx, ref, 5, nextGeneration, "")
 		}
 		for _, old := range displaced {
-			if err := d.docker.Restart(recoveryCtx, old, nil); err != nil {
-				for _, name := range started {
-					d.docker.Start(recoveryCtx, name)
+			if err := d.docker.RestartFenced(recoveryCtx, old, nil, fromGeneration, ""); err != nil {
+				if !state.GenerationFenced(err) {
+					for i, name := range started {
+						ref := name
+						if i < len(startedIDs) && startedIDs[i] != "" {
+							ref = startedIDs[i]
+						}
+						d.docker.Start(recoveryCtx, ref)
+					}
+					return fmt.Errorf("committing authoritative applied state after replacing the fixed-port host workload: %w; restoring the original workload failed: %v; Teploy attempted to restart the new workload to avoid an outage", commitErr, err)
 				}
-				return fmt.Errorf("committing authoritative applied state after replacing the fixed-port host workload: %w; restoring the original workload failed: %v; Teploy attempted to restart the new workload to avoid an outage", commitErr, err)
+				// A newer generation owns the name: the successor is
+				// responsible for it now — leave it strictly alone.
+				fmt.Fprintf(d.out, "  WARNING: displaced container %s was not restored — a newer generation owns the name\n", old)
 			}
 		}
 		// A caddy-ingress app with publish entries entered this branch too
@@ -1275,15 +1415,23 @@ func (d *Deployer) abortStateCommit(ctx context.Context, cfg Config, current *st
 		// if that fails, keep the candidates running rather than routing to
 		// nothing.
 		if cfg.usesCaddy() {
-			if err := d.restorePreviousRoute(recoveryCtx, cfg, current); err != nil {
-				for _, name := range started {
-					d.docker.Start(recoveryCtx, name)
+			if err := d.restorePreviousRoute(recoveryCtx, cfg, current, routeCAS, fromGeneration); err != nil {
+				for i, name := range started {
+					ref := name
+					if i < len(startedIDs) && startedIDs[i] != "" {
+						ref = startedIDs[i]
+					}
+					d.docker.Start(recoveryCtx, ref)
 				}
 				return fmt.Errorf("committing authoritative applied state after replacing the fixed-port host workload: %w; the original workload restarted but its route could not be restored: %v; the uncommitted workload was restarted to avoid an outage", commitErr, err)
 			}
 		}
-		for _, name := range started {
-			d.docker.Remove(recoveryCtx, name)
+		for i, name := range started {
+			ref := name
+			if i < len(startedIDs) && startedIDs[i] != "" {
+				ref = startedIDs[i]
+			}
+			d.docker.Remove(recoveryCtx, ref)
 		}
 		if len(displaced) == 0 {
 			return fmt.Errorf("committing authoritative applied state after starting the first host-ingress workload: %w; the uncommitted workload was stopped and removed", commitErr)
@@ -1292,14 +1440,18 @@ func (d *Deployer) abortStateCommit(ctx context.Context, cfg Config, current *st
 	}
 
 	if cfg.usesCaddy() {
-		if err := d.restorePreviousRoute(recoveryCtx, cfg, current); err != nil {
+		if err := d.restorePreviousRoute(recoveryCtx, cfg, current, routeCAS, fromGeneration); err != nil {
 			return fmt.Errorf("committing authoritative applied state after route switch: %w; restoring the previous route failed: %v; old and new workloads were left running to avoid routing to a stopped container", commitErr, err)
 		}
 	}
 
-	for _, name := range started {
-		d.docker.Stop(recoveryCtx, name, 5)
-		d.docker.Remove(recoveryCtx, name)
+	for i, name := range started {
+		ref := name
+		if i < len(startedIDs) && startedIDs[i] != "" {
+			ref = startedIDs[i]
+		}
+		d.docker.StopGenerationFenced(recoveryCtx, ref, 5, nextGeneration, "")
+		d.docker.Remove(recoveryCtx, ref)
 	}
 	if current == nil {
 		return fmt.Errorf("committing authoritative applied state after route switch: %w; the new route was removed and the uncommitted workload was stopped", commitErr)
@@ -1317,12 +1469,25 @@ func (d *Deployer) abortStateCommit(ctx context.Context, cfg Config, current *st
 // config drifted (and compensating to a drifted block is compensating to
 // the wrong route). Reconstruct-from-inspection remains only as the
 // documented fallback for legacy installs without a record — and it says so.
-func (d *Deployer) restorePreviousRoute(ctx context.Context, cfg Config, current *state.AppState) error {
+//
+// C01-8/9 + A12/T05: the restored block is stamped with the generation
+// being restored TO, and the commit runs under the exact-block CAS over
+// routeCAS — the region this deploy resolved plus the region it switched
+// to. This compensation is deliberately UNFENCED (A07: refusing to clean up
+// one's own partial effects strands an app), which is exactly why its
+// writes must be identity-fenced instead: a successor that took over and
+// switched the route has a block in NEITHER set, and the restore refuses
+// (ErrRouteCAS) rather than clobber the newer generation's route.
+func (d *Deployer) restorePreviousRoute(ctx context.Context, cfg Config, current *state.AppState, routeCAS []string, generation uint64) error {
+	restoreCaddy := d.caddy.WithGeneration(generation)
+	if len(routeCAS) > 0 {
+		restoreCaddy = restoreCaddy.WithRouteCAS(cfg.App, routeCAS, generation)
+	}
 	if current == nil || current.CurrentHash == "" {
-		return d.caddy.RemoveRoute(ctx, cfg.App)
+		return restoreCaddy.RemoveRoute(ctx, cfg.App)
 	}
 	if current.IngressMode != "" && current.IngressMode != "caddy" {
-		return d.caddy.RemoveRoute(ctx, cfg.App)
+		return restoreCaddy.RemoveRoute(ctx, cfg.App)
 	}
 
 	rec, recErr := releasemeta.Read(ctx, d.exec, cfg.App, current.CurrentHash)
@@ -1333,14 +1498,14 @@ func (d *Deployer) restorePreviousRoute(ctx context.Context, cfg Config, current
 		fmt.Fprintf(d.out, "Warning: no release record for %s@%s (pre-F14 install) — restoring the previous route from live inspection instead of the recorded receipt\n", cfg.App, current.CurrentHash)
 	default:
 		if port, ok := releasemeta.PrimaryContainerPort(rec); ok {
-			return d.restoreRouteFromReceipt(ctx, cfg, current, rec, port)
+			return d.restoreRouteFromReceipt(ctx, cfg, current, rec, port, restoreCaddy)
 		}
 		// A record without a designated primary port (a backfilled record
 		// whose bindings identified none) cannot render the receipt's
 		// upstream port; that piece falls back to inspection, loudly.
 		fmt.Fprintf(d.out, "Warning: the release record for %s@%s names no primary container port — restoring the previous route from live inspection instead of the recorded receipt\n", cfg.App, current.CurrentHash)
 	}
-	return d.restoreRouteFromInspection(ctx, cfg, current)
+	return d.restoreRouteFromInspection(ctx, cfg, current, restoreCaddy)
 }
 
 // restoreRouteFromReceipt renders the predecessor route from the recorded
@@ -1351,7 +1516,7 @@ func (d *Deployer) restorePreviousRoute(ctx context.Context, cfg Config, current
 // carries them; a backfilled record cannot (nothing recoverable from
 // containers), and the CLI-passed config stays the fallback for it exactly
 // like rollback's applyRecordToRollback.
-func (d *Deployer) restoreRouteFromReceipt(ctx context.Context, cfg Config, current *state.AppState, rec *releasemeta.Record, containerPort int) error {
+func (d *Deployer) restoreRouteFromReceipt(ctx context.Context, cfg Config, current *state.AppState, rec *releasemeta.Record, containerPort int, cd *caddy.Client) error {
 	replicas := rec.Replicas
 	if replicas <= 0 {
 		replicas = 1
@@ -1397,15 +1562,15 @@ func (d *Deployer) restoreRouteFromReceipt(ctx context.Context, cfg Config, curr
 	}
 
 	if replicas > 1 {
-		return d.caddy.SetLoadBalancerHealth(ctx, cfg.App, domain, upstreams, healthPath, tls, caddyExtra, cache, fw, access)
+		return cd.SetLoadBalancerHealth(ctx, cfg.App, domain, upstreams, healthPath, tls, caddyExtra, cache, fw, access)
 	}
-	return d.caddy.SetRoute(ctx, cfg.App, domain, names[0], containerPort, tls, caddyExtra, cache, fw, access)
+	return cd.SetRoute(ctx, cfg.App, domain, names[0], containerPort, tls, caddyExtra, cache, fw, access)
 }
 
 // restoreRouteFromInspection is the legacy fallback (pre-F14 installs, or a
 // record that cannot name its route): reconstruct the previous block from
 // the current config plus a live inspect of the predecessor containers.
-func (d *Deployer) restoreRouteFromInspection(ctx context.Context, cfg Config, current *state.AppState) error {
+func (d *Deployer) restoreRouteFromInspection(ctx context.Context, cfg Config, current *state.AppState, cd *caddy.Client) error {
 	replicas := len(current.CurrentPorts)
 	if replicas == 0 {
 		replicas = 1
@@ -1435,9 +1600,9 @@ func (d *Deployer) restoreRouteFromInspection(ctx context.Context, cfg Config, c
 	}
 	tls := caddy.TLS{Cert: cfg.TLSCert, Key: cfg.TLSKey, Internal: cfg.TLSInternal}
 	if replicas > 1 {
-		return d.caddy.SetLoadBalancerHealth(ctx, cfg.App, domain, upstreams, cfg.Health.Path, tls, cfg.CaddyExtra, cfg.Cache, cfg.Firewall, cfg.Access)
+		return cd.SetLoadBalancerHealth(ctx, cfg.App, domain, upstreams, cfg.Health.Path, tls, cfg.CaddyExtra, cfg.Cache, cfg.Firewall, cfg.Access)
 	}
-	return d.caddy.SetRoute(ctx, cfg.App, domain, names[0], primaryPort, tls, cfg.CaddyExtra, cfg.Cache, cfg.Firewall, cfg.Access)
+	return cd.SetRoute(ctx, cfg.App, domain, names[0], primaryPort, tls, cfg.CaddyExtra, cfg.Cache, cfg.Firewall, cfg.Access)
 }
 
 // logDeploy appends the terminal receipt for a deploy attempt. success

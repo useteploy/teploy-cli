@@ -51,7 +51,7 @@ func TestRestorePreviousRoute_RendersRouteFromRecordedReceipt(t *testing.T) {
 
 	current := &state.AppState{SchemaVersion: 2, CurrentHash: "old123", Domain: "live.example.com", CurrentPorts: []int{49152}}
 	cfg := Config{App: "myapp", Domain: "cfg.example.com", Version: "new456"}
-	if err := d.restorePreviousRoute(context.Background(), cfg, current); err != nil {
+	if err := d.restorePreviousRoute(context.Background(), cfg, current, nil, 0); err != nil {
 		t.Fatalf("restorePreviousRoute: %v", err)
 	}
 
@@ -91,7 +91,7 @@ func TestRestorePreviousRoute_SameVersionUsesReplacedNaming(t *testing.T) {
 
 	current := &state.AppState{SchemaVersion: 2, CurrentHash: "old123", CurrentPorts: []int{49152}}
 	cfg := Config{App: "myapp", Domain: "myapp.com", Version: "old123"} // same version
-	if err := d.restorePreviousRoute(context.Background(), cfg, current); err != nil {
+	if err := d.restorePreviousRoute(context.Background(), cfg, current, nil, 0); err != nil {
 		t.Fatalf("restorePreviousRoute: %v", err)
 	}
 	caddyfile := string(mock.Files["/deployments/caddy/Caddyfile"])
@@ -114,7 +114,7 @@ func TestRestorePreviousRoute_NoRecordFallsBackLoudly(t *testing.T) {
 
 	current := &state.AppState{SchemaVersion: 2, CurrentHash: "old123", Domain: "live.example.com", CurrentPorts: []int{49152}}
 	cfg := Config{App: "myapp", Domain: "cfg.example.com", Version: "new456"}
-	if err := d.restorePreviousRoute(context.Background(), cfg, current); err != nil {
+	if err := d.restorePreviousRoute(context.Background(), cfg, current, nil, 0); err != nil {
 		t.Fatalf("restorePreviousRoute: %v", err)
 	}
 
@@ -149,7 +149,7 @@ func TestRestorePreviousRoute_RecordDisagreesWithLiveInspect_RecordWins(t *testi
 
 	current := &state.AppState{SchemaVersion: 2, CurrentHash: "old123", Domain: "live.example.com", CurrentPorts: []int{49152, 49153}}
 	cfg := Config{App: "myapp", Domain: "cfg.example.com", Version: "new456"}
-	if err := d.restorePreviousRoute(context.Background(), cfg, current); err != nil {
+	if err := d.restorePreviousRoute(context.Background(), cfg, current, nil, 0); err != nil {
 		t.Fatalf("restorePreviousRoute: %v", err)
 	}
 

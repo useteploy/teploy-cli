@@ -107,12 +107,15 @@ func TestRollback(t *testing.T) {
 		t.Errorf("rollback route should not use host port 49152, got: %s", string(caddyfile))
 	}
 
-	// Verify current container was stopped.
+	// Verify the current container was stopped — by its exact ID from the
+	// under-lock inventory (C01-9), inside the composed guarded stop. Only
+	// the FINAL (fully guard-stripped) command form prefixes with
+	// "docker stop"; the composed and intermediate forms are recorded too.
 	stopCalls := 0
 	for _, call := range mock.Calls {
 		if strings.HasPrefix(call, "docker stop") {
 			stopCalls++
-			if !strings.Contains(call, "myapp-web-v2") {
+			if !strings.Contains(call, "'bbb'") && !strings.Contains(call, "myapp-web-v2") {
 				t.Errorf("expected stop for v2 container, got: %s", call)
 			}
 		}
@@ -432,7 +435,8 @@ func TestRollback_ToSpecificHash(t *testing.T) {
 	// the target) must be left completely untouched.
 	var stoppedV3, touchedV2 bool
 	for _, c := range mock.Calls {
-		if strings.HasPrefix(c, "docker stop") && strings.Contains(c, "myapp-web-v3") {
+		// The retirement stop addresses the exact container ID (C01-9).
+		if strings.HasPrefix(c, "docker stop") && (strings.Contains(c, "myapp-web-v3") || strings.Contains(c, "'ccc'")) {
 			stoppedV3 = true
 		}
 		if strings.Contains(c, "myapp-web-v2") {
@@ -616,7 +620,8 @@ func TestRollback_HostIngressKeepsTheFixedPort(t *testing.T) {
 	// would try to bind the same fixed port.
 	stopIdx, runIdx := -1, -1
 	for i, c := range mock.Calls {
-		if stopIdx < 0 && strings.Contains(c, "docker stop") && strings.Contains(c, "myapp-web-v2") {
+		// The displacement stop addresses the exact container ID (C01-9).
+		if stopIdx < 0 && strings.HasPrefix(c, "docker stop") && (strings.Contains(c, "myapp-web-v2") || strings.Contains(c, "'bbb'")) {
 			stopIdx = i
 		}
 		if runIdx < 0 && strings.Contains(c, "docker run") {

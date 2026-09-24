@@ -3,8 +3,11 @@ package ssh
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -31,6 +34,12 @@ type MockExecutor struct {
 	// instead of being evaluated against Files — modeling an SSH channel
 	// dying mid-command, the ambiguous-release case of audit T02.
 	GuardTransportFailures int
+
+	// GenerationLabels models the docker generation labels (C01-8/9) for
+	// the composed generation-check fragment docker emits: container
+	// name → decimal generation. Absent names read as 0 (legacy/unlabeled
+	// — the compat rule), so tests that don't care keep working.
+	GenerationLabels map[string]string
 }
 
 // MockCommand maps a command prefix to a response.
@@ -79,6 +88,47 @@ func (m *MockExecutor) Run(ctx context.Context, cmd string) (string, error) {
 		m.Calls = append(m.Calls, cmd)
 	}
 
+	// The committed-generation CAS prefix (internal/state,
+	// GenerationCASPrefix — C01-8/9): evaluate the sidecar read exactly as
+	// the server shell would, so a stale plan's commit is refused against
+	// the recorded file state and a current one proceeds.
+	if rest, refused, found, expected, ok := evalGenerationCAS(m.Files, cmd); ok {
+		if refused {
+			m.mu.Unlock()
+			if found == 0 && expected == 0 {
+				return "", fmt.Errorf("exit status 74: TEPLOY_GENERATION_BADGEN")
+			}
+			return "", fmt.Errorf("exit status 74: TEPLOY_GENERATION_FENCED %d %d", found, expected)
+		}
+		cmd = rest
+		m.Calls = append(m.Calls, cmd)
+	}
+
+	// docker's composed generation label check (internal/docker,
+	// generationCheckFragment — C01-8/9): evaluate the container's
+	// generation label from GenerationLabels against the expected bound.
+	if rest, refused, found, expected, ok := m.evalGenerationLabelCheck(cmd); ok {
+		if refused {
+			m.mu.Unlock()
+			return "", fmt.Errorf("exit status 74: TEPLOY_GENERATION_FENCED %d %d", found, expected)
+		}
+		cmd = rest
+		m.Calls = append(m.Calls, cmd)
+	}
+
+	// The exact-block route CAS on Caddyfile commits (internal/caddy,
+	// routeCASFragment — A12/T05): hash the app's managed region from the
+	// recorded Caddyfile with caddy's normalization and compare against
+	// the acceptable hashes embedded in the command.
+	if rest, refused, foundGen, expectedGen, ok := evalRouteCAS(m.Files, cmd); ok {
+		if refused {
+			m.mu.Unlock()
+			return "", fmt.Errorf("exit status 76: TEPLOY_ROUTE_CAS_MISMATCH found_generation=%d expected_generation=%d", foundGen, expectedGen)
+		}
+		cmd = rest
+		m.Calls = append(m.Calls, cmd)
+	}
+
 	// `cat <path>` answers from the recorded file state when the mock has
 	// one (the real server re-reads whatever earlier writes left); an
 	// explicit registration still wins for paths the mock has no file for.
@@ -96,14 +146,26 @@ func (m *MockExecutor) Run(ctx context.Context, cmd string) (string, error) {
 			}
 			if c.Err == nil {
 				m.applyFileCommand(cmd)
+				// A compound file op (`mv a b && mv c d`, C01-8/9's
+				// state+sidecar commit) matched a broad registration;
+				// apply each segment so the recorded file state still
+				// reflects what the server shell did.
+				if isFileOpCommand(cmd) {
+					for _, seg := range strings.Split(cmd, " && ") {
+						m.applyFileCommand(seg)
+					}
+				}
 			}
 			m.mu.Unlock()
 			return c.Output, c.Err
 		}
 	}
-	if strings.HasPrefix(cmd, "mv -f -- ") || strings.HasPrefix(cmd, "mv -fT -- ") ||
-		strings.HasPrefix(cmd, "rm -f -- ") || strings.HasPrefix(cmd, "rm -rf -- ") {
-		m.applyFileCommand(cmd)
+	if isFileOpCommand(cmd) {
+		for _, seg := range strings.Split(cmd, " && ") {
+			if isFileOpCommand(seg) {
+				m.applyFileCommand(seg)
+			}
+		}
 		m.mu.Unlock()
 		return "", nil
 	}
@@ -248,6 +310,235 @@ func parseConditionalLockRelease(cmd string) (dir, owner string, ok bool) {
 		return "", "", false
 	}
 	return dir, owner, true
+}
+
+// isFileOpCommand reports whether cmd (or its first && -chained segment)
+// is a plain file mutation the mock models against Files. Compound
+// commands made ENTIRELY of such segments (state.WriteFenced's
+// `mv state && mv sidecar`, C01-8/9) are applied segment by segment; a
+// compound carrying anything else falls through to the registrations.
+func isFileOpCommand(cmd string) bool {
+	for _, seg := range strings.Split(cmd, " && ") {
+		seg = strings.TrimSpace(seg)
+		if !strings.HasPrefix(seg, "mv -f -- ") && !strings.HasPrefix(seg, "mv -fT -- ") &&
+			!strings.HasPrefix(seg, "rm -f -- ") && !strings.HasPrefix(seg, "rm -rf -- ") {
+			return false
+		}
+	}
+	return true
+}
+
+// evalGenerationCAS recognizes the committed-generation CAS prefix emitted
+// by state.GenerationCASPrefix:
+//
+//	if [ -f '<sidecar>' ]; then tg=$(cat '<sidecar>' 2>/dev/null); case
+//	"$tg" in ''|*[!0-9]*) ... BADGEN ...;; esac; [ "$tg" -le <E> ] ||
+//	{ ... TEPLOY_GENERATION_FENCED ...;; }; fi; <effect>
+//
+// It evaluates the sidecar against the recorded files: absent passes
+// (generation 0 — the targetguard contract), a newer committed generation
+// than expected refuses, and a present-but-non-numeric sidecar refuses
+// fail-closed. Returns the remaining effect command, whether the CAS
+// refused, the committed and expected generations (for the refusal error),
+// and whether cmd carried the prefix at all.
+func evalGenerationCAS(files map[string][]byte, cmd string) (rest string, refused bool, found, expected uint64, ok bool) {
+	const casHead = "if [ -f '"
+	if !strings.HasPrefix(cmd, casHead) {
+		return "", false, 0, 0, false
+	}
+	endQuote := strings.Index(cmd[len(casHead):], "'")
+	if endQuote < 0 {
+		return "", false, 0, 0, false
+	}
+	path := cmd[len(casHead) : len(casHead)+endQuote]
+	// The prefix ends at the first `fi; ` after the sidecar test.
+	fiAt := strings.Index(cmd, "fi; ")
+	if fiAt < 0 {
+		return "", false, 0, 0, false
+	}
+	prefix := cmd[:fiAt]
+	// Expected generation from the `[ "$tg" -le <E> ]` comparison.
+	leAt := strings.Index(prefix, `[ "$tg" -le `)
+	if leAt < 0 {
+		return "", false, 0, 0, false
+	}
+	numRest := prefix[leAt+len(`[ "$tg" -le `):]
+	numEnd := strings.Index(numRest, " ]")
+	if numEnd < 0 {
+		return "", false, 0, 0, false
+	}
+	exp, err := strconv.ParseUint(numRest[:numEnd], 10, 64)
+	if err != nil {
+		return "", false, 0, 0, false
+	}
+	data, present := files[path]
+	if !present {
+		return cmd[fiAt+len("fi; "):], false, 0, exp, true
+	}
+	committed, perr := strconv.ParseUint(strings.TrimSpace(string(data)), 10, 64)
+	if perr != nil {
+		// BADGEN: found==expected==0 disambiguates from a numeric refusal.
+		return "", true, 0, 0, true
+	}
+	if committed > exp {
+		return "", true, committed, exp, true
+	}
+	return cmd[fiAt+len("fi; "):], false, committed, exp, true
+}
+
+// evalGenerationLabelCheck recognizes docker's composed generation label
+// check (internal/docker.generationCheckFragment):
+//
+//	g=$(docker inspect -f '{{index .Config.Labels "teploy.generation"}}'
+//	 '<ref>' 2>/dev/null || printf '0'); case "$g" in ''|*[!0-9]*) g=0;;
+//	esac; [ "$g" -le <E> ] || { ...TEPLOY_GENERATION_FENCED...; exit 74; };
+//
+// The label is answered from m.GenerationLabels (absent = 0, the legacy
+// compat rule). Must be called with m.mu held.
+func (m *MockExecutor) evalGenerationLabelCheck(cmd string) (rest string, refused bool, found, expected uint64, ok bool) {
+	const head = `g=$(docker inspect -f '{{index .Config.Labels "teploy.generation"}}' '`
+	if !strings.HasPrefix(cmd, head) {
+		return "", false, 0, 0, false
+	}
+	restQuote := cmd[len(head):]
+	endQuote := strings.Index(restQuote, "' 2>/dev/null")
+	if endQuote < 0 {
+		return "", false, 0, 0, false
+	}
+	ref := restQuote[:endQuote]
+	leAt := strings.Index(cmd, `[ "$g" -le `)
+	if leAt < 0 {
+		return "", false, 0, 0, false
+	}
+	numRest := cmd[leAt+len(`[ "$g" -le `):]
+	numEnd := strings.Index(numRest, " ]")
+	if numEnd < 0 {
+		return "", false, 0, 0, false
+	}
+	exp, err := strconv.ParseUint(numRest[:numEnd], 10, 64)
+	if err != nil {
+		return "", false, 0, 0, false
+	}
+	gen := uint64(0)
+	if v, present := m.GenerationLabels[ref]; present {
+		if parsed, perr := strconv.ParseUint(strings.TrimSpace(v), 10, 64); perr == nil {
+			gen = parsed
+		}
+	}
+	if gen > exp {
+		return "", true, gen, exp, true
+	}
+	// Strip through the refusal block's closing `; }; ` — the fragment's
+	// shape is `[ "$g" -le N ] || { ...; exit 74; }; <effect>`.
+	tail := numRest[numEnd:]
+	end := strings.Index(tail, "; }; ")
+	if end < 0 {
+		return "", false, 0, 0, false
+	}
+	return tail[end+len("; }; "):], false, gen, exp, true
+}
+
+// evalRouteCAS recognizes caddy's exact-block compare-and-swap fragment
+// (internal/caddy.routeCASFragment — A12/T05):
+//
+//	cur=$(sed -n '/^# TEPLOY BEGIN <app>$/,/^# TEPLOY END <app>$/p'
+//	 '<caddyfile>' 2>/dev/null | sha256sum | cut -d' ' -f1);
+//	case "$cur" in <h1>|<h2>) ;; *) ...TEPLOY_ROUTE_CAS_MISMATCH...;; esac;
+//
+// It extracts the app's marker-inclusive region from the recorded
+// Caddyfile, hashes it with caddy's normalization (region + "\n", empty
+// input for an absent region) and compares against the acceptable hashes.
+// foundGen reports the live region's stamp (0 when unstamped) for the
+// refusal error, expectedGen the fragment's expectation.
+func evalRouteCAS(files map[string][]byte, cmd string) (rest string, refused bool, foundGen, expectedGen uint64, ok bool) {
+	const head = `cur=$(sed -n '/^# TEPLOY BEGIN `
+	if !strings.HasPrefix(cmd, head) {
+		return "", false, 0, 0, false
+	}
+	// App name: between "BEGIN " and the range separator "$/,/^# TEPLOY END".
+	beginIdx := strings.Index(cmd[len(head):], "$/,/^# TEPLOY END ")
+	if beginIdx < 0 {
+		return "", false, 0, 0, false
+	}
+	app := cmd[len(head) : len(head)+beginIdx]
+	// The case list: between `case "$cur" in ` and `) ;; *)`.
+	caseAt := strings.Index(cmd, `case "$cur" in `)
+	if caseAt < 0 {
+		return "", false, 0, 0, false
+	}
+	listRest := cmd[caseAt+len(`case "$cur" in `):]
+	listEnd := strings.Index(listRest, ") ;; *)")
+	if listEnd < 0 {
+		return "", false, 0, 0, false
+	}
+	acceptable := strings.Split(listRest[:listEnd], "|")
+	// The expectation rides the refusal printf: expected_generation=<E>.
+	if at := strings.Index(cmd, "expected_generation="); at >= 0 {
+		num := cmd[at+len("expected_generation="):]
+		end := strings.IndexAny(num, " \n")
+		if end < 0 {
+			end = len(num)
+		}
+		if v, err := strconv.ParseUint(num[:end], 10, 64); err == nil {
+			expectedGen = v
+		}
+	}
+	// The fragment ends at `esac; `.
+	esacAt := strings.Index(cmd, "esac; ")
+	if esacAt < 0 {
+		return "", false, 0, 0, false
+	}
+	// Region extraction, mirroring the server sed: marker-inclusive lines.
+	fileData, present := files["/deployments/caddy/Caddyfile"]
+	if !present {
+		fileData = nil
+	}
+	regionText := extractMockManagedRegion(string(fileData), app)
+	var payload []byte
+	if regionText != "" {
+		payload = append([]byte(regionText), '\n')
+	}
+	sum := sha256.Sum256(payload)
+	actual := hex.EncodeToString(sum[:])
+	for _, line := range strings.Split(regionText, "\n") {
+		if strings.HasPrefix(line, "# TEPLOY GENERATION ") {
+			if v, err := strconv.ParseUint(strings.TrimSpace(strings.TrimPrefix(line, "# TEPLOY GENERATION ")), 10, 64); err == nil {
+				foundGen = v
+			}
+			break
+		}
+	}
+	for _, h := range acceptable {
+		if h == actual {
+			return cmd[esacAt+len("esac; "):], false, foundGen, expectedGen, true
+		}
+	}
+	return "", true, foundGen, expectedGen, true
+}
+
+// extractMockManagedRegion is the mock's mirror of caddy's
+// extractManagedRegion (marker-inclusive region text, "" when absent) —
+// duplicated rather than imported so the ssh package keeps no caddy
+// dependency; the two MUST stay byte-compatible (exact-line marker
+// matching, lines joined with \n, no trailing newline).
+func extractMockManagedRegion(content, app string) string {
+	lines := strings.Split(content, "\n")
+	var out []string
+	active := false
+	for _, line := range lines {
+		if !active {
+			if line == "# TEPLOY BEGIN "+app {
+				active = true
+				out = append(out, line)
+			}
+			continue
+		}
+		out = append(out, line)
+		if line == "# TEPLOY END "+app {
+			return strings.Join(out, "\n")
+		}
+	}
+	return ""
 }
 
 func mockCommandMatches(cmd, match string) bool {

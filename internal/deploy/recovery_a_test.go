@@ -114,7 +114,7 @@ func TestAbortStateCommit_CancelledContextStillRunsCompensation(t *testing.T) {
 		ContainerPort: 8080,
 	}
 	started := []string{"fency-web-abc123"}
-	err := d.abortStateCommit(ctx, cfg, nil, started, nil, releasemeta.MustAttempt(app, cfg.Version), time.Now(), errBoom)
+	err := d.abortStateCommit(ctx, cfg, nil, started, nil, nil, releasemeta.MustAttempt(app, cfg.Version), nil, time.Now(), errBoom)
 	if err == nil {
 		t.Fatal("expected the commit error to be returned")
 	}
@@ -160,7 +160,7 @@ func TestAbortStateCommit_CaddyPublishAppRestoresRoute(t *testing.T) {
 		Health:  HealthConfig{Timeout: 5 * time.Second, Interval: 10 * time.Millisecond},
 	}
 	started := []string{"fency-web-abc123"}
-	err := d.abortStateCommit(context.Background(), cfg, current, started, nil, releasemeta.MustAttempt(app, cfg.Version), time.Now(), errBoom)
+	err := d.abortStateCommit(context.Background(), cfg, current, started, nil, nil, releasemeta.MustAttempt(app, cfg.Version), nil, time.Now(), errBoom)
 	if err == nil {
 		t.Fatal("expected the commit error to surface")
 	}

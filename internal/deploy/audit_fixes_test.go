@@ -44,7 +44,7 @@ func TestDeploy_SameVersion_DedupesReplicaAndPlainNames(t *testing.T) {
 		ssh.MockCommand{Match: "a=$(docker exec caddy md5sum", Output: "TEPLOY_CADDY_OK"},
 		ssh.MockCommand{Match: "UPLOAD:", Output: ""},
 		ssh.MockCommand{Match: "mv -f -- ", Output: ""},
-		ssh.MockCommand{Match: "if [ ! -e '/deployments/caddy/Caddyfile'", Err: fmt.Errorf("none")},
+		ssh.MockCommand{Match: "if [ ! -e '/deployments/caddy/Caddyfile'", Output: "present\n{\n\tadmin 0.0.0.0:2019\n}\n"},
 	)
 
 	var buf bytes.Buffer
@@ -111,7 +111,7 @@ func TestDeploy_RemovedWorkerIsStoppedByInventory(t *testing.T) {
 		ssh.MockCommand{Match: "a=$(docker exec caddy md5sum", Output: "TEPLOY_CADDY_OK"},
 		ssh.MockCommand{Match: "UPLOAD:", Output: ""},
 		ssh.MockCommand{Match: "mv -f -- ", Output: ""},
-		ssh.MockCommand{Match: "if [ ! -e '/deployments/caddy/Caddyfile'", Err: fmt.Errorf("none")},
+		ssh.MockCommand{Match: "if [ ! -e '/deployments/caddy/Caddyfile'", Output: "present\n{\n\tadmin 0.0.0.0:2019\n}\n"},
 	)
 
 	var buf bytes.Buffer
@@ -130,7 +130,10 @@ func TestDeploy_RemovedWorkerIsStoppedByInventory(t *testing.T) {
 
 	stoppedWorker := false
 	for _, call := range mock.Calls {
-		if strings.Contains(call, "myapp-worker-old123") && strings.HasPrefix(call, "docker stop") {
+		// The retirement stop addresses the container by its exact ID from
+		// the deploy's under-lock snapshot (C01-9); the fixture's inventory
+		// gives the worker ID b.
+		if (strings.Contains(call, "myapp-worker-old123") || strings.Contains(call, "'b'")) && strings.HasPrefix(call, "docker stop") {
 			stoppedWorker = true
 		}
 	}
