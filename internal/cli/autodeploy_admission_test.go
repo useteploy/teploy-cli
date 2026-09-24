@@ -589,3 +589,40 @@ func TestAdmission_ResumeCarriesCommit(t *testing.T) {
 		t.Errorf("resumed deploy pinned to commit %q, want %q (the ledger-recorded commit, not the tip)", gotCommit, sha)
 	}
 }
+
+// TestAdmission_RunningDeliveryIsNeverSupersedable: a delivery admitted as
+// "running" goes straight to the worker, so the next admit — however soon,
+// even before the worker goroutine is scheduled — is queued, not a
+// superseder of the delivery already reported as running. (Found flaking
+// TestAdmission_NoGoroutinePileup at ~3% under -race: the running item sat
+// in the pending slot until the worker took it.)
+func TestAdmission_RunningDeliveryIsNeverSupersedable(t *testing.T) {
+	block := make(chan struct{})
+	run := newCountingRun().blocking(block)
+	ledger := &memLedger{}
+	q := newAdmissionQueue(ledger, run.run, func(string, ...any) {})
+
+	now := time.Now().UTC()
+	first := autodeploy.AdmissionRecord{Kind: autodeploy.AdmissionKindAdmitted, ID: "first", Digest: "d1", App: "myapp", Commit: "c1", Received: now}
+	if got := q.admit(first, nil, false); got != dispositionRunning {
+		t.Fatalf("first admit = %q, want running", got)
+	}
+	if _, pending := q.snapshot(); pending != nil {
+		t.Fatalf("running delivery %q sits in the pending slot; the next admit could supersede it", pending.rec.ID)
+	}
+	second := autodeploy.AdmissionRecord{Kind: autodeploy.AdmissionKindAdmitted, ID: "second", Digest: "d2", App: "myapp", Commit: "c2", Received: now}
+	if got := q.admit(second, nil, false); got != dispositionQueued {
+		t.Fatalf("second admit = %q, want queued", got)
+	}
+	if got := len(ledger.byKind(autodeploy.AdmissionKindSuperseded)); got != 0 {
+		t.Fatalf("superseded records = %d, want 0", got)
+	}
+
+	close(block)
+	run.waitCall(t)
+	run.waitCall(t)
+	run.waitIdle(t, q)
+	if run.count() != 2 {
+		t.Fatalf("deploy invocations = %d, want 2 (first, then second)", run.count())
+	}
+}

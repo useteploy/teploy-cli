@@ -436,21 +436,28 @@ func (q *admissionQueue) admit(rec autodeploy.AdmissionRecord, changedFiles []st
 		q.pending = item
 		return dispositionQueued
 	default:
-		q.pending = item
+		// The item goes to the worker directly, never through the pending
+		// slot: a delivery reported "running" must not be supersedable by
+		// the next admit before the worker goroutine is scheduled.
 		q.workerLive = true
-		go q.worker()
+		go q.worker(item)
 		return dispositionRunning
 	}
 }
 
-// worker is the ONLY deploy runner: one goroutine at a time, draining the
-// pending slot. It exits when the queue is empty; the next admit restarts
-// it — so rapid deliveries during a long deploy never spawn per-delivery
-// goroutines.
-func (q *admissionQueue) worker() {
+// worker is the ONLY deploy runner: one goroutine at a time, running its
+// first item and then draining the pending slot. It exits when the queue is
+// empty; the next admit restarts it — so rapid deliveries during a long
+// deploy never spawn per-delivery goroutines.
+func (q *admissionQueue) worker(item *queuedAdmission) {
 	for {
+		if q.run != nil {
+			q.run(item.changedFiles, item.filesKnown, item.rec.Commit)
+		}
+		q.markProcessed(item.rec)
+
 		q.mu.Lock()
-		item := q.pending
+		item = q.pending
 		if item == nil {
 			q.workerLive = false
 			q.mu.Unlock()
@@ -458,11 +465,6 @@ func (q *admissionQueue) worker() {
 		}
 		q.pending = nil
 		q.mu.Unlock()
-
-		if q.run != nil {
-			q.run(item.changedFiles, item.filesKnown, item.rec.Commit)
-		}
-		q.markProcessed(item.rec)
 	}
 }
 
