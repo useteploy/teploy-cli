@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -39,7 +40,9 @@ const (
 	// (UNMIGRATED: currently internal).
 	codeConflict = "conflict"
 	// The effect's fate is unknown pending reconciliation; never
-	// rendered or recorded as failure (UNMIGRATED: currently internal).
+	// rendered or recorded as failure. Wired for interrupted commands
+	// (context canceled / deadline exceeded — SIGINT, automation
+	// timeouts); deeper per-phase migration stays on the S2 list.
 	codeUncertainOutcome = "uncertain-outcome"
 	// Success with a flag — traffic switched but the outcome is not
 	// clean (UNMIGRATED: currently internal).
@@ -87,12 +90,19 @@ func refuseAdmission(err error) error {
 // refusals → config-invalid; an absent config is a config failure for a
 // machine caller the same way a malformed one is. A plan/apply drift
 // refusal (C05) → conflict — the request is coherent, the world moved.
-// Everything else is internal until its site is migrated (S2
+// An interrupted command (context canceled or deadline exceeded — the
+// SIGINT path, an automation timeout) → uncertain-outcome: whatever
+// effect was in flight has an unknown fate until reconciled (the C01
+// crash-window machinery treats every interrupted window as INSPECT),
+// which is precisely the class automation must not render as a plain
+// failure. Everything else is internal until its site is migrated (S2
 // generalization).
 func classifyMachineError(err error) string {
 	switch {
 	case errors.Is(err, errPlanDrift):
 		return codeConflict
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		return codeUncertainOutcome
 	case errors.Is(err, config.ErrInvalidConfig),
 		errors.Is(err, config.ErrNoConfig),
 		errors.Is(err, errDeployAdmission):
@@ -114,6 +124,8 @@ func writeMachineErrorEnvelope(out io.Writer, err error) error {
 		}
 	case codeConflict:
 		message = "plan no longer valid"
+	case codeUncertainOutcome:
+		message = "interrupted — outcome unknown until reconciled"
 	}
 	return json.NewEncoder(out).Encode(machineErrorEnvelope{
 		MachineInterface: MachineInterface,

@@ -10,6 +10,7 @@ Neutron/Nucleus dependency and a public mirror.
 
 | Corpus rev | Emitting CLI | Machine Interface | Notes |
 |---|---|---|---|
+| 5 | main (X02 S2 tail: server-status fixtures + schema correction) | 2 | server-status-envelope fixtures landed (was "pending live capture"): valid x2 (full healthy observation, partial-caddy-unavailable — the class a target without a caddy container produces) + legacy pre-MI (machine_interface absent, the 42243e2-era shape). Encoder-derived: generated from the REAL `collectServerStatus` via a mock SSH executor (`contracts_golden_test.go`, TEPLOY_UPDATE_CONTRACTS) — synthetic values, real encoder and parse stages; the wire shape was verified against a live `server status --json` run before pinning. Defect fixed in the same commit: the schema had copied the appStatus root since its S2 draft (its own defect-fix commit 08cfb1b said so) and never described the actual serverStatusDTO wire format (server/host/uptime/load/memory/disks/docker/caddy) — rewritten to the real root with strict required-key coverage of the DTO's no-omitempty fields. Additive to consumers (a schema that matched nothing before now matches the wire); no MI bump. |
 | 4 | main (X02 S2 tail: server-list reshape) | 2 | **The MI 2 bump** (D8 non-additive): `server list --json` now emits the envelope `{machine_interface, servers[], observed_at}` carrying the per-server fields unchanged (name + id/host/user/role/tags/vpn_ip); the pre-reshape bare map-of-servers root is GONE on the wire and is pinned as the artifact's legacy class. New artifact server-list-envelope (schema + valid + legacy fixtures); version-handshake schema maximum 1→2 and its valid fixture renamed mi1→mi2 (app-list valid likewise — both envelopes now report MI 2). Capability tokens unchanged. Coordinated consumer: teploy-dash decodes both shapes during the transition (MaxSupportedMachineInterface 2). |
 | 3 (amended) | main (C05 plan-record corpus + defect fix) | 1 | C05 added the plan-record artifact + plan-apply token (see git history); amendment: server-status schema now carries its own $defs (its $refs never resolved), and app-list fixtures emit [] where the encoder emits [] (null fixtures failed schema + the real dash decode - found by dash's new contracts CI job, fixed here). |
 | 1 | post-v0.1.37 main (S2 skeleton) | 1 | First goldens: version handshake, app-list envelope (MI + pre-MI legacy), error envelope (config-invalid, internal, invalid-code), release-record, attempt-name grammar, preview-state eras. |
@@ -23,7 +24,7 @@ Neutron/Nucleus dependency and a public mirror.
 | version-handshake | yes | valid (real `writeVersion` encoder) | teploy-cli |
 | app-list-envelope | yes | valid (real DTO tags) + legacy pre-MI | teploy-cli |
 | server-list-envelope | yes (MI 2 reshape) | valid (real `writeServerList` encoder) + legacy bare-map | teploy-cli |
-| server-status-envelope | yes (appStatus root) | pending S2 tail (live `server status` capture) | teploy-cli |
+| server-status-envelope | yes (serverStatusDTO root, corrected rev 5) | valid x2 (full, partial-caddy-unavailable; real `collectServerStatus` encoder over mock executor) + legacy pre-MI | teploy-cli |
 | error-envelope | yes | valid x2 + invalid code | teploy-cli |
 | release-record | yes | valid container | teploy-cli |
 | attempt-name | yes (pattern) | valid + invalid examples | teploy-cli |

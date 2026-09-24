@@ -1,0 +1,94 @@
+{
+  "machine_interface": 2,
+  "server": "prod",
+  "host": "192.0.2.10",
+  "uptime": {
+    "seconds": 3600.5
+  },
+  "load": {
+    "one": 0.1,
+    "five": 0.2,
+    "fifteen": 0.3
+  },
+  "memory": {
+    "total_bytes": 1024000,
+    "used_bytes": 614400,
+    "available_bytes": 409600
+  },
+  "disks": [
+    {
+      "filesystem": "/dev/vda1",
+      "mountpoint": "/",
+      "total_bytes": 1000,
+      "used_bytes": 250,
+      "available_bytes": 750,
+      "used_percent": "25%"
+    },
+    {
+      "filesystem": "/dev/vdb1",
+      "mountpoint": "/srv",
+      "total_bytes": 2000,
+      "used_bytes": 500,
+      "available_bytes": 1500,
+      "used_percent": "26%"
+    }
+  ],
+  "docker": {
+    "installed": true,
+    "version": "29.0.0",
+    "containers": [
+      {
+        "id": "9f31c02",
+        "name": "myapp-web-3",
+        "image": "example/myapp:3",
+        "state": "running",
+        "status": "Up 4 minutes",
+        "created_at": "2026-09-23 11:55:00 +0000 UTC",
+        "process": "web",
+        "version": "3"
+      }
+    ],
+    "images": [
+      {
+        "id": "sha256:1a2b3c4d5e6f",
+        "repository": "example/myapp",
+        "tag": "3",
+        "size": "25MB",
+        "created_at": "2026-09-23 11:50:00 +0000 UTC"
+      }
+    ]
+  },
+  "caddy": {
+    "available": true,
+    "routes": [
+      {
+        "server": "srv0",
+        "id": "",
+        "hosts": [
+          "myapp.example.com"
+        ],
+        "handlers": [
+          "reverse_proxy"
+        ],
+        "upstreams": [
+          "myapp-web-3:3000"
+        ],
+        "status_code": ""
+      },
+      {
+        "server": "srv0",
+        "id": "myapp",
+        "hosts": [
+          "myapp.example.com"
+        ],
+        "handlers": [
+          "subroute"
+        ],
+        "upstreams": [],
+        "status_code": ""
+      }
+    ]
+  },
+  "observed_at": "2026-09-23T12:00:00Z",
+  "errors": []
+}

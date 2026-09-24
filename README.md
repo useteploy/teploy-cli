@@ -1,6 +1,6 @@
 <p align="center">
   <h1 align="center">teploy</h1>
-  <p align="center">Zero-downtime Docker deploys to any server via SSH.<br>Single binary. No management server. No dependencies.</p>
+  <p align="center">Docker deploys to any Linux server you can SSH into, with blue/green zero-downtime under Caddy.<br>Single binary. No management server.</p>
 </p>
 
 <p align="center">
@@ -13,7 +13,7 @@
 
 ## Why teploy?
 
-Most deploy tools require either a management server (Coolify, Dokploy) or complex configuration (Kamal). Teploy is a single binary that deploys Docker containers to any server you can SSH into. Three lines of config, one command to deploy.
+Most deploy tools require either a management server (Coolify, Dokploy) or longer configuration (Kamal). Teploy is a single binary that deploys Docker containers to any server you can SSH into. Three lines of config, one command to deploy.
 
 ```yaml
 # teploy.yml
@@ -26,7 +26,11 @@ server: 1.2.3.4
 teploy deploy
 ```
 
-Your app is live with HTTPS, zero-downtime deploys, and automatic rollback on failure.
+With the default Caddy ingress your app is live with automatic HTTPS,
+blue/green zero-downtime deploys, and rollback to the previous version if
+the readiness gate fails. (`ingress: host` publishes a raw port instead:
+recreate-style deploys with seconds of downtime — see
+[docs/supported-workloads.md](docs/supported-workloads.md).)
 
 ## Install
 
@@ -81,16 +85,16 @@ standalone.
 2. **Starts** a new container alongside the old one
 3. **Health checks** the new container
 4. **Routes traffic** via Caddy (automatic HTTPS)
-5. **Stops** the old container — zero downtime
-6. **Rolls back** automatically if anything fails
+5. **Stops** the old container — no downtime during the switch under Caddy
+6. **Rolls back** to the previous version if the readiness gate fails
 
 ## Features
 
 | Feature | Description |
 |---|---|
-| **Zero-downtime deploys** | New container starts and passes health checks before old one stops |
+| **Zero-downtime deploys** | New container starts and passes health checks before old one stops (Caddy blue/green; `ingress: host` deploys by recreate — brief downtime, documented) |
 | **Automatic HTTPS** | Caddy provisions and renews TLS certificates |
-| **Rollback** | `teploy rollback` reverts to the previous version instantly |
+| **Rollback** | `teploy rollback` reverts to the previous version and health-gates it before answering |
 | **Multi-process** | Run web, worker, and scheduler from the same image |
 | **Accessories** | Manage Postgres, Redis, etc. alongside your app |
 | **Environment variables** | `teploy env set KEY=value` — stored securely on server |
@@ -631,8 +635,20 @@ the server), and a five-command human-confirmed rebuild runbook. Read
 
 ## Requirements
 
-- A server with SSH access (any Linux VPS — Hetzner, DigitalOcean, Linode, etc.)
-- That's it. `teploy setup` handles the rest.
+- A Linux server with SSH key access (any VPS — Hetzner, DigitalOcean, Linode, etc.)
+- That's it for the standard path. `teploy setup` installs Docker, Caddy, and rsync. Already-provisioned Docker hosts work too (an `ingress: host` deploy needs nothing else).
+
+One app runs one image; multi-image stacks are refused, not approximated — see the full matrix and declared limits in [docs/supported-workloads.md](docs/supported-workloads.md).
+
+## Docs
+
+- [First success](docs/first-success.md) — install to verified deploy and rollback, with failure modes and remedies
+- [Supported workloads](docs/supported-workloads.md) — what deploys today, what is refused, ingress guarantees, operational limits
+- [Failure and recovery](docs/failure-and-recovery.md) — error envelope and exit codes, `teploy doctor`, interrupted deploys and repair debt, DR bundles (`teploy dr`)
+- [Migration](docs/migration.md) — Dokploy/Coolify/Compose import: what converts, what refuses, concept mapping
+- [CI/CD](docs/ci-deploy.md) — push-to-deploy with Forgejo/GitHub Actions
+- [Secrets scanning](docs/secrets-scanning.md) — Gitleaks recipe
+- [Resilience](docs/resilience.md) — surviving server loss (topology + runbook)
 
 ## Comparison
 

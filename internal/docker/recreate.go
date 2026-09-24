@@ -543,9 +543,38 @@ func recreatePublishBinding(b RecreateBinding) (string, error) {
 // Recreate force-removes the named container and runs a fresh one from the
 // spec. avoidPorts is the set of host ports currently held by containers
 // this recreation must not collide with; a binding whose original port is
-// in the set gets a freshly allocated one (see Restart's doc comment for the
-// rollback collision this exists for).
+// in the set gets a freshly allocated one (see Restart's doc comment for
+// the rollback collision this exists for).
 func (c *Client) Recreate(ctx context.Context, spec *RecreateSpec, avoidPorts map[int]bool) error {
+	return c.recreate(ctx, spec, avoidPorts, "")
+}
+
+// RecreateGuarded is Recreate with the force-remove composed under a guard
+// prefix (holdership and/or generation check): the rm — the destructive
+// half of a recreate — is refused in-shell when the guard fails, so a
+// stale holder cannot remove a container the successor now owns.
+func (c *Client) RecreateGuarded(ctx context.Context, spec *RecreateSpec, avoidPorts map[int]bool, rmGuardPrefix string) error {
+	return c.recreate(ctx, spec, avoidPorts, rmGuardPrefix)
+}
+
+// RestartFenced is Restart with the force-remove composed under BOTH the
+// holdership guard prefix (state.Lock.GuardPrefix, when non-empty) and the
+// generation label check (C01-8/9): recreating a stopped rollback target
+// removes the container under its name first, and under a takeover with a
+// same-hash redeploy that NAME may now belong to a NEWER generation's
+// container — the label check refuses exactly that, in the same shell as
+// the rm, so a stale rollback can never destroy the successor's workload
+// even when its commands land post-takeover. Refusals match
+// state.GenerationFenced (label check) and state.FenceLost (guard).
+func (c *Client) RestartFenced(ctx context.Context, name string, avoidPorts map[int]bool, expectedGeneration uint64, guardPrefix string) error {
+	spec, err := c.InspectRecreate(ctx, name)
+	if err != nil {
+		return err
+	}
+	return c.recreate(ctx, spec, avoidPorts, guardPrefix+generationCheckFragment(name, expectedGeneration))
+}
+
+func (c *Client) recreate(ctx context.Context, spec *RecreateSpec, avoidPorts map[int]bool, rmGuardPrefix string) error {
 	if spec == nil || spec.Name == "" {
 		return fmt.Errorf("recreate requires a spec with a container name")
 	}
@@ -603,7 +632,10 @@ func (c *Client) Recreate(ctx context.Context, spec *RecreateSpec, avoidPorts ma
 		return err
 	}
 
-	if _, err := c.exec.Run(ctx, "docker rm -f "+ssh.ShellQuote(spec.Name)); err != nil {
+	if _, err := c.exec.Run(ctx, rmGuardPrefix+"docker rm -f "+ssh.ShellQuote(spec.Name)); err != nil {
+		if strings.Contains(err.Error(), generationLostMarker) || stateGenerationRefused(err) {
+			return fmt.Errorf("recreating %s refused: the name now belongs to a container of a newer generation than this operation prepared against — %w", spec.Name, err)
+		}
 		return fmt.Errorf("removing old %s: %w", spec.Name, err)
 	}
 	if _, err := c.exec.Run(ctx, "docker run "+strings.Join(args, " ")); err != nil {

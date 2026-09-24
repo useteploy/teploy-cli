@@ -57,6 +57,16 @@ type RunConfig struct {
 	CPU           string            // CPU limit, e.g. "1.0"
 	Name          string            // explicit container name (overrides auto-generated)
 	NoHealthcheck bool              // pass --no-healthcheck so the container ignores the image HEALTHCHECK
+	// Generation stamps the teploy.generation label — the identity of the
+	// deployment generation this container is created for (C01-9's
+	// generation-keyed identity sub-slice). Because container NAMES remain
+	// version-keyed, two attempts of one release hash share names; the
+	// label is the immutable discriminator a stale operation can fence on
+	// (StopGenerationFenced): a container created by a NEWER generation is
+	// never removable by an operation prepared against an older one, no
+	// matter when its commands land. Zero means legacy/unlabeled (skipped)
+	// — pre-label containers keep working everywhere.
+	Generation uint64
 }
 
 // publishBinding renders a docker -p binding "[ip:]host:container" with
@@ -172,12 +182,17 @@ func (c *Client) run(ctx context.Context, cfg RunConfig, guardPrefix string) (st
 		args = append(args, "--network-alias", q(cfg.App+"-"+cfg.Process))
 	}
 
-	// Labels for filtering containers by app, process, and version.
+	// Labels for filtering containers by app, process, and version. The
+	// generation label (when set) keys the container to the deployment
+	// generation that created it — the identity stale operations fence on.
 	args = append(args,
 		"--label", q("teploy.app="+cfg.App),
 		"--label", q("teploy.process="+cfg.Process),
 		"--label", q("teploy.version="+cfg.Version),
 	)
+	if cfg.Generation > 0 {
+		args = append(args, "--label", q("teploy.generation="+strconv.FormatUint(cfg.Generation, 10)))
+	}
 
 	// Port publishing and PORT env var injection.
 	if cfg.Port > 0 {
@@ -334,6 +349,78 @@ func (c *Client) Stop(ctx context.Context, name string, timeout int) error {
 		return fmt.Errorf("stopping container %s: %w", name, err)
 	}
 	return nil
+}
+
+// GenerationLabelName is the label that keys a container to the deployment
+// generation that created it (RunConfig.Generation).
+const GenerationLabelName = "teploy.generation"
+
+// generationLostMarker mirrors state's generation-fence markers (unexported
+// there): the stderr sentinel a generation-checked effect emits on refusal,
+// matched by state.GenerationFenced over the error text.
+const generationLostMarker = "TEPLOY_GENERATION_FENCED"
+
+// generationCheckFragment renders the shell that refuses (marker on stderr,
+// exit 74) when ref's teploy.generation label names a generation NEWER than
+// expected — composed into the SAME command as the effect it guards, so an
+// in-flight command landing after a takeover still sees the newer label and
+// refuses: unlike holdership guards this check is over the target's OWN
+// immutable identity (a container's generation label never changes after
+// creation), which is what closes the delayed-SSH-effect window. A missing
+// container or an unlabeled (legacy) container passes — generation 0.
+func generationCheckFragment(ref string, expected uint64) string {
+	return fmt.Sprintf(
+		`g=$(docker inspect -f '{{index .Config.Labels %q}}' %s 2>/dev/null || printf '0'); case "$g" in ''|*[!0-9]*) g=0;; esac; [ "$g" -le %d ] || { printf '%s %%s %%s\n' "$g" %d >&2; exit 74; }; `,
+		GenerationLabelName, ssh.ShellQuote(ref), expected, generationLostMarker, expected,
+	)
+}
+
+// StopGenerationFenced stops the container named by ref (a name or — the
+// exact form — a container ID from this operation's own under-lock
+// inventory) only when its generation label does not name a NEWER
+// generation than expectedGeneration (C01-8/9). The label check, the
+// optional holdership guard prefix, and the stop are ONE remote command:
+// a stale rollback's retirement stop cannot kill a newer generation's
+// container even when the command lands long after a takeover. Refusal
+// errors match state.GenerationFenced and name both generations.
+func (c *Client) StopGenerationFenced(ctx context.Context, ref string, timeout int, expectedGeneration uint64, guardPrefix string) error {
+	cmd := guardPrefix + generationCheckFragment(ref, expectedGeneration) +
+		fmt.Sprintf("docker stop -t %d %s", timeout, ssh.ShellQuote(ref))
+	_, err := c.exec.Run(ctx, cmd)
+	if err != nil {
+		if strings.Contains(err.Error(), generationLostMarker) || stateGenerationRefused(err) {
+			return fmt.Errorf("stopping %s refused: the container belongs to a generation newer than this operation prepared against (expected %d) — %w", ref, expectedGeneration, err)
+		}
+		return fmt.Errorf("stopping container %s: %w", ref, err)
+	}
+	return nil
+}
+
+// stateGenerationRefused reports whether the executor surfaced the
+// generation check's exit status (74) without the marker text.
+func stateGenerationRefused(err error) bool {
+	msg := err.Error()
+	return strings.Contains(msg, "status 74") || strings.Contains(msg, "exit status 74")
+}
+
+// ContainerGeneration reads ref's generation label. The second result is
+// false when the container carries no label (legacy) or no longer exists.
+func (c *Client) ContainerGeneration(ctx context.Context, ref string) (uint64, bool, error) {
+	out, err := c.exec.Run(ctx, fmt.Sprintf(
+		"docker inspect -f '{{index .Config.Labels %q}}' %s 2>/dev/null || true",
+		GenerationLabelName, ssh.ShellQuote(ref)))
+	if err != nil {
+		return 0, false, fmt.Errorf("inspecting %s's generation label: %w", ref, err)
+	}
+	v := strings.TrimSpace(out)
+	if v == "" {
+		return 0, false, nil
+	}
+	gen, perr := strconv.ParseUint(v, 10, 64)
+	if perr != nil {
+		return 0, false, fmt.Errorf("container %s carries an unreadable generation label %q", ref, v)
+	}
+	return gen, true, nil
 }
 
 // Exec runs a command inside a running container via docker exec.

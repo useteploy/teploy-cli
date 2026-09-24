@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -20,6 +21,91 @@ const (
 	deploymentsDir  = "/deployments"
 	SchemaVersionV2 = 2
 )
+
+// generationFencedMarker and generationBadgenMarker are the stderr sentinels
+// of the generation CAS prefix (below): the first names the committed and the
+// expected generation when a stale plan is fenced out; the second reports a
+// present-but-unreadable .generation sidecar (fail closed, never pass a
+// corrupt fence). Exit status 74 distinguishes the refusal class from the
+// holdership fence's 75 in transport-wrapped errors.
+const (
+	generationFencedMarker = "TEPLOY_GENERATION_FENCED"
+	generationBadgenMarker = "TEPLOY_GENERATION_BADGEN"
+)
+
+// ErrGenerationFenced is returned when an effect prepared against generation
+// E discovers the target has committed a NEWER generation (sidecar > E) —
+// the stale-rollback shape C01-8/9 exist to make impossible: reconcile
+// against the observed target instead of retrying (the D11 honesty floor).
+var ErrGenerationFenced = errors.New("generation fence refused the effect — the target committed a newer generation than this operation prepared against; reconcile before retrying")
+
+// GenerationFenced reports whether err is a generation-CAS refusal — the
+// composed prefix's marker or its exit status (74) surfaced by either
+// executor flavor — including effects composed by other packages through
+// GenerationCASPrefix (docker's generation-checked stops use the same
+// marker contract).
+func GenerationFenced(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, ErrGenerationFenced) {
+		return true
+	}
+	msg := err.Error()
+	return strings.Contains(msg, generationFencedMarker) ||
+		strings.Contains(msg, generationBadgenMarker) ||
+		strings.Contains(msg, "status 74") ||
+		strings.Contains(msg, "exit status 74")
+}
+
+// GenerationSidecarPath returns the committed-generation sidecar's path:
+// /deployments/<app>/.generation, a plain decimal integer written atomically
+// by every state commit (Write/WriteFenced[Generation]). The path and the
+// "absent = 0" rule are the targetguard helper's contract
+// (internal/targetguard/guard.sh) — one sidecar both fences read.
+func GenerationSidecarPath(app string) string {
+	return fmt.Sprintf("%s/%s/.generation", deploymentsDir, app)
+}
+
+// ReadCommittedGeneration reads the sidecar: absent means 0 (pre-sidecar
+// install), a parseable integer is returned as-is, anything else is an
+// error — a corrupt fence must never silently read as generation 0.
+func ReadCommittedGeneration(ctx context.Context, exec ssh.Executor, app string) (uint64, error) {
+	data, present, err := ReadRemoteFile(ctx, exec, GenerationSidecarPath(app))
+	if err != nil {
+		return 0, fmt.Errorf("reading the committed generation for %s: %w", app, err)
+	}
+	if !present {
+		return 0, nil
+	}
+	gen, perr := strconv.ParseUint(strings.TrimSpace(string(data)), 10, 64)
+	if perr != nil {
+		return 0, fmt.Errorf("the committed-generation sidecar for %s is unreadable (%q) — inspect %s before retrying", app, strings.TrimSpace(string(data)), GenerationSidecarPath(app))
+	}
+	return gen, nil
+}
+
+// GenerationCASPrefix returns the shell prefix that composes the
+// committed-generation compare-and-swap with an effect command into ONE
+// remote invocation:
+//
+//	<prefix><effect>
+//
+// The prefix refuses (marker on stderr, exit 74) when the app's .generation
+// sidecar names a generation NEWER than expected, or when a present sidecar
+// is unreadable (fail closed). An absent sidecar reads as generation 0 —
+// the targetguard contract — so legacy installs keep working. Semantics are
+// identical to internal/targetguard/guard.sh's fence (committed > expected
+// fences; GUARD_BADGEN fails closed), implemented as an in-shell prefix so
+// it composes with the holdership guard (state.Lock.GuardPrefix) and needs
+// no helper upload. Effect sites map refusals with GenerationFenced.
+func GenerationCASPrefix(app string, expected uint64) string {
+	sidecar := ssh.ShellQuote(GenerationSidecarPath(app))
+	return fmt.Sprintf(
+		`if [ -f %s ]; then tg=$(cat %[1]s 2>/dev/null); case "$tg" in ''|*[!0-9]*) printf '%s\n' >&2; exit 74;; esac; [ "$tg" -le %d ] || { printf '%s %%s %%s\n' "$tg" %d >&2; exit 74; }; fi; `,
+		sidecar, generationBadgenMarker, expected, generationFencedMarker, expected,
+	)
+}
 
 // staleLockTTL is how long an "auto" deploy lock (see LockInfo.Type) is
 // honored before AcquireLock treats it as abandoned and breaks it. Deploys
@@ -374,14 +460,35 @@ func validateReleaseDigest(release *ReleaseMetadata) error {
 
 // Write atomically writes canonical v2 JSON. It never updates the legacy
 // key=value file, making that file an import-only migration source rather than
-// a second writable authority.
+// a second writable authority. The committed-generation sidecar (C01-8/9) is
+// written right after the state rename — state.json is the authority and the
+// sidecar trails it by one shell command, so the generation CAS
+// (GenerationCASPrefix, targetguard) always fences against a generation that
+// already committed.
 func Write(ctx context.Context, exec ssh.Executor, app string, s *AppState) error {
 	data, err := prepareState(s)
 	if err != nil {
 		return err
 	}
 	path := fmt.Sprintf("%s/%s/state.json", deploymentsDir, app)
-	return ssh.UploadAtomic(ctx, exec, bytes.NewReader(data), path, "0644")
+	if err := ssh.UploadAtomic(ctx, exec, bytes.NewReader(data), path, "0644"); err != nil {
+		return err
+	}
+	return writeGenerationSidecar(ctx, exec, app, s.Generation)
+}
+
+// writeGenerationSidecar publishes the committed generation atomically
+// (stage + rename) — the targetguard contract's write side.
+func writeGenerationSidecar(ctx context.Context, exec ssh.Executor, app string, generation uint64) error {
+	path := GenerationSidecarPath(app)
+	tmp := path + ".tmp-commit"
+	if err := exec.Upload(ctx, strings.NewReader(strconv.FormatUint(generation, 10)+"\n"), tmp, "0644"); err != nil {
+		return fmt.Errorf("staging the committed-generation sidecar for %s: %w", app, err)
+	}
+	if _, err := exec.Run(ctx, "mv -fT -- "+ssh.ShellQuote(tmp)+" "+ssh.ShellQuote(path)); err != nil {
+		return fmt.Errorf("publishing the committed-generation sidecar for %s: %w", app, err)
+	}
+	return nil
 }
 
 // prepareState validates and serializes s for writing (shared by Write and

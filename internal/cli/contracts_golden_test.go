@@ -9,7 +9,9 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -18,6 +20,7 @@ import (
 
 	"github.com/useteploy/teploy/internal/config"
 	"github.com/useteploy/teploy/internal/releasemeta"
+	"github.com/useteploy/teploy/internal/ssh"
 )
 
 const contractsDir = "../../contracts"
@@ -129,6 +132,70 @@ func TestContractsAppListEnvelopeGolden(t *testing.T) {
 	}
 	delete(legacy, "machine_interface")
 	writeFixture(t, "app-list-envelope/legacy/pre-mi.json", legacy)
+}
+
+// TestContractsServerStatusEnvelopeGolden drives the REAL
+// collectServerStatus encoder (the same collection path `server status
+// --json` runs) through a mock SSH executor — the DTO values are
+// synthetic, the encoder and every parse stage (memory, disks, docker
+// inventory, Caddy routes) are the real ones. The wire shape was
+// verified against a live `server status --json` capture before this
+// fixture was pinned (see MANIFEST rev 5). Two valid classes: a full
+// healthy observation, and a partial one with the Caddy probe failing —
+// the class a real deployment without a caddy container produces. The
+// legacy fixture is the pre-MI shape (machine_interface absent), which a
+// 42243e2-era CLI emitted.
+func TestContractsServerStatusEnvelopeGolden(t *testing.T) {
+	observedAt := time.Date(2026, 9, 23, 12, 0, 0, 0, time.UTC)
+	container := `{"ID":"9f31c02","Names":"myapp-web-3","Image":"example/myapp:3","State":"running","Status":"Up 4 minutes","CreatedAt":"2026-09-23 11:55:00 +0000 UTC","Labels":"teploy.app=myapp,teploy.process=web,teploy.version=3"}`
+	image := `{"ID":"sha256:1a2b3c4d5e6f","Repository":"example/myapp","Tag":"3","Size":"25MB","CreatedAt":"2026-09-23 11:50:00 +0000 UTC"}`
+	caddy := `{"servers":{"srv0":{"routes":[{"@id":"myapp","match":[{"host":["myapp.example.com"]}],"handle":[{"handler":"subroute","routes":[{"handle":[{"handler":"reverse_proxy","upstreams":[{"dial":"myapp-web-3:3000"}]}]}]}]}]}}}`
+	full := ssh.NewMockExecutor("192.0.2.10",
+		ssh.MockCommand{Match: "cat /proc/uptime", Output: "3600.50 1200.00"},
+		ssh.MockCommand{Match: "cat /proc/loadavg", Output: "0.10 0.20 0.30 1/100 1"},
+		ssh.MockCommand{Match: "cat /proc/meminfo", Output: "MemTotal: 1000 kB\nMemAvailable: 400 kB\n"},
+		ssh.MockCommand{Match: "df -B1 -P", Output: "Filesystem 1-blocks Used Available Capacity Mounted on\n/dev/vda1 1000 250 750 25% /\n/dev/vdb1 2000 500 1500 26% /srv\n"},
+		ssh.MockCommand{Match: "docker version", Output: "29.0.0"},
+		ssh.MockCommand{Match: "docker ps --all", Output: container},
+		ssh.MockCommand{Match: "docker image ls", Output: image},
+		ssh.MockCommand{Match: "docker exec caddy", Output: caddy},
+	)
+	got := collectServerStatus(context.Background(), full, "prod", observedAt)
+	if len(got.Errors) != 0 {
+		t.Fatalf("full observation reported errors: %#v", got.Errors)
+	}
+	fullStatus := got
+	writeFixture(t, "server-status-envelope/valid/full.json", got)
+
+	partial := ssh.NewMockExecutor("192.0.2.20",
+		ssh.MockCommand{Match: "cat /proc/uptime", Output: "86400.00 86400.00"},
+		ssh.MockCommand{Match: "cat /proc/loadavg", Output: "0.00 0.01 0.05 1/100 1"},
+		ssh.MockCommand{Match: "cat /proc/meminfo", Output: "MemTotal: 500 kB\nMemAvailable: 250 kB\n"},
+		ssh.MockCommand{Match: "df -B1 -P", Output: "Filesystem 1-blocks Used Available Capacity Mounted on\n/dev/vda1 500 100 400 20% /\n"},
+		ssh.MockCommand{Match: "docker version", Output: "29.0.0"},
+		ssh.MockCommand{Match: "docker ps --all", Output: ""},
+		ssh.MockCommand{Match: "docker image ls", Output: ""},
+		ssh.MockCommand{Match: "docker exec caddy", Err: errors.New("Error response from daemon: No such container: caddy")},
+	)
+	got = collectServerStatus(context.Background(), partial, "staging", observedAt)
+	if len(got.Errors) != 1 || got.Errors[0].Scope != "caddy.routes" {
+		t.Fatalf("partial observation missing its caddy error: %#v", got.Errors)
+	}
+	writeFixture(t, "server-status-envelope/valid/partial-caddy-unavailable.json", got)
+
+	// Legacy: the pre-MI envelope (no machine_interface field) a CLI
+	// between 42243e2 and dda4911 emitted. Same delete-from-map approach
+	// as the app-list legacy class.
+	raw, err := json.Marshal(fullStatus)
+	if err != nil {
+		t.Fatalf("marshal full status: %v", err)
+	}
+	var legacy map[string]any
+	if err := json.Unmarshal(raw, &legacy); err != nil {
+		t.Fatalf("unmarshal legacy: %v", err)
+	}
+	delete(legacy, "machine_interface")
+	writeFixture(t, "server-status-envelope/legacy/pre-mi.json", legacy)
 }
 
 // TestContractsErrorEnvelopeGolden pins the two wired error classes.

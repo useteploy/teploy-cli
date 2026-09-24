@@ -2,6 +2,9 @@
 /teploy
 /cmd/teploy/teploy
 
+# Release-verify local build matrix (scripts/release-verify.sh)
+/dist-verify/
+
 # Go
 *.exe
 *.test
