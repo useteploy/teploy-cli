@@ -6,10 +6,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/useteploy/teploy/internal/deploy"
 	"github.com/useteploy/teploy/internal/ssh"
 )
 
@@ -684,5 +686,26 @@ func TestListIncludesLegacyAndCanonical(t *testing.T) {
 	}
 	if byBranch[dashBranch].ID != "" {
 		t.Errorf("legacy record must be listed unmodified (no invented ID): %+v", byBranch[dashBranch])
+	}
+}
+
+// TestProbeTCP_RequiresLiveListener: the preview readiness fallback uses the
+// deploy gate's held-connection probe, not a bare /dev/tcp connect — a bare
+// connect succeeds against docker-proxy even when the backend is dead.
+func TestProbeTCP_RequiresLiveListener(t *testing.T) {
+	want, ok := deploy.TCPProbeCommand("localhost", 8080)
+	if !ok {
+		t.Fatal("TCPProbeCommand rejected localhost:8080")
+	}
+	live := ssh.NewMockExecutor("1.2.3.4", ssh.MockCommand{Match: want})
+	if !NewManager(live, io.Discard).probeTCP(context.Background(), 8080) {
+		t.Fatal("probeTCP must pass when the held-connection probe exits 0")
+	}
+	connectOnly := ssh.NewMockExecutor("1.2.3.4", ssh.MockCommand{Match: "bash -c '</dev/tcp/localhost/8080'"})
+	if NewManager(connectOnly, io.Discard).probeTCP(context.Background(), 8080) {
+		t.Fatal("probeTCP must not be satisfied by a bare connect")
+	}
+	if NewManager(live, io.Discard).probeTCP(context.Background(), 0) {
+		t.Fatal("probeTCP must reject port 0")
 	}
 }

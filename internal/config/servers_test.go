@@ -1163,3 +1163,47 @@ func TestEffectiveUser(t *testing.T) {
 		})
 	}
 }
+
+// TestResolveServer_HostFlagResolvesNamedServer pins the R02 defect: a
+// --host value naming a servers.yml entry resolves to the entry (host and
+// user) instead of being dialed as a literal hostname; --user still wins,
+// and a --host that is not a registered name stays a raw host.
+func TestResolveServer_HostFlagResolvesNamedServer(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HOME", dir)
+	t.Setenv("TEPLOY_HOST", "")
+	t.Setenv("TEPLOY_USER", "")
+	t.Setenv("TEPLOY_SSH_KEY", "")
+
+	serversPath, err := DefaultServersPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := AddServer(serversPath, "box1", "10.0.0.5:2222", "deploy", "", ""); err != nil {
+		t.Fatalf("AddServer: %v", err)
+	}
+
+	host, user, _, err := ResolveServer("box1", "box1", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if host != "10.0.0.5:2222" || user != "deploy" {
+		t.Fatalf("--host box1 resolved to %s@%s, want deploy@10.0.0.5:2222", user, host)
+	}
+
+	_, user, key, err := ResolveServer("box1", "box1", "admin", "/k")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if user != "admin" || key != "/k" {
+		t.Fatalf("--user/--key must win over the entry: got user=%s key=%s", user, key)
+	}
+
+	host, user, _, err = ResolveServer("x", "203.0.113.9", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if host != "203.0.113.9" || user != "root" {
+		t.Fatalf("raw --host must stay raw: got %s@%s", user, host)
+	}
+}

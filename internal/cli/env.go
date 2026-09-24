@@ -7,10 +7,15 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
 
 	"github.com/spf13/cobra"
+	"github.com/useteploy/teploy/internal/config"
 	"github.com/useteploy/teploy/internal/env"
+	"github.com/useteploy/teploy/internal/openbao"
+	"github.com/useteploy/teploy/internal/secret"
+	"github.com/useteploy/teploy/internal/ssh"
 )
 
 func newEnvCmd(flags *Flags) *cobra.Command {
@@ -90,6 +95,10 @@ func runEnvSet(flags *Flags, appName string, pairs map[string]string) error {
 	}
 	defer executor.Close()
 
+	if err := checkEnvSetShadowing(ctx, executor, appCfg, pairs, os.Stderr); err != nil {
+		return err
+	}
+
 	mgr := env.NewManager(executor)
 	if err := mgr.Set(ctx, appCfg.App, pairs); err != nil {
 		return err
@@ -97,6 +106,51 @@ func runEnvSet(flags *Flags, appName string, pairs map[string]string) error {
 
 	for k := range pairs {
 		fmt.Printf("  Set %s\n", k)
+	}
+	return nil
+}
+
+// checkEnvSetShadowing refuses an `env set` whose value could never reach
+// the container. At deploy the server .env is the FIRST env file; teploy.yml
+// env: plus decrypted secrets (`teploy secret set`) and resolved vault
+// references ride a later attempt env file and win. So `env set` on a
+// secret-backed key was a silent no-op (Ship wave-9: "env set does not feed
+// secret-backed vars; secret set does") — by design on precedence (secrets
+// win over plaintext), a defect in reporting success. Secret-backed keys are
+// refused with the remedy; a key teploy.yml's env: sets in plain text is
+// shadowed the same way and is warned about (only knowable when teploy.yml
+// was loaded, i.e. without --app).
+func checkEnvSetShadowing(ctx context.Context, executor ssh.Executor, appCfg *config.AppConfig, pairs map[string]string, warn io.Writer) error {
+	stored, err := secret.NewManager(executor).List(ctx, appCfg.App)
+	if err != nil {
+		return fmt.Errorf("checking the secret store before env set: %w", err)
+	}
+	inStore := make(map[string]bool, len(stored))
+	for _, k := range stored {
+		inStore[k] = true
+	}
+	vaultRefs := openbao.CollectRefs(appCfg.Env)
+
+	keys := make([]string, 0, len(pairs))
+	for k := range pairs {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var refused []string
+	for _, k := range keys {
+		switch {
+		case inStore[k] && !secret.IsManagementKey(k):
+			refused = append(refused, fmt.Sprintf("%s is a secret for %s (teploy secret set); the decrypted secret overrides .env at deploy, so env set would be ignored — use `teploy secret set %s=...` (or `teploy secret rm %s` first to manage it as plain env)", k, appCfg.App, k, k))
+		case vaultRefs[k] != [2]string{}:
+			refused = append(refused, fmt.Sprintf("%s is a secret: reference in teploy.yml env: (%s); the value resolved from OpenBao overrides .env at deploy, so env set would be ignored — change the secret in OpenBao, or drop the reference from teploy.yml to manage it as plain env", k, appCfg.Env[k]))
+		default:
+			if _, inYAML := appCfg.Env[k]; inYAML {
+				fmt.Fprintf(warn, "warning: teploy.yml env: also sets %s and wins over .env at deploy — this value is shadowed until that entry is removed\n", k)
+			}
+		}
+	}
+	if len(refused) > 0 {
+		return fmt.Errorf("env set refused (nothing written):\n  %s", strings.Join(refused, "\n  "))
 	}
 	return nil
 }

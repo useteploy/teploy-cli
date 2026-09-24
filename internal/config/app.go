@@ -202,7 +202,9 @@ type AppHealthConfig struct {
 	//
 	//   http — status-based only: HTTP GET path, 200 = ready. A 404/3xx
 	//          FAILS the gate (no fallback).
-	//   tcp  — a TCP dial against the published port; nothing is fetched.
+	//   tcp  — a TCP dial against the published port, held ~1s; nothing
+	//          is fetched. An immediate close (docker-proxy with a dead
+	//          backend) is not ready.
 	//          Setting path alongside is rejected (nothing would fetch it).
 	//   auto — compatibility (the default when unset): HTTP GET first, a
 	//          404/3xx falls back to the TCP dial — the exact behavior

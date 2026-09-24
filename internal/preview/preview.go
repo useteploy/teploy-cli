@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/useteploy/teploy/internal/caddy"
+	"github.com/useteploy/teploy/internal/deploy"
 	"github.com/useteploy/teploy/internal/docker"
 	"github.com/useteploy/teploy/internal/ssh"
 )
@@ -656,10 +657,11 @@ func (m *Manager) probeOnce(ctx context.Context, port int) bool {
 // probeTCP reports whether a TCP connection to localhost:port succeeds —
 // the listening-but-no-/health fallback.
 func (m *Manager) probeTCP(ctx context.Context, port int) bool {
-	if port < 1 || port > 65535 {
+	cmd, ok := deploy.TCPProbeCommand("localhost", port)
+	if !ok {
 		return false
 	}
-	_, err := m.exec.Run(ctx, fmt.Sprintf("bash -c '</dev/tcp/localhost/%d' 2>/dev/null", port))
+	_, err := m.exec.Run(ctx, cmd)
 	return err == nil
 }
 

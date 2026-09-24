@@ -43,7 +43,7 @@ func NewRootCmd(version string) *cobra.Command {
 		},
 	}
 
-	root.PersistentFlags().StringVar(&flags.Host, "host", "", "server host (overrides servers.yml)")
+	root.PersistentFlags().StringVar(&flags.Host, "host", "", "server host or servers.yml name (overrides the configured server)")
 	root.PersistentFlags().StringVar(&flags.User, "user", "", "SSH user (default: root)")
 	root.PersistentFlags().StringVar(&flags.Key, "key", "", "path to SSH private key")
 	root.PersistentFlags().StringVar(&flags.ProjectDir, "project-dir", "", "run as if teploy was started in this directory")
