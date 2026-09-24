@@ -61,7 +61,15 @@ If a previously-deployed container mounted volumes from a different host path
 (common when migrating from Dokploy or hand-rolled docker run setups), the
 deploy aborts safely rather than orphaning data. Pass --migrate-volumes to
 copy data from the existing source into the teploy-expected path before
-swapping traffic.`,
+swapping traffic.
+
+Outcomes and exit codes: 0 = deployed (warnings possible — read the output);
+1 = refused before any effect (config/admission problems), failed, or
+INTERRUPTED — an interrupted deploy (Ctrl-C, timeout) has an unknown outcome
+until reconciled; re-running is safe (the next attempt reconciles partial
+state), or inspect with teploy status. Under --json a failure is reported as
+a machine error envelope on stderr whose code distinguishes the classes
+(config-invalid, conflict, uncertain-outcome, internal).`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			var serverName string
@@ -713,7 +721,7 @@ func deployBuiltImageFenced(ctx context.Context, executor ssh.Executor, appCfg *
 	emitDeployAudit(ctx, appCfg, "deploy.run", version, serverDisplay, deployErr)
 
 	if deployErr != nil {
-		return deployErr
+		return wrapDeployOutcomeError(deployErr)
 	}
 
 	// 13. Prune old build images (best-effort).
@@ -723,6 +731,19 @@ func deployBuiltImageFenced(ctx context.Context, executor ssh.Executor, appCfg *
 	}
 
 	return nil
+}
+
+// wrapDeployOutcomeError renders a failed deploy's error for the human
+// path. An interrupted deploy (Ctrl-C, automation timeout) leaves the
+// outcome UNKNOWN — the C01 crash-window contract — so it names the
+// recovery action instead of letting a bare "context canceled" read as a
+// clean failure. Under --json the machine envelope classifies the same
+// error as uncertain-outcome (errevelope.go).
+func wrapDeployOutcomeError(err error) error {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("deploy interrupted: %w\nThe outcome is unknown until reconciled. Re-running this deploy is safe (the next attempt reconciles any partial state); inspect first with: teploy status", err)
+	}
+	return err
 }
 
 // plannedVolumeMounts resolves config volume declarations to the docker
@@ -969,18 +990,18 @@ func runMultiDeploy(flags *Flags, appCfg *config.AppConfig, image, version strin
 		fmt.Printf("\n%d of %d servers failed — rolling back the %d server(s) that succeeded...\n",
 			failCount, len(targets), len(successTargets))
 
-	// Best-effort: attempt to roll back EVERY succeeded server even if one
-	// rollback fails — otherwise a single rollback failure would fail-fast
-	// and strand the remaining servers on the new version (M1). The wave
-	// runs on a bounded DETACHED recovery context (audit T58): the deploy
-	// context is signal-cancelled exactly when the operator interrupts,
-	// and recovery work that skips itself because the cancelled context
-	// disappeared is how a Ctrl-C strands half a fleet on the new version.
-	rollbackCtx, rollbackCancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Minute)
-	defer rollbackCancel()
-	rollbackResults := multideploy.ParallelDeployAll(rollbackCtx, successTargets, parallel, func(ctx context.Context, target multideploy.ServerTarget, out io.Writer) error {
-		return rollbackSingleServer(ctx, appCfg, target, out)
-	}, os.Stdout)
+		// Best-effort: attempt to roll back EVERY succeeded server even if one
+		// rollback fails — otherwise a single rollback failure would fail-fast
+		// and strand the remaining servers on the new version (M1). The wave
+		// runs on a bounded DETACHED recovery context (audit T58): the deploy
+		// context is signal-cancelled exactly when the operator interrupts,
+		// and recovery work that skips itself because the cancelled context
+		// disappeared is how a Ctrl-C strands half a fleet on the new version.
+		rollbackCtx, rollbackCancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Minute)
+		defer rollbackCancel()
+		rollbackResults := multideploy.ParallelDeployAll(rollbackCtx, successTargets, parallel, func(ctx context.Context, target multideploy.ServerTarget, out io.Writer) error {
+			return rollbackSingleServer(ctx, appCfg, target, out)
+		}, os.Stdout)
 
 		var rolledBack, firstDeploys, rollbackFailed []string
 		for _, r := range rollbackResults {
