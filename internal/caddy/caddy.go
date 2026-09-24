@@ -3,6 +3,7 @@ package caddy
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"net/url"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -203,6 +205,12 @@ type Client struct {
 	// new owner's window. Empty = unguarded commits (the receiver shared
 	// by callers that hold no app fence). Set through WithCommitGuard.
 	commitGuardPrefix string
+	// stampGeneration, when > 0, stamps the next managed block this client
+	// upserts with the deployment generation it serves (WithGeneration).
+	stampGeneration uint64
+	// routeCAS, when set, applies an exact-block compare-and-swap to the
+	// next managed-block commit (WithRouteCAS) — A12/T05.
+	routeCAS *routeExpectation
 }
 
 // NewClient creates a Caddy client backed by the given SSH executor.
@@ -220,6 +228,57 @@ func NewClient(exec ssh.Executor) *Client {
 func (c *Client) WithCommitGuard(guardPrefix string) *Client {
 	cp := *c
 	cp.commitGuardPrefix = guardPrefix
+	return &cp
+}
+
+// generationStampFmt is the managed block's generation identity line
+// (C01-8/9): the FIRST line inside the marker region, naming the
+// deployment generation the block serves. A comment, so caddy ignores it;
+// inside the markers, so every teploy rewrite replaces it and it can never
+// leak outside the managed region. Blocks written before this convention
+// carry no stamp (RegionGeneration reports ok=false) — the exact-block CAS
+// compares whole-region hashes, so unstamped blocks are still protected
+// byte-exactly; the stamp is what lets a refusal NAME both generations.
+const generationStampFmt = "# TEPLOY GENERATION %d"
+
+// WithGeneration returns a client whose next managed-block upsert stamps
+// the block with the given generation (A12/T05 + C01-8/9): the block the
+// operation writes names the generation it is creating, making the route
+// attributable by evidence the same way containers are (teploy.generation
+// labels) and giving the exact-block CAS its refusal evidence.
+func (c *Client) WithGeneration(generation uint64) *Client {
+	cp := *c
+	cp.stampGeneration = generation
+	return &cp
+}
+
+// routeExpectation is an exact-block compare-and-swap (A12/T05): the set of
+// region hashes the app's managed block may hold at commit time for the
+// edit to proceed, plus the generation this operation prepared against
+// (refusal evidence).
+type routeExpectation struct {
+	app                    string
+	acceptableRegionHashes []string
+	expectedGeneration     uint64
+}
+
+// WithRouteCAS returns a client whose next managed-block upsert commits
+// under an exact-block compare-and-swap: the app's managed region on the
+// live Caddyfile must hash (ManagedRegionHash) to one of the given
+// acceptable hashes — the precise predecessor block this operation
+// resolved — or the commit is refused (ErrRouteCAS) with evidence naming
+// both generations. Concurrent writers cannot interleave: a successor's
+// block swap between resolution and commit changes the region hash and
+// fences the stale edit out, independently of lock holdership (the
+// delayed-SSH-effect window guards cannot close). The expectation applies
+// to the NEXT applyManagedBlock-derived edit on this client instance.
+func (c *Client) WithRouteCAS(app string, acceptableRegionHashes []string, expectedGeneration uint64) *Client {
+	cp := *c
+	cp.routeCAS = &routeExpectation{
+		app:                    app,
+		acceptableRegionHashes: acceptableRegionHashes,
+		expectedGeneration:     expectedGeneration,
+	}
 	return &cp
 }
 
@@ -469,6 +528,12 @@ func (c *Client) RemoveMaintenance(ctx context.Context, app string) error {
 // (refusing to clean up one's own partial effects is how a fencing design
 // strands an app).
 func (c *Client) mutate(ctx context.Context, transform func(prev string) (string, error)) error {
+	return c.mutateWithCAS(ctx, nil, transform)
+}
+
+// mutateWithCAS is mutate with an optional exact-block compare-and-swap on
+// the app's managed region, evaluated inside the COMMIT command (A12/T05).
+func (c *Client) mutateWithCAS(ctx context.Context, cas *routeExpectation, transform func(prev string) (string, error)) error {
 	lockOwner, err := c.acquireLock(ctx)
 	if err != nil {
 		return err
@@ -504,9 +569,23 @@ func (c *Client) mutate(ctx context.Context, transform func(prev string) (string
 	// C01-2/C01-3 composition: the APP fence (when the caller holds one)
 	// and the CADDY-LOCK fence (this mutation's own lock, owner-tagged)
 	// both precede the rename, so a broken app holder's route edit AND a
-	// stale-broken editor's late write are refused in-shell. A refused
-	// commit propagates the fence error; the staged file is cleaned up
-	// here (bounded).
+	// stale-broken editor's late write are refused in-shell. The exact-
+	// block CAS (when the caller resolved one) chains AFTER the guards and
+	// BEFORE the rename: the region being replaced must still be the one
+	// this operation prepared against, or the edit is refused with both
+	// generations named (ErrRouteCAS). A refused commit propagates the
+	// fence/CAS error; the staged file is cleaned up here (bounded).
+	casPrefix := ""
+	if cas != nil {
+		hashes := make([]string, len(cas.acceptableRegionHashes))
+		for i, h := range cas.acceptableRegionHashes {
+			hashes[i] = h
+		}
+		if len(hashes) == 0 {
+			hashes = []string{ManagedRegionHash("")}
+		}
+		casPrefix = routeCASFragment(cas.app, hashes, cas.expectedGeneration)
+	}
 	tmp, err := c.stageCaddyfile(ctx, updated)
 	if err != nil {
 		return err
@@ -519,7 +598,10 @@ func (c *Client) mutate(ctx context.Context, transform func(prev string) (string
 			cancel()
 		}
 	}()
-	if err := c.commitCaddyfile(ctx, tmp, c.commitGuardPrefix+caddyGuardFragment(lockOwner)); err != nil {
+	if err := c.commitCaddyfile(ctx, tmp, c.commitGuardPrefix+caddyGuardFragment(lockOwner)+casPrefix); err != nil {
+		if cas != nil && routeCASRefused(err) {
+			return c.routeCASError(ctx, cas, err)
+		}
 		return err
 	}
 	committed = true
@@ -620,8 +702,22 @@ func (c *Client) adaptCheck(ctx context.Context, content string) error {
 // The app's persisted webhook fragment (webhook.go) is re-applied to the
 // rendered block, so deploys and rollbacks can no longer erase the webhook
 // route the way they erased the old runtime-API injection (audit T26).
+//
+// C01-8/9 + A12/T05: when the client carries a generation (WithGeneration)
+// the block is stamped with it, and when it carries an exact-block
+// expectation (WithRouteCAS) the COMMIT runs under the compare-and-swap —
+// both consumed by THIS edit. An expectation naming a different app is a
+// caller bug and refuses loudly rather than silently skipping the CAS.
 func (c *Client) applyManagedBlock(ctx context.Context, app string, hosts []string, block string) error {
-	return c.mutate(ctx, func(prev string) (string, error) {
+	if c.routeCAS != nil && c.routeCAS.app != app {
+		return fmt.Errorf("route CAS expectation names app %s but the edit targets %s — refusing to edit without the compare-and-swap", c.routeCAS.app, app)
+	}
+	if block != "" && c.stampGeneration > 0 {
+		block = fmt.Sprintf(generationStampFmt, c.stampGeneration) + "\n" + block
+	}
+	cas := c.routeCAS
+	c.routeCAS = nil // consume-once: one expectation guards one edit
+	return c.mutateWithCAS(ctx, cas, func(prev string) (string, error) {
 		updated, err := renderUpdated(prev, app, hosts, block)
 		if err != nil {
 			return "", err
@@ -682,12 +778,14 @@ func renderUpdated(prev, app string, hosts []string, block string) (string, erro
 // managedBlockHosts returns the site-address hosts of the app's managed
 // block (its first non-empty line), or nil when the app has no managed
 // block. Used to prove whether a legacy lb-<app> block belongs to this app
-// rather than to a distinct application of the same name (TCL-23).
+// rather than to a distinct application of the same name (TCL-23). The
+// generation stamp line (C01-8/9) is a comment inside the region and is
+// skipped — the address line is the first non-comment content line.
 func managedBlockHosts(content, app string) []string {
 	block := extractCaddyfileBlock(content, fmt.Sprintf(markerBeginFmt, app), fmt.Sprintf(markerEndFmt, app))
 	for _, line := range strings.Split(block, "\n") {
 		line = strings.TrimSpace(line)
-		if line == "" {
+		if line == "" || strings.HasPrefix(line, "# TEPLOY GENERATION ") {
 			continue
 		}
 		addr := strings.TrimSpace(strings.TrimSuffix(line, "{"))
@@ -777,6 +875,37 @@ func fenceRefused(err error) bool {
 	return strings.Contains(msg, "TEPLOY_FENCE_LOST") ||
 		strings.Contains(msg, "status 75") ||
 		strings.Contains(msg, "exit status 75")
+}
+
+// routeCASRefused reports whether a commit-command error is the exact-block
+// CAS refusing the edit (marker on stderr or exit status 76).
+func routeCASRefused(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, routeCASMarker) ||
+		strings.Contains(msg, "status 76") ||
+		strings.Contains(msg, "exit status 76")
+}
+
+// routeCASError turns a raw CAS refusal into the evidence-carrying
+// ErrRouteCAS: the live region is re-read (safe — nothing landed) to name
+// the found generation and its upstreams alongside the expected one.
+func (c *Client) routeCASError(ctx context.Context, cas *routeExpectation, cause error) error {
+	e := &ErrRouteCAS{
+		App:                cas.app,
+		ExpectedGeneration: cas.expectedGeneration,
+	}
+	if len(cas.acceptableRegionHashes) > 0 {
+		e.ExpectedRegionHash = cas.acceptableRegionHashes[0]
+	}
+	if region, present, rerr := c.ReadManagedBlock(ctx, cas.app); rerr == nil && present {
+		e.FoundRegionHash = ManagedRegionHash(region)
+		e.FoundGeneration, e.FoundStamped = RegionGeneration(region)
+		e.FoundUpstreams = RegionUpstreams(region)
+	}
+	return fmt.Errorf("%w: %v", e, cause)
 }
 
 func (c *Client) reload(ctx context.Context) error {
@@ -976,6 +1105,173 @@ const (
 	markerBeginPrefix = "# TEPLOY BEGIN "
 	markerEndPrefix   = "# TEPLOY END "
 )
+
+// extractManagedRegion returns the app's managed region MARKER-INCLUSIVE —
+// the exact bytes between and including the `# TEPLOY BEGIN <app>` and
+// `# TEPLOY END <app>` lines — or "" when the app has no region. This is
+// the exact-block CAS's identity: what ManagedRegionHash hashes and the
+// commit-time sed extraction prints, so a Go-computed expectation and the
+// server-side comparison are over identical bytes. An UNTERMINATED region
+// (begin marker with no end) yields "" here while the server-side sed
+// would print to end-of-file — the hash mismatch refuses the edit, the
+// fail-closed direction for a corrupted Caddyfile.
+func extractManagedRegion(content, app string) string {
+	var out []string
+	active := false
+	for _, line := range strings.Split(content, "\n") {
+		if name, ok := beginMarkerApp(line); ok {
+			if name == app {
+				active = true
+				out = append(out, line)
+			}
+			continue
+		}
+		if name, ok := endMarkerApp(line); ok {
+			if active && name == app {
+				out = append(out, line)
+				return strings.Join(out, "\n")
+			}
+			continue
+		}
+		if active {
+			out = append(out, line)
+		}
+	}
+	return ""
+}
+
+// ManagedRegionHash normalizes a managed region for the exact-block CAS.
+// The server-side comparison pipes sed's extraction through sha256sum; sed
+// terminates every printed line, so a non-empty region hashes as
+// region+"\n" while an absent region hashes as the empty input. Both sides
+// (Go expectations, shell fragments) MUST use this normalization.
+func ManagedRegionHash(region string) string {
+	payload := []byte(region)
+	if region != "" {
+		payload = append(append([]byte(nil), region...), '\n')
+	}
+	sum := sha256.Sum256(payload)
+	return hex.EncodeToString(sum[:])
+}
+
+// RegionGeneration parses a managed region's generation stamp line
+// (generationStampFmt). ok=false means the region carries no stamp — a
+// legacy block written before C01-8/9 or a foreign/unstamped region.
+func RegionGeneration(region string) (gen uint64, ok bool) {
+	for _, line := range strings.Split(region, "\n") {
+		t := strings.TrimSpace(line)
+		if !strings.HasPrefix(t, "# TEPLOY GENERATION ") {
+			continue
+		}
+		n, err := strconv.ParseUint(strings.TrimSpace(strings.TrimPrefix(t, "# TEPLOY GENERATION ")), 10, 64)
+		if err != nil {
+			return 0, false
+		}
+		return n, true
+	}
+	return 0, false
+}
+
+// RegionUpstreams lists the upstream dials a managed region routes to
+// (`name:port` tokens on reverse_proxy lines) — refusal evidence so a CAS
+// mismatch can name WHAT the conflicting generation serves, not just its
+// number.
+func RegionUpstreams(region string) []string {
+	var upstreams []string
+	for _, line := range strings.Split(region, "\n") {
+		code := line
+		if i := strings.IndexByte(code, '#'); i >= 0 {
+			code = code[:i]
+		}
+		if !strings.Contains(code, "reverse_proxy") {
+			continue
+		}
+		for _, tok := range strings.Fields(code) {
+			if tok == "reverse_proxy" || tok == "{" {
+				continue
+			}
+			if strings.HasPrefix(tok, "#") {
+				break
+			}
+			if i := strings.IndexByte(tok, ':'); i > 0 {
+				if _, err := strconv.Atoi(tok[i+1:]); err == nil {
+					upstreams = append(upstreams, tok)
+				}
+			}
+		}
+	}
+	return upstreams
+}
+
+// ReadManagedBlock reads the app's managed region from the live Caddyfile
+// (marker-inclusive; "" when absent). Callers resolve the region under
+// their app lock at effect-preparation time and hand ManagedRegionHash of
+// it to WithRouteCAS — the exact predecessor block identity.
+func (c *Client) ReadManagedBlock(ctx context.Context, app string) (region string, present bool, err error) {
+	data, present, err := readServerFile(ctx, c.exec, caddyfilePath)
+	if err != nil {
+		return "", false, fmt.Errorf("reading the Caddyfile for %s's managed block: %w", app, err)
+	}
+	if !present {
+		return "", false, nil
+	}
+	region = extractManagedRegion(string(data), app)
+	if region == "" {
+		return "", false, nil
+	}
+	return region, true, nil
+}
+
+// ErrRouteCAS is the exact-block compare-and-swap refusal (A12/T05): the
+// app's managed region on the live Caddyfile is NOT one this operation
+// resolved, so a newer writer switched the route in between and this edit
+// must not land over it. The error names BOTH generations — the one this
+// operation prepared against and the one the live block serves — plus the
+// live block's upstreams, the operator's reconciliation evidence.
+type ErrRouteCAS struct {
+	App                string
+	ExpectedGeneration uint64
+	FoundGeneration    uint64
+	FoundStamped       bool
+	FoundUpstreams     []string
+	ExpectedRegionHash string
+	FoundRegionHash    string
+}
+
+func (e *ErrRouteCAS) Error() string {
+	found := "unstamped (legacy or foreign)"
+	if e.FoundStamped {
+		found = fmt.Sprintf("generation %d", e.FoundGeneration)
+	}
+	upstreams := "none parsed"
+	if len(e.FoundUpstreams) > 0 {
+		upstreams = strings.Join(e.FoundUpstreams, ", ")
+	}
+	return fmt.Sprintf(
+		"route compare-and-swap refused for %s: the managed block changed since this operation resolved it — prepared against generation %d, the live block serves %s (upstreams: %s); another operation switched the route, reconcile before retrying",
+		e.App, e.ExpectedGeneration, found, upstreams)
+}
+
+// routeCASMarker is the stderr sentinel of the commit-time CAS fragment;
+// exit 76 distinguishes it from the fence guards' 75.
+const routeCASMarker = "TEPLOY_ROUTE_CAS_MISMATCH"
+
+// routeCASFragment renders the commit-time exact-block check: extract the
+// app's managed region, hash it, and refuse (marker + both generations on
+// stderr, exit 76) unless it matches one of the acceptable hashes. Composed
+// into the SAME shell command as the commit rename — after the holdership
+// guards — so the comparison happens on the target against the bytes being
+// replaced, with no client-side read in between.
+func routeCASFragment(app string, acceptable []string, expectedGeneration uint64) string {
+	begin := fmt.Sprintf(markerBeginFmt, app)
+	end := fmt.Sprintf(markerEndFmt, app)
+	extract := fmt.Sprintf("sed -n '/^%s$/,/^%s$/p' %s 2>/dev/null", begin, end, ssh.ShellQuote(caddyfilePath))
+	cases := strings.Join(acceptable, "|")
+	return fmt.Sprintf(
+		`cur=$(%s | sha256sum | cut -d' ' -f1); case "$cur" in %s) ;; *) fg=$(%s | grep -m1 '^# TEPLOY GENERATION ' | cut -d' ' -f4); printf '%s found_generation=%%s expected_generation=%d\n' "${fg:--}" %d >&2; exit 76;; esac; `,
+		extract, cases, extract, routeCASMarker, expectedGeneration, expectedGeneration,
+	)
+}
 
 // extractCaddyfileBlock returns the content between the app's exact begin
 // and end marker lines (markers excluded), or "" if not found. Marker lines
