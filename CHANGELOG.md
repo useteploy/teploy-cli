@@ -4,6 +4,20 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+### Changed
+
+- **Machine interface 2: `server list --json` emits the machine
+  envelope.** The output is now
+  `{"machine_interface":2,"servers":[{"name","id","host","user","role","tags","vpn_ip"}],"observed_at"}`
+  — every per-server field the old bare map carried, with the map key
+  promoted to a `name` field — where it previously emitted a bare
+  map-of-servers at the root. Removing the bare map from the wire is a
+  non-additive machine-interface change: the whole binary now reports
+  `machine_interface: 2` in every `--json` envelope (MI 2 = MI 1 plus
+  this reshape; no capability token changed). Machine consumers pinned
+  to MI 1 must move to the envelope; teploy-dash ships a decoder for
+  both shapes in the same release.
+
 ### Added
 
 - **Plan/apply with drift invalidation (C05).** `teploy plan` now renders

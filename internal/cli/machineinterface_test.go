@@ -71,8 +71,8 @@ func TestVersionCommandJSONEndToEnd(t *testing.T) {
 	if err := json.Unmarshal(out.Bytes(), &decoded); err != nil {
 		t.Fatalf("version --json output not JSON: %q: %v", out.String(), err)
 	}
-	if decoded["machine_interface"] != float64(1) {
-		t.Fatalf("machine_interface = %v, want 1", decoded["machine_interface"])
+	if decoded["machine_interface"] != float64(2) {
+		t.Fatalf("machine_interface = %v, want 2 (MI 2 = MI 1 + the server-list envelope reshape; nothing else)", decoded["machine_interface"])
 	}
 }
 

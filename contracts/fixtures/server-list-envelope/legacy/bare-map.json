@@ -1,0 +1,15 @@
+{
+  "prod": {
+    "id": "srv-0123456789abcdef",
+    "host": "192.0.2.10",
+    "user": "deploy",
+    "role": "app",
+    "tags": {
+      "region": "us-east"
+    },
+    "vpn_ip": "100.64.0.7"
+  },
+  "staging": {
+    "host": "192.0.2.20"
+  }
+}

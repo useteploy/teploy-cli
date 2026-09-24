@@ -1,11 +1,14 @@
 package cli
 
 import (
+	"bytes"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/useteploy/teploy/internal/config"
 )
@@ -147,5 +150,137 @@ func TestServerUpdateCmd_BadRoleRejected(t *testing.T) {
 	}
 	if cfg.Servers["prod"].Role != "app" {
 		t.Errorf("rejected update modified the config: %+v", cfg.Servers["prod"])
+	}
+}
+
+// serverListFixedTime is the deterministic clock for the envelope tests.
+var serverListFixedTime = time.Date(2026, 9, 23, 12, 0, 0, 0, time.UTC)
+
+// TestServerListJSONEnvelopeShape pins the MI 2 reshape decode-side: the
+// root IS the envelope {machine_interface, servers, observed_at} and IS
+// NOT the bare map-of-servers the pre-MI-2 CLI emitted (that shape is gone
+// on the wire — the reason this is a contract bump, not a field add).
+func TestServerListJSONEnvelopeShape(t *testing.T) {
+	path := seedServersFile(t)
+	servers, err := config.ListServers(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	if err := writeServerList(&buf, servers, true, serverListFixedTime); err != nil {
+		t.Fatalf("writeServerList: %v", err)
+	}
+
+	var decoded map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &decoded); err != nil {
+		t.Fatalf("server list --json is not valid JSON: %q: %v", buf.String(), err)
+	}
+	if decoded["machine_interface"] != float64(MachineInterface) {
+		t.Fatalf("machine_interface = %v, want %d", decoded["machine_interface"], MachineInterface)
+	}
+	if _, bare := decoded["prod"]; bare {
+		t.Fatalf("bare-map root survived the reshape (a server name is a root key): %s", buf.String())
+	}
+	entries, ok := decoded["servers"].([]any)
+	if !ok || len(entries) != 2 {
+		t.Fatalf("servers = %#v, want the two seeded entries", decoded["servers"])
+	}
+	first, _ := entries[0].(map[string]any)
+	if first["name"] != "prod" || first["host"] != "1.2.3.4" || first["user"] != "deploy" || first["role"] != "app" {
+		t.Fatalf("first entry did not carry the per-server fields: %#v", first)
+	}
+	if first["vpn_ip"] != "100.64.0.7" {
+		t.Fatalf("vpn_ip not carried over by the reshape: %#v", first)
+	}
+	if entries[1].(map[string]any)["name"] != "staging" {
+		t.Fatalf("entries not sorted by name: %s", buf.String())
+	}
+	if decoded["observed_at"] != serverListFixedTime.Format(time.RFC3339Nano) {
+		t.Fatalf("observed_at = %v", decoded["observed_at"])
+	}
+}
+
+// TestServerListJSONEnvelopeStableIDAndEmpty pins the S4 stable id riding
+// the envelope (present when the record has one, absent for id-less
+// legacy entries — omitempty, never an empty string) and the empty-fleet
+// shape: `servers` is an array (empty, not null), never a null map.
+func TestServerListJSONEnvelopeStableIDAndEmpty(t *testing.T) {
+	withID := map[string]config.Server{
+		"prod": {ID: "srv-0123456789abcdef", Host: "192.0.2.10", User: "deploy"},
+	}
+	var buf bytes.Buffer
+	if err := writeServerList(&buf, withID, true, serverListFixedTime); err != nil {
+		t.Fatal(err)
+	}
+	var decoded struct {
+		Servers []struct {
+			Name string `json:"name"`
+			ID   string `json:"id"`
+		} `json:"servers"`
+	}
+	if err := json.Unmarshal(buf.Bytes(), &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if len(decoded.Servers) != 1 || decoded.Servers[0].Name != "prod" || decoded.Servers[0].ID != "srv-0123456789abcdef" {
+		t.Fatalf("stable id not carried: %s", buf.String())
+	}
+
+	buf.Reset()
+	if err := writeServerList(&buf, nil, true, serverListFixedTime); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(buf.Bytes(), &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded.Servers == nil || len(decoded.Servers) != 0 {
+		t.Fatalf("empty fleet must decode as an empty (non-null) array: %s", buf.String())
+	}
+}
+
+// TestServerListCommandJSONEndToEnd runs the real cobra command against a
+// private HOME so the wiring (flags.JSON, HOME resolution, encoder) is
+// exercised together.
+func TestServerListCommandJSONEndToEnd(t *testing.T) {
+	seedServersFile(t)
+
+	var out bytes.Buffer
+	root := NewRootCmd("test")
+	root.SetOut(&out)
+	root.SetErr(io.Discard)
+	root.SetArgs([]string{"server", "list", "--json"})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("server list --json: %v", err)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(out.Bytes(), &decoded); err != nil {
+		t.Fatalf("output not JSON: %q: %v", out.String(), err)
+	}
+	if decoded["machine_interface"] != float64(MachineInterface) {
+		t.Fatalf("machine_interface = %v, want %d", decoded["machine_interface"], MachineInterface)
+	}
+	if _, ok := decoded["servers"].([]any); !ok {
+		t.Fatalf("servers missing from the envelope: %s", out.String())
+	}
+}
+
+// TestServerListHumanUnchanged pins the human table output: the MI 2
+// reshape touched the machine surface only.
+func TestServerListHumanUnchanged(t *testing.T) {
+	path := seedServersFile(t)
+	servers, err := config.ListServers(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var buf bytes.Buffer
+	if err := writeServerList(&buf, servers, false, serverListFixedTime); err != nil {
+		t.Fatal(err)
+	}
+	want := "NAME     HOST     USER    ROLE\n" +
+		"prod     1.2.3.4  deploy  app\n" +
+		"staging  5.6.7.8  root    app\n"
+	if buf.String() != want {
+		t.Fatalf("human output changed:\n got: %q\nwant: %q", buf.String(), want)
 	}
 }

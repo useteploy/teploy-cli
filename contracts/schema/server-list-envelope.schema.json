@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://teploy.github.io/contracts/schema/server-list-envelope.schema.json",
+  "title": "teploy server list --json (MI 2 serverListDTO — the reshape that minted MI 2)",
+  "type": "object",
+  "required": ["machine_interface", "servers", "observed_at"],
+  "additionalProperties": false,
+  "properties": {
+    "machine_interface": {
+      "type": "integer",
+      "minimum": 2,
+      "maximum": 2
+    },
+    "servers": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/serverEntry"
+      }
+    },
+    "observed_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  },
+  "$defs": {
+    "serverEntry": {
+      "type": "object",
+      "required": ["name", "host"],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "id": {
+          "type": "string",
+          "pattern": "^srv-[0-9a-f]{16}$"
+        },
+        "host": {
+          "type": "string"
+        },
+        "user": {
+          "type": "string"
+        },
+        "role": {
+          "type": "string"
+        },
+        "tags": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "vpn_ip": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}

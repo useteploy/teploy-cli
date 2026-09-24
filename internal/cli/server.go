@@ -8,6 +8,7 @@ import (
 	"os"
 	"sort"
 	"text/tabwriter"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/useteploy/teploy/internal/config"
@@ -211,26 +212,50 @@ func runServerList(flags *Flags, out io.Writer) error {
 		}
 		servers = map[string]config.Server{}
 	}
-	return writeServerList(out, servers, flags.JSON)
+	return writeServerList(out, servers, flags.JSON, time.Now().UTC())
 }
 
-func writeServerList(out io.Writer, servers map[string]config.Server, jsonOutput bool) error {
-	if jsonOutput {
-		if servers == nil {
-			servers = map[string]config.Server{}
-		}
-		return json.NewEncoder(out).Encode(servers)
-	}
-	if len(servers) == 0 {
-		fmt.Fprintln(out, "No servers configured. Use 'teploy server add' to add one.")
-		return nil
-	}
+// serverListEntryDTO is one server in the `server list --json` envelope:
+// the bare-map era's map key promoted to a `name` field, plus every field
+// of the config.Server record that era emitted (id/host/user/role/tags/
+// vpn_ip). The MI 2 reshape changed the root only; the per-server payload
+// is carried over unchanged.
+type serverListEntryDTO struct {
+	Name string `json:"name"`
+	config.Server
+}
 
+// serverListDTO is the `server list --json` envelope (MI 2, the reshape
+// that minted it — X02 §2.1: the pre-reshape bare map-of-servers root had
+// no object to carry machine_interface additively).
+type serverListDTO struct {
+	MachineInterface int                  `json:"machine_interface"`
+	Servers          []serverListEntryDTO `json:"servers"`
+	ObservedAt       time.Time            `json:"observed_at"`
+}
+
+func writeServerList(out io.Writer, servers map[string]config.Server, jsonOutput bool, observedAt time.Time) error {
 	names := make([]string, 0, len(servers))
 	for name := range servers {
 		names = append(names, name)
 	}
 	sort.Strings(names)
+
+	if jsonOutput {
+		entries := make([]serverListEntryDTO, 0, len(names))
+		for _, name := range names {
+			entries = append(entries, serverListEntryDTO{Name: name, Server: servers[name]})
+		}
+		return json.NewEncoder(out).Encode(serverListDTO{
+			MachineInterface: MachineInterface,
+			Servers:          entries,
+			ObservedAt:       observedAt,
+		})
+	}
+	if len(servers) == 0 {
+		fmt.Fprintln(out, "No servers configured. Use 'teploy server add' to add one.")
+		return nil
+	}
 
 	w := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(w, "NAME\tHOST\tUSER\tROLE")

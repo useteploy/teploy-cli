@@ -1,0 +1,21 @@
+{
+  "machine_interface": 2,
+  "observed_at": "2026-09-23T12:00:00Z",
+  "servers": [
+    {
+      "host": "192.0.2.10",
+      "id": "srv-0123456789abcdef",
+      "name": "prod",
+      "role": "app",
+      "tags": {
+        "region": "us-east"
+      },
+      "user": "deploy",
+      "vpn_ip": "100.64.0.7"
+    },
+    {
+      "host": "192.0.2.20",
+      "name": "staging"
+    }
+  ]
+}
