@@ -76,6 +76,26 @@ func LoadServers(path string) (*ServersConfig, error) {
 func ResolveServer(name string, flagHost, flagUser, flagKey string) (host, user, keyPath string, err error) {
 	// 1. Flags override everything
 	if flagHost != "" {
+		// A --host value that names a servers.yml entry resolves to that
+		// entry, the same way a positional server name or teploy.yml's
+		// server: does. It used to be taken verbatim, so `teploy log --app
+		// demo --host box1` (and every other --app/--host command) dialed
+		// the literal hostname "box1" (R02 docs lane). --user/--key still
+		// win over the entry's user.
+		if entry, ok := lookupNamedServer(flagHost); ok {
+			user = flagUser
+			if user == "" {
+				user = entry.User
+			}
+			if user == "" {
+				user = "root"
+			}
+			keyPath = flagKey
+			if keyPath == "" {
+				keyPath = os.Getenv("TEPLOY_SSH_KEY")
+			}
+			return entry.Host, user, keyPath, nil
+		}
 		host = flagHost
 		user = flagUser
 		if user == "" {
@@ -139,6 +159,25 @@ func ResolveServer(name string, flagHost, flagUser, flagKey string) (host, user,
 		user = "root"
 	}
 	return server.Host, user, envKey, nil
+}
+
+// lookupNamedServer reports the servers.yml entry registered under name.
+// A missing or unreadable servers.yml is "not named": the --host flag path
+// that uses it must keep accepting raw hosts exactly as before.
+func lookupNamedServer(name string) (Server, bool) {
+	serversPath, err := DefaultServersPath()
+	if err != nil {
+		return Server{}, false
+	}
+	cfg, err := LoadServers(serversPath)
+	if err != nil {
+		return Server{}, false
+	}
+	entry, ok := cfg.Servers[name]
+	if !ok || entry.Host == "" {
+		return Server{}, false
+	}
+	return entry, true
 }
 
 // EffectiveUser resolves the SSH user to connect as, layering teploy.yml's
