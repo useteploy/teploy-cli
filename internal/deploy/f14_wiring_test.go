@@ -467,7 +467,8 @@ func TestRollback_FixedPortTargetDisplacesCurrent(t *testing.T) {
 	}
 	stopIdx, runIdx := -1, -1
 	for i, c := range mock.Calls {
-		if stopIdx < 0 && strings.HasPrefix(c, "docker stop") && strings.Contains(c, "myapp-web-v2") {
+		// The displacement stop addresses the exact container ID (C01-9).
+		if stopIdx < 0 && strings.HasPrefix(c, "docker stop") && (strings.Contains(c, "myapp-web-v2") || strings.Contains(c, "'bbb'")) {
 			stopIdx = i
 		}
 		if runIdx < 0 && strings.HasPrefix(c, "docker run") && strings.Contains(c, "myapp-web-v1") {

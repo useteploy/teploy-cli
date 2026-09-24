@@ -177,7 +177,7 @@ func TestPredecessorSnapshot_CrashRecoveryCompensatesExactlyRecordedIDs(t *testi
 	d := NewDeployer(recovered, &out)
 	err := d.abortStateCommit(context.Background(), Config{
 		App: "web", Image: "web:new", Version: "new456", Ingress: "host", ContainerPort: 3000,
-	}, &state.AppState{SchemaVersion: 2, CurrentHash: "old123", IngressMode: "host"}, nil, nil, att, time.Now(), errBoom)
+	}, &state.AppState{SchemaVersion: 2, CurrentHash: "old123", IngressMode: "host"}, nil, nil, nil, att, nil, time.Now(), errBoom)
 	if err == nil {
 		t.Fatal("expected the commit error to surface")
 	}

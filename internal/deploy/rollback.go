@@ -133,6 +133,35 @@ func Rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg Rollbac
 		return fmt.Errorf("target version %s is already current", target)
 	}
 
+	// 2b. The rollback's GENERATION identity (C01-8/9): everything this
+	// rollback does is prepared against `fromGeneration` — the generation
+	// state.json names right now — and creates `nextGeneration`. Container
+	// names stay version-keyed, so a takeover + same-hash redeploy can put
+	// a NEWER generation's container under a name this rollback resolved;
+	// every destructive effect below (route switch, state commit, target
+	// restarts, retirement stops) is fenced on the generation identity —
+	// label checks and sidecar/CAS compares composed into the same remote
+	// command as the effect — so a stale rollback can never stop, remove,
+	// or overwrite a newer generation, no matter when its SSH commands
+	// land.
+	fromGeneration := current.Generation
+	nextGeneration := fromGeneration + 1
+	// The exact-block route CAS expectation (A12/T05): the app's managed
+	// region as resolved NOW, under the lock. The route switch commits
+	// only if this is still the live region; a successor's block refuses
+	// the switch with both generations named.
+	resolvedRouteHash := ""
+	if cfg.usesCaddy() {
+		region, _, rerr := cd.ReadManagedBlock(ctx, cfg.App)
+		if rerr != nil {
+			return fmt.Errorf("refusing to roll back %s with an unreadable route authority: %w", cfg.App, rerr)
+		}
+		resolvedRouteHash = caddy.ManagedRegionHash(region)
+	}
+	// switchedRouteHash is re-resolved after a SUCCESSFUL switch: the block
+	// this rollback wrote but has not committed.
+	switchedRouteHash := resolvedRouteHash
+
 	fmt.Fprintf(out, "Rolling back %s from %s to %s...\n", cfg.App, current.CurrentHash, target)
 
 	// 3. Find the target version's containers. This happens BEFORE anything
@@ -230,12 +259,20 @@ func Rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg Rollbac
 	// restoreDisplaced brings back the fixed-port workload displaced by host
 	// ingress. Every failure path after the displacement runs it — an error
 	// that returns while the displaced workload is still stopped leaves a
-	// host-ingress app down (audit F12).
+	// host-ingress app down (audit F12). The recreate's force-remove is
+	// generation-checked (C01-9): a successor that re-created the name at a
+	// newer generation is left strictly alone; recovery of OUR effects must
+	// not destroy the new owner's workload. Holdership is deliberately NOT
+	// checked here (A07: recovery is never fenced).
 	restoreDisplaced := func() {
 		recoveryCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()
 		for _, name := range displacedHostWeb {
-			if rerr := dk.Restart(recoveryCtx, name, nil); rerr != nil {
+			if rerr := dk.RestartFenced(recoveryCtx, name, nil, fromGeneration, ""); rerr != nil {
+				if state.GenerationFenced(rerr) {
+					fmt.Fprintf(out, "  WARNING: could not restore %s after the failed rollback — a newer generation owns the name\n", name)
+					continue
+				}
 				fmt.Fprintf(out, "  WARNING: could not restore %s after the failed rollback: %v\n", name, rerr)
 			} else {
 				fmt.Fprintf(out, "  Restored %s\n", name)
@@ -243,11 +280,12 @@ func Rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg Rollbac
 		}
 	}
 	if fixedPorts {
-		// Fence (F16): stopping the fixed-port workload is this rollback's
-		// first destructive effect; nothing of ours needs restoring yet.
-		if err := lk.Check(ctx, exec); err != nil {
-			return err
-		}
+		// Fence + generation check composed into the stop (F16 + C01-8/9):
+		// stopping the fixed-port workload is this rollback's first
+		// destructive effect — the composed command refuses when the lock
+		// was broken (holdership) or the name now belongs to a newer
+		// generation's container (identity). Nothing of ours needs
+		// restoring yet, so a refusal is a plain abort.
 		for _, c := range containers {
 			// Displace only the RUNNING web containers of the AUTHORITATIVE
 			// current generation (TCL-07). The old filter (any non-target
@@ -263,7 +301,11 @@ func Rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg Rollbac
 			if c.State != "running" {
 				continue
 			}
-			if err := dk.Stop(ctx, c.Name, 10); err != nil {
+			ref := c.Name
+			if c.ID != "" {
+				ref = c.ID
+			}
+			if err := dk.StopGenerationFenced(ctx, ref, 10, fromGeneration, lk.GuardPrefix()); err != nil {
 				// Earlier containers may already be stopped — restore them
 				// before bailing (F12).
 				restoreDisplaced()
@@ -277,26 +319,31 @@ func Rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg Rollbac
 	var started []string
 	var targetWeb []docker.Container
 	for _, c := range targetContainers {
-		// Fence (F16): each target restart is an effect; a lost fence
-		// unwinds what this rollback started and restores the displaced
-		// workload before bailing (recovery is never fenced).
-		if err := lk.Check(ctx, exec); err != nil {
-			for _, name := range started {
-				dk.Stop(ctx, name, 5)
-			}
-			restoreDisplaced()
-			return err
-		}
-		fmt.Fprintf(out, "Starting %s...\n", c.Name)
+		// Fence + generation identity composed into the recreate (F16 +
+		// C01-8/9): the holdership guard and the generation label check
+		// ride the same remote command as the force-remove — the
+		// destructive half of Restart. A lost fence unwinds what this
+		// rollback started and restores the displaced workload before
+		// bailing (recovery is never holdership-fenced); a generation
+		// refusal means a newer generation now owns the name (takeover +
+		// same-hash redeploy) and the recreate is refused instead of
+		// destroying the successor's container. The recreated container
+		// PRESERVES its labels (Recreate re-emits them), so the target
+		// workload keeps the generation identity it was created under.
+		//
 		// Recreate rather than `docker start`: Docker 29 silently fails
 		// to re-publish HostConfig.PortBindings on `docker start` when
 		// another container has taken+released the host port in the
-		// interim — a common case if rolling back after deploying a
-		// neighboring app that reused the port. Restart() inspects the
-		// stopped container, force-removes, and `docker run`s fresh
-		// with the same config, reallocating any port binding that
-		// collides with avoidPorts.
-		if err := dk.Restart(ctx, c.Name, avoidPorts); err != nil {
+		// interim — see docker.Client.Restart's doc comment.
+		fmt.Fprintf(out, "Starting %s...\n", c.Name)
+		if err := dk.RestartFenced(ctx, c.Name, avoidPorts, fromGeneration, lk.GuardPrefix()); err != nil {
+			if state.FenceLost(err) || state.GenerationFenced(err) {
+				for _, name := range started {
+					dk.Stop(ctx, name, 5)
+				}
+				restoreDisplaced()
+				return err
+			}
 			// Stop anything this rollback already (re)started, then put the
 			// displaced fixed-port workload back (F12).
 			for _, name := range started {
@@ -392,15 +439,16 @@ func Rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg Rollbac
 	// container Teploy starts (in this case, the target version's).
 	if cfg.usesCaddy() {
 		fmt.Fprintln(out, "Updating routes...")
-		// Fence (F16): the route switch commits traffic to the target —
-		// a late write would hijack a newer operation's route.
-		if err := lk.Check(ctx, exec); err != nil {
-			for _, name := range started {
-				dk.Stop(ctx, name, 5)
-			}
-			restoreDisplaced()
-			return err
-		}
+		// Fence (F16, C01-2 composition) + the exact-block CAS (A12/T05):
+		// the Caddyfile commit runs under this rollback's holdership guard
+		// AND a compare-and-swap on the managed region resolved at step 2b
+		// — stamped with the generation this rollback creates. A late
+		// write from a broken holder cannot hijack a newer operation's
+		// route, and a newer writer's block (a successor that already
+		// switched) refuses this switch with BOTH generations named
+		// instead of being overwritten.
+		cad := cd.WithGeneration(nextGeneration).
+			WithRouteCAS(cfg.App, []string{resolvedRouteHash}, fromGeneration)
 		// failRoutePhase unwinds a route-phase failure the same way a
 		// health/start failure unwinds (audit T06): the upstream-port
 		// inspections and SetRoute/SetLoadBalancerHealth used to return
@@ -433,8 +481,8 @@ func Rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg Rollbac
 				}
 				upstreams = append(upstreams, caddy.Upstream{Dial: fmt.Sprintf("%s:%d", c.Name, port)})
 			}
-			if err := cd.SetLoadBalancerHealth(ctx, cfg.App, cfg.Domain, upstreams, healthCfg.Path, tls, cfg.CaddyExtra, cfg.Cache, cfg.Firewall, cfg.Access); err != nil {
-				return failRoutePhase(fmt.Errorf("updating load balancer route: %w", err))
+			if err := cad.SetLoadBalancerHealth(ctx, cfg.App, cfg.Domain, upstreams, healthCfg.Path, tls, cfg.CaddyExtra, cfg.Cache, cfg.Firewall, cfg.Access); err != nil {
+				return failRoutePhase(routePhaseErr(err))
 			}
 			fmt.Fprintf(out, "  Traffic load-balanced across %d replicas\n", len(targetWeb))
 		} else {
@@ -442,10 +490,15 @@ func Rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg Rollbac
 			if err != nil {
 				return failRoutePhase(fmt.Errorf("inspecting target container port: %w", err))
 			}
-			if err := cd.SetRoute(ctx, cfg.App, cfg.Domain, targetWeb[0].Name, port, tls, cfg.CaddyExtra, cfg.Cache, cfg.Firewall, cfg.Access); err != nil {
-				return failRoutePhase(fmt.Errorf("updating route: %w", err))
+			if err := cad.SetRoute(ctx, cfg.App, cfg.Domain, targetWeb[0].Name, port, tls, cfg.CaddyExtra, cfg.Cache, cfg.Firewall, cfg.Access); err != nil {
+				return failRoutePhase(routePhaseErr(err))
 			}
 			fmt.Fprintln(out, "  Traffic routed to target version")
+		}
+		// The switched-to region is this rollback's own uncommitted block —
+		// the restore path's CAS accepts exactly {resolved, this}.
+		if region, _, rerr := cd.ReadManagedBlock(ctx, cfg.App); rerr == nil {
+			switchedRouteHash = caddy.ManagedRegionHash(region)
 		}
 	} else {
 		fmt.Fprintf(out, "Skipping Caddy route restore (ingress: %s)\n", cfg.Ingress)
@@ -488,9 +541,13 @@ func Rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg Rollbac
 	if digest, digestErr := dk.ContainerImageDigest(ctx, targetWeb[0].Name); digestErr == nil {
 		newState.ImageDigest = digest
 	}
-	// The commit runs under the fence (F16): the atomic rename that makes
-	// the rollback authoritative is a guarded effect.
-	if err := state.WriteFenced(ctx, exec, cfg.App, newState, lk); err != nil {
+	// The commit runs under the fence (F16) and the generation CAS
+	// (C01-8/9): the atomic rename that makes the rollback authoritative
+	// is a guarded effect chained with a compare-and-swap on the committed
+	// generation — a rollback that resolved the world at fromGeneration
+	// cannot commit over a successor's newer generation (ErrGenerationFenced
+	// naming both), so a stale rollback can never become authority.
+	if err := state.WriteFencedGeneration(ctx, exec, cfg.App, newState, lk, fromGeneration); err != nil {
 		// Fixed host ports: the target holds them. Stop it, restore the
 		// displaced workload, then remove the uncommitted target — previously
 		// this branch skipped the restore and still claimed "the original
@@ -506,7 +563,19 @@ func Rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg Rollbac
 			return fmt.Errorf("committing authoritative applied state after rollback: %w; the fixed-port workload was restored and the uncommitted target was removed", err)
 		}
 		if cfg.usesCaddy() {
-			if restoreErr := restoreRollbackRoute(ctx, cd, dk, cfg, current, containers); restoreErr != nil {
+			// The restore is CAS-fenced (A12/T05): it may only overwrite
+			// the block this rollback resolved or the one it switched to.
+			// When the commit was refused because a NEWER generation
+			// committed (ErrGenerationFenced) and that successor also
+			// switched the route, the restore refuses too — the newer
+			// generation's route is never clobbered by this rollback's
+			// compensation. When the route is still ours to undo, it is
+			// undone.
+			if restoreErr := restoreRollbackRoute(ctx, exec, out, cd, dk, cfg, current, containers, restoreRouteCAS(resolvedRouteHash, switchedRouteHash), fromGeneration); restoreErr != nil {
+				var routeCAS *caddy.ErrRouteCAS
+				if errors.As(restoreErr, &routeCAS) {
+					return fmt.Errorf("committing authoritative applied state after rollback route switch: %w; the route was left to the newer generation that owns it (%v)", err, routeCAS)
+				}
 				return fmt.Errorf("committing authoritative applied state after rollback route switch: %w; restoring the original route failed: %v; original and target workloads were left running to avoid routing to a stopped container", err, restoreErr)
 			}
 		}
@@ -533,15 +602,33 @@ func Rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg Rollbac
 		}
 	}
 	for _, c := range containers {
-		if lk != nil {
-			if err := lk.Check(ctx, exec); err != nil {
+		if c.Labels["teploy.version"] != current.CurrentHash || c.State != "running" {
+			continue
+		}
+		// C01-8/9: the retirement stop is a composed guarded effect —
+		// holdership guard + generation label check + stop, addressing the
+		// container by its exact ID from this rollback's under-lock
+		// inventory. A delayed command landing after a takeover reads the
+		// live container's immutable generation label: a newer
+		// generation's container (same names, takeover + same-hash
+		// redeploy) is REFUSED, never stopped — the property this slice
+		// exists for. A fence loss stops the sweep loudly (degraded,
+		// visible), as before.
+		ref := c.Name
+		if c.ID != "" {
+			ref = c.ID
+		}
+		fmt.Fprintf(out, "Stopping %s...\n", c.Name)
+		if err := dk.StopGenerationFenced(ctx, ref, stopTimeout, fromGeneration, lk.GuardPrefix()); err != nil {
+			if state.FenceLost(err) {
 				fmt.Fprintf(out, "Warning: current-workload cleanup stopped — %v\n", err)
 				break
 			}
-		}
-		if c.Labels["teploy.version"] == current.CurrentHash && c.State == "running" {
-			fmt.Fprintf(out, "Stopping %s...\n", c.Name)
-			dk.Stop(ctx, c.Name, stopTimeout)
+			if state.GenerationFenced(err) {
+				fmt.Fprintf(out, "Warning: retirement of %s refused — the container belongs to a newer generation (%v)\n", c.Name, err)
+				continue
+			}
+			fmt.Fprintf(out, "Warning: could not stop %s: %v\n", c.Name, err)
 		}
 	}
 
@@ -560,7 +647,112 @@ func Rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg Rollbac
 	return nil
 }
 
-func restoreRollbackRoute(ctx context.Context, cd *caddy.Client, dk *docker.Client, cfg RollbackConfig, current *state.AppState, containers []docker.Container) error {
+// restoreRollbackRoute compensates a failed rollback's route switch by
+// putting the CURRENT (rolled-back-from) release's route back — the
+// failed-rollback twin of deploy's restorePreviousRoute (C01-7's A12/T05
+// remainder). The F14 record of the version being rolled back FROM is the
+// receipt of what was serving before the switch and is AUTHORITATIVE for
+// the restore: domain, replica upstream names, the recorded primary
+// container port, TLS/extra/cache/firewall/access, and the LB health path.
+// Reconstruct-from-inspection remains only as the announced legacy
+// fallback (pre-F14 installs, unreadable records, no primary port).
+//
+// C01-8/9 + A12/T05: the restored block is stamped with fromGeneration and
+// the commit runs under the exact-block CAS over routeCAS — {the region
+// this rollback resolved, the region it switched to}. The compensation is
+// deliberately UNFENCED (A07), which is why its write must be
+// identity-fenced: a successor's block is in NEITHER set and the restore
+// refuses (caddy.ErrRouteCAS) instead of clobbering the newer generation's
+// route — the acceptance shape for the delayed-effect race.
+func restoreRollbackRoute(ctx context.Context, exec ssh.Executor, out io.Writer, cd *caddy.Client, dk *docker.Client, cfg RollbackConfig, current *state.AppState, containers []docker.Container, routeCAS []string, generation uint64) error {
+	restoreCaddy := cd.WithGeneration(generation)
+	if len(routeCAS) > 0 {
+		restoreCaddy = restoreCaddy.WithRouteCAS(cfg.App, routeCAS, generation)
+	}
+
+	rec, recErr := releasemeta.Read(ctx, exec, cfg.App, current.CurrentHash)
+	switch {
+	case recErr != nil:
+		fmt.Fprintf(out, "Warning: the release record for %s@%s could not be read (%v) — restoring the original route from live inspection instead of the recorded receipt\n", cfg.App, current.CurrentHash, recErr)
+	case rec == nil:
+		fmt.Fprintf(out, "Warning: no release record for %s@%s (pre-F14 install) — restoring the original route from live inspection instead of the recorded receipt\n", cfg.App, current.CurrentHash)
+	default:
+		if port, ok := releasemeta.PrimaryContainerPort(rec); ok {
+			return restoreRollbackRouteFromReceipt(ctx, restoreCaddy, cfg, current, rec, port)
+		}
+		fmt.Fprintf(out, "Warning: the release record for %s@%s names no primary container port — restoring the original route from live inspection instead of the recorded receipt\n", cfg.App, current.CurrentHash)
+	}
+	return restoreRollbackRouteFromInspection(ctx, restoreCaddy, dk, cfg, current, containers)
+}
+
+// routePhaseErr keeps fence/CAS refusals classified instead of wrapping
+// them into generic route failures the caller cannot distinguish.
+func routePhaseErr(err error) error {
+	var routeCAS *caddy.ErrRouteCAS
+	if errors.As(err, &routeCAS) {
+		return routeCAS
+	}
+	if state.FenceLost(err) {
+		return fmt.Errorf("switching the route back: %w", err)
+	}
+	return fmt.Errorf("updating route: %w", err)
+}
+
+// restoreRollbackRouteFromReceipt renders the rolled-back-from release's
+// route from its F14 record — zero live inspect. The upstream NAMES are
+// deterministic per release; rollback does not rename the from-version's
+// containers, so no _replaced suffix applies here.
+func restoreRollbackRouteFromReceipt(ctx context.Context, cd *caddy.Client, cfg RollbackConfig, current *state.AppState, rec *releasemeta.Record, containerPort int) error {
+	replicas := rec.Replicas
+	if replicas <= 0 {
+		replicas = 1
+	}
+	names := make([]string, replicas)
+	upstreams := make([]caddy.Upstream, replicas)
+	for i := range replicas {
+		name := docker.ReplicaContainerName(cfg.App, "web", current.CurrentHash, i+1, replicas)
+		names[i] = name
+		upstreams[i] = caddy.Upstream{Dial: fmt.Sprintf("%s:%d", name, containerPort)}
+	}
+
+	domain := rec.Domain
+	if domain == "" {
+		domain = current.Domain
+	}
+	if domain == "" {
+		domain = cfg.Domain
+	}
+
+	tls := caddy.TLS{Cert: cfg.TLSCert, Key: cfg.TLSKey, Internal: cfg.TLSInternal}
+	caddyExtra := cfg.CaddyExtra
+	cache := cfg.Cache
+	fw := cfg.Firewall
+	access := cfg.Access
+	if rec.Caddy != nil {
+		tls = caddy.TLS{Cert: rec.Caddy.TLSCert, Key: rec.Caddy.TLSKey, Internal: rec.Caddy.TLSInternal}
+		caddyExtra = rec.Caddy.CaddyExtra
+		cache = rec.Caddy.Cache
+		if rec.Caddy.Firewall != nil {
+			fw = *rec.Caddy.Firewall
+		}
+		if rec.Caddy.Access != nil {
+			access = *rec.Caddy.Access
+		}
+	}
+	healthPath := cfg.Health.withDefaults().Path
+	if rec.Health != nil && rec.Health.Path != "" {
+		healthPath = rec.Health.Path
+	}
+
+	if replicas > 1 {
+		return cd.SetLoadBalancerHealth(ctx, cfg.App, domain, upstreams, healthPath, tls, caddyExtra, cache, fw, access)
+	}
+	return cd.SetRoute(ctx, cfg.App, domain, names[0], containerPort, tls, caddyExtra, cache, fw, access)
+}
+
+// restoreRollbackRouteFromInspection is the announced legacy fallback:
+// reconstruct the original block from the running from-version containers.
+func restoreRollbackRouteFromInspection(ctx context.Context, cd *caddy.Client, dk *docker.Client, cfg RollbackConfig, current *state.AppState, containers []docker.Container) error {
 	var currentWeb []docker.Container
 	for _, container := range containers {
 		if container.Labels["teploy.version"] == current.CurrentHash && container.Labels["teploy.process"] == "web" && container.State == "running" {
