@@ -576,7 +576,10 @@ func (c *Client) AccessoryBackup(ctx context.Context, app, name, image string, e
 	plan := planAccessoryDump(app, name, image, env, workDir)
 	dumpPath := plan.artifactPath
 	s3Key := fmt.Sprintf("s3://%s/%s/accessories/%s/%s%s", s3.Bucket, app, name, timestamp, plan.ext)
-
+	if err := plan.stage(ctx, c.exec); err != nil {
+		cleanup()
+		return fmt.Errorf("staging the mysql credential file for %s (no dump was run): %w", name, err)
+	}
 	fmt.Fprintf(c.out, "Backing up %s...\n", containerName)
 	if _, err := c.exec.Run(ctx, plan.cmd); err != nil {
 		// Never leave partial backups around: they're disk-fillers at best,
@@ -634,7 +637,33 @@ func (c *Client) AccessoryRestore(ctx context.Context, app, name, image, date st
 		// restore was deterministically broken (audit F31).
 		s3Key = fmt.Sprintf("s3://%s/%s/accessories/%s/%s.sql.gz", s3.Bucket, app, name, date)
 		restorePath = tmpdir + "/restore.sql.gz"
-		restoreCmd = mysqlRestoreCmd(app+"-"+name, mysqlDB(app, env), mysqlRootPassword(env), restorePath, tmpdir+"/restore.sql")
+		qContainer := ssh.ShellQuote(app + "-" + name)
+		db := mysqlDB(app, env)
+		// Same 0600 env-file credential transport as the backup path
+		// (see there) — the password rides in no argv. The restore
+		// failure path DELIBERATELY keeps tmpdir for inspection, so the
+		// credential file must be removed by name there: keep the SQL,
+		// never the secret (C08).
+		execEnv := ""
+		if pwd := mysqlRootPassword(env); pwd != "" {
+			envFile := tmpdir + "/mysql.env"
+			if err := c.exec.Upload(ctx, strings.NewReader("MYSQL_PWD="+pwd+"\n"), envFile, "0600"); err != nil {
+				return keepTmp(fmt.Errorf("staging the mysql credential file for %s: %w", name, err))
+			}
+			execEnv = " --env-file " + ssh.ShellQuote(envFile)
+		}
+		// Same pipeline-to-redirect shape as postgres (mysql itself exits
+		// nonzero on SQL errors when reading a script, but gunzip's failure
+		// must not be masked either).
+		sqlPath := tmpdir + "/restore.sql"
+		restoreCmd = fmt.Sprintf("gunzip -c %s > %s && docker exec -i%s %s mysql -u root %s < %s",
+			ssh.ShellQuote(restorePath), ssh.ShellQuote(sqlPath), execEnv, qContainer, ssh.ShellQuote(db), ssh.ShellQuote(sqlPath))
+		// The kept-on-failure scratch dir must never keep the credential.
+		innerKeep := keepTmp
+		keepTmp = func(err error) error {
+			c.exec.Run(context.WithoutCancel(ctx), "rm -f "+ssh.ShellQuote(tmpdir+"/mysql.env"))
+			return innerKeep(err)
+		}
 	case isDBType(image, "mongo"):
 		s3Key = fmt.Sprintf("s3://%s/%s/accessories/%s/%s.archive.gz", s3.Bucket, app, name, date)
 		restorePath = tmpdir + "/restore.archive.gz"
@@ -775,6 +804,27 @@ type accessoryDumpPlan struct {
 	// the generic tar branch.
 	artifactPath string
 	cmd          string
+	// credential, when non-nil, is a secret the plan's command needs via a
+	// 0600 env-file (--env-file) rather than argv: the CALLER must upload
+	// it before running cmd and ensure it never survives a kept scratch
+	// dir (C08 transport contract).
+	credential *planCredential
+}
+
+// planCredential is the staged env-file contract between the planner and
+// its callers: content uploaded at path with mode 0600.
+type planCredential struct {
+	path    string
+	content string
+}
+
+// stage uploads the plan's credential file (no-op when the plan carries
+// none). Errors are pre-effect: no dump command has run yet.
+func (p accessoryDumpPlan) stage(ctx context.Context, exec ssh.Executor) error {
+	if p.credential == nil {
+		return nil
+	}
+	return exec.Upload(ctx, strings.NewReader(p.credential.content), p.credential.path, "0600")
 }
 
 // Consistency level labels recorded in DR bundle manifests. A raw tar of a
@@ -821,18 +871,23 @@ func planAccessoryDump(app, name, image string, env map[string]string, workDir s
 			engine = "mariadb"
 		}
 		db := mysqlDB(app, env)
-		// Root password via MYSQL_PWD container env, never a command-line
-		// flag: mysqldump/mysql argv is visible in `ps` inside the
-		// container. Absent = current behavior (passwordless root).
+		// Root password rides a 0600 env-file consumed by --env-file, never
+		// argv (mysqldump argv is visible in `ps` inside the container, and
+		// -e MYSQL_PWD puts the secret in the docker CLI's own argv on the
+		// host). Absent = current behavior (passwordless root).
 		execEnv := ""
+		var cred *planCredential
 		if pwd := mysqlRootPassword(env); pwd != "" {
-			execEnv = " -e MYSQL_PWD=" + ssh.ShellQuote(pwd)
+			envFile := workDir + "/mysql.env"
+			cred = &planCredential{path: envFile, content: "MYSQL_PWD=" + pwd + "\n"}
+			execEnv = " --env-file " + ssh.ShellQuote(envFile)
 		}
 		return accessoryDumpPlan{
 			engine: engine, method: "mysqldump", consistency: consistencyEngineDump, ext: ".sql.gz",
 			artifactPath: dumpPath,
 			cmd: fmt.Sprintf("docker exec%s %s mysqldump -u root %s > %s && gzip -c %s > %s",
 				execEnv, qContainer, ssh.ShellQuote(db), ssh.ShellQuote(dumpTmp), ssh.ShellQuote(dumpTmp), ssh.ShellQuote(dumpPath)),
+			credential: cred,
 		}
 	case isDBType(image, "mongo"):
 		return accessoryDumpPlan{
@@ -1030,9 +1085,10 @@ func mysqlDB(app string, env map[string]string) string {
 
 // mysqlRootPassword resolves the root password the mysql/mariadb containers
 // themselves honor (MYSQL_ROOT_PASSWORD, falling back to MYSQL_PASSWORD).
-// Used to inject MYSQL_PWD into docker exec as container env — never as a
-// command-line argument, which would expose the password in `ps` output.
-// Empty means no password configured; callers keep the bare command.
+// Used to stage MYSQL_PWD in a 0600 env-file consumed by `docker exec
+// --env-file` — never on any argv, which would expose the password in
+// the host's `ps` output. Empty means no password configured; callers
+// keep the bare command.
 func mysqlRootPassword(env map[string]string) string {
 	if pwd := env["MYSQL_ROOT_PASSWORD"]; pwd != "" {
 		return pwd

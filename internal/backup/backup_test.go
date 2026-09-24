@@ -296,15 +296,23 @@ func TestAccessoryBackup_MySQL_UsesRootPasswordEnv(t *testing.T) {
 		if strings.Contains(call, "mysqldump") {
 			dumpCmd = call
 		}
+		if strings.Contains(call, "sekret") {
+			t.Errorf("password must appear in NO command: %s", call)
+		}
 	}
 	if dumpCmd == "" {
 		t.Fatal("expected a mysqldump command")
 	}
-	if !strings.Contains(dumpCmd, "docker exec -e MYSQL_PWD='sekret' 'myapp-mysql' mysqldump -u root 'myapp'") {
-		t.Errorf("password must ride as MYSQL_PWD env on docker exec, got: %s", dumpCmd)
+	if !strings.Contains(dumpCmd, "docker exec --env-file '/tmp/teploy-backup.abc123/mysql.env' 'myapp-mysql' mysqldump -u root 'myapp'") {
+		t.Errorf("password must ride via docker exec --env-file, got: %s", dumpCmd)
 	}
-	if dump := dumpCmd[strings.Index(dumpCmd, "mysqldump"):]; strings.Contains(dump, "sekret") {
-		t.Errorf("password must not appear on the mysqldump argv: %s", dumpCmd)
+	if got := string(mock.Files["/tmp/teploy-backup.abc123/mysql.env"]); got != "MYSQL_PWD=sekret\n" {
+		t.Errorf("credential file content = %q", got)
+	}
+	for _, up := range mock.Calls {
+		if strings.HasPrefix(up, "UPLOAD:") && !strings.Contains(up, "mode 0600") {
+			t.Errorf("credential file must be uploaded 0600: %s", up)
+		}
 	}
 }
 
@@ -327,12 +335,18 @@ func TestAccessoryBackup_MySQL_PasswordFallbackAndAbsence(t *testing.T) {
 	}
 	found := false
 	for _, call := range mock.Calls {
-		if strings.Contains(call, "-e MYSQL_PWD='fall'") {
+		if strings.Contains(call, "--env-file") {
 			found = true
+		}
+		if strings.Contains(call, "fall") {
+			t.Errorf("password must appear in no command: %s", call)
 		}
 	}
 	if !found {
 		t.Errorf("MYSQL_PASSWORD must be used when MYSQL_ROOT_PASSWORD is absent, calls: %v", mock.Calls)
+	}
+	if got := string(mock.Files["/tmp/teploy-backup.abc123/mysql.env"]); got != "MYSQL_PWD=fall\n" {
+		t.Errorf("fallback credential file content = %q", got)
 	}
 
 	// No password configured: keep the bare command (passwordless root).
@@ -356,9 +370,9 @@ func TestAccessoryBackup_MySQL_PasswordFallbackAndAbsence(t *testing.T) {
 	}
 }
 
-// The password lands inside a shell command string: it must be single-quote
-// wrapped (ShellQuote), so values with spaces or quotes neither break the
-// command nor escape into something executable.
+// The hostile value must round-trip through the credential FILE with no
+// shell exposure at all — there is no quoting surface left to get right
+// because the password never enters a command string.
 func TestAccessoryBackup_MySQL_QuotesHostilePassword(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
@@ -379,14 +393,13 @@ func TestAccessoryBackup_MySQL_QuotesHostilePassword(t *testing.T) {
 		t.Fatalf("AccessoryBackup: %v", err)
 	}
 
-	var dumpCmd string
 	for _, call := range mock.Calls {
-		if strings.Contains(call, "mysqldump") {
-			dumpCmd = call
+		if strings.Contains(call, "p@'ss") || strings.Contains(call, "word; id") {
+			t.Errorf("hostile password must appear in no command: %s", call)
 		}
 	}
-	if !strings.Contains(dumpCmd, "-e MYSQL_PWD='p@'\"'\"'ss word; id'") {
-		t.Errorf("password must be ShellQuote-wrapped, got: %s", dumpCmd)
+	if got := string(mock.Files["/tmp/teploy-backup.abc123/mysql.env"]); got != "MYSQL_PWD=p@'ss word; id\n" {
+		t.Errorf("credential file must carry the password verbatim, got %q", got)
 	}
 }
 
@@ -413,15 +426,55 @@ func TestAccessoryRestore_MySQL_UsesRootPasswordEnv(t *testing.T) {
 		if strings.Contains(call, "mysql -u root") {
 			restoreCmd = call
 		}
+		if strings.Contains(call, "sekret") {
+			t.Errorf("password must appear in no command: %s", call)
+		}
 	}
 	if restoreCmd == "" {
 		t.Fatal("expected a mysql restore command")
 	}
-	if !strings.Contains(restoreCmd, "docker exec -i -e MYSQL_PWD='sekret' 'myapp-mysql' mysql -u root 'myapp'") {
-		t.Errorf("password must ride as MYSQL_PWD env on docker exec, got: %s", restoreCmd)
+	if !strings.Contains(restoreCmd, "docker exec -i --env-file '/tmp/teploy-restore.abc123/mysql.env' 'myapp-mysql' mysql -u root 'myapp'") {
+		t.Errorf("password must ride via docker exec --env-file, got: %s", restoreCmd)
 	}
-	if mysql := restoreCmd[strings.Index(restoreCmd, "mysql -u root"):]; strings.Contains(mysql, "sekret") {
-		t.Errorf("password must not appear on the mysql argv: %s", restoreCmd)
+	if got := string(mock.Files["/tmp/teploy-restore.abc123/mysql.env"]); got != "MYSQL_PWD=sekret\n" {
+		t.Errorf("credential file content = %q", got)
+	}
+}
+
+// TestAccessoryRestore_MySQL_FailureKeepsSQlNotSecret pins the restore
+// failure semantics of the credential file: the restore workspace is
+// deliberately kept for inspection on failure, but the mysql credential
+// must be removed by name from what stays behind.
+func TestAccessoryRestore_MySQL_FailureKeepsSQLNotSecret(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
+		ssh.MockCommand{Match: "aws s3 cp", Output: "download: done\n"},
+		ssh.MockCommand{Match: "mktemp -d '/tmp/teploy-restore.XXXXXX'", Output: "/tmp/teploy-restore.abc123\n"},
+		// The restore command fails so keepTmp runs.
+		ssh.MockCommand{Match: "gunzip -c", Err: errors.New("exit status 1: gzip: invalid")},
+		ssh.MockCommand{Match: "rm -f", Output: ""},
+	)
+
+	var buf bytes.Buffer
+	client := NewClient(mock, &buf)
+	env := map[string]string{"MYSQL_ROOT_PASSWORD": "sekret"}
+	err := client.AccessoryRestore(context.Background(), "myapp", "mysql", "mysql:8",
+		"20260101-000000", env, S3Config{Bucket: "my-bucket", Region: "us-east-1"})
+	if err == nil {
+		t.Fatal("expected the failed restore to error")
+	}
+
+	removed := false
+	for _, call := range mock.Calls {
+		if strings.Contains(call, "rm -f '/tmp/teploy-restore.abc123/mysql.env'") {
+			removed = true
+		}
+		if strings.Contains(call, "sekret") {
+			t.Errorf("password must appear in no command: %s", call)
+		}
+	}
+	if !removed {
+		t.Errorf("the kept-for-inspection workspace must have its credential file removed, calls: %v", mock.Calls)
 	}
 }
 

@@ -642,6 +642,9 @@ func (c *Client) CreateBundle(ctx context.Context, opts BundleOptions, store Bun
 		}
 		fmt.Fprintf(c.out, "Snapshotting accessory %s (%s)...\n", accName, image)
 		plan := planAccessoryDump(opts.App, accName, image, env, accWS)
+		if err := plan.stage(ctx, c.exec); err != nil {
+			return nil, fmt.Errorf("staging credential for accessory %s (no dump was run): %w", accName, err)
+		}
 		if _, err := c.exec.Run(ctx, plan.cmd); err != nil {
 			cleanup()
 			return nil, fmt.Errorf("dumping accessory %s: %w", accName, err)

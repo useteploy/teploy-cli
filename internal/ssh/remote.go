@@ -30,6 +30,9 @@ type RemoteExecutor struct {
 	// acceptNewHost records the host-key policy this connection was created
 	// with, so secondary channels (e.g. static-deploy rsync) can mirror it.
 	acceptNewHost bool
+	// commandTimeout bounds each command when the caller's context has
+	// no earlier deadline (ConnectConfig.CommandTimeout, C08).
+	commandTimeout time.Duration
 }
 
 // ConnectConfig holds the parameters for establishing an SSH connection.
@@ -39,6 +42,14 @@ type ConnectConfig struct {
 	KeyPath       string // Path to SSH private key (optional, tries defaults)
 	Password      string // if set, use password auth instead of/in addition to key auth
 	AcceptNewHost bool   // if true, auto-accept unknown host keys and save to known_hosts
+	// CommandTimeout, when > 0, bounds EVERY command run on this
+	// connection: a context with no deadline (or a later one) gets this
+	// one, so a hung remote command dies at a deadline instead of
+	// hanging the CLI forever (C08 bounded subprocess lifetime). A
+	// caller-supplied EARLIER deadline always wins. 0 keeps the historic
+	// caller-controlled behavior. Long-running work (deploys, log
+	// tails) should pass explicit deadlines rather than raise this.
+	CommandTimeout time.Duration
 }
 
 // Connect establishes an SSH connection and returns a RemoteExecutor.
@@ -108,10 +119,25 @@ func Connect(ctx context.Context, cfg ConnectConfig) (*RemoteExecutor, error) {
 		return nil, fmt.Errorf("connecting to %s: %w", cfg.Host, err)
 	}
 
-	return &RemoteExecutor{client: client, host: cfg.Host, user: cfg.User, acceptNewHost: cfg.AcceptNewHost}, nil
+	return &RemoteExecutor{client: client, host: cfg.Host, user: cfg.User, acceptNewHost: cfg.AcceptNewHost, commandTimeout: cfg.CommandTimeout}, nil
+}
+
+// boundCtx applies the connection's CommandTimeout when the caller's
+// context has no deadline (or a later one). A caller-supplied earlier
+// deadline always wins; CommandTimeout 0 leaves the context untouched.
+func (e *RemoteExecutor) boundCtx(ctx context.Context) (context.Context, context.CancelFunc) {
+	if e.commandTimeout <= 0 {
+		return ctx, func() {}
+	}
+	if d, ok := ctx.Deadline(); ok && d.Before(time.Now().Add(e.commandTimeout)) {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, e.commandTimeout)
 }
 
 func (e *RemoteExecutor) Run(ctx context.Context, cmd string) (string, error) {
+	ctx, cancel := e.boundCtx(ctx)
+	defer cancel()
 	var stdout, stderr bytes.Buffer
 	if err := e.RunStream(ctx, cmd, &stdout, &stderr); err != nil {
 		if stderr.Len() > 0 {
@@ -123,6 +149,8 @@ func (e *RemoteExecutor) Run(ctx context.Context, cmd string) (string, error) {
 }
 
 func (e *RemoteExecutor) RunStream(ctx context.Context, cmd string, stdout, stderr io.Writer) error {
+	ctx, cancel := e.boundCtx(ctx)
+	defer cancel()
 	session, err := e.client.NewSession()
 	if err != nil {
 		return fmt.Errorf("creating SSH session: %w", err)
@@ -152,6 +180,8 @@ func (e *RemoteExecutor) RunStream(ctx context.Context, cmd string, stdout, stde
 }
 
 func (e *RemoteExecutor) RunInput(ctx context.Context, cmd string, stdin io.Reader) error {
+	ctx, cancel := e.boundCtx(ctx)
+	defer cancel()
 	session, err := e.client.NewSession()
 	if err != nil {
 		return fmt.Errorf("creating SSH session: %w", err)
@@ -173,6 +203,73 @@ func (e *RemoteExecutor) RunInput(ctx context.Context, cmd string, stdin io.Read
 		_ = session.Close()
 		<-done
 		return ctx.Err()
+	}
+}
+
+// runDetailed is RemoteExecutor's native structured capture: separate
+// bounded stdout/stderr buffers, the remote exit status from the SSH
+// channel's exit-status request, and the context's cancellation vs
+// deadline distinction. See Result for the field contract.
+func (e *RemoteExecutor) runDetailed(ctx context.Context, cmd string, stdin io.Reader, limit int64) Result {
+	ctx, cancel := e.boundCtx(ctx)
+	defer cancel()
+	if res, done := contextFailureResult(ctx); done {
+		return res
+	}
+	session, err := e.client.NewSession()
+	if err != nil {
+		return Result{ExitCode: -1, Err: fmt.Errorf("creating SSH session: %w", err)}
+	}
+	defer session.Close()
+
+	var stdout, stderr limitedBuffer
+	stdout.limit, stderr.limit = limit, limit
+	session.Stdout = &stdout
+	session.Stderr = &stderr
+	if stdin != nil {
+		session.Stdin = stdin
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- session.Run(cmd)
+	}()
+
+	select {
+	case err := <-done:
+		res := Result{
+			Stdout:    stdout.bytes(),
+			Stderr:    stderr.bytes(),
+			ExitCode:  0,
+			Truncated: stdout.overflow || stderr.overflow,
+		}
+		if err == nil {
+			return res
+		}
+		var exitErr *gossh.ExitError
+		if errors.As(err, &exitErr) {
+			res.ExitCode = exitErr.Waitmsg.ExitStatus()
+			return res
+		}
+		// No exit status arrived: the command did not complete (channel
+		// torn down, connection lost).
+		res.ExitCode = -1
+		res.Err = err
+		return res
+	case <-ctx.Done():
+		_ = session.Signal(gossh.SIGTERM)
+		_ = session.Close()
+		<-done
+		res := Result{
+			Stdout:    stdout.bytes(),
+			Stderr:    stderr.bytes(),
+			ExitCode:  -1,
+			Truncated: stdout.overflow || stderr.overflow,
+		}
+		res.Canceled = errors.Is(ctx.Err(), context.Canceled)
+		res.TimedOut = errors.Is(ctx.Err(), context.DeadlineExceeded)
+		res.Err = ctx.Err()
+		return res
 	}
 }
 
@@ -396,64 +493,8 @@ func dialWithContext(ctx context.Context, network, addr string, config *gossh.Cl
 	return gossh.NewClient(c, chans, reqs), nil
 }
 
-// acceptNewHostKeyCallback returns a host key callback that accepts unknown
-// host keys (appending them to known_hosts) but rejects every verification
-// failure that is NOT "host simply unknown": key mismatches (any algorithm),
-// revoked keys, and an unreadable/malformed known_hosts database all fail
-// closed. Trust-on-first-use must mean "unknown host", never "verification
-// was inconvenient" — the previous version treated a known_hosts parse
-// failure as "nothing is known" (accepting whatever key was presented) and
-// let knownhosts.RevokedError fall through the unknown-host branch.
-func acceptNewHostKeyCallback(knownHostsPath string) gossh.HostKeyCallback {
-	existing, existingErr := knownhosts.New(knownHostsPath)
-	if existingErr != nil && errors.Is(existingErr, fs.ErrNotExist) {
-		// A missing known_hosts is the fresh-box case: nothing is known, so
-		// every host is unknown and TOFU-enrollable. Only a file that EXISTS
-		// but cannot be read or parsed fails closed below.
-		existing, existingErr = nil, nil
-	}
-	return func(hostname string, remote net.Addr, key gossh.PublicKey) error {
-		if existingErr != nil {
-			return fmt.Errorf("cannot verify host key: reading %s failed: %w", knownHostsPath, existingErr)
-		}
-		if existing != nil {
-			err := existing(hostname, remote, key)
-			if err == nil {
-				return nil // known and matches
-			}
-			// Only a genuinely unknown host (empty Want list) may be enrolled.
-			// Any non-KeyError (revocation, database problem) and any mismatch
-			// against a known host (nonempty Want, same or different algorithm)
-			// is rejected.
-			var keyErr *knownhosts.KeyError
-			if !errors.As(err, &keyErr) || len(keyErr.Want) != 0 {
-				return mismatchHint(hostname, key, err)
-			}
-		}
-		// Append to known_hosts. Ensure the parent directory exists first (a
-		// fresh box may have no ~/.ssh at all) so a merely-missing directory
-		// doesn't get treated the same as a genuine write failure below.
-		if err := os.MkdirAll(filepath.Dir(knownHostsPath), 0700); err != nil {
-			return fmt.Errorf("creating %s: %w", filepath.Dir(knownHostsPath), err)
-		}
-		line := knownhosts.Line([]string{knownhosts.Normalize(hostname)}, key)
-		f, err := os.OpenFile(knownHostsPath, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0644)
-		if err != nil {
-			// Previously returned nil here — accepting the key anyway when it
-			// couldn't be recorded. That silently disables TOFU protection: every
-			// later connection looks like another first connection, so a key
-			// change (MITM) is never detected. Fail the connection instead; a
-			// read-only home or full disk is rare enough that failing loudly
-			// beats a permanently-unprotected connection.
-			return fmt.Errorf("recording host key in %s: %w", knownHostsPath, err)
-		}
-		defer f.Close()
-		if _, err := f.WriteString(line + "\n"); err != nil {
-			return fmt.Errorf("recording host key in %s: %w", knownHostsPath, err)
-		}
-		return nil
-	}
-}
+// acceptNewHostKeyCallback, the TOFU enrollment machinery, and the
+// mismatch / change-vs-rename distinction live in hostkey.go (C08).
 
 // PublicKeyBytes returns the authorized-key line for the identity the
 // caller will actually authenticate with (audit A32): for an explicit key

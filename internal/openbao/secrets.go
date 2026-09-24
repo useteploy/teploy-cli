@@ -34,8 +34,11 @@ func appPath(app, name string) string {
 	return kvMount + "/" + app + "/" + name
 }
 
-// Put writes key=value pairs to secret/<app>/<name>. Values are shell-quoted
-// for the inner container shell.
+// Put writes key=value pairs to secret/<app>/<name>. The values ride
+// the session's stdin as one JSON object (`bao kv put <path> -`), never
+// the docker exec argv: shell-quoted values on the command line sat in
+// the server's process list for the life of every write (C08). The
+// token travels the same pipe (see bao).
 func (c *Client) Put(ctx context.Context, app, accessory, name string, kvs []string) error {
 	if accessory == "" {
 		accessory = defaultAccessory
@@ -45,15 +48,19 @@ func (c *Client) Put(ctx context.Context, app, accessory, name string, kvs []str
 		return err
 	}
 	container := accessories.ContainerName(app, accessory)
-	parts := make([]string, 0, len(kvs))
+	data := make(map[string]string, len(kvs))
 	for _, kv := range kvs {
 		k, v, ok := strings.Cut(kv, "=")
 		if !ok {
 			return fmt.Errorf("invalid key=value pair %q", kv)
 		}
-		parts = append(parts, k+"="+shellSingleQuote(v))
+		data[k] = v
 	}
-	out, err := c.bao(ctx, container, root, "kv put "+appPath(app, name)+" "+strings.Join(parts, " "))
+	payload, err := json.Marshal(data)
+	if err != nil {
+		return fmt.Errorf("encoding kv payload: %w", err)
+	}
+	out, err := c.baoInput(ctx, container, root, "kv put "+appPath(app, name)+" -", string(payload))
 	if err != nil {
 		return fmt.Errorf("kv put: %s", truncate(out, 160))
 	}
@@ -182,10 +189,4 @@ func (c *Client) baoField(ctx context.Context, container, token, args, field str
 		return "", fmt.Errorf("%s not found in response", field)
 	}
 	return v, nil
-}
-
-// shellSingleQuote wraps a value in single quotes for the inner container shell,
-// escaping embedded single quotes (mirrors the kv command's approach).
-func shellSingleQuote(s string) string {
-	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }

@@ -449,21 +449,25 @@ func doctorRegistryCheck(ctx context.Context, exec ssh.Executor, appCfg *config.
 			Detail: "no registry image ref — the image is built from source at deploy time",
 		}
 	}
-	if _, err := exec.Run(ctx, "docker manifest inspect "+ssh.ShellQuote(appCfg.Image)); err != nil {
-		switch classifyRegistryError(err) {
+	res := ssh.RunDetailed(ctx, exec, "docker manifest inspect "+ssh.ShellQuote(appCfg.Image))
+	if res.Failed() {
+		switch classifyRegistryFailure(res) {
 		case "auth":
 			return doctorCheck{
-				Name: "registry", Result: doctorFail, Detail: err.Error(),
+				Name: "registry", Result: doctorFail,
+				Detail:      registryFailureDetail(res),
 				Remediation: "store credentials on the server: teploy registry login <registry> — deploys pull as the server's docker",
 			}
 		case "missing":
 			return doctorCheck{
-				Name: "registry", Result: doctorFail, Detail: err.Error(),
+				Name: "registry", Result: doctorFail,
+				Detail:      registryFailureDetail(res),
 				Remediation: "push the image to the registry, or correct the image ref in teploy.yml",
 			}
 		default:
 			return doctorCheck{
-				Name: "registry", Result: doctorFail, Detail: err.Error(),
+				Name: "registry", Result: doctorFail,
+				Detail:      registryFailureDetail(res),
 				Remediation: "check the network path from the server to the registry (DNS, firewall, proxy)",
 			}
 		}
@@ -471,11 +475,25 @@ func doctorRegistryCheck(ctx context.Context, exec ssh.Executor, appCfg *config.
 	return doctorCheck{Name: "registry", Result: doctorOK, Detail: fmt.Sprintf("registry reachable for %s", appCfg.Image)}
 }
 
-// classifyRegistryError buckets a manifest-inspect failure into auth /
-// missing / unreachable — display classification only; the detail always
-// carries the underlying error verbatim.
-func classifyRegistryError(err error) string {
-	msg := strings.ToLower(err.Error())
+// registryFailureDetail renders the structured failure for display: the
+// command's own stderr when it produced some, the transport error
+// otherwise.
+func registryFailureDetail(res ssh.Result) string {
+	if d := res.ExitErrorText(); d != "" {
+		return d
+	}
+	return fmt.Sprintf("manifest inspect failed (exit status %d)", res.ExitCode)
+}
+
+// classifyRegistryFailure buckets a manifest-inspect failure into auth /
+// missing / unreachable. Docker's CLI exits 1 for every failure class,
+// so the exit code cannot distinguish them — classification reads the
+// tool's own stderr (via the structured Result, NOT the folded
+// executor error text, which mixes in teploy's own wrapper words).
+// Display classification only; the detail always carries the underlying
+// output verbatim.
+func classifyRegistryFailure(res ssh.Result) string {
+	msg := strings.ToLower(res.ExitErrorText())
 	switch {
 	case strings.Contains(msg, "unauthorized"), strings.Contains(msg, "authentication required"), strings.Contains(msg, "denied"):
 		return "auth"
@@ -516,21 +534,29 @@ func doctorCaddyCheck(ctx context.Context, exec ssh.Executor, appCfg *config.App
 // Absence is ok — the server binary is optional infrastructure; skew is
 // a warning because scheduled redeploys and webhook builds run on it.
 func doctorCompatCheck(ctx context.Context, deps doctorDeps, exec ssh.Executor) doctorCheck {
-	out, err := exec.Run(ctx, ssh.ShellQuote(serverTeployBinaryPath)+" version")
-	if err != nil {
-		msg := err.Error()
-		if strings.Contains(msg, "not found") || strings.Contains(msg, "no such file") || strings.Contains(msg, "status 127") {
+	res := ssh.RunDetailed(ctx, exec, ssh.ShellQuote(serverTeployBinaryPath)+" version")
+	if res.ExitCode != 0 || res.Err != nil {
+		// Exit code 127 is the remote shell's definitive "command not
+		// found" — absence of the optional server binary. Structured
+		// status, not a guess from the failure text (which breaks the
+		// moment a wrapper message contains "not found" for another
+		// reason, or localizes).
+		if res.ExitCode == 127 {
 			return doctorCheck{
 				Name: "compatibility", Result: doctorOK,
 				Detail: fmt.Sprintf("no server-side teploy binary (optional — autodeploy installs one at %s)", serverTeployBinaryPath),
 			}
 		}
+		detail := res.ExitErrorText()
+		if detail == "" {
+			detail = fmt.Sprintf("exit status %d", res.ExitCode)
+		}
 		return doctorCheck{
-			Name: "compatibility", Result: doctorWarn, Detail: err.Error(),
+			Name: "compatibility", Result: doctorWarn, Detail: detail,
 			Remediation: fmt.Sprintf("inspect %s on the server — it exists but would not run", serverTeployBinaryPath),
 		}
 	}
-	serverVersion := doctorServerTeployVersion(out)
+	serverVersion := doctorServerTeployVersion(res.TrimmedStdout())
 	if serverVersion == "" {
 		return doctorCheck{
 			Name: "compatibility", Result: doctorWarn,

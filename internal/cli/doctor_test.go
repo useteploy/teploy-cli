@@ -464,9 +464,18 @@ func TestDoctorRegistryCheck(t *testing.T) {
 			"i/o timeout": "unreachable",
 		}
 		for msg, want := range cases {
-			if got := classifyRegistryError(errors.New(msg)); got != want {
-				t.Fatalf("classifyRegistryError(%q) = %q, want %q", msg, got, want)
+			// Docker's CLI exits 1 for every class; the classifier reads
+			// the structured stderr, which mocks carry via the failure
+			// error text.
+			res := ssh.Result{ExitCode: 1, Stderr: []byte(msg)}
+			if got := classifyRegistryFailure(res); got != want {
+				t.Fatalf("classifyRegistryFailure(%q) = %q, want %q", msg, got, want)
 			}
+		}
+		// A transport failure (no stderr, error set) is unreachable-class.
+		res := ssh.Result{ExitCode: -1, Err: errors.New("ssh: connection timed out")}
+		if got := classifyRegistryFailure(res); got != "unreachable" {
+			t.Fatalf("transport failure classified %q, want unreachable", got)
 		}
 	})
 }
@@ -542,6 +551,16 @@ func TestDoctorCompatibilityCheck(t *testing.T) {
 		check := doctorCompatCheck(ctx, deps, mock)
 		if check.Result != "ok" {
 			t.Fatalf("absent server binary = %+v, want ok", check)
+		}
+	})
+	t.Run("absence is judged by exit code, not failure text", func(t *testing.T) {
+		// A non-127 failure whose TEXT contains "not found" must not be
+		// read as absence — that is exactly the text-parse the
+		// structured result replaces.
+		mock := ssh.NewMockExecutor("h", ssh.MockCommand{Match: "'/deployments/.bin/teploy' version", Err: errors.New("exit status 1: ld.so: object not found")})
+		check := doctorCompatCheck(ctx, deps, mock)
+		if check.Result != "warn" {
+			t.Fatalf("non-127 failure with not-found text = %+v, want warn", check)
 		}
 	})
 	t.Run("unreadable server binary warns", func(t *testing.T) {

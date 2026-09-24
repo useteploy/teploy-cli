@@ -252,19 +252,56 @@ func (c *Client) ensureContainer(ctx context.Context, opts SetupOptions, contain
 	return nil
 }
 
+// bao runs a bao CLI invocation inside the container. The auth token
+// rides the session's stdin, never the docker exec argv: the old form
+// embedded `BAO_TOKEN=<token>` in the `sh -c` string, which is the
+// docker exec process's command line on the HOST — the root token sat
+// in the server's process list for every vault operation (C08). The
+// inner shell reads one line from stdin into the env, then execs bao.
+// On failure the returned string carries the command's stderr (the text
+// callers scan for idempotency markers like "already in use"), matching
+// the previous error-text contract.
 func (c *Client) bao(ctx context.Context, container, token, args string) (string, error) {
-	env := "BAO_ADDR=" + containerAPIAddr
+	inner := `IFS= read -r teploy_tok; export BAO_ADDR=` + containerAPIAddr
 	if token != "" {
-		env += " BAO_TOKEN=" + token
+		inner += ` BAO_TOKEN="$teploy_tok"`
 	}
-	// docker.Exec wraps `docker exec <c> sh -c <cmd>`; we build the inner cmd.
-	out, err := c.docker.Exec(ctx, container, env+" bao "+args)
+	inner += `; exec bao ` + args
+	stdin := "\n"
+	if token != "" {
+		stdin = token + "\n"
+	}
+	out, err := c.docker.ExecInput(ctx, container, inner, strings.NewReader(stdin))
 	if err != nil {
-		// The SSH executor discards stdout on a non-zero exit and folds bao's
-		// stderr into the error. Return that text as the "output" so callers can
-		// inspect one string for messages / idempotency markers ("already in
-		// use"). On success, out is the real stdout (e.g. JSON).
-		return err.Error(), err
+		if out == "" {
+			out = err.Error()
+		}
+		return out, err
+	}
+	return out, nil
+}
+
+// baoInput runs a bao invocation whose own stdin payload follows the
+// token line on the same pipe: line 1 is the auth token (consumed by
+// the read in bao's inner shell), the remainder is payload — the JSON
+// object `bao kv put <path> -` reads. Both the token and the secret
+// values stay off every argv (C08).
+func (c *Client) baoInput(ctx context.Context, container, token, args, payload string) (string, error) {
+	inner := `IFS= read -r teploy_tok; export BAO_ADDR=` + containerAPIAddr
+	if token != "" {
+		inner += ` BAO_TOKEN="$teploy_tok"`
+	}
+	inner += `; exec bao ` + args
+	stdin := "\n" + payload
+	if token != "" {
+		stdin = token + "\n" + payload
+	}
+	out, err := c.docker.ExecInput(ctx, container, inner, strings.NewReader(stdin))
+	if err != nil {
+		if out == "" {
+			out = err.Error()
+		}
+		return out, err
 	}
 	return out, nil
 }
