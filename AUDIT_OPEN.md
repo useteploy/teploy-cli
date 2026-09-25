@@ -2578,3 +2578,17 @@ Gates: `go test ./... -count=1` 26/26 packages ok (macOS);
 internal/deploy full suite PASS on Linux (colima, bash 5.2);
 `GOOS=linux go vet ./... && GOOS=linux go build ./...` clean; `make
 quickstart` green on colima.
+
+## L14 — remote build context credential exposure (2026-09-24)
+
+Resolved in the source-sync path: Git-ignored files no longer ride along with
+remote builds, protected configuration/secret paths cannot be allowlisted,
+ordinary generated artifacts have an explicit `.teployignore` include path,
+and the resolved transfer list also drives provenance. Attempt directories
+are mode 0700. Static releases exclude protected files too. `teploy doctor`
+reports legacy exposure without mutating the server. See `docs/build-context.md`.
+
+Validation: full Go tests and vet; source-selection/rsync argument tests;
+private-directory permission tests; real repository context checks for Ship,
+Dash and Observe. This change does not remove historical uploaded copies or
+rotate potentially exposed credentials; the doctor reports those separately.

@@ -7,6 +7,15 @@ import (
 	"testing"
 )
 
+// contextFingerprint resolves dir's upload selection and fingerprints it.
+func contextFingerprint(dir string) (string, error) {
+	src, err := ResolveSource(dir)
+	if err != nil {
+		return "", err
+	}
+	return src.Fingerprint("")
+}
+
 func writeTree(t *testing.T, dir string, files map[string]string) {
 	t.Helper()
 	for rel, content := range files {
@@ -37,11 +46,11 @@ func TestContextFingerprint_DeterministicAndSensitive(t *testing.T) {
 	writeTree(t, a, base)
 	writeTree(t, b, base)
 
-	fa, err := ContextFingerprint(a, DefaultIgnore)
+	fa, err := contextFingerprint(a)
 	if err != nil {
 		t.Fatalf("ContextFingerprint: %v", err)
 	}
-	fb, err := ContextFingerprint(b, DefaultIgnore)
+	fb, err := contextFingerprint(b)
 	if err != nil {
 		t.Fatalf("ContextFingerprint: %v", err)
 	}
@@ -50,7 +59,7 @@ func TestContextFingerprint_DeterministicAndSensitive(t *testing.T) {
 	}
 
 	// Re-resolving the SAME tree (a second attempt) is stable.
-	fa2, err := ContextFingerprint(a, DefaultIgnore)
+	fa2, err := contextFingerprint(a)
 	if err != nil || fa2 != fa {
 		t.Fatalf("same tree re-fingerprinted differently: %q vs %q (%v)", fa, fa2, err)
 	}
@@ -60,7 +69,7 @@ func TestContextFingerprint_DeterministicAndSensitive(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(b, "main.go"), []byte("package mian"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if fb, err = ContextFingerprint(b, DefaultIgnore); err != nil || fb == fa {
+	if fb, err = contextFingerprint(b); err != nil || fb == fa {
 		t.Fatalf("a content change must move the fingerprint: %q vs %q (%v)", fa, fb, err)
 	}
 
@@ -69,7 +78,7 @@ func TestContextFingerprint_DeterministicAndSensitive(t *testing.T) {
 	if err := os.Rename(filepath.Join(b, "docs"), filepath.Join(b, "docz")); err != nil {
 		t.Fatal(err)
 	}
-	if fb, err = ContextFingerprint(b, DefaultIgnore); err != nil || fb == fa {
+	if fb, err = contextFingerprint(b); err != nil || fb == fa {
 		t.Fatalf("a rename must move the fingerprint (path is part of identity): %q vs %q (%v)", fa, fb, err)
 	}
 
@@ -78,7 +87,7 @@ func TestContextFingerprint_DeterministicAndSensitive(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(b, "brand/new/dir"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if fb, err = ContextFingerprint(b, DefaultIgnore); err != nil || fb == fa {
+	if fb, err = contextFingerprint(b); err != nil || fb == fa {
 		t.Fatalf("a new empty directory must move the fingerprint (TCL-38 parity): %q vs %q (%v)", fa, fb, err)
 	}
 }
@@ -98,11 +107,11 @@ func TestContextFingerprint_HonorsExcludePatterns(t *testing.T) {
 		".env.local":                "SECRET=2",
 	})
 
-	fa, err := ContextFingerprint(a, DefaultIgnore)
+	fa, err := contextFingerprint(a)
 	if err != nil {
 		t.Fatal(err)
 	}
-	fb, err := ContextFingerprint(b, DefaultIgnore)
+	fb, err := contextFingerprint(b)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -127,11 +136,11 @@ func TestContextFingerprint_SymlinkTargetMovesIdentity(t *testing.T) {
 	if err := os.Symlink("elsewhere", filepath.Join(b, "link")); err != nil {
 		t.Fatal(err)
 	}
-	fa, err := ContextFingerprint(a, DefaultIgnore)
+	fa, err := contextFingerprint(a)
 	if err != nil {
 		t.Fatal(err)
 	}
-	fb, err := ContextFingerprint(b, DefaultIgnore)
+	fb, err := contextFingerprint(b)
 	if err != nil {
 		t.Fatal(err)
 	}

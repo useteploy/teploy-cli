@@ -114,7 +114,7 @@ func WriteAttemptProvenance(ctx context.Context, exec ssh.Executor, att Attempt,
 	if err != nil {
 		return fmt.Errorf("marshaling provenance: %w", err)
 	}
-	if _, err := exec.Run(ctx, "mkdir -p "+att.Dir()); err != nil {
+	if _, err := exec.Run(ctx, att.MkdirCmd()); err != nil {
 		return fmt.Errorf("creating the attempt directory: %w", err)
 	}
 	return ssh.UploadAtomic(ctx, exec, bytes.NewReader(data), AttemptProvenancePath(att), "0600")

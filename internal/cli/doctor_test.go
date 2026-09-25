@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -18,7 +19,7 @@ import (
 // against (adding checks is additive at the end; renaming/removing is a
 // machine-interface bump).
 var doctorCheckOrder = []string{
-	"git", "config", "ssh", "docker", "disk", "registry", "caddy", "compatibility", "repair-debt",
+	"git", "config", "ssh", "docker", "disk", "registry", "caddy", "compatibility", "repair-debt", "secret-exposure",
 }
 
 // doctorHappyMock registers every remote read a fully healthy target
@@ -30,6 +31,7 @@ func doctorHappyMock() *ssh.MockExecutor {
 		ssh.MockCommand{Match: "docker manifest inspect", Output: `{"schemaVersion":2}`},
 		ssh.MockCommand{Match: "docker exec caddy", Output: `{}`},
 		ssh.MockCommand{Match: "'/deployments/.bin/teploy' version", Output: "teploy v0.1.37"},
+		ssh.MockCommand{Match: "find /deployments ", Output: ""},
 	)
 }
 
@@ -78,8 +80,8 @@ func TestDoctorAllChecksPass(t *testing.T) {
 	if ex == nil {
 		t.Fatal("expected an executor back")
 	}
-	if report.Summary != (doctorSummary{OK: 9, Warn: 0, Fail: 0}) {
-		t.Fatalf("summary = %+v, want 9 ok", report.Summary)
+	if report.Summary != (doctorSummary{OK: 10, Warn: 0, Fail: 0}) {
+		t.Fatalf("summary = %+v, want 10 ok", report.Summary)
 	}
 	if len(report.Checks) != len(doctorCheckOrder) {
 		t.Fatalf("got %d checks, want %d", len(report.Checks), len(doctorCheckOrder))
@@ -126,8 +128,8 @@ func TestDoctorJSONStableShape(t *testing.T) {
 		t.Fatalf("machine_interface = %v, want %d", doc["machine_interface"], MachineInterface)
 	}
 	checks, ok := doc["checks"].([]any)
-	if !ok || len(checks) != 9 {
-		t.Fatalf("checks = %#v, want 9 entries", doc["checks"])
+	if !ok || len(checks) != 10 {
+		t.Fatalf("checks = %#v, want 10 entries", doc["checks"])
 	}
 	for i, raw := range checks {
 		check, ok := raw.(map[string]any)
@@ -178,6 +180,7 @@ func TestDoctorHumanTable(t *testing.T) {
 		ssh.MockCommand{Match: "docker manifest inspect", Output: `{}`},
 		ssh.MockCommand{Match: "docker exec caddy", Output: `{}`},
 		ssh.MockCommand{Match: "'/deployments/.bin/teploy' version", Output: "teploy v0.1.37"},
+		ssh.MockCommand{Match: "find /deployments ", Output: ""},
 	)
 	report, _ := doctorRun(context.Background(), doctorTestDeps(mock), &Flags{}, "", doctorTestApp(), nil)
 	var out bytes.Buffer
@@ -191,7 +194,7 @@ func TestDoctorHumanTable(t *testing.T) {
 	if !strings.Contains(rendered, "fix:") {
 		t.Fatalf("table missing the remediation line:\n%s", rendered)
 	}
-	if !strings.Contains(rendered, "Summary: 8 ok, 0 warn, 1 fail") {
+	if !strings.Contains(rendered, "Summary: 9 ok, 0 warn, 1 fail") {
 		t.Fatalf("table summary line wrong:\n%s", rendered)
 	}
 	assertDoctorReadOnlyCalls(t, mock.Calls)
@@ -312,7 +315,7 @@ func TestDoctorSSHUnreachable(t *testing.T) {
 		}
 	}
 	// Every remote check is skipped-with-fail, naming SSH as the reason.
-	for _, name := range []string{"docker", "disk", "registry", "caddy", "compatibility", "repair-debt"} {
+	for _, name := range []string{"docker", "disk", "registry", "caddy", "compatibility", "repair-debt", "secret-exposure"} {
 		check := doctorFindCheck(t, report, name)
 		if check.Result != "fail" || !strings.Contains(check.Detail, "SSH unreachable") {
 			t.Fatalf("%s check = %+v, want fail/skipped (SSH unreachable)", name, check)
@@ -664,7 +667,7 @@ func TestDoctorEndToEndAllOK(t *testing.T) {
 	if err := runDoctor(doctorTestDeps(mock), &Flags{}, "", &out); err != nil {
 		t.Fatalf("runDoctor: %v", err)
 	}
-	if !strings.Contains(out.String(), "Summary: 9 ok, 0 warn, 0 fail") {
+	if !strings.Contains(out.String(), "Summary: 10 ok, 0 warn, 0 fail") {
 		t.Fatalf("human report wrong:\n%s", out.String())
 	}
 	assertDoctorReadOnlyCalls(t, mock.Calls)
@@ -681,6 +684,7 @@ func assertDoctorReadOnlyCalls(t *testing.T, calls []string) {
 		"df ",
 		"'/deployments/.bin/teploy' version",
 		"if [ ! -e '/deployments/",
+		"find /deployments ",
 	}
 	for _, call := range calls {
 		allowed := false
@@ -694,4 +698,75 @@ func assertDoctorReadOnlyCalls(t *testing.T, calls []string) {
 			t.Fatalf("doctor issued a non-read-only command: %q", call)
 		}
 	}
+}
+
+// The L14 cleanup surface: secret-bearing files older CLIs uploaded into
+// build contexts are a fail listing the paths; world-traversable build
+// dirs alone are a warn; a clean host is ok. Every command is read-only
+// (find piped to head) and nothing is deleted.
+func TestDoctorSecretExposureCheck(t *testing.T) {
+	ctx := context.Background()
+	t.Run("clean host", func(t *testing.T) {
+		mock := ssh.NewMockExecutor("h", ssh.MockCommand{Match: "find /deployments ", Output: ""})
+		if check := doctorSecretExposureCheck(ctx, mock); check.Result != "ok" {
+			t.Fatalf("check = %+v, want ok", check)
+		}
+		assertDoctorReadOnlyCalls(t, mock.Calls)
+	})
+	t.Run("leaked overlay fails with the paths", func(t *testing.T) {
+		mock := ssh.NewMockExecutor("h",
+			ssh.MockCommand{Match: "find /deployments \\( -name .git", Output: "/deployments/dash/meta/att/v1.0123456789abcdef/build/teploy.home.yml\n/deployments/dash/build/.env\n"},
+			ssh.MockCommand{Match: "find /deployments -mindepth 2", Output: "/deployments/dash/build\n"},
+		)
+		check := doctorSecretExposureCheck(ctx, mock)
+		if check.Result != "fail" {
+			t.Fatalf("check = %+v, want fail", check)
+		}
+		for _, frag := range []string{"2 secret-bearing", "teploy.home.yml", "/deployments/dash/build/.env"} {
+			if !strings.Contains(check.Detail, frag) {
+				t.Fatalf("detail must carry %q: %s", frag, check.Detail)
+			}
+		}
+		for _, frag := range []string{"rotate", "never chmod -R", "find /deployments"} {
+			if !strings.Contains(check.Remediation, frag) {
+				t.Fatalf("remediation must carry %q: %s", frag, check.Remediation)
+			}
+		}
+		assertDoctorReadOnlyCalls(t, mock.Calls)
+		for _, call := range mock.Calls {
+			if strings.Contains(call, "-delete") || strings.Contains(call, "chmod") || strings.Contains(call, "xargs") || strings.Contains(call, " rm ") {
+				t.Fatalf("doctor must never purge or chmod: %q", call)
+			}
+		}
+	})
+	t.Run("open build dir alone warns", func(t *testing.T) {
+		mock := ssh.NewMockExecutor("h",
+			ssh.MockCommand{Match: "find /deployments \\( -name .git", Output: ""},
+			ssh.MockCommand{Match: "find /deployments -mindepth 2", Output: "/deployments/ship/meta/att\n"},
+		)
+		check := doctorSecretExposureCheck(ctx, mock)
+		if check.Result != "warn" || !strings.Contains(check.Detail, "/deployments/ship/meta/att") {
+			t.Fatalf("check = %+v, want warn naming the dir", check)
+		}
+	})
+	t.Run("scan failure warns", func(t *testing.T) {
+		mock := ssh.NewMockExecutor("h", ssh.MockCommand{Match: "find /deployments ", Err: errors.New("ssh: connection lost")})
+		if check := doctorSecretExposureCheck(ctx, mock); check.Result != "warn" {
+			t.Fatalf("check = %+v, want warn", check)
+		}
+	})
+	t.Run("count caps at 200+", func(t *testing.T) {
+		var many strings.Builder
+		for i := 0; i < 201; i++ {
+			fmt.Fprintf(&many, "/deployments/a/build/x%d/.env\n", i)
+		}
+		mock := ssh.NewMockExecutor("h",
+			ssh.MockCommand{Match: "find /deployments \\( -name .git", Output: many.String()},
+			ssh.MockCommand{Match: "find /deployments -mindepth 2", Output: ""},
+		)
+		check := doctorSecretExposureCheck(ctx, mock)
+		if !strings.Contains(check.Detail, "200+ secret-bearing") || !strings.Contains(check.Detail, "(+196 more)") {
+			t.Fatalf("detail = %s", check.Detail)
+		}
+	})
 }

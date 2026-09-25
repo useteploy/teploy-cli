@@ -32,6 +32,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/useteploy/teploy/internal/build"
 	"github.com/useteploy/teploy/internal/caddy"
 	"github.com/useteploy/teploy/internal/releasemeta"
 	"github.com/useteploy/teploy/internal/ssh"
@@ -415,9 +416,17 @@ func (d *StaticDeployer) rsyncTo(ctx context.Context, srcDir, remoteDest string)
 	// must be quoted element-wise so an identity path with spaces
 	// survives (TCL-52).
 	sshCmd := ssh.ExternalSSHCommand(d.exec.Host(), d.SSHKeyPath, hostKeyPolicy == "accept-new")
-	cmd := exec.CommandContext(ctx, "rsync",
-		append([]string{"-az", "--delete", "-e", sshCmd}, src, target)...,
-	)
+	// The protected set (env files, teploy config and overlays, secrets
+	// stores — build.DefaultIgnore) never reaches a static release either
+	// (L14): a release dir is served to the public, so `source: .` would
+	// otherwise publish an overlay's credentials over HTTP. .gitignore is
+	// deliberately NOT applied here — a static source is normally a build
+	// output, which is gitignored by nature.
+	args := []string{"-az", "--delete", "-e", sshCmd}
+	for _, pattern := range build.DefaultIgnore {
+		args = append(args, "--exclude", pattern)
+	}
+	cmd := exec.CommandContext(ctx, "rsync", append(args, src, target)...)
 	cmd.Stdout = d.out
 	cmd.Stderr = d.out
 	return cmd.Run()

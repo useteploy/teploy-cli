@@ -72,9 +72,11 @@ func resolveDeployProvenance(ctx context.Context, exec ssh.Executor, out io.Writ
 	if appCfg.Context != "" && appCfg.Context != "." {
 		contextDir = filepath.Join(sourceRoot, appCfg.Context)
 	}
-	if excludes, err := build.LoadIgnore(sourceRoot); err != nil {
-		fmt.Fprintf(out, "Warning: could not load the ignore rules for the context fingerprint: %v\n", err)
-	} else if fp, err := build.ContextFingerprint(contextDir, excludes); err != nil {
+	// The fingerprint covers exactly the selection a server build uploads
+	// (build.ResolveSource), restricted to the configured context.
+	if src, err := build.ResolveSource(sourceRoot); err != nil {
+		fmt.Fprintf(out, "Warning: could not resolve the build context for the fingerprint: %v\n", err)
+	} else if fp, err := src.Fingerprint(appCfg.Context); err != nil {
 		fmt.Fprintf(out, "Warning: could not fingerprint the build context: %v\n", err)
 	} else {
 		prov.ContextFingerprint = fp

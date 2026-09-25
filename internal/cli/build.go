@@ -177,25 +177,9 @@ func runBuild(flags *Flags, version, destination string) error {
 	// incremental. The directory is scratch — the next deploy of this app
 	// prunes it once its hash leaves the protection window.
 	att := releasemeta.MustAttempt(appCfg.App, version)
-	remoteDir := att.BuildDir()
-	if _, err := executor.Run(ctx, "mkdir -p "+remoteDir); err != nil {
-		return fmt.Errorf("creating build directory: %w", err)
-	}
-	fmt.Fprintln(out, "Syncing source to server...")
-	excludes, err := build.LoadIgnore(".")
+	remoteDir, err := syncAttemptBuildContext(ctx, executor, appCfg, att, buildMode, host, user, key, out, os.Stderr)
 	if err != nil {
-		return fmt.Errorf("loading ignore rules: %w", err)
-	}
-	if err := build.Sync(ctx, build.SyncConfig{
-		LocalDir:  ".",
-		RemoteDir: remoteDir,
-		Host:      host,
-		User:      user,
-		KeyPath:   key,
-		Excludes:  excludes,
-		LinkDest:  releasemeta.PreviousAttemptBuildDir(ctx, executor, appCfg.App, att.ID),
-	}, out, os.Stderr); err != nil {
-		return fmt.Errorf("syncing source: %w", err)
+		return err
 	}
 
 	fmt.Fprintln(out, "Building image on server...")
@@ -232,4 +216,42 @@ func reportBuild(flags *Flags, image, version string, built bool) error {
 		fmt.Printf("Image ready: %s\n", image)
 	}
 	return nil
+}
+
+// syncAttemptBuildContext uploads this directory's build context into the
+// attempt's private build dir (F08 scoping, L14 selection + modes) and
+// returns that dir. The selection honors .gitignore, never sends protected
+// files (env files, teploy config and overlays, secrets stores), and fails
+// before uploading when the Dockerfile needs something the selection
+// leaves out — see internal/build/source.go for the rule.
+func syncAttemptBuildContext(ctx context.Context, executor ssh.Executor, appCfg *config.AppConfig, att releasemeta.Attempt, mode build.Mode, host, user, key string, stdout, stderr io.Writer) (string, error) {
+	src, err := build.ResolveSource(".")
+	if err != nil {
+		return "", fmt.Errorf("resolving the build context: %w", err)
+	}
+	if mode == build.ModeDockerfile {
+		if err := src.CheckDockerfile(appCfg.Context, appCfg.Dockerfile); err != nil {
+			return "", err
+		}
+	}
+	remoteDir := att.BuildDir()
+	if _, err := executor.Run(ctx, att.MkdirCmd("build")); err != nil {
+		return "", fmt.Errorf("creating build directory: %w", err)
+	}
+	if src.GitAware {
+		fmt.Fprintf(stdout, "Syncing source to server (%d files; .gitignore honored)...\n", len(src.Entries))
+	} else {
+		fmt.Fprintf(stdout, "Syncing source to server (%d entries; not a git work tree, so only .teployignore and the protected defaults apply)...\n", len(src.Entries))
+	}
+	if err := build.Sync(ctx, build.SyncConfig{
+		Source:    src,
+		RemoteDir: remoteDir,
+		Host:      host,
+		User:      user,
+		KeyPath:   key,
+		LinkDest:  releasemeta.PreviousAttemptBuildDir(ctx, executor, appCfg.App, att.ID),
+	}, stdout, stderr); err != nil {
+		return "", fmt.Errorf("syncing source: %w", err)
+	}
+	return remoteDir, nil
 }

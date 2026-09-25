@@ -110,8 +110,9 @@ func newDoctorCmd(flags *Flags, version string) *cobra.Command {
 			"app's server (or --server), remote Docker, remote disk headroom, registry\n" +
 			"reachability for the configured image (auth failures distinguished from\n" +
 			"unreachable), the Caddy admin API (caddy ingress only), teploy version\n" +
-			"compatibility with the server's teploy binary if present, and outstanding\n" +
-			"release-record repair debt.\n\n" +
+			"compatibility with the server's teploy binary if present, outstanding\n" +
+			"release-record repair debt, and secret-bearing files or world-traversable\n" +
+			"build directories older CLIs left under /deployments (listed, never deleted).\n\n" +
 			"Exit codes: 0 when no check fails, 1 when any check fails, 2 never (that\n" +
 			"code stays drift --exit-code's CI signal).",
 		Args: cobra.NoArgs,
@@ -196,7 +197,7 @@ func doctorRun(ctx context.Context, deps doctorDeps, flags *Flags, serverName st
 
 	if executor == nil {
 		const sshDown = "restore SSH connectivity (see the ssh check above), then re-run teploy doctor"
-		for _, name := range []string{"docker", "disk", "registry", "caddy", "compatibility", "repair-debt"} {
+		for _, name := range []string{"docker", "disk", "registry", "caddy", "compatibility", "repair-debt", "secret-exposure"} {
 			skipFail(name, "SSH unreachable", sshDown)
 		}
 	} else {
@@ -212,6 +213,7 @@ func doctorRun(ctx context.Context, deps doctorDeps, flags *Flags, serverName st
 		}
 		report.Checks = append(report.Checks, doctorCompatCheck(ctx, deps, executor))
 		report.Checks = append(report.Checks, doctorRepairDebtCheck(ctx, executor, appCfg))
+		report.Checks = append(report.Checks, doctorSecretExposureCheck(ctx, executor))
 	}
 
 	report.summarize()
@@ -615,4 +617,98 @@ func doctorRepairDebtCheck(ctx context.Context, exec ssh.Executor, appCfg *confi
 			debt.App, debt.Release, debt.Attempts, debt.Reason),
 		Remediation: "re-run teploy deploy (the reconciler repairs the record before its own work); teploy status shows the same debt",
 	}
+}
+
+// doctorSecretFilesProbe lists secret-bearing files where teploy uploads
+// operator source: build contexts (every path with a /build/ segment —
+// attempt contexts, the legacy shared dir, copies of either) and static
+// releases, which Caddy serves to the public. The names are the protected
+// upload set (build.DefaultIgnore) minus conventional templates; base
+// teploy.yml is left out because autodeploy checkouts legitimately hold
+// it. Read-only: find -print (the probe caps the output with head).
+const doctorSecretFilesFind = "find /deployments \\( -name .git -o -name node_modules \\) -prune -o -type f " +
+	"\\( -path '*/build/*' -o -path '/deployments/*/releases/*' \\) " +
+	"\\( -name 'teploy.*.yml' -o -name 'teploy.*.yaml' -o -name 'teploy.*.toml' -o -name .env -o -name '.env.*' " +
+	"-o -name .secrets -o -name secrets.yml -o -name secrets.yaml -o -name secrets.json -o -name secrets.toml " +
+	"-o -name secrets.env -o -name '*.secrets.env' \\) " +
+	"! -name 'teploy.example.*' ! -name .env.example ! -name .env.sample ! -name .env.template " +
+	"-print"
+
+const doctorSecretFilesProbe = doctorSecretFilesFind + " 2>/dev/null | head -n 201"
+
+// doctorOpenBuildDirsProbe lists build-context directories other host
+// users can traverse (o+x): the legacy shared build dir and the attempt
+// root. Read-only.
+const doctorOpenBuildDirsProbe = "find /deployments -mindepth 2 -maxdepth 3 -type d " +
+	"\\( -path '/deployments/*/build' -o -path '/deployments/*/meta/att' \\) -perm -001 -print 2>/dev/null | head -n 201"
+
+// doctorSecretExposureCheck finds what teploy CLIs before L14 left behind:
+// they uploaded the whole source tree, gitignored files included, so
+// teploy.<dest>.yml overlays and env files (live: an admin password) sat
+// in build directories other host users could read. A secret-bearing file
+// is a fail — it stays on disk until someone deletes it, and whatever it
+// held must be rotated; an open directory alone is a warn. Nothing is
+// deleted or chmodded here: the remediation names the commands.
+func doctorSecretExposureCheck(ctx context.Context, exec ssh.Executor) doctorCheck {
+	files, err := exec.Run(ctx, doctorSecretFilesProbe)
+	if err != nil {
+		return doctorCheck{
+			Name: "secret-exposure", Result: doctorWarn, Detail: "could not scan /deployments: " + err.Error(),
+			Remediation: "check that the SSH user can read /deployments, then re-run teploy doctor",
+		}
+	}
+	dirs, err := exec.Run(ctx, doctorOpenBuildDirsProbe)
+	if err != nil {
+		return doctorCheck{
+			Name: "secret-exposure", Result: doctorWarn, Detail: "could not scan /deployments: " + err.Error(),
+			Remediation: "check that the SSH user can read /deployments, then re-run teploy doctor",
+		}
+	}
+	secretPaths, openDirs := doctorLines(files), doctorLines(dirs)
+	if len(secretPaths) > 0 {
+		return doctorCheck{
+			Name: "secret-exposure", Result: doctorFail,
+			Detail: fmt.Sprintf("%s secret-bearing file(s) in uploaded build contexts or static releases (teploy before L14 uploaded gitignored files): %s",
+				doctorCount(secretPaths), doctorSample(secretPaths)),
+			Remediation: "on the server, list every file with `" + doctorSecretFilesFind + "`, review, delete each with rm, " +
+				"and rotate every credential they held — current teploy never uploads them. Tighten open build dirs with chmod 700 on the directory only " +
+				"(never chmod -R a build context: Docker COPY carries its file modes into images)",
+		}
+	}
+	if len(openDirs) > 0 {
+		return doctorCheck{
+			Name: "secret-exposure", Result: doctorWarn,
+			Detail: fmt.Sprintf("no secret-bearing files found, but %s build director(ies) are traversable by other host users: %s",
+				doctorCount(openDirs), doctorSample(openDirs)),
+			Remediation: "chmod 700 each listed directory (the directory only — never chmod -R a build context: Docker COPY carries its file modes into images); deploys from current teploy create them 0700",
+		}
+	}
+	return doctorCheck{Name: "secret-exposure", Result: doctorOK, Detail: "no secret-bearing files in build contexts or static releases; build directories are private"}
+}
+
+func doctorLines(out string) []string {
+	var lines []string
+	for _, l := range strings.Split(out, "\n") {
+		if l = strings.TrimSpace(l); l != "" {
+			lines = append(lines, l)
+		}
+	}
+	return lines
+}
+
+// doctorCount renders a probe's hit count; the probes stop at 201 lines,
+// so 201 means "more than 200".
+func doctorCount(lines []string) string {
+	if len(lines) > 200 {
+		return "200+"
+	}
+	return strconv.Itoa(len(lines))
+}
+
+func doctorSample(lines []string) string {
+	const shown = 5
+	if len(lines) <= shown {
+		return strings.Join(lines, ", ")
+	}
+	return strings.Join(lines[:shown], ", ") + fmt.Sprintf(" (+%d more)", len(lines)-shown)
 }
