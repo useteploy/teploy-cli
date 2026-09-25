@@ -463,7 +463,7 @@ func (d *Deployer) DeployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 		if prev := releasemeta.PreviousAttemptAssetsDir(ctx, d.exec, cfg.App, att.ID); prev != "" {
 			seed = prev
 		}
-		seedCmd := "mkdir -p " + ssh.ShellQuote(assetDir)
+		seedCmd := att.MkdirCmd("assets")
 		if seed != "" {
 			seedCmd += " && cp -a " + ssh.ShellQuote(seed+"/.") + " " + ssh.ShellQuote(assetDir+"/")
 		}

@@ -133,7 +133,7 @@ func buildContainerEnvFiles(ctx context.Context, executor ssh.Executor, app stri
 		return nil, fmt.Errorf("buildContainerEnvFiles requires a deploy attempt (F08) — the env file is attempt-scoped")
 	}
 	path := att.EnvFile()
-	if _, err := executor.Run(ctx, "mkdir -p "+ssh.ShellQuote(att.Dir())); err != nil {
+	if _, err := executor.Run(ctx, att.MkdirCmd()); err != nil {
 		return nil, fmt.Errorf("creating attempt directory: %w", err)
 	}
 	if err := executor.Upload(ctx, strings.NewReader(sb.String()), path, "0600"); err != nil {

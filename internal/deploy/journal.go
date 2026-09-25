@@ -108,7 +108,7 @@ func (d *Deployer) persistPredecessorSnapshot(ctx context.Context, att releaseme
 	// The path segments are grammar-validated (app via releasemeta's
 	// ValidateName, hash via validHash, random hex id), so — like
 	// releasemeta.Write's own meta mkdir — the path needs no quoting.
-	if _, err := d.exec.Run(ctx, "mkdir -p "+att.Dir()); err != nil {
+	if _, err := d.exec.Run(ctx, att.MkdirCmd()); err != nil {
 		return fmt.Errorf("creating the attempt directory: %w", err)
 	}
 	return ssh.UploadAtomic(ctx, d.exec, bytes.NewReader(data), predecessorSnapshotPath(att), "0600")
@@ -242,7 +242,7 @@ func (d *Deployer) persistReadinessReceipt(ctx context.Context, att releasemeta.
 	if err != nil {
 		return fmt.Errorf("marshaling the readiness receipt: %w", err)
 	}
-	if _, err := d.exec.Run(ctx, "mkdir -p "+att.Dir()); err != nil {
+	if _, err := d.exec.Run(ctx, att.MkdirCmd()); err != nil {
 		return fmt.Errorf("creating the attempt directory: %w", err)
 	}
 	return ssh.UploadAtomic(ctx, d.exec, bytes.NewReader(data), readinessReceiptPath(att), "0600")
