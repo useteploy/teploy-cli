@@ -459,26 +459,9 @@ func deployAppConfig(flags *Flags, appCfg *config.AppConfig, serverName, image, 
 			// previous attempt's build dir as rsync's --link-dest basis so
 			// the fresh directory still transfers incrementally and
 			// hardlink-shares unchanged files.
-			remoteDir := att.BuildDir()
-			if _, err := executor.Run(ctx, "mkdir -p "+remoteDir); err != nil {
-				return fmt.Errorf("creating build directory: %w", err)
-			}
-
-			fmt.Println("Syncing source to server...")
-			excludes, err := build.LoadIgnore(".")
+			remoteDir, err := syncAttemptBuildContext(ctx, executor, appCfg, att, buildMode, host, user, key, os.Stdout, os.Stderr)
 			if err != nil {
-				return fmt.Errorf("loading ignore rules: %w", err)
-			}
-			if err := build.Sync(ctx, build.SyncConfig{
-				LocalDir:  ".",
-				RemoteDir: remoteDir,
-				Host:      host,
-				User:      user,
-				KeyPath:   key,
-				Excludes:  excludes,
-				LinkDest:  releasemeta.PreviousAttemptBuildDir(ctx, executor, appCfg.App, att.ID),
-			}, os.Stdout, os.Stderr); err != nil {
-				return fmt.Errorf("syncing source: %w", err)
+				return err
 			}
 
 			fmt.Println("Building image on server...")

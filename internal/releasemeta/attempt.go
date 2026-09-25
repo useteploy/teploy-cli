@@ -112,6 +112,27 @@ func (a Attempt) Dir() string {
 // BuildDir is where the attempt's rsync'd build context lives.
 func (a Attempt) BuildDir() string { return a.Dir() + "/build" }
 
+// MkdirCmd is the shell command every writer of the attempt's artifacts
+// runs first (L14): create the attempt directory (plus any subdirectories
+// named) and make it owner-only. The attempt dir holds the build context,
+// resolved env file and receipts; at 0700 nothing inside is reachable by
+// other host users whatever the modes beneath it — which matters because
+// rsync -a keeps the operator's local modes (usually 0644) on the build
+// context, and those modes must stay as they are: Docker COPY carries them
+// into the image, where a non-root process has to read them. The attempt
+// root is tightened too (hides attempt names, closes dirs older CLIs left
+// at 0755), best-effort only there: a root owned by another account is not
+// ours to chmod, and the attempt dir alone already seals the contents.
+// Paths are grammar-validated (NewAttempt), so they need no quoting.
+func (a Attempt) MkdirCmd(subdirs ...string) string {
+	dirs := []string{a.Dir()}
+	for _, s := range subdirs {
+		dirs = append(dirs, a.Dir()+"/"+s)
+	}
+	return "mkdir -p " + strings.Join(dirs, " ") + " && chmod 700 " + a.Dir() +
+		" && { chmod 700 " + attemptRoot(a.App) + " 2>/dev/null || true; }"
+}
+
 // EnvFile is the attempt's resolved container env file (docker --env-file).
 func (a Attempt) EnvFile() string { return a.Dir() + "/env" }
 

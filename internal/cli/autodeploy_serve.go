@@ -600,7 +600,10 @@ func triggerAutoDeploy(ctx context.Context, executor ssh.Executor, app, branch, 
 	defer state.ReleaseLockFenced(executor, lk, app)
 	lk.StartRenewal(executor)
 
-	if _, err := executor.Run(ctx, "mkdir -p "+ssh.ShellQuote(buildDir)); err != nil {
+	// Owner-only (L14): the checkout is build input other host users have
+	// no business reading. Only the directory — its files keep their
+	// checkout modes, which Docker COPY carries into the image.
+	if _, err := executor.Run(ctx, "mkdir -p "+ssh.ShellQuote(buildDir)+" && chmod 700 "+ssh.ShellQuote(buildDir)); err != nil {
 		return fmt.Errorf("creating build directory: %w", err)
 	}
 	if err := fetchCheckout(ctx, executor, buildDir, branch, commit, out); err != nil {

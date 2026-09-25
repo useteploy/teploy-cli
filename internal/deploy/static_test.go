@@ -321,3 +321,32 @@ func TestHashDir_Stable(t *testing.T) {
 		t.Errorf("hash didn't change after content change")
 	}
 }
+
+// A static release is served to the public, so the protected set (env
+// files, teploy config and overlays, secrets stores) must never be in the
+// upload even when `source:` points at the project root (L14). A fake
+// rsync on PATH records the argv the deployer hands it.
+func TestStaticRsync_ExcludesProtectedFiles(t *testing.T) {
+	bin := t.TempDir()
+	record := filepath.Join(bin, "argv")
+	fake := "#!/bin/sh\nprintf '%s\\n' \"$@\" > '" + record + "'\n"
+	if err := os.WriteFile(filepath.Join(bin, "rsync"), []byte(fake), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	d := NewStaticDeployer(ssh.NewMockExecutor("192.0.2.1"), &bytes.Buffer{})
+	if err := d.rsyncTo(context.Background(), staticTestSource(t), "/deployments/site/releases/abc.tmp"); err != nil {
+		t.Fatalf("rsyncTo: %v", err)
+	}
+	raw, err := os.ReadFile(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	argv := "\n" + string(raw)
+	for _, pattern := range []string{".env", ".env.*", "teploy.*.yml", "/teploy.yml", "secrets.env"} {
+		if !strings.Contains(argv, "\n--exclude\n"+pattern+"\n") {
+			t.Errorf("static rsync must exclude %q; argv:%s", pattern, argv)
+		}
+	}
+}

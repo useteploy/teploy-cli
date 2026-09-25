@@ -101,26 +101,9 @@ func (s *singleServerDeployer) deployApp(ctx context.Context, appCfg *config.App
 			// Attempt-scoped build context (F08): a fresh directory per
 			// (release, attempt), with the previous attempt's build dir as
 			// rsync's --link-dest basis so transfer stays incremental.
-			remoteDir := att.BuildDir()
-			if _, err := s.exec.Run(ctx, "mkdir -p "+remoteDir); err != nil {
-				return fmt.Errorf("creating build directory: %w", err)
-			}
-
-			fmt.Fprintln(s.out, "Syncing source to server...")
-			excludes, err := build.LoadIgnore(".")
+			remoteDir, err := syncAttemptBuildContext(ctx, s.exec, appCfg, att, buildMode, s.exec.Host(), s.exec.User(), s.keyPath, s.out, s.out)
 			if err != nil {
-				return fmt.Errorf("loading ignore rules: %w", err)
-			}
-			if err := build.Sync(ctx, build.SyncConfig{
-				LocalDir:  ".",
-				RemoteDir: remoteDir,
-				Host:      s.exec.Host(),
-				User:      s.exec.User(),
-				KeyPath:   s.keyPath,
-				Excludes:  excludes,
-				LinkDest:  releasemeta.PreviousAttemptBuildDir(ctx, s.exec, appCfg.App, att.ID),
-			}, s.out, s.out); err != nil {
-				return fmt.Errorf("syncing source: %w", err)
+				return err
 			}
 
 			fmt.Fprintln(s.out, "Building image on server...")
