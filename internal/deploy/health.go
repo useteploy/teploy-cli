@@ -139,11 +139,17 @@ func (d *Deployer) HealthCheckPublic(ctx context.Context, port int) error {
 // actually published on rather than assuming localhost. Falls back to the
 // localhost behavior when the address cannot be read.
 func (d *Deployer) HealthCheckAt(ctx context.Context, port int, containerName string) error {
+	return d.HealthCheckAtWithConfig(ctx, port, containerName, defaultHealthConfig())
+}
+
+// HealthCheckAtWithConfig probes the published address with the selected
+// readiness contract, including its mode, path and total deadline.
+func (d *Deployer) HealthCheckAtWithConfig(ctx context.Context, port int, containerName string, cfg HealthConfig) error {
 	bindHost := ""
 	if containerName != "" {
 		bindHost = docker.NewClient(d.exec).HostBindIP(ctx, containerName)
 	}
-	return d.healthCheck(ctx, port, defaultHealthConfig(), bindHost)
+	return d.healthCheck(ctx, port, cfg, bindHost)
 }
 
 // checkHealth performs a single AUTO-mode attempt (the compatibility
