@@ -10,8 +10,11 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/useteploy/teploy/internal/config"
 	"github.com/useteploy/teploy/internal/deploy"
 	"github.com/useteploy/teploy/internal/docker"
+	"github.com/useteploy/teploy/internal/releasemeta"
+	"github.com/useteploy/teploy/internal/ssh"
 	"github.com/useteploy/teploy/internal/state"
 )
 
@@ -72,7 +75,11 @@ func runHealth(flags *Flags, appName string) error {
 	// `bind:` is not reachable at localhost, so a localhost-only probe reports
 	// a perfectly healthy app as failed — the same trap that made every deploy
 	// of a bound app an outage until the deployer learned to read the bind.
-	if err := deployer.HealthCheckAt(ctx, current.CurrentPort, docker.ContainerName(appCfg.App, "web", current.CurrentHash)); err != nil {
+	health, err := healthConfigForCommand(ctx, executor, appCfg, current.CurrentHash, appName != "")
+	if err == nil {
+		err = deployer.HealthCheckAtWithConfig(ctx, current.CurrentPort, docker.ContainerName(appCfg.App, "web", current.CurrentHash), health)
+	}
+	if err != nil {
 		if flags.JSON {
 			if encodeErr := json.NewEncoder(os.Stdout).Encode(healthDTO{App: appCfg.App, Host: executor.Host(), Port: current.CurrentPort, Healthy: false, Error: err.Error(), ObservedAt: time.Now().UTC()}); encodeErr != nil {
 				return encodeErr
@@ -88,4 +95,20 @@ func runHealth(flags *Flags, appName string) error {
 
 	fmt.Println("Health check passed")
 	return nil
+}
+
+func healthConfigForCommand(ctx context.Context, executor ssh.Executor, app *config.AppConfig, version string, stateOnly bool) (deploy.HealthConfig, error) {
+	if !stateOnly {
+		return healthConfigFrom(app.Health), nil
+	}
+	// --app has no local manifest: use the current release's recorded contract.
+	record, err := releasemeta.Read(ctx, executor, app.App, version)
+	if err != nil {
+		return deploy.HealthConfig{}, err
+	}
+	if record == nil || record.Health == nil {
+		return deploy.HealthConfig{}, fmt.Errorf("health configuration for %s@%s is unavailable; run health from its app directory", app.App, version)
+	}
+	h := record.Health
+	return healthConfigFrom(config.AppHealthConfig{Mode: h.Mode, Path: h.Path, TimeoutSeconds: h.TimeoutSeconds, IntervalSeconds: h.IntervalSeconds}), nil
 }

@@ -343,7 +343,7 @@ teploy stop / start / restart             # container lifecycle
 teploy logs [--tail N] [--process web]    # stream container logs
 teploy status                             # show running containers
 teploy stats                              # CPU/RAM per container
-teploy health                             # run health check on live app
+teploy health                             # run configured readiness check on live app
 teploy log                                # deploy history
 teploy exec <server> <cmd>                # run a command on the server (SSH)
 teploy app exec -- <cmd>                  # run a command in the app container (migrations, etc.)
