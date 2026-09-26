@@ -1320,12 +1320,15 @@ func healthConfigFrom(h config.AppHealthConfig) deploy.HealthConfig {
 }
 
 // isDigestPinned reports whether an image reference is content-addressed
-// (`repo@sha256:...`). Such a reference names exactly one set of bytes forever,
+// (`repo@sha256:...` or a full local `sha256:...` ID). Such a reference names exactly one set of bytes forever,
 // so a local copy of it can never be out of date. Everything else — every tag,
 // and a bare repo (which Docker resolves to `:latest`) — is mutable: the
 // registry can move it under us at any time, and "looks like a git sha" is a
 // convention nothing enforces, so tags are not special-cased here.
 func isDigestPinned(image string) bool {
+	if deploy.ImageDigestFromRef(image) != "" {
+		return true
+	}
 	i := strings.LastIndex(image, "@")
 	if i < 0 {
 		return false
@@ -1365,6 +1368,9 @@ func ensureImage(ctx context.Context, dk *docker.Client, image string, out io.Wr
 	if exists && isDigestPinned(image) {
 		fmt.Fprintf(out, "  Using local image %s (digest-pinned, cannot be stale)\n", image)
 		return nil
+	}
+	if strings.HasPrefix(image, "sha256:") && deploy.ImageDigestFromRef(image) != "" {
+		return fmt.Errorf("local image ID %s is absent from the server; build or load it there before deploying", image)
 	}
 	fmt.Fprintf(out, "Pulling image %s...\n", image)
 	if err := dk.Pull(ctx, image); err != nil {

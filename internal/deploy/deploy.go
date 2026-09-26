@@ -1762,14 +1762,18 @@ func containerPort(c Config) int {
 }
 
 // ImageDigestFromRef extracts the digest of a digest-pinned image
-// reference ("repo@sha256:<64hex>"), or "" for every other reference
+// reference ("repo@sha256:<64hex>") or a full local "sha256:<64hex>" ID,
+// or "" for every other reference
 // shape. Exported for the CLI's plan-time provenance, which must apply
 // the SAME like-for-like rule the deployed record applies (a pinned ref
 // is identified by its manifest digest, a mutable ref by docker's
 // resolved content ID) or plan/receipt equality compares apples to
 // oranges.
 func ImageDigestFromRef(image string) string {
-	if _, digest, ok := strings.Cut(image, "@"); ok && strings.HasPrefix(digest, "sha256:") && len(digest) == len("sha256:")+64 {
+	if strings.HasPrefix(image, "sha256:") && len(image) == 71 && docker.IsImageID(image) {
+		return image
+	}
+	if repo, digest, ok := strings.Cut(image, "@"); ok && repo != "" && strings.HasPrefix(digest, "sha256:") && len(digest) == 71 && docker.IsImageID(digest) {
 		return digest
 	}
 	return ""

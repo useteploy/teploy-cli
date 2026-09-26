@@ -1,5 +1,13 @@
 # Open audit items
 
+## 2026-09-25 — local image identity
+
+Full local `sha256:<64hex>` image IDs now count as immutable in deployment
+plans and receipts. An existing ID is used without a registry request; an absent
+ID refuses with build/load guidance. Named mutable tags still pull on every
+deploy. Regression tests cover both cache states and the provenance identity,
+including malformed digests. Full Go vet and tests passed.
+
 Unresolved findings for this repository from the ChatGPT-led audit series.
 Pass 1-5 (2026-09-09 through 2026-09-11, register: teploy-neutron-lullmail
 expanded audit) closed fully below. Pass 6 (2026-09-17, 78 findings F01-F78,

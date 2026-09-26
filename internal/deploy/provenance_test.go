@@ -200,3 +200,15 @@ func TestDeploy_NoPlanDigestNoFalseAlarm(t *testing.T) {
 		t.Errorf("nothing to compare must not warn:\n%s", buf.String())
 	}
 }
+
+func TestFullLocalImageIDIsItsOwnProvenance(t *testing.T) {
+	id := "sha256:" + strings.Repeat("b", 64)
+	if got := plannedImageDigest(id, id, nil); got != id {
+		t.Fatalf("got %q, want %q", got, id)
+	}
+	for _, invalid := range []string{"sha256:" + strings.Repeat("z", 64), "sha256:abcdef123456", "@" + id, "repo@sha256:" + strings.Repeat("z", 64)} {
+		if got := ImageDigestFromRef(invalid); got != "" {
+			t.Fatalf("invalid identity %q returned %q", invalid, got)
+		}
+	}
+}

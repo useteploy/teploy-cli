@@ -208,3 +208,28 @@ func TestIsDigestPinned(t *testing.T) {
 		}
 	}
 }
+
+func TestEnsureImageLocalIDNeverPulls(t *testing.T) {
+	image := "sha256:" + strings.Repeat("b", 64)
+	for _, exists := range []bool{true, false} {
+		response := ""
+		if exists {
+			response = "exists\n"
+		}
+		mock := ssh.NewMockExecutor("host", ssh.MockCommand{Match: "err=$(mktemp); if docker image inspect", Output: response})
+		var out bytes.Buffer
+		err := ensureImage(context.Background(), docker.NewClient(mock), image, &out)
+		if exists && err != nil {
+			t.Fatal(err)
+		}
+		if !exists && (err == nil || !strings.Contains(err.Error(), "build or load")) {
+			t.Fatalf("missing image: %v", err)
+		}
+		if pullAttempted(mock) {
+			t.Fatal("local image ID must never cause a registry request")
+		}
+		if exists && !strings.Contains(out.String(), "digest-pinned") {
+			t.Fatalf("identity misclassified: %s", out.String())
+		}
+	}
+}
