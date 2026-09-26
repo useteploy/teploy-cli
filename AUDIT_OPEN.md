@@ -2569,10 +2569,12 @@ commit; live proofs on the colima fixture.
 **Recorded, not done here:** `internal/preview`'s `probeTCP` has the same
 connect-only shape as the old gate. Left alone because the L1 lane owned
 internal/preview this wave; the fix is to switch it to
-`deploy.TCPProbeCommand`. `teploy health` probes with the default auto
-mode and not the app's configured `health.mode`/path. That is a
-pre-existing inconsistency, now visible because the fixture has a real
-`/health`.
+`deploy.TCPProbeCommand`. The separate `teploy health` mode/path inconsistency
+was corrected September 25: local commands use the manifest's health contract;
+`--app` uses the current release's recorded contract. An absent or unreadable
+record refuses the state-only probe with guidance to use the app directory.
+HTTP-only failures never fall back to a successful TCP connection. Regression
+tests cover HTTP paths, deadlines, TCP-only probes and unavailable records.
 
 Gates: `go test ./... -count=1` 26/26 packages ok (macOS);
 internal/deploy full suite PASS on Linux (colima, bash 5.2);

@@ -120,6 +120,12 @@ teploy log        # deploy history: deploys, rollbacks, failures
 And from any machine that can reach the app: `curl http(s)://<domain or
 host:port>/`.
 
+`teploy health` uses the app's configured health mode, path and deadline.
+With `--app <name> --host <server>`, it reads those settings from the current
+release record instead. If an older release has no recorded health settings,
+run the command from its app directory; the state-only command refuses to
+guess a readiness contract.
+
 ## 5. Change something, deploy again, roll back
 
 Commit a change and deploy; `teploy status` now shows current and previous
