@@ -2,6 +2,23 @@
 
 All notable changes to teploy are documented here. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.1.38] - 2026-10-08
+
+### Fixed
+
+- **Deploys no longer fail on secrets stored with a trailing newline.**
+  Since v0.1.37 secrets decrypt exactly as stored, so values written by
+  older releases (which kept one trailing line terminator) were rejected by
+  the env-file writer with "env value for X spans multiple lines". When
+  building the container `--env-file`, exactly one trailing `\n` or `\r\n`
+  is now dropped from secret values only, with a warning naming the keys
+  (never the values). Stored values, `secret get`, templates and kv are
+  untouched; embedded newlines and values with two or more trailing
+  newlines are still rejected, and `env:`/tag values are never trimmed.
+  `teploy secret set KEY=value` also warns when a value ends in a newline
+  (it still stores exactly what is passed). To clear the warning, re-set
+  the secret: `teploy secret set KEY=value`.
+
 ## [0.1.37] - 2026-09-22
 
 ### Fixed

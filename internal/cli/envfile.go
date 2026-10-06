@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"regexp"
 	"sort"
@@ -57,6 +58,44 @@ func expandEnvTemplates(env map[string]string, strict bool) error {
 	return nil
 }
 
+// trimSecretTerminators returns a copy of secrets with exactly one trailing
+// "\n" or "\r\n" removed from each value, writing one warning to w naming
+// the affected keys (never the values).
+//
+// Why: `secret get` and the vault return decrypted bytes exactly as stored
+// (v0.1.37, F23), and secrets stored by older releases carry one trailing
+// line terminator that was never part of the value. docker's --env-file is
+// line-based and cannot carry it, so without this every such secret would
+// fail the deploy as "spans multiple lines".
+//
+// Scope: this runs ONLY on the way into a docker --env-file. Stored values,
+// `secret get`, templates and kv keep their exact bytes. Only ONE terminator
+// is removed: a value with more than one trailing newline (or any embedded
+// one) is genuinely multi-line and is still rejected by the caller's check.
+// appEnv/extra values are operator-written config and are never trimmed.
+func trimSecretTerminators(secrets map[string]string, w io.Writer) map[string]string {
+	out := make(map[string]string, len(secrets))
+	var trimmed []string
+	for k, v := range secrets {
+		switch {
+		case strings.HasSuffix(v, "\r\n"):
+			v = strings.TrimSuffix(v, "\r\n")
+			trimmed = append(trimmed, k)
+		case strings.HasSuffix(v, "\n"):
+			v = strings.TrimSuffix(v, "\n")
+			trimmed = append(trimmed, k)
+		}
+		out[k] = v
+	}
+	if len(trimmed) > 0 && w != nil {
+		sort.Strings(trimmed)
+		fmt.Fprintf(w, "Warning: secret(s) %s are stored with a trailing newline; it was dropped for the container env file. "+
+			"Re-store each one without it (`teploy secret set KEY=value` keeps exactly the bytes you pass) to silence this warning.\n",
+			strings.Join(trimmed, ", "))
+	}
+	return out
+}
+
 // buildContainerEnvFiles computes the full container environment — values
 // already resolved (YAML templates expanded once by expandEnvTemplates,
 // env_files loaded literally, decrypted secrets overlaid last so a secret
@@ -87,7 +126,7 @@ func buildContainerEnvFiles(ctx context.Context, executor ssh.Executor, app stri
 	for k, v := range extra {
 		merged[k] = v
 	}
-	for k, v := range secrets {
+	for k, v := range trimSecretTerminators(secrets, os.Stderr) {
 		merged[k] = v
 	}
 
