@@ -100,6 +100,18 @@ const (
 	// updates); `preview list --json` rows carry url with the served
 	// scheme (DELEGATED_DECISIONS §10).
 	CapPreviewExposure = "preview-exposure"
+	// `deploy|preview deploy|preview destroy --trigger-stdin --json`:
+	// bounded immutable trigger admission converges on the TARGET's
+	// resident state — durable per-operation receipts under the app
+	// lease, replay reconciliation before any preparation, truthful
+	// committed/not_committed/unknown results (final JSON on nonzero).
+	// Agreed reserved interface: cli-trigger-convergence-proposal.json.
+	CapTriggerConvergence = "trigger-convergence-v1"
+	// Preview destruction compares the admitted ownership ID/generation
+	// (and optional updated_at token) against authority re-read under the
+	// same lease; a renewed preview is refused before any route, container
+	// or authority effect — including between prune's listing and destroy.
+	CapPreviewCompareDestroy = "preview-compare-destroy-v1"
 )
 
 // MachineCapabilities returns every capability token this build
@@ -124,6 +136,8 @@ func MachineCapabilities() []string {
 		CapDoctorDiagnostics,
 		CapPlanApply,
 		CapPreviewExposure,
+		CapTriggerConvergence,
+		CapPreviewCompareDestroy,
 	}
 	sort.Strings(tokens)
 	return tokens

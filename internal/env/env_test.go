@@ -220,8 +220,8 @@ EMPTY=
 	vars := parseEnv(content)
 
 	tests := map[string]string{
-		"DB_URL": "postgres://user:pass@host/db",
-		"SECRET": "my secret value",
+		"DB_URL": `"postgres://user:pass@host/db"`,
+		"SECRET": "'my secret value'",
 		"PLAIN":  "simple",
 		"EMPTY":  "",
 	}
@@ -281,5 +281,17 @@ func TestSerializeEnv_SortedKeys(t *testing.T) {
 	}
 	if !strings.HasPrefix(lines[2], "Z=") {
 		t.Errorf("expected third key Z, got: %s", lines[2])
+	}
+}
+
+func TestLiteralEnvRoundtrip(t *testing.T) {
+	input := map[string]string{"QUOTE": `"quoted"`, "SPACE": "value ", "B": "old"}
+	vars := parseEnv(serializeEnv(input))
+	vars["B"] = "new"
+	again := parseEnv(serializeEnv(vars))
+	for _, k := range []string{"QUOTE", "SPACE"} {
+		if again[k] != input[k] {
+			t.Fatalf("%s changed: %q", k, again[k])
+		}
 	}
 }

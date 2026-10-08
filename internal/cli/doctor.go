@@ -634,13 +634,10 @@ const doctorSecretFilesFind = "find /deployments \\( -name .git -o -name node_mo
 	"! -name 'teploy.example.*' ! -name .env.example ! -name .env.sample ! -name .env.template " +
 	"-print"
 
-const doctorSecretFilesProbe = doctorSecretFilesFind + " 2>/dev/null | head -n 201"
+const doctorSecretFilesProbe = "scan=$(" + doctorSecretFilesFind + `) || exit $?; printf '%s\n' "$scan" | head -n 201`
 
-// doctorOpenBuildDirsProbe lists build-context directories other host
-// users can traverse (o+x): the legacy shared build dir and the attempt
-// root. Read-only.
-const doctorOpenBuildDirsProbe = "find /deployments -mindepth 2 -maxdepth 3 -type d " +
-	"\\( -path '/deployments/*/build' -o -path '/deployments/*/meta/att' \\) -perm -001 -print 2>/dev/null | head -n 201"
+// doctorOpenBuildDirsProbe preserves find's status while bounding output.
+const doctorOpenBuildDirsProbe = `scan=$(find /deployments -mindepth 2 -maxdepth 3 -type d \( -path '*/build' -o -path '*/meta/att' \) -perm -001 -print) || exit $?; printf '%s\n' "$scan" | head -n 201`
 
 // doctorSecretExposureCheck finds what teploy CLIs before L14 left behind:
 // they uploaded the whole source tree, gitignored files included, so

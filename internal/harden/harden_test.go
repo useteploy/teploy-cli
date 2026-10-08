@@ -12,6 +12,12 @@ import (
 
 func TestConfigureUFW_AlreadyInstalled(t *testing.T) {
 	mock := ssh.NewMockExecutor("server1",
+		ssh.MockCommand{Match: "umask 077; mktemp -d /tmp/teploy-sshd.", Output: "/tmp/teploy-sshd.fixture"},
+		ssh.MockCommand{Match: "printf '%s'", Output: "203.0.113.7 54321 10.0.0.5 22"},
+		ssh.MockCommand{Match: "ufw allow 22/tcp", Output: ""},
+		ssh.MockCommand{Match: "sudo ufw allow 22/tcp", Output: ""},
+		ssh.MockCommand{Match: "sh -c 'set -eu; backup=", Output: ""},
+		ssh.MockCommand{Match: "sudo sh -c 'set -eu; backup=", Output: ""},
 		ssh.MockCommand{Match: "which ufw", Output: "/usr/sbin/ufw"},
 		ssh.MockCommand{Match: "ufw default deny incoming && ufw default allow outgoing", Output: ""},
 		ssh.MockCommand{Match: "ufw allow 22/tcp && ufw allow 80/tcp && ufw allow 443/tcp", Output: ""},
@@ -37,6 +43,12 @@ func TestConfigureUFW_AlreadyInstalled(t *testing.T) {
 
 func TestConfigureUFW_FreshInstall(t *testing.T) {
 	mock := ssh.NewMockExecutor("server1",
+		ssh.MockCommand{Match: "umask 077; mktemp -d /tmp/teploy-sshd.", Output: "/tmp/teploy-sshd.fixture"},
+		ssh.MockCommand{Match: "printf '%s'", Output: "203.0.113.7 54321 10.0.0.5 22"},
+		ssh.MockCommand{Match: "ufw allow 22/tcp", Output: ""},
+		ssh.MockCommand{Match: "sudo ufw allow 22/tcp", Output: ""},
+		ssh.MockCommand{Match: "sh -c 'set -eu; backup=", Output: ""},
+		ssh.MockCommand{Match: "sudo sh -c 'set -eu; backup=", Output: ""},
 		ssh.MockCommand{Match: "which ufw", Err: fmt.Errorf("not found")},
 		ssh.MockCommand{Match: "DEBIAN_FRONTEND=noninteractive apt-get update", Output: ""},
 		ssh.MockCommand{Match: "ufw default deny incoming", Output: ""},
@@ -57,6 +69,12 @@ func TestConfigureUFW_FreshInstall(t *testing.T) {
 
 func TestConfigureUFW_WithSudo(t *testing.T) {
 	mock := ssh.NewMockExecutor("server1",
+		ssh.MockCommand{Match: "umask 077; mktemp -d /tmp/teploy-sshd.", Output: "/tmp/teploy-sshd.fixture"},
+		ssh.MockCommand{Match: "printf '%s'", Output: "203.0.113.7 54321 10.0.0.5 22"},
+		ssh.MockCommand{Match: "ufw allow 22/tcp", Output: ""},
+		ssh.MockCommand{Match: "sudo ufw allow 22/tcp", Output: ""},
+		ssh.MockCommand{Match: "sh -c 'set -eu; backup=", Output: ""},
+		ssh.MockCommand{Match: "sudo sh -c 'set -eu; backup=", Output: ""},
 		ssh.MockCommand{Match: "which ufw", Err: fmt.Errorf("not found")},
 		ssh.MockCommand{Match: "sudo DEBIAN_FRONTEND=noninteractive apt-get update", Output: ""},
 		ssh.MockCommand{Match: "sudo ufw default deny incoming", Output: ""},
@@ -83,6 +101,12 @@ func TestConfigureUFW_WithSudo(t *testing.T) {
 
 func TestInstallFail2ban_AlreadyInstalled(t *testing.T) {
 	mock := ssh.NewMockExecutor("server1",
+		ssh.MockCommand{Match: "umask 077; mktemp -d /tmp/teploy-sshd.", Output: "/tmp/teploy-sshd.fixture"},
+		ssh.MockCommand{Match: "printf '%s'", Output: "203.0.113.7 54321 10.0.0.5 22"},
+		ssh.MockCommand{Match: "ufw allow 22/tcp", Output: ""},
+		ssh.MockCommand{Match: "sudo ufw allow 22/tcp", Output: ""},
+		ssh.MockCommand{Match: "sh -c 'set -eu; backup=", Output: ""},
+		ssh.MockCommand{Match: "sudo sh -c 'set -eu; backup=", Output: ""},
 		ssh.MockCommand{Match: "which fail2ban-server", Output: "/usr/bin/fail2ban-server"},
 		ssh.MockCommand{Match: "systemctl enable --now fail2ban", Output: ""},
 		ssh.MockCommand{Match: "echo $SSH_CONNECTION", Output: "203.0.113.7 54321 10.0.0.5 22"},
@@ -123,6 +147,12 @@ func TestInstallFail2ban_AlreadyInstalled(t *testing.T) {
 
 func TestInstallFail2ban_FreshInstall(t *testing.T) {
 	mock := ssh.NewMockExecutor("server1",
+		ssh.MockCommand{Match: "umask 077; mktemp -d /tmp/teploy-sshd.", Output: "/tmp/teploy-sshd.fixture"},
+		ssh.MockCommand{Match: "printf '%s'", Output: "203.0.113.7 54321 10.0.0.5 22"},
+		ssh.MockCommand{Match: "ufw allow 22/tcp", Output: ""},
+		ssh.MockCommand{Match: "sudo ufw allow 22/tcp", Output: ""},
+		ssh.MockCommand{Match: "sh -c 'set -eu; backup=", Output: ""},
+		ssh.MockCommand{Match: "sudo sh -c 'set -eu; backup=", Output: ""},
 		ssh.MockCommand{Match: "which fail2ban-server", Err: fmt.Errorf("not found")},
 		ssh.MockCommand{Match: "DEBIAN_FRONTEND=noninteractive apt-get update", Output: ""},
 		ssh.MockCommand{Match: "systemctl enable --now fail2ban", Output: ""},
@@ -144,6 +174,12 @@ func TestInstallFail2ban_FreshInstall(t *testing.T) {
 
 func TestHardenSSH_NoAuthorizedKeys(t *testing.T) {
 	mock := ssh.NewMockExecutor("server1",
+		ssh.MockCommand{Match: "umask 077; mktemp -d /tmp/teploy-sshd.", Output: "/tmp/teploy-sshd.fixture"},
+		ssh.MockCommand{Match: "printf '%s'", Output: "203.0.113.7 54321 10.0.0.5 22"},
+		ssh.MockCommand{Match: "ufw allow 22/tcp", Output: ""},
+		ssh.MockCommand{Match: "sudo ufw allow 22/tcp", Output: ""},
+		ssh.MockCommand{Match: "sh -c 'set -eu; backup=", Output: ""},
+		ssh.MockCommand{Match: "sudo sh -c 'set -eu; backup=", Output: ""},
 		ssh.MockCommand{Match: "cat ~/.ssh/authorized_keys", Err: fmt.Errorf("no such file")},
 		ssh.MockCommand{Match: "cat /root/.ssh/authorized_keys", Err: fmt.Errorf("no such file")},
 	)
@@ -166,6 +202,12 @@ func TestHardenSSH_NoAuthorizedKeys(t *testing.T) {
 
 func TestHardenSSH_EmptyAuthorizedKeys(t *testing.T) {
 	mock := ssh.NewMockExecutor("server1",
+		ssh.MockCommand{Match: "umask 077; mktemp -d /tmp/teploy-sshd.", Output: "/tmp/teploy-sshd.fixture"},
+		ssh.MockCommand{Match: "printf '%s'", Output: "203.0.113.7 54321 10.0.0.5 22"},
+		ssh.MockCommand{Match: "ufw allow 22/tcp", Output: ""},
+		ssh.MockCommand{Match: "sudo ufw allow 22/tcp", Output: ""},
+		ssh.MockCommand{Match: "sh -c 'set -eu; backup=", Output: ""},
+		ssh.MockCommand{Match: "sudo sh -c 'set -eu; backup=", Output: ""},
 		ssh.MockCommand{Match: "cat ~/.ssh/authorized_keys", Output: "   \n\n"},
 		ssh.MockCommand{Match: "cat /root/.ssh/authorized_keys", Output: "   \n\n"},
 	)
@@ -182,6 +224,15 @@ func TestHardenSSH_EmptyAuthorizedKeys(t *testing.T) {
 
 func TestHardenSSH_KeysExist(t *testing.T) {
 	mock := ssh.NewMockExecutor("server1",
+		ssh.MockCommand{Match: "umask 077; mktemp -d /tmp/teploy-sshd.", Output: "/tmp/teploy-sshd.fixture"},
+		ssh.MockCommand{Match: "printf '%s'", Output: "203.0.113.7 54321 10.0.0.5 22"},
+		ssh.MockCommand{Match: "ufw allow 22/tcp", Output: ""},
+		ssh.MockCommand{Match: "sudo ufw allow 22/tcp", Output: ""},
+		// R2-01: the policy install is ONE whole-script command that
+		// validates, installs and rolls back (see round3_regression_test
+		// for the script body's real execution).
+		ssh.MockCommand{Match: "sh -c 'policy=", Output: ""},
+		ssh.MockCommand{Match: "sudo sh -c 'policy=", Output: ""},
 		ssh.MockCommand{Match: "cat ~/.ssh/authorized_keys", Output: "ssh-ed25519 AAAAC3... user@host"},
 		ssh.MockCommand{Match: "sed -i", Output: ""},
 		ssh.MockCommand{Match: "sed -i", Output: ""},
@@ -205,19 +256,27 @@ func TestHardenSSH_KeysExist(t *testing.T) {
 		t.Error("should report PubkeyAuthentication change")
 	}
 
-	var sedCount int
+	var validated bool
 	for _, call := range mock.Calls {
-		if strings.Contains(call, "sed -i") {
-			sedCount++
+		if strings.Contains(call, "sshd -t -f") && strings.Contains(call, "sshd -T -f") {
+			validated = true
 		}
 	}
-	if sedCount != 3 {
-		t.Errorf("expected 3 sed calls, got %d", sedCount)
+	if !validated {
+		t.Fatal("effective policy must be validated before reload")
 	}
+
 }
 
 func TestHarden_RunsAllSteps_AsRoot(t *testing.T) {
 	mock := ssh.NewMockExecutor("server1",
+		ssh.MockCommand{Match: "umask 077; mktemp -d /tmp/teploy-sshd.", Output: "/tmp/teploy-sshd.fixture"},
+		ssh.MockCommand{Match: "printf '%s'", Output: "203.0.113.7 54321 10.0.0.5 22"},
+		ssh.MockCommand{Match: "ufw allow 22/tcp", Output: ""},
+		ssh.MockCommand{Match: "sudo ufw allow 22/tcp", Output: ""},
+		// R2-01: whole-script policy install/validate/rollback.
+		ssh.MockCommand{Match: "sh -c 'policy=", Output: ""},
+		ssh.MockCommand{Match: "sudo sh -c 'policy=", Output: ""},
 		// detectSudo
 		ssh.MockCommand{Match: "whoami", Output: "root"},
 		// UFW
@@ -267,6 +326,12 @@ func TestHarden_RunsAllSteps_AsRoot(t *testing.T) {
 
 func TestHarden_RunsAllSteps_WithSudo(t *testing.T) {
 	mock := ssh.NewMockExecutor("server1",
+		ssh.MockCommand{Match: "umask 077; mktemp -d /tmp/teploy-sshd.", Output: "/tmp/teploy-sshd.fixture"},
+		ssh.MockCommand{Match: "printf '%s'", Output: "203.0.113.7 54321 10.0.0.5 22"},
+		ssh.MockCommand{Match: "ufw allow 22/tcp", Output: ""},
+		ssh.MockCommand{Match: "sudo ufw allow 22/tcp", Output: ""},
+		ssh.MockCommand{Match: "sh -c 'set -eu; backup=", Output: ""},
+		ssh.MockCommand{Match: "sudo sh -c 'set -eu; backup=", Output: ""},
 		// detectSudo
 		ssh.MockCommand{Match: "whoami", Output: "tyler"},
 		// UFW

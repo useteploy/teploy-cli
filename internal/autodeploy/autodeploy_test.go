@@ -460,18 +460,13 @@ func TestSchedule(t *testing.T) {
 	for _, want := range []string{
 		`APP="myapp"`,
 		`BRANCH="main"`,
-		"docker pull",
-		"docker inspect",
-		"teploy.app=$APP",
-		"CURRENT_DIGEST",
-		"NEW_DIGEST",
 		`"/deployments/.bin/teploy" autodeploy redeploy --app "$APP" --branch "$BRANCH"`,
 	} {
 		if !strings.Contains(string(script), want) {
 			t.Errorf("scheduled-redeploy.sh missing %q", want)
 		}
 	}
-	for _, forbidden := range []string{"docker run", "docker stop", "docker rm"} {
+	for _, forbidden := range []string{"docker run", "docker stop", "docker rm", "docker pull", ".Config.Image"} {
 		if strings.Contains(string(script), forbidden) {
 			t.Errorf("scheduled-redeploy.sh must not reconstruct containers itself (%q present) — the redeploy goes through the engine", forbidden)
 		}
@@ -557,10 +552,6 @@ func TestGenerateScheduledRedeployScript(t *testing.T) {
 	for _, want := range []string{
 		`APP="myapp"`,
 		`BRANCH="release"`,
-		"docker pull",
-		"docker inspect",
-		"CURRENT_DIGEST",
-		"NEW_DIGEST",
 		`"/deployments/.bin/teploy" autodeploy redeploy --app "$APP" --branch "$BRANCH"`,
 		"$(ts) [redeploy]",
 	} {
@@ -570,7 +561,7 @@ func TestGenerateScheduledRedeployScript(t *testing.T) {
 	}
 	// C02: the script must never reconstruct the container itself — the
 	// redeploy runs through the engine (locks, health gate, records).
-	for _, forbidden := range []string{"docker run", "docker stop", "docker rm"} {
+	for _, forbidden := range []string{"docker run", "docker stop", "docker rm", "docker pull", ".Config.Image"} {
 		if strings.Contains(script, forbidden) {
 			t.Errorf("scheduled redeploy script must not contain %q — container reconstruction bypasses the engine", forbidden)
 		}

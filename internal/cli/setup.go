@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	osexec "os/exec"
 	"os/signal"
@@ -202,7 +203,6 @@ func runSetup(flags *Flags, host string, name string, noHarden bool, networkProv
 	if vpnIP != "" {
 		serverHost = vpnIP
 		fmt.Printf("\nVPN connected — reconnecting via %s\n", vpnIP)
-		executor.Close()
 		reconnectCfg := ssh.ConnectConfig{
 			Host:          vpnIP,
 			User:          user,
@@ -212,10 +212,13 @@ func runSetup(flags *Flags, host string, name string, noHarden bool, networkProv
 		vpnDial := func(ctx context.Context) (ssh.Executor, error) {
 			return ssh.Connect(ctx, reconnectCfg)
 		}
-		executor, err = ssh.NewReconnectingExecutor(ctx, vpnDial, setupReconnectBudget)
+		replacement, reconnectErr := ssh.NewReconnectingExecutor(ctx, vpnDial, setupReconnectBudget)
+		err = reconnectErr
 		if err != nil {
 			return fmt.Errorf("reconnecting via VPN IP %s: %w", vpnIP, err)
 		}
+		executor.Close()
+		executor = replacement
 		defer executor.Close()
 	}
 
@@ -308,10 +311,6 @@ func setupNetwork(ctx context.Context, exec ssh.Executor, w io.Writer, providerN
 		return "", fmt.Errorf("installing %s: %w", providerName, err)
 	}
 
-	// Get the server's hostname before joining — we'll use it to find the node locally.
-	hostname, _ := exec.Run(ctx, "hostname")
-	hostname = strings.TrimSpace(hostname)
-
 	// Reset Tailscale state if present — cloned VMs inherit the previous machine's identity
 	// which causes IP conflicts. Stop tailscaled, wipe state, restart.
 	if providerName == "tailscale" || providerName == "headscale" {
@@ -334,36 +333,32 @@ func setupNetwork(ctx context.Context, exec ssh.Executor, w io.Writer, providerN
 
 	// Fire VPN join in the background and don't wait for it.
 	// Tailscale/Headscale modifies iptables which can kill the SSH connection,
-	// so we detach the command and poll from the local machine instead.
+	// so detach the join and use the reconnecting authenticated executor to observe it.
 	fmt.Fprintf(w, "Joining %s mesh...\n", providerName)
 	if err := joinVPNMesh(ctx, exec, sudo, providerName, cfg); err != nil {
 		return "", err
 	}
 
-	// Poll locally for the node to appear on our tailnet.
-	fmt.Fprintf(w, "  Waiting for node to appear on tailnet...\n")
-	tsBinary := findTailscaleBinary()
+	// Query the authenticated target through its selected provider, rather
+	// than trusting a same-named peer on an unrelated local control plane.
+	cfg.Sudo = sudo
+	provider, err = network.NewProvider(cfg)
+	if err != nil {
+		return "", err
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
 	var vpnIP string
-	for i := 0; i < 30; i++ { // 30 attempts, 2 seconds each = 60 second timeout
-		time.Sleep(2 * time.Second)
-		out, err := runLocal(tsBinary, "status")
-		if err != nil {
-			continue
-		}
-		for _, line := range strings.Split(out, "\n") {
-			fields := strings.Fields(line)
-			if len(fields) >= 2 && strings.EqualFold(fields[1], hostname) {
-				vpnIP = fields[0]
-				break
-			}
-		}
-		if vpnIP != "" {
+	for {
+		vpnIP, err = provider.GetIP(waitCtx, exec)
+		if err == nil && net.ParseIP(vpnIP) != nil {
 			break
 		}
-	}
-
-	if vpnIP == "" {
-		return "", fmt.Errorf("timed out waiting for %s to join tailnet (expected hostname: %s)", providerName, hostname)
+		select {
+		case <-waitCtx.Done():
+			return "", fmt.Errorf("waiting for %s address: %w", providerName, waitCtx.Err())
+		case <-time.After(2 * time.Second):
+		}
 	}
 
 	fmt.Fprintf(w, "  VPN IP: %s\n", vpnIP)

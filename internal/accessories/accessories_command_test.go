@@ -13,14 +13,14 @@ import (
 // The command: override must land as trailing args after the image —
 // MinIO/ntfy style images need an explicit verb (`server /data`, `serve`).
 func TestEnsureRunningAppendsCommand(t *testing.T) {
-	mock := ssh.NewMockExecutor("h",
+	mock := ssh.NewMockExecutor("h", append(admissionStubs("myapp"),
 		ssh.MockCommand{Match: "docker inspect", Output: "exited"},
 		// "exited" = the container exists but is stopped, so EnsureRunning
 		// removes it before recreating (docker run would hit a name conflict).
 		ssh.MockCommand{Match: "docker rm -f", Output: ""},
 		ssh.MockCommand{Match: "mkdir -p", Output: ""},
 		ssh.MockCommand{Match: "docker run", Output: "abc"},
-	)
+	)...)
 	m := NewManager(mock, io.Discard)
 	_, err := m.EnsureRunning(context.Background(), "myapp", "minio", config.AccessoryConfig{
 		Image:   "minio/minio:latest",
@@ -43,14 +43,14 @@ func TestEnsureRunningAppendsCommand(t *testing.T) {
 
 // Without command:, the docker run line must end at the image (no regression).
 func TestEnsureRunningNoCommandUnchanged(t *testing.T) {
-	mock := ssh.NewMockExecutor("h",
+	mock := ssh.NewMockExecutor("h", append(admissionStubs("myapp"),
 		ssh.MockCommand{Match: "docker inspect", Output: "exited"},
 		// "exited" = the container exists but is stopped, so EnsureRunning
 		// removes it before recreating (docker run would hit a name conflict).
 		ssh.MockCommand{Match: "docker rm -f", Output: ""},
 		ssh.MockCommand{Match: "mkdir -p", Output: ""},
 		ssh.MockCommand{Match: "docker run", Output: "abc"},
-	)
+	)...)
 	m := NewManager(mock, io.Discard)
 	_, err := m.EnsureRunning(context.Background(), "myapp", "db", config.AccessoryConfig{
 		Image: "postgres:16",

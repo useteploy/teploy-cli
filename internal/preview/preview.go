@@ -2,6 +2,7 @@ package preview
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -18,6 +19,7 @@ import (
 	"github.com/useteploy/teploy/internal/deploy"
 	"github.com/useteploy/teploy/internal/docker"
 	"github.com/useteploy/teploy/internal/ssh"
+	"github.com/useteploy/teploy/internal/state"
 )
 
 const deploymentsDir = "/deployments"
@@ -27,7 +29,17 @@ type State struct {
 	// ID is the canonical preview identifier (<app>-p-<8hex>, see
 	// PreviewID). Empty on records written before the canonical-ID
 	// migration (legacy slug-keyed records).
-	ID string `json:"id,omitempty"`
+	ID          string `json:"id,omitempty"`
+	OwnershipID string `json:"ownership_id,omitempty"`
+	Generation  uint64 `json:"generation,omitempty"`
+	// UpdatedAt is the change token compared by preview compare-destroy.
+	// A pointer so legacy records without one stay absent on the wire
+	// (encoding/json does not omit zero time.Time values).
+	UpdatedAt              *time.Time `json:"updated_at,omitempty"`
+	OperationKey           string     `json:"operation_key,omitempty"`
+	ExecutionBindingDigest string     `json:"execution_binding_digest,omitempty"`
+	SourceRevision         string     `json:"source_revision,omitempty"`
+	ImageDigest            string     `json:"image_digest,omitempty"`
 	// Branch is the FULL, unsanitized branch name. Records are keyed by
 	// the canonical ID, not by this value's sanitized form.
 	Branch string `json:"branch"`
@@ -80,14 +92,19 @@ func (s State) URL() string {
 
 // DeployConfig holds parameters for creating a preview.
 type DeployConfig struct {
-	App     string
-	Domain  string // base domain (e.g., myapp.com)
-	Branch  string
-	Image   string
-	Version string
-	EnvFile string
-	Env     map[string]string
-	Volumes map[string]string
+	OwnershipID            string
+	ExpectedGeneration     *uint64
+	OperationKey           string
+	ExecutionBindingDigest string
+	SourceRevision         string
+	App                    string
+	Domain                 string // base domain (e.g., myapp.com)
+	Branch                 string
+	Image                  string
+	Version                string
+	EnvFile                string
+	Env                    map[string]string
+	Volumes                map[string]string
 	// TTL is how long the preview lives; 0 means the documented default of
 	// 72h. Applied on every Deploy (create AND update — an update refreshes
 	// the deadline), recorded as the absolute State.ExpiresAt.
@@ -246,7 +263,7 @@ func SanitizeBranch(branch string) string {
 // existing previews, while the app name is stable.
 func previewIDHex(app, branch string) string {
 	sum := sha256.Sum256([]byte(app + "\x00" + branch))
-	return hex.EncodeToString(sum[:4])
+	return hex.EncodeToString(sum[:16])
 }
 
 // PreviewID returns the canonical preview identifier: <app>-p-<8hex>,
@@ -331,9 +348,15 @@ func (e *AmbiguousPreviewError) Error() string {
 // error naming the path (identity cannot be established — fail closed
 // rather than guessing or silently adopting).
 func (m *Manager) readRecord(ctx context.Context, path string) (*State, error) {
-	content, err := m.exec.Run(ctx, "cat "+path)
-	if err != nil || strings.TrimSpace(content) == "" {
+	content, err := m.exec.Run(ctx, "if test -f "+ssh.ShellQuote(path)+"; then cat "+path+"; elif test -e "+ssh.ShellQuote(path)+"; then exit 1; else printf '__TEPLOY_PREVIEW_ABSENT__'; fi")
+	if err != nil {
+		return nil, fmt.Errorf("reading preview authority %s: %w", path, err)
+	}
+	if strings.TrimSpace(content) == "__TEPLOY_PREVIEW_ABSENT__" {
 		return nil, nil
+	}
+	if strings.TrimSpace(content) == "" {
+		return nil, fmt.Errorf("empty preview authority %s", path)
 	}
 	var s State
 	if err := json.Unmarshal([]byte(strings.TrimSpace(content)), &s); err != nil {
@@ -364,6 +387,21 @@ func (m *Manager) resolveRecord(ctx context.Context, app, branch, repo string) (
 		return nil, "", err
 	}
 
+	if canon == nil {
+		sum := sha256.Sum256([]byte(app + "\x00" + branch))
+		oldPath := previewDir(app) + "/" + app + "-p-" + hex.EncodeToString(sum[:4]) + ".json"
+		old, readErr := m.readRecord(ctx, oldPath)
+		if readErr != nil {
+			return nil, "", readErr
+		}
+		if old != nil {
+			canon = old
+			canonPath = oldPath
+		}
+	}
+	if canon != nil && (canon.Branch != branch || (canon.Repo != "" && repo != "" && canon.Repo != repo)) {
+		return nil, "", &AmbiguousPreviewError{App: app, Path: canonPath, StoredBranch: canon.Branch, RequestedBranch: branch, StoredRepo: canon.Repo, RequestedRepo: repo}
+	}
 	legacyPath := legacyPreviewStatePath(app, branch)
 	legacy, err := m.readRecord(ctx, legacyPath)
 	if err != nil {
@@ -396,9 +434,7 @@ func (m *Manager) resolveRecord(ctx context.Context, app, branch, repo string) (
 	// this branch is a stale duplicate of the canonical one (interrupted
 	// migration) — the full-Branch match established it is this branch's
 	// own, so remove it. Any other legacy file stays untouched above.
-	if legacy.Branch == branch {
-		m.exec.Run(ctx, "rm -f -- "+legacyPath)
-	}
+
 	return canon, canonPath, nil
 }
 
@@ -408,7 +444,7 @@ func (m *Manager) writeRecord(ctx context.Context, s *State, path string) error 
 	if err != nil {
 		return err
 	}
-	if err := m.exec.Upload(ctx, strings.NewReader(string(data)), path, "0644"); err != nil {
+	if err := state.WriteAtomicPrivate(ctx, m.exec, path, strings.NewReader(string(data))); err != nil {
 		return err
 	}
 	return nil
@@ -424,7 +460,7 @@ func (m *Manager) writeRecord(ctx context.Context, s *State, path string) error 
 // running, routed, and recorded; only the failed candidate is cleaned up.
 // The canonical ID, state path, route key, and domain are stable across
 // updates — only the upstream container moves.
-func (m *Manager) Deploy(ctx context.Context, cfg DeployConfig) error {
+func (m *Manager) deployLocked(ctx context.Context, cfg DeployConfig) error {
 	if cfg.TTL == 0 {
 		cfg.TTL = 72 * time.Hour
 	}
@@ -436,6 +472,33 @@ func (m *Manager) Deploy(ctx context.Context, cfg DeployConfig) error {
 	// key first, so the rewrite below replaces one record instead of
 	// orphaning the old key.
 	existing, existingPath, err := m.resolveRecord(ctx, cfg.App, cfg.Branch, cfg.Repo)
+	if err != nil {
+		return err
+	}
+	if cfg.ExpectedGeneration != nil {
+		actual := uint64(0)
+		if existing != nil {
+			actual = existing.Generation
+			if existing.OwnershipID != cfg.OwnershipID {
+				return fmt.Errorf("preview ownership changed")
+			}
+		}
+		if actual != *cfg.ExpectedGeneration {
+			return fmt.Errorf("preview generation changed")
+		}
+	}
+	ownership := cfg.OwnershipID
+	if existing != nil && existing.OwnershipID != "" {
+		ownership = existing.OwnershipID
+	}
+	if ownership == "" {
+		var id [16]byte
+		if _, err := rand.Read(id[:]); err != nil {
+			return err
+		}
+		ownership = hex.EncodeToString(id[:])
+	}
+	generation, err := m.reserveGeneration(ctx, cfg.App, existing)
 	if err != nil {
 		return err
 	}
@@ -575,7 +638,9 @@ func (m *Manager) Deploy(ctx context.Context, cfg DeployConfig) error {
 	// Write state.
 	now := time.Now().UTC()
 	state := State{
-		ID:         PreviewID(cfg.App, cfg.Branch),
+		ID:          PreviewID(cfg.App, cfg.Branch),
+		OwnershipID: ownership, Generation: generation, UpdatedAt: &now,
+		OperationKey: cfg.OperationKey, ExecutionBindingDigest: cfg.ExecutionBindingDigest, SourceRevision: cfg.SourceRevision,
 		Branch:     cfg.Branch,
 		Repo:       cfg.Repo,
 		Route:      routeApp,
@@ -589,8 +654,22 @@ func (m *Manager) Deploy(ctx context.Context, cfg DeployConfig) error {
 		HTTPOnly:   exp.httpOnly,
 		AllowIPs:   exp.allowIPs,
 	}
+	state.ImageDigest, err = m.docker.ContainerImageDigest(ctx, containerName)
+	if err != nil {
+		return publicationUnknown(err)
+	}
 	if err := m.writeRecord(ctx, &state, previewStatePath(cfg.App, cfg.Branch)); err != nil {
-		return fmt.Errorf("writing preview state: %w", err)
+		actual, readErr := m.readRecord(context.WithoutCancel(ctx), previewStatePath(cfg.App, cfg.Branch))
+		if readErr == nil && actual != nil && actual.Generation == generation && actual.OwnershipID == ownership && actual.OperationKey == cfg.OperationKey {
+			return publicationCommitted(err)
+		}
+		return publicationUnknown(errors.Join(err, readErr))
+	}
+
+	if existingPath != "" && existingPath != previewStatePath(cfg.App, cfg.Branch) {
+		if _, err := m.exec.Run(ctx, "rm -f -- "+ssh.ShellQuote(existingPath)); err != nil {
+			return fmt.Errorf("retiring old preview authority: %w", err)
+		}
 	}
 
 	// Retire the predecessor — strictly AFTER the route serves the
@@ -695,7 +774,7 @@ func (m *Manager) List(ctx context.Context, app string) ([]State, error) {
 }
 
 // Destroy tears down a preview environment.
-func (m *Manager) Destroy(ctx context.Context, app, branch string) error {
+func (m *Manager) destroyLocked(ctx context.Context, app, branch string, expected *State) error {
 	s, path, err := m.resolveRecord(ctx, app, branch, "")
 	if err != nil {
 		return err
@@ -704,15 +783,48 @@ func (m *Manager) Destroy(ctx context.Context, app, branch string) error {
 		return nil // no preview to destroy
 	}
 
-	// Stop and remove container.
-	m.docker.Stop(ctx, s.Container, 5)
-	m.docker.Remove(ctx, s.Container)
+	if expected == nil || s.OwnershipID != expected.OwnershipID || s.Generation != expected.Generation || !sameUpdatedAt(s.UpdatedAt, expected.UpdatedAt) {
+		return fmt.Errorf("preview ownership/generation changed; refusing teardown")
+	}
+	// Preserve authority until every required teardown effect succeeds.
+	if err := m.caddy.RemoveRoute(ctx, previewRouteKey(app, s)); err != nil {
+		return fmt.Errorf("removing preview route: %w", err)
+	}
+	// Reconcile route absence into the active Caddy config even on a retry.
+	if _, present, err := m.caddy.ReadManagedBlock(ctx, previewRouteKey(app, s)); err != nil || present {
+		return fmt.Errorf("preview route absence unproven: %v", err)
+	}
+	if _, err := m.exec.Run(ctx, "docker exec caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile"); err != nil {
+		return fmt.Errorf("activating preview route absence: %w", err)
+	}
+	container, err := m.previewContainer(ctx, s.Container)
+	if err != nil {
+		return err
+	}
+	if container != nil {
+		if container.State == "running" {
+			if err := m.docker.Stop(ctx, container.ID, 5); err != nil {
+				observed, inspectErr := m.previewContainer(ctx, s.Container)
+				if inspectErr != nil || (observed != nil && observed.State == "running") {
+					return errors.Join(err, inspectErr)
+				}
+			}
+		}
+		if err := m.docker.Remove(ctx, container.ID); err != nil {
+			observed, inspectErr := m.previewContainer(ctx, s.Container)
+			if inspectErr != nil || observed != nil {
+				return errors.Join(err, inspectErr)
+			}
+		}
+		observed, inspectErr := m.previewContainer(ctx, s.Container)
+		if inspectErr != nil || observed != nil {
+			return fmt.Errorf("preview container absence unproven: %v", inspectErr)
+		}
+	}
 
-	// Remove Caddy route (keyed by the record's own era).
-	m.caddy.RemoveRoute(ctx, previewRouteKey(app, s))
-
-	// Remove state file.
-	m.exec.Run(ctx, "rm -f -- "+path)
+	if _, err := m.exec.Run(ctx, "rm -f -- "+ssh.ShellQuote(path)); err != nil {
+		return fmt.Errorf("removing preview authority: %w", err)
+	}
 
 	fmt.Fprintf(m.out, "Destroyed preview for branch %q\n", branch)
 	return nil
@@ -729,18 +841,20 @@ func (m *Manager) Prune(ctx context.Context, app string) (int, error) {
 
 	now := time.Now().UTC()
 	pruned := 0
+	var failures error
 	for _, p := range previews {
 		if !now.After(p.ExpiresAt) {
 			continue
 		}
-		if err := m.Destroy(ctx, app, p.Branch); err != nil {
+		if err := m.CompareDestroy(ctx, app, p.Branch, p.OwnershipID, p.Generation, p.UpdatedAt); err != nil {
+			failures = errors.Join(failures, err)
 			fmt.Fprintf(m.out, "Warning: failed to prune preview %s: %v\n", p.Branch, err)
 			continue
 		}
 		fmt.Fprintf(m.out, "Pruned expired preview %q (%s)\n", p.Branch, p.Domain)
 		pruned++
 	}
-	return pruned, nil
+	return pruned, failures
 }
 
 // PruneAll removes expired previews across EVERY app on the target server,
@@ -782,4 +896,235 @@ func (m *Manager) PruneAll(ctx context.Context) (int, error) {
 		total += n
 	}
 	return total, errors.Join(errs...)
+}
+
+// Serialize preview updates and teardown with the app's existing renewable fence.
+func (m *Manager) Deploy(ctx context.Context, cfg DeployConfig) error {
+	existing, _, err := m.resolveRecord(ctx, cfg.App, cfg.Branch, cfg.Repo)
+	if err != nil {
+		return err
+	}
+	if _, err := resolveExposure(cfg, existing); err != nil {
+		return err
+	}
+	locked, release, err := m.locked(ctx, cfg.App)
+	if err != nil {
+		return err
+	}
+	defer release()
+	return locked.deployLocked(ctx, cfg)
+}
+func (m *Manager) Destroy(ctx context.Context, app, branch string) error {
+	existing, _, err := m.resolveRecord(ctx, app, branch, "")
+	if err != nil {
+		return err
+	}
+	if existing == nil {
+		return nil
+	}
+	locked, release, err := m.locked(ctx, app)
+	if err != nil {
+		return err
+	}
+	defer release()
+	return locked.destroyLocked(ctx, app, branch, existing)
+}
+func (m *Manager) locked(ctx context.Context, app string) (*Manager, func(), error) {
+	if _, err := m.exec.Run(ctx, "mkdir -p "+ssh.ShellQuote(deploymentsDir+"/"+app)); err != nil {
+		return nil, nil, err
+	}
+	lock, err := state.AcquireLockFenced(ctx, m.exec, app)
+	if err != nil {
+		return nil, nil, err
+	}
+	lock.StartRenewal(m.exec)
+	exec := &previewExecutor{Executor: m.exec, lock: lock}
+	manager := NewManager(exec, m.out)
+	manager.healthInterval = m.healthInterval
+	manager.healthTimeout = m.healthTimeout
+	return manager, func() { state.ReleaseLockFenced(m.exec, lock, app) }, nil
+}
+
+type previewExecutor struct {
+	ssh.Executor
+	lock *state.Lock
+}
+
+func (e *previewExecutor) Run(ctx context.Context, cmd string) (string, error) {
+	return e.lock.Guarded(ctx, e.Executor, cmd)
+}
+func (e *previewExecutor) Upload(ctx context.Context, r io.Reader, path, mode string) error {
+	temporary := path + ".preview-" + e.lock.Owner()
+	if err := e.Executor.Upload(ctx, r, temporary, mode); err != nil {
+		return err
+	}
+	_, err := e.lock.Guarded(ctx, e.Executor, "mv -f -- "+ssh.ShellQuote(temporary)+" "+ssh.ShellQuote(path))
+	return err
+}
+
+func (m *Manager) previewContainer(ctx context.Context, name string) (*docker.Container, error) {
+	output, err := m.exec.Run(ctx, `docker ps --all --no-trunc --format '{"ID":{{json .ID}},"Names":{{json .Names}},"State":{{json .State}},"Labels":{{json .Labels}}}'`)
+	if err != nil {
+		return nil, fmt.Errorf("preview inventory unknown: %w", err)
+	}
+	containers, err := docker.ParseContainers(output)
+	if err != nil {
+		return nil, err
+	}
+	for _, container := range containers {
+		if container.Name == name {
+			if container.ID == "" {
+				return nil, fmt.Errorf("preview immutable ID missing")
+			}
+			return &container, nil
+		}
+	}
+	return nil, nil
+}
+
+func publicationUnknown(err error) error   { return &state.PublicationError{Unknown: true, Err: err} }
+func publicationCommitted(err error) error { return &state.PublicationError{Committed: true, Err: err} }
+
+// sameUpdatedAt compares two optional change tokens: absent equals absent,
+// and any present token must match exactly.
+func sameUpdatedAt(a, b *time.Time) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return a.Equal(*b)
+}
+
+func (m *Manager) reserveGeneration(ctx context.Context, app string, existing *State) (uint64, error) {
+	if _, err := m.exec.Run(ctx, "mkdir -p "+ssh.ShellQuote(previewDir(app))); err != nil {
+		return 0, err
+	}
+	path := previewDir(app) + "/.generation"
+	data, present, err := state.ReadRemoteFile(ctx, m.exec, path)
+	if err != nil {
+		return 0, err
+	}
+	var generation uint64
+	if present {
+		generation, err = strconv.ParseUint(strings.TrimSpace(string(data)), 10, 64)
+		if err != nil {
+			return 0, err
+		}
+	}
+	if existing != nil && existing.Generation > generation {
+		generation = existing.Generation
+	}
+	if generation == ^uint64(0) {
+		return 0, fmt.Errorf("preview generation exhausted")
+	}
+	generation++
+	if err = state.WriteAtomicPrivate(ctx, m.exec, path, strings.NewReader(strconv.FormatUint(generation, 10))); err != nil {
+		return 0, err
+	}
+	return generation, nil
+}
+
+// CompareDestroy retains the listed identity through acquisition, then reads
+// actual authority under the same renewable lease used by preview renewal.
+// The expected triple IS the comparison: a preview renewed between the
+// listing and this call rewrites ownership/generation/updated_at and is
+// refused before any route, container or authority effect. Legacy records
+// compare their all-empty triple exactly — any renewal stamps canonical
+// fields, so a stale listing can never authorize teardown of a record that
+// changed. The trigger path additionally requires a nonzero observed
+// generation at request decode.
+func (m *Manager) CompareDestroy(ctx context.Context, app, branch, ownership string, generation uint64, updatedAt *time.Time) error {
+	locked, release, err := m.locked(ctx, app)
+	if err != nil {
+		return err
+	}
+	defer release()
+	return locked.CompareDestroyHeld(ctx, app, branch, ownership, generation, updatedAt)
+}
+func (m *Manager) CompareDestroyHeld(ctx context.Context, app, branch, ownership string, generation uint64, updatedAt *time.Time) error {
+	actual, _, err := m.resolveRecord(ctx, app, branch, "")
+	if err != nil {
+		return err
+	}
+	// An absent authority alone does not prove teardown: the durable adapter
+	// must retain the previous effect evidence and prove route/container absence.
+	if actual == nil {
+		return fmt.Errorf("preview authority absent; teardown proof required")
+	}
+	if actual.OwnershipID != ownership || actual.Generation != generation || !sameUpdatedAt(actual.UpdatedAt, updatedAt) {
+		return fmt.Errorf("preview ownership/generation changed; refusing teardown")
+	}
+	return m.destroyLocked(ctx, app, branch, actual)
+}
+
+// Observe reads the real owning record, never a guessed generation.
+func (m *Manager) Observe(ctx context.Context, app, branch string) (*State, error) {
+	s, _, err := m.resolveRecord(ctx, app, branch, "")
+	return s, err
+}
+
+// WithLease lets the trigger adapter and preview effects share ONE lease.
+func (m *Manager) WithLease(lock *state.Lock) *Manager {
+	return NewManager(&previewExecutor{Executor: m.exec, lock: lock}, m.out)
+}
+func (m *Manager) DeployHeld(ctx context.Context, cfg DeployConfig) error {
+	return m.deployLocked(ctx, cfg)
+}
+func (e *previewExecutor) RunInput(ctx context.Context, cmd string, input io.Reader) error {
+	return e.Executor.RunInput(ctx, e.lock.GuardPrefix()+cmd, input)
+}
+func (e *previewExecutor) RunStream(ctx context.Context, cmd string, out, stderr io.Writer) error {
+	return e.Executor.RunStream(ctx, e.lock.GuardPrefix()+cmd, out, stderr)
+}
+
+// ProveDestroyed reconciles from the immutable pre-effect evidence retained
+// in the operation journal. Missing authority without this evidence is unknown.
+func (m *Manager) ProveDestroyed(ctx context.Context, app string, admitted State) (bool, error) {
+	actual, _, err := m.resolveRecord(ctx, app, admitted.Branch, admitted.Repo)
+	if err != nil {
+		return false, err
+	}
+	if actual != nil {
+		if actual.OwnershipID != admitted.OwnershipID || actual.Generation != admitted.Generation || !sameUpdatedAt(actual.UpdatedAt, admitted.UpdatedAt) {
+			return false, fmt.Errorf("preview renewed; retained teardown evidence cannot authorize destruction")
+		}
+		if _, ok := m.exec.(*previewExecutor); !ok {
+			return false, fmt.Errorf("teardown reconciliation requires app lease")
+		}
+		if err := m.destroyLocked(ctx, app, admitted.Branch, &admitted); err != nil {
+			return false, err
+		}
+	}
+	if admitted.OwnershipID == "" || admitted.Generation == 0 {
+		return false, fmt.Errorf("missing admitted teardown evidence")
+	}
+	if _, present, err := m.caddy.ReadManagedBlock(ctx, previewRouteKey(app, &admitted)); err != nil || present {
+		return false, fmt.Errorf("route absence unproven: %v", err)
+	}
+	if _, err := m.exec.Run(ctx, "docker exec caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile"); err != nil {
+		return false, err
+	}
+	container, err := m.previewContainer(ctx, admitted.Container)
+	if err != nil {
+		return false, err
+	}
+	return container == nil, nil
+}
+
+func (m *Manager) ProveServing(ctx context.Context, app string, authority State) error {
+	container, err := m.previewContainer(ctx, authority.Container)
+	if err != nil {
+		return err
+	}
+	if container == nil || container.State != "running" || container.ID == "" {
+		return fmt.Errorf("preview serving container unproven")
+	}
+	digest, err := m.docker.ContainerImageDigest(ctx, container.ID)
+	if err != nil || digest != authority.ImageDigest {
+		return errors.Join(fmt.Errorf("preview immutable image mismatch"), err)
+	}
+	route, present, err := m.caddy.ReadManagedBlock(ctx, previewRouteKey(app, &authority))
+	if err != nil || !present || !strings.Contains(route, authority.Container) {
+		return errors.Join(fmt.Errorf("preview serving route unproven"), err)
+	}
+	return nil
 }

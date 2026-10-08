@@ -342,8 +342,8 @@ func TestDRIntegration_CutoverCopyFailurePreservesOriginals(t *testing.T) {
 	// Inject the copy failure: the staged tree becomes unreadable, so
 	// promoteStaged's `cp -a` fails AFTER the originals were moved aside —
 	// exactly the mid-restore partial-copy window.
-	run("chmod 000 " + ssh.ShellQuote(DRStagingPath(drFixtureApp, manifest.ID)+"/volumes/data"))
-	defer run("chmod -R 700 " + ssh.ShellQuote(DRStagingPath(drFixtureApp, manifest.ID)) + " >/dev/null 2>&1 || true")
+	run("chmod 000 " + ssh.ShellQuote(receipt.StagingPath+"/volumes/data"))
+	defer run("chmod -R 700 " + ssh.ShellQuote(receipt.StagingPath) + " >/dev/null 2>&1 || true")
 
 	_, err = client.CutoverBundle(ctx, BundleRestoreOptions{App: drFixtureApp, ID: manifest.ID, Config: cfg})
 	if err == nil || !strings.Contains(err.Error(), "promoting data at cutover") {

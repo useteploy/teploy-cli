@@ -170,11 +170,9 @@ func (r *Registry) Fetch(ctx context.Context, name string, vars map[string]strin
 
 	content = string(body)
 
-	// Apply variable substitution.
-	content = substituteVariables(content, vars)
-
-	// Generate secrets.
+	// Generate only directives supplied by the template, before user literals.
 	content, generated = GenerateSecrets(content)
+	content = substituteVariables(content, vars)
 
 	if vars != nil {
 		if missing := findMissingVariables(content); len(missing) > 0 {
@@ -184,6 +182,12 @@ func (r *Registry) Fetch(ctx context.Context, name string, vars map[string]strin
 		if err := yaml.Unmarshal([]byte(content), &doc); err != nil {
 			return "", nil, fmt.Errorf("rendered template %q is not valid YAML: %w", name, err)
 		}
+		makeTemplateEnvLiteral(&doc)
+		rendered, marshalErr := yaml.Marshal(&doc)
+		if marshalErr != nil {
+			return "", nil, fmt.Errorf("encoding template: %w", marshalErr)
+		}
+		content = string(rendered)
 	}
 
 	return content, generated, nil
@@ -487,4 +491,22 @@ func RandomHex(n int) string {
 		panic("crypto/rand failed: " + err.Error())
 	}
 	return hex.EncodeToString(b)
+}
+
+// Rendered template environment is literal configuration, including user
+// passwords named auto or containing dollar signs. Ordinary env keeps its
+// interpolation/generation semantics for hand-authored configurations.
+func makeTemplateEnvLiteral(node *yaml.Node) {
+	if node.Kind == yaml.MappingNode {
+		for i := 0; i+1 < len(node.Content); i += 2 {
+			if node.Content[i].Value == "env" {
+				node.Content[i].Value = "env_literal"
+			}
+			makeTemplateEnvLiteral(node.Content[i+1])
+		}
+	} else {
+		for _, child := range node.Content {
+			makeTemplateEnvLiteral(child)
+		}
+	}
 }

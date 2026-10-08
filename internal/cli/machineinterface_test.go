@@ -92,6 +92,7 @@ func TestCapabilityTokenRegistry(t *testing.T) {
 		"plan-apply",
 		"preview-blue-green",
 		"preview-canonical-id",
+		"preview-compare-destroy-v1",
 		"preview-exposure",
 		"provenance-records",
 		"readiness-receipts",
@@ -100,6 +101,7 @@ func TestCapabilityTokenRegistry(t *testing.T) {
 		"server-status-machine",
 		"server-update",
 		"template-var-stdin",
+		"trigger-convergence-v1",
 	}
 	got := MachineCapabilities()
 	if len(got) != len(want) {

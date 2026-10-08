@@ -102,7 +102,6 @@ func TestContextFingerprint_HonorsExcludePatterns(t *testing.T) {
 	writeTree(t, b, core)
 	writeTree(t, b, map[string]string{
 		"node_modules/pkg/index.js": "junk",
-		".git/config":               "junk",
 		".env":                      "SECRET=1",
 		".env.local":                "SECRET=2",
 	})

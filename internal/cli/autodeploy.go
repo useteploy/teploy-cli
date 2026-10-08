@@ -103,7 +103,7 @@ func runAutoDeploySetup(flags *Flags, branch, secret string) error {
 	// pipeline as `teploy update` (see binarydist.go).
 	const teployBinaryPath = "/deployments/.bin/teploy"
 	fmt.Println("Installing teploy binary on server...")
-	binVersion, err := deployTeployBinaryToServer(ctx, executor, teployBinaryPath)
+	binVersion, err := deployTeployBinaryToServer(ctx, executor, teployBinaryPath, "autodeploy serve")
 	if err != nil {
 		return fmt.Errorf("installing teploy binary: %w", err)
 	}
@@ -320,11 +320,8 @@ func runAutoDeploySchedule(flags *Flags, schedule, branch string) error {
 	// than reconstructing the container itself (C02), so the server needs
 	// a teploy binary that speaks `autodeploy redeploy`.
 	const teployBinaryPath = "/deployments/.bin/teploy"
-	if _, err := deployTeployBinaryToServer(ctx, executor, teployBinaryPath); err != nil {
+	if _, err := deployTeployBinaryToServer(ctx, executor, teployBinaryPath, "autodeploy redeploy"); err != nil {
 		return fmt.Errorf("installing the teploy binary on the server: %w", err)
-	}
-	if _, err := executor.Run(ctx, fmt.Sprintf("%s autodeploy redeploy --help >/dev/null 2>&1", ssh.ShellQuote(teployBinaryPath))); err != nil {
-		return fmt.Errorf("the server's teploy binary does not support 'autodeploy redeploy' (the scheduled redeploy now runs the full engine through it); release a teploy version that includes it, then re-run this command: %w", err)
 	}
 
 	mgr := autodeploy.NewManager(executor, os.Stdout)

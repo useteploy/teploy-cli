@@ -49,10 +49,15 @@ func drRestoreMock(manifest *BundleManifest, extra ...ssh.MockCommand) *ssh.Mock
 		{Match: "gzip -t", Output: ""},
 		{Match: "tar -xzf", Output: ""},
 		{Match: "docker rm -f", Output: ""},
-		{Match: "docker run -d", Output: "cid123\n"},
+		{Match: "docker create", Output: strings.Repeat("a", 64)},
+		{Match: "docker start", Output: ""},
+		{Match: "docker inspect -f '{{index .Config.Labels", Output: ""},
 		{Match: "for i in $(seq", Output: ""},
+		{Match: "umask 077; gunzip -c", Output: ""},
 		{Match: "gunzip -c", Output: ""},
-		{Match: "docker exec 'myapp-db-drcheck' psql -tA", Output: "3\n"},
+		{Match: "docker exec '" + strings.Repeat("a", 64) + "' psql -tA", Output: "3\n"},
+		// r2-03 private stdin import: SQL + credential header piped to exec -i.
+		{Match: "{ cat; cat ", Output: ""},
 	}...)...)
 	// The store's manifest, readable through the framed auto-answer.
 	mock.Files["/var/drstore/myapp/dr/"+manifest.ID+"/manifest.json"] = manifestJSON
@@ -128,6 +133,7 @@ func TestRestoreBundleIsolated_CorruptBundleFailsBeforeEngines(t *testing.T) {
 func TestRestoreBundleIsolated_ReceiptRPORTO(t *testing.T) {
 	manifest := drTestManifest()
 	mock := drRestoreMock(manifest)
+	executor := &round3DRExecutor{MockExecutor: mock, owners: map[string]string{}}
 	start := time.Date(2026, 9, 23, 11, 0, 0, 0, time.UTC)
 	validated := start.Add(90 * time.Second)
 	calls := 0
@@ -139,7 +145,7 @@ func TestRestoreBundleIsolated_ReceiptRPORTO(t *testing.T) {
 		return validated
 	}
 
-	client := NewClient(mock, &bytes.Buffer{})
+	client := NewClient(executor, &bytes.Buffer{})
 	receipt, err := client.RestoreBundleIsolated(context.Background(), BundleRestoreOptions{
 		App: "myapp", ID: manifest.ID, Config: drTestConfig(), Now: now,
 	}, DirBundleStore{Root: "/var/drstore"})
@@ -156,7 +162,7 @@ func TestRestoreBundleIsolated_ReceiptRPORTO(t *testing.T) {
 	if receipt.RTOSeconds != 90 {
 		t.Errorf("RTO = %d, want 90", receipt.RTOSeconds)
 	}
-	if receipt.StagingPath != DRStagingPath("myapp", manifest.ID) {
+	if receipt.StagingPath != DRStagingPath("myapp", manifest.ID)+"/"+receipt.InvocationID {
 		t.Errorf("staging path: %s", receipt.StagingPath)
 	}
 	var dataCheck, appCheck bool
@@ -173,8 +179,8 @@ func TestRestoreBundleIsolated_ReceiptRPORTO(t *testing.T) {
 	}
 	// Scratch teardown happened.
 	var sawTeardown bool
-	for _, call := range mock.Calls {
-		if strings.Contains(call, "docker rm -f 'myapp-db-drcheck'") {
+	for _, call := range executor.commands {
+		if strings.HasPrefix(call, "docker rm -f '") {
 			sawTeardown = true
 		}
 		if strings.Contains(call, "/deployments/myapp") {
@@ -215,12 +221,20 @@ func TestRestoreBundleIsolated_EncryptedWithoutKeyFailsBeforeEngines(t *testing.
 // ---- Cutover ----
 
 func drCutoverMock(receipt *RestoreReceipt, manifest *BundleManifest, extra ...ssh.MockCommand) *ssh.MockExecutor {
-	staging := DRStagingPath("myapp", manifest.ID)
+	base := DRStagingPath("myapp", manifest.ID)
+	staging := base + "/" + strings.Repeat("b", 32)
+	receipt.InvocationID = strings.Repeat("b", 32)
+	receipt.StagingPath = staging
+	if receipt.ManifestSHA256 == "" {
+		receipt.ManifestSHA256 = bundleManifestDigest(manifest)
+	}
 	receiptJSON, _ := json.Marshal(receipt)
 	manifestJSON, _ := json.Marshal(manifest)
 	// extras are PREPENDED so injected failures outrank the base successes.
 	mock := ssh.NewMockExecutor("dr-host", append(extra, []ssh.MockCommand{
 		{Match: "mkdir /deployments/myapp/.lock", Output: ""},
+		// Accessory admission (R2-06) runs before any cutover effect.
+		{Match: "teploy_volume_actor", Output: ""},
 		{Match: "docker ps --filter label=teploy.app='myapp'", Output: "myapp-web\nmyapp-db\n"},
 		{Match: "docker stop", Output: ""},
 		{Match: "docker start", Output: ""},
@@ -232,7 +246,10 @@ func drCutoverMock(receipt *RestoreReceipt, manifest *BundleManifest, extra ...s
 		{Match: "docker image inspect", Output: "\n"},
 		{Match: "docker run --detach", Output: ""},
 		{Match: "for i in $(seq", Output: ""},
+		{Match: "umask 077; gunzip -c", Output: ""},
 		{Match: "gunzip -c", Output: ""},
+		// r2-03 private stdin import: SQL + credential header piped to exec -i.
+		{Match: "{ cat; cat ", Output: ""},
 		{Match: "mkdir -p '/deployments/myapp/volumes/data'", Output: ""},
 		{Match: "mktemp -d '/deployments", Output: "/deployments/myapp/recovery123\n"},
 		{Match: "find ", Output: ""},
@@ -243,6 +260,7 @@ func drCutoverMock(receipt *RestoreReceipt, manifest *BundleManifest, extra ...s
 		{Match: "mkdir -p '/deployments/myapp/meta' '/deployments/myapp/secrets'", Output: ""},
 		{Match: "mkdir -p /deployments/myapp/meta", Output: ""},
 	}...)...)
+	mock.Files[base+"/receipt.json"] = receiptJSON
 	mock.Files[staging+"/receipt.json"] = receiptJSON
 	mock.Files[staging+"/manifest.json"] = manifestJSON
 	return mock
@@ -385,7 +403,7 @@ func TestCutover_HappyPath(t *testing.T) {
 		t.Errorf("promoted paths: %v", receipt.Promoted)
 	}
 	stateBytes, ok := mock.Files["/deployments/myapp/state.json"]
-	if !ok || !strings.Contains(string(stateBytes), `"generation":4`) {
+	if !ok || !strings.Contains(string(stateBytes), `"generation":1`) {
 		t.Errorf("restored state.json not installed: %q", string(stateBytes))
 	}
 	if _, ok := mock.Files["/deployments/myapp/meta/rel-77.json"]; !ok {
@@ -413,7 +431,7 @@ func TestCutover_NonEmptyAccessoryDirWithoutVolumeData(t *testing.T) {
 		t.Fatalf("CutoverBundle: %v", err)
 	}
 	for _, call := range mock.Calls {
-		if strings.HasPrefix(call, "mv -f ") || strings.Contains(call, "docker run --rm --user 0") {
+		if (strings.HasPrefix(call, "mv -f ") && !strings.Contains(call, "state.json.tmp-")) || strings.Contains(call, "docker run --rm --user 0") {
 			t.Errorf("nothing existed to move aside, yet a move ran: %s", call)
 		}
 		if strings.Contains(call, "pre-cutover.XXXXXX") {

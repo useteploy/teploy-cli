@@ -227,7 +227,7 @@ container.
 
 A key that is not set is reported as such and is not an error, so re-running the
 removal of an already-revoked credential is safe. Containers keep the old value
-in their environment until they are restarted.`,
+in their environment until the app is redeployed with teploy deploy.`,
 		Args: cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runSecretRm(flags, *provider, args)
@@ -270,7 +270,7 @@ func runSecretRm(flags *Flags, providerFlag string, keys []string) error {
 		fmt.Printf("  No secret %s set — nothing to remove\n", key)
 	}
 	if removed > 0 {
-		fmt.Println("  (Restart containers to drop the value from their environment)")
+		fmt.Println("  (Redeploy the app to drop the value from their environment)")
 	}
 	return nil
 }
@@ -306,6 +306,6 @@ func runSecretRotate(flags *Flags, key string) error {
 	}
 	fmt.Printf("  Rotated %s\n", key)
 	fmt.Printf("  New value: %s\n", newVal)
-	fmt.Println("  (Restart containers to apply)")
+	fmt.Println("  (Redeploy the app to apply)")
 	return nil
 }

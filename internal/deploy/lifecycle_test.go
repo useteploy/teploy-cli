@@ -12,6 +12,7 @@ import (
 
 func TestStop(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "mkdir /deployments/myapp/.lock", Output: ""},
 		ssh.MockCommand{Match: "docker ps --all --filter label=teploy.app='myapp'",
 			Output: `{"ID":"abc123","Names":"myapp-web-v1","Image":"myapp:latest","State":"running","Status":"Up 2h","Labels":"teploy.app=myapp,teploy.version=v1,teploy.process=web"}` + "\n" +
 				`{"ID":"def456","Names":"myapp-worker-v1","Image":"myapp:latest","State":"running","Status":"Up 2h","Labels":"teploy.app=myapp,teploy.version=v1,teploy.process=worker"}`,
@@ -22,6 +23,7 @@ func TestStop(t *testing.T) {
 	)
 
 	var buf bytes.Buffer
+	seedRound3Lifecycle(mock, "myapp")
 	lc := NewLifecycle(mock, &buf)
 	if err := lc.Stop(context.Background(), "myapp", 10); err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -45,9 +47,11 @@ func TestStop(t *testing.T) {
 
 func TestStop_NoContainers(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "mkdir /deployments/myapp/.lock", Output: ""},
 		ssh.MockCommand{Match: "docker ps --all --filter label=teploy.app='myapp'", Output: ""},
 	)
 
+	seedRound3Lifecycle(mock, "myapp")
 	lc := NewLifecycle(mock, &bytes.Buffer{})
 	err := lc.Stop(context.Background(), "myapp", 10)
 	if err == nil {
@@ -58,6 +62,7 @@ func TestStop_NoContainers(t *testing.T) {
 func TestStart(t *testing.T) {
 	stateContent := "current_port=49152\ncurrent_hash=v1\n"
 	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "mkdir /deployments/myapp/.lock", Output: ""},
 		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state.json' ]", Output: "absent"},
 		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state' ]", Output: "present\n" + stateContent},
 		ssh.MockCommand{Match: "docker ps --all --filter label=teploy.app='myapp'",
@@ -70,6 +75,7 @@ func TestStart(t *testing.T) {
 	)
 
 	var buf bytes.Buffer
+	seedRound3Lifecycle(mock, "myapp")
 	lc := NewLifecycle(mock, &buf)
 	if err := lc.Start(context.Background(), "myapp"); err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -82,6 +88,7 @@ func TestStart(t *testing.T) {
 
 func TestStart_NoState(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "mkdir /deployments/myapp/.lock", Output: ""},
 		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state.json' ]", Output: "absent"},
 		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state' ]", Output: "absent"},
 	)
@@ -99,6 +106,7 @@ func TestStart_NoState(t *testing.T) {
 func TestRestart(t *testing.T) {
 	stateContent := "current_port=49152\ncurrent_hash=v1\n"
 	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "mkdir /deployments/myapp/.lock", Output: ""},
 		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state.json' ]", Output: "absent"},
 		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state' ]", Output: "present\n" + stateContent},
 		ssh.MockCommand{Match: "docker ps --all --filter label=teploy.app='myapp'",
@@ -112,6 +120,7 @@ func TestRestart(t *testing.T) {
 	)
 
 	var buf bytes.Buffer
+	seedRound3Lifecycle(mock, "myapp")
 	lc := NewLifecycle(mock, &buf)
 	if err := lc.Restart(context.Background(), "myapp", 10); err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -131,6 +140,7 @@ func TestRestart(t *testing.T) {
 
 func TestStop_LogsAction(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "mkdir /deployments/myapp/.lock", Output: ""},
 		ssh.MockCommand{Match: "docker ps --all --filter label=teploy.app='myapp'",
 			Output: `{"ID":"abc123","Names":"myapp-web-v1","Image":"myapp:latest","State":"running","Status":"Up 2h","Labels":"teploy.app=myapp,teploy.version=v1,teploy.process=web"}`,
 		},
@@ -139,6 +149,7 @@ func TestStop_LogsAction(t *testing.T) {
 		ssh.MockCommand{Match: "UPLOAD:", Output: ""},
 	)
 
+	seedRound3Lifecycle(mock, "myapp")
 	lc := NewLifecycle(mock, &bytes.Buffer{})
 	lc.Stop(context.Background(), "myapp", 10)
 

@@ -88,14 +88,17 @@ func TestRunDetailed_LocalExecutor_TimedOutVsCanceled(t *testing.T) {
 // beyond the limit is dropped and flagged, never buffered.
 func TestRunDetailed_LocalExecutor_Truncated(t *testing.T) {
 	e := NewLocalExecutor()
-	res := runDetailedWithLimit(context.Background(), e, "yes a", nil, 64)
+	res := runDetailedWithLimit(context.Background(), e, "printf '%0100d' 0", nil, 64)
+	if res.ExitCode != 0 || res.Err != nil {
+		t.Fatalf("producer outcome changed: %+v", res)
+	}
 	if !res.Truncated {
 		t.Fatal("Truncated must be set when the capture limit is hit")
 	}
 	if int64(len(res.Stdout)) > 64 {
 		t.Fatalf("captured %d bytes, limit was 64", len(res.Stdout))
 	}
-	if !strings.HasPrefix(string(res.Stdout), "a") {
+	if !strings.HasPrefix(string(res.Stdout), "0") {
 		t.Fatalf("the FIRST bytes must be kept, got %q", res.Stdout)
 	}
 }
@@ -237,3 +240,16 @@ func (f *fakeFallbackExecutor) Upload(ctx context.Context, content io.Reader, re
 func (f *fakeFallbackExecutor) Close() error { return nil }
 func (f *fakeFallbackExecutor) Host() string { return "fake" }
 func (f *fakeFallbackExecutor) User() string { return "root" }
+
+func TestLimitedBufferDiscardsTailWithoutShortWrite(t *testing.T) {
+	b := &limitedBuffer{limit: 4}
+	for _, input := range []string{"abcdef", "gh"} {
+		n, err := b.Write([]byte(input))
+		if n != len(input) || err != nil {
+			t.Fatalf("Write = %d, %v", n, err)
+		}
+	}
+	if string(b.bytes()) != "abcd" || !b.overflow {
+		t.Fatalf("capture = %q, overflow=%v", b.bytes(), b.overflow)
+	}
+}

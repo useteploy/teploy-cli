@@ -476,66 +476,20 @@ func (m *Manager) Remove(ctx context.Context, app string) error {
 	return nil
 }
 
-// generateScheduledRedeployScript returns the bash script that the cron job
-// invokes. It runs entirely on the server with no teploy-binary dependency:
-//  1. Find the running container for this app's "web" process by labels.
-//  2. Pull the image tag the container was started with.
-//  3. Compare the running image digest with the just-pulled one. If they
-//     match, exit silently — the container is already current.
-//  4. Otherwise, capture the current container's env, volumes, ports,
-//     labels, network, and restart policy via docker inspect, then
-//     stop+rm and recreate it with the same name and the new image.
-//
-// We keep the same container name on purpose: Caddy's reverse_proxy upstream
-// resolves containers by their network alias / DNS name, and re-using the
-// engine entry. The script only performs the CHEAP part — find the web
-// container, pull its image tag, compare digests, and exit 0 when nothing
-// changed. When the digest DID move it invokes the on-server teploy binary's
-// `autodeploy redeploy`, which runs the exact same fenced, health-gated,
-// release-recorded deploy code as `teploy deploy` and the webhook listener
-// (C02: one execution path for every trigger). The old version of this
-// script reconstructed the container from docker inspect and did its own
-// stop/rm/run — no lock, no health gate, no release record, no rollback,
-// and a stop-to-start downtime window.
+// generateScheduledRedeployScript delegates every scheduled trigger to the
+// full engine, which resolves the original configured image reference and
+// handles source builds. Container Config.Image is an immutable local ID,
+// not a registry reference and cannot be used as a pull preflight.
 func generateScheduledRedeployScript(app, branch, binaryPath string) string {
 	return fmt.Sprintf(`#!/bin/bash
-# Scheduled redeploy for %[1]s (branch %[2]s) — digest pre-check, then the full deploy engine.
 set -e
-
 APP=%[4]q
 BRANCH=%[5]q
 LOG="/deployments/$APP/scheduled-redeploy.log"
-
 ts() { date -u +%%Y-%%m-%%dT%%H:%%M:%%SZ; }
-
 CONTAINER=$(docker ps --filter "label=teploy.app=$APP" --filter "label=teploy.process=web" --format '{{.Names}}' | head -n 1)
-if [ -z "$CONTAINER" ]; then
-    echo "$(ts) [skip] no running container for $APP/web" >> "$LOG"
-    exit 0
-fi
-
-IMAGE=$(docker inspect --format='{{.Config.Image}}' "$CONTAINER")
-if [ -z "$IMAGE" ]; then
-    echo "$(ts) [error] could not read image for $CONTAINER" >> "$LOG"
-    exit 1
-fi
-
-CURRENT_DIGEST=$(docker inspect --format='{{.Image}}' "$CONTAINER")
-
-# Pull the same tag — gets the latest digest if the upstream was updated.
-if ! docker pull "$IMAGE" >> "$LOG" 2>&1; then
-    echo "$(ts) [error] docker pull failed for $IMAGE" >> "$LOG"
-    exit 1
-fi
-
-NEW_DIGEST=$(docker image inspect --format='{{.Id}}' "$IMAGE")
-
-if [ "$CURRENT_DIGEST" = "$NEW_DIGEST" ]; then
-    # No-op silent exit. Don't spam the log on every cron tick.
-    exit 0
-fi
-
-echo "$(ts) [redeploy] new digest for $IMAGE — running the deploy engine" >> "$LOG"
+if [ -z "$CONTAINER" ]; then exit 0; fi
+echo "$(ts) [redeploy] running the deploy engine" >> "$LOG"
 %[3]q autodeploy redeploy --app "$APP" --branch "$BRANCH" >> "$LOG" 2>&1
 `, app, branch, binaryPath, app, branch)
 }

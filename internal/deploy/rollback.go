@@ -264,11 +264,13 @@ func Rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg Rollbac
 	// newer generation is left strictly alone; recovery of OUR effects must
 	// not destroy the new owner's workload. Holdership is deliberately NOT
 	// checked here (A07: recovery is never fenced).
-	restoreDisplaced := func() {
+	restoreDisplaced := func() error {
+		var failures []error
 		recoveryCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()
 		for _, name := range displacedHostWeb {
 			if rerr := dk.RestartFenced(recoveryCtx, name, nil, fromGeneration, ""); rerr != nil {
+				failures = append(failures, fmt.Errorf("restoring %s: %w", name, rerr))
 				if state.GenerationFenced(rerr) {
 					fmt.Fprintf(out, "  WARNING: could not restore %s after the failed rollback — a newer generation owns the name\n", name)
 					continue
@@ -278,6 +280,7 @@ func Rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg Rollbac
 				fmt.Fprintf(out, "  Restored %s\n", name)
 			}
 		}
+		return errors.Join(failures...)
 	}
 	if fixedPorts {
 		// Fence + generation check composed into the stop (F16 + C01-8/9):
@@ -557,19 +560,36 @@ func Rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg Rollbac
 	// cannot commit over a successor's newer generation (ErrGenerationFenced
 	// naming both), so a stale rollback can never become authority.
 	if err := state.WriteFencedGeneration(ctx, exec, cfg.App, newState, lk, fromGeneration); err != nil {
+		if state.PreservePublishedState(err) {
+			return fmt.Errorf("state publication requires reconciliation; serving workload preserved: %w", err)
+		}
+
 		// Fixed host ports: the target holds them. Stop it, restore the
 		// displaced workload, then remove the uncommitted target — previously
 		// this branch skipped the restore and still claimed "the original
 		// workload was left running" (audit F12).
 		if fixedPorts {
-			for _, name := range started {
-				dk.Stop(ctx, name, 5)
+			recoveryCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 60*time.Second)
+			defer cancel()
+			if cfg.usesCaddy() {
+				if restoreErr := restoreRollbackRoute(recoveryCtx, exec, out, cd, dk, cfg, current, containers, restoreRouteCAS(resolvedRouteHash, switchedRouteHash), fromGeneration); restoreErr != nil {
+					return fmt.Errorf("committing authoritative state: %w; restoring route failed: %v; target preserved to avoid routing to a removed container", err, restoreErr)
+				}
 			}
-			restoreDisplaced()
 			for _, name := range started {
-				dk.Remove(ctx, name)
+				if stopErr := dk.Stop(recoveryCtx, name, 5); stopErr != nil {
+					return fmt.Errorf("state commit failed: %w; stopping target before fixed-port recovery: %v", err, stopErr)
+				}
 			}
-			return fmt.Errorf("committing authoritative applied state after rollback: %w; the fixed-port workload was restored and the uncommitted target was removed", err)
+			if restoreErr := restoreDisplaced(); restoreErr != nil {
+				return fmt.Errorf("state commit failed: %w; restoring fixed-port workload failed: %v", err, restoreErr)
+			}
+			for _, name := range started {
+				if removeErr := dk.Remove(recoveryCtx, name); removeErr != nil {
+					return fmt.Errorf("state commit failed: %w; workload/route restored but target cleanup failed: %v", err, removeErr)
+				}
+			}
+			return fmt.Errorf("committing authoritative applied state after rollback: %w; the fixed-port workload and route were restored and the uncommitted target was removed", err)
 		}
 		if cfg.usesCaddy() {
 			// The restore is CAS-fenced (A12/T05): it may only overwrite

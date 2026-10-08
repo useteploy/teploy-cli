@@ -22,15 +22,18 @@ import (
 
 // Config holds all parameters for a deploy.
 type Config struct {
-	App       string
-	Domain    string
-	Image     string
-	Version   string   // short git hash or tag
-	EnvFiles  []string // paths to env files on the server, applied in order (later files' keys win) — see docker.RunConfig.EnvFiles
-	Env       map[string]string
-	Volumes   map[string]string
-	Cmd       string            // command override for single-process deploys
-	Processes map[string]string // process_name -> command (overrides Cmd)
+	TriggerOperationKey    string
+	ExecutionBindingDigest string
+	App                    string
+	Domain                 string
+	Image                  string
+	Version                string   // short git hash or tag
+	EnvFiles               []string // paths to env files on the server, applied in order (later files' keys win) — see docker.RunConfig.EnvFiles
+	Env                    map[string]string
+	Volumes                map[string]string
+	VolumeOwnership        map[string]config.VolumeOwnership
+	Cmd                    string            // command override for single-process deploys
+	Processes              map[string]string // process_name -> command (overrides Cmd)
 	// NoHealthcheck disables the container HEALTHCHECK for specific processes.
 	// Keyed by process name; true means pass --no-healthcheck to docker run.
 	// Used when a process shouldn't be probed by the image's built-in
@@ -216,6 +219,17 @@ func (c Config) validate() error {
 	// Provenance identity (C04): a record describing another deploy than
 	// the Config it rides on is a lie that would corrupt the plan/receipt
 	// equality surfaces — refused before any effect.
+	for name, permission := range c.VolumeOwnership {
+		if err := config.ValidateName(name); err != nil {
+			return err
+		}
+		if err := permission.Validate(); err != nil {
+			return err
+		}
+		if _, ok := c.Volumes[fmt.Sprintf("/deployments/%s/volumes/%s", c.App, name)]; !ok {
+			return fmt.Errorf("volume ownership requires matching managed volume %s", name)
+		}
+	}
 	if c.Provenance != nil && (c.Provenance.App != c.App || c.Provenance.Release != c.Version) {
 		return fmt.Errorf("provenance identity mismatch: provenance describes %s@%s, deploy is %s@%s", c.Provenance.App, c.Provenance.Release, c.App, c.Version)
 	}
@@ -354,6 +368,17 @@ func (d *Deployer) DeployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 	current, err := state.Read(ctx, d.exec, cfg.App)
 	if err != nil {
 		return fmt.Errorf("refusing to deploy with unreadable state for %s: %w", cfg.App, err)
+	}
+
+	volumeNames := make([]string, 0, len(cfg.VolumeOwnership))
+	for name := range cfg.VolumeOwnership {
+		volumeNames = append(volumeNames, name)
+	}
+	sort.Strings(volumeNames)
+	for _, name := range volumeNames {
+		if err := d.docker.ProvisionManagedVolume(ctx, cfg.App, "", name, cfg.VolumeOwnership[name], lk.GuardPrefix()); err != nil {
+			return err
+		}
 	}
 
 	// 1z. Resolve the generation identities this deploy prepares against
@@ -995,6 +1020,8 @@ func (d *Deployer) DeployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 	newState.ManifestSHA256 = cfg.ManifestSHA256
 	newState.AppliedManifest = append(json.RawMessage(nil), cfg.AppliedManifest...)
 	newState.SourceRevision = cfg.SourceRevision
+	newState.TriggerOperationKey = cfg.TriggerOperationKey
+	newState.ExecutionBindingDigest = cfg.ExecutionBindingDigest
 	newState.ImageRef = cfg.Image
 	newState.ImageDigest = ImageDigestFromRef(cfg.Image)
 	if newState.ImageDigest == "" {
@@ -1013,6 +1040,9 @@ func (d *Deployer) DeployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 	// commands land inside the successor's window (WriteFencedGeneration
 	// refuses with ErrGenerationFenced naming both generations).
 	if err := state.WriteFencedGeneration(ctx, d.exec, cfg.App, newState, lk, fromGeneration); err != nil {
+		if state.PreservePublishedState(err) {
+			return fmt.Errorf("state publication requires reconciliation; serving workload preserved: %w", err)
+		}
 		return d.abortStateCommit(ctx, cfg, current, started, startedIDs, displacedHostWeb, assetAttempt, restoreRouteCAS(resolvedRouteHash, switchedRouteHash), start, err)
 	}
 
@@ -1645,26 +1675,28 @@ func (d *Deployer) recordRelease(ctx context.Context, cfg Config, att releasemet
 	healthCfg := cfg.Health.withDefaults()
 
 	rec := &releasemeta.Record{
-		App:            cfg.App,
-		Hash:           cfg.Version,
-		Generation:     applied.Generation,
-		DeploymentType: "container",
-		IngressMode:    cfg.Ingress,
-		Domain:         cfg.Domain,
-		ImageRef:       cfg.Image,
-		ImageDigest:    applied.ImageDigest,
-		ManifestSHA256: cfg.ManifestSHA256,
-		Replicas:       len(ports),
-		Processes:      maps.Clone(cfg.Processes),
-		Cmd:            cfg.Cmd,
-		Env:            maps.Clone(cfg.Env),
-		EnvFiles:       append([]string(nil), cfg.EnvFiles...),
-		Volumes:        maps.Clone(cfg.Volumes),
-		Publish:        append([]string(nil), cfg.Publish...),
-		Memory:         cfg.Memory,
-		CPU:            cfg.CPU,
-		StopTimeout:    cfg.StopTimeout,
-		Bind:           cfg.Bind,
+		TriggerOperationKey: cfg.TriggerOperationKey, ExecutionBindingDigest: cfg.ExecutionBindingDigest,
+		App:             cfg.App,
+		Hash:            cfg.Version,
+		Generation:      applied.Generation,
+		DeploymentType:  "container",
+		IngressMode:     cfg.Ingress,
+		Domain:          cfg.Domain,
+		ImageRef:        cfg.Image,
+		ImageDigest:     applied.ImageDigest,
+		ManifestSHA256:  cfg.ManifestSHA256,
+		Replicas:        len(ports),
+		Processes:       maps.Clone(cfg.Processes),
+		Cmd:             cfg.Cmd,
+		Env:             maps.Clone(cfg.Env),
+		EnvFiles:        append([]string(nil), cfg.EnvFiles...),
+		Volumes:         maps.Clone(cfg.Volumes),
+		VolumeOwnership: maps.Clone(cfg.VolumeOwnership),
+		Publish:         append([]string(nil), cfg.Publish...),
+		Memory:          cfg.Memory,
+		CPU:             cfg.CPU,
+		StopTimeout:     cfg.StopTimeout,
+		Bind:            cfg.Bind,
 		Health: &releasemeta.Health{
 			Mode:            healthCfg.Mode,
 			Path:            healthCfg.Path,

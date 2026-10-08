@@ -3,7 +3,12 @@ package deploy
 import (
 	"context"
 	"fmt"
+	"github.com/useteploy/teploy/internal/config"
+	"github.com/useteploy/teploy/internal/releasemeta"
 	"io"
+	"sort"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/useteploy/teploy/internal/docker"
@@ -29,6 +34,13 @@ func NewLifecycle(exec ssh.Executor, out io.Writer) *Lifecycle {
 
 // Stop stops all running containers for the app.
 func (l *Lifecycle) Stop(ctx context.Context, app string, timeout int) error {
+	lk, err := state.AcquireLockFenced(ctx, l.exec, app)
+	if err != nil {
+		return err
+	}
+	lk.StartRenewal(l.exec)
+	defer state.ReleaseLockFenced(l.exec, lk, app)
+
 	containers, err := l.appContainers(ctx, app)
 	if err != nil {
 		return err
@@ -39,7 +51,7 @@ func (l *Lifecycle) Stop(ctx context.Context, app string, timeout int) error {
 
 	for _, c := range containers {
 		fmt.Fprintf(l.out, "Stopping %s...\n", c.Name)
-		if err := l.docker.Stop(ctx, c.Name, timeout); err != nil {
+		if err := l.stop(ctx, lk, c, timeout); err != nil {
 			return err
 		}
 	}
@@ -51,6 +63,13 @@ func (l *Lifecycle) Stop(ctx context.Context, app string, timeout int) error {
 
 // Start starts all stopped containers for the app and runs a health check.
 func (l *Lifecycle) Start(ctx context.Context, app string) error {
+	lk, err := state.AcquireLockFenced(ctx, l.exec, app)
+	if err != nil {
+		return err
+	}
+	lk.StartRenewal(l.exec)
+	defer state.ReleaseLockFenced(l.exec, lk, app)
+
 	current, err := state.Read(ctx, l.exec, app)
 	if err != nil || current == nil {
 		return fmt.Errorf("no deploy state found for %s — deploy first", app)
@@ -66,7 +85,7 @@ func (l *Lifecycle) Start(ctx context.Context, app string) error {
 
 	for _, c := range containers {
 		fmt.Fprintf(l.out, "Starting %s...\n", c.Name)
-		if err := l.docker.Start(ctx, c.Name); err != nil {
+		if err := l.start(ctx, lk, c); err != nil {
 			return err
 		}
 	}
@@ -76,8 +95,26 @@ func (l *Lifecycle) Start(ctx context.Context, app string) error {
 		fmt.Fprintln(l.out, "Running health check...")
 		deployer := &Deployer{exec: l.exec, out: l.out}
 		// Probe the bound address, not localhost — see healthProbeHost.
-		bindHost := l.docker.HostBindIP(ctx, containers[0].Name)
-		if err := deployer.healthCheck(ctx, current.CurrentPort, defaultHealthConfig(), bindHost); err != nil {
+		webName := ""
+		for _, c := range containers {
+			if c.Labels["teploy.process"] == "web" {
+				webName = c.Name
+				break
+			}
+		}
+		if webName == "" {
+			return fmt.Errorf("current release has no web container")
+		}
+		bindHost := l.docker.HostBindIP(ctx, webName)
+		health := defaultHealthConfig()
+		rec, recErr := releasemeta.Read(ctx, l.exec, app, current.CurrentHash)
+		if recErr != nil {
+			return recErr
+		}
+		if rec != nil {
+			applyRecordToRollback(&RollbackConfig{}, rec, &health)
+		}
+		if err := deployer.healthCheck(ctx, current.CurrentPort, health, bindHost); err != nil {
 			return fmt.Errorf("health check failed after start: %w", err)
 		}
 		fmt.Fprintln(l.out, "  Health check passed")
@@ -90,6 +127,13 @@ func (l *Lifecycle) Start(ctx context.Context, app string) error {
 
 // Restart stops then starts all containers for the app.
 func (l *Lifecycle) Restart(ctx context.Context, app string, timeout int) error {
+	lk, err := state.AcquireLockFenced(ctx, l.exec, app)
+	if err != nil {
+		return err
+	}
+	lk.StartRenewal(l.exec)
+	defer state.ReleaseLockFenced(l.exec, lk, app)
+
 	current, err := state.Read(ctx, l.exec, app)
 	if err != nil || current == nil {
 		return fmt.Errorf("no deploy state found for %s — deploy first", app)
@@ -106,7 +150,7 @@ func (l *Lifecycle) Restart(ctx context.Context, app string, timeout int) error 
 	// Stop all.
 	for _, c := range containers {
 		fmt.Fprintf(l.out, "Stopping %s...\n", c.Name)
-		if err := l.docker.Stop(ctx, c.Name, timeout); err != nil {
+		if err := l.stop(ctx, lk, c, timeout); err != nil {
 			return err
 		}
 	}
@@ -114,7 +158,7 @@ func (l *Lifecycle) Restart(ctx context.Context, app string, timeout int) error 
 	// Start all.
 	for _, c := range containers {
 		fmt.Fprintf(l.out, "Starting %s...\n", c.Name)
-		if err := l.docker.Start(ctx, c.Name); err != nil {
+		if err := l.start(ctx, lk, c); err != nil {
 			return err
 		}
 	}
@@ -124,8 +168,26 @@ func (l *Lifecycle) Restart(ctx context.Context, app string, timeout int) error 
 		fmt.Fprintln(l.out, "Running health check...")
 		deployer := &Deployer{exec: l.exec, out: l.out}
 		// Probe the bound address, not localhost — see healthProbeHost.
-		bindHost := l.docker.HostBindIP(ctx, containers[0].Name)
-		if err := deployer.healthCheck(ctx, current.CurrentPort, defaultHealthConfig(), bindHost); err != nil {
+		webName := ""
+		for _, c := range containers {
+			if c.Labels["teploy.process"] == "web" {
+				webName = c.Name
+				break
+			}
+		}
+		if webName == "" {
+			return fmt.Errorf("current release has no web container")
+		}
+		bindHost := l.docker.HostBindIP(ctx, webName)
+		health := defaultHealthConfig()
+		rec, recErr := releasemeta.Read(ctx, l.exec, app, current.CurrentHash)
+		if recErr != nil {
+			return recErr
+		}
+		if rec != nil {
+			applyRecordToRollback(&RollbackConfig{}, rec, &health)
+		}
+		if err := deployer.healthCheck(ctx, current.CurrentPort, health, bindHost); err != nil {
 			return fmt.Errorf("health check failed after restart: %w", err)
 		}
 		fmt.Fprintln(l.out, "  Health check passed")
@@ -136,39 +198,104 @@ func (l *Lifecycle) Restart(ctx context.Context, app string, timeout int) error 
 	return nil
 }
 
-// appContainers returns all running containers for the app.
+// Only current recorded processes and currently configured accessories belong
+// to lifecycle. Start activates configured accessories, including previously
+// stopped ones; removed/unknown accessories and historical workloads stay alone.
 func (l *Lifecycle) appContainers(ctx context.Context, app string) ([]docker.Container, error) {
-	containers, err := l.docker.ListContainers(ctx, app)
+	current, err := state.Read(ctx, l.exec, app)
 	if err != nil {
 		return nil, err
 	}
-
+	if current == nil {
+		return nil, fmt.Errorf("no deploy state for %s", app)
+	}
+	containers, err := l.appContainersByVersion(ctx, app, current.CurrentHash)
+	if err != nil {
+		return nil, err
+	}
 	var running []docker.Container
-	for _, c := range containers {
-		if c.State == "running" {
-			running = append(running, c)
+	for _, container := range containers {
+		if container.State == "running" {
+			running = append(running, container)
 		}
 	}
 	return running, nil
 }
-
-// appContainersByVersion returns all containers (any state) matching the given version.
 func (l *Lifecycle) appContainersByVersion(ctx context.Context, app, version string) ([]docker.Container, error) {
+	current, err := state.Read(ctx, l.exec, app)
+	if err != nil {
+		return nil, err
+	}
+	if current == nil || current.CurrentHash != version {
+		return nil, fmt.Errorf("current release changed")
+	}
+	record, err := releasemeta.Read(ctx, l.exec, app, version)
+	if err != nil {
+		return nil, err
+	}
+	if record == nil || record.App != app || record.Hash != version {
+		return nil, fmt.Errorf("current release record required for lifecycle")
+	}
+	accessories := map[string]bool{}
+	if len(current.AppliedManifest) > 0 {
+		manifest, err := config.ParseAppliedManifest(current.AppliedManifest)
+		if err != nil {
+			return nil, err
+		}
+		for name := range manifest.Accessories {
+			accessories[name] = true
+		}
+	}
 	containers, err := l.docker.ListContainers(ctx, app)
 	if err != nil {
 		return nil, err
 	}
-
-	// Match by the teploy.version label, not a name suffix — replica containers
-	// ("<app>-<proc>-<version>-1") don't end in "-<version>", so a suffix match
-	// silently skips them (restart/start would miss every web replica).
 	var matched []docker.Container
-	for _, c := range containers {
-		if c.Labels["teploy.version"] == version {
-			matched = append(matched, c)
+	for _, container := range containers {
+		if currentLifecycleContainer(container, app, version, current.Generation, record.Generation, record.Processes, accessories) {
+			matched = append(matched, container)
 		}
 	}
+	sort.SliceStable(matched, func(i, j int) bool {
+		return matched[i].Labels["teploy.role"] == "accessory" && matched[j].Labels["teploy.role"] != "accessory"
+	})
 	return matched, nil
+}
+func currentLifecycleContainer(container docker.Container, app, version string, generation, recordedGeneration uint64, processes map[string]string, accessories map[string]bool) bool {
+	labels := container.Labels
+	if container.ID == "" || labels["teploy.app"] != app {
+		return false
+	}
+	if labels["teploy.preview"] != "" {
+		return false
+	}
+	role := labels["teploy.role"]
+	if role == "accessory" {
+		name := labels["teploy.accessory"]
+		return name != "" && accessories[name] && container.Name == app+"-"+name && labels["teploy.process"] == ""
+	}
+	if role != "" && role != "app" {
+		return false
+	}
+	process := labels["teploy.process"]
+	if labels["teploy.version"] != version {
+		return false
+	}
+	if process != "web" {
+		if _, recorded := processes[process]; !recorded || process == "" {
+			return false
+		}
+	}
+	if label := labels["teploy.generation"]; label != "" && label != strconv.FormatUint(generation, 10) && label != strconv.FormatUint(recordedGeneration, 10) {
+		return false
+	}
+	name := app + "-" + process + "-" + version
+	if container.Name == name {
+		return true
+	}
+	suffix, ok := strings.CutPrefix(container.Name, name+"-")
+	replica, err := strconv.Atoi(suffix)
+	return ok && err == nil && replica > 0 && strconv.Itoa(replica) == suffix
 }
 
 func (l *Lifecycle) logAction(ctx context.Context, app, action string) {
@@ -178,4 +305,21 @@ func (l *Lifecycle) logAction(ctx context.Context, app, action string) {
 		Type:      action,
 		Success:   true,
 	})
+}
+
+func (l *Lifecycle) stop(ctx context.Context, lk *state.Lock, c docker.Container, timeout int) error {
+	ref := c.ID
+	if ref == "" {
+		return fmt.Errorf("immutable container ID required")
+	}
+	_, err := lk.Guarded(ctx, l.exec, fmt.Sprintf("docker stop --time %d %s", timeout, ssh.ShellQuote(ref)))
+	return err
+}
+func (l *Lifecycle) start(ctx context.Context, lk *state.Lock, c docker.Container) error {
+	ref := c.ID
+	if ref == "" {
+		return fmt.Errorf("immutable container ID required")
+	}
+	_, err := lk.Guarded(ctx, l.exec, "docker start "+ssh.ShellQuote(ref))
+	return err
 }

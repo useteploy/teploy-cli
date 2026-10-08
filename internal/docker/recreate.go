@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -48,41 +49,41 @@ type RecreateMount struct {
 //     represented through the docker CLI (which takes a single --entrypoint
 //     string); recreate fails closed instead of silently mangling it.
 type RecreateSpec struct {
-	Name          string              `json:"name"`
-	ImageID       string              `json:"image_id,omitempty"` // immutable sha256:… (top-level .Image)
-	ImageRef      string              `json:"image_ref,omitempty"` // Config.Image original tag reference
-	Entrypoint    []string            `json:"entrypoint,omitempty"`
-	Cmd           []string            `json:"cmd,omitempty"`
-	Env           []string            `json:"env,omitempty"`
+	Name       string   `json:"name"`
+	ImageID    string   `json:"image_id,omitempty"`  // immutable sha256:… (top-level .Image)
+	ImageRef   string   `json:"image_ref,omitempty"` // Config.Image original tag reference
+	Entrypoint []string `json:"entrypoint,omitempty"`
+	Cmd        []string `json:"cmd,omitempty"`
+	Env        []string `json:"env,omitempty"`
 	// EnvFile, when set, names a private on-target env file rendered from
 	// Env; Recreate publishes it via --env-file instead of -e arguments so
 	// resolved values never appear in the host process list / command
 	// diagnostics (audit T19). Empty at inspect time.
-	EnvFile       string              `json:"-"`
-	WorkingDir    string              `json:"working_dir,omitempty"`
-	User          string              `json:"user,omitempty"`
-	Labels        map[string]string   `json:"labels,omitempty"`
-	NoHealthcheck bool                `json:"no_healthcheck,omitempty"`
-	Networks      []string            `json:"networks,omitempty"` // non-default networks, primary first
-	Aliases       []string            `json:"aliases,omitempty"`  // primary network's aliases, sorted
-	PortBindings  []RecreateBinding   `json:"port_bindings,omitempty"`
-	Binds         []string            `json:"binds,omitempty"`
-	Mounts        []RecreateMount     `json:"mounts,omitempty"`
-	MemoryBytes   int64               `json:"memory_bytes,omitempty"`
-	NanoCPUs      int64               `json:"nano_cpus,omitempty"`
-	RestartPolicy string              `json:"restart_policy,omitempty"`
-	StopTimeout   int                 `json:"stop_timeout,omitempty"`
-	StopSignal    string              `json:"stop_signal,omitempty"`
-	LogDriver     string              `json:"log_driver,omitempty"`
-	LogOpts       []string            `json:"log_opts,omitempty"` // sorted "k=v"
-	ExtraHosts    []string            `json:"extra_hosts,omitempty"`
-	Sysctls       map[string]string   `json:"sysctls,omitempty"`
-	Tmpfs         map[string]string   `json:"tmpfs,omitempty"`
-	CapAdd        []string            `json:"cap_add,omitempty"`
-	CapDrop       []string            `json:"cap_drop,omitempty"`
-	SecurityOpt   []string            `json:"security_opt,omitempty"`
-	Privileged    bool                `json:"privileged,omitempty"`
-	ReadonlyRootfs bool               `json:"readonly_rootfs,omitempty"`
+	EnvFile        string            `json:"-"`
+	WorkingDir     string            `json:"working_dir,omitempty"`
+	User           string            `json:"user,omitempty"`
+	Labels         map[string]string `json:"labels,omitempty"`
+	NoHealthcheck  bool              `json:"no_healthcheck,omitempty"`
+	Networks       []string          `json:"networks,omitempty"` // non-default networks, primary first
+	Aliases        []string          `json:"aliases,omitempty"`  // primary network's aliases, sorted
+	PortBindings   []RecreateBinding `json:"port_bindings,omitempty"`
+	Binds          []string          `json:"binds,omitempty"`
+	Mounts         []RecreateMount   `json:"mounts,omitempty"`
+	MemoryBytes    int64             `json:"memory_bytes,omitempty"`
+	NanoCPUs       int64             `json:"nano_cpus,omitempty"`
+	RestartPolicy  string            `json:"restart_policy,omitempty"`
+	StopTimeout    int               `json:"stop_timeout,omitempty"`
+	StopSignal     string            `json:"stop_signal,omitempty"`
+	LogDriver      string            `json:"log_driver,omitempty"`
+	LogOpts        []string          `json:"log_opts,omitempty"` // sorted "k=v"
+	ExtraHosts     []string          `json:"extra_hosts,omitempty"`
+	Sysctls        map[string]string `json:"sysctls,omitempty"`
+	Tmpfs          map[string]string `json:"tmpfs,omitempty"`
+	CapAdd         []string          `json:"cap_add,omitempty"`
+	CapDrop        []string          `json:"cap_drop,omitempty"`
+	SecurityOpt    []string          `json:"security_opt,omitempty"`
+	Privileged     bool              `json:"privileged,omitempty"`
+	ReadonlyRootfs bool              `json:"readonly_rootfs,omitempty"`
 }
 
 // containerInspect mirrors the subset of `docker inspect` JSON used to build
@@ -110,13 +111,13 @@ type containerInspect struct {
 		}
 	}
 	HostConfig struct {
-		NetworkMode   string
-		PortBindings  map[string][]struct {
+		NetworkMode  string
+		PortBindings map[string][]struct {
 			HostIp   string
 			HostPort string
 		}
-		Binds         []string
-		Mounts        []struct {
+		Binds  []string
+		Mounts []struct {
 			Type     string // "bind" | "volume" | "tmpfs"
 			Source   string
 			Target   string
@@ -125,19 +126,19 @@ type containerInspect struct {
 		RestartPolicy struct {
 			Name string
 		}
-		Memory        int64 // bytes
-		NanoCpus      int64 // nano-CPUs (1 CPU = 1e9)
-		LogConfig     struct {
+		Memory    int64 // bytes
+		NanoCpus  int64 // nano-CPUs (1 CPU = 1e9)
+		LogConfig struct {
 			Type   string
 			Config map[string]string
 		}
-		ExtraHosts   []string
-		Sysctls      map[string]string
-		Tmpfs        map[string]string
-		CapAdd       []string
-		CapDrop      []string
-		SecurityOpt  []string
-		Privileged   bool
+		ExtraHosts     []string
+		Sysctls        map[string]string
+		Tmpfs          map[string]string
+		CapAdd         []string
+		CapDrop        []string
+		SecurityOpt    []string
+		Privileged     bool
 		ReadonlyRootfs bool
 	}
 	// EffectiveMounts is the container's EFFECTIVE mount inventory
@@ -182,29 +183,29 @@ func (c *Client) InspectRecreate(ctx context.Context, name string) (*RecreateSpe
 // so tests can drive it without an executor.
 func specFromInspect(name string, in containerInspect) (*RecreateSpec, error) {
 	spec := &RecreateSpec{
-		Name:          name,
-		ImageID:       in.Image,
-		ImageRef:      in.Config.Image,
-		Entrypoint:    append([]string(nil), in.Config.Entrypoint...),
-		Cmd:           append([]string(nil), in.Config.Cmd...),
-		Env:           append([]string(nil), in.Config.Env...),
-		WorkingDir:    in.Config.WorkingDir,
-		User:          in.Config.User,
-		Labels:        in.Config.Labels,
-		StopSignal:    in.Config.StopSignal,
-		StopTimeout:   in.Config.StopTimeout,
-		Binds:         append([]string(nil), in.HostConfig.Binds...),
-		MemoryBytes:   in.HostConfig.Memory,
-		NanoCPUs:      in.HostConfig.NanoCpus,
-		RestartPolicy: in.HostConfig.RestartPolicy.Name,
-		LogDriver:     in.HostConfig.LogConfig.Type,
-		ExtraHosts:    append([]string(nil), in.HostConfig.ExtraHosts...),
-		Sysctls:       in.HostConfig.Sysctls,
-		Tmpfs:         in.HostConfig.Tmpfs,
-		CapAdd:        append([]string(nil), in.HostConfig.CapAdd...),
-		CapDrop:       append([]string(nil), in.HostConfig.CapDrop...),
-		SecurityOpt:   append([]string(nil), in.HostConfig.SecurityOpt...),
-		Privileged:    in.HostConfig.Privileged,
+		Name:           name,
+		ImageID:        in.Image,
+		ImageRef:       in.Config.Image,
+		Entrypoint:     append([]string(nil), in.Config.Entrypoint...),
+		Cmd:            append([]string(nil), in.Config.Cmd...),
+		Env:            append([]string(nil), in.Config.Env...),
+		WorkingDir:     in.Config.WorkingDir,
+		User:           in.Config.User,
+		Labels:         in.Config.Labels,
+		StopSignal:     in.Config.StopSignal,
+		StopTimeout:    in.Config.StopTimeout,
+		Binds:          append([]string(nil), in.HostConfig.Binds...),
+		MemoryBytes:    in.HostConfig.Memory,
+		NanoCPUs:       in.HostConfig.NanoCpus,
+		RestartPolicy:  in.HostConfig.RestartPolicy.Name,
+		LogDriver:      in.HostConfig.LogConfig.Type,
+		ExtraHosts:     append([]string(nil), in.HostConfig.ExtraHosts...),
+		Sysctls:        in.HostConfig.Sysctls,
+		Tmpfs:          in.HostConfig.Tmpfs,
+		CapAdd:         append([]string(nil), in.HostConfig.CapAdd...),
+		CapDrop:        append([]string(nil), in.HostConfig.CapDrop...),
+		SecurityOpt:    append([]string(nil), in.HostConfig.SecurityOpt...),
+		Privileged:     in.HostConfig.Privileged,
 		ReadonlyRootfs: in.HostConfig.ReadonlyRootfs,
 	}
 	if in.Config.Healthcheck != nil && len(in.Config.Healthcheck.Test) == 1 && in.Config.Healthcheck.Test[0] == "NONE" {
@@ -619,10 +620,12 @@ func (c *Client) recreate(ctx context.Context, spec *RecreateSpec, avoidPorts ma
 		if err != nil {
 			return err
 		}
-		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer func() {
-			c.exec.Run(cleanupCtx, "rm -f -- "+ssh.ShellQuote(envPath))
-			cleanupCancel()
+			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cleanupCancel()
+			if _, cleanupErr := c.exec.Run(cleanupCtx, "rm -f -- "+ssh.ShellQuote(envPath)); cleanupErr != nil {
+				fmt.Fprintf(os.Stderr, "teploy: failed to remove private recreation environment file: %v\n", cleanupErr)
+			}
 		}()
 		spec.EnvFile = envPath
 	}

@@ -700,3 +700,54 @@ func TestRollback_RoutePhaseFailureUnwinds(t *testing.T) {
 		t.Error("the uncommitted target container was left running after the route failure")
 	}
 }
+
+func TestRollback_FixedPublishStateFailureRestoresCaddyRoute(t *testing.T) {
+	stateContent := "current_port=49153\ncurrent_hash=v2\nprevious_port=49152\nprevious_hash=v1\ndomain=myapp.com\n"
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state.json' ]", Output: "absent"},
+		ssh.MockCommand{Match: "mkdir -p /deployments/myapp", Output: ""},
+		ssh.MockCommand{Match: "mkdir /deployments/myapp/.lock", Output: ""},
+		ssh.MockCommand{Match: "cat /deployments/myapp/.lock/info", Err: fmt.Errorf("none")},
+		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state' ]", Output: "present\n" + stateContent},
+		ssh.MockCommand{Match: "mkdir -p /deployments/myapp", Output: ""},
+		ssh.MockCommand{Match: "mkdir /deployments/myapp/.lock", Output: ""},
+		ssh.MockCommand{Match: "cat /deployments/myapp/.lock/info", Err: fmt.Errorf("none")},
+		ssh.MockCommand{Match: "docker ps --all --filter label=teploy.app='myapp'",
+			Output: `{"ID":"aaa","Names":"myapp-web-v1","Image":"myapp:latest","State":"exited","Status":"Exited","Labels":"teploy.app=myapp,teploy.version=v1,teploy.process=web"}` + "\n" +
+				`{"ID":"bbb","Names":"myapp-web-v2","Image":"myapp:latest","State":"running","Status":"Up 1h","Labels":"teploy.app=myapp,teploy.version=v2,teploy.process=web"}`,
+		},
+		ssh.MockCommand{Match: "docker inspect 'myapp-web-v1'", Output: `[{"Config":{"Image":"myapp:latest","Labels":{"teploy.app":"myapp"}},"HostConfig":{"NetworkMode":"teploy","PortBindings":{"3000/tcp":[{"HostIp":"127.0.0.1","HostPort":"49152"}]},"RestartPolicy":{"Name":"no"}},"NetworkSettings":{"Networks":{"teploy":{"Aliases":["myapp"]}}}}]`},
+		ssh.MockCommand{Match: "docker rm", Output: ""},
+		ssh.MockCommand{Match: "docker inspect 'myapp-web-v2'", Output: `[{"Config":{"Image":"myapp:latest","Labels":{"teploy.app":"myapp"}},"HostConfig":{"NetworkMode":"teploy","PortBindings":{"3000/tcp":[{"HostIp":"127.0.0.1","HostPort":"49153"}]},"RestartPolicy":{"Name":"no"}},"NetworkSettings":{"Networks":{"teploy":{"Aliases":["myapp"]}}}}]`},
+		ssh.MockCommand{Match: "docker run", Output: ""},
+		// HostBindIP fixture: the bind IP the health probe actually dials (TCL-16 fail-closed host validation makes the old artifact — a bare
+		// port number reused from the HostPort fixture — an invalid probe host).
+		ssh.MockCommand{Match: "docker inspect -f '{{range $p, $b := .NetworkSettings.Ports}}{{range $b}}{{.HostIp}}", Output: "127.0.0.1 "},
+		ssh.MockCommand{Match: "docker inspect -f '{{range $p, $b := .NetworkSettings.Ports}}", Output: "49152"},
+		ssh.MockCommand{Match: "docker inspect -f '{{range $p, $_ := .NetworkSettings.Ports}}", Output: "3000/tcp"},
+		ssh.MockCommand{Match: "curl", Output: "200"},
+		ssh.MockCommand{Match: "cat /deployments/caddy/Caddyfile", Output: "{\n\tadmin 0.0.0.0:2019\n}\n"},
+		ssh.MockCommand{Match: "mv /tmp/teploy_caddyfile.tmp", Output: ""},
+		ssh.MockCommand{Match: "mkdir /deployments/caddy/.lock", Output: ""},
+		ssh.MockCommand{Match: "a=$(docker exec caddy md5sum", Output: "TEPLOY_CADDY_OK"},
+		ssh.MockCommand{Match: "docker exec caddy caddy reload", Output: ""},
+		ssh.MockCommand{Match: "rmdir /deployments/caddy/.lock", Output: ""},
+		ssh.MockCommand{Match: "UPLOAD:/deployments/myapp/state.json.tmp-", Err: fmt.Errorf("disk full")},
+		ssh.MockCommand{Match: "docker stop", Output: ""},
+	)
+	mock.Files["/deployments/myapp/meta/v1.json"] = []byte(`{"schema_version":1,"app":"myapp","hash":"v1","deployment_type":"container","ingress_mode":"caddy","domain":"myapp.com","ports":[{"host_port":49152,"container_port":3000}],"publish":["127.0.0.1:6380:6379"]}`)
+	var out bytes.Buffer
+
+	err := Rollback(context.Background(), mock, &out, rollbackCfg())
+	if err == nil || !strings.Contains(err.Error(), "fixed-port workload and route were restored") {
+		t.Fatalf("expected fail-closed rollback state error, got %v", err)
+	}
+	if strings.Contains(out.String(), "Rolled back") {
+		t.Fatalf("failed rollback reported success: %s", out.String())
+	}
+
+	restoredCaddyfile := string(mock.Files["/deployments/caddy/Caddyfile"])
+	if !strings.Contains(restoredCaddyfile, "myapp-web-v2:3000") {
+		t.Fatalf("original route was not restored: %s", restoredCaddyfile)
+	}
+}

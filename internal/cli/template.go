@@ -1,11 +1,14 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"gopkg.in/yaml.v3"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -147,16 +150,11 @@ func runTemplateDeploy(flags *Flags, name, domain, server string, port int, extr
 		return err
 	}
 
-	// The written teploy.yml is what `teploy deploy` re-reads, so a --port
-	// override must land in the FILE, not just the in-memory config (there is
-	// no AppConfig serializer; a targeted top-level line patch is the same
-	// shape GenerateSecrets uses for its substitutions).
-	if port != 0 {
-		content = replaceTopLevelPort(content, port)
+	content, err = persistTemplateOverrides(content, domain, server, port)
+	if err != nil {
+		return err
 	}
-
-	// Write to teploy.yml in current directory.
-	if err := os.WriteFile("teploy.yml", []byte(content), 0644); err != nil {
+	if err := writePrivateTemplate("teploy.yml", []byte(content)); err != nil {
 		return fmt.Errorf("writing teploy.yml: %w", err)
 	}
 
@@ -291,6 +289,10 @@ func runTemplateInstall(flags *Flags, name, domain, server string, port int, ext
 	}
 	fmt.Printf("  Server: %s\n", server)
 
+	if err := resolveDeployEnv(ctx, appCfg, flags.StrictEnv); err != nil {
+		return err
+	}
+
 	// Templates are first-deploys by definition, so volume mismatch can't apply yet.
 	if err := deployAppConfig(flags, appCfg, server, appCfg.Image, "", false, false, ""); err != nil {
 		return err
@@ -346,4 +348,66 @@ func joinStrings(ss []string) string {
 		result += s
 	}
 	return result
+}
+
+func persistTemplateOverrides(content, domain, server string, port int) (string, error) {
+	var doc yaml.Node
+	if err := yaml.Unmarshal([]byte(content), &doc); err != nil {
+		return "", err
+	}
+	if len(doc.Content) != 1 || doc.Content[0].Kind != yaml.MappingNode {
+		return "", fmt.Errorf("template must be a YAML mapping")
+	}
+	root := doc.Content[0]
+	set := func(key, value, tag string) {
+		for i := 0; i < len(root.Content); i += 2 {
+			if root.Content[i].Value == key {
+				root.Content[i+1] = &yaml.Node{Kind: yaml.ScalarNode, Tag: tag, Value: value}
+				return
+			}
+		}
+		root.Content = append(root.Content, &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: key}, &yaml.Node{Kind: yaml.ScalarNode, Tag: tag, Value: value})
+	}
+	if domain != "" {
+		set("domain", domain, "!!str")
+	}
+	if server != "" {
+		set("server", server, "!!str")
+	}
+	if port != 0 {
+		set("port", fmt.Sprint(port), "!!int")
+	}
+	var out bytes.Buffer
+	enc := yaml.NewEncoder(&out)
+	enc.SetIndent(2)
+	if err := enc.Encode(&doc); err != nil {
+		return "", err
+	}
+	if err := enc.Close(); err != nil {
+		return "", err
+	}
+	return out.String(), nil
+}
+
+// Link publication is atomic and refuses any preexisting file or symlink.
+func writePrivateTemplate(path string, content []byte) error {
+	f, err := os.CreateTemp(filepath.Dir(path), ".teploy-template-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(f.Name())
+	if _, err = f.Write(content); err == nil {
+		err = f.Sync()
+	}
+	closeErr := f.Close()
+	if err != nil {
+		return err
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	if err := os.Link(f.Name(), path); err != nil {
+		return fmt.Errorf("refusing to replace existing output or unable to publish %s: %w", path, err)
+	}
+	return nil
 }

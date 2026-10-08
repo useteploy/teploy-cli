@@ -2,13 +2,17 @@ package openbao
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
 
 	"github.com/useteploy/teploy/internal/accessories"
 	teplaudit "github.com/useteploy/teploy/internal/audit"
+	"github.com/useteploy/teploy/internal/state"
 )
 
 // OpenBaoAuditEntry is the subset of an OpenBao audit log line we forward.
@@ -77,7 +81,13 @@ func ToObserveEvent(app string, e OpenBaoAuditEntry) (teplaudit.Event, bool) {
 // instance's tamper-evident trail. It tracks how many lines have already been
 // shipped (in a server-side marker file) so repeated runs are idempotent and
 // only new access events are forwarded. Returns the number shipped.
-func (c *Client) ShipAudit(ctx context.Context, app, accessory, observeEndpoint, observeToken, observeSite string) (int, error) {
+func (c *Client) ShipAudit(ctx context.Context, app, accessory, observeEndpoint, observeToken, observeSite string) (shipped int, retErr error) {
+	lock, err := state.AcquireLockFenced(ctx, c.exec, app)
+	if err != nil {
+		return 0, err
+	}
+	defer state.ReleaseLockFenced(c.exec, lock, app)
+	lock.StartRenewal(c.exec)
 	if accessory == "" {
 		accessory = defaultAccessory
 	}
@@ -87,27 +97,50 @@ func (c *Client) ShipAudit(ctx context.Context, app, accessory, observeEndpoint,
 	container := accessories.ContainerName(app, accessory)
 	markerFile := fmt.Sprintf("/deployments/%s/accessories/%s/.audit-shipped", app, accessory)
 
-	// How many lines shipped previously (0 if none).
-	prev := 0
-	if out, err := c.exec.Run(ctx, "cat "+markerFile+" 2>/dev/null || echo 0"); err == nil {
-		if n, e := strconv.Atoi(strings.TrimSpace(out)); e == nil {
-			prev = n
-		}
+	type cursor struct {
+		Lines  int    `json:"lines"`
+		Prefix string `json:"prefix"`
 	}
+	var previous cursor
+	marker, err := c.exec.Run(ctx, "if test -f "+markerFile+"; then cat "+markerFile+"; elif test -e "+markerFile+"; then exit 1; else printf '{}'; fi")
+	if err != nil {
+		return 0, fmt.Errorf("reading audit cursor: %w", err)
+	}
+	if err := json.Unmarshal([]byte(marker), &previous); err != nil {
+		if _, legacyErr := strconv.Atoi(strings.TrimSpace(marker)); legacyErr != nil {
+			return 0, fmt.Errorf("invalid audit cursor: %w", err)
+		}
+		// A legacy line count cannot establish log identity; replay once rather than lose rotated events.
+		fmt.Fprintln(c.out, "Migrating legacy audit cursor: existing events may be replayed with stable source_event_id")
+	}
+	prev := previous.Lines
 
 	// Read the whole audit log (JSON-per-line) from the container.
-	out, err := c.docker.Exec(ctx, container, "cat /openbao/data/audit.log 2>/dev/null || true")
+	out, err := c.docker.Exec(ctx, container, "cat /openbao/data/audit.log")
 	if err != nil {
 		return 0, fmt.Errorf("reading audit log: %w", err)
 	}
 	lines := strings.Split(strings.TrimRight(out, "\n"), "\n")
 	total := len(lines)
-	if total <= prev {
-		return 0, nil // nothing new
+	prefix := func(n int) string {
+		sum := sha256.Sum256([]byte(strings.Join(lines[:n], "\n")))
+		return hex.EncodeToString(sum[:])
+	}
+	if prev < 0 || prev > total || (prev > 0 && previous.Prefix != prefix(prev)) {
+		prev = 0
+	}
+	checkpoint := func(n int) error {
+		data, _ := json.Marshal(cursor{Lines: n, Prefix: prefix(n)})
+		if err := lock.Check(ctx, c.exec); err != nil {
+			return err
+		}
+		return c.exec.Upload(ctx, strings.NewReader(string(data)+"\n"), markerFile, "0600")
+	}
+	if total == prev {
+		return 0, nil
 	}
 
-	shipped := 0
-	for _, line := range lines[prev:] {
+	for offset, line := range lines[prev:] {
 		line = strings.TrimSpace(line)
 		if line == "" || !strings.HasPrefix(line, "{") {
 			continue
@@ -120,19 +153,18 @@ func (c *Client) ShipAudit(ctx context.Context, app, accessory, observeEndpoint,
 		if !ok {
 			continue
 		}
+		sum := sha256.Sum256([]byte(app + "\x00" + accessory + "\x00" + line))
+		ev.Metadata["source_event_id"] = hex.EncodeToString(sum[:])
 		if err := teplaudit.Emit(ctx, observeEndpoint, observeToken, observeSite, ev); err != nil {
 			// Persist progress up to the last successful ship so we don't
 			// re-send, then surface the error.
-			c.persistShipMarker(ctx, markerFile, prev+shipped)
-			return shipped, fmt.Errorf("emitting audit event: %w", err)
+			return shipped, errors.Join(fmt.Errorf("emitting audit event: %w", err), checkpoint(prev+offset))
 		}
 		shipped++
 	}
 
-	c.persistShipMarker(ctx, markerFile, total)
+	if err := checkpoint(total); err != nil {
+		return shipped, fmt.Errorf("persisting audit cursor: %w", err)
+	}
 	return shipped, nil
-}
-
-func (c *Client) persistShipMarker(ctx context.Context, markerFile string, count int) {
-	_ = c.exec.Upload(ctx, strings.NewReader(strconv.Itoa(count)+"\n"), markerFile, "0600")
 }

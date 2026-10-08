@@ -1,0 +1,5 @@
+# Caddy's Dockerfile copies the locally generated static site. Teploy's
+# gitignore-aware source sync must explicitly include this build output.
+!/dist/
+# Keep source maps out of the published static directory.
+/dist/**/*.map

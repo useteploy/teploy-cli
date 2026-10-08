@@ -66,6 +66,11 @@ Example:
 }
 
 func runBuild(flags *Flags, version, destination string) error {
+	if version != "" {
+		if err := validateVersionArg(version); err != nil {
+			return err
+		}
+	}
 	var appCfg *config.AppConfig
 	var err error
 	if destination != "" {
@@ -176,7 +181,10 @@ func runBuild(flags *Flags, version, destination string) error {
 	// attempt's build dir is the --link-dest basis so transfer stays
 	// incremental. The directory is scratch — the next deploy of this app
 	// prunes it once its hash leaves the protection window.
-	att := releasemeta.MustAttempt(appCfg.App, version)
+	att, err := releasemeta.NewAttempt(appCfg.App, version)
+	if err != nil {
+		return err
+	}
 	remoteDir, err := syncAttemptBuildContext(ctx, executor, appCfg, att, buildMode, host, user, key, out, os.Stderr)
 	if err != nil {
 		return err

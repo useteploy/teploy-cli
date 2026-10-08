@@ -14,6 +14,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -232,10 +233,12 @@ func TestContractsAttemptNameGolden(t *testing.T) {
 	writeFixture(t, "attempt-name/valid/examples.json", []string{
 		"abc1234.deadb17ecafef00d",
 		"9f31c02.0123456789abcdef",
+		"ABC1234.deadb17ecafef00d",
+		"v1.2.3.deadb17ecafef00d",
+		"release_1.deadb17ecafef00d",
 	})
 	writeFixture(t, "attempt-name/invalid/examples.json", []string{
 		"deadb17ecafef00d",         // missing the hash half
-		"ABC1234.deadb17ecafef00d", // uppercase
 		"abc1234.DeadB17eCafef00d", // uppercase hex half
 		"abc1234.deadb17ecafef00",  // 15 hex chars
 		"../escape.attempt0000000", // path characters
@@ -349,5 +352,35 @@ func TestContractsPreviewStateListRowGolden(t *testing.T) {
 		row["era"] = "canonical"
 		row["app"] = "myapp"
 		writeFixture(t, name, row)
+	}
+}
+
+func TestRuntimeIdentifierSchemaParity(t *testing.T) {
+	for _, hash := range []string{"v1", "v1.2.3", "1750000000", "abcdef12", "release_1", "ABC1234", strings.Repeat("a", 128)} {
+		attempt, err := releasemeta.NewAttempt("demo", hash)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, tt := range []struct {
+			schema, value string
+			nested        bool
+		}{{"attempt-name", attempt.Name(), false}, {"release-record", hash, true}} {
+			data, err := os.ReadFile(filepath.Join(contractsDir, "schema", tt.schema+".schema.json"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var schema map[string]any
+			if err := json.Unmarshal(data, &schema); err != nil {
+				t.Fatal(err)
+			}
+			pattern, _ := schema["pattern"].(string)
+			if tt.nested {
+				pattern = schema["properties"].(map[string]any)["hash"].(map[string]any)["pattern"].(string)
+			}
+			matched, err := regexp.MatchString(pattern, tt.value)
+			if err != nil || !matched {
+				t.Fatalf("%s rejects runtime %s: %v", tt.schema, tt.value, err)
+			}
+		}
 	}
 }

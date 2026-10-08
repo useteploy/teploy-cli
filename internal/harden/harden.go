@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/useteploy/teploy/internal/ssh"
 )
@@ -29,6 +31,21 @@ func ConfigureUFW(ctx context.Context, exec ssh.Executor, w io.Writer, sudo stri
 		}
 	}
 
+	conn, err := exec.Run(ctx, "printf '%s' \"$SSH_CONNECTION\"")
+	if err != nil {
+		return fmt.Errorf("reading management connection: %w", err)
+	}
+	fields := strings.Fields(conn)
+	if len(fields) != 4 {
+		return fmt.Errorf("cannot establish management SSH port; refusing to enable firewall")
+	}
+	port, err := strconv.Atoi(fields[3])
+	if err != nil || port < 1 || port > 65535 {
+		return fmt.Errorf("invalid management SSH port")
+	}
+	if _, err := exec.Run(ctx, sudo+fmt.Sprintf("ufw allow %d/tcp", port)); err != nil {
+		return fmt.Errorf("preserving SSH management port: %w", err)
+	}
 	if _, err := exec.Run(ctx, sudo+"ufw default deny incoming && "+sudo+"ufw default allow outgoing"); err != nil {
 		return fmt.Errorf("setting ufw defaults: %w", err)
 	}
@@ -113,20 +130,28 @@ func HardenSSH(ctx context.Context, exec ssh.Executor, w io.Writer, sudo string)
 		return nil
 	}
 
-	if _, err := exec.Run(ctx, sudo+`sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config`); err != nil {
-		return fmt.Errorf("setting PermitRootLogin: %w", err)
+	// Put global policy before Include/Match: sshd uses the first value found.
+	policy := "PermitRootLogin prohibit-password\nPasswordAuthentication no\nKbdInteractiveAuthentication no\nPubkeyAuthentication yes\n"
+	workspace, err := exec.Run(ctx, "umask 077; mktemp -d /tmp/teploy-sshd.XXXXXXXXXXXX")
+	if err != nil {
+		return fmt.Errorf("creating private SSH policy workspace: %w", err)
 	}
-
-	if _, err := exec.Run(ctx, sudo+`sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config`); err != nil {
-		return fmt.Errorf("setting PasswordAuthentication: %w", err)
+	workspace = strings.TrimSpace(workspace)
+	if !strings.HasPrefix(workspace, "/tmp/teploy-sshd.") || strings.ContainsAny(workspace, "\n\r ") {
+		return fmt.Errorf("invalid private SSH workspace")
 	}
-
-	if _, err := exec.Run(ctx, sudo+`sed -i 's/^#\?PubkeyAuthentication.*/PubkeyAuthentication yes/' /etc/ssh/sshd_config`); err != nil {
-		return fmt.Errorf("setting PubkeyAuthentication: %w", err)
+	policyPath := workspace + "/policy"
+	defer func() {
+		cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		exec.Run(cleanup, "rm -f -- "+ssh.ShellQuote(policyPath)+"; rmdir -- "+ssh.ShellQuote(workspace))
+	}()
+	if err := exec.Upload(ctx, strings.NewReader(policy), policyPath, "0600"); err != nil {
+		return err
 	}
-
-	if _, err := exec.Run(ctx, sudo+"systemctl restart sshd"); err != nil {
-		return fmt.Errorf("restarting sshd: %w", err)
+	command := sudo + "sh -c " + ssh.ShellQuote(sshPolicyScript(policyPath))
+	if _, err := exec.Run(ctx, command); err != nil {
+		return fmt.Errorf("validating and installing effective SSH policy: %w", err)
 	}
 
 	fmt.Fprintln(w, "  PermitRootLogin prohibit-password")
@@ -266,4 +291,29 @@ func splitFirstLine(s string) string {
 		}
 	}
 	return s
+}
+
+// Quote only once, at the invocation boundary. The trap is ordinary shell syntax.
+func sshPolicyScript(policyPath string) string {
+	return "policy=" + ssh.ShellQuote(policyPath) + `
+set -eu
+backup=$(mktemp /etc/ssh/sshd_config.teploy-old.XXXXXXXX)
+candidate=$(mktemp /etc/ssh/sshd_config.teploy-new.XXXXXXXX)
+trap 'rm -f "$candidate"' EXIT
+cp -p /etc/ssh/sshd_config "$backup"
+cat "$policy" /etc/ssh/sshd_config > "$candidate"
+chmod 600 "$candidate"
+sshd -t -f "$candidate"
+effective=$(sshd -T -f "$candidate")
+for setting in "permitrootlogin without-password" "passwordauthentication no" "kbdinteractiveauthentication no" "pubkeyauthentication yes"; do
+ printf "%s\n" "$effective" | grep -Fx "$setting" >/dev/null || exit 1
+done
+mv "$candidate" /etc/ssh/sshd_config
+if ! systemctl reload sshd; then
+ cp -p "$backup" /etc/ssh/sshd_config
+ systemctl reload sshd
+ exit 1
+fi
+rm -f "$backup"
+`
 }

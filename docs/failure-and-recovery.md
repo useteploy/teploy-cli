@@ -158,3 +158,39 @@ read them before trusting a volume snapshot of a writing database.
 
 For the topology-level version (N+1, state off-box, the dead-server
 runbook), see [resilience.md](resilience.md).
+
+### Reviewed plan compatibility
+
+Saved plans use record schema 2. Re-plan older records: their execution binding
+omitted fields now covered by the private config digest. The public display
+manifest remains redacted; environment values retain the established exclusion
+policy. Apply revalidates authority under the app lock, then builds or serves a
+private copy of the admitted source rather than a changing caller directory.
+Static serving output is fingerprinted even when Gitignored. The plan output
+file and parents it creates are excluded from its own fingerprint. Reviewed
+static source must be inside the project; absolute source symlinks are refused.
+Direct deploy keeps its existing source-path support.
+
+Rendered template environments use `env_literal`, beside ordinary `env`:
+variables that become passwords such as `generate`, `auto`, `$NAME` or
+`vault:literal#field` remain literal bytes. Original template generation
+sentinels are resolved before variable substitution. New template manifests
+require a CLI revision supporting `env_literal`; do not feed them to an older
+release that lacks this field.
+
+DR restore receipts now use schema 2 and include a private invocation identity.
+Each restore retains its own staging directory; another restore never wipes
+it. Cutover selects the latest completed receipt for the requested bundle,
+then binds to that invocation's own receipt and manifest. Older schema-1
+receipts require a fresh isolated restore. Scratch validation uses unique names
+and cleans only the immutable IDs created by that invocation after checking
+ownership; unknown create outcomes require inspection, not removal by name.
+
+Fleet publication errors retain committed or unknown workload authority and
+withhold automatic load-balancer changes and fleet convergence rollback until
+reconciliation. Lifecycle stop/start/restart requires a current release record
+and selects only its web/workers plus accessories in the current applied
+manifest. Start activates those configured accessories before app processes,
+including accessories previously stopped by an operator; removed accessories,
+previews, historical releases and unknown processes are excluded. A legacy
+release without a record must be redeployed before using lifecycle commands.

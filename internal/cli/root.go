@@ -1,7 +1,9 @@
 package cli
 
 import (
+	"encoding/json"
 	"fmt"
+	"github.com/useteploy/teploy/internal/trigger"
 	"os"
 
 	"github.com/spf13/cobra"
@@ -37,7 +39,15 @@ func NewRootCmd(version string) *cobra.Command {
 				return nil
 			}
 			if err := os.Chdir(flags.ProjectDir); err != nil {
-				return fmt.Errorf("changing to project directory %q: %w", flags.ProjectDir, err)
+				failure := fmt.Errorf("changing to project directory %q: %w", flags.ProjectDir, err)
+				if requested, _ := cmd.Flags().GetBool("trigger-stdin"); requested {
+					result := trigger.Initial(trigger.Request{})
+					result.ErrorCode = "admission_failed"
+					if encodeErr := json.NewEncoder(cmd.OutOrStdout()).Encode(result); encodeErr != nil {
+						return encodeErr
+					}
+				}
+				return failure
 			}
 			return nil
 		},
@@ -51,6 +61,7 @@ func NewRootCmd(version string) *cobra.Command {
 	root.PersistentFlags().BoolVar(&flags.StrictEnv, "strict-env", false, "strict env/overlay mode: fail on unset ${VAR} in env:, and let an empty map/list in a destination overlay explicitly clear the base value")
 
 	root.AddCommand(newDeployCmd(flags))
+	root.AddCommand(newTriggerCmd(flags))
 	root.AddCommand(newBuildCmd(flags))
 	root.AddCommand(newExecCmd(flags))
 	root.AddCommand(newAppCmd(flags))

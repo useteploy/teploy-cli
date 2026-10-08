@@ -55,9 +55,9 @@ func newNetworkGrantCmd(flags *Flags) *cobra.Command {
 	)
 	cmd := &cobra.Command{
 		Use:   "grant",
-		Short: "Mint a time-boxed mesh access key (auto-revokes)",
-		Long: "Create a pre-auth key that expires on its own — \"give the contractor two\n" +
-			"hours of access\". The node it enrolls is ephemeral (drops off the mesh when it\n" +
+		Short: "Mint a mesh enrollment key with an expiry",
+		Long: "Create a pre-auth key with a bounded enrollment window. Expiry does not\n" +
+			"revoke enrolled devices; remove those devices to end access. The node is ephemeral (drops off the mesh when it\n" +
 			"disconnects) and carries the tags you set; what those tags can reach is decided\n" +
 			"by your tailnet/headscale ACL policy, which teploy never edits.\n\n" +
 			"Credentials: TAILSCALE_API_KEY (+ optional TAILSCALE_TAILNET), or\n" +
@@ -92,12 +92,12 @@ func newNetworkGrantCmd(flags *Flags) *cobra.Command {
 			default:
 				fmt.Println("  tailscale up --auth-key <key>")
 			}
-			fmt.Println("The key expires automatically; revoke early with: teploy network revoke", grant.ID)
+			fmt.Println("Enrollment expires automatically; enrolled devices require separate removal. Revoke the key early with: teploy network revoke", grant.ID)
 			return nil
 		},
 	}
 	cmd.Flags().StringVar(&provider, "provider", "", "mesh provider (tailscale, headscale); default from teploy.yml")
-	cmd.Flags().DurationVar(&ttl, "ttl", time.Hour, "grant lifetime (e.g. 30m, 2h, 24h)")
+	cmd.Flags().DurationVar(&ttl, "ttl", time.Hour, "enrollment window (e.g. 30m, 2h, 24h); enrolled access does not expire")
 	cmd.Flags().StringArrayVar(&tags, "tag", nil, "ACL tag(s) for the enrolled node (e.g. tag:contractor); repeatable")
 	cmd.Flags().BoolVar(&reusable, "reusable", false, "allow multiple devices to enroll with this key")
 	return cmd

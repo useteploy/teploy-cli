@@ -14,6 +14,7 @@ import (
 	"github.com/useteploy/teploy/internal/config"
 	"github.com/useteploy/teploy/internal/notify"
 	"github.com/useteploy/teploy/internal/preview"
+	"github.com/useteploy/teploy/internal/trigger"
 )
 
 func newPreviewCmd(flags *Flags) *cobra.Command {
@@ -42,9 +43,38 @@ type previewDeployOpts struct {
 }
 
 func newPreviewDeployCmd(flags *Flags) *cobra.Command {
-	return newPreviewDeployCmdWith(func(branch string, opts previewDeployOpts) error {
-		return runPreviewDeploy(flags, branch, opts)
-	})
+	cmd := newPreviewDeployCmdWith(func(branch string, opts previewDeployOpts) error { return runPreviewDeploy(flags, branch, opts) })
+	var triggerStdin bool
+	cmd.Flags().BoolVar(&triggerStdin, "trigger-stdin", false, "read a bounded immutable trigger request from stdin")
+	ordinary := cmd.RunE
+	cmd.Args = func(cmd *cobra.Command, args []string) error {
+		if triggerStdin {
+			return cobra.MaximumNArgs(1)(cmd, args)
+		}
+		return cobra.ExactArgs(1)(cmd, args)
+	}
+	cmd.RunE = func(cmd *cobra.Command, args []string) error {
+		if !triggerStdin {
+			return ordinary(cmd, args)
+		}
+		return triggerCommand(cmd, "preview_create", func(r trigger.Request) (trigger.Result, error) {
+			branch := strings.TrimPrefix(r.Ref, "refs/heads/")
+			if len(args) > 0 && args[0] != branch {
+				return trigger.Initial(r), fmt.Errorf("preview branch mismatch")
+			}
+			opts := previewDeployOpts{}
+			opts.ttl, _ = cmd.Flags().GetString("ttl")
+			opts.image, _ = cmd.Flags().GetString("image")
+			opts.baseDomain, _ = cmd.Flags().GetString("base-domain")
+			httpOnly, _ := cmd.Flags().GetBool("http-only")
+			allowIPs, _ := cmd.Flags().GetStringSlice("allow-ip")
+			if err := finishPreviewDeployOpts(cmd, &opts, httpOnly, allowIPs); err != nil {
+				return trigger.Initial(r), err
+			}
+			return runTriggerCLI(cmd, flags, "preview_create", branch, opts.image, "", opts, r)
+		})
+	}
+	return cmd
 }
 
 // newPreviewDeployCmdWith builds the command around run (the test seam:
@@ -295,14 +325,28 @@ func previewListRows(previews []preview.State) []previewListRow {
 }
 
 func newPreviewDestroyCmd(flags *Flags) *cobra.Command {
-	return &cobra.Command{
-		Use:   "destroy <branch>",
-		Short: "Tear down a preview environment",
-		Args:  cobra.ExactArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			return runPreviewDestroy(flags, args[0])
-		},
+	var triggerStdin bool
+	cmd := &cobra.Command{Use: "destroy [branch]", Short: "Tear down a preview environment"}
+	cmd.Flags().BoolVar(&triggerStdin, "trigger-stdin", false, "read a bounded immutable trigger request from stdin")
+	cmd.Args = func(cmd *cobra.Command, args []string) error {
+		if triggerStdin {
+			return cobra.MaximumNArgs(1)(cmd, args)
+		}
+		return cobra.ExactArgs(1)(cmd, args)
 	}
+	cmd.RunE = func(cmd *cobra.Command, args []string) error {
+		if triggerStdin {
+			return triggerCommand(cmd, "preview_destroy", func(r trigger.Request) (trigger.Result, error) {
+				branch := strings.TrimPrefix(r.Ref, "refs/heads/")
+				if len(args) > 0 && args[0] != branch {
+					return trigger.Initial(r), fmt.Errorf("preview branch mismatch")
+				}
+				return runTriggerCLI(cmd, flags, "preview_destroy", branch, "", "", previewDeployOpts{}, r)
+			})
+		}
+		return runPreviewDestroy(flags, args[0])
+	}
+	return cmd
 }
 
 func runPreviewDestroy(flags *Flags, branch string) error {

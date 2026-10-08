@@ -45,6 +45,17 @@ GO_SLUG="$(echo "$GO_VERSION" | tr '.' '-')"
 COMMIT="$(git rev-parse HEAD)"
 GIT_DIRTY="$(git status --porcelain | wc -l | tr -d ' ')"
 GIT_DESCRIBE="$(git describe --tags 2>/dev/null || echo untagged)"
+SOURCE_SHA256="$(python3 - <<'PYCODE'
+import hashlib,pathlib
+h=hashlib.sha256()
+paths=[pathlib.Path("go.mod"),pathlib.Path("go.sum")]
+for root in ["cmd","internal"]:
+    paths.extend(p for p in pathlib.Path(root).rglob("*") if p.is_file())
+for p in sorted(paths):
+    h.update(str(p).encode()+b"\0"+p.read_bytes()+b"\0")
+print(h.hexdigest())
+PYCODE
+)"
 EXPECT_FILE="$EXPECT_DIR/checksums-${VERSION}-${GO_SLUG}.txt"
 
 record_inputs() {
@@ -52,10 +63,12 @@ record_inputs() {
 # teploy release-verify receipt
 # version label : $VERSION
 # commit        : $COMMIT
+# source sha256 : $SOURCE_SHA256
 # git describe  : $GIT_DESCRIBE
 # dirty files   : $GIT_DIRTY
 # go toolchain  : $GO_VERSION (go.mod: $(awk '/^go /{print $2}' go.mod))
 # build env     : CGO_ENABLED=0 GOFLAGS=
+# build flags   : -trimpath -buildvcs=false
 # ldflags       : -s -w -X main.version=$VERSION
 # recorded      : $(date -u +%Y-%m-%dT%H:%M:%SZ) on $(uname -s)/$(uname -m)
 EOF
@@ -67,8 +80,8 @@ build_matrix() {
   for os_arch in $OS_ARCH_MATRIX; do
     GOOS="${os_arch%%/*}"; GOARCH="${os_arch##*/}"
     echo "building teploy_${GOOS}_${GOARCH}"
-    CGO_ENABLED=0 GOOS="$GOOS" GOARCH="$GOARCH" \
-      go build -trimpath -ldflags "-s -w -X main.version=$VERSION" \
+    CGO_ENABLED=0 GOFLAGS= GOOS="$GOOS" GOARCH="$GOARCH" \
+      go build -trimpath -buildvcs=false -ldflags "-s -w -X main.version=$VERSION" \
       -o "$DIST_DIR/teploy_${GOOS}_${GOARCH}" ./cmd/teploy
   done
 }
@@ -102,7 +115,12 @@ verify)
     echo "Bit-identical reproduction is toolchain-scoped — align toolchains or re-record."
     exit 1
   fi
-  if [ "$RECORDED_COMMIT" != "$COMMIT" ]; then
+  RECORDED_SOURCE="$(sed -n 's/^# source sha256 : //p' "$EXPECT_FILE" | head -1)"
+  if [ -n "$RECORDED_SOURCE" ] && [ "$RECORDED_SOURCE" != "$SOURCE_SHA256" ]; then
+    echo "INPUTS DIFFER: compiler source snapshot differs from recorded digest"
+    exit 1
+  fi
+  if [ -z "$RECORDED_SOURCE" ] && [ "$RECORDED_COMMIT" != "$COMMIT" ]; then
     # The expectation file itself lands in a commit AFTER the source it
     # records, so strict HEAD equality would make every recorded
     # expectation unverifiable. The honest test is source identity: if
@@ -150,8 +168,8 @@ smoke)
   esac
   rm -rf "$DIST_DIR"; mkdir -p "$DIST_DIR"
   echo "building linux/$DOCKER_ARCH smoke binary ($VERSION)"
-  CGO_ENABLED=0 GOOS=linux GOARCH="$DOCKER_ARCH" \
-    go build -trimpath -ldflags "-s -w -X main.version=$VERSION" \
+  CGO_ENABLED=0 GOFLAGS= GOOS=linux GOARCH="$DOCKER_ARCH" \
+    go build -trimpath -buildvcs=false -ldflags "-s -w -X main.version=$VERSION" \
     -o "$DIST_DIR/teploy_linux_$DOCKER_ARCH" ./cmd/teploy
   IMAGE="teploy:release-smoke-$VERSION"
   docker build -q -f "$REPO_ROOT/Dockerfile" --build-arg BINARY="dist-verify/teploy_linux_$DOCKER_ARCH" -t "$IMAGE" "$REPO_ROOT" >/dev/null

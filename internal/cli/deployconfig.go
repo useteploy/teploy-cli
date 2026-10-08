@@ -20,6 +20,7 @@ func deployConfigFromApp(appCfg *config.AppConfig, image, version string, envFil
 		Version:         version,
 		EnvFiles:        envFiles,
 		Volumes:         volumes,
+		VolumeOwnership: appCfg.VolumeOwnership,
 		Processes:       appCfg.Processes,
 		NoHealthcheck:   disabledHealthchecks(appCfg.Healthcheck),
 		Health:          healthConfigFrom(appCfg.Health),

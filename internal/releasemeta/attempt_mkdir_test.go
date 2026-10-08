@@ -1,6 +1,7 @@
 package releasemeta
 
 import (
+	"github.com/useteploy/teploy/internal/ssh"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -31,7 +32,7 @@ func TestAttemptMkdirCmd_PrivateModes(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	cmd := strings.ReplaceAll(att.MkdirCmd("build"), deploymentsDir, base)
+	cmd := strings.ReplaceAll(att.MkdirCmd("build"), deploymentsDir, ssh.ShellQuote(base))
 	if out, err := exec.Command("sh", "-c", cmd).CombinedOutput(); err != nil {
 		t.Fatalf("%s: %v\n%s", cmd, err, out)
 	}

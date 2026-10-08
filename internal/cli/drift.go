@@ -213,7 +213,7 @@ func reportDrift(ctx context.Context, flags *Flags, appCfg *config.AppConfig, ex
 		// the empty loop used to report "in sync" for a fully removed
 		// deployment (audit F76). State says this app IS deployed, so an
 		// empty live inventory is maximal drift.
-		if len(items) == 0 && len(containers) == 0 {
+		if len(items) == 0 && !hasDeployedWorkload(containers) {
 			items = append(items, driftItem{
 				Kind:   "missing",
 				Name:   appCfg.App,
@@ -260,4 +260,13 @@ func reportDrift(ctx context.Context, flags *Flags, appCfg *config.AppConfig, ex
 	fmt.Printf("\nDRIFT DETECTED: %d difference(s). Run `teploy deploy` to reconcile.\n", len(items))
 	fmt.Println("(This is report-only — no changes were made.)")
 	return true, nil
+}
+
+func hasDeployedWorkload(containers []docker.Container) bool {
+	for _, c := range containers {
+		if c.Labels["teploy.role"] != "accessory" && !strings.HasPrefix(c.Labels["teploy.process"], "preview-") && c.Labels["teploy.version"] != "" {
+			return true
+		}
+	}
+	return false
 }

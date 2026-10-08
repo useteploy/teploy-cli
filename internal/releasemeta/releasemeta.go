@@ -111,10 +111,12 @@ type Static struct {
 
 // Record is the immutable per-release execution record.
 type Record struct {
-	SchemaVersion int       `json:"schema_version"`
-	App           string    `json:"app"`
-	Hash          string    `json:"hash"`
-	CreatedAt     time.Time `json:"created_at"`
+	TriggerOperationKey    string    `json:"trigger_operation_key,omitempty"`
+	ExecutionBindingDigest string    `json:"execution_binding_digest,omitempty"`
+	SchemaVersion          int       `json:"schema_version"`
+	App                    string    `json:"app"`
+	Hash                   string    `json:"hash"`
+	CreatedAt              time.Time `json:"created_at"`
 	// Backfilled marks a "release-0" record synthesized from live containers
 	// rather than observed at deploy time (see the package doc).
 	Backfilled bool   `json:"backfilled,omitempty"`
@@ -135,19 +137,20 @@ type Record struct {
 	// Dockerfile identity, platform, image digest and mutability.
 	Provenance *Provenance `json:"provenance,omitempty"`
 
-	Replicas    int               `json:"replicas,omitempty"`
-	Processes   map[string]string `json:"processes,omitempty"`
-	Cmd         string            `json:"cmd,omitempty"`
-	Env         map[string]string `json:"env,omitempty"`
-	EnvFiles    []string          `json:"env_files,omitempty"`
-	Volumes     map[string]string `json:"volumes,omitempty"`
-	Publish     []string          `json:"publish,omitempty"`
-	Ports       []Port            `json:"ports,omitempty"`
-	Labels      map[string]string `json:"labels,omitempty"`
-	Memory      string            `json:"memory,omitempty"`
-	CPU         string            `json:"cpu,omitempty"`
-	StopTimeout int               `json:"stop_timeout,omitempty"`
-	Bind        string            `json:"bind,omitempty"`
+	Replicas        int                               `json:"replicas,omitempty"`
+	Processes       map[string]string                 `json:"processes,omitempty"`
+	Cmd             string                            `json:"cmd,omitempty"`
+	Env             map[string]string                 `json:"env,omitempty"`
+	EnvFiles        []string                          `json:"env_files,omitempty"`
+	Volumes         map[string]string                 `json:"volumes,omitempty"`
+	VolumeOwnership map[string]config.VolumeOwnership `json:"volume_ownership,omitempty"`
+	Publish         []string                          `json:"publish,omitempty"`
+	Ports           []Port                            `json:"ports,omitempty"`
+	Labels          map[string]string                 `json:"labels,omitempty"`
+	Memory          string                            `json:"memory,omitempty"`
+	CPU             string                            `json:"cpu,omitempty"`
+	StopTimeout     int                               `json:"stop_timeout,omitempty"`
+	Bind            string                            `json:"bind,omitempty"`
 
 	Health *Health     `json:"health,omitempty"`
 	Caddy  *CaddyRoute `json:"caddy,omitempty"`

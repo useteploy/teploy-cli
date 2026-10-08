@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -320,7 +321,11 @@ func outputResult(flags *Flags, result *validationResult) error {
 	if flags.JSON {
 		enc := json.NewEncoder(os.Stdout)
 		enc.SetIndent("", "  ")
-		return enc.Encode(result)
+		var outcome error
+		if !result.Valid {
+			outcome = fmt.Errorf("validation failed with %d error(s)", len(result.Errors))
+		}
+		return errors.Join(outcome, enc.Encode(result))
 	}
 
 	if result.Valid {

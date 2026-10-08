@@ -159,6 +159,7 @@ services:
   worker:
     build:
       context: .
+      dockerfile: Dockerfile.prod
     command: node worker.js
 `
 	os.WriteFile(filepath.Join(dir, "docker-compose.yml"), []byte(compose), 0644)

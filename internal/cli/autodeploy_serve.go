@@ -24,6 +24,7 @@ import (
 	"github.com/useteploy/teploy/internal/releasemeta"
 	"github.com/useteploy/teploy/internal/ssh"
 	"github.com/useteploy/teploy/internal/state"
+	"github.com/useteploy/teploy/internal/trigger"
 )
 
 // newAutoDeployServeCmd is the resident webhook listener `teploy autodeploy
@@ -129,6 +130,10 @@ func runAutoDeployServe(app, branch string, port int, strictEnv bool) error {
 	queue := newAdmissionQueue(ledger, func(changedFiles []string, filesKnown bool, commit string) {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 		defer cancel()
+		if !trigger.ValidCommit(commit) {
+			logf("refusing nonimmutable authenticated admission; explicit scheduler tip mode is separate")
+			return
+		}
 		if err := triggerAutoDeploy(ctx, executor, app, branch, buildDir, commit, out, changedFiles, filesKnown, strictEnv); err != nil {
 			logf("deploy failed: %v", err)
 		} else {
@@ -234,6 +239,7 @@ type webhookHandlerConfig struct {
 // C02), and enqueues them on the bounded queue. A persistence failure is
 // a 503 + Retry-After: never ack what isn't durable.
 func newWebhookHandler(cfg webhookHandlerConfig) http.HandlerFunc {
+	var admissionMu sync.Mutex
 	writeJSON := func(w http.ResponseWriter, code int, v any) {
 		body, err := json.Marshal(v)
 		if err != nil {
@@ -300,6 +306,10 @@ func newWebhookHandler(cfg webhookHandlerConfig) http.HandlerFunc {
 		contentSum := sha256.Sum256(body)
 		digest := hex.EncodeToString(contentSum[:])
 		contentID := autodeploy.ContentIDFromDigest(digest)
+		// Serialize dedup through durable admission: concurrent duplicates wait
+		// for the first admission outcome before they can be acknowledged.
+		admissionMu.Lock()
+		defer admissionMu.Unlock()
 		if cfg.dedup.SeenAndRecord(contentID) {
 			writeJSON(w, http.StatusOK, admissionResponse{Status: "duplicate"})
 			if cfg.logf != nil {
@@ -328,6 +338,13 @@ func newWebhookHandler(cfg webhookHandlerConfig) http.HandlerFunc {
 		// after/checkout_sha names the exact commit this event built; the
 		// fetch pins the checkout to it instead of the moving tip.
 		commit := autodeploy.PushCommit(body)
+		if commit == "" {
+			// Authenticated delivery does not imply an immutable revision. Never
+			// send malformed/missing/zero after values into explicit tip mode.
+			cfg.dedup.Unrecord(contentID)
+			writeJSON(w, http.StatusUnprocessableEntity, admissionResponse{Status: "error", Error: "push requires a full nonzero authenticated commit"})
+			return
+		}
 
 		// DURABLE ADMISSION (C02): the record is fsynced BEFORE the 200.
 		// A crash immediately after the response still leaves the admitted
@@ -636,6 +653,14 @@ func triggerAutoDeploy(ctx context.Context, executor ssh.Executor, app, branch, 
 	if err := expandEnvTemplates(appCfg.Env, strictEnv); err != nil {
 		return err
 	}
+	if len(appCfg.EnvLiteral) > 0 {
+		if appCfg.Env == nil {
+			appCfg.Env = map[string]string{}
+		}
+		for k, v := range appCfg.EnvLiteral {
+			appCfg.Env[k] = v
+		}
+	}
 	if len(appCfg.EnvFiles) > 0 {
 		fileVars, err := env.LoadLocalEnvFiles(ctx, buildDir, appCfg.EnvFiles)
 		if err != nil {
@@ -668,18 +693,31 @@ func triggerAutoDeploy(ctx context.Context, executor ssh.Executor, app, branch, 
 		return fmt.Errorf("type:static apps are not supported by `teploy autodeploy serve` yet — use a scheduled/manual deploy")
 	}
 
-	version, err := gitShortHashIn(buildDir)
+	revision, err := executor.Run(ctx, "cd "+ssh.ShellQuote(buildDir)+" && git rev-parse HEAD")
 	if err != nil {
-		return fmt.Errorf("resolving version: %w", err)
+		return fmt.Errorf("resolving fetched revision: %w", err)
 	}
-	if revision, revisionErr := gitRevisionIn(buildDir); revisionErr == nil {
-		appCfg.SourceRevision = revision
+	revision = strings.TrimSpace(revision)
+	if len(revision) != 40 && len(revision) != 64 {
+		return fmt.Errorf("invalid fetched revision")
 	}
+	if _, decodeErr := hex.DecodeString(revision); decodeErr != nil {
+		return fmt.Errorf("invalid fetched revision")
+	}
+	if commit != "" && revision != commit {
+		return fmt.Errorf("fetched revision does not match authenticated commit")
+	}
+	version := revision
+	appCfg.SourceRevision = revision
 
 	var image string
 	needsBuild := appCfg.Image == ""
 	if needsBuild {
-		buildMode, detectErr := build.DetectAt(buildDir, appCfg.Dockerfile)
+		contextDir, contextErr := buildContextDir(buildDir, appCfg.Context)
+		if contextErr != nil {
+			return contextErr
+		}
+		buildMode, detectErr := build.DetectAt(contextDir, appCfg.Dockerfile)
 		if detectErr != nil {
 			return detectErr
 		}
@@ -781,4 +819,30 @@ func resolveTLSFromRoot(tls *config.TLSConfig, root string) *config.TLSConfig {
 	out.Cert = resolve(out.Cert)
 	out.Key = resolve(out.Key)
 	return &out
+}
+
+func buildContextDir(checkout, configured string) (string, error) {
+	if configured == "" {
+		configured = "."
+	}
+	if filepath.IsAbs(configured) {
+		return "", fmt.Errorf("build context must be relative to checkout")
+	}
+	root, err := filepath.Abs(checkout)
+	if err != nil {
+		return "", err
+	}
+	resolved, err := filepath.EvalSymlinks(filepath.Join(root, configured))
+	if err != nil {
+		return "", err
+	}
+	root, err = filepath.EvalSymlinks(root)
+	if err != nil {
+		return "", err
+	}
+	rel, err := filepath.Rel(root, resolved)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("build context escapes checkout")
+	}
+	return resolved, nil
 }

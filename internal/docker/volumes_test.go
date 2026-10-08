@@ -184,8 +184,9 @@ func TestFormatMismatchError_IncludesEverythingUserNeeds(t *testing.T) {
 
 func TestMigrateVolumes_HappyPath(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
-		ssh.MockCommand{Match: "docker ps -aq", Output: "deadbeef"},
+		ssh.MockCommand{Match: "docker ps -q", Output: "deadbeef"},
 		ssh.MockCommand{Match: "docker stop deadbeef", Output: ""},
+		ssh.MockCommand{Match: "docker start", Output: ""},
 		ssh.MockCommand{Match: "mkdir -p", Output: ""},
 		ssh.MockCommand{Match: "cp -a", Output: ""},
 	)
@@ -228,7 +229,7 @@ func TestMigrateVolumes_NoExistingContainer(t *testing.T) {
 	// User passed --migrate-volumes but the existing container was already gone.
 	// Should no-op rather than error.
 	mock := ssh.NewMockExecutor("1.2.3.4",
-		ssh.MockCommand{Match: "docker ps -aq", Output: ""},
+		ssh.MockCommand{Match: "docker ps -q", Output: ""},
 	)
 
 	var buf bytes.Buffer

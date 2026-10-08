@@ -644,20 +644,21 @@ func (c *Client) AccessoryRestore(ctx context.Context, app, name, image, date st
 		// failure path DELIBERATELY keeps tmpdir for inspection, so the
 		// credential file must be removed by name there: keep the SQL,
 		// never the secret (C08).
-		execEnv := ""
+		client := "mysql"
+		if isDBType(image, "mariadb") {
+			client = "mariadb"
+		}
+		sqlPath := tmpdir + "/restore.sql"
+		receiver := "docker exec -i " + qContainer + " " + client + " -u root " + ssh.ShellQuote(db) + " < " + ssh.ShellQuote(sqlPath)
 		if pwd := mysqlRootPassword(env); pwd != "" {
 			envFile := tmpdir + "/mysql.env"
 			if err := c.exec.Upload(ctx, strings.NewReader("MYSQL_PWD="+pwd+"\n"), envFile, "0600"); err != nil {
-				return keepTmp(fmt.Errorf("staging the mysql credential file for %s: %w", name, err))
+				return keepTmp(err)
 			}
-			execEnv = " --env-file " + ssh.ShellQuote(envFile)
+			receiver = "{ cat " + ssh.ShellQuote(envFile) + " && cat " + ssh.ShellQuote(sqlPath) + "; } | docker exec -i " + qContainer + " sh -c " + ssh.ShellQuote(mysqlPasswordPrelude+"exec "+client+" -u root "+ssh.ShellQuote(db))
 		}
-		// Same pipeline-to-redirect shape as postgres (mysql itself exits
-		// nonzero on SQL errors when reading a script, but gunzip's failure
-		// must not be masked either).
-		sqlPath := tmpdir + "/restore.sql"
-		restoreCmd = fmt.Sprintf("gunzip -c %s > %s && docker exec -i%s %s mysql -u root %s < %s",
-			ssh.ShellQuote(restorePath), ssh.ShellQuote(sqlPath), execEnv, qContainer, ssh.ShellQuote(db), ssh.ShellQuote(sqlPath))
+		restoreCmd = "gunzip -c " + ssh.ShellQuote(restorePath) + " > " + ssh.ShellQuote(sqlPath) + " && " + receiver
+
 		// The kept-on-failure scratch dir must never keep the credential.
 		innerKeep := keepTmp
 		keepTmp = func(err error) error {
@@ -867,28 +868,27 @@ func planAccessoryDump(app, name, image string, env map[string]string, workDir s
 		}
 	case isDBType(image, "mysql"), isDBType(image, "mariadb"):
 		engine := "mysql"
+		client := "mysqldump"
 		if isDBType(image, "mariadb") {
 			engine = "mariadb"
+			client = "mariadb-dump"
 		}
 		db := mysqlDB(app, env)
 		// Root password rides a 0600 env-file consumed by --env-file, never
 		// argv (mysqldump argv is visible in `ps` inside the container, and
 		// -e MYSQL_PWD puts the secret in the docker CLI's own argv on the
 		// host). Absent = current behavior (passwordless root).
-		execEnv := ""
 		var cred *planCredential
+		command := "docker exec " + qContainer + " " + client + " -u root " + ssh.ShellQuote(db)
 		if pwd := mysqlRootPassword(env); pwd != "" {
 			envFile := workDir + "/mysql.env"
 			cred = &planCredential{path: envFile, content: "MYSQL_PWD=" + pwd + "\n"}
-			execEnv = " --env-file " + ssh.ShellQuote(envFile)
+			inner := mysqlPasswordPrelude + "exec " + client + " -u root " + ssh.ShellQuote(db)
+			command = "docker exec -i " + qContainer + " sh -c " + ssh.ShellQuote(inner) + " < " + ssh.ShellQuote(envFile)
 		}
-		return accessoryDumpPlan{
-			engine: engine, method: "mysqldump", consistency: consistencyEngineDump, ext: ".sql.gz",
-			artifactPath: dumpPath,
-			cmd: fmt.Sprintf("docker exec%s %s mysqldump -u root %s > %s && gzip -c %s > %s",
-				execEnv, qContainer, ssh.ShellQuote(db), ssh.ShellQuote(dumpTmp), ssh.ShellQuote(dumpTmp), ssh.ShellQuote(dumpPath)),
-			credential: cred,
-		}
+		return accessoryDumpPlan{engine: engine, method: client, consistency: consistencyEngineDump, ext: ".sql.gz", artifactPath: dumpPath, credential: cred,
+			cmd: command + " > " + ssh.ShellQuote(dumpTmp) + " && gzip -c " + ssh.ShellQuote(dumpTmp) + " > " + ssh.ShellQuote(dumpPath)}
+
 	case isDBType(image, "mongo"):
 		return accessoryDumpPlan{
 			engine: "mongo", method: "mongodump", consistency: consistencyEngineDump, ext: ".archive.gz",
@@ -962,15 +962,28 @@ func postgresRestoreCmd(container, user, db, dumpPath, sqlPath string) string {
 		ssh.ShellQuote(dumpPath), ssh.ShellQuote(sqlPath), ssh.ShellQuote(container), ssh.ShellQuote(user), ssh.ShellQuote(db), ssh.ShellQuote(sqlPath))
 }
 
-// mysqlRestoreCmd mirrors postgresRestoreCmd for mysql/mariadb; the root
-// password rides MYSQL_PWD container env, never argv (audit F22).
-func mysqlRestoreCmd(container, db, pwd, dumpPath, sqlPath string) string {
-	execEnv := ""
-	if pwd != "" {
-		execEnv = " -e MYSQL_PWD=" + ssh.ShellQuote(pwd)
+// restoreMySQL decompresses successfully before streaming a credential header and SQL.
+// The password is confined to SSH stdin and the client environment, never command text.
+func (c *Client) restoreMySQL(ctx context.Context, engine, container, db, pwd, dumpPath, sqlPath string) error {
+	if strings.ContainsAny(pwd, "\r\n") {
+		return fmt.Errorf("database credential contains a line break")
 	}
-	return fmt.Sprintf("gunzip -c %s > %s && docker exec -i%s %s mysql -u root %s < %s",
-		ssh.ShellQuote(dumpPath), ssh.ShellQuote(sqlPath), execEnv, ssh.ShellQuote(container), ssh.ShellQuote(db), ssh.ShellQuote(sqlPath))
+	if _, err := c.exec.Run(ctx, "umask 077; gunzip -c "+ssh.ShellQuote(dumpPath)+" > "+ssh.ShellQuote(sqlPath)); err != nil {
+		return err
+	}
+	client, _ := mysqlTools(engine)
+	receiver := "{ cat; cat " + ssh.ShellQuote(sqlPath) + "; } | docker exec -i " + ssh.ShellQuote(container) + " sh -c " + ssh.ShellQuote(mysqlPasswordPrelude+"exec "+client+" -u root "+ssh.ShellQuote(db))
+	return c.exec.RunInput(ctx, receiver, strings.NewReader("MYSQL_PWD="+pwd+"\n"))
+}
+func mysqlTools(engine string) (string, string) {
+	if engine == "mariadb" {
+		return "mariadb", "mariadb-admin"
+	}
+	return "mysql", "mysqladmin"
+}
+func mysqlReadyProbe(engine string) string {
+	_, admin := mysqlTools(engine)
+	return "sh -c " + ssh.ShellQuote("MYSQL_PWD=${MARIADB_ROOT_PASSWORD:-${MYSQL_ROOT_PASSWORD:-${MYSQL_PASSWORD:-}}}; export MYSQL_PWD; exec "+admin+" ping -u root --silent")
 }
 
 // mongoRestoreCmd streams a mongodump archive into mongorestore.
@@ -1076,7 +1089,10 @@ func postgresDBAndUser(app string, env map[string]string) (db, user string) {
 // user, matching connectionEnvVars' own hardcoded assumption there — no
 // equivalent MYSQL_USER override exists to resolve.
 func mysqlDB(app string, env map[string]string) string {
-	db := env["MYSQL_DATABASE"]
+	db := env["MARIADB_DATABASE"]
+	if db == "" {
+		db = env["MYSQL_DATABASE"]
+	}
 	if db == "" {
 		db = app
 	}
@@ -1090,8 +1106,13 @@ func mysqlDB(app string, env map[string]string) string {
 // the host's `ps` output. Empty means no password configured; callers
 // keep the bare command.
 func mysqlRootPassword(env map[string]string) string {
+	if pwd := env["MARIADB_ROOT_PASSWORD"]; pwd != "" {
+		return pwd
+	}
 	if pwd := env["MYSQL_ROOT_PASSWORD"]; pwd != "" {
 		return pwd
 	}
 	return env["MYSQL_PASSWORD"]
 }
+
+const mysqlPasswordPrelude = `IFS= read -r teploy_credential || exit 1; MYSQL_PWD=${teploy_credential#MYSQL_PWD=}; export MYSQL_PWD; `

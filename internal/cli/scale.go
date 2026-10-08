@@ -4,10 +4,12 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/signal"
 	"sort"
 	"strconv"
+	"strings"
 
 	"github.com/spf13/cobra"
 	"github.com/useteploy/teploy/internal/caddy"
@@ -46,6 +48,12 @@ func runScale(flags *Flags, count, parallel int) error {
 		return err
 	}
 
+	if appCfg.Type == "static" {
+		return fmt.Errorf("fleet scaling static applications is unsupported; deploy each static target explicitly")
+	}
+	if err := resolveDeployEnv(context.Background(), appCfg, flags.StrictEnv); err != nil {
+		return err
+	}
 	// 2. Get app-role servers.
 	serversPath, err := config.DefaultServersPath()
 	if err != nil {
@@ -134,10 +142,13 @@ func runScale(flags *Flags, count, parallel int) error {
 		}
 	}
 
+	if err := fleetPublicationError(results); err != nil {
+		return err
+	}
 	// 6. Update LB if any servers succeeded.
 	if len(successTargets) > 0 {
 		if err := updateLoadBalancer(ctx, flags, appCfg, serversPath, successTargets); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: LB update failed: %v\n", err)
+			return fmt.Errorf("backends deployed but load balancer activation failed: %w", err)
 		}
 	}
 
@@ -229,7 +240,7 @@ func updateLoadBalancer(ctx context.Context, flags *Flags, appCfg *config.AppCon
 	upstreams := make([]caddy.Upstream, len(targets))
 	for i, t := range targets {
 		// Default HTTP port for app containers.
-		upstreams[i] = caddy.Upstream{Dial: fmt.Sprintf("%s:80", t.Host)}
+		upstreams[i] = caddy.Upstream{Dial: fleetServiceAddress(t.Host, appCfg)}
 	}
 
 	// Update each LB server.
@@ -266,7 +277,7 @@ func updateLoadBalancer(ctx context.Context, flags *Flags, appCfg *config.AppCon
 		tls := caddy.TLS{Cert: cert, Key: key, Internal: internal}
 
 		client := caddy.NewClient(executor)
-		err = client.SetLoadBalancer(ctx, appCfg.App, appCfg.Domain, upstreams, tls, appCfg.CaddyExtra, appCfg.Cache, caddyFirewall(appCfg.Firewall), caddyAccess(appCfg.Access))
+		err = client.SetLoadBalancerHealth(ctx, appCfg.App, appCfg.Domain, upstreams, appCfg.Health.Path, tls, appCfg.CaddyExtra, appCfg.Cache, caddyFirewall(appCfg.Firewall), caddyAccess(appCfg.Access))
 		executor.Close()
 		if err != nil {
 			return fmt.Errorf("updating LB %s: %w", name, err)
@@ -276,4 +287,17 @@ func updateLoadBalancer(ctx context.Context, flags *Flags, appCfg *config.AppCon
 	}
 
 	return nil
+}
+
+func fleetServiceAddress(endpoint string, app *config.AppConfig) string {
+	host := endpoint
+	if parsed, _, err := net.SplitHostPort(endpoint); err == nil {
+		host = parsed
+	}
+	host = strings.Trim(host, "[]")
+	port := 80
+	if app.Ingress == "host" && app.Port > 0 {
+		port = app.Port
+	}
+	return net.JoinHostPort(host, strconv.Itoa(port))
 }

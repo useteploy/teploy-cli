@@ -8,7 +8,9 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
+	"github.com/useteploy/teploy/internal/config"
 	"github.com/useteploy/teploy/internal/docker"
+	"github.com/useteploy/teploy/internal/ssh"
 	"github.com/useteploy/teploy/internal/state"
 )
 
@@ -49,6 +51,12 @@ func tailToLines(_ *pflag.FlagSet, name string) pflag.NormalizedName {
 }
 
 func runLogs(flags *Flags, appName, process string, lines int, follow bool) error {
+	if err := config.ValidateIdentifier("process", process); err != nil {
+		return err
+	}
+	if lines < 0 {
+		return fmt.Errorf("lines must be nonnegative")
+	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
@@ -74,5 +82,5 @@ func logsCommand(containerName string, lines int, follow bool) string {
 	if follow {
 		followFlag = " -f"
 	}
-	return fmt.Sprintf("docker logs%s --tail %d %s", followFlag, lines, containerName)
+	return fmt.Sprintf("docker logs%s --tail %d %s", followFlag, lines, ssh.ShellQuote(containerName))
 }

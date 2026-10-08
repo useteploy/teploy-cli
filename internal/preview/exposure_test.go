@@ -58,7 +58,7 @@ func managedBlock(t *testing.T, mock *ssh.MockExecutor, key string) string {
 // line) with the allowlist as its firewall, under the explicit base; the
 // record carries the mode and the output names the http:// URL.
 func TestDeploy_TailnetModeWritesHTTPOnlyGatedRoute(t *testing.T) {
-	mock := ssh.NewMockExecutor("1.2.3.4", previewDeployMocks()...)
+	mock := previewMockExecutor("1.2.3.4", previewDeployMocks()...)
 	var buf bytes.Buffer
 	mgr := NewManager(mock, &buf)
 
@@ -95,7 +95,7 @@ func TestDeploy_TailnetModeWritesHTTPOnlyGatedRoute(t *testing.T) {
 // hostname, still HTTP-only, still gated — never silently back to HTTPS or
 // open.
 func TestDeploy_UpdateInheritsTailnetMode(t *testing.T) {
-	mock := ssh.NewMockExecutor("1.2.3.4", previewDeployMocks()...)
+	mock := previewMockExecutor("1.2.3.4", previewDeployMocks()...)
 	var buf bytes.Buffer
 	mgr := NewManager(mock, &buf)
 
@@ -123,7 +123,7 @@ func TestDeploy_UpdateInheritsTailnetMode(t *testing.T) {
 // off keeps the recorded base and allowlist; an empty non-nil allowlist
 // clears it.
 func TestDeploy_UpdateOverridesFieldByField(t *testing.T) {
-	mock := ssh.NewMockExecutor("1.2.3.4", previewDeployMocks()...)
+	mock := previewMockExecutor("1.2.3.4", previewDeployMocks()...)
 	var buf bytes.Buffer
 	mgr := NewManager(mock, &buf)
 
@@ -157,7 +157,7 @@ func TestDeploy_UpdateOverridesFieldByField(t *testing.T) {
 // byte-shaped like before), and updating a record written before the
 // fields existed keeps automatic HTTPS, no gate, and the app-domain host.
 func TestDeploy_DefaultAndLegacyRecordsUnchanged(t *testing.T) {
-	mock := ssh.NewMockExecutor("1.2.3.4", previewDeployMocks()...)
+	mock := previewMockExecutor("1.2.3.4", previewDeployMocks()...)
 	var buf bytes.Buffer
 	mgr := NewManager(mock, &buf)
 
@@ -239,7 +239,7 @@ func TestDeploy_InvalidExposureRefusesBeforeMutation(t *testing.T) {
 		"no-base":       func(c *DeployConfig) { c.Domain = "" },
 	} {
 		t.Run(name, func(t *testing.T) {
-			mock := ssh.NewMockExecutor("1.2.3.4", previewDeployMocks()...)
+			mock := previewMockExecutor("1.2.3.4", previewDeployMocks()...)
 			mgr := NewManager(mock, &bytes.Buffer{})
 			cfg := deployCfg(loginBranch, "v1")
 			mutate(&cfg)
@@ -247,7 +247,7 @@ func TestDeploy_InvalidExposureRefusesBeforeMutation(t *testing.T) {
 				t.Fatal("invalid exposure must fail the deploy")
 			}
 			for _, c := range mock.Calls {
-				if !strings.HasPrefix(c, "cat ") {
+				if !strings.HasPrefix(c, "cat ") && !strings.HasPrefix(c, "if test -f ") {
 					t.Errorf("mutated before validating: %q", c)
 				}
 			}

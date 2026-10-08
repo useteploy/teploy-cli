@@ -5,7 +5,9 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
+	"path"
 	"strings"
+	"time"
 
 	"github.com/useteploy/teploy/internal/ssh"
 )
@@ -18,7 +20,7 @@ import (
 // (update.go's fetchLatestRelease/downloadToBytes/checksumFor/
 // extractBinary), just targeting the server's platform instead of the
 // operator's local one, and uploading instead of self-replacing.
-func deployTeployBinaryToServer(ctx context.Context, exec ssh.Executor, remotePath string) (version string, err error) {
+func deployTeployBinaryToServer(ctx context.Context, exec ssh.Executor, remotePath string, capabilities ...string) (version string, err error) {
 	goos, goarch, err := serverPlatform(ctx, exec)
 	if err != nil {
 		return "", fmt.Errorf("detecting server platform: %w", err)
@@ -64,29 +66,8 @@ func deployTeployBinaryToServer(ctx context.Context, exec ssh.Executor, remotePa
 		return "", fmt.Errorf("extracting binary: %w", err)
 	}
 
-	// Upload to a staging path and rename into place, rather than writing
-	// remotePath directly: if `teploy autodeploy serve` is already running
-	// from remotePath (re-running `autodeploy setup` to pick up a newer
-	// release), an SFTP write straight to that path fails with ETXTBSY
-	// ("text file busy") — Linux refuses to open-for-write a file that's
-	// currently mapped as a running executable. rename() has no such
-	// restriction: it only touches the directory entry, so it succeeds
-	// even while the old inode is still executing. The running process
-	// keeps its old code until the systemd restart later in Setup picks
-	// up the new binary at the same path. Found live: re-running
-	// `autodeploy setup` against an already-configured app failed outright.
-	stagingPath := remotePath + ".new"
-	if err := exec.Upload(ctx, bytes.NewReader(binData), stagingPath, "0755"); err != nil {
-		return "", fmt.Errorf("uploading teploy binary: %w", err)
-	}
-	if _, err := exec.Run(ctx, fmt.Sprintf("mv %s %s", ssh.ShellQuote(stagingPath), ssh.ShellQuote(remotePath))); err != nil {
-		return "", fmt.Errorf("installing teploy binary: %w", err)
-	}
-
-	// Sanity check the uploaded binary actually runs before wiring a
-	// systemd unit up to depend on it.
-	if _, err := exec.Run(ctx, ssh.ShellQuote(remotePath)+" version"); err != nil {
-		return "", fmt.Errorf("uploaded binary failed to run: %w", err)
+	if err := installServerBinary(ctx, exec, remotePath, binData, latestVersion, capabilities...); err != nil {
+		return "", err
 	}
 
 	return latestVersion, nil
@@ -123,4 +104,71 @@ func serverPlatform(ctx context.Context, exec ssh.Executor) (goos, goarch string
 	}
 
 	return goos, goarch, nil
+}
+
+// installServerBinary validates a private candidate before one atomic,
+// serialized publication. The incumbent is never replaced by a refused
+// candidate; privileged destinations use the supported passwordless sudo path.
+func installServerBinary(ctx context.Context, executor ssh.Executor, destination string, data []byte, version string, capabilities ...string) error {
+	if !path.IsAbs(destination) || path.Clean(destination) != destination {
+		return fmt.Errorf("binary destination must be a clean absolute path")
+	}
+	out, err := executor.Run(ctx, "umask 077; mktemp -d /tmp/teploy-install.XXXXXXXX")
+	if err != nil {
+		return fmt.Errorf("creating binary staging directory: %w", err)
+	}
+	dir := strings.TrimSpace(out)
+	if !strings.HasPrefix(dir, "/tmp/teploy-install.") || strings.ContainsAny(dir, "\n\r") || path.Dir(dir) != "/tmp" {
+		return fmt.Errorf("invalid binary staging directory")
+	}
+	defer func() {
+		cleanup, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		_, _ = executor.Run(cleanup, "rm -rf -- "+ssh.ShellQuote(dir))
+	}()
+	candidate := path.Join(dir, "teploy")
+	if err := executor.Upload(ctx, bytes.NewReader(data), candidate, "0700"); err != nil {
+		return fmt.Errorf("uploading teploy candidate: %w", err)
+	}
+	checkCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	actual, err := executor.Run(checkCtx, ssh.ShellQuote(candidate)+" version")
+	if err != nil {
+		return fmt.Errorf("candidate binary failed to run: %w", err)
+	}
+	if strings.TrimSpace(actual) != "teploy "+version {
+		return fmt.Errorf("candidate version mismatch: expected teploy %s", version)
+	}
+	for _, capability := range capabilities {
+		var args []string
+		for _, arg := range strings.Fields(capability) {
+			args = append(args, ssh.ShellQuote(arg))
+		}
+		if len(args) == 0 {
+			return fmt.Errorf("empty binary capability")
+		}
+		if _, err := executor.Run(checkCtx, ssh.ShellQuote(candidate)+" "+strings.Join(args, " ")+" --help >/dev/null 2>&1"); err != nil {
+			return fmt.Errorf("candidate does not support %s: %w", capability, err)
+		}
+	}
+	prefix := ""
+	if strings.HasPrefix(destination, "/usr/") || strings.HasPrefix(destination, "/opt/") {
+		prefix = sudoPrefixFor(ctx, executor)
+		if prefix != "" {
+			prefix = "sudo -n "
+		}
+	}
+	script := fmt.Sprintf(`set -eu
+stage=$(mktemp %s)
+trap 'rm -f -- "$stage"' EXIT HUP INT TERM
+cp -- %s "$stage"
+chmod 0755 "$stage"
+mv -f -- "$stage" %s`, ssh.ShellQuote(path.Join(path.Dir(destination), ".teploy-candidate.XXXXXXXX")), ssh.ShellQuote(candidate), ssh.ShellQuote(destination))
+	// A unique sibling gives atomic rename on the destination filesystem.
+	// flock prevents concurrent installers from interleaving publication.
+	command := prefix + "flock -w 30 " + ssh.ShellQuote(destination+".install.lock") + " sh -c " + ssh.ShellQuote(script)
+	if _, err := executor.Run(ctx, command); err != nil {
+		return fmt.Errorf("publishing verified binary: %w", err)
+	}
+	return nil
 }
