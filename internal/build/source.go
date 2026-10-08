@@ -172,7 +172,26 @@ func isGitWorkTree(dir string) (bool, error) {
 	}
 	out, err := exec.Command("git", "-C", dir, "rev-parse", "--is-inside-work-tree").Output()
 	if err != nil {
-		return false, nil
+		abs, absErr := filepath.Abs(dir)
+		if absErr != nil {
+			return false, absErr
+		}
+		for d := abs; ; d = filepath.Dir(d) {
+			if _, statErr := os.Lstat(filepath.Join(d, ".git")); statErr == nil {
+				return false, fmt.Errorf("git work-tree discovery failed for %s: %w", dir, err)
+			} else if !errors.Is(statErr, fs.ErrNotExist) {
+				return false, statErr
+			}
+			if filepath.Dir(d) == d {
+				break
+			}
+		}
+		var exit *exec.ExitError
+		// Git distinguishes a genuinely absent repository in its diagnostic.
+		if errors.As(err, &exit) && strings.Contains(string(exit.Stderr), "not a git repository") {
+			return false, nil
+		}
+		return false, fmt.Errorf("cannot establish whether %s is a git work tree: %w", dir, err)
 	}
 	return strings.TrimSpace(string(out)) == "true", nil
 }
@@ -232,6 +251,17 @@ func addAllowlisted(root string, rules *Rules, set map[string]bool) error {
 		starts = literals
 	}
 	for _, s := range starts {
+		// A literal start must not reach through a symlinked ancestor to an
+		// outside tree. Symlink entries themselves retain normal selection.
+		for parent := path.Dir(s); parent != "." && parent != ""; parent = path.Dir(parent) {
+			info, err := os.Lstat(filepath.Join(root, filepath.FromSlash(parent)))
+			if err == nil && info.Mode()&os.ModeSymlink != 0 {
+				return fmt.Errorf("allowlisted path %s has a symlinked ancestor", s)
+			}
+			if err != nil && !errors.Is(err, fs.ErrNotExist) {
+				return err
+			}
+		}
 		// walkAdmitted judges every entry's ancestors too, so a literal
 		// under a protected or excluded directory still yields nothing.
 		found, err := walkAdmitted(root, s, rules, keep)
@@ -290,7 +320,12 @@ func (s *Source) FileList() []byte {
 // Permission bits are ignored (umask stability across machines). The
 // fingerprint describes what the build host RECEIVED — a provenance
 // identity, not a security boundary.
-func (s *Source) Fingerprint(sub string) (string, error) {
+func (s *Source) Fingerprint(sub string) (string, error) { return s.fingerprint(sub, false) }
+
+// ReviewedFingerprint binds permission modes as well as bytes, including implied parents.
+// Existing mode-free provenance remains v2; reviewed authorization is v3.
+func (s *Source) ReviewedFingerprint(sub string) (string, error) { return s.fingerprint(sub, true) }
+func (s *Source) fingerprint(sub string, reviewed bool) (string, error) {
 	sub = strings.Trim(path.Clean("/"+filepath.ToSlash(sub)), "/")
 	type entry struct {
 		rel    string
@@ -300,6 +335,9 @@ func (s *Source) Fingerprint(sub string) (string, error) {
 		target string
 	}
 	byRel := map[string]entry{}
+	if reviewed {
+		byRel[""] = entry{rel: "", kind: 'd'}
+	}
 	addDirs := func(rel string) {
 		for i := 0; i < len(rel); i++ {
 			if rel[i] == '/' {
@@ -354,7 +392,11 @@ func (s *Source) Fingerprint(sub string) (string, error) {
 	h := sha256.New()
 	// v2: the entry set is the L14 selection (gitignore-aware), not v1's
 	// walk-minus-excludes — a new version so the two are never compared.
-	h.Write([]byte("teploy-context-v2\x00"))
+	if reviewed {
+		h.Write([]byte("teploy-reviewed-context-v3\x00"))
+	} else {
+		h.Write([]byte("teploy-context-v2\x00"))
+	}
 	var num [8]byte
 	binary.BigEndian.PutUint64(num[:], uint64(len(entries)))
 	h.Write(num[:])
@@ -367,6 +409,15 @@ func (s *Source) Fingerprint(sub string) (string, error) {
 	for _, e := range entries {
 		h.Write([]byte{e.kind})
 		writeStr(e.rel)
+		if reviewed && e.kind != 'l' {
+			full := filepath.Join(s.Root, filepath.FromSlash(sub), filepath.FromSlash(e.rel))
+			info, err := os.Lstat(full)
+			if err != nil {
+				return "", err
+			}
+			binary.BigEndian.PutUint64(len8[:], uint64(info.Mode().Perm()))
+			h.Write(len8[:])
+		}
 		switch e.kind {
 		case 'f':
 			binary.BigEndian.PutUint64(len8[:], uint64(e.size))

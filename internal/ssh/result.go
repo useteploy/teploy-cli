@@ -209,6 +209,7 @@ func (b *limitedBuffer) Write(p []byte) (int, error) {
 	if b.limit <= 0 {
 		b.limit = DefaultResultLimit
 	}
+	originalLen := len(p)
 	room := b.limit - int64(b.buf.Len())
 	if room <= 0 {
 		b.overflow = true
@@ -218,7 +219,8 @@ func (b *limitedBuffer) Write(p []byte) (int, error) {
 		b.overflow = true
 		p = p[:room]
 	}
-	return b.buf.Write(p)
+	_, err := b.buf.Write(p)
+	return originalLen, err
 }
 
 func (b *limitedBuffer) bytes() []byte {

@@ -3,7 +3,9 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 
@@ -109,7 +111,11 @@ func newDRCreateCmd(flags *Flags, version string) *cobra.Command {
 				return err
 			}
 			defer executor.Close()
-			client := backup.NewClient(executor, os.Stdout)
+			progress := io.Writer(os.Stdout)
+			if flags.JSON {
+				progress = os.Stderr
+			}
+			client := backup.NewClient(executor, progress)
 			m, err := client.CreateBundle(ctx, backup.BundleOptions{
 				App:            appCfg.App,
 				Config:         *appCfg,
@@ -274,7 +280,11 @@ func newDRRestoreCmd(flags *Flags) *cobra.Command {
 				return err
 			}
 			defer executor.Close()
-			client := backup.NewClient(executor, os.Stdout)
+			progress := io.Writer(os.Stdout)
+			if flags.JSON {
+				progress = os.Stderr
+			}
+			client := backup.NewClient(executor, progress)
 			receipt, err := client.RestoreBundleIsolated(ctx, backup.BundleRestoreOptions{
 				App:    appCfg.App,
 				ID:     args[0],
@@ -284,7 +294,11 @@ func newDRRestoreCmd(flags *Flags) *cobra.Command {
 				return err
 			}
 			if flags.JSON {
-				return json.NewEncoder(os.Stdout).Encode(receipt)
+				var outcome error
+				if !receipt.OK {
+					outcome = fmt.Errorf("restore validation failed — see the receipt; nothing live was touched")
+				}
+				return errors.Join(outcome, json.NewEncoder(os.Stdout).Encode(receipt))
 			}
 			printReceipt(receipt)
 			if !receipt.OK {
@@ -331,7 +345,11 @@ func newDRCutoverCmd(flags *Flags) *cobra.Command {
 				return err
 			}
 			defer executor.Close()
-			client := backup.NewClient(executor, os.Stdout)
+			progress := io.Writer(os.Stdout)
+			if flags.JSON {
+				progress = os.Stderr
+			}
+			client := backup.NewClient(executor, progress)
 			receipt, err := client.CutoverBundle(ctx, backup.BundleRestoreOptions{
 				App:    appCfg.App,
 				ID:     args[0],
@@ -341,7 +359,11 @@ func newDRCutoverCmd(flags *Flags) *cobra.Command {
 				return err
 			}
 			if flags.JSON {
-				return json.NewEncoder(os.Stdout).Encode(receipt)
+				var outcome error
+				if !receipt.OK {
+					outcome = fmt.Errorf("cutover did not complete — inspect the receipt and recovery directories")
+				}
+				return errors.Join(outcome, json.NewEncoder(os.Stdout).Encode(receipt))
 			}
 			fmt.Printf("Cutover receipt for bundle %s: %d path(s) promoted, originals kept in %v\n",
 				receipt.BundleID, len(receipt.Promoted), receipt.RecoveryDirs)

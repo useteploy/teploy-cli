@@ -6,6 +6,10 @@ on:
 
 # Least privilege by default (audit T61): the workflow as a whole is
 # read-only; only the publishing job escalates to contents: write.
+concurrency:
+  group: teploy-release-distribution
+  cancel-in-progress: false
+
 permissions:
   contents: read
 
@@ -34,4 +38,34 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+      - name: Check out the Homebrew tap
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: useteploy/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: distribution/homebrew-tap
+      - name: Check out the Scoop bucket
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: useteploy/scoop-bucket
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: distribution/scoop-bucket
+      - name: Render distribution manifests from release checksums
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python3 scripts/render-distribution.py "$RELEASE_TAG" dist/checksums.txt distribution/homebrew-tap distribution/scoop-bucket
+      - name: Publish distribution manifests
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          for repo in distribution/homebrew-tap distribution/scoop-bucket; do
+            git -C "$repo" config user.name github-actions[bot]
+            git -C "$repo" config user.email 41898282+github-actions[bot]@users.noreply.github.com
+            if [ -f "$repo/teploy.rb" ]; then git -C "$repo" add teploy.rb; else git -C "$repo" add teploy.json; fi
+            if ! git -C "$repo" diff --cached --quiet; then
+              git -C "$repo" commit -m "Update teploy to $RELEASE_TAG"
+              git -C "$repo" pull --rebase
+              git -C "$repo" push
+            fi
+          done

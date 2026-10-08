@@ -65,10 +65,31 @@ func Observe(ctx context.Context, exec ssh.Executor, app, attempted, predecessor
 			predName = fmt.Sprintf("%s-web-%s", app, predecessor)
 		}
 		for _, c := range containers {
-			isCandidate := strings.HasPrefix(c.Name, candPrefix)
-			isPredecessor := predName != "" &&
-				(strings.HasPrefix(c.Name, predName) || strings.HasPrefix(c.Name, predName+"_replaced"))
+			version := c.Labels["teploy.version"]
+			process := c.Labels["teploy.process"]
+			isCandidate := version == attempted && process == "web"
+			if version == "" {
+				isCandidate = c.Name == candPrefix || strings.HasPrefix(c.Name, candPrefix+"-")
+			}
+			isPredecessor := predecessor != "" && version == predecessor && process == "web"
+			if version == "" {
+				isPredecessor = predName != "" && (c.Name == predName || c.Name == predName+"_replaced" || strings.HasPrefix(c.Name, predName+"-"))
+			}
 			switch {
+			case c.Labels["teploy.role"] == "accessory" && c.Labels["teploy.accessory"] != "":
+				// Independently managed accessories have no app-release version.
+				continue
+			case process != "" && process != "web" && (version == attempted || version == predecessor):
+				rec, recErr := releasemeta.Read(ctx, exec, app, version)
+				if recErr == nil && rec != nil {
+					if _, ok := rec.Processes[process]; ok {
+						continue
+					}
+				}
+				if c.State == "running" {
+					o.ForeignCandidates = recovery.Present
+				}
+				continue
 			case isCandidate:
 				if c.State == "running" {
 					o.Candidates = recovery.Present

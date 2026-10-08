@@ -2,6 +2,9 @@ package backup
 
 import (
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +15,7 @@ import (
 
 	"github.com/useteploy/teploy/internal/accessories"
 	"github.com/useteploy/teploy/internal/config"
+	"github.com/useteploy/teploy/internal/docker"
 	"github.com/useteploy/teploy/internal/secret"
 	"github.com/useteploy/teploy/internal/ssh"
 	"github.com/useteploy/teploy/internal/state"
@@ -30,7 +34,7 @@ import (
 const DRStagingRoot = "/var/tmp/teploy-dr"
 
 // RestoreReceiptSchemaVersion versions the restore receipt.
-const RestoreReceiptSchemaVersion = 1
+const RestoreReceiptSchemaVersion = 2
 
 // DRStagingPath is the deterministic staging directory for one bundle of
 // one app — deterministic so a later `teploy dr cutover` finds it without
@@ -58,22 +62,25 @@ type DRCheckResult struct {
 // start to validated staging (download + extract + validation) — the
 // recovery-time floor before cutover.
 type RestoreReceipt struct {
-	SchemaVersion int             `json:"schema_version"`
-	BundleID      string          `json:"bundle_id"`
-	App           string          `json:"app"`
-	StartedAt     time.Time       `json:"started_at"`
-	ValidatedAt   time.Time       `json:"validated_at"`
-	RPOSeconds    int64           `json:"rpo_seconds"`
-	RTOSeconds    int64           `json:"rto_seconds"`
-	StagingPath   string          `json:"staging_path"`
-	Checks        []DRCheckResult `json:"checks"`
-	OK            bool            `json:"ok"`
-	NextStep      string          `json:"next_step"`
+	InvocationID   string          `json:"invocation_id"`
+	ManifestSHA256 string          `json:"manifest_sha256"`
+	SchemaVersion  int             `json:"schema_version"`
+	BundleID       string          `json:"bundle_id"`
+	App            string          `json:"app"`
+	StartedAt      time.Time       `json:"started_at"`
+	ValidatedAt    time.Time       `json:"validated_at"`
+	RPOSeconds     int64           `json:"rpo_seconds"`
+	RTOSeconds     int64           `json:"rto_seconds"`
+	StagingPath    string          `json:"staging_path"`
+	Checks         []DRCheckResult `json:"checks"`
+	OK             bool            `json:"ok"`
+	NextStep       string          `json:"next_step"`
 }
 
 // CutoverReceipt records what the explicit cutover changed and where the
 // pre-cutover originals were preserved.
 type CutoverReceipt struct {
+	OK            bool      `json:"ok"`
 	SchemaVersion int       `json:"schema_version"`
 	BundleID      string    `json:"bundle_id"`
 	App           string    `json:"app"`
@@ -115,18 +122,18 @@ func (c *Client) RestoreBundleIsolated(ctx context.Context, opts BundleRestoreOp
 		return nil, err
 	}
 
-	staging := DRStagingPath(opts.App, manifest.ID)
-	if !drStagingRE.MatchString(staging) {
-		return nil, fmt.Errorf("internal error: staging path %q fails the safety pattern", staging)
+	invocation, err := drInvocationID()
+	if err != nil {
+		return nil, err
 	}
-
-	// ---- Staging (isolated: /var/tmp/teploy-dr/..., never /deployments).
-	// A re-restore of the same bundle wipes only this bundle's staging tree.
-	if _, err := c.exec.Run(ctx, "rm -rf "+ssh.ShellQuote(staging)); err != nil {
-		return nil, fmt.Errorf("clearing previous staging: %w", err)
+	base := DRStagingPath(opts.App, manifest.ID)
+	if !drStagingRE.MatchString(base) {
+		return nil, fmt.Errorf("invalid DR staging base")
 	}
-	if _, err := c.exec.Run(ctx, "umask 077; mkdir -p "+ssh.ShellQuote(staging)); err != nil {
-		return nil, fmt.Errorf("creating staging dir: %w", err)
+	staging := base + "/" + invocation
+	// Exclusively create a private invocation tree; never wipe an incumbent.
+	if _, err := c.exec.Run(ctx, "umask 077; mkdir -p "+ssh.ShellQuote(base)+" && mkdir -m 0700 -- "+ssh.ShellQuote(staging)); err != nil {
+		return nil, fmt.Errorf("creating private DR invocation: %w", err)
 	}
 
 	// ---- Download every artifact named by the manifest (+ secret members).
@@ -151,8 +158,12 @@ func (c *Client) RestoreBundleIsolated(ctx context.Context, opts BundleRestoreOp
 	}
 	// Keep the manifest itself in staging: cutover re-reads it without the
 	// store, and the receipt records which bundle produced this tree.
-	if manifestBytes, err := json.MarshalIndent(manifest, "", "  "); err == nil {
-		_ = c.exec.Upload(context.WithoutCancel(ctx), strings.NewReader(string(manifestBytes)+"\n"), staging+"/manifest.json", "0600")
+	manifestBytes, err := json.MarshalIndent(manifest, "", "  ")
+	if err != nil {
+		return nil, err
+	}
+	if err := c.exec.Upload(ctx, strings.NewReader(string(manifestBytes)+"\n"), staging+"/manifest.json", "0600"); err != nil {
+		return nil, fmt.Errorf("persisting staged manifest: %w", err)
 	}
 
 	// ---- Integrity: every gzip artifact must prove itself BEFORE any
@@ -174,12 +185,14 @@ func (c *Client) RestoreBundleIsolated(ctx context.Context, opts BundleRestoreOp
 	}
 
 	receipt := &RestoreReceipt{
-		SchemaVersion: RestoreReceiptSchemaVersion,
-		BundleID:      manifest.ID,
-		App:           opts.App,
-		StartedAt:     started.UTC(),
-		StagingPath:   staging,
-		NextStep:      fmt.Sprintf("teploy dr cutover %s", manifest.ID),
+		InvocationID:   invocation,
+		ManifestSHA256: bundleManifestDigest(manifest),
+		SchemaVersion:  RestoreReceiptSchemaVersion,
+		BundleID:       manifest.ID,
+		App:            opts.App,
+		StartedAt:      started.UTC(),
+		StagingPath:    staging,
+		NextStep:       fmt.Sprintf("teploy dr cutover %s", manifest.ID),
 	}
 
 	// ---- Extract app volumes + generic accessory tars into staging.
@@ -224,7 +237,19 @@ func (c *Client) RestoreBundleIsolated(ctx context.Context, opts BundleRestoreOp
 	} else {
 		fmt.Fprintf(c.out, "Isolated restore FAILED validation — staging kept at %s for inspection; nothing live was touched\n", staging)
 	}
-	writeReceipt(ctx, c.exec, staging+"/receipt.json", receipt)
+	if err := writeReceipt(ctx, c.exec, staging+"/receipt.json", receipt); err != nil {
+		return receipt, err
+	}
+	// Publish only a completed receipt as the latest selection. Cutover reads
+	// that selection once and follows its immutable invocation, never another
+	// validation's mutable staging. Older invocations remain inspectable.
+	data, err := json.Marshal(receipt)
+	if err != nil {
+		return receipt, err
+	}
+	if err := ssh.UploadAtomic(ctx, c.exec, strings.NewReader(string(data)+"\n"), base+"/receipt.json", "0600"); err != nil {
+		return receipt, err
+	}
 	return receipt, nil
 }
 
@@ -289,47 +314,49 @@ func (c *Client) decryptProof(ctx context.Context, manifest *BundleManifest, sta
 	if manifest.Secrets.Mode != "encrypted" || len(manifest.Secrets.Included) == 0 {
 		return nil
 	}
-	var member string
-	for _, inc := range manifest.Secrets.Included {
-		if strings.HasSuffix(inc, ".age") {
-			member = inc
-			break
-		}
-	}
-	if member == "" {
-		return nil // only .env/credentials included; no ciphertext to prove
-	}
 	keyPath := deploymentsDir + "/.age-key"
-	if manifest.Secrets.AgeKeyIncluded {
+	hasKey, err := c.remoteExists(ctx, keyPath)
+	if err != nil {
+		return fmt.Errorf("checking surviving target age key: %w", err)
+	}
+	if !hasKey {
+		if !manifest.Secrets.AgeKeyIncluded {
+			return fmt.Errorf("target age key missing; restore an encrypted bundle with its age key or supply matching target credentials")
+		}
 		keyPath = staging + "/age-key"
 	}
-	// age -d reads the file; output goes to the shell's trash — this is a
-	// decryptability proof, not an extraction.
-	cmd := fmt.Sprintf("age -d -i %s %s >/dev/null 2>&1", ssh.ShellQuote(keyPath), ssh.ShellQuote(staging+"/"+member))
-	if _, err := c.exec.Run(ctx, cmd); err != nil {
-		if manifest.Secrets.AgeKeyIncluded {
-			return fmt.Errorf("the bundled age key cannot decrypt the bundled ciphertext %s — the bundle is internally inconsistent; nothing has been touched", member)
+	for _, member := range manifest.Secrets.Included {
+		if !strings.HasPrefix(member, "secrets/") || !strings.HasSuffix(member, ".age") {
+			continue
 		}
-		return fmt.Errorf("this target's age key cannot decrypt the bundle's secret material (ciphertext %s) — the bundle was encrypted on %s; supply that host's /deployments/.age-key on this target, or restore a references-only bundle and set the secrets by hand; nothing has been touched", member, manifest.Server)
+		cmd := fmt.Sprintf("age -d -i %s %s >/dev/null 2>&1", ssh.ShellQuote(keyPath), ssh.ShellQuote(staging+"/"+member))
+		if _, err := c.exec.Run(ctx, cmd); err != nil {
+			return fmt.Errorf("the age key that will remain live cannot decrypt bundled ciphertext %s; supply secrets encrypted for the target key or restore references only; target key was preserved", member)
+		}
 	}
+
 	return nil
 }
 
 // validateEngineSnapshot boots a scratch engine, restores the dump into it,
 // and checks the restored data is real. The scratch container is always torn
 // down. The LIVE accessory (if any) is never contacted.
-func (c *Client) validateEngineSnapshot(ctx context.Context, manifest *BundleManifest, snap SnapshotRecord, staging string) DRCheckResult {
-	check := DRCheckResult{
+func (c *Client) validateEngineSnapshot(ctx context.Context, manifest *BundleManifest, snap SnapshotRecord, staging string) (check DRCheckResult) {
+	check = DRCheckResult{
 		Name: fmt.Sprintf("accessory:%s (%s)", snap.Name, snap.Engine),
 		Kind: "data",
 	}
-	scratch := manifest.App + "-" + snap.Name + "-drcheck"
-	teardown := func() {
-		c.exec.Run(context.WithoutCancel(ctx), "docker rm -f "+ssh.ShellQuote(scratch)+" >/dev/null 2>&1 || true")
+	invocation, err := drInvocationID()
+	if err != nil {
+		return checkFailed(check, err)
 	}
-	// Remove stale scratch from an interrupted earlier run.
-	c.exec.Run(ctx, "docker rm -f "+ssh.ShellQuote(scratch)+" >/dev/null 2>&1 || true")
-	defer teardown()
+	scratch := "teploy-dr-engine-" + invocation
+	scratchID := ""
+	defer func() {
+		if err := c.cleanupDRScratch(ctx, scratchID, invocation); err != nil {
+			check = checkFailed(check, err)
+		}
+	}()
 
 	dump := staging + "/" + snap.Artifact
 	image := snap.Image
@@ -346,20 +373,21 @@ func (c *Client) validateEngineSnapshot(ctx context.Context, manifest *BundleMan
 		if user == "" {
 			user = "postgres"
 		}
-		if _, err := c.exec.Run(ctx, fmt.Sprintf(
-			"docker run -d --name %s -e POSTGRES_DB=%s -e POSTGRES_USER=%s -e POSTGRES_HOST_AUTH_METHOD=trust %s >/dev/null",
-			ssh.ShellQuote(scratch), ssh.ShellQuote(db), ssh.ShellQuote(user), ssh.ShellQuote(image))); err != nil {
+		scratchID, err = c.createDRScratch(ctx, scratch, invocation, fmt.Sprintf(
+			"docker run -d --name %s -e POSTGRES_DB=%s -e POSTGRES_USER=%s -e POSTGRES_HOST_AUTH_METHOD=trust %s",
+			ssh.ShellQuote(scratch), ssh.ShellQuote(db), ssh.ShellQuote(user), ssh.ShellQuote(image)), true)
+		if err != nil {
 			return checkFailed(check, fmt.Errorf("starting scratch postgres: %w", err))
 		}
-		if err := c.waitReady(ctx, scratch, fmt.Sprintf("pg_isready -U %s", ssh.ShellQuote(user)), 30); err != nil {
+		if err := c.waitReady(ctx, scratchID, fmt.Sprintf("pg_isready -U %s", ssh.ShellQuote(user)), 30); err != nil {
 			return checkFailed(check, err)
 		}
-		if _, err := c.exec.Run(ctx, postgresRestoreCmd(scratch, user, db, dump, staging+"/"+snap.Name+".sql")); err != nil {
+		if _, err := c.exec.Run(ctx, postgresRestoreCmd(scratchID, user, db, dump, staging+"/"+snap.Name+".sql")); err != nil {
 			return checkFailed(check, fmt.Errorf("restoring dump into scratch: %w", err))
 		}
 		out, err := c.exec.Run(ctx, fmt.Sprintf(
 			"docker exec %s psql -tA -U %s %s -c \"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='public'\"",
-			ssh.ShellQuote(scratch), ssh.ShellQuote(user), ssh.ShellQuote(db)))
+			ssh.ShellQuote(scratchID), ssh.ShellQuote(user), ssh.ShellQuote(db)))
 		if err != nil {
 			return checkFailed(check, fmt.Errorf("verify query: %w", err))
 		}
@@ -375,19 +403,27 @@ func (c *Client) validateEngineSnapshot(ctx context.Context, manifest *BundleMan
 
 	case "mysql", "mariadb":
 		db := snap.EngineParams["db"]
-		if _, err := c.exec.Run(ctx, fmt.Sprintf(
-			"docker run -d --name %s -e MYSQL_DATABASE=%s -e MYSQL_ALLOW_EMPTY_PASSWORD=yes %s >/dev/null",
-			ssh.ShellQuote(scratch), ssh.ShellQuote(db), ssh.ShellQuote(image))); err != nil {
+		client, _ := mysqlTools(snap.Engine)
+		envPrefix := "MYSQL"
+		emptyPassword := "MYSQL_ALLOW_EMPTY_PASSWORD"
+		if snap.Engine == "mariadb" {
+			envPrefix = "MARIADB"
+			emptyPassword = "MARIADB_ALLOW_EMPTY_ROOT_PASSWORD"
+		}
+		scratchID, err = c.createDRScratch(ctx, scratch, invocation, fmt.Sprintf(
+			"docker run -d --name %s -e "+envPrefix+"_DATABASE=%s -e "+emptyPassword+"=yes %s",
+			ssh.ShellQuote(scratch), ssh.ShellQuote(db), ssh.ShellQuote(image)), true)
+		if err != nil {
 			return checkFailed(check, fmt.Errorf("starting scratch mysql: %w", err))
 		}
-		if err := c.waitReady(ctx, scratch, "mysqladmin ping -u root --silent", 40); err != nil {
+		if err := c.waitReady(ctx, scratchID, mysqlReadyProbe(snap.Engine), 40); err != nil {
 			return checkFailed(check, err)
 		}
-		if _, err := c.exec.Run(ctx, mysqlRestoreCmd(scratch, db, "", dump, staging+"/"+snap.Name+".sql")); err != nil {
+		if err := c.restoreMySQL(ctx, snap.Engine, scratchID, db, "", dump, staging+"/"+snap.Name+".sql"); err != nil {
 			return checkFailed(check, fmt.Errorf("restoring dump into scratch: %w", err))
 		}
-		out, err := c.exec.Run(ctx, fmt.Sprintf("docker exec %s sh -c %s", ssh.ShellQuote(scratch),
-			ssh.ShellQuote(fmt.Sprintf("mysql -u root -N -e \"SHOW TABLES\" %s | wc -l", db))))
+		out, err := c.exec.Run(ctx, fmt.Sprintf("docker exec %s sh -c %s", ssh.ShellQuote(scratchID),
+			ssh.ShellQuote(fmt.Sprintf(client+" -u root -N -e \"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema=DATABASE()\" %s", ssh.ShellQuote(db)))))
 		if err != nil {
 			return checkFailed(check, fmt.Errorf("verify query: %w", err))
 		}
@@ -402,20 +438,21 @@ func (c *Client) validateEngineSnapshot(ctx context.Context, manifest *BundleMan
 		return check
 
 	case "mongo":
-		if _, err := c.exec.Run(ctx, fmt.Sprintf("docker run -d --name %s %s >/dev/null",
-			ssh.ShellQuote(scratch), ssh.ShellQuote(image))); err != nil {
+		scratchID, err = c.createDRScratch(ctx, scratch, invocation, fmt.Sprintf("docker run -d --name %s %s",
+			ssh.ShellQuote(scratch), ssh.ShellQuote(image)), true)
+		if err != nil {
 			return checkFailed(check, fmt.Errorf("starting scratch mongo: %w", err))
 		}
 		probe := "sh -c 'mongosh --quiet --eval 1 || mongo --quiet --eval 1'"
-		if err := c.waitReady(ctx, scratch, probe, 30); err != nil {
+		if err := c.waitReady(ctx, scratchID, probe, 30); err != nil {
 			return checkFailed(check, err)
 		}
-		if _, err := c.exec.Run(ctx, mongoRestoreCmd(scratch, dump)); err != nil {
+		if _, err := c.exec.Run(ctx, mongoRestoreCmd(scratchID, dump)); err != nil {
 			return checkFailed(check, fmt.Errorf("restoring dump into scratch: %w", err))
 		}
 		out, err := c.exec.Run(ctx, fmt.Sprintf(
 			"docker exec %s sh -c 'mongosh --quiet --eval \"db.getMongo().getDBNames().length\" || mongo --quiet --eval \"db.getMongo().getDBNames().length\"'",
-			ssh.ShellQuote(scratch)))
+			ssh.ShellQuote(scratchID)))
 		if err != nil {
 			return checkFailed(check, fmt.Errorf("verify query: %w", err))
 		}
@@ -428,16 +465,21 @@ func (c *Client) validateEngineSnapshot(ctx context.Context, manifest *BundleMan
 		// start it: redis boots FROM the backup, and a corrupt rdb fails the
 		// readiness probe (same shape as verify.go).
 		rdb := staging + "/" + snap.Name + ".rdb"
-		if _, err := c.exec.Run(ctx, fmt.Sprintf(
-			"gunzip -c %s > %s && docker create --name %s %s >/dev/null && docker cp %s %s:/data/dump.rdb && docker start %s >/dev/null",
-			ssh.ShellQuote(dump), ssh.ShellQuote(rdb), ssh.ShellQuote(scratch), ssh.ShellQuote(image),
-			ssh.ShellQuote(rdb), ssh.ShellQuote(scratch), ssh.ShellQuote(scratch))); err != nil {
-			return checkFailed(check, fmt.Errorf("seeding scratch redis: %w", err))
-		}
-		if err := c.waitReady(ctx, scratch, "redis-cli ping", 20); err != nil {
+		if _, err := c.exec.Run(ctx, "umask 077; gunzip -c "+ssh.ShellQuote(dump)+" > "+ssh.ShellQuote(rdb)); err != nil {
 			return checkFailed(check, err)
 		}
-		out, err := c.exec.Run(ctx, fmt.Sprintf("docker exec %s redis-cli dbsize", ssh.ShellQuote(scratch)))
+		scratchID, err = c.createDRScratch(ctx, scratch, invocation, "docker create --name "+ssh.ShellQuote(scratch)+" "+ssh.ShellQuote(image), false)
+		if err != nil {
+			return checkFailed(check, err)
+		}
+		if _, err := c.exec.Run(ctx, "docker cp "+ssh.ShellQuote(rdb)+" "+ssh.ShellQuote(scratchID+":/data/dump.rdb")+" && docker start "+ssh.ShellQuote(scratchID)); err != nil {
+			return checkFailed(check, err)
+		}
+
+		if err := c.waitReady(ctx, scratchID, "redis-cli ping", 20); err != nil {
+			return checkFailed(check, err)
+		}
+		out, err := c.exec.Run(ctx, fmt.Sprintf("docker exec %s redis-cli dbsize", ssh.ShellQuote(scratchID)))
 		if err != nil {
 			return checkFailed(check, fmt.Errorf("verify query: %w", err))
 		}
@@ -456,8 +498,8 @@ func (c *Client) validateEngineSnapshot(ctx context.Context, manifest *BundleMan
 // bundled env (when the operator included it) and reports whether it reaches
 // running state. It is isolated: no network alias, no published port, no
 // Caddy involvement — it can never receive production traffic.
-func (c *Client) appCheck(ctx context.Context, manifest *BundleManifest, opts BundleRestoreOptions, staging string) DRCheckResult {
-	check := DRCheckResult{Name: "app", Kind: "app"}
+func (c *Client) appCheck(ctx context.Context, manifest *BundleManifest, opts BundleRestoreOptions, staging string) (check DRCheckResult) {
+	check = DRCheckResult{Name: "app", Kind: "app"}
 
 	var appState state.AppState
 	if err := json.Unmarshal(manifest.State, &appState); err != nil {
@@ -474,9 +516,17 @@ func (c *Client) appCheck(ctx context.Context, manifest *BundleManifest, opts Bu
 		check.Detail = "bundle carries no deployed image reference — application check skipped (data checks still ran)"
 		return check
 	}
-	scratch := manifest.App + "-dr-appcheck"
-	c.exec.Run(ctx, "docker rm -f "+ssh.ShellQuote(scratch)+" >/dev/null 2>&1 || true")
-	defer c.exec.Run(context.WithoutCancel(ctx), "docker rm -f "+ssh.ShellQuote(scratch)+" >/dev/null 2>&1 || true")
+	invocation, err := drInvocationID()
+	if err != nil {
+		return checkFailed(check, err)
+	}
+	scratch := "teploy-dr-app-" + invocation
+	scratchID := ""
+	defer func() {
+		if err := c.cleanupDRScratch(ctx, scratchID, invocation); err != nil {
+			check = checkFailed(check, err)
+		}
+	}()
 
 	args := []string{"docker", "run", "-d", "--name", ssh.ShellQuote(scratch),
 		"--label", "teploy.app=" + manifest.App, "--label", "teploy.role=dr-appcheck"}
@@ -495,7 +545,8 @@ func (c *Client) appCheck(ctx context.Context, manifest *BundleManifest, opts Bu
 		args = append(args, ssh.ShellQuote(w))
 	}
 
-	if _, err := c.exec.Run(ctx, strings.Join(args, " ")); err != nil {
+	scratchID, err = c.createDRScratch(ctx, scratch, invocation, strings.Join(args, " "), true)
+	if err != nil {
 		// An unavailable image is a SKIP with the reason, not a silent
 		// pass: the operator sees exactly what was not proven.
 		if strings.Contains(err.Error(), "Unable to find image") || strings.Contains(err.Error(), "pull access denied") || strings.Contains(err.Error(), "not found") {
@@ -508,7 +559,7 @@ func (c *Client) appCheck(ctx context.Context, manifest *BundleManifest, opts Bu
 	// Bounded wait for "running": docker ps filtering by exact name.
 	waitCmd := fmt.Sprintf(
 		"for i in $(seq 1 15); do s=$(docker inspect -f '{{.State.Status}}' %s 2>/dev/null) && [ \"$s\" = running ] && exit 0; sleep 2; done; docker logs --tail 20 %s >&2; exit 1",
-		ssh.ShellQuote(scratch), ssh.ShellQuote(scratch))
+		ssh.ShellQuote(scratchID), ssh.ShellQuote(scratchID))
 	if _, err := c.exec.Run(ctx, waitCmd); err != nil {
 		return checkFailed(check, fmt.Errorf("app container never reached running state: %w", err))
 	}
@@ -560,6 +611,25 @@ func (c *Client) CutoverBundle(ctx context.Context, opts BundleRestoreOptions) (
 	if err := json.Unmarshal(receiptData, &receipt); err != nil {
 		return nil, fmt.Errorf("parsing the staged restore receipt: %w", err)
 	}
+	if receipt.SchemaVersion != RestoreReceiptSchemaVersion || !drInvocationRE.MatchString(receipt.InvocationID) || receipt.StagingPath != staging+"/"+receipt.InvocationID {
+		return nil, fmt.Errorf("restore receipt lacks private invocation identity; re-restore before cutover")
+	}
+	staging = receipt.StagingPath
+	immutableReceipt, present, err := state.ReadRemoteFile(ctx, c.exec, staging+"/receipt.json")
+	if err != nil || !present {
+		return nil, fmt.Errorf("private invocation receipt unavailable: %v", err)
+	}
+	var selected RestoreReceipt
+	if err := json.Unmarshal(immutableReceipt, &selected); err != nil {
+		return nil, err
+	}
+	{ // compare canonical records, including checks
+		left, _ := json.Marshal(receipt)
+		right, _ := json.Marshal(selected)
+		if string(left) != string(right) {
+			return nil, fmt.Errorf("selected invocation receipt changed; re-restore")
+		}
+	}
 	if !receipt.OK {
 		return nil, fmt.Errorf("the staged restore for bundle %s FAILED validation — cutover refused; inspect %s or re-run teploy dr restore", opts.ID, staging)
 	}
@@ -571,6 +641,12 @@ func (c *Client) CutoverBundle(ctx context.Context, opts BundleRestoreOptions) (
 	manifest, err := ParseBundleManifest(manifestData)
 	if err != nil {
 		return nil, err
+	}
+	if receipt.BundleID != opts.ID || receipt.App != opts.App || receipt.ManifestSHA256 == "" || receipt.ManifestSHA256 != bundleManifestDigest(manifest) {
+		return nil, fmt.Errorf("validated receipt does not bind this staged manifest; run teploy dr restore again before cutover")
+	}
+	if manifest.ID != opts.ID {
+		return nil, fmt.Errorf("staged bundle id does not match requested cutover")
 	}
 	if manifest.App != opts.App {
 		return nil, fmt.Errorf("staged bundle belongs to app %q, not %q", manifest.App, opts.App)
@@ -608,6 +684,40 @@ func (c *Client) CutoverBundle(ctx context.Context, opts BundleRestoreOptions) (
 		return nil, fmt.Errorf("acquiring the app lock for cutover: %w", err)
 	}
 	defer state.ReleaseLockFenced(c.exec, lk, opts.App)
+	lk.StartRenewal(c.exec)
+	current, err := state.Read(ctx, c.exec, opts.App)
+	if err != nil {
+		return nil, err
+	}
+	baseGeneration, err := state.ReadCommittedGeneration(ctx, c.exec, opts.App)
+	if err != nil {
+		return nil, err
+	}
+	if current != nil && current.Generation > baseGeneration {
+		baseGeneration = current.Generation
+	}
+	if baseGeneration == ^uint64(0) {
+		return nil, fmt.Errorf("target generation exhausted")
+	}
+	dk := docker.NewClient(&state.FencedExecutor{Executor: c.exec, Lock: lk})
+	for name, permission := range opts.Config.VolumeOwnership {
+		if err := dk.ValidateManagedVolume(ctx, opts.App, "", name, permission); err != nil {
+			return nil, err
+		}
+	}
+	for accessory, cfg := range opts.Config.Accessories {
+		for name, permission := range cfg.VolumeOwnership {
+			if err := dk.ValidateManagedVolume(ctx, opts.App, accessory, name, permission); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if err := c.ensureBundleAgeKey(ctx, manifest, staging); err != nil {
+		return nil, err
+	}
+	if err := c.decryptProof(ctx, manifest, staging); err != nil {
+		return nil, err
+	}
 
 	// Stop live containers (web + accessories). They are STOPPED, not
 	// removed — an aborted cutover restarts them.
@@ -622,11 +732,11 @@ func (c *Client) CutoverBundle(ctx context.Context, opts BundleRestoreOptions) (
 			continue
 		}
 		fmt.Fprintf(c.out, "Stopping %s...\n", n)
-		if _, err := c.exec.Run(ctx, "docker stop "+ssh.ShellQuote(n)); err != nil {
-			c.restartContainers(context.WithoutCancel(ctx), stopped)
-			return nil, fmt.Errorf("stopping %s for cutover (it was left as-is): %w", n, err)
-		}
 		stopped = append(stopped, n)
+		if _, err := c.exec.Run(ctx, "docker stop "+ssh.ShellQuote(n)); err != nil {
+			restartErr := c.restartContainers(context.WithoutCancel(ctx), stopped)
+			return nil, errors.Join(fmt.Errorf("stopping %s for cutover: %w; recovery restart attempted", n, err), restartErr)
+		}
 	}
 	out.Stopped = stopped
 
@@ -635,9 +745,12 @@ func (c *Client) CutoverBundle(ctx context.Context, opts BundleRestoreOptions) (
 		// state is not left dark; staged data and recovery dirs are KEPT
 		// and named. If a promotion already happened for some path, the
 		// receipt lists it and the error says exactly where originals are.
-		c.restartContainers(context.WithoutCancel(ctx), stopped)
-		writeReceipt(context.WithoutCancel(ctx), c.exec, staging+"/cutover-receipt.json", out)
-		return out, fmt.Errorf("%w — staged data kept at %s, pre-cutover originals kept in %v; stopped containers were restarted", err, staging, out.RecoveryDirs)
+		if state.PreservePublishedState(err) {
+			return out, fmt.Errorf("cutover state publication needs reconciliation; workload preserved: %w", err)
+		}
+		restartErr := c.restartContainers(context.WithoutCancel(ctx), stopped)
+		receiptErr := writeReceipt(context.WithoutCancel(ctx), c.exec, staging+"/cutover-receipt.json", out)
+		return out, fmt.Errorf("%w — staged data kept at %s, originals kept in %v; recovery restart attempted", errors.Join(err, restartErr, receiptErr), staging, out.RecoveryDirs)
 	}
 
 	// Engine-dump accessories first: their data lands through the engine,
@@ -702,7 +815,7 @@ func (c *Client) CutoverBundle(ctx context.Context, opts BundleRestoreOptions) (
 		}
 
 		// Start the accessory from config (fresh dirs), then pipe the dump.
-		mgr := accessories.NewManager(c.exec, c.out)
+		mgr := accessories.NewManager(&state.FencedExecutor{Executor: c.exec, Lock: lk}, c.out)
 		env, err := mgr.EnsureRunning(ctx, opts.App, snap.Name, accCfg)
 		if err != nil {
 			return fail(fmt.Errorf("starting accessory %s for cutover: %w", snap.Name, err))
@@ -720,10 +833,10 @@ func (c *Client) CutoverBundle(ctx context.Context, opts BundleRestoreOptions) (
 			}
 		case "mysql", "mariadb":
 			db := mysqlDB(opts.App, engineEnv(snap, env, accCfg))
-			if err := c.waitReady(ctx, container, "mysqladmin ping -u root --silent", 40); err != nil {
+			if err := c.waitReady(ctx, container, mysqlReadyProbe(snap.Engine), 40); err != nil {
 				restoreErr = err
 			} else {
-				_, restoreErr = c.exec.Run(ctx, mysqlRestoreCmd(container, db, mysqlRootPassword(engineEnv(snap, env, accCfg)), dump, staging+"/"+snap.Name+".cutover.sql"))
+				restoreErr = c.restoreMySQL(ctx, snap.Engine, container, db, mysqlRootPassword(engineEnv(snap, env, accCfg)), dump, staging+"/"+snap.Name+".cutover.sql")
 			}
 		case "mongo":
 			_, restoreErr = c.exec.Run(ctx, mongoRestoreCmd(container, dump))
@@ -776,12 +889,15 @@ func (c *Client) CutoverBundle(ctx context.Context, opts BundleRestoreOptions) (
 	// State, release records, and secret material land LAST — after all
 	// data promotions succeeded, so a failed promotion never leaves the
 	// target claiming a generation it does not have.
-	if err := c.installBundleState(ctx, manifest, staging); err != nil {
+	if err := c.installBundleState(ctx, manifest, staging, lk, baseGeneration); err != nil {
 		return fail(fmt.Errorf("installing restored state: %w", err))
 	}
 
 	out.CompletedAt = timeNow(opts.Now).UTC()
-	writeReceipt(ctx, c.exec, staging+"/cutover-receipt.json", out)
+	out.OK = true
+	if err := writeReceipt(ctx, c.exec, staging+"/cutover-receipt.json", out); err != nil {
+		return out, fmt.Errorf("cutover completed but receipt could not be persisted: %w", err)
+	}
 	fmt.Fprintf(c.out, "Cutover complete. Pre-cutover originals kept in %v\n", out.RecoveryDirs)
 	fmt.Fprintf(c.out, "Next: %s\n", out.NextStep)
 	return out, nil
@@ -832,6 +948,13 @@ func engineEnv(snap SnapshotRecord, liveEnv map[string]string, cfg config.Access
 	for k, v := range liveEnv {
 		merged[k] = v // resolved values (auto passwords, DATABASE_URL) win
 	}
+	// env_literal values are the operator's exact bytes: they win over both,
+	// exactly as the accessory container itself applies them (a MariaDB root
+	// password with directive-looking bytes can only be declared literally,
+	// and restoring its dump without it would authenticate as nobody).
+	for k, v := range cfg.EnvLiteral {
+		merged[k] = v
+	}
 	if p := snap.EngineParams; p != nil {
 		if db := p["db"]; db != "" && merged["POSTGRES_DB"] == "" && merged["MYSQL_DATABASE"] == "" {
 			switch snap.Engine {
@@ -847,13 +970,10 @@ func engineEnv(snap SnapshotRecord, liveEnv map[string]string, cfg config.Access
 
 // installBundleState writes the bundle's state.json, release records and
 // secret material into /deployments/<app> — atomically per file, 0600.
-func (c *Client) installBundleState(ctx context.Context, manifest *BundleManifest, staging string) error {
+func (c *Client) installBundleState(ctx context.Context, manifest *BundleManifest, staging string, lk *state.Lock, baseGeneration uint64) error {
 	appDir := fmt.Sprintf("%s/%s", deploymentsDir, manifest.App)
 	if _, err := c.exec.Run(ctx, "mkdir -p "+ssh.ShellQuote(appDir+"/meta")+" "+ssh.ShellQuote(appDir+"/secrets")); err != nil {
 		return fmt.Errorf("preparing state dirs: %w", err)
-	}
-	if err := c.exec.Upload(ctx, strings.NewReader(string(manifest.State)+"\n"), appDir+"/state.json", "0600"); err != nil {
-		return fmt.Errorf("writing restored state.json: %w", err)
 	}
 	for _, rec := range manifest.ReleaseRecords {
 		var r struct {
@@ -897,13 +1017,24 @@ func (c *Client) installBundleState(ctx context.Context, manifest *BundleManifes
 				return fmt.Errorf("checking the target age key: %w", err)
 			}
 			if !hasKey {
-				if _, err := c.exec.Run(ctx, fmt.Sprintf("cp -p %s %s && chmod 600 %s",
-					ssh.ShellQuote(staging+"/age-key"), ssh.ShellQuote(deploymentsDir+"/.age-key"), ssh.ShellQuote(deploymentsDir+"/.age-key"))); err != nil {
+				if _, err := c.exec.Run(ctx, fmt.Sprintf("umask 077; tmp=$(mktemp /deployments/.age-key.XXXXXXXX) || exit 1; trap 'rm -f -- \"$tmp\"' EXIT; cp %s \"$tmp\" && chmod 600 \"$tmp\" && ln \"$tmp\" %s",
+					ssh.ShellQuote(staging+"/age-key"), ssh.ShellQuote(deploymentsDir+"/.age-key"))); err != nil {
 					return fmt.Errorf("installing the bundled age key: %w", err)
 				}
 			}
 		}
 	}
+	var restored state.AppState
+	if err := json.Unmarshal(manifest.State, &restored); err != nil {
+		return err
+	}
+	restored.Generation = baseGeneration + 1
+	restored.OperationID = "dr-cutover-" + manifest.ID
+	restored.UpdatedAt = time.Now().UTC()
+	if err := state.WriteFencedGeneration(ctx, c.exec, manifest.App, &restored, lk, baseGeneration); err != nil {
+		return fmt.Errorf("publishing restored state as target generation %d: %w", restored.Generation, err)
+	}
+
 	return nil
 }
 
@@ -911,16 +1042,17 @@ func (c *Client) failReceipt(ctx context.Context, receipt *RestoreReceipt, err e
 	receipt.Checks = append(receipt.Checks, DRCheckResult{Name: "restore", Kind: "data", Status: "fail", Detail: err.Error()})
 	receipt.ValidatedAt = time.Now().UTC()
 	receipt.OK = false
-	writeReceipt(context.WithoutCancel(ctx), c.exec, receipt.StagingPath+"/receipt.json", receipt)
-	return err
+	return errors.Join(err, writeReceipt(context.WithoutCancel(ctx), c.exec, receipt.StagingPath+"/receipt.json", receipt))
 }
 
-func writeReceipt(ctx context.Context, exec ssh.Executor, path string, v any) {
+func writeReceipt(ctx context.Context, exec ssh.Executor, path string, v any) error {
 	data, err := json.MarshalIndent(v, "", "  ")
 	if err != nil {
-		return
+		return err
 	}
-	_ = exec.Upload(context.WithoutCancel(ctx), strings.NewReader(string(data)+"\n"), path, "0600")
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+	return exec.Upload(ctx, strings.NewReader(string(data)+"\n"), path, "0600")
 }
 
 func allPassed(checks []DRCheckResult) bool {
@@ -954,4 +1086,76 @@ func timeNow(f func() time.Time) time.Time {
 		return f()
 	}
 	return time.Now()
+}
+
+// Publish a missing bundled key before stopping workloads, without replacing
+// an existing global key used by another app. A concurrent publisher causes a
+// refusal before cutover; retry then proves ciphertext with the surviving key.
+func (c *Client) ensureBundleAgeKey(ctx context.Context, manifest *BundleManifest, staging string) error {
+	if manifest.Secrets.Mode != "encrypted" || !manifest.Secrets.AgeKeyIncluded {
+		return nil
+	}
+	hasKey, err := c.remoteExists(ctx, deploymentsDir+"/.age-key")
+	if err != nil {
+		return err
+	}
+	if hasKey {
+		return nil
+	}
+	cmd := fmt.Sprintf("umask 077; tmp=$(mktemp /deployments/.age-key.XXXXXXXX) || exit 1; trap 'rm -f -- \"$tmp\"' EXIT; cp %s \"$tmp\" && chmod 600 \"$tmp\" && ln \"$tmp\" %s", ssh.ShellQuote(staging+"/age-key"), ssh.ShellQuote(deploymentsDir+"/.age-key"))
+	if _, err := c.exec.Run(ctx, cmd); err != nil {
+		return fmt.Errorf("publishing bundled age key without overwriting an existing key: %w", err)
+	}
+	return nil
+}
+
+func bundleManifestDigest(manifest *BundleManifest) string {
+	data, err := json.Marshal(manifest)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(data)
+	return fmt.Sprintf("%x", sum[:])
+}
+
+var drInvocationRE = regexp.MustCompile(`^[0-9a-f]{32}$`)
+var drContainerIDRE = regexp.MustCompile(`^[0-9a-f]{64}$`)
+
+func drInvocationID() (string, error) {
+	var nonce [16]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(nonce[:]), nil
+}
+func (c *Client) createDRScratch(ctx context.Context, name, owner, command string, start bool) (string, error) {
+	command = strings.Replace(command, "docker run -d", "docker create", 1)
+	command = strings.TrimSuffix(command, " >/dev/null")
+	nameFlag := "--name " + ssh.ShellQuote(name)
+	command = strings.Replace(command, nameFlag, nameFlag+" --label "+ssh.ShellQuote("teploy.dr-owner="+owner)+" --label teploy.role=dr-check", 1)
+	output, err := c.exec.Run(ctx, command)
+	if err != nil {
+		return "", fmt.Errorf("scratch create outcome unknown (name %s, owner %s); no incumbent removed: %w", name, owner, err)
+	}
+	id := strings.TrimSpace(output)
+	if !drContainerIDRE.MatchString(id) {
+		return "", fmt.Errorf("scratch create returned no immutable ID (%s); inspect owner %s", name, owner)
+	}
+	if start {
+		_, err = c.exec.Run(ctx, "docker start "+ssh.ShellQuote(id))
+	}
+	return id, err
+}
+func (c *Client) cleanupDRScratch(ctx context.Context, id, owner string) error {
+	if id == "" {
+		return nil
+	}
+	cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	actual, err := c.exec.Run(cleanup, "docker inspect -f '{{index .Config.Labels \"teploy.dr-owner\"}}' "+ssh.ShellQuote(id))
+	if err != nil || strings.TrimSpace(actual) != owner {
+		return fmt.Errorf("scratch ownership unproven for %s; cleanup withheld: %v", id, err)
+	}
+	_, err = c.exec.Run(cleanup, "docker rm -f "+ssh.ShellQuote(id))
+	return err
 }

@@ -74,6 +74,16 @@ func LoadServers(path string) (*ServersConfig, error) {
 // ResolveServer looks up a server by name or treats the input as a raw host.
 // Priority: flags → env vars → servers.yml.
 func ResolveServer(name string, flagHost, flagUser, flagKey string) (host, user, keyPath string, err error) {
+	defer func() {
+		if err == nil {
+			if flagUser != "" {
+				user = flagUser
+			}
+			if flagKey != "" {
+				keyPath = flagKey
+			}
+		}
+	}()
 	// 1. Flags override everything
 	if flagHost != "" {
 		// A --host value that names a servers.yml entry resolves to that

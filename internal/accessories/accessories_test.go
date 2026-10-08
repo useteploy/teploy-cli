@@ -11,8 +11,20 @@ import (
 	"github.com/useteploy/teploy/internal/ssh"
 )
 
+// admissionStubs registers the remote surface every unfenced EnsureRunning
+// and Upgrade now walks before any accessory effect: the descriptor-based
+// managed-directory admission (R2-06) and the fenced app lock's mkdir
+// (F16). The lock info upload and the guarded release are modeled by the
+// mock's file state, so only these two registrations are test plumbing.
+func admissionStubs(app string) []ssh.MockCommand {
+	return []ssh.MockCommand{
+		ssh.MockCommand{Match: "teploy_volume_actor", Output: ""},
+		ssh.MockCommand{Match: "mkdir /deployments/" + app + "/.lock", Output: ""},
+	}
+}
+
 func TestEnsureRunning_New(t *testing.T) {
-	mock := ssh.NewMockExecutor("1.2.3.4",
+	mock := ssh.NewMockExecutor("1.2.3.4", append(admissionStubs("myapp"),
 		// No stored credentials.
 		ssh.MockCommand{Match: "if [ ! -e ", Output: "absent"},
 		// Not running.
@@ -21,7 +33,7 @@ func TestEnsureRunning_New(t *testing.T) {
 		ssh.MockCommand{Match: "mkdir -p /deployments/myapp/accessories/postgres", Output: ""},
 		// Start container.
 		ssh.MockCommand{Match: "docker run", Output: "abc123"},
-	)
+	)...)
 
 	var buf bytes.Buffer
 	mgr := NewManager(mock, &buf)
@@ -129,7 +141,7 @@ func TestEnsureRunning_New(t *testing.T) {
 }
 
 func TestEnsureRunning_ReconcilesFreshVolumeOwnership(t *testing.T) {
-	mock := ssh.NewMockExecutor("1.2.3.4",
+	mock := ssh.NewMockExecutor("1.2.3.4", append(admissionStubs("myapp"),
 		ssh.MockCommand{Match: "if [ ! -e ", Output: "absent"},
 		ssh.MockCommand{Match: "docker inspect", Err: fmt.Errorf("not found")},
 		ssh.MockCommand{Match: "mkdir -p /deployments/myapp/accessories/nucleus", Output: ""},
@@ -138,7 +150,7 @@ func TestEnsureRunning_ReconcilesFreshVolumeOwnership(t *testing.T) {
 		ssh.MockCommand{Match: "stat -c '%u' '/deployments/myapp/accessories/nucleus/data'", Output: "1000\n"},
 		ssh.MockCommand{Match: "docker run --rm --user 0 --entrypoint chown", Output: ""},
 		ssh.MockCommand{Match: "docker run", Output: "abc123"},
-	)
+	)...)
 
 	var buf bytes.Buffer
 	mgr := NewManager(mock, &buf)
@@ -152,11 +164,13 @@ func TestEnsureRunning_ReconcilesFreshVolumeOwnership(t *testing.T) {
 		t.Fatalf("EnsureRunning: %v", err)
 	}
 
-	var mkdir, chown, run int = -1, -1, -1
+	// The volume directory is created by the descriptor-based provision
+	// (R2-06), which must still precede the ownership reconcile.
+	var provision, chown, run int = -1, -1, -1
 	for i, call := range mock.Calls {
 		switch {
-		case call == "mkdir -p /deployments/myapp/accessories/nucleus/data":
-			mkdir = i
+		case strings.HasPrefix(call, "teploy_volume_actor=") && strings.Contains(call, "'/deployments/myapp/accessories/nucleus/data' provision"):
+			provision = i
 		case strings.HasPrefix(call, "docker run --rm --user 0 --entrypoint chown"):
 			chown = i
 			if !strings.Contains(call, "'/deployments/myapp/accessories/nucleus/data:/teploy-data'") || !strings.Contains(call, "-R 10001:10001 /teploy-data") {
@@ -166,11 +180,11 @@ func TestEnsureRunning_ReconcilesFreshVolumeOwnership(t *testing.T) {
 			run = i
 		}
 	}
-	if mkdir < 0 || chown < 0 || run < 0 {
-		t.Fatalf("expected mkdir, chown and run calls, got: %v", mock.Calls)
+	if provision < 0 || chown < 0 || run < 0 {
+		t.Fatalf("expected volume provision, chown and run calls, got: %v", mock.Calls)
 	}
-	if !(mkdir < chown && chown < run) {
-		t.Errorf("expected volume mkdir, then chown, then the accessory start; got order mkdir=%d chown=%d run=%d", mkdir, chown, run)
+	if !(provision < chown && chown < run) {
+		t.Errorf("expected volume provision, then chown, then the accessory start; got order provision=%d chown=%d run=%d", provision, chown, run)
 	}
 	if !strings.Contains(buf.String(), "is owned by uid 1000 — reconciling") {
 		t.Errorf("expected reconcile message, got: %s", buf.String())
@@ -178,13 +192,13 @@ func TestEnsureRunning_ReconcilesFreshVolumeOwnership(t *testing.T) {
 }
 
 func TestEnsureRunning_AlreadyRunning(t *testing.T) {
-	mock := ssh.NewMockExecutor("1.2.3.4",
+	mock := ssh.NewMockExecutor("1.2.3.4", append(admissionStubs("myapp"),
 		// Stored credentials exist (needed for connection string).
 		ssh.MockCommand{Match: "if [ ! -e ", Output: "present"},
 		ssh.MockCommand{Match: "cat -- ", Output: "POSTGRES_PASSWORD=existingpass123\n"},
 		// Already running.
 		ssh.MockCommand{Match: "docker inspect", Output: "running"},
-	)
+	)...)
 
 	var buf bytes.Buffer
 	mgr := NewManager(mock, &buf)
@@ -219,7 +233,7 @@ func TestEnsureRunning_AlreadyRunning(t *testing.T) {
 }
 
 func TestEnsureRunning_StoredCredentials(t *testing.T) {
-	mock := ssh.NewMockExecutor("1.2.3.4",
+	mock := ssh.NewMockExecutor("1.2.3.4", append(admissionStubs("myapp"),
 		// Stored credentials exist.
 		ssh.MockCommand{Match: "if [ ! -e ", Output: "present"},
 		ssh.MockCommand{Match: "cat -- ", Output: "POSTGRES_PASSWORD=storedpass456\n"},
@@ -229,7 +243,7 @@ func TestEnsureRunning_StoredCredentials(t *testing.T) {
 		ssh.MockCommand{Match: "mkdir -p", Output: ""},
 		// Start container.
 		ssh.MockCommand{Match: "docker run", Output: "def456"},
-	)
+	)...)
 
 	var buf bytes.Buffer
 	mgr := NewManager(mock, &buf)
@@ -259,14 +273,14 @@ func TestEnsureRunning_StoredCredentials(t *testing.T) {
 }
 
 func TestEnsureRunning_NoEnv(t *testing.T) {
-	mock := ssh.NewMockExecutor("1.2.3.4",
+	mock := ssh.NewMockExecutor("1.2.3.4", append(admissionStubs("myapp"),
 		// Not running.
 		ssh.MockCommand{Match: "docker inspect", Err: fmt.Errorf("not found")},
 		// Create directory.
 		ssh.MockCommand{Match: "mkdir -p", Output: ""},
 		// Start container.
 		ssh.MockCommand{Match: "docker run", Output: "ghi789"},
-	)
+	)...)
 
 	var buf bytes.Buffer
 	mgr := NewManager(mock, &buf)
@@ -389,7 +403,7 @@ func TestLogs(t *testing.T) {
 }
 
 func TestUpgrade(t *testing.T) {
-	mock := ssh.NewMockExecutor("1.2.3.4",
+	mock := ssh.NewMockExecutor("1.2.3.4", append(admissionStubs("myapp"),
 		// Pull new image.
 		ssh.MockCommand{Match: "docker pull", Output: ""},
 		// Stop old container.
@@ -404,7 +418,7 @@ func TestUpgrade(t *testing.T) {
 		ssh.MockCommand{Match: "mkdir -p", Output: ""},
 		// EnsureRunning: start new container.
 		ssh.MockCommand{Match: "docker run", Output: "new123"},
-	)
+	)...)
 
 	var buf bytes.Buffer
 	mgr := NewManager(mock, &buf)
@@ -423,9 +437,15 @@ func TestUpgrade(t *testing.T) {
 		t.Fatalf("Upgrade: %v", err)
 	}
 
-	// Verify pull was called with new image.
-	if !strings.Contains(mock.Calls[0], "docker pull 'postgres:17'") {
-		t.Errorf("expected pull of postgres:17, got: %s", mock.Calls[0])
+	// Verify pull was called with new image (after the admission surface).
+	var pullCmd string
+	for _, call := range mock.Calls {
+		if strings.HasPrefix(call, "docker pull") {
+			pullCmd = call
+		}
+	}
+	if !strings.Contains(pullCmd, "docker pull 'postgres:17'") {
+		t.Errorf("expected pull of postgres:17, got: %s", pullCmd)
 	}
 
 	// Verify new container uses new image.
@@ -627,7 +647,7 @@ func TestIsImageType(t *testing.T) {
 }
 
 func TestEnsureRunning_SecretReference(t *testing.T) {
-	mock := ssh.NewMockExecutor("1.2.3.4",
+	mock := ssh.NewMockExecutor("1.2.3.4", append(admissionStubs("myapp"),
 		// No stored credentials (first test -f), then the secret EXISTS
 		// (second test -f) and decrypts.
 		ssh.MockCommand{Match: "if [ ! -e ", Output: "absent", Once: true},
@@ -637,7 +657,7 @@ func TestEnsureRunning_SecretReference(t *testing.T) {
 		ssh.MockCommand{Match: "docker inspect", Err: fmt.Errorf("not found")},
 		ssh.MockCommand{Match: "mkdir -p /deployments/myapp/accessories/nucleus", Output: ""},
 		ssh.MockCommand{Match: "docker run", Output: "abc123"},
-	)
+	)...)
 
 	var buf bytes.Buffer
 	mgr := NewManager(mock, &buf)
@@ -688,11 +708,11 @@ func TestEnsureRunning_SecretReference(t *testing.T) {
 }
 
 func TestEnsureRunning_SecretReferenceMissing(t *testing.T) {
-	mock := ssh.NewMockExecutor("1.2.3.4",
+	mock := ssh.NewMockExecutor("1.2.3.4", append(admissionStubs("myapp"),
 		ssh.MockCommand{Match: "if [ ! -e ", Output: "absent"},
 		// Secret file does not exist.
 		ssh.MockCommand{Match: "if [ ! -e  /deployments/myapp/secrets/NUCLEUS_PASSWORD.age", Output: "absent"},
-	)
+	)...)
 
 	var buf bytes.Buffer
 	mgr := NewManager(mock, &buf)
@@ -716,9 +736,9 @@ func TestEnsureRunning_SecretReferenceMissing(t *testing.T) {
 }
 
 func TestEnsureRunning_SecretReferenceEmptyKey(t *testing.T) {
-	mock := ssh.NewMockExecutor("1.2.3.4",
+	mock := ssh.NewMockExecutor("1.2.3.4", append(admissionStubs("myapp"),
 		ssh.MockCommand{Match: "if [ ! -e ", Output: "absent"},
-	)
+	)...)
 	var buf bytes.Buffer
 	mgr := NewManager(mock, &buf)
 	_, err := mgr.EnsureRunning(context.Background(), "myapp", "nucleus", config.AccessoryConfig{
@@ -734,11 +754,11 @@ func TestEnsureRunning_SecretReferenceEmptyKey(t *testing.T) {
 // containers down with it — an engine's own advisory memory budget does not
 // prevent that. These cover the limits actually reaching docker run.
 func TestEnsureRunning_ResourceLimits(t *testing.T) {
-	mock := ssh.NewMockExecutor("1.2.3.4",
+	mock := ssh.NewMockExecutor("1.2.3.4", append(admissionStubs("myapp"),
 		ssh.MockCommand{Match: "docker inspect", Err: fmt.Errorf("not found")},
 		ssh.MockCommand{Match: "mkdir -p", Output: ""},
 		ssh.MockCommand{Match: "docker run", Output: "abc123"},
-	)
+	)...)
 	var buf bytes.Buffer
 	mgr := NewManager(mock, &buf)
 
@@ -766,11 +786,11 @@ func TestEnsureRunning_ResourceLimits(t *testing.T) {
 }
 
 func TestEnsureRunning_NoLimitsWhenUnset(t *testing.T) {
-	mock := ssh.NewMockExecutor("1.2.3.4",
+	mock := ssh.NewMockExecutor("1.2.3.4", append(admissionStubs("myapp"),
 		ssh.MockCommand{Match: "docker inspect", Err: fmt.Errorf("not found")},
 		ssh.MockCommand{Match: "mkdir -p", Output: ""},
 		ssh.MockCommand{Match: "docker run", Output: "abc123"},
-	)
+	)...)
 	var buf bytes.Buffer
 	mgr := NewManager(mock, &buf)
 
@@ -790,11 +810,11 @@ func TestEnsureRunning_NoLimitsWhenUnset(t *testing.T) {
 // already up does nothing until it is recreated. Silence there would leave the
 // operator believing in a cap that does not exist.
 func TestEnsureRunning_WarnsWhenRunningContainerLacksLimit(t *testing.T) {
-	mock := ssh.NewMockExecutor("1.2.3.4",
+	mock := ssh.NewMockExecutor("1.2.3.4", append(admissionStubs("myapp"),
 		ssh.MockCommand{Match: "docker inspect -f '{{.State.Status}}'", Output: "running"},
 		// HostConfig.Memory / NanoCpus: both unset on the running container.
 		ssh.MockCommand{Match: "docker inspect -f '{{.HostConfig.Memory}}", Output: "0 0"},
-	)
+	)...)
 	var buf bytes.Buffer
 	mgr := NewManager(mock, &buf)
 
@@ -814,10 +834,10 @@ func TestEnsureRunning_WarnsWhenRunningContainerLacksLimit(t *testing.T) {
 }
 
 func TestEnsureRunning_NoWarningWhenLimitAlreadyApplied(t *testing.T) {
-	mock := ssh.NewMockExecutor("1.2.3.4",
+	mock := ssh.NewMockExecutor("1.2.3.4", append(admissionStubs("myapp"),
 		ssh.MockCommand{Match: "docker inspect -f '{{.State.Status}}'", Output: "running"},
 		ssh.MockCommand{Match: "docker inspect -f '{{.HostConfig.Memory}}", Output: "8589934592 0"},
-	)
+	)...)
 	var buf bytes.Buffer
 	mgr := NewManager(mock, &buf)
 
@@ -836,7 +856,7 @@ func TestEnsureRunning_NoWarningWhenLimitAlreadyApplied(t *testing.T) {
 // root to 10001) leaves the data dir owned by the old user, and the upgraded
 // container crash-loops on a permission error that names nothing useful.
 func TestUpgrade_ReconcilesDataOwnershipOnUIDChange(t *testing.T) {
-	mock := ssh.NewMockExecutor("1.2.3.4",
+	mock := ssh.NewMockExecutor("1.2.3.4", append(admissionStubs("ship"),
 		ssh.MockCommand{Match: "docker pull", Output: ""},
 		ssh.MockCommand{Match: "docker stop", Output: ""},
 		ssh.MockCommand{Match: "docker rm", Output: ""},
@@ -847,7 +867,7 @@ func TestUpgrade_ReconcilesDataOwnershipOnUIDChange(t *testing.T) {
 		ssh.MockCommand{Match: "docker inspect", Err: fmt.Errorf("not found")},
 		ssh.MockCommand{Match: "mkdir -p", Output: ""},
 		ssh.MockCommand{Match: "docker run", Output: "abc123"},
-	)
+	)...)
 	var buf bytes.Buffer
 	mgr := NewManager(mock, &buf)
 
@@ -874,7 +894,7 @@ func TestUpgrade_ReconcilesDataOwnershipOnUIDChange(t *testing.T) {
 }
 
 func TestUpgrade_LeavesOwnershipAloneWhenUIDMatches(t *testing.T) {
-	mock := ssh.NewMockExecutor("1.2.3.4",
+	mock := ssh.NewMockExecutor("1.2.3.4", append(admissionStubs("ship"),
 		ssh.MockCommand{Match: "docker pull", Output: ""},
 		ssh.MockCommand{Match: "docker stop", Output: ""},
 		ssh.MockCommand{Match: "docker rm", Output: ""},
@@ -883,7 +903,7 @@ func TestUpgrade_LeavesOwnershipAloneWhenUIDMatches(t *testing.T) {
 		ssh.MockCommand{Match: "docker inspect", Err: fmt.Errorf("not found")},
 		ssh.MockCommand{Match: "mkdir -p", Output: ""},
 		ssh.MockCommand{Match: "docker run", Output: "abc123"},
-	)
+	)...)
 	var buf bytes.Buffer
 	mgr := NewManager(mock, &buf)
 
@@ -901,7 +921,7 @@ func TestUpgrade_LeavesOwnershipAloneWhenUIDMatches(t *testing.T) {
 // A root-running image must not trigger a chown — that would be teploy
 // rewriting ownership on every upgrade of an ordinary image.
 func TestUpgrade_SkipsReconcileForRootImage(t *testing.T) {
-	mock := ssh.NewMockExecutor("1.2.3.4",
+	mock := ssh.NewMockExecutor("1.2.3.4", append(admissionStubs("myapp"),
 		ssh.MockCommand{Match: "docker pull", Output: ""},
 		ssh.MockCommand{Match: "docker stop", Output: ""},
 		ssh.MockCommand{Match: "docker rm", Output: ""},
@@ -909,7 +929,7 @@ func TestUpgrade_SkipsReconcileForRootImage(t *testing.T) {
 		ssh.MockCommand{Match: "docker inspect", Err: fmt.Errorf("not found")},
 		ssh.MockCommand{Match: "mkdir -p", Output: ""},
 		ssh.MockCommand{Match: "docker run", Output: "abc123"},
-	)
+	)...)
 	var buf bytes.Buffer
 	mgr := NewManager(mock, &buf)
 
@@ -929,12 +949,12 @@ func TestUpgrade_SkipsReconcileForRootImage(t *testing.T) {
 // surfaced a raw daemon error naming no accessory. Recreate it instead — the
 // data is on a bind mount, so the container is disposable.
 func TestEnsureRunning_RecreatesStoppedContainer(t *testing.T) {
-	mock := ssh.NewMockExecutor("1.2.3.4",
+	mock := ssh.NewMockExecutor("1.2.3.4", append(admissionStubs("ship"),
 		ssh.MockCommand{Match: "docker inspect -f '{{.State.Status}}'", Output: "exited"},
 		ssh.MockCommand{Match: "docker rm -f", Output: ""},
 		ssh.MockCommand{Match: "mkdir -p", Output: ""},
 		ssh.MockCommand{Match: "docker run", Output: "abc123"},
-	)
+	)...)
 	var buf bytes.Buffer
 	mgr := NewManager(mock, &buf)
 
@@ -964,10 +984,10 @@ func TestEnsureRunning_RecreatesStoppedContainer(t *testing.T) {
 
 // A running accessory must never be torn down as a side effect of a deploy.
 func TestEnsureRunning_NeverRemovesARunningContainer(t *testing.T) {
-	mock := ssh.NewMockExecutor("1.2.3.4",
+	mock := ssh.NewMockExecutor("1.2.3.4", append(admissionStubs("ship"),
 		ssh.MockCommand{Match: "docker inspect -f '{{.State.Status}}'", Output: "running"},
 		ssh.MockCommand{Match: "docker inspect -f '{{.HostConfig.Memory}}", Output: "0 0"},
-	)
+	)...)
 	var buf bytes.Buffer
 	mgr := NewManager(mock, &buf)
 
@@ -980,5 +1000,26 @@ func TestEnsureRunning_NeverRemovesARunningContainer(t *testing.T) {
 		if strings.HasPrefix(c, "docker rm") || strings.HasPrefix(c, "docker run") {
 			t.Errorf("a running accessory must be left alone, got: %s", c)
 		}
+	}
+}
+
+func TestAccessoryLiteralDirectiveValuesNeverResolve(t *testing.T) {
+	mock := ssh.NewMockExecutor("test", append(admissionStubs("demo"),
+		ssh.MockCommand{Match: "docker inspect", Err: fmt.Errorf("not found")},
+		ssh.MockCommand{Match: "mkdir -p", Output: ""},
+		ssh.MockCommand{Match: "docker run", Output: ""})...)
+	mgr := NewManager(mock, &bytes.Buffer{})
+	_, err := mgr.EnsureRunning(context.Background(), "demo", "db", config.AccessoryConfig{Image: "redis:7", Env: map[string]string{"AUTO": "auto", "SECRET": "secret:retired"}, EnvLiteral: map[string]string{"AUTO": "auto", "SECRET": "secret:retired"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, call := range mock.Calls {
+		if strings.Contains(call, "credentials") || strings.Contains(call, "age -d") {
+			t.Fatalf("literal values triggered secret resolution: %s", call)
+		}
+	}
+	contents := string(mock.Files["/deployments/demo/accessories/db/container.env"])
+	if !strings.Contains(contents, "AUTO=auto\n") || !strings.Contains(contents, "SECRET=secret:retired\n") {
+		t.Fatalf("literal values changed: %q", contents)
 	}
 }

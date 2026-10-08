@@ -45,13 +45,13 @@ func TestPreviewIDGolden(t *testing.T) {
 	tests := []struct {
 		app, branch, want string
 	}{
-		{"myapp", "feature/login", "myapp-p-08e81639"},
-		{"myapp", "feature-login", "myapp-p-cb4bdf9a"},
-		{"myapp", "main", "myapp-p-563059ce"},
-		{"myapp", "old-feature", "myapp-p-491218d3"},
-		{"myapp", "active-feature", "myapp-p-9fdbab8f"},
-		{"market-eval", "feature/login", "market-eval-p-a575aaf7"},
-		{"market-eval", "feature-login", "market-eval-p-84d280a4"},
+		{"myapp", "feature/login", "myapp-p-08e8163960152ff19d4fc9c432d3270b"},
+		{"myapp", "feature-login", "myapp-p-cb4bdf9a7dccde9a7efb87f30130dd51"},
+		{"myapp", "main", "myapp-p-563059ce85fc40eb503e69fbd8d6e5ac"},
+		{"myapp", "old-feature", "myapp-p-491218d3875552fa51c5745cd295c065"},
+		{"myapp", "active-feature", "myapp-p-9fdbab8f86d005409fbb6ee5161f2bca"},
+		{"market-eval", "feature/login", "market-eval-p-a575aaf7f4e9a0cdff3aa848bdca42d8"},
+		{"market-eval", "feature-login", "market-eval-p-84d280a492101709ac6c9dfaddfb1bcb"},
 	}
 	for _, tt := range tests {
 		if got := PreviewID(tt.app, tt.branch); got != tt.want {
@@ -93,9 +93,11 @@ func TestPreviewBranchIdentityIsDistinct(t *testing.T) {
 }
 
 func TestDeploy(t *testing.T) {
-	mock := ssh.NewMockExecutor("1.2.3.4",
+	mock := previewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "mkdir -p /deployments/myapp/previews", Output: ""},
 		ssh.MockCommand{Match: "cat /deployments/myapp/previews/feature-login.json", Output: "", Err: nil},
+		ssh.MockCommand{Match: "docker stop", Output: ""},
+		ssh.MockCommand{Match: "docker rm", Output: ""},
 		ssh.MockCommand{Match: "ss -tln", Output: ""},
 		ssh.MockCommand{Match: "docker run", Output: "abc123"},
 		ssh.MockCommand{Match: "docker inspect -f '{{range $p", Output: "80/tcp"},
@@ -127,13 +129,13 @@ func TestDeploy(t *testing.T) {
 	}
 
 	output := buf.String()
-	if !bytes.Contains([]byte(output), []byte("preview-feature-login-08e81639.myapp.com")) {
+	if !bytes.Contains([]byte(output), []byte("preview-feature-login-08e8163960152ff19d4fc9c432d3270b.myapp.com")) {
 		t.Errorf("expected preview domain in output, got: %s", output)
 	}
 }
 
 func TestList_Empty(t *testing.T) {
-	mock := ssh.NewMockExecutor("1.2.3.4",
+	mock := previewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "ls", Output: "", Err: nil},
 	)
 
@@ -163,7 +165,7 @@ func TestPrune_OnlyDestroysExpired(t *testing.T) {
 	freshJSON := fmt.Sprintf(`{"branch":"active-feature","domain":"preview-active-feature.myapp.com","port":49201,"container":"myapp-preview-active-feature-v2","image":"myapp:v2","created_at":"2020-01-01T00:00:00Z","expires_at":%q}`,
 		"2099-01-01T00:00:00Z")
 
-	mock := ssh.NewMockExecutor("1.2.3.4",
+	mock := previewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "ls /deployments/myapp/previews/*.json",
 			Output: "/deployments/myapp/previews/old-feature.json\n/deployments/myapp/previews/active-feature.json"},
 		ssh.MockCommand{Match: "cat /deployments/myapp/previews/old-feature.json", Output: expiredJSON},
@@ -205,11 +207,11 @@ func TestPreviewDomain(t *testing.T) {
 	tests := []struct {
 		app, branch, domain, want string
 	}{
-		{"myapp", "feature/login", "myapp.com", "preview-feature-login-08e81639.myapp.com"},
-		{"myapp", "main", "example.com", "preview-main-563059ce.example.com"},
+		{"myapp", "feature/login", "myapp.com", "preview-feature-login-08e8163960152ff19d4fc9c432d3270b.myapp.com"},
+		{"myapp", "main", "example.com", "preview-main-563059ce85fc40eb503e69fbd8d6e5ac.example.com"},
 		// A 70-char slug must truncate so the whole DNS label stays <= 63:
 		// "preview-" (8) + 46 chars + "-" + 8 hex = 63.
-		{"myapp", strings.Repeat("a", 70) + "/x", "myapp.com", "preview-" + strings.Repeat("a", 46) + "-54119e3a.myapp.com"},
+		{"myapp", strings.Repeat("a", 70) + "/x", "myapp.com", "preview-" + strings.Repeat("a", 22) + "-54119e3a866a54584c354461c6a4e1e7.myapp.com"},
 	}
 	for _, tt := range tests {
 		got := previewDomain(tt.app, tt.branch, tt.domain)
@@ -232,6 +234,8 @@ func TestPreviewDomain(t *testing.T) {
 func previewDeployMocks() []ssh.MockCommand {
 	return []ssh.MockCommand{
 		ssh.MockCommand{Match: "mkdir -p /deployments/myapp/previews", Output: ""},
+		ssh.MockCommand{Match: "docker stop", Output: ""},
+		ssh.MockCommand{Match: "docker rm", Output: ""},
 		ssh.MockCommand{Match: "ss -tln", Output: ""},
 		ssh.MockCommand{Match: "docker run", Output: "abc123"},
 		ssh.MockCommand{Match: "docker inspect -f '{{range $p", Output: "80/tcp"},
@@ -245,8 +249,8 @@ func previewDeployMocks() []ssh.MockCommand {
 }
 
 const (
-	loginIDHex  = "08e81639" // previewIDHex("myapp", "feature/login")
-	dashIDHex   = "cb4bdf9a" // previewIDHex("myapp", "feature-login")
+	loginIDHex  = "08e8163960152ff19d4fc9c432d3270b" // previewIDHex("myapp", "feature/login")
+	dashIDHex   = "cb4bdf9a7dccde9a7efb87f30130dd51" // previewIDHex("myapp", "feature-login")
 	loginBranch = "feature/login"
 	dashBranch  = "feature-login"
 )
@@ -272,7 +276,7 @@ func mustDeploy(t *testing.T, mgr *Manager, cfg DeployConfig) {
 func callsContaining(mock *ssh.MockExecutor, needle string) []string {
 	var found []string
 	for _, c := range mock.Calls {
-		if strings.Contains(c, needle) {
+		if strings.Contains(c, needle) && !strings.HasPrefix(c, "grep -q ") {
 			found = append(found, c)
 		}
 	}
@@ -283,7 +287,7 @@ func callsContaining(mock *ssh.MockExecutor, needle string) []string {
 // deploy side by side with distinct state records, containers, routes and
 // domains — neither deploy destroys or blocks the other.
 func TestDeployCoexistence(t *testing.T) {
-	mock := ssh.NewMockExecutor("1.2.3.4", previewDeployMocks()...)
+	mock := previewMockExecutor("1.2.3.4", previewDeployMocks()...)
 	var buf bytes.Buffer
 	mgr := NewManager(mock, &buf)
 
@@ -353,7 +357,7 @@ func TestDeployCoexistence(t *testing.T) {
 // Updating one preview of a colliding pair must not touch the other's
 // record or container.
 func TestDeployUpdateOneLeavesOther(t *testing.T) {
-	mock := ssh.NewMockExecutor("1.2.3.4", previewDeployMocks()...)
+	mock := previewMockExecutor("1.2.3.4", previewDeployMocks()...)
 	var buf bytes.Buffer
 	mgr := NewManager(mock, &buf)
 
@@ -379,7 +383,7 @@ func TestDeployUpdateOneLeavesOther(t *testing.T) {
 // Destroying one preview of a colliding pair leaves the other fully
 // intact.
 func TestDestroyOneLeavesOther(t *testing.T) {
-	mock := ssh.NewMockExecutor("1.2.3.4", previewDeployMocks()...)
+	mock := previewMockExecutor("1.2.3.4", previewDeployMocks()...)
 	var buf bytes.Buffer
 	mgr := NewManager(mock, &buf)
 
@@ -414,7 +418,7 @@ func TestDestroyOneLeavesOther(t *testing.T) {
 // Prune expires one canonical preview of a colliding pair and leaves the
 // other running.
 func TestPruneExpiresOneLeavesOther(t *testing.T) {
-	mock := ssh.NewMockExecutor("1.2.3.4",
+	mock := previewMockExecutor("1.2.3.4",
 		append([]ssh.MockCommand{
 			ssh.MockCommand{Match: "ls /deployments/myapp/previews/*.json",
 				Output: previewStatePath("myapp", loginBranch) + "\n" + previewStatePath("myapp", dashBranch)},
@@ -476,7 +480,7 @@ func seedCaddyfileWithRoute(mock *ssh.MockExecutor, key, host string) {
 // down the artifacts the record actually names (the old slug-keyed
 // container and route), and deploys fresh canonical-keyed artifacts.
 func TestLegacyAdoptionDeploy(t *testing.T) {
-	mock := ssh.NewMockExecutor("1.2.3.4", previewDeployMocks()...)
+	mock := previewMockExecutor("1.2.3.4", previewDeployMocks()...)
 	var buf bytes.Buffer
 	mgr := NewManager(mock, &buf)
 
@@ -532,7 +536,7 @@ func TestLegacyAdoptionDeploy(t *testing.T) {
 // DIFFERENT branch. Deploy must refuse with an ambiguous-resource error
 // naming both branches and the record path, and must not mutate anything.
 func TestLegacyCollisionDeployIsAmbiguous(t *testing.T) {
-	mock := ssh.NewMockExecutor("1.2.3.4", previewDeployMocks()...)
+	mock := previewMockExecutor("1.2.3.4", previewDeployMocks()...)
 	var buf bytes.Buffer
 	mgr := NewManager(mock, &buf)
 
@@ -563,7 +567,7 @@ func TestLegacyCollisionDeployIsAmbiguous(t *testing.T) {
 	if got := string(mock.Files[legacyPath]); got != string(legacy) {
 		t.Errorf("ambiguous legacy record was mutated:\nbefore: %s\nafter:  %s", legacy, got)
 	}
-	if calls := mock.Calls; len(calls) > 2 { // the two record reads only
+	if calls := mock.Calls; len(calls) > 3 { // the two record reads only
 		t.Errorf("ambiguous legacy record must abort before any mutation, calls: %v", calls)
 	}
 }
@@ -571,7 +575,7 @@ func TestLegacyCollisionDeployIsAmbiguous(t *testing.T) {
 // Destroy hits the same ambiguity wall: it must refuse, not guess, and
 // leave the record intact.
 func TestLegacyCollisionDestroyIsAmbiguous(t *testing.T) {
-	mock := ssh.NewMockExecutor("1.2.3.4", previewDeployMocks()...)
+	mock := previewMockExecutor("1.2.3.4", previewDeployMocks()...)
 	var buf bytes.Buffer
 	mgr := NewManager(mock, &buf)
 
@@ -598,7 +602,7 @@ func TestLegacyCollisionDestroyIsAmbiguous(t *testing.T) {
 // Repo provenance participates in legacy adoption when both sides record
 // one: same branch, different repo → ambiguous, untouched.
 func TestLegacyRepoMismatchIsAmbiguous(t *testing.T) {
-	mock := ssh.NewMockExecutor("1.2.3.4", previewDeployMocks()...)
+	mock := previewMockExecutor("1.2.3.4", previewDeployMocks()...)
 	var buf bytes.Buffer
 	mgr := NewManager(mock, &buf)
 
@@ -624,9 +628,10 @@ func TestLegacyRepoMismatchIsAmbiguous(t *testing.T) {
 // this branch once this branch has its own canonical record: the legacy
 // file belongs to that branch and is left in place untouched.
 func TestLegacyOtherBranchNotBlocked(t *testing.T) {
-	mock := ssh.NewMockExecutor("1.2.3.4", previewDeployMocks()...)
+	mock := previewMockExecutor("1.2.3.4", previewDeployMocks()...)
+	inventory := newPreviewInventoryExecutor(mock, "myapp-preview-feature-login-v9")
 	var buf bytes.Buffer
-	mgr := NewManager(mock, &buf)
+	mgr := NewManager(inventory, &buf)
 
 	// This branch's canonical record exists (a modern deploy happened).
 	mustDeploy(t, mgr, deployCfg(loginBranch, "v1"))
@@ -646,14 +651,15 @@ func TestLegacyOtherBranchNotBlocked(t *testing.T) {
 	}
 
 	// And destroying THAT branch still finds and removes its legacy record.
+	legacyID := inventory.containers["myapp-preview-feature-login-v9"]
 	if err := mgr.Destroy(context.Background(), "myapp", dashBranch); err != nil {
 		t.Fatalf("Destroy of the legacy branch: %v", err)
 	}
 	if _, ok := mock.Files[legacyPath]; ok {
 		t.Errorf("legacy record for %s not removed by its own destroy", dashBranch)
 	}
-	if len(callsContaining(mock, "docker stop -t 5 'myapp-preview-feature-login-v9'")) != 1 {
-		t.Errorf("legacy branch's container not stopped via its stored name: %v", callsContaining(mock, "docker stop"))
+	if len(callsContaining(mock, "docker stop -t 5 '"+legacyID+"'")) != 1 {
+		t.Errorf("legacy branch's container not stopped by its immutable ID: %v", callsContaining(mock, "docker stop"))
 	}
 }
 
@@ -661,7 +667,7 @@ func TestLegacyOtherBranchNotBlocked(t *testing.T) {
 func TestListIncludesLegacyAndCanonical(t *testing.T) {
 	loginPath := previewStatePath("myapp", loginBranch)
 	legacyPath := legacyPreviewStatePath("myapp", dashBranch)
-	mock := ssh.NewMockExecutor("1.2.3.4",
+	mock := previewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "ls /deployments/myapp/previews/*.json",
 			Output: loginPath + "\n" + legacyPath},
 	)
@@ -697,11 +703,11 @@ func TestProbeTCP_RequiresLiveListener(t *testing.T) {
 	if !ok {
 		t.Fatal("TCPProbeCommand rejected localhost:8080")
 	}
-	live := ssh.NewMockExecutor("1.2.3.4", ssh.MockCommand{Match: want})
+	live := previewMockExecutor("1.2.3.4", ssh.MockCommand{Match: want})
 	if !NewManager(live, io.Discard).probeTCP(context.Background(), 8080) {
 		t.Fatal("probeTCP must pass when the held-connection probe exits 0")
 	}
-	connectOnly := ssh.NewMockExecutor("1.2.3.4", ssh.MockCommand{Match: "bash -c '</dev/tcp/localhost/8080'"})
+	connectOnly := previewMockExecutor("1.2.3.4", ssh.MockCommand{Match: "bash -c '</dev/tcp/localhost/8080'"})
 	if NewManager(connectOnly, io.Discard).probeTCP(context.Background(), 8080) {
 		t.Fatal("probeTCP must not be satisfied by a bare connect")
 	}

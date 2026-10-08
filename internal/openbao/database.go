@@ -63,11 +63,11 @@ func (c *Client) EnableDatabaseSecrets(ctx context.Context, opts DBSetupOptions)
 	// (`write <path> -`), never the docker exec argv (C08).
 	connURL := fmt.Sprintf("postgresql://{{username}}:{{password}}@%s:5432/%s?sslmode=disable", dbHost, opts.DBName)
 	cfg, err := json.Marshal(map[string]string{
-		"plugin_name":     "postgresql-database-plugin",
-		"allowed_roles":   dbRoleName(opts.App),
-		"connection_url":  connURL,
-		"username":        opts.AdminUser,
-		"password":        opts.AdminPass,
+		"plugin_name":    "postgresql-database-plugin",
+		"allowed_roles":  dbRoleName(opts.App),
+		"connection_url": connURL,
+		"username":       opts.AdminUser,
+		"password":       opts.AdminPass,
 	})
 	if err != nil {
 		return fmt.Errorf("encoding db connection config: %w", err)
@@ -245,9 +245,39 @@ func (c *Client) writeAppPolicy(ctx context.Context, container, root, app string
 // hasDBRole reports whether a dynamic DB role is already configured for the app
 // (so a policy re-write can preserve the DB grant). Best-effort: any error =
 // treat as absent.
-func (c *Client) hasDBRole(ctx context.Context, container, root, app string) bool {
-	out, err := c.bao(ctx, container, root, "read database/roles/"+dbRoleName(app))
-	return err == nil && !strings.Contains(out, "No value found") && !strings.Contains(out, "Error")
+func (c *Client) discoverDBRoles(ctx context.Context, container, root, app string) (bool, error) {
+	found := false
+	for _, path := range []string{"database/roles/" + dbRoleName(app), "database/static-roles"} {
+		verb := "read "
+		if path == "database/static-roles" {
+			verb = "list -format=json "
+		}
+		out, err := c.bao(ctx, container, root, verb+path)
+		if strings.Contains(out, "No value found") || strings.Contains(out, "No value") {
+			continue
+		}
+		if err != nil {
+			return false, fmt.Errorf("discovering database policy before rewrite: %w", err)
+		}
+		if path == "database/static-roles" {
+			var result struct {
+				Data struct {
+					Keys []string `json:"keys"`
+				} `json:"data"`
+			}
+			if err := json.Unmarshal([]byte(extractJSON(out)), &result); err != nil {
+				return false, fmt.Errorf("decoding static role inventory: %w", err)
+			}
+			for _, key := range result.Data.Keys {
+				if strings.HasPrefix(key, app+"-") {
+					found = true
+				}
+			}
+		} else {
+			found = true
+		}
+	}
+	return found, nil
 }
 
 // AppReadPolicy renders the app's least-privilege HCL policy (pure/testable):

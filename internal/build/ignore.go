@@ -128,6 +128,8 @@ type rule struct {
 }
 
 func compileRule(p string) (rule, error) {
+	for _,part:=range strings.Split(p,"/") {if part==".." {return rule{},fmt.Errorf("pattern must not traverse the source root")}}
+	if strings.ContainsRune(p,0) {return rule{},fmt.Errorf("pattern contains NUL")}
 	var r rule
 	if strings.HasSuffix(p, "/") {
 		r.dirOnly = true

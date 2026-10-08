@@ -122,10 +122,12 @@ func (r *RolloutConfig) CanaryCount(total int) (int, error) {
 
 // AccessoryConfig represents a stateful service container (database, cache, etc.).
 type AccessoryConfig struct {
-	Image   string            `yaml:"image" toml:"image"`
-	Port    int               `yaml:"port,omitempty" toml:"port"`
-	Env     map[string]string `yaml:"env,omitempty" toml:"env"`
-	Volumes map[string]string `yaml:"volumes,omitempty" toml:"volumes"`
+	Image           string                     `yaml:"image" toml:"image"`
+	Port            int                        `yaml:"port,omitempty" toml:"port"`
+	Env             map[string]string          `yaml:"env,omitempty" toml:"env"`
+	EnvLiteral      map[string]string          `yaml:"env_literal,omitempty" toml:"env_literal"`
+	Volumes         map[string]string          `yaml:"volumes,omitempty" toml:"volumes"`
+	VolumeOwnership map[string]VolumeOwnership `yaml:"volume_ownership,omitempty" toml:"volume_ownership"`
 	// Command overrides the image's default command (docker run trailing
 	// args) — required by images whose entrypoint needs an explicit verb,
 	// e.g. MinIO (`server /data --console-address :9001`) or ntfy (`serve`).
@@ -419,14 +421,16 @@ type AppConfig struct {
 	// everything — historical behavior. Set to 2 or 3 to enable auto-prune
 	// with a rollback window. Container-deploy only; static deploy uses
 	// KeepReleases instead.
-	KeepVersions int               `yaml:"keep_versions,omitempty" toml:"keep_versions"`
-	Hooks        HooksConfig       `yaml:"hooks,omitempty" toml:"hooks"`
-	Volumes      map[string]string `yaml:"volumes,omitempty" toml:"volumes"`
-	Processes    map[string]string `yaml:"processes,omitempty" toml:"processes"`
+	KeepVersions    int                        `yaml:"keep_versions,omitempty" toml:"keep_versions"`
+	Hooks           HooksConfig                `yaml:"hooks,omitempty" toml:"hooks"`
+	Volumes         map[string]string          `yaml:"volumes,omitempty" toml:"volumes"`
+	VolumeOwnership map[string]VolumeOwnership `yaml:"volume_ownership,omitempty" toml:"volume_ownership"`
+	Processes       map[string]string          `yaml:"processes,omitempty" toml:"processes"`
 	// Env are plain environment variables passed to the app container. Values
 	// may reference ${VAR} from the local environment (expanded at deploy
 	// time). Secrets set via `teploy secret` override these key-for-key.
-	Env map[string]string `yaml:"env,omitempty" toml:"env"`
+	Env        map[string]string `yaml:"env,omitempty" toml:"env"`
+	EnvLiteral map[string]string `yaml:"env_literal,omitempty" toml:"env_literal"`
 	// Health configures the teploy-level deploy health check (the HTTP poll
 	// that gates traffic switch after a deploy, separate from the container
 	// HEALTHCHECK). Path defaults to "/health" when unset.
@@ -794,7 +798,11 @@ func ValidatePublishEntries(entries []string) error {
 		if spec.HostPort == 0 {
 			continue // ephemeral ports cannot collide with each other by name
 		}
-		key := fmt.Sprintf("%d/%s", spec.HostPort, spec.Proto)
+		proto := spec.Proto
+		if proto == "" {
+			proto = "tcp"
+		}
+		key := fmt.Sprintf("%d/%s", spec.HostPort, proto)
 		set, ok := seen[key]
 		if !ok {
 			set = &bindSet{binds: map[string]bool{}}
@@ -1028,6 +1036,12 @@ func (c *AppConfig) validate() error {
 	if c.Health.Mode == HealthModeTCP && c.Health.Path != "" {
 		return fmt.Errorf("'health.path' has no effect with 'health.mode: tcp' (TCP readiness dials the port; nothing is fetched) — remove the path or use mode http/auto")
 	}
+	if c.IsStatic() && len(c.VolumeOwnership) > 0 {
+		return fmt.Errorf("volume_ownership requires a container app")
+	}
+	if err := ValidateVolumeOwnership(c.Volumes, c.VolumeOwnership); err != nil {
+		return err
+	}
 	for name, dest := range c.Volumes {
 		if !validName.MatchString(name) && !IsHostBindVolume(name) {
 			return fmt.Errorf("volume name %q must be lowercase alphanumeric with hyphens, or an absolute host path for a bind mount", name)
@@ -1037,6 +1051,9 @@ func (c *AppConfig) validate() error {
 		}
 	}
 	for name, acc := range c.Accessories {
+		if err := ValidateVolumeOwnership(acc.Volumes, acc.VolumeOwnership); err != nil {
+			return fmt.Errorf("accessory %s: %w", name, err)
+		}
 		if !validName.MatchString(name) {
 			return fmt.Errorf("accessory name %q must be lowercase alphanumeric with hyphens", name)
 		}
@@ -1239,6 +1256,9 @@ func LoadApp(dir string) (*AppConfig, error) {
 		return nil, invalidConfig(err)
 	}
 	if composeCfg != nil {
+		if err := composeCfg.validate(); err != nil {
+			return nil, fmt.Errorf("invalid Compose config: %w", err)
+		}
 		return composeCfg, nil
 	}
 
@@ -1325,6 +1345,9 @@ func clearExplicitEmpties(base, overlay *AppConfig, present map[string]any) {
 	}
 	if _, ok := present["publish"]; ok && len(overlay.Publish) == 0 {
 		base.Publish = nil
+	}
+	if _, ok := present["volume_ownership"]; ok && len(overlay.VolumeOwnership) == 0 {
+		base.VolumeOwnership = nil
 	}
 	if _, ok := present["volumes"]; ok && len(overlay.Volumes) == 0 {
 		base.Volumes = nil
@@ -1450,6 +1473,14 @@ func mergeConfigs(base, overlay *AppConfig) {
 		base.Hooks.PostDeploy = overlay.Hooks.PostDeploy
 	}
 	// Merge maps: overlay keys override base keys.
+	if len(overlay.VolumeOwnership) > 0 {
+		if base.VolumeOwnership == nil {
+			base.VolumeOwnership = map[string]VolumeOwnership{}
+		}
+		for k, v := range overlay.VolumeOwnership {
+			base.VolumeOwnership[k] = v
+		}
+	}
 	if len(overlay.Volumes) > 0 {
 		if base.Volumes == nil {
 			base.Volumes = map[string]string{}
@@ -1566,6 +1597,14 @@ func mergeConfigs(base, overlay *AppConfig) {
 			base.Headers[k] = v
 		}
 	}
+	if len(overlay.EnvLiteral) > 0 {
+		if base.EnvLiteral == nil {
+			base.EnvLiteral = map[string]string{}
+		}
+		for k, v := range overlay.EnvLiteral {
+			base.EnvLiteral[k] = v
+		}
+	}
 	if overlay.KeepReleases > 0 {
 		base.KeepReleases = overlay.KeepReleases
 	}
@@ -1599,6 +1638,11 @@ func mergeAccessory(base, overlay AccessoryConfig) AccessoryConfig {
 	}
 	if overlay.Command != "" {
 		out.Command = overlay.Command
+		out.CommandArgs = nil
+	}
+	if len(overlay.CommandArgs) > 0 {
+		out.CommandArgs = append([]string(nil), overlay.CommandArgs...)
+		out.Command = ""
 	}
 	if len(overlay.Publish) > 0 {
 		out.Publish = overlay.Publish
@@ -1619,12 +1663,28 @@ func mergeAccessory(base, overlay AccessoryConfig) AccessoryConfig {
 			out.Env[k] = v
 		}
 	}
+	if len(overlay.VolumeOwnership) > 0 {
+		if out.VolumeOwnership == nil {
+			out.VolumeOwnership = map[string]VolumeOwnership{}
+		}
+		for k, v := range overlay.VolumeOwnership {
+			out.VolumeOwnership[k] = v
+		}
+	}
 	if len(overlay.Volumes) > 0 {
 		if out.Volumes == nil {
 			out.Volumes = map[string]string{}
 		}
 		for k, v := range overlay.Volumes {
 			out.Volumes[k] = v
+		}
+	}
+	if len(overlay.EnvLiteral) > 0 {
+		if out.EnvLiteral == nil {
+			out.EnvLiteral = map[string]string{}
+		}
+		for k, v := range overlay.EnvLiteral {
+			out.EnvLiteral[k] = v
 		}
 	}
 	return out

@@ -56,12 +56,12 @@ compares via source identity, not strict HEAD equality).
 - ldflags       : -s -w -X main.version=0.0.0-localverify-11d0709
 - matrix        : linux/darwin/windows × amd64/arm64 (goreleaser parity)
 - checksums     : release/expectations/checksums-0.0.0-localverify-11d0709-go1-26-6.txt
-  - bf185800ea9b731849cd0a4c61940586bb4fdfc5875636966abe01aad4a34d8e  teploy_darwin_amd64
-  - 553044b9f5d81fc99fb7ebd2369f0435a41daff3abbfe3f27e0fc192024653f8  teploy_darwin_arm64
-  - bacf79c2f18585676e64ebbc06a409304fdb91fb72b9c386ae0b51b4adbcc259  teploy_linux_amd64
-  - 33446a81515d1d7c4026b5de04aa56e7216389f6833ac56d13c35a25a41fa208  teploy_linux_arm64
-  - 7d0255f55e8f6e74e9c85acff6d57b634b323dd5ea84caeb2ce86da966362fc9  teploy_windows_amd64
-  - 13d24237797c3484a40388fa21af4834c1affa3ba16beb2a139960764c23de56  teploy_windows_arm64
+  - 9b41470e71554bb6a2899a5832ae20b67af06ec27aa6b3d31a99fa07a3706329  teploy_darwin_amd64
+  - fa51620f2abbbdfa8d9db71c18470c327f1ce7be8065cac7fb5045c01c5eef22  teploy_darwin_arm64
+  - 2e37ab081802d45638dd5a4d0e50f685c9ef27dd438eafcb078653539b2dcd37  teploy_linux_amd64
+  - 1e22ca85320fdef40039a430248ac5b46366ba41904d33e449e34742f0896c73  teploy_linux_arm64
+  - d0b2447f61520c97f4be25e9ef57cc9bc7ab8db253a3b5672a20413708e3cc5a  teploy_windows_amd64
+  - 7108ded33e71efc125601d7bbf93bb1beb57d51e360dbe2b763bdc8314f89bd5  teploy_windows_arm64
 - verify        : `./scripts/release-verify.sh verify 0.0.0-localverify-11d0709`
   → REPRODUCIBLE (all 6 binaries bit-identical to the recording; clean
   tree, Darwin/arm64 host)
@@ -78,3 +78,5 @@ embed mtimes) and is recorded at release time. Bit-identical
 reproduction is toolchain-scoped: the expectation file pins the go
 version, and `release-verify` refuses to compare (exit 1, INPUTS
 DIFFER) rather than report a meaningless mismatch across toolchains.
+
+2026-10-07 reconciliation: the human checksum transcription above was corrected to the expectation file after rebuilding all six binaries at exact source commit `11d0709fbe19b642739809c614d1ff64a0812e41` with Go 1.26.6 and verifying byte equality. Future recordings explicitly clear GOFLAGS, disable VCS build-info variation, and bind the actual compiler-source digest (including dirty source). Historical expectations retain their original recipe.

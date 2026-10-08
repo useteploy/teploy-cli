@@ -303,8 +303,8 @@ func TestAccessoryBackup_MySQL_UsesRootPasswordEnv(t *testing.T) {
 	if dumpCmd == "" {
 		t.Fatal("expected a mysqldump command")
 	}
-	if !strings.Contains(dumpCmd, "docker exec --env-file '/tmp/teploy-backup.abc123/mysql.env' 'myapp-mysql' mysqldump -u root 'myapp'") {
-		t.Errorf("password must ride via docker exec --env-file, got: %s", dumpCmd)
+	if !strings.Contains(dumpCmd, "docker exec -i 'myapp-mysql' sh -c") {
+		t.Errorf("password must ride via private stdin transport, got: %s", dumpCmd)
 	}
 	if got := string(mock.Files["/tmp/teploy-backup.abc123/mysql.env"]); got != "MYSQL_PWD=sekret\n" {
 		t.Errorf("credential file content = %q", got)
@@ -335,7 +335,7 @@ func TestAccessoryBackup_MySQL_PasswordFallbackAndAbsence(t *testing.T) {
 	}
 	found := false
 	for _, call := range mock.Calls {
-		if strings.Contains(call, "--env-file") {
+		if strings.Contains(call, "MYSQL_PWD=${teploy_credential#MYSQL_PWD=}") {
 			found = true
 		}
 		if strings.Contains(call, "fall") {
@@ -433,8 +433,8 @@ func TestAccessoryRestore_MySQL_UsesRootPasswordEnv(t *testing.T) {
 	if restoreCmd == "" {
 		t.Fatal("expected a mysql restore command")
 	}
-	if !strings.Contains(restoreCmd, "docker exec -i --env-file '/tmp/teploy-restore.abc123/mysql.env' 'myapp-mysql' mysql -u root 'myapp'") {
-		t.Errorf("password must ride via docker exec --env-file, got: %s", restoreCmd)
+	if !strings.Contains(restoreCmd, "docker exec -i 'myapp-mysql' sh -c") {
+		t.Errorf("password must ride via private stdin transport, got: %s", restoreCmd)
 	}
 	if got := string(mock.Files["/tmp/teploy-restore.abc123/mysql.env"]); got != "MYSQL_PWD=sekret\n" {
 		t.Errorf("credential file content = %q", got)

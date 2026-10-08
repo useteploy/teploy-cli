@@ -16,6 +16,7 @@ import (
 	"github.com/useteploy/teploy/internal/docker"
 	"github.com/useteploy/teploy/internal/secret"
 	"github.com/useteploy/teploy/internal/ssh"
+	"github.com/useteploy/teploy/internal/state"
 )
 
 const deploymentsDir = "/deployments"
@@ -44,12 +45,49 @@ func ContainerName(app, name string) string {
 // EnsureRunning checks if an accessory is running and starts it if not.
 // Returns env vars to inject into the app (e.g., DATABASE_URL for postgres).
 func (m *Manager) EnsureRunning(ctx context.Context, app, name string, cfg config.AccessoryConfig) (map[string]string, error) {
+	if err := config.ValidateVolumeOwnership(cfg.Volumes, cfg.VolumeOwnership); err != nil {
+		return nil, err
+	}
+	if fenced, ok := m.exec.(interface{ UnderFence() bool }); !ok || !fenced.UnderFence() {
+		if err := m.docker.EnsureManagedDirectory(ctx, app, "", ""); err != nil {
+			return nil, err
+		}
+		lk, err := state.AcquireLockFenced(ctx, m.exec, app)
+		if err != nil {
+			return nil, err
+		}
+		lk.StartRenewal(m.exec)
+		defer state.ReleaseLockFenced(m.exec, lk, app)
+		return NewManager(&state.FencedExecutor{Executor: m.exec, Lock: lk}, m.out).EnsureRunning(ctx, app, name, cfg)
+	}
+	for _, volume := range sortedKeys(cfg.VolumeOwnership) {
+		if err := m.docker.ValidateManagedVolume(ctx, app, name, volume, cfg.VolumeOwnership[volume]); err != nil {
+			return nil, err
+		}
+	}
+	for _, volume := range sortedKeys(cfg.VolumeOwnership) {
+		if err := m.docker.ProvisionManagedVolume(ctx, app, name, volume, cfg.VolumeOwnership[volume]); err != nil {
+			return nil, err
+		}
+	}
 	containerName := ContainerName(app, name)
 
 	// Always resolve env (needed for connection strings even if already running).
-	env, err := m.resolveEnv(ctx, app, name, cfg.Env)
+	directives := make(map[string]string, len(cfg.Env))
+	for k, v := range cfg.Env {
+		if _, literal := cfg.EnvLiteral[k]; !literal {
+			directives[k] = v
+		}
+	}
+	env, err := m.resolveEnv(ctx, app, name, directives)
 	if err != nil {
 		return nil, fmt.Errorf("resolving env vars: %w", err)
+	}
+	if env == nil {
+		env = map[string]string{}
+	}
+	for k, v := range cfg.EnvLiteral {
+		env[k] = v
 	}
 
 	// Check if already running.
@@ -81,7 +119,7 @@ func (m *Manager) EnsureRunning(ctx context.Context, app, name string, cfg confi
 
 	// Ensure directory structure.
 	accDir := fmt.Sprintf("%s/%s/accessories/%s", deploymentsDir, app, name)
-	if _, err := m.exec.Run(ctx, fmt.Sprintf("mkdir -p %s", accDir)); err != nil {
+	if err := m.docker.EnsureManagedDirectory(ctx, app, name, ""); err != nil {
 		return nil, fmt.Errorf("creating accessory directory: %w", err)
 	}
 
@@ -99,12 +137,16 @@ func (m *Manager) EnsureRunning(ctx context.Context, app, name string, cfg confi
 	// the engine. That is the upgrade failure reconcileDataOwnership already
 	// covers, hit on a fresh install by every deploy — `template install`
 	// included.
-	for _, hostPath := range sortedKeys(volumes) {
-		if _, err := m.exec.Run(ctx, "mkdir -p "+hostPath); err != nil {
-			return nil, fmt.Errorf("creating accessory volume directory %s: %w", hostPath, err)
+	for _, volume := range sortedKeys(cfg.Volumes) {
+		if _, owned := cfg.VolumeOwnership[volume]; owned {
+			continue
+		}
+		if err := m.docker.EnsureManagedDirectory(ctx, app, name, volume); err != nil {
+			return nil, err
 		}
 	}
-	if err := m.reconcileDataOwnership(ctx, app, name, cfg); err != nil {
+
+	if err := m.reconcileDataOwnership(ctx, app, name, withoutOwnedVolumes(cfg)); err != nil {
 		return nil, err
 	}
 
@@ -454,6 +496,28 @@ func (m *Manager) Logs(ctx context.Context, app, name string, lines int) error {
 
 // Upgrade stops the old container, pulls the new image, and starts a new one with same config.
 func (m *Manager) Upgrade(ctx context.Context, app, name, newImage string, cfg config.AccessoryConfig) error {
+	if fenced, ok := m.exec.(interface{ UnderFence() bool }); !ok || !fenced.UnderFence() {
+		if err := m.docker.EnsureManagedDirectory(ctx, app, "", ""); err != nil {
+			return err
+		}
+		lk, err := state.AcquireLockFenced(ctx, m.exec, app)
+		if err != nil {
+			return err
+		}
+		lk.StartRenewal(m.exec)
+		defer state.ReleaseLockFenced(m.exec, lk, app)
+		return NewManager(&state.FencedExecutor{Executor: m.exec, Lock: lk}, m.out).Upgrade(ctx, app, name, newImage, cfg)
+	}
+	for _, volume := range sortedKeys(cfg.VolumeOwnership) {
+		if err := m.docker.ValidateManagedVolume(ctx, app, name, volume, cfg.VolumeOwnership[volume]); err != nil {
+			return err
+		}
+	}
+	for _, volume := range sortedKeys(cfg.VolumeOwnership) {
+		if err := m.docker.ProvisionManagedVolume(ctx, app, name, volume, cfg.VolumeOwnership[volume]); err != nil {
+			return err
+		}
+	}
 	containerName := ContainerName(app, name)
 
 	fmt.Fprintf(m.out, "Pulling %s...\n", newImage)
@@ -529,6 +593,9 @@ func (m *Manager) reconcileDataOwnership(ctx context.Context, app, name string, 
 
 	accDir := fmt.Sprintf("%s/%s/accessories/%s", deploymentsDir, app, name)
 	for _, volName := range sortedKeys(cfg.Volumes) {
+		if _, explicit := cfg.VolumeOwnership[volName]; explicit {
+			continue
+		}
 		dir := fmt.Sprintf("%s/%s", accDir, volName)
 		dirOwner, ownErr := m.exec.Run(ctx, fmt.Sprintf("stat -c '%%u' %s 2>/dev/null", ssh.ShellQuote(dir)))
 		if ownErr != nil || strings.TrimSpace(dirOwner) == "" || strings.TrimSpace(dirOwner) == uid {
@@ -575,8 +642,14 @@ func connectionEnvVars(app, name, image string, port int, env map[string]string)
 		vars["DATABASE_URL"] = dbURL("postgres", user, password, alias, port, db)
 
 	case isImageType(image, "mysql"), isImageType(image, "mariadb"):
-		password := env["MYSQL_ROOT_PASSWORD"]
-		db := env["MYSQL_DATABASE"]
+		password := env["MARIADB_ROOT_PASSWORD"]
+		if password == "" {
+			password = env["MYSQL_ROOT_PASSWORD"]
+		}
+		db := env["MARIADB_DATABASE"]
+		if db == "" {
+			db = env["MYSQL_DATABASE"]
+		}
 		if db == "" {
 			db = app
 		}
@@ -635,11 +708,22 @@ func generatePassword() (string, error) {
 	return hex.EncodeToString(b), nil
 }
 
-func sortedKeys(m map[string]string) []string {
+func sortedKeys[V any](m map[string]V) []string {
 	keys := make([]string, 0, len(m))
 	for k := range m {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
 	return keys
+}
+
+func withoutOwnedVolumes(cfg config.AccessoryConfig) config.AccessoryConfig {
+	copyCfg := cfg
+	copyCfg.Volumes = make(map[string]string)
+	for name, target := range cfg.Volumes {
+		if _, explicit := cfg.VolumeOwnership[name]; !explicit {
+			copyCfg.Volumes[name] = target
+		}
+	}
+	return copyCfg
 }

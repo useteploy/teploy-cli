@@ -28,15 +28,21 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"time"
 
+	"github.com/useteploy/teploy/internal/build"
+	"github.com/useteploy/teploy/internal/config"
 	"github.com/useteploy/teploy/internal/state"
 )
 
 // PlanRecordSchemaVersion is the plan record's schema version.
-const PlanRecordSchemaVersion = 1
+const PlanRecordSchemaVersion = 2
 
 // Image resolution classes: what the plan could and could not bind.
 const (
@@ -80,12 +86,13 @@ type PlanRecord struct {
 	VersionExplicit bool `json:"version_explicit,omitempty"`
 
 	// ConfigDigest is the effective-config digest
-	// (config.NormalizeAndDigest) over the plan's app config with the
+	// (config.ExecutionBindingDigest) over the plan's app config with the
 	// image reference the plan resolved — "" for a build deploy, whose
 	// image does not exist at plan time. The DEPLOYED receipt carries
 	// its own manifest digest computed with the built image; the plan id
 	// (stamped into that receipt) is the tie between the two.
-	ConfigDigest string `json:"config_digest"`
+	ConfigDigest    string   `json:"config_digest"`
+	InputExclusions []string `json:"input_exclusions,omitempty"`
 
 	Image       PlanImageIdentity `json:"image"`
 	TargetState PlanTargetState   `json:"target_state"`
@@ -160,6 +167,9 @@ func computePlanID(rec *PlanRecord) string {
 	fmt.Fprintf(h, "destination=%s\n", rec.Destination)
 	fmt.Fprintf(h, "target_version=%s\n", rec.TargetVersion)
 	fmt.Fprintf(h, "config_digest=%s\n", rec.ConfigDigest)
+	for _, path := range rec.InputExclusions {
+		fmt.Fprintf(h, "input_exclusion=%q\n", path)
+	}
 	fmt.Fprintf(h, "context_fingerprint=%s\n", rec.Image.ContextFingerprint)
 	fmt.Fprintf(h, "dockerfile_sha256=%s\n", rec.Image.DockerfileSHA256)
 	fmt.Fprintf(h, "generation=%d\n", rec.TargetState.Generation)
@@ -291,4 +301,253 @@ func loadPlanFile(path string) (*PlanRecord, error) {
 		return nil, fmt.Errorf("plan file %s is not self-consistent: recorded id %s, identity recomputes to %s — the record was edited after planning; re-plan", path, rec.PlanID, want)
 	}
 	return &rec, nil
+}
+
+// freezePlanInputs copies the admitted source into a private tree. Apply then
+// verifies and builds that same tree, so edits to the user's checkout cannot
+// change the bytes between review validation and transfer/build.
+func freezePlanInputs(exclusions []string, cfg *config.AppConfig) (string, error) {
+	src, err := resolveReviewedSource(cfg)
+	if err != nil {
+		return "", err
+	}
+	root, err := filepath.Abs(".")
+	if err != nil {
+		return "", err
+	}
+	snapshot, err := os.MkdirTemp("", "teploy-reviewed-inputs-*")
+	if err != nil {
+		return "", err
+	}
+	privateWorkspace := snapshot
+	snapshot = filepath.Join(privateWorkspace, "tree")
+	rootInfo, err := os.Stat(root)
+	if err != nil {
+		os.RemoveAll(privateWorkspace)
+		return "", err
+	}
+	if err := os.Mkdir(snapshot, 0700); err != nil {
+		os.RemoveAll(privateWorkspace)
+		return "", err
+	}
+	ok := false
+	defer func() {
+		if !ok {
+			os.RemoveAll(privateWorkspace)
+		}
+	}()
+	excluded := map[string]bool{}
+	for _, path := range exclusions {
+		excluded[path] = true
+	}
+	copyFile := func(rel string, private bool) error {
+		in, err := os.Open(filepath.Join(root, rel))
+		if err != nil {
+			return err
+		}
+		defer in.Close()
+		info, err := in.Stat()
+		if err != nil {
+			return err
+		}
+		dest := filepath.Join(snapshot, rel)
+		if err := os.MkdirAll(filepath.Dir(dest), 0700); err != nil {
+			return err
+		}
+		mode := info.Mode().Perm()
+		if private {
+			mode = 0600
+		}
+		out, err := os.OpenFile(dest, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
+		if err != nil {
+			return err
+		}
+		_, copyErr := io.Copy(out, in)
+		modeErr := out.Chmod(mode)
+		closeErr := out.Close()
+		return errors.Join(copyErr, modeErr, closeErr)
+	}
+	admitted := map[string]bool{}
+	for _, rel := range src.Entries {
+		if !excluded[rel] {
+			admitted[rel] = true
+		}
+	}
+	for _, rel := range src.Entries {
+		if excluded[rel] {
+			continue
+		}
+		info, err := os.Lstat(filepath.Join(root, rel))
+		if err != nil {
+			return "", err
+		}
+		dest := filepath.Join(snapshot, rel)
+		if info.Mode().IsRegular() {
+			if err := copyFile(rel, false); err != nil {
+				return "", err
+			}
+			continue
+		}
+		if info.IsDir() {
+			if err := os.MkdirAll(dest, 0700); err != nil {
+				return "", err
+			}
+			continue
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			target, err := os.Readlink(filepath.Join(root, rel))
+			if err != nil {
+				return "", err
+			}
+			if filepath.IsAbs(target) {
+				return "", fmt.Errorf("reviewed apply requires relative source symlinks: %s", rel)
+			}
+			resolved, err := filepath.EvalSymlinks(filepath.Join(root, rel))
+			if err != nil {
+				return "", err
+			}
+			relative, err := filepath.Rel(root, resolved)
+			if err != nil {
+				return "", err
+			}
+			if relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+				return "", fmt.Errorf("source symlink escapes reviewed input: %s", rel)
+			}
+			if targetInfo, err := os.Stat(resolved); err != nil {
+				return "", err
+			} else if !targetInfo.IsDir() && !admitted[filepath.ToSlash(relative)] {
+				return "", fmt.Errorf("source symlink targets an unreviewed file: %s", rel)
+			}
+			if err := os.MkdirAll(filepath.Dir(dest), 0700); err != nil {
+				return "", err
+			}
+			if err := os.Symlink(target, dest); err != nil {
+				return "", err
+			}
+			continue
+		}
+		return "", fmt.Errorf("unsupported reviewed source entry %s", rel)
+	}
+	// Admission controls and TLS input files stay private and are excluded from
+	// source transfer by the same protected-path rules as the original tree.
+	controls := []string{".teployignore", ".dockerignore", ".gitignore"}
+	if cfg.TLS != nil {
+		controls = append(controls, cfg.TLS.Cert, cfg.TLS.Key)
+	}
+	for _, name := range controls {
+		if name == "" || filepath.IsAbs(name) {
+			continue
+		}
+		clean := filepath.Clean(name)
+		if clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+			continue
+		}
+		if _, err := os.Stat(filepath.Join(snapshot, clean)); err == nil {
+			continue
+		}
+		if _, err := os.Stat(filepath.Join(root, clean)); errors.Is(err, os.ErrNotExist) {
+			continue
+		} else if err != nil {
+			return "", err
+		}
+		if err := copyFile(clean, true); err != nil {
+			return "", err
+		}
+	}
+	// Preserve source directory modes inside the private root: these modes can
+	// become image metadata through Docker COPY, and must not become 0700 merely
+	// because the snapshot's admission workspace is private.
+	directories := map[string]bool{}
+	for rel := range admitted {
+		parent := filepath.Dir(rel)
+		if info, err := os.Lstat(filepath.Join(root, rel)); err == nil && info.IsDir() {
+			directories[rel] = true
+		}
+		for parent != "." {
+			directories[parent] = true
+			parent = filepath.Dir(parent)
+		}
+	}
+	for rel := range directories {
+		info, err := os.Stat(filepath.Join(root, rel))
+		if err != nil {
+			return "", err
+		}
+		if err := os.Chmod(filepath.Join(snapshot, rel), info.Mode().Perm()); err != nil {
+			return "", err
+		}
+	}
+
+	if err := os.Chmod(snapshot, rootInfo.Mode().Perm()); err != nil {
+		return "", err
+	}
+	ok = true
+	return snapshot, nil
+}
+
+// A prebuilt static source is uploaded even when Git ignores it. Include that
+// actual serving tree alongside project build inputs so dist/ is both bound
+// and frozen; protected configuration and secret files still never transfer.
+func resolveReviewedSource(cfg *config.AppConfig) (*build.Source, error) {
+	src, err := build.ResolveSource(".")
+	if err != nil {
+		return nil, err
+	}
+	if cfg == nil || !cfg.IsStatic() {
+		return src, nil
+	}
+	root, err := filepath.Abs(".")
+	if err != nil {
+		return nil, err
+	}
+	source, err := filepath.Abs(cfg.Source)
+	if err != nil {
+		return nil, err
+	}
+	rel, err := filepath.Rel(root, source)
+	if err != nil {
+		return nil, err
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return nil, fmt.Errorf("reviewed static source must be inside the project directory; place the serving tree under the project before planning")
+	}
+	if _, err := os.Stat(source); errors.Is(err, os.ErrNotExist) && len(cfg.Build) > 0 {
+		return src, nil
+	} else if err != nil {
+		return nil, err
+	}
+	entries := map[string]bool{}
+	for _, entry := range src.Entries {
+		entries[entry] = true
+	}
+	err = filepath.WalkDir(source, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		relative, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		relative = filepath.ToSlash(relative)
+		if relative == "." {
+			return nil
+		}
+		if src.Rules.IsProtected(relative, entry.IsDir()) {
+			if entry.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		entries[relative] = true
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	src.Entries = src.Entries[:0]
+	for entry := range entries {
+		src.Entries = append(src.Entries, entry)
+	}
+	sort.Strings(src.Entries)
+	return src, nil
 }

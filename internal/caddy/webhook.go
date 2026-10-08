@@ -129,11 +129,14 @@ func stripWebhookFragment(block, app string) string {
 // TEPLOY markers (extractCaddyfileBlock's contract).
 func injectWebhookFragment(block, app string, cfg *webhookRouteConfig) (string, error) {
 	lines := strings.Split(block, "\n")
-	if len(lines) < 2 || !strings.HasSuffix(strings.TrimSpace(lines[0]), "{") {
-		return "", fmt.Errorf("cannot place the webhook route: %s's site block has no recognizable opening line", app)
+	opening, err := siteOpeningLine(lines)
+	if err != nil {
+		return "", fmt.Errorf("cannot place webhook route for %s: %w", app, err)
 	}
 	fragment := webhookFragment(app, cfg)
-	out := append([]string{lines[0], strings.TrimRight(fragment, "\n")}, lines[1:]...)
+	out := append([]string{}, lines[:opening+1]...)
+	out = append(out, strings.TrimRight(fragment, "\n"))
+	out = append(out, lines[opening+1:]...)
 	return strings.Join(out, "\n"), nil
 }
 

@@ -315,10 +315,16 @@ func mergeSecretVaultRefs(ctx context.Context, exec ssh.Executor, appCfg *config
 	if dst == nil {
 		dst = make(map[string]string)
 	}
-	if len(openbao.CollectRefs(appCfg.Env)) == 0 {
+	directives := make(map[string]string, len(appCfg.Env))
+	for k, v := range appCfg.Env {
+		if _, literal := appCfg.EnvLiteral[k]; !literal {
+			directives[k] = v
+		}
+	}
+	if len(openbao.CollectRefs(directives)) == 0 {
 		return dst, nil
 	}
-	resolved, err := openbao.NewClient(exec, os.Stderr).ResolveEnvRefs(ctx, appCfg.App, appCfg.Secret.Accessory, appCfg.Env)
+	resolved, err := openbao.NewClient(exec, os.Stderr).ResolveEnvRefs(ctx, appCfg.App, appCfg.Secret.Accessory, directives)
 	if err != nil {
 		return nil, fmt.Errorf("resolving vault references: %w", err)
 	}

@@ -65,7 +65,8 @@ func PushEvent(body []byte, branch string) (ok bool) {
 // Empty when the payload carries no usable commit: a non-push shape (the
 // caller has already filtered with PushEvent), a branch deletion, the
 // all-zero deletion marker, or a malformed hash. An empty result means
-// "deploy the tip and say so", never "pin to garbage".
+// "refuse authenticated-event deployment". Explicit scheduler/manual tip
+// mode is admitted separately and must not infer authentication from this.
 func PushCommit(body []byte) string {
 	var p pushPayload
 	if err := json.Unmarshal(body, &p); err != nil {

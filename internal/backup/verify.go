@@ -2,8 +2,12 @@ package backup
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -49,7 +53,7 @@ func (c *Client) InspectAccessory(ctx context.Context, app, name string) (image 
 	}
 	env = make(map[string]string)
 	for _, line := range strings.Split(rawEnv, "\n") {
-		line = strings.TrimSpace(line)
+		line = strings.TrimSuffix(line, "\r")
 		if line == "" {
 			continue
 		}
@@ -113,7 +117,7 @@ func verifyTmpDir() string {
 	return "/var/tmp"
 }
 
-func (c *Client) VerifyBackup(ctx context.Context, app, name, date string, s3 S3Config) (*VerifyResult, error) {
+func (c *Client) VerifyBackup(ctx context.Context, app, name, date string, s3 S3Config) (retResult *VerifyResult, retErr error) {
 	if err := c.ensureAWSCLI(ctx); err != nil {
 		return nil, err
 	}
@@ -138,32 +142,35 @@ func (c *Client) VerifyBackup(ctx context.Context, app, name, date string, s3 S3
 		App: app, Accessory: name, Image: image, Date: date, SizeBytes: size,
 	}
 
-	scratch := app + "-" + name + "-verify"
-	// /var/tmp, not /tmp. Verifying a backup means writing the whole dataset
-	// to disk twice (the archive, then the extract), and /tmp is a tmpfs on
-	// many distributions — RAM-sized. A 28 GB Nucleus accessory against a
-	// 15 GB tmpfs failed here with "tar: Wrote only 2560 of 10240 bytes",
-	// which reads like a corrupt archive and is not: the archive was fine and
-	// the target was full. /var/tmp is disk-backed by convention and survives
-	// the cleanup semantics we want. TEPLOY_VERIFY_TMPDIR overrides it for
-	// hosts that keep their space somewhere else.
-	tmpDir := verifyTmpDir()
-	tmpBase := fmt.Sprintf("%s/teploy-verify-%s-%s", tmpDir, app, name)
-
-	// Always clean up, pass or fail — a leftover scratch container must never
-	// survive a verification run. Covers every per-type artifact: the
-	// downloaded dump (tmpBase.sql.gz/.rdb.gz/.archive.gz/.tar.gz) and the
-	// extract dir (tmpBase.d) — a 597 MB .tar.gz was found orphaned in /tmp
-	// on a prod box because only tmpBase and tmpBase.d were removed.
+	var nonce [16]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return nil, err
+	}
+	owner := hex.EncodeToString(nonce[:])
+	scratch := "teploy-backup-verify-" + owner
+	workspace, err := c.exec.Run(ctx, "umask 077; mktemp -d "+ssh.ShellQuote(verifyTmpDir()+"/teploy-verify.XXXXXXXX"))
+	if err != nil {
+		return nil, fmt.Errorf("creating private verification workspace: %w", err)
+	}
+	workspace = strings.TrimSpace(workspace)
+	if !strings.HasPrefix(workspace, verifyTmpDir()+"/teploy-verify.") || strings.ContainsAny(workspace, "\n\r") || filepath.Clean(workspace) != workspace {
+		return nil, fmt.Errorf("invalid verification workspace")
+	}
+	tmpBase := workspace + "/backup"
 	defer func() {
-		_, _ = c.exec.Run(context.WithoutCancel(ctx), fmt.Sprintf(
-			"docker rm -f %s >/dev/null 2>&1; rm -rf %s %s.d %s.sql.gz %s.rdb.gz %s.archive.gz %s.tar.gz",
-			ssh.ShellQuote(scratch), ssh.ShellQuote(tmpBase), ssh.ShellQuote(tmpBase),
-			ssh.ShellQuote(tmpBase), ssh.ShellQuote(tmpBase), ssh.ShellQuote(tmpBase),
-			ssh.ShellQuote(tmpBase)))
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		defer cancel()
+		_, cleanupErr := c.exec.Run(cleanupCtx, fmt.Sprintf("if [ \"$(docker inspect -f '{{index .Config.Labels \"teploy.verify.owner\"}}' %s 2>/dev/null)\" = %s ]; then docker rm -f %s >/dev/null; fi; rm -rf -- %s", ssh.ShellQuote(scratch), ssh.ShellQuote(owner), ssh.ShellQuote(scratch), ssh.ShellQuote(workspace)))
+		if cleanupErr != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("cleaning verification scratch: %w", cleanupErr))
+			if retResult != nil {
+				retResult.OK = false
+				retResult.Detail = "scratch cleanup failed"
+			}
+		}
 	}()
-	// Remove any stale scratch from a previous interrupted run.
-	_, _ = c.exec.Run(ctx, fmt.Sprintf("docker rm -f %s >/dev/null 2>&1 || true", ssh.ShellQuote(scratch)))
+	// The unique container name and owner label keep cleanup invocation-scoped.
+	env["TEPLOY_VERIFY_OWNER"] = owner
 
 	switch {
 	case isDBType(image, "postgres"):
@@ -198,21 +205,30 @@ func (c *Client) VerifyBackup(ctx context.Context, app, name, date string, s3 S3
 	return res, nil
 }
 
-// envFlags renders `-e K=V` docker-run flags for the env keys relevant to a
-// DB image, cloning the source accessory's configuration so the scratch
-// container authenticates exactly like the one the backup was taken from.
-func envFlags(env map[string]string, prefixes ...string) string {
-	var parts []string
-	for k, v := range env {
+// verifyEnv stages database environment in the private workspace; values never enter argv.
+func (c *Client) verifyEnv(ctx context.Context, env map[string]string, tmpBase string, prefixes ...string) (string, error) {
+	var keys []string
+	for k := range env {
 		for _, p := range prefixes {
 			if strings.HasPrefix(k, p) {
-				parts = append(parts, "-e "+ssh.ShellQuote(k+"="+v))
+				keys = append(keys, k)
 				break
 			}
 		}
 	}
-	sort.Strings(parts)
-	return strings.Join(parts, " ")
+	sort.Strings(keys)
+	var data strings.Builder
+	for _, k := range keys {
+		if strings.ContainsAny(env[k], "\r\n\x00") {
+			return "", fmt.Errorf("invalid scratch environment value")
+		}
+		fmt.Fprintf(&data, "%s=%s\n", k, env[k])
+	}
+	path := tmpBase + ".env"
+	if err := c.exec.Upload(ctx, strings.NewReader(data.String()), path, "0600"); err != nil {
+		return "", err
+	}
+	return "--label teploy.verify.owner=" + ssh.ShellQuote(env["TEPLOY_VERIFY_OWNER"]) + " --env-file " + ssh.ShellQuote(path), nil
 }
 
 func (c *Client) download(ctx context.Context, s3Key, dest string, s3 S3Config) error {
@@ -245,7 +261,10 @@ func (c *Client) verifyPostgres(ctx context.Context, res *VerifyResult, app, nam
 		return err
 	}
 
-	flags := envFlags(env, "POSTGRES_")
+	flags, err := c.verifyEnv(ctx, env, tmpBase, "POSTGRES_")
+	if err != nil {
+		return err
+	}
 	if _, ok := env["POSTGRES_PASSWORD"]; !ok {
 		// Source ran without auth config (trust); scratch images require one.
 		flags += " -e POSTGRES_HOST_AUTH_METHOD=trust"
@@ -261,8 +280,8 @@ func (c *Client) verifyPostgres(ctx context.Context, res *VerifyResult, app, nam
 
 	fmt.Fprintf(c.out, "Restoring into scratch...\n")
 	if _, err := c.exec.Run(ctx, fmt.Sprintf(
-		"gunzip -c %s | docker exec -i %s psql -q -v ON_ERROR_STOP=1 -U %s %s >/dev/null",
-		ssh.ShellQuote(dump), ssh.ShellQuote(scratch), ssh.ShellQuote(user), ssh.ShellQuote(db))); err != nil {
+		"gunzip -c %s > %s.sql && docker exec -i %s psql -q -v ON_ERROR_STOP=1 -U %s %s < %s.sql >/dev/null",
+		ssh.ShellQuote(dump), ssh.ShellQuote(tmpBase), ssh.ShellQuote(scratch), ssh.ShellQuote(user), ssh.ShellQuote(db), ssh.ShellQuote(tmpBase))); err != nil {
 		return fmt.Errorf("restore into scratch failed: %w", err)
 	}
 
@@ -289,7 +308,10 @@ func (c *Client) verifyMySQL(ctx context.Context, res *VerifyResult, app, name, 
 		return err
 	}
 
-	flags := envFlags(env, "MYSQL_", "MARIADB_")
+	flags, err := c.verifyEnv(ctx, env, tmpBase, "MYSQL_", "MARIADB_")
+	if err != nil {
+		return err
+	}
 	if _, ok := env["MYSQL_ROOT_PASSWORD"]; !ok {
 		if _, ok2 := env["MARIADB_ROOT_PASSWORD"]; !ok2 {
 			flags += " -e MYSQL_ALLOW_EMPTY_PASSWORD=yes"
@@ -300,25 +322,24 @@ func (c *Client) verifyMySQL(ctx context.Context, res *VerifyResult, app, name, 
 		"docker run -d --name %s %s %s >/dev/null", ssh.ShellQuote(scratch), flags, ssh.ShellQuote(image))); err != nil {
 		return fmt.Errorf("starting scratch container: %w", err)
 	}
-	// mysqladmin ping via socket mirrors the backup's `mysqldump -u root`
-	// (socket auth, no password on argv).
-	if err := c.waitReady(ctx, scratch, "mysqladmin ping -u root --silent", 40); err != nil {
+	client, admin := "mysql", "mysqladmin"
+	if isDBType(image, "mariadb") {
+		client, admin = "mariadb", "mariadb-admin"
+	}
+	prelude := `MYSQL_PWD=${MYSQL_ROOT_PASSWORD:-${MARIADB_ROOT_PASSWORD:-}}; export MYSQL_PWD; `
+	if err := c.waitReady(ctx, scratch, "sh -c "+ssh.ShellQuote(prelude+"exec "+admin+" ping -u root --silent"), 40); err != nil {
 		return err
 	}
-
-	fmt.Fprintf(c.out, "Restoring into scratch...\n")
-	if _, err := c.exec.Run(ctx, fmt.Sprintf(
-		"gunzip -c %s | docker exec -i %s mysql -u root %s",
-		ssh.ShellQuote(dump), ssh.ShellQuote(scratch), ssh.ShellQuote(db))); err != nil {
+	restore := prelude + "exec " + client + " -u root " + ssh.ShellQuote(db)
+	if _, err := c.exec.Run(ctx, "gunzip -c "+ssh.ShellQuote(dump)+" > "+ssh.ShellQuote(tmpBase+".sql")+" && docker exec -i "+ssh.ShellQuote(scratch)+" sh -c "+ssh.ShellQuote(restore)+" < "+ssh.ShellQuote(tmpBase+".sql")); err != nil {
 		return fmt.Errorf("restore into scratch failed: %w", err)
 	}
-
-	out, err := c.exec.Run(ctx, fmt.Sprintf(
-		"docker exec %s sh -c %s", ssh.ShellQuote(scratch),
-		ssh.ShellQuote(fmt.Sprintf("mysql -u root -N -e \"SHOW TABLES\" %s | wc -l", db))))
+	query := prelude + "exec " + client + " -u root -N -e " + ssh.ShellQuote("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = '"+strings.ReplaceAll(db, "'", "''")+"'")
+	out, err := c.exec.Run(ctx, "docker exec "+ssh.ShellQuote(scratch)+" sh -c "+ssh.ShellQuote(query))
 	if err != nil {
 		return fmt.Errorf("verify query failed: %w", err)
 	}
+
 	n, _ := strconv.Atoi(strings.TrimSpace(out))
 	res.Metric = fmt.Sprintf("tables=%d", n)
 	if n == 0 {
@@ -339,9 +360,9 @@ func (c *Client) verifyRedis(ctx context.Context, res *VerifyResult, app, name, 
 	// Create stopped, seed the rdb, then start — so redis boots FROM the
 	// backup (a corrupt rdb fails the readiness probe).
 	cmd := fmt.Sprintf(
-		"gunzip -c %s > %s.rdb && docker create --name %s %s >/dev/null && docker cp %s.rdb %s:/data/dump.rdb && docker start %s >/dev/null",
+		"gunzip -c %s > %s.rdb && docker create --name %s --label teploy.verify.owner=%s %s >/dev/null && docker cp %s.rdb %s:/data/dump.rdb && docker start %s >/dev/null",
 		ssh.ShellQuote(dump), ssh.ShellQuote(tmpBase),
-		ssh.ShellQuote(scratch), ssh.ShellQuote(image),
+		ssh.ShellQuote(scratch), ssh.ShellQuote(env["TEPLOY_VERIFY_OWNER"]), ssh.ShellQuote(image),
 		ssh.ShellQuote(tmpBase), ssh.ShellQuote(scratch), ssh.ShellQuote(scratch))
 	if _, err := c.exec.Run(ctx, cmd); err != nil {
 		return fmt.Errorf("seeding scratch redis: %w", err)
@@ -365,10 +386,14 @@ func (c *Client) verifyMongo(ctx context.Context, res *VerifyResult, app, name, 
 		return err
 	}
 
+	flags, err := c.verifyEnv(ctx, env, tmpBase, "MONGO_")
+	if err != nil {
+		return err
+	}
 	fmt.Fprintf(c.out, "Starting scratch %s...\n", scratch)
 	if _, err := c.exec.Run(ctx, fmt.Sprintf(
 		"docker run -d --name %s %s %s >/dev/null",
-		ssh.ShellQuote(scratch), envFlags(env, "MONGO_"), ssh.ShellQuote(image))); err != nil {
+		ssh.ShellQuote(scratch), flags, ssh.ShellQuote(image))); err != nil {
 		return fmt.Errorf("starting scratch container: %w", err)
 	}
 	// mongosh on 5.x+, legacy mongo shell before that.
@@ -414,10 +439,14 @@ func (c *Client) verifyNucleus(ctx context.Context, res *VerifyResult, app, name
 		return fmt.Errorf("archive extract failed (or no nucleus-data dir inside): %w", err)
 	}
 
+	flags, err := c.verifyEnv(ctx, env, tmpBase, "NUCLEUS_")
+	if err != nil {
+		return err
+	}
 	fmt.Fprintf(c.out, "Booting scratch %s on the restored data dir...\n", scratch)
 	if _, err := c.exec.Run(ctx, fmt.Sprintf(
 		"docker run -d --name %s %s -v %s/nucleus-data:/data %s >/dev/null",
-		ssh.ShellQuote(scratch), envFlags(env, "NUCLEUS_"), ssh.ShellQuote(extractDir), ssh.ShellQuote(image))); err != nil {
+		ssh.ShellQuote(scratch), flags, ssh.ShellQuote(extractDir), ssh.ShellQuote(image))); err != nil {
 		return fmt.Errorf("starting scratch container: %w", err)
 	}
 

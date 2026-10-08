@@ -150,11 +150,11 @@ func TestServerListJSONWithoutConfigFile(t *testing.T) {
 }
 
 func TestLogsCommandFollowModes(t *testing.T) {
-	if got := logsCommand("app-web-v1", 50, true); got != "docker logs -f --tail 50 app-web-v1" {
+	if got := logsCommand("app-web-v1", 50, true); got != "docker logs -f --tail 50 'app-web-v1'" {
 		t.Fatalf("default logs command = %q", got)
 	}
 	got := logsCommand("app-web-v1", 100, false)
-	if got != "docker logs --tail 100 app-web-v1" {
+	if got != "docker logs --tail 100 'app-web-v1'" {
 		t.Fatalf("bounded logs command = %q", got)
 	}
 	if strings.Contains(got, " -f") {

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"github.com/useteploy/teploy/internal/state"
 	"io"
 	"sync"
 )
@@ -20,9 +21,10 @@ type ServerTarget struct {
 
 // Result tracks the outcome of a single-server deploy.
 type Result struct {
-	Server  string
-	Success bool
-	Error   error
+	Server                         string
+	Success                        bool
+	Error                          error
+	PublicationNeedsReconciliation bool
 }
 
 // PrefixWriter wraps a writer to prefix each line with a server name.
@@ -197,9 +199,10 @@ func parallelDeploy(ctx context.Context, servers []ServerTarget, parallel int, f
 			}
 
 			results[idx] = Result{
-				Server:  srv.Name,
-				Success: err == nil,
-				Error:   err,
+				Server:                         srv.Name,
+				Success:                        err == nil,
+				Error:                          err,
+				PublicationNeedsReconciliation: state.PreservePublishedState(err),
 			}
 
 			if err != nil {

@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"time"
@@ -14,6 +15,7 @@ import (
 	"github.com/useteploy/teploy/internal/releasemeta"
 	"github.com/useteploy/teploy/internal/secret"
 	"github.com/useteploy/teploy/internal/ssh"
+	"github.com/useteploy/teploy/internal/state"
 )
 
 // singleServerDeployer wraps the deploy logic for a single server.
@@ -22,6 +24,7 @@ type singleServerDeployer struct {
 	exec           ssh.Executor
 	out            io.Writer
 	keyPath        string
+	deployEngine   func(context.Context, deploy.Config, *state.Lock) error
 	migrateVolumes bool // auto-migrate foreign volume sources instead of aborting
 }
 
@@ -39,11 +42,42 @@ func newSingleServerDeployer(exec ssh.Executor, out io.Writer, keyPath string, m
 // build-from-source falls back to git (audit F10 — this path used to ignore
 // the flags entirely and always take gitShortHash, which failed outside a
 // checkout and mislabeled prebuilt deploys).
-func (s *singleServerDeployer) deployApp(ctx context.Context, appCfg *config.AppConfig, tags map[string]string, imageOverride, versionOverride string) error {
+func (s *singleServerDeployer) deployApp(ctx context.Context, appCfg *config.AppConfig, tags map[string]string, imageOverride, versionOverride string) (retErr error) {
+	if appCfg.Type == "static" {
+		return fmt.Errorf("fleet deployment of static applications is unsupported; deploy each static target explicitly")
+	}
+	if err := docker.NewClient(s.exec).EnsureManagedDirectory(ctx, appCfg.App, "", ""); err != nil {
+		return err
+	}
+	rawExecutor := s.exec
+	lk, err := state.AcquireLockFenced(ctx, rawExecutor, appCfg.App)
+	if err != nil {
+		return err
+	}
+	defer state.ReleaseLockFenced(rawExecutor, lk, appCfg.App)
+	lk.StartRenewal(rawExecutor)
+	invocation := *s
+	s = &invocation
+	s.exec = &state.FencedExecutor{Executor: rawExecutor, Lock: lk}
+	if err := admitDeploymentVolumes(ctx, s.exec, appCfg); err != nil {
+		return err
+	}
+	var migration *docker.VolumeMigration
+	defer func() {
+		if migration != nil {
+			if retErr == nil || state.PreservePublishedState(retErr) {
+				migration.Commit()
+			} else {
+				retErr = errors.Join(retErr, migration.Restore(ctx))
+			}
+		}
+	}()
 	image := imageOverride
+	if image == "" {
+		image = appCfg.Image
+	}
 
 	// Resolve version (mirrors deployAppConfig's ordering and rationale).
-	var err error
 	if versionOverride != "" {
 		if err := validateVersionArg(versionOverride); err != nil {
 			return err
@@ -176,8 +210,10 @@ func (s *singleServerDeployer) deployApp(ctx context.Context, appCfg *config.App
 			}
 			hostPath := fmt.Sprintf("/deployments/%s/volumes/%s", appCfg.App, name)
 			volumes[hostPath] = containerPath
-			if _, err := s.exec.Run(ctx, "mkdir -p "+hostPath); err != nil {
-				return fmt.Errorf("creating volume directory %s: %w", hostPath, err)
+			if _, owned := appCfg.VolumeOwnership[name]; !owned {
+				if err := docker.NewClient(s.exec).EnsureManagedDirectory(ctx, appCfg.App, "", name); err != nil {
+					return err
+				}
 			}
 		}
 	}
@@ -205,7 +241,8 @@ func (s *singleServerDeployer) deployApp(ctx context.Context, appCfg *config.App
 			if !s.migrateVolumes {
 				return docker.FormatMismatchError(appCfg.App, mismatches)
 			}
-			if err := docker.MigrateVolumes(ctx, s.exec, appCfg.App, mismatches, s.out); err != nil {
+			migration, err = docker.BeginVolumeMigration(ctx, s.exec, appCfg.App, mismatches, s.out)
+			if err != nil {
 				return fmt.Errorf("migrating volumes: %w", err)
 			}
 		}
@@ -258,7 +295,7 @@ func (s *singleServerDeployer) deployApp(ctx context.Context, appCfg *config.App
 	if err := releasemeta.WriteAttemptProvenance(ctx, s.exec, att, prov); err != nil {
 		fmt.Fprintf(s.out, "Warning: could not persist the deploy provenance receipt for %s@%s: %v\n", appCfg.App, version, err)
 	}
-	deployer := deploy.NewDeployer(s.exec, s.out)
+	deployer := deploy.NewDeployer(rawExecutor, s.out)
 	deployCfg := deployConfigFromApp(appCfg, image, version, envFiles, volumes, tlsCert, tlsKey, tlsInternal, appliedManifest, manifestSHA256)
 	deployCfg.Provenance = prov
 
@@ -272,5 +309,8 @@ func (s *singleServerDeployer) deployApp(ctx context.Context, appCfg *config.App
 		}
 	}
 
-	return deployer.Deploy(ctx, deployCfg)
+	if s.deployEngine != nil {
+		return s.deployEngine(ctx, deployCfg, lk)
+	}
+	return deployer.DeployFenced(ctx, deployCfg, lk)
 }

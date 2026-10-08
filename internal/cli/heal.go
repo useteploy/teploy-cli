@@ -89,7 +89,8 @@ type HealConfig struct {
 	Processes   []string `json:"processes"`       // opted-in process names (web is the only one with a probe surface)
 	MaxAttempts int      `json:"max_attempts"`    // consecutive restarts before giving up + alerting
 	BackoffSecs int      `json:"backoff_seconds"` // minimum seconds between restarts of the same container
-	HealthPath  string   `json:"health_path"`     // probe path (default /health)
+	HealthMode  string   `json:"health_mode,omitempty"`
+	HealthPath  string   `json:"health_path"` // probe path (default /health)
 }
 
 func (c HealConfig) withDefaults() HealConfig {
@@ -99,7 +100,7 @@ func (c HealConfig) withDefaults() HealConfig {
 	if c.BackoffSecs == 0 {
 		c.BackoffSecs = 60
 	}
-	if c.HealthPath == "" {
+	if c.HealthPath == "" && c.HealthMode != deploy.HealthModeTCP {
 		c.HealthPath = "/health"
 	}
 	if len(c.Processes) == 0 {
@@ -251,6 +252,12 @@ func runHealEnable(flags *Flags, cfg HealConfig, intervalSec int, noBinary bool)
 		return err
 	}
 	defer executor.Close()
+	if cfg.HealthPath == "" {
+		cfg.HealthPath = appCfg.Health.Path
+	}
+	if cfg.HealthMode == "" {
+		cfg.HealthMode = appCfg.Health.Mode
+	}
 	if intervalSec < 5 {
 		intervalSec = 30
 	}
@@ -356,7 +363,7 @@ func runHealPass(ctx context.Context, exec ssh.Executor, app string, out io.Writ
 		if err != nil || port == 0 {
 			continue // can't probe without a published port
 		}
-		if probeHealthy(ctx, exec, port, cfg.HealthPath) {
+		if deploy.NewDeployer(exec, io.Discard).HealthCheckAtWithConfig(ctx, port, c.Name, deploy.HealthConfig{Path: cfg.HealthPath, Mode: cfg.HealthMode, Timeout: 5 * time.Second, Interval: time.Second}) == nil {
 			delete(hs, c.Name) // recovered — reset attempt state
 			continue
 		}
@@ -411,23 +418,7 @@ func runHealPass(ctx context.Context, exec ssh.Executor, app string, out io.Writ
 // probeHealthy runs a single host-side health check, mirroring
 // internal/deploy/health.go: 200 = healthy; 404/3xx falls back to a TCP check.
 func probeHealthy(ctx context.Context, exec ssh.Executor, port int, path string) bool {
-	out, err := exec.Run(ctx, fmt.Sprintf("curl -s -o /dev/null -w '%%{http_code}' http://localhost:%d%s", port, path))
-	if err != nil {
-		return false
-	}
-	code := strings.TrimSpace(out)
-	if code == "200" {
-		return true
-	}
-	if code == "404" || strings.HasPrefix(code, "3") {
-		cmd, ok := deploy.TCPProbeCommand("localhost", port)
-		if !ok {
-			return false
-		}
-		_, terr := exec.Run(ctx, cmd)
-		return terr == nil
-	}
-	return false
+	return deploy.NewDeployer(exec, io.Discard).HealthCheckAtWithConfig(ctx, port, "", deploy.HealthConfig{Path: path, Timeout: 5 * time.Second, Interval: time.Second}) == nil
 }
 
 func readHealConf(ctx context.Context, exec ssh.Executor, app string) (HealConfig, bool, error) {

@@ -277,8 +277,12 @@ func runKvQuery(flags *Flags, t *kvTarget, sql string) (string, error) {
 
 	dk := docker.NewClient(executor)
 	container := accessories.ContainerName(appCfg.App, t.accessory)
-	command := fmt.Sprintf("nucleus shell -c %s --json", shellSingleQuote(sql))
-	output, err := dk.Exec(ctx, container, command)
+	help, err := dk.Exec(ctx, container, "nucleus shell --help")
+	if err != nil || !strings.Contains(help, "--command-stdin") {
+		return "", fmt.Errorf("Nucleus accessory requires shell --command-stdin support for private SQL transport; upgrade the Nucleus image")
+	}
+	command := "nucleus shell --command-stdin --json"
+	output, err := dk.ExecInput(ctx, container, command, strings.NewReader(sql))
 	if err != nil {
 		msg := strings.TrimSpace(output)
 		if msg != "" {

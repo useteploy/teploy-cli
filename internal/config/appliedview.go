@@ -59,11 +59,15 @@ func ParseAppliedManifest(data []byte) (*AppliedManifestView, error) {
 	if err := json.Unmarshal(data, &root); err != nil {
 		return nil, fmt.Errorf("parsing applied manifest: %w", err)
 	}
+	if root == nil {
+		return nil, fmt.Errorf("applied manifest root must be an object")
+	}
 	view := &AppliedManifestView{}
-	decodeString(root, "app", &view.App)
-	decodeString(root, "deployment_type", &view.DeploymentType)
-	decodeString(root, "domain", &view.Domain)
-	decodeString(root, "ingress_mode", &view.IngressMode)
+	for key, dst := range map[string]*string{"app": &view.App, "deployment_type": &view.DeploymentType, "domain": &view.Domain, "ingress_mode": &view.IngressMode} {
+		if err := decodeString(root, key, dst); err != nil {
+			return nil, err
+		}
+	}
 
 	if raw, ok := root["container"]; ok && len(raw) > 0 && string(raw) != "null" {
 		var c struct {
@@ -122,8 +126,14 @@ func ParseAppliedManifest(data []byte) (*AppliedManifestView, error) {
 	return view, nil
 }
 
-func decodeString(root map[string]json.RawMessage, key string, dst *string) {
+func decodeString(root map[string]json.RawMessage, key string, dst *string) error {
 	if raw, ok := root[key]; ok {
-		_ = json.Unmarshal(raw, dst)
+		if string(raw) == "null" {
+			return fmt.Errorf("applied manifest %s must be a string", key)
+		}
+		if err := json.Unmarshal(raw, dst); err != nil {
+			return fmt.Errorf("parsing applied manifest %s: %w", key, err)
+		}
 	}
+	return nil
 }

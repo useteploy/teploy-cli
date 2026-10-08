@@ -31,7 +31,7 @@ func doctorHappyMock() *ssh.MockExecutor {
 		ssh.MockCommand{Match: "docker manifest inspect", Output: `{"schemaVersion":2}`},
 		ssh.MockCommand{Match: "docker exec caddy", Output: `{}`},
 		ssh.MockCommand{Match: "'/deployments/.bin/teploy' version", Output: "teploy v0.1.37"},
-		ssh.MockCommand{Match: "find /deployments ", Output: ""},
+		ssh.MockCommand{Match: "scan=$(find /deployments ", Output: ""},
 	)
 }
 
@@ -180,7 +180,7 @@ func TestDoctorHumanTable(t *testing.T) {
 		ssh.MockCommand{Match: "docker manifest inspect", Output: `{}`},
 		ssh.MockCommand{Match: "docker exec caddy", Output: `{}`},
 		ssh.MockCommand{Match: "'/deployments/.bin/teploy' version", Output: "teploy v0.1.37"},
-		ssh.MockCommand{Match: "find /deployments ", Output: ""},
+		ssh.MockCommand{Match: "scan=$(find /deployments ", Output: ""},
 	)
 	report, _ := doctorRun(context.Background(), doctorTestDeps(mock), &Flags{}, "", doctorTestApp(), nil)
 	var out bytes.Buffer
@@ -677,7 +677,7 @@ func TestDoctorEndToEndAllOK(t *testing.T) {
 // outside doctor's read-only allowlist — the no-deployment-effects proof.
 func assertDoctorReadOnlyCalls(t *testing.T, calls []string) {
 	t.Helper()
-	readOnly := []string{
+	readOnly := []string{"scan=$(find",
 		"docker version",
 		"docker manifest inspect",
 		"docker exec caddy",
@@ -707,7 +707,7 @@ func assertDoctorReadOnlyCalls(t *testing.T, calls []string) {
 func TestDoctorSecretExposureCheck(t *testing.T) {
 	ctx := context.Background()
 	t.Run("clean host", func(t *testing.T) {
-		mock := ssh.NewMockExecutor("h", ssh.MockCommand{Match: "find /deployments ", Output: ""})
+		mock := ssh.NewMockExecutor("h", ssh.MockCommand{Match: "scan=$(find /deployments ", Output: ""})
 		if check := doctorSecretExposureCheck(ctx, mock); check.Result != "ok" {
 			t.Fatalf("check = %+v, want ok", check)
 		}
@@ -715,8 +715,8 @@ func TestDoctorSecretExposureCheck(t *testing.T) {
 	})
 	t.Run("leaked overlay fails with the paths", func(t *testing.T) {
 		mock := ssh.NewMockExecutor("h",
-			ssh.MockCommand{Match: "find /deployments \\( -name .git", Output: "/deployments/dash/meta/att/v1.0123456789abcdef/build/teploy.home.yml\n/deployments/dash/build/.env\n"},
-			ssh.MockCommand{Match: "find /deployments -mindepth 2", Output: "/deployments/dash/build\n"},
+			ssh.MockCommand{Match: "scan=$(find /deployments \\( -name .git", Output: "/deployments/dash/meta/att/v1.0123456789abcdef/build/teploy.home.yml\n/deployments/dash/build/.env\n"},
+			ssh.MockCommand{Match: "scan=$(find /deployments -mindepth 2", Output: "/deployments/dash/build\n"},
 		)
 		check := doctorSecretExposureCheck(ctx, mock)
 		if check.Result != "fail" {
@@ -741,8 +741,8 @@ func TestDoctorSecretExposureCheck(t *testing.T) {
 	})
 	t.Run("open build dir alone warns", func(t *testing.T) {
 		mock := ssh.NewMockExecutor("h",
-			ssh.MockCommand{Match: "find /deployments \\( -name .git", Output: ""},
-			ssh.MockCommand{Match: "find /deployments -mindepth 2", Output: "/deployments/ship/meta/att\n"},
+			ssh.MockCommand{Match: "scan=$(find /deployments \\( -name .git", Output: ""},
+			ssh.MockCommand{Match: "scan=$(find /deployments -mindepth 2", Output: "/deployments/ship/meta/att\n"},
 		)
 		check := doctorSecretExposureCheck(ctx, mock)
 		if check.Result != "warn" || !strings.Contains(check.Detail, "/deployments/ship/meta/att") {
@@ -750,7 +750,7 @@ func TestDoctorSecretExposureCheck(t *testing.T) {
 		}
 	})
 	t.Run("scan failure warns", func(t *testing.T) {
-		mock := ssh.NewMockExecutor("h", ssh.MockCommand{Match: "find /deployments ", Err: errors.New("ssh: connection lost")})
+		mock := ssh.NewMockExecutor("h", ssh.MockCommand{Match: "scan=$(find /deployments ", Err: errors.New("ssh: connection lost")})
 		if check := doctorSecretExposureCheck(ctx, mock); check.Result != "warn" {
 			t.Fatalf("check = %+v, want warn", check)
 		}
@@ -761,8 +761,8 @@ func TestDoctorSecretExposureCheck(t *testing.T) {
 			fmt.Fprintf(&many, "/deployments/a/build/x%d/.env\n", i)
 		}
 		mock := ssh.NewMockExecutor("h",
-			ssh.MockCommand{Match: "find /deployments \\( -name .git", Output: many.String()},
-			ssh.MockCommand{Match: "find /deployments -mindepth 2", Output: ""},
+			ssh.MockCommand{Match: "scan=$(find /deployments \\( -name .git", Output: many.String()},
+			ssh.MockCommand{Match: "scan=$(find /deployments -mindepth 2", Output: ""},
 		)
 		check := doctorSecretExposureCheck(ctx, mock)
 		if !strings.Contains(check.Detail, "200+ secret-bearing") || !strings.Contains(check.Detail, "(+196 more)") {

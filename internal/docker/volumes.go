@@ -2,9 +2,11 @@ package docker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
+	"time"
 
 	"github.com/useteploy/teploy/internal/ssh"
 )
@@ -117,10 +119,11 @@ func FormatMismatchError(app string, mismatches []VolumeMismatch) error {
 	fmt.Fprintln(&b, "      teploy-expected path before deploy. This stops the running container")
 	fmt.Fprintln(&b, "      first and preserves file ownership via cp -a.")
 	fmt.Fprintln(&b, "  (b) Migrate manually on the server, then re-run teploy deploy:")
-	for _, m := range mismatches {
-		fmt.Fprintf(&b, "        docker stop $(docker ps -q --filter label=teploy.app=%s --filter label=teploy.process=web)\n", shellEscape(app))
-		fmt.Fprintf(&b, "        mkdir -p %s && cp -a %s/. %s/\n", m.ExpectedSource, m.ExistingSource, m.ExpectedSource)
-	}
+	fmt.Fprintln(&b, "      Hold a manual app lock (teploy lock) and an exclusive administrator window first.")
+	fmt.Fprintln(&b, "      Run this ONE checked script. A failed inventory/stop refuses every copy.")
+	fmt.Fprintf(&b, "        sh -c %s\n", ssh.ShellQuote(manualMigrationScript(app, mismatches)))
+	fmt.Fprintln(&b, "      Keep the lock until redeploy/recovery; use the printed immutable IDs to restart old writers if needed, then teploy unlock.")
+
 	return fmt.Errorf("%s", b.String())
 }
 
@@ -132,38 +135,46 @@ func FormatMismatchError(app string, mismatches []VolumeMismatch) error {
 //
 // On any error the function returns immediately — the caller should treat
 // a partial migration as a failure state and not proceed with the deploy.
-func MigrateVolumes(ctx context.Context, exec ssh.Executor, app string, mismatches []VolumeMismatch, out io.Writer) error {
+func BeginVolumeMigration(ctx context.Context, exec ssh.Executor, app string, mismatches []VolumeMismatch, out io.Writer) (migration *VolumeMigration, retErr error) {
 	if len(mismatches) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	cidCmd := fmt.Sprintf(
-		"docker ps -aq --filter label=teploy.app=%s --filter label=teploy.process=web | head -n 1",
+		"docker ps -q --filter label=teploy.app=%s",
 		shellEscape(app),
 	)
 	cidOut, err := exec.Run(ctx, cidCmd)
 	if err != nil {
-		return fmt.Errorf("looking up existing container: %w", err)
+		return nil, fmt.Errorf("looking up existing container: %w", err)
 	}
-	cid := strings.TrimSpace(cidOut)
+	ids := strings.Fields(cidOut)
+	cid := strings.Join(ids, " ")
 	if cid == "" {
 		// No running container to migrate from — strange, but means there's
 		// nothing to copy. Treat as no-op rather than error.
 		fmt.Fprintln(out, "  (no running container found — nothing to migrate)")
-		return nil
+		return nil, nil
 	}
 
 	fmt.Fprintf(out, "Migrating %d volume(s) for %s...\n", len(mismatches), app)
 	fmt.Fprintf(out, "  Stopping container %s before copy...\n", cid[:min(12, len(cid))])
+	migration = &VolumeMigration{exec: exec, ids: ids}
+	recoveryHandle := migration
+	defer func() {
+		if retErr != nil {
+			retErr = errors.Join(retErr, recoveryHandle.Restore(ctx))
+		}
+	}()
 	if _, err := exec.Run(ctx, fmt.Sprintf("docker stop %s", cid)); err != nil {
-		return fmt.Errorf("stopping container before migration: %w", err)
+		return nil, fmt.Errorf("stopping container before migration: %w", err)
 	}
 
 	for _, m := range mismatches {
 		fmt.Fprintf(out, "  %s -> %s\n", m.ExistingSource, m.ExpectedSource)
 		mkdir := fmt.Sprintf("mkdir -p %s", shellEscape(m.ExpectedSource))
 		if _, err := exec.Run(ctx, mkdir); err != nil {
-			return fmt.Errorf("creating destination %s: %w", m.ExpectedSource, err)
+			return nil, fmt.Errorf("creating destination %s: %w", m.ExpectedSource, err)
 		}
 		// cp -a preserves ownership/perms/times; using "/." copies contents
 		// rather than the directory itself so the destination already-exists
@@ -173,12 +184,12 @@ func MigrateVolumes(ctx context.Context, exec ssh.Executor, app string, mismatch
 			shellEscape(m.ExistingSource), shellEscape(m.ExpectedSource),
 		)
 		if _, err := exec.Run(ctx, copyCmd); err != nil {
-			return fmt.Errorf("copying %s -> %s: %w", m.ExistingSource, m.ExpectedSource, err)
+			return nil, fmt.Errorf("copying %s -> %s: %w", m.ExistingSource, m.ExpectedSource, err)
 		}
 	}
 
 	fmt.Fprintln(out, "  Migration complete. Proceeding with deploy.")
-	return nil
+	return migration, nil
 }
 
 // shellEscape wraps a value in single quotes for safe shell embedding,
@@ -190,4 +201,60 @@ func shellEscape(s string) string {
 		return "''"
 	}
 	return "'" + strings.ReplaceAll(s, "'", "'\\''") + "'"
+}
+
+type VolumeMigration struct {
+	exec      ssh.Executor
+	ids       []string
+	committed bool
+}
+
+func (m *VolumeMigration) Commit() {
+	if m != nil {
+		m.committed = true
+	}
+}
+func (m *VolumeMigration) Restore(ctx context.Context) error {
+	if m == nil || m.committed {
+		return nil
+	}
+	recovery, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancel()
+	var result error
+	for _, id := range m.ids {
+		if _, err := m.exec.Run(recovery, "docker start "+ssh.ShellQuote(id)); err != nil {
+			result = errors.Join(result, err)
+		}
+	}
+	return result
+}
+func MigrateVolumes(ctx context.Context, exec ssh.Executor, app string, mismatches []VolumeMismatch, out io.Writer) error {
+	m, err := BeginVolumeMigration(ctx, exec, app, mismatches, out)
+	if err != nil {
+		return err
+	}
+	return m.Restore(ctx)
+}
+
+// manualMigrationScript inventories ALL app-labelled running writers, never
+// the first web process. Every path is quoted and every stop is checked.
+func manualMigrationScript(app string, mismatches []VolumeMismatch) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "set -eu\nids=$(docker ps --no-trunc -q --filter %s) || exit 1\nstopped=''\n", ssh.ShellQuote("label=teploy.app="+app))
+	b.WriteString(`for id in $ids; do
+ case $id in *[!0-9a-f]*|'') echo 'invalid writer ID' >&2; exit 1;; esac
+ [ ${#id} -eq 64 ] || exit 1
+ docker stop -- "$id" || { echo "stop failed; no copy performed; recovery IDs: $stopped $id" >&2; exit 1; }
+ stopped="$stopped $id"
+done
+`)
+	fmt.Fprintf(&b, `remaining=$(docker ps --no-trunc -q --filter %s) || exit 1
+[ -z "$remaining" ] || { echo 'writers remain; no copy performed' >&2; exit 1; }
+`, ssh.ShellQuote("label=teploy.app="+app))
+	for _, m := range mismatches {
+		fmt.Fprintf(&b, `mkdir -p -- %s && cp -a -- %s %s || { echo "copy failed; recovery IDs: $stopped" >&2; exit 1; }
+`, ssh.ShellQuote(m.ExpectedSource), ssh.ShellQuote(m.ExistingSource+"/."), ssh.ShellQuote(m.ExpectedSource+"/"))
+	}
+	b.WriteString("echo \"copy complete; keep writers stopped until deploy; recovery IDs: $stopped\"\n")
+	return b.String()
 }

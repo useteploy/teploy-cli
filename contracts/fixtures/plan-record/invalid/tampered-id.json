@@ -1,6 +1,6 @@
 {
-  "schema_version": 1,
-  "plan_id": "e6e098f1e0322e3f",
+  "schema_version": 2,
+  "plan_id": "1eefc411f1a95ead",
   "app": "myapp",
   "server": "srv.example.com",
   "server_name": "prod",

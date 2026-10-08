@@ -43,17 +43,19 @@ import (
 // config.AppConfig that matter for static and translates them into the form
 // the deployer needs (resolved hosts, container-side root path, etc.).
 type StaticConfig struct {
-	App          string
-	Domain       string // raw "a.com, www.a.com" — caddy.SetStaticRoute splits it
-	Source       string // local path to the directory to upload (the built dist/)
-	Build        []string
-	BuildRemote  bool
-	SPA          bool
-	SPAFallback  string
-	Cache        map[string]string
-	Headers      map[string]string
-	KeepReleases int // 0 = use default
-	CaddyExtra   string
+	ExpectedState      *state.GenerationExpectation
+	UnderLockPreflight func(context.Context) error
+	App                string
+	Domain             string // raw "a.com, www.a.com" — caddy.SetStaticRoute splits it
+	Source             string // local path to the directory to upload (the built dist/)
+	Build              []string
+	BuildRemote        bool
+	SPA                bool
+	SPAFallback        string
+	Cache              map[string]string
+	Headers            map[string]string
+	KeepReleases       int // 0 = use default
+	CaddyExtra         string
 
 	// Server-side mount path — the directory Caddy is configured to serve
 	// from, inside the Caddy container. See DefaultStaticMount.
@@ -136,6 +138,35 @@ func (d *StaticDeployer) Deploy(ctx context.Context, cfg StaticConfig) error {
 	start := time.Now()
 	fmt.Fprintf(d.out, "Deploying %s (static)\n", cfg.App)
 
+	// 4. Lock the app to avoid concurrent deploys racing on the symlink swap
+	// (F16: fenced, so a broken holder's late writes are refused).
+	if err := state.EnsureAppDir(ctx, d.exec, cfg.App); err != nil {
+		return fmt.Errorf("ensure app dir: %w", err)
+	}
+	lk, err := state.AcquireLockFenced(ctx, d.exec, cfg.App)
+	if err != nil {
+		return fmt.Errorf("acquire lock: %w", err)
+	}
+	defer state.ReleaseLockFenced(d.exec, lk, cfg.App)
+	lk.StartRenewal(d.exec)
+
+	// 5. Read prior state for rollback bookkeeping. A read failure aborts —
+	// treating unreadable state as "no state" would drop the rollback
+	// history and mislabel a replacement as a first deploy (audit F15).
+	prior, err := state.Read(ctx, d.exec, cfg.App)
+	if err != nil {
+		return fmt.Errorf("refusing to deploy with unreadable state for %s: %w", cfg.App, err)
+	}
+
+	if err := cfg.ExpectedState.Check(cfg.App, prior); err != nil {
+		return err
+	}
+	if cfg.UnderLockPreflight != nil {
+		if err := cfg.UnderLockPreflight(ctx); err != nil {
+			return err
+		}
+	}
+
 	// 1. Build (locally for now; remote build is a deferred feature).
 	if len(cfg.Build) > 0 {
 		if cfg.BuildRemote {
@@ -162,26 +193,6 @@ func (d *StaticDeployer) Deploy(ctx context.Context, cfg StaticConfig) error {
 	}
 	shortHash := hash[:12]
 	fmt.Fprintf(d.out, "  release %s\n", shortHash)
-
-	// 4. Lock the app to avoid concurrent deploys racing on the symlink swap
-	// (F16: fenced, so a broken holder's late writes are refused).
-	if err := state.EnsureAppDir(ctx, d.exec, cfg.App); err != nil {
-		return fmt.Errorf("ensure app dir: %w", err)
-	}
-	lk, err := state.AcquireLockFenced(ctx, d.exec, cfg.App)
-	if err != nil {
-		return fmt.Errorf("acquire lock: %w", err)
-	}
-	defer state.ReleaseLockFenced(d.exec, lk, cfg.App)
-	lk.StartRenewal(d.exec)
-
-	// 5. Read prior state for rollback bookkeeping. A read failure aborts —
-	// treating unreadable state as "no state" would drop the rollback
-	// history and mislabel a replacement as a first deploy (audit F15).
-	prior, err := state.Read(ctx, d.exec, cfg.App)
-	if err != nil {
-		return fmt.Errorf("refusing to deploy with unreadable state for %s: %w", cfg.App, err)
-	}
 
 	// 6. Ensure the releases dir exists, then rsync to a temp release dir and
 	//    atomically rename. If the release for this hash already exists we
@@ -270,6 +281,9 @@ func (d *StaticDeployer) Deploy(ctx context.Context, cfg StaticConfig) error {
 	// The commit runs under the fence (F16): the rename that makes the new
 	// release authoritative is a guarded effect.
 	if err := state.WriteFenced(ctx, d.exec, cfg.App, newState, lk); err != nil {
+		if state.PreservePublishedState(err) {
+			return err
+		}
 		return d.abortStaticStateCommit(ctx, cfg.App, cfg.StateDir, currentLink, prior, err)
 	}
 
@@ -730,6 +744,9 @@ func (d *StaticDeployer) Rollback(ctx context.Context, cfg StaticRollbackConfig)
 		newState.ApplyRelease(prior.PreviousRelease)
 	}
 	if err := state.WriteFenced(ctx, d.exec, cfg.App, newState, lk); err != nil {
+		if state.PreservePublishedState(err) {
+			return err
+		}
 		if restoreErr := d.restoreStaticLink(ctx, cfg.App, cfg.StateDir, prior); restoreErr != nil {
 			return fmt.Errorf("committing authoritative applied state after static rollback route switch: %w; restoring release %s failed: %v; the target release was left active", err, prior.CurrentHash, restoreErr)
 		}
@@ -832,6 +849,9 @@ func (d *StaticDeployer) RollbackStateOnly(ctx context.Context, app, toHash stri
 		newState.ApplyRelease(prior.PreviousRelease)
 	}
 	if err := state.WriteFenced(ctx, d.exec, app, newState, lk); err != nil {
+		if state.PreservePublishedState(err) {
+			return err
+		}
 		if restoreErr := d.restoreStaticLink(ctx, app, DefaultStateDir, prior); restoreErr != nil {
 			return fmt.Errorf("committing authoritative applied state after static rollback route switch: %w; restoring release %s failed: %v; the target release was left active", err, prior.CurrentHash, restoreErr)
 		}
@@ -886,3 +906,7 @@ func (d *StaticDeployer) ListReleases(ctx context.Context, app, stateDir string)
 	}
 	return releases, nil
 }
+
+// StaticSourceFingerprint binds the actual static files, including generated
+// output excluded from the project build context, to a reviewed apply.
+func StaticSourceFingerprint(dir string) (string, error) { return hashDir(dir) }

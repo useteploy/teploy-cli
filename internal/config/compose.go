@@ -138,6 +138,11 @@ func LoadCompose(dir string) (*AppConfig, error) {
 }
 
 func mapCompose(dir string, compose composeFile) (*AppConfig, error) {
+	absoluteDir, err := filepath.Abs(dir)
+	if err != nil {
+		return nil, err
+	}
+	dir = absoluteDir
 	cfg := &AppConfig{
 		App:         filepath.Base(dir),
 		Processes:   make(map[string]string),
@@ -213,12 +218,18 @@ func mapCompose(dir string, compose composeFile) (*AppConfig, error) {
 	}
 
 	webBuildContext := parseBuildContext(webService.Build)
+	webDockerfile, err := composeDockerfile(webService.Build)
+	if err != nil {
+		return nil, err
+	}
+	cfg.Context = webBuildContext
+	cfg.Dockerfile = webDockerfile
 
 	// Set domain placeholder — user must set this.
 	cfg.Domain = cfg.App + ".example.com"
 
 	// Web process gets empty command (use image CMD).
-	cfg.Processes["web"] = ""
+	cfg.Processes["web"] = parseCommand(webService.Command)
 
 	// If web service has an image (not build), use it.
 	if webService.Image != "" && webBuildContext == "" {
@@ -281,6 +292,10 @@ func mapCompose(dir string, compose composeFile) (*AppConfig, error) {
 		svc := services[name]
 
 		svcBuildContext := parseBuildContext(svc.Build)
+		svcDockerfile, buildErr := composeDockerfile(svc.Build)
+		if buildErr != nil {
+			return nil, fmt.Errorf("service %s: %w", name, buildErr)
+		}
 
 		// Check if it's a known accessory image.
 		if isAccessoryImage(svc.Image) {
@@ -291,8 +306,9 @@ func mapCompose(dir string, compose composeFile) (*AppConfig, error) {
 			// rather than translated or rejected (classification table).
 
 			acc := AccessoryConfig{
-				Image: svc.Image,
-				Port:  accessoryPort(svc.Image),
+				Image:   svc.Image,
+				Command: parseCommand(svc.Command),
+				Port:    accessoryPort(svc.Image),
 			}
 
 			// Map environment variables.
@@ -312,7 +328,7 @@ func mapCompose(dir string, compose composeFile) (*AppConfig, error) {
 		}
 
 		// Same build context as web → worker process.
-		if svcBuildContext != "" && svcBuildContext == webBuildContext {
+		if svcBuildContext != "" && svcBuildContext == webBuildContext && svcDockerfile == webDockerfile {
 			violations = append(violations, composeFieldViolations(name, svc)...)
 			if svc.Healthcheck != nil {
 				if composeHealthcheckDisabled(svc.Healthcheck) {
@@ -340,7 +356,7 @@ func mapCompose(dir string, compose composeFile) (*AppConfig, error) {
 		// Has a standalone image that isn't a known DB → treat as accessory.
 		if svc.Image != "" {
 			violations = append(violations, composeFieldViolations(name, svc)...)
-			acc := AccessoryConfig{Image: svc.Image}
+			acc := AccessoryConfig{Image: svc.Image, Command: parseCommand(svc.Command)}
 			env := parseEnvironment(svc.Environment)
 			if len(env) > 0 {
 				acc.Env = env
@@ -875,4 +891,21 @@ func isAccessoryImage(image string) bool {
 
 func accessoryPort(image string) int {
 	return knownAccessoryImages[imageBaseName(image)]
+}
+
+func composeDockerfile(build interface{}) (string, error) {
+	if v, ok := build.(map[string]interface{}); ok {
+		for k := range v {
+			if k != "context" && k != "dockerfile" {
+				return "", fmt.Errorf("unsupported compose build field %q; write teploy.yml explicitly", k)
+			}
+		}
+		if d, exists := v["dockerfile"]; exists {
+			if text, ok := d.(string); ok {
+				return text, nil
+			}
+			return "", fmt.Errorf("compose dockerfile must be a string")
+		}
+	}
+	return "", nil
 }

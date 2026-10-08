@@ -156,7 +156,7 @@ func TestWebhookHandler_ValidSignatureTriggersDeployOnce(t *testing.T) {
 	run := newCountingRun()
 	handler, ledger, queue := newAdmissionStack("s3cret", "", "myapp", run.run)
 
-	rec := postSigned(t, handler, "s3cret", "delivery-1", `{"ref":"refs/heads/main"}`)
+	rec := postSigned(t, handler, "s3cret", "delivery-1", `{"ref":"refs/heads/main","after":"51cff3c1f0bc59f6187e7040cc12a4e9b1eca7aa"}`)
 
 	if rec.Code != http.StatusOK {
 		t.Errorf("status = %d, want 200", rec.Code)
@@ -178,7 +178,7 @@ func TestWebhookHandler_InvalidSignatureNeverTriggers(t *testing.T) {
 	run := newCountingRun()
 	handler, _, _ := newAdmissionStack("s3cret", "", "myapp", run.run)
 
-	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"ref":"refs/heads/main"}`))
+	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"ref":"refs/heads/main","after":"51cff3c1f0bc59f6187e7040cc12a4e9b1eca7aa"}`))
 	req.Header.Set("X-Hub-Signature-256", "sha256=0000000000000000000000000000000000000000000000000000000000000000")
 	rec := httptest.NewRecorder()
 
@@ -217,8 +217,8 @@ func TestWebhookHandler_ReplayedDeliveryIgnored(t *testing.T) {
 	run := newCountingRun()
 	handler, _, queue := newAdmissionStack("s3cret", "", "myapp", run.run)
 
-	rec1 := postSigned(t, handler, "s3cret", "delivery-1", `{"ref":"refs/heads/main"}`)
-	rec2 := postSigned(t, handler, "s3cret", "delivery-1", `{"ref":"refs/heads/main"}`)
+	rec1 := postSigned(t, handler, "s3cret", "delivery-1", `{"ref":"refs/heads/main","after":"51cff3c1f0bc59f6187e7040cc12a4e9b1eca7aa"}`)
+	rec2 := postSigned(t, handler, "s3cret", "delivery-1", `{"ref":"refs/heads/main","after":"51cff3c1f0bc59f6187e7040cc12a4e9b1eca7aa"}`)
 
 	run.waitCall(t)
 	run.waitIdle(t, queue)
@@ -241,7 +241,7 @@ func TestWebhookHandler_GitLabToken(t *testing.T) {
 	run := newCountingRun()
 	handler, _, queue := newAdmissionStack("s3cret", "", "myapp", run.run)
 
-	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"ref":"refs/heads/main"}`))
+	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(`{"ref":"refs/heads/main","after":"51cff3c1f0bc59f6187e7040cc12a4e9b1eca7aa"}`))
 	req.Header.Set("X-Gitlab-Token", "s3cret")
 	rec := httptest.NewRecorder()
 
@@ -314,7 +314,7 @@ func TestWebhookHandler_OnDedupChangedCalledAfterDurableAdmission(t *testing.T) 
 		onDedupChanged: func() { changedCount++ },
 	})
 
-	postSigned(t, handler, "s3cret", "delivery-1", `{"ref":"refs/heads/main","after":"a"}`)
+	postSigned(t, handler, "s3cret", "delivery-1", `{"ref":"refs/heads/main","after":"86f7e437faa5a7fce15d1ddcb9eaeaea377667b8"}`)
 	if changedCount != 1 {
 		t.Errorf("onDedupChanged called %d times after durable admission, want 1", changedCount)
 	}
@@ -341,7 +341,7 @@ func TestWebhookHandler_OnlyWatchedBranchPushes(t *testing.T) {
 		body string
 		want bool
 	}{
-		{"watched branch", `{"ref":"refs/heads/main","commits":[{"added":["a"]}]}`, true},
+		{"watched branch", `{"ref":"refs/heads/main","after":"51cff3c1f0bc59f6187e7040cc12a4e9b1eca7aa","commits":[{"added":["a"]}]}`, true},
 		{"other branch", `{"ref":"refs/heads/develop","commits":[{"added":["a"]}]}`, false},
 		{"tag push", `{"ref":"refs/tags/v1.0.0"}`, false},
 		{"ping", `{}`, false},
@@ -372,7 +372,7 @@ func TestWebhookHandler_OnlyWatchedBranchPushes(t *testing.T) {
 func TestWebhookHandler_ContentReplayRejected(t *testing.T) {
 	run := newCountingRun()
 	handler, _, queue := newAdmissionStack("s3cret", "main", "myapp", run.run)
-	body := `{"ref":"refs/heads/main"}`
+	body := `{"ref":"refs/heads/main","after":"51cff3c1f0bc59f6187e7040cc12a4e9b1eca7aa"}`
 
 	if rec := postSigned(t, handler, "s3cret", "delivery-1", body); rec.Code != http.StatusOK {
 		t.Fatalf("first delivery status = %d, want 200", rec.Code)
@@ -401,16 +401,16 @@ func TestWebhookHandler_ReusedDeliveryIDDifferentContentNotSuppressed(t *testing
 	run := newCountingRun()
 	handler, _, queue := newAdmissionStack("s3cret", "", "myapp", run.run)
 
-	postSigned(t, handler, "s3cret", "same-delivery-id", `{"ref":"refs/heads/main","after":"aaaa"}`)
+	postSigned(t, handler, "s3cret", "same-delivery-id", `{"ref":"refs/heads/main","after":"70c881d4a26984ddce795f6f71817c9cf4480e79"}`)
 	run.waitCall(t)
-	postSigned(t, handler, "s3cret", "same-delivery-id", `{"ref":"refs/heads/main","after":"bbbb"}`)
+	postSigned(t, handler, "s3cret", "same-delivery-id", `{"ref":"refs/heads/main","after":"8aed1322e5450badb078e1fb60a817a1df25a2ca"}`)
 	run.waitCall(t)
 	run.waitIdle(t, queue)
 	if run.count() != 2 {
 		t.Errorf("distinct authenticated content under a reused delivery ID must both deploy, got %d", run.count())
 	}
 	// The SAME content replays to a no-op regardless of the header.
-	postSigned(t, handler, "s3cret", "same-delivery-id", `{"ref":"refs/heads/main","after":"aaaa"}`)
+	postSigned(t, handler, "s3cret", "same-delivery-id", `{"ref":"refs/heads/main","after":"70c881d4a26984ddce795f6f71817c9cf4480e79"}`)
 	run.waitIdle(t, queue)
 	if run.count() != 2 {
 		t.Errorf("replayed content must be a no-op, got %d", run.count())
@@ -466,25 +466,42 @@ func TestWebhookHandler_ThreadsCommitToTrigger(t *testing.T) {
 	}
 }
 
-// A delivery with NO usable commit still deploys — pinned to nothing (tip),
-// stated as such to the trigger.
-func TestWebhookHandler_NoCommitMeansTip(t *testing.T) {
-	var gotCommit string
+// C02: an authenticated delivery without a usable immutable commit is
+// REFUSED (422, delivery unrecorded so a corrected retry can admit) — it
+// must never fall through to moving-tip deployment. Explicit scheduler or
+// manual tip mode is a separate admission that cannot inherit this event's
+// authentication.
+func TestWebhookHandler_NoCommitRefusedNeverTip(t *testing.T) {
+	var gotCommit = "unset"
 	var gotMu sync.Mutex
+	ran := false
 	run := func(_ []string, _ bool, commit string) {
+		ran = true
 		gotMu.Lock()
 		gotCommit = commit
 		gotMu.Unlock()
 	}
-	handler, _, queue := newAdmissionStack("s3cret", "main", "myapp", run)
+	handler, ledger, queue := newAdmissionStack("s3cret", "main", "myapp", run)
 
-	postSigned(t, handler, "s3cret", "delivery-1", `{"ref":"refs/heads/main"}`)
+	for _, payload := range []string{
+		`{"ref":"refs/heads/main"}`,                                           // no after/checkout_sha at all
+		`{"ref":"refs/heads/main","after":""}`,                                // empty
+		`{"ref":"refs/heads/main","after":"abc"}`,                             // malformed hash
+		`{"ref":"refs/heads/main","after":"` + strings.Repeat("0", 40) + `"}`, // all-zero deletion marker
+	} {
+		rec := postSigned(t, handler, "s3cret", "delivery-nocommit", payload)
+		if rec.Code != http.StatusUnprocessableEntity {
+			t.Fatalf("payload %s: status = %d, want 422 refusing nonimmutable admission", payload, rec.Code)
+		}
+	}
 	waitQueueIdle(t, queue)
-
 	gotMu.Lock()
 	defer gotMu.Unlock()
-	if gotCommit != "" {
-		t.Errorf("payload without a commit pinned trigger to %q, want empty (tip)", gotCommit)
+	if ran {
+		t.Errorf("nonimmutable delivery reached the deploy trigger pinned to %q", gotCommit)
+	}
+	if got := len(ledger.snapshot()); got != 0 {
+		t.Errorf("refused delivery left %d durable records; the retry path must be able to admit a corrected payload", got)
 	}
 }
 

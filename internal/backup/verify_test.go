@@ -12,6 +12,7 @@ import (
 
 func TestLatestBackupDate_PicksNewest(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "umask 077; mktemp -d", Output: "/var/tmp/teploy-verify.test\n"},
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
 		ssh.MockCommand{Match: "aws s3 ls", Output: "" +
 			"2026-07-08 04:00:01     1000 20260708-040000.sql.gz\n" +
@@ -33,6 +34,7 @@ func TestLatestBackupDate_PicksNewest(t *testing.T) {
 
 func TestLatestBackupDate_NoBackups(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "umask 077; mktemp -d", Output: "/var/tmp/teploy-verify.test\n"},
 		ssh.MockCommand{Match: "aws s3 ls", Output: "\n"},
 	)
 	client := NewClient(mock, &bytes.Buffer{})
@@ -48,6 +50,7 @@ func TestLatestBackupDate_NoBackups(t *testing.T) {
 // real accessory), the verify query runs, and teardown removes the scratch.
 func TestVerifyBackup_Postgres(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "umask 077; mktemp -d", Output: "/var/tmp/teploy-verify.test\n"},
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
 		ssh.MockCommand{Match: "docker inspect -f '{{.Config.Image}}'", Output: "postgres:16\n"},
 		ssh.MockCommand{Match: "docker inspect -f '{{range .Config.Env}}", Output: "POSTGRES_PASSWORD=sekret\nPOSTGRES_DB=appdb\nPATH=/usr/bin\n"},
@@ -57,7 +60,7 @@ func TestVerifyBackup_Postgres(t *testing.T) {
 		ssh.MockCommand{Match: "for i in $(seq", Output: ""},
 		ssh.MockCommand{Match: "gunzip -c", Output: ""},
 		ssh.MockCommand{Match: "docker exec", Output: "42\n"},
-		ssh.MockCommand{Match: "docker rm -f", Output: ""},
+		ssh.MockCommand{Match: "if [", Output: ""},
 	)
 	client := NewClient(mock, &bytes.Buffer{})
 	res, err := client.VerifyBackup(context.Background(), "myapp", "db", "", S3Config{Bucket: "b", Region: "us-east-1"})
@@ -75,10 +78,10 @@ func TestVerifyBackup_Postgres(t *testing.T) {
 	for _, call := range mock.Calls {
 		if strings.Contains(call, "docker run -d") {
 			sawScratchRun = true
-			if !strings.Contains(call, "myapp-db-verify") {
+			if !strings.Contains(call, "teploy-backup-verify-") {
 				t.Errorf("scratch run must use the -verify container name: %s", call)
 			}
-			if !strings.Contains(call, "POSTGRES_PASSWORD=sekret") {
+			if strings.Contains(call, "sekret") || !strings.Contains(string(mock.Files["/var/tmp/teploy-verify.test/backup.env"]), "POSTGRES_PASSWORD=sekret") {
 				t.Errorf("scratch must clone source POSTGRES_* env: %s", call)
 			}
 			if strings.Contains(call, "PATH=") {
@@ -87,14 +90,14 @@ func TestVerifyBackup_Postgres(t *testing.T) {
 		}
 		if strings.Contains(call, "gunzip -c") && strings.Contains(call, "psql") {
 			sawRestore = true
-			if !strings.Contains(call, "myapp-db-verify") {
+			if !strings.Contains(call, "teploy-backup-verify-") {
 				t.Errorf("restore must target the scratch container, got: %s", call)
 			}
 			if !strings.Contains(call, "'appdb'") {
 				t.Errorf("restore must target POSTGRES_DB from inspected env: %s", call)
 			}
 		}
-		if strings.Contains(call, "docker rm -f") && strings.Contains(call, "myapp-db-verify") {
+		if strings.Contains(call, "docker rm -f") && strings.Contains(call, "teploy-backup-verify-") {
 			sawTeardown = true
 		}
 	}
@@ -107,6 +110,7 @@ func TestVerifyBackup_Postgres(t *testing.T) {
 // yields ok=false (not an operational error) and STILL removes the scratch.
 func TestVerifyBackup_FailureIsResultAndTearsDown(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "umask 077; mktemp -d", Output: "/var/tmp/teploy-verify.test\n"},
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
 		ssh.MockCommand{Match: "docker inspect -f '{{.Config.Image}}'", Output: "postgres:16\n"},
 		ssh.MockCommand{Match: "docker inspect -f '{{range .Config.Env}}", Output: "POSTGRES_PASSWORD=x\n"},
@@ -114,7 +118,7 @@ func TestVerifyBackup_FailureIsResultAndTearsDown(t *testing.T) {
 		ssh.MockCommand{Match: "docker run -d", Output: ""},
 		ssh.MockCommand{Match: "for i in $(seq", Output: ""},
 		ssh.MockCommand{Match: "gunzip -c", Err: fmt.Errorf("psql: ERROR: syntax error")},
-		ssh.MockCommand{Match: "docker rm -f", Output: ""},
+		ssh.MockCommand{Match: "if [", Output: ""},
 	)
 	client := NewClient(mock, &bytes.Buffer{})
 	res, err := client.VerifyBackup(context.Background(), "myapp", "db", "20260710-040000", S3Config{Bucket: "b", Region: "us-east-1"})
@@ -129,7 +133,7 @@ func TestVerifyBackup_FailureIsResultAndTearsDown(t *testing.T) {
 	}
 	teardown := false
 	for _, call := range mock.Calls {
-		if strings.Contains(call, "docker rm -f") && strings.Contains(call, "myapp-db-verify") {
+		if strings.Contains(call, "docker rm -f") && strings.Contains(call, "teploy-backup-verify-") {
 			teardown = true
 		}
 	}
@@ -142,6 +146,7 @@ func TestVerifyBackup_FailureIsResultAndTearsDown(t *testing.T) {
 // nucleus accessories (generic tar + scratch engine on the restored data dir).
 func TestVerifyBackup_NucleusBootVerify(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "umask 077; mktemp -d", Output: "/var/tmp/teploy-verify.test\n"},
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
 		ssh.MockCommand{Match: "docker inspect -f '{{.Config.Image}}'", Output: "ghcr.io/neutron-build/nucleus:latest\n"},
 		ssh.MockCommand{Match: "docker inspect -f '{{range .Config.Env}}", Output: "NUCLEUS_ALLOW_NO_AUTH=1\n"},
@@ -150,7 +155,7 @@ func TestVerifyBackup_NucleusBootVerify(t *testing.T) {
 		ssh.MockCommand{Match: "mkdir -p", Output: ""},
 		ssh.MockCommand{Match: "docker run -d", Output: ""},
 		ssh.MockCommand{Match: "for i in $(seq", Output: "Restored 57 table\n"},
-		ssh.MockCommand{Match: "docker rm -f", Output: ""},
+		ssh.MockCommand{Match: "if [", Output: ""},
 	)
 	client := NewClient(mock, &bytes.Buffer{})
 	res, err := client.VerifyBackup(context.Background(), "observe", "nucleus", "", S3Config{Bucket: "b", Region: "us-east-1"})
@@ -164,7 +169,7 @@ func TestVerifyBackup_NucleusBootVerify(t *testing.T) {
 		t.Errorf("metric should parse the boot-restore line, got %q", res.Metric)
 	}
 	for _, call := range mock.Calls {
-		if strings.Contains(call, "docker run -d") && !strings.Contains(call, "NUCLEUS_ALLOW_NO_AUTH") {
+		if strings.Contains(call, "docker run -d") && !strings.Contains(string(mock.Files["/var/tmp/teploy-verify.test/backup.env"]), "NUCLEUS_ALLOW_NO_AUTH") {
 			t.Errorf("scratch nucleus must clone NUCLEUS_* env: %s", call)
 		}
 	}
@@ -174,12 +179,13 @@ func TestVerifyBackup_NucleusBootVerify(t *testing.T) {
 // integrity check, and an empty archive fails.
 func TestVerifyBackup_VolumeArchive(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "umask 077; mktemp -d", Output: "/var/tmp/teploy-verify.test\n"},
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
 		ssh.MockCommand{Match: "docker inspect -f '{{.Config.Image}}'", Output: "some/custom-thing:1\n"},
 		ssh.MockCommand{Match: "docker inspect -f '{{range .Config.Env}}", Output: "\n"},
 		ssh.MockCommand{Match: "aws s3 cp", Output: "done\n"},
 		ssh.MockCommand{Match: "mkdir -p", Output: "12\n"},
-		ssh.MockCommand{Match: "docker rm -f", Output: ""},
+		ssh.MockCommand{Match: "if [", Output: ""},
 	)
 	client := NewClient(mock, &bytes.Buffer{})
 	res, err := client.VerifyBackup(context.Background(), "myapp", "thing", "20260710-040000", S3Config{Bucket: "b", Region: "us-east-1"})

@@ -2602,3 +2602,92 @@ Validation: full Go tests and vet; source-selection/rsync argument tests;
 private-directory permission tests; real repository context checks for Ship,
 Dash and Observe. This change does not remove historical uploaded copies or
 rotate potentially exposed credentials; the doctor reports those separately.
+
+
+## 2026-10-07 campaign reconciliation
+
+Implemented the current CLI/distribution remediation set: CLI-01..09,
+LIF-01..15, ADM-01..14, ENG-01..09, RCLI-01..07, CFG-01..03,
+STA-01..03, DIST-01..04 and the CLI portion of TSEM-03. This includes
+reviewed source snapshots and under-lock admission, durable duplicate webhook
+admission/torn-tail repair, DR authority and key validation, compensated
+lifecycle/migration, explicit literal environments, bounded secret-safe backup
+verification, framed preview authority, and validated binary publication.
+Historical checksum transcription was reconciled by rebuilding the exact
+six-platform source revision; published v0.1.37 archives were independently
+verified. Final integration status is recorded outside this public repository.
+
+CC05 now has a supported additive pre-start `volume_ownership` map (see
+`docs/volume-ownership.md`); existing volume maps keep their meanings. The
+contract provisions only an empty managed root, preserves matching populated
+roots, refuses populated mismatches and never recursively changes data.
+
+Plan record schema 2 requires re-planning schema-1 records. Templates emit
+`env_literal` and require a matching CLI revision. Provider enrollment-window
+wording preserves deliberate external ACL ownership; it does not claim active
+device access expires. Private audit material is not part of this repository.
+
+Real consumer dependencies remain explicit: Nucleus must support
+`shell --command-stdin --json` for private KV transport; older images refuse.
+Observe can deduplicate stable `source_event_id` metadata for delivery retries.
+Live integration and new release publication are separate from source fixes.
+
+### Source correction follow-up
+
+Reviewed-input mode binding, native/private-stdin DR restoration, unique owned
+DR validation, retryable preview destruction, authoritative lifecycle selection
+and fleet publication-outcome propagation have additional source corrections.
+Managed volume admission now precedes preparation effects and uses no-follow
+directory descriptors with explicit trusted-administrator ancestor admission.
+SSH policy installation quotes the complete script and uses private invocation
+inputs. The corresponding regression sources are present; compilation and
+runtime acceptance must be completed for these new bytes before closure.
+
+### Trigger convergence and compare-destroy — landing review (2026-10-07, r5)
+
+The round4 mandatory engineering OPEN is implemented and locally validated.
+`deploy`, `preview deploy` and `preview destroy` accept `--trigger-stdin
+--json`: one bounded (32 KiB) duplicate-key-refusing schema-1 request whose
+canonical domain-separated key binds target/source/repository/exact ref/full
+commit/private execution binding/action; the target's enrolled identity is
+proved from the target, never from a caller alias. Durable per-operation
+receipts live target-resident under `/deployments/<app>/.operations` (0600,
+O_NOFOLLOW, fsync+rename, completed receipts immutable), are written before
+any preparation under the SAME renewable app lease, and replay reconciles
+pending or unknown debt against authoritative state, immutable release/image
+and binding before new preparation. Results are truthful
+`not_started|not_committed|committed|unknown` with reconciliation status, and
+the final JSON reaches stdout even on nonzero Cobra exits. Authenticated
+webhook deliveries without a usable immutable commit are refused before
+durable admission (C02); explicit tip mode can no longer be inferred from an
+authenticated malformed event.
+
+Preview records now carry a durable ownership ID, a monotonic per-app
+generation and an updated-at token. Destruction compares the admitted
+identity against authority re-read under the same lease — including between
+prune's listing and the destroy — and refuses renewed previews before any
+route, container or record effect; teardown proves route and container
+absence (immutable IDs) before unlinking authority, tolerates proven-absent
+retries, and never converts unknown inventory into absence. Legacy-era
+records compare their all-empty identity triple exactly and remain prunable.
+
+`teploy version --json` advertises `trigger-convergence-v1` and
+`preview-compare-destroy-v1` (contracts corpus rev 9). Dash and other
+consumers must keep cross-trigger consumption inactive until their own
+pinned contract acceptance runs against an exact released artifact — the
+capability token is the CLI-side handshake, not a consumer pass.
+
+Executed locally: build, vet (plus the `integration` tag type-check), full
+unit and race suites (27/27 packages, no races), gofmt on the round's paths,
+and the Linux/Windows/Darwin compile matrix including the static
+`CGO_ENABLED=0` Linux binaries the release config builds. Two completion
+defects were fixed beyond the interrupted lane's bytes: DR cutover engine
+environment now honors `env_literal` database passwords (previously restored
+with an empty password), and legacy preview records no longer serialize a
+zero `updated_at`. Still open and not claimed: live-DB/SSH integration
+suites (env-gated), real Linux/SSH/Docker/Caddy acceptance, native Windows
+and release publication, ADM-11 upstream acceptance, migrating the resident
+autodeploy deploy path onto the trigger adapter, and scheduler/manual
+tip-mode admission plumbing. Private evidence and exact receipts live
+outside this repository.
+

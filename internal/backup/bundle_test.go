@@ -181,7 +181,7 @@ func TestCreateBundle_VolumePatternHeuristic(t *testing.T) {
 // snapshot is then labeled quiesced with detection=teploy-stop.
 func TestCreateBundle_StopAppQuiescesVolumes(t *testing.T) {
 	mock := drBaseMock(
-		ssh.MockCommand{Match: "docker ps --filter label=teploy.app='myapp' --filter label=teploy.process=web", Output: "myapp-web\n"},
+		ssh.MockCommand{Match: "docker ps --filter label=teploy.app='myapp' --filter label=teploy.process", Output: "myapp-web\n"},
 		ssh.MockCommand{Match: "docker stop", Output: ""},
 		ssh.MockCommand{Match: "docker start", Output: ""},
 	)

@@ -10,6 +10,7 @@
     "plan-apply",
     "preview-blue-green",
     "preview-canonical-id",
+    "preview-compare-destroy-v1",
     "preview-exposure",
     "provenance-records",
     "readiness-receipts",
@@ -17,7 +18,8 @@
     "server-rename",
     "server-status-machine",
     "server-update",
-    "template-var-stdin"
+    "template-var-stdin",
+    "trigger-convergence-v1"
   ],
   "machine_interface": 2,
   "version": "v0.0.0-contracts"

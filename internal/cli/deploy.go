@@ -31,10 +31,12 @@ import (
 	"github.com/useteploy/teploy/internal/secret"
 	"github.com/useteploy/teploy/internal/ssh"
 	"github.com/useteploy/teploy/internal/state"
+	"github.com/useteploy/teploy/internal/trigger"
 )
 
 func newDeployCmd(flags *Flags) *cobra.Command {
 	var (
+		triggerStdin   bool
 		image          string
 		version        string
 		skipDNSCheck   bool
@@ -72,6 +74,11 @@ a machine error envelope on stderr whose code distinguishes the classes
 (config-invalid, conflict, uncertain-outcome, internal).`,
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if triggerStdin {
+				return triggerCommand(cmd, "deploy", func(r trigger.Request) (trigger.Result, error) {
+					return runTriggerCLI(cmd, flags, "deploy", "", image, version, previewDeployOpts{}, r)
+				})
+			}
 			var serverName string
 			if len(args) > 0 {
 				serverName = args[0]
@@ -87,6 +94,7 @@ a machine error envelope on stderr whose code distinguishes the classes
 		},
 	}
 
+	cmd.Flags().BoolVar(&triggerStdin, "trigger-stdin", false, "read a bounded immutable trigger request from stdin")
 	cmd.Flags().StringVar(&image, "image", "", "Docker image to deploy (skips build if set)")
 	cmd.Flags().StringVar(&version, "version", "", "version identifier (default: git short hash)")
 	cmd.Flags().BoolVar(&skipDNSCheck, "skip-dns-check", false, "skip DNS validation (for proxied domains like Cloudflare)")
@@ -226,6 +234,22 @@ func resolveDeployEnv(ctx context.Context, appCfg *config.AppConfig, strict bool
 			}
 		}
 	}
+	if appCfg.Env == nil {
+		appCfg.Env = map[string]string{}
+	}
+	for k, v := range appCfg.EnvLiteral {
+		appCfg.Env[k] = v
+	}
+	for name, acc := range appCfg.Accessories {
+		if acc.Env == nil {
+			acc.Env = map[string]string{}
+		}
+		for k, v := range acc.EnvLiteral {
+			acc.Env[k] = v
+		}
+		appCfg.Accessories[name] = acc
+	}
+
 	return nil
 }
 
@@ -308,7 +332,7 @@ func selectServersByRoleTag(names []string, all map[string]config.Server, role s
 // deployAppConfig runs a single-server deploy from an already-loaded AppConfig.
 // Used by runDeploy (from teploy.yml), runTemplateInstall (from template),
 // and runApply (a verified C05 plan record — planID stamps the receipt).
-func deployAppConfig(flags *Flags, appCfg *config.AppConfig, serverName, image, version string, skipDNSCheck, migrateVolumes bool, planID string) error {
+func deployAppConfig(flags *Flags, appCfg *config.AppConfig, serverName, image, version string, skipDNSCheck, migrateVolumes bool, planID string, plans ...*PlanRecord) error {
 	var err error
 
 	// 2. Resolve server (single-server deploy).
@@ -334,7 +358,7 @@ func deployAppConfig(flags *Flags, appCfg *config.AppConfig, serverName, image, 
 	// no health checks) so we branch here before the container build/run
 	// machinery runs.
 	if appCfg.IsStatic() {
-		return runStaticDeploy(appCfg, host, user, key)
+		return runStaticDeploy(appCfg, host, user, key, plans...)
 	}
 
 	// 3. Resolve image.
@@ -406,7 +430,7 @@ func deployAppConfig(flags *Flags, appCfg *config.AppConfig, serverName, image, 
 	// serialize at the source instead of interleaving writes onto shared
 	// per-app paths. The lease is fenced (F16) and renewed in the
 	// background; it is released when deployAppConfig returns.
-	if err := state.EnsureAppDir(ctx, executor, appCfg.App); err != nil {
+	if err := docker.NewClient(executor).EnsureManagedDirectory(ctx, appCfg.App, "", ""); err != nil {
 		return fmt.Errorf("creating app directory: %w", err)
 	}
 	lk, err := state.AcquireLockFenced(ctx, executor, appCfg.App)
@@ -415,6 +439,15 @@ func deployAppConfig(flags *Flags, appCfg *config.AppConfig, serverName, image, 
 	}
 	defer state.ReleaseLockFenced(executor, lk, appCfg.App)
 	lk.StartRenewal(executor)
+	if len(plans) > 0 && plans[0] != nil {
+		if err := revalidateLockedPlan(ctx, executor, appCfg, image, version, plans[0]); err != nil {
+			return refuseApply(err)
+		}
+	}
+
+	if err := admitDeploymentVolumes(ctx, &state.FencedExecutor{Executor: executor, Lock: lk}, appCfg); err != nil {
+		return err
+	}
 
 	// The attempt keys every artifact this deploy generates (F08):
 	// immutable per (release, attempt), so the F14 record's references
@@ -522,15 +555,47 @@ func deployBuiltImage(ctx context.Context, executor ssh.Executor, appCfg *config
 // deployBuiltImageFenced is deployBuiltImage with the caller's lease and
 // attempt: lk is a lock the caller already owns (the terminal path's early
 // lease and the resident autodeploy path — audits F07/F08) and att keys the
-// attempt-scoped artifacts (env file, TLS). lk == nil means Deployer.Deploy
-// acquires the lock itself (att must still be non-nil for the env file).
+// attempt-scoped artifacts (env file, TLS). A nil lease is acquired here
+// before ownership admission and preparation effects.
 // sourceRoot is the directory the source was synced/built from ("." for
 // manual deploys, the fetched checkout for autodeploy) — it keys the
 // plan-time provenance (C04); empty means no build provenance. planID,
 // when non-empty, is the C05 plan record the caller verified before
 // executing; it is stamped into the provenance receipt so releasemeta
 // ties the release back to the reviewed plan.
-func deployBuiltImageFenced(ctx context.Context, executor ssh.Executor, appCfg *config.AppConfig, image, version, serverDisplay string, migrateVolumes, needsBuild bool, sourceRoot string, lk *state.Lock, att *releasemeta.Attempt, planID string) error {
+func deployBuiltImageFenced(ctx context.Context, executor ssh.Executor, appCfg *config.AppConfig, image, version, serverDisplay string, migrateVolumes, needsBuild bool, sourceRoot string, lk *state.Lock, att *releasemeta.Attempt, planID string) (retErr error) {
+	out := deployOutput(ctx)
+	if out == nil {
+		out = os.Stdout
+	}
+	if lk == nil {
+		if err := docker.NewClient(executor).EnsureManagedDirectory(ctx, appCfg.App, "", ""); err != nil {
+			return err
+		}
+		var err error
+		lk, err = state.AcquireLockFenced(ctx, executor, appCfg.App)
+		if err != nil {
+			return err
+		}
+		defer state.ReleaseLockFenced(executor, lk, appCfg.App)
+		lk.StartRenewal(executor)
+	}
+	rawExecutor := executor
+	executor = &state.FencedExecutor{Executor: executor, Lock: lk}
+	if err := admitDeploymentVolumes(ctx, executor, appCfg); err != nil {
+		return err
+	}
+	var migration *docker.VolumeMigration
+	defer func() {
+		if migration == nil {
+			return
+		}
+		if retErr == nil || state.PreservePublishedState(retErr) {
+			migration.Commit()
+		} else {
+			retErr = errors.Join(retErr, migration.Restore(context.WithoutCancel(ctx)))
+		}
+	}()
 	if att == nil {
 		attVal := releasemeta.MustAttempt(appCfg.App, version)
 		att = &attVal
@@ -547,17 +612,17 @@ func deployBuiltImageFenced(ctx context.Context, executor ssh.Executor, appCfg *
 	// attempt's write-once namespace, next to the build context it
 	// describes. Best-effort resolution, but the receipt itself must
 	// land: a missing provenance file is an unwitnessed plan (warned).
-	prov := resolveDeployProvenance(ctx, executor, os.Stdout, appCfg, sourceRoot, image, version, manifestSHA256, needsBuild)
+	prov := resolveDeployProvenance(ctx, executor, out, appCfg, sourceRoot, image, version, manifestSHA256, needsBuild)
 	prov.PlanID = planID
 	if err := releasemeta.WriteAttemptProvenance(ctx, executor, *att, prov); err != nil {
-		fmt.Printf("Warning: could not persist the deploy provenance receipt for %s@%s: %v\n", appCfg.App, version, err)
+		fmt.Fprintf(out, "Warning: could not persist the deploy provenance receipt for %s@%s: %v\n", appCfg.App, version, err)
 	}
 
 	// 9. Ensure accessories are running.
 	var envFile string
 	if len(appCfg.Accessories) > 0 {
-		fmt.Println("Ensuring accessories...")
-		accMgr := accessories.NewManager(executor, os.Stdout)
+		fmt.Fprintln(out, "Ensuring accessories...")
+		accMgr := accessories.NewManager(executor, out)
 		allVars := make(map[string]string)
 		for _, name := range sortedAccessoryNames(appCfg.Accessories) {
 			vars, err := accMgr.EnsureRunning(ctx, appCfg.App, name, appCfg.Accessories[name])
@@ -602,9 +667,15 @@ func deployBuiltImageFenced(ctx context.Context, executor ssh.Executor, appCfg *
 	var volumes map[string]string
 	if len(appCfg.Volumes) > 0 {
 		volumes = plannedVolumeMounts(appCfg.App, appCfg.Volumes)
-		for _, hostPath := range managedVolumeHostPaths(appCfg.App, appCfg.Volumes) {
-			if _, err := executor.Run(ctx, "mkdir -p "+hostPath); err != nil {
-				return fmt.Errorf("creating volume directory %s: %w", hostPath, err)
+		for _, name := range volumeKeys(appCfg.Volumes) {
+			if config.IsHostBindVolume(name) {
+				continue
+			}
+			if _, owned := appCfg.VolumeOwnership[name]; owned {
+				continue
+			}
+			if err := docker.NewClient(executor).EnsureManagedDirectory(ctx, appCfg.App, "", name); err != nil {
+				return err
 			}
 		}
 	}
@@ -631,7 +702,8 @@ func deployBuiltImageFenced(ctx context.Context, executor ssh.Executor, appCfg *
 			if !migrateVolumes {
 				return docker.FormatMismatchError(appCfg.App, mismatches)
 			}
-			if err := docker.MigrateVolumes(ctx, executor, appCfg.App, mismatches, os.Stdout); err != nil {
+			migration, err = docker.BeginVolumeMigration(ctx, executor, appCfg.App, mismatches, out)
+			if err != nil {
 				return fmt.Errorf("migrating volumes: %w", err)
 			}
 		}
@@ -646,7 +718,7 @@ func deployBuiltImageFenced(ctx context.Context, executor ssh.Executor, appCfg *
 		return err
 	}
 	if tlsCert != "" {
-		fmt.Println("  TLS certificate uploaded")
+		fmt.Fprintln(out, "  TLS certificate uploaded")
 	}
 
 	// Container env: teploy.yml's `env:` block plus decrypted secrets,
@@ -658,15 +730,16 @@ func deployBuiltImageFenced(ctx context.Context, executor ssh.Executor, appCfg *
 	}
 
 	// 11. Deploy.
-	deployer := deploy.NewDeployer(executor, os.Stdout)
+	deployer := deploy.NewDeployer(rawExecutor, out)
 	deployCfg := deployConfigFromApp(appCfg, image, version, envFiles, volumes, tlsCert, tlsKey, tlsInternal, appliedManifest, manifestSHA256)
 	deployCfg.Provenance = prov
+	attachTrigger(ctx, &deployCfg)
 
 	// Vulnerability gate: scan the image on the server before any container
 	// starts — fixable CRITICALs block the deploy.
 	if appCfg.Scan {
-		fmt.Println("Scanning image for vulnerabilities (trivy)...")
-		if err := docker.NewClient(executor).ScanImage(ctx, image, os.Stdout); err != nil {
+		fmt.Fprintln(out, "Scanning image for vulnerabilities (trivy)...")
+		if err := docker.NewClient(executor).ScanImage(ctx, image, out); err != nil {
 			return err
 		}
 	}
@@ -709,7 +782,7 @@ func deployBuiltImageFenced(ctx context.Context, executor ssh.Executor, appCfg *
 
 	// 13. Prune old build images (best-effort).
 	if needsBuild {
-		builder := build.NewBuilder(executor, os.Stdout)
+		builder := build.NewBuilder(executor, out)
 		builder.PruneImages(ctx, appCfg.App)
 	}
 
@@ -889,8 +962,8 @@ func runMultiDeploy(flags *Flags, appCfg *config.AppConfig, image, version strin
 		fmt.Print(multideploy.FormatResults(canaryResults))
 		if failed := rollbackFailedWave(ctx, appCfg, canary, canaryResults, parallel, migrateVolumes); failed > 0 {
 			// A canary failure halts everything: the rest of the fleet was
-			// never touched and the canary is back on the old version.
-			return fmt.Errorf("rollout halted: %d of %d canary server(s) failed; rest of fleet untouched", failed, len(canary))
+			// never touched; canary authority may require reconciliation.
+			return fmt.Errorf("rollout halted: %d of %d canary server(s) failed; rest of fleet untouched; reconcile failed canary authority", failed, len(canary))
 		}
 		fmt.Printf("Rollout: canary healthy — deploying remaining %d server(s) (parallel=%d, max_failures=%d)...\n",
 			len(rest), parallel, maxFailures)
@@ -926,6 +999,9 @@ func runMultiDeploy(flags *Flags, appCfg *config.AppConfig, image, version strin
 	// main wave busts the failure budget.
 	successTargets = append(canarySucceeded, successTargets...)
 
+	if err := fleetPublicationError(results); err != nil {
+		return err
+	}
 	if failCount == 0 {
 		if len(successTargets) > 0 {
 			// Front-door activation is a required deployment phase (audit
@@ -1030,6 +1106,10 @@ func rollbackFailedWave(ctx context.Context, appCfg *config.AppConfig, wave []mu
 		} else {
 			failed++
 		}
+	}
+	if err := fleetPublicationError(results); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return failed
 	}
 	if failed == 0 {
 		return 0
@@ -1162,7 +1242,7 @@ func gitRevisionIn(dir string) (string, error) {
 // runStaticDeploy handles the type:static deploy path: build (locally) →
 // rsync → symlink → Caddyfile mirror. Container build/run/health-check
 // machinery is intentionally bypassed.
-func runStaticDeploy(cfg *config.AppConfig, host, user, key string) error {
+func runStaticDeploy(cfg *config.AppConfig, host, user, key string, plans ...*PlanRecord) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
@@ -1198,6 +1278,13 @@ func runStaticDeploy(cfg *config.AppConfig, host, user, key string) error {
 		SourceRevision:  cfg.SourceRevision,
 	}
 
+	if len(plans) > 0 && plans[0] != nil {
+		rec := plans[0]
+		staticCfg.ExpectedState = &state.GenerationExpectation{Exists: rec.TargetState.Deployed, Generation: rec.TargetState.Generation}
+		staticCfg.UnderLockPreflight = func(ctx context.Context) error {
+			return revalidateLockedPlan(ctx, executor, cfg, "", rec.TargetVersion, rec)
+		}
+	}
 	d := deploy.NewStaticDeployer(executor, os.Stdout)
 	d.SSHKeyPath = key
 	if err := d.Deploy(ctx, staticCfg); err != nil {
@@ -1382,5 +1469,18 @@ func ensureImage(ctx context.Context, dk *docker.Client, image string, out io.Wr
 		return fmt.Errorf("image not found or registry auth failed: %w", err)
 	}
 	fmt.Fprintln(out, "  Image pulled")
+	return nil
+}
+
+func fleetPublicationError(results []multideploy.Result) error {
+	var debt error
+	for _, result := range results {
+		if result.PublicationNeedsReconciliation || state.PreservePublishedState(result.Error) {
+			debt = errors.Join(debt, fmt.Errorf("%s: %w", result.Server, result.Error))
+		}
+	}
+	if debt != nil {
+		return fmt.Errorf("fleet publication requires reconciliation; automatic load-balancer changes and convergence rollback withheld: %w", debt)
+	}
 	return nil
 }

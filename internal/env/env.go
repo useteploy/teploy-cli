@@ -145,7 +145,7 @@ func (m *Manager) writeEnv(ctx context.Context, app string, vars map[string]stri
 func parseEnv(content string) map[string]string {
 	vars := make(map[string]string)
 	for _, line := range strings.Split(content, "\n") {
-		line = strings.TrimSpace(line)
+		line = strings.TrimLeft(line, " \t")
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
@@ -155,7 +155,6 @@ func parseEnv(content string) map[string]string {
 		}
 		key := line[:idx]
 		val := line[idx+1:]
-		val = unquote(val)
 		vars[key] = val
 	}
 	return vars

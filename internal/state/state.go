@@ -132,15 +132,17 @@ const staleHealLockTTL = 2 * time.Minute
 // ReleaseMetadata identifies an applied release. PreviousRelease retains the
 // one-level rollback target's identity without creating a second state store.
 type ReleaseMetadata struct {
-	Hash            string          `json:"hash,omitempty"`
-	ManifestSHA256  string          `json:"manifest_sha256,omitempty"`
-	SourceRevision  string          `json:"source_revision,omitempty"`
-	ImageRef        string          `json:"image_ref,omitempty"`
-	ImageDigest     string          `json:"image_digest,omitempty"`
-	UpdatedAt       time.Time       `json:"updated_at,omitempty"`
-	OperationID     string          `json:"operation_id,omitempty"`
-	Generation      uint64          `json:"generation,omitempty"`
-	AppliedManifest json.RawMessage `json:"applied_manifest,omitempty"`
+	TriggerOperationKey    string          `json:"trigger_operation_key,omitempty"`
+	ExecutionBindingDigest string          `json:"execution_binding_digest,omitempty"`
+	Hash                   string          `json:"hash,omitempty"`
+	ManifestSHA256         string          `json:"manifest_sha256,omitempty"`
+	SourceRevision         string          `json:"source_revision,omitempty"`
+	ImageRef               string          `json:"image_ref,omitempty"`
+	ImageDigest            string          `json:"image_digest,omitempty"`
+	UpdatedAt              time.Time       `json:"updated_at,omitempty"`
+	OperationID            string          `json:"operation_id,omitempty"`
+	Generation             uint64          `json:"generation,omitempty"`
+	AppliedManifest        json.RawMessage `json:"applied_manifest,omitempty"`
 }
 
 // MigrationMetadata records the first import from the legacy key=value file.
@@ -152,17 +154,19 @@ type MigrationMetadata struct {
 // stored at /deployments/<app>/state.json; the old key=value state file is
 // read only when state.json does not yet exist.
 type AppState struct {
-	SchemaVersion  int       `json:"schema_version"`
-	DeploymentType string    `json:"deployment_type"`
-	IngressMode    string    `json:"ingress_mode"`
-	Domain         string    `json:"domain,omitempty"`
-	UpdatedAt      time.Time `json:"updated_at"`
-	ManifestSHA256 string    `json:"manifest_sha256,omitempty"`
-	SourceRevision string    `json:"source_revision,omitempty"`
-	ImageRef       string    `json:"image_ref,omitempty"`
-	ImageDigest    string    `json:"image_digest,omitempty"`
-	OperationID    string    `json:"operation_id"`
-	Generation     uint64    `json:"generation"`
+	TriggerOperationKey    string    `json:"trigger_operation_key,omitempty"`
+	ExecutionBindingDigest string    `json:"execution_binding_digest,omitempty"`
+	SchemaVersion          int       `json:"schema_version"`
+	DeploymentType         string    `json:"deployment_type"`
+	IngressMode            string    `json:"ingress_mode"`
+	Domain                 string    `json:"domain,omitempty"`
+	UpdatedAt              time.Time `json:"updated_at"`
+	ManifestSHA256         string    `json:"manifest_sha256,omitempty"`
+	SourceRevision         string    `json:"source_revision,omitempty"`
+	ImageRef               string    `json:"image_ref,omitempty"`
+	ImageDigest            string    `json:"image_digest,omitempty"`
+	OperationID            string    `json:"operation_id"`
+	Generation             uint64    `json:"generation"`
 
 	AppliedManifest json.RawMessage    `json:"applied_manifest,omitempty"`
 	PreviousRelease *ReleaseMetadata   `json:"previous_release,omitempty"`
@@ -383,15 +387,17 @@ func (s *AppState) ReleaseMetadata() *ReleaseMetadata {
 		return nil
 	}
 	return &ReleaseMetadata{
-		Hash:            s.CurrentHash,
-		ManifestSHA256:  s.ManifestSHA256,
-		SourceRevision:  s.SourceRevision,
-		ImageRef:        s.ImageRef,
-		ImageDigest:     s.ImageDigest,
-		UpdatedAt:       s.UpdatedAt,
-		OperationID:     s.OperationID,
-		Generation:      s.Generation,
-		AppliedManifest: cloneRawMessage(s.AppliedManifest),
+		TriggerOperationKey:    s.TriggerOperationKey,
+		ExecutionBindingDigest: s.ExecutionBindingDigest,
+		Hash:                   s.CurrentHash,
+		ManifestSHA256:         s.ManifestSHA256,
+		SourceRevision:         s.SourceRevision,
+		ImageRef:               s.ImageRef,
+		ImageDigest:            s.ImageDigest,
+		UpdatedAt:              s.UpdatedAt,
+		OperationID:            s.OperationID,
+		Generation:             s.Generation,
+		AppliedManifest:        cloneRawMessage(s.AppliedManifest),
 	}
 }
 
@@ -400,6 +406,8 @@ func (s *AppState) ApplyRelease(release *ReleaseMetadata) {
 	if release == nil {
 		return
 	}
+	s.TriggerOperationKey = release.TriggerOperationKey
+	s.ExecutionBindingDigest = release.ExecutionBindingDigest
 	s.ManifestSHA256 = release.ManifestSHA256
 	s.SourceRevision = release.SourceRevision
 	s.ImageRef = release.ImageRef
@@ -472,20 +480,26 @@ func Write(ctx context.Context, exec ssh.Executor, app string, s *AppState) erro
 	}
 	path := fmt.Sprintf("%s/%s/state.json", deploymentsDir, app)
 	if err := ssh.UploadAtomic(ctx, exec, bytes.NewReader(data), path, "0644"); err != nil {
-		return err
+		return resolvePublication(exec, app, data, s.Generation, nil, err)
 	}
-	return writeGenerationSidecar(ctx, exec, app, s.Generation)
+	if err := writeGenerationSidecar(ctx, exec, app, s.Generation); err != nil {
+		return resolvePublication(exec, app, data, s.Generation, nil, err)
+	}
+	return nil
 }
 
 // writeGenerationSidecar publishes the committed generation atomically
 // (stage + rename) — the targetguard contract's write side.
 func writeGenerationSidecar(ctx context.Context, exec ssh.Executor, app string, generation uint64) error {
+	return writeGenerationSidecarFenced(ctx, exec, app, generation, nil)
+}
+func writeGenerationSidecarFenced(ctx context.Context, exec ssh.Executor, app string, generation uint64, lk *Lock) error {
 	path := GenerationSidecarPath(app)
 	tmp := path + ".tmp-commit"
 	if err := exec.Upload(ctx, strings.NewReader(strconv.FormatUint(generation, 10)+"\n"), tmp, "0644"); err != nil {
 		return fmt.Errorf("staging the committed-generation sidecar for %s: %w", app, err)
 	}
-	if _, err := exec.Run(ctx, "mv -fT -- "+ssh.ShellQuote(tmp)+" "+ssh.ShellQuote(path)); err != nil {
+	if _, err := lk.Guarded(ctx, exec, "mv -fT -- "+ssh.ShellQuote(tmp)+" "+ssh.ShellQuote(path)); err != nil {
 		return fmt.Errorf("publishing the committed-generation sidecar for %s: %w", app, err)
 	}
 	return nil

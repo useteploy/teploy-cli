@@ -1,6 +1,8 @@
 package cli
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -114,5 +116,44 @@ func TestTemplateVars(t *testing.T) {
 	vars = templateVars("d.io", []string{"A=1"}, nil)
 	if len(vars) != 2 || vars["A"] != "1" || vars["domain"] != "d.io" {
 		t.Errorf("nil stdin vars: %v", vars)
+	}
+}
+
+func TestPrivateTemplatePublicationAndOverrides(t *testing.T) {
+	content, err := persistTemplateOverrides("app: demo\ningress: host\nport: 80\n", "example.test", "production", 8080)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.ParseAppBytes([]byte(content))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Server != "production" || cfg.Domain != "example.test" || cfg.Port != 8080 {
+		t.Fatalf("lost overrides: %+v", cfg)
+	}
+	path := filepath.Join(t.TempDir(), "teploy.yml")
+	if err := writePrivateTemplate(path, []byte(content)); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0600 {
+		t.Fatalf("mode %o", info.Mode().Perm())
+	}
+	if err := writePrivateTemplate(path, []byte("replacement")); err == nil {
+		t.Fatal("existing output replaced")
+	}
+	got, _ := os.ReadFile(path)
+	if string(got) != content {
+		t.Fatal("existing file changed")
+	}
+	link := filepath.Join(filepath.Dir(path), "link.yml")
+	if err := os.Symlink(path, link); err != nil {
+		t.Fatal(err)
+	}
+	if err := writePrivateTemplate(link, []byte("replacement")); err == nil {
+		t.Fatal("symlink replaced")
 	}
 }

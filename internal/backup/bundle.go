@@ -3,12 +3,14 @@ package backup
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
 	"time"
 
 	"github.com/useteploy/teploy/internal/config"
+	"github.com/useteploy/teploy/internal/releasemeta"
 	"github.com/useteploy/teploy/internal/secret"
 	"github.com/useteploy/teploy/internal/ssh"
 	"github.com/useteploy/teploy/internal/state"
@@ -266,7 +268,7 @@ func (s S3BundleStore) ListIDs(ctx context.Context, exec ssh.Executor, app strin
 	var ids []string
 	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
 		fields := strings.Fields(line)
-		if len(fields) < 4 || !strings.HasSuffix(fields[len(fields)-1], "/") {
+		if len(fields) != 2 || fields[0] != "PRE" || !strings.HasSuffix(fields[1], "/") {
 			continue
 		}
 		id := strings.TrimSuffix(fields[len(fields)-1], "/")
@@ -359,6 +361,9 @@ func ParseBundleManifest(data []byte) (*BundleManifest, error) {
 	if err := ValidateDate(m.ID); err != nil {
 		return nil, fmt.Errorf("bundle manifest id: %w", err)
 	}
+	if err := validateBundlePaths(&m); err != nil {
+		return nil, err
+	}
 	return &m, nil
 }
 
@@ -433,7 +438,7 @@ func guessVolumeEngine(containerPath string) string {
 // CreateBundle assembles a complete DR bundle on the server and publishes it
 // through the store. The manifest is uploaded LAST so a partial upload can
 // never be mistaken for a bundle.
-func (c *Client) CreateBundle(ctx context.Context, opts BundleOptions, store BundleStore) (*BundleManifest, error) {
+func (c *Client) CreateBundle(ctx context.Context, opts BundleOptions, store BundleStore) (result *BundleManifest, retErr error) {
 	if !safeName.MatchString(opts.App) {
 		return nil, fmt.Errorf("invalid app name %q", opts.App)
 	}
@@ -506,7 +511,7 @@ func (c *Client) CreateBundle(ctx context.Context, opts BundleOptions, store Bun
 	var stoppedContainers []string
 	if opts.StopApp {
 		names, err := c.exec.Run(ctx, fmt.Sprintf(
-			"docker ps --filter label=teploy.app=%s --filter label=teploy.process=web --format '{{.Names}}'",
+			"docker ps --filter label=teploy.app=%s --filter label=teploy.process --format '{{.Names}}'",
 			ssh.ShellQuote(opts.App)))
 		if err != nil {
 			cleanup()
@@ -517,16 +522,22 @@ func (c *Client) CreateBundle(ctx context.Context, opts BundleOptions, store Bun
 				continue
 			}
 			fmt.Fprintf(c.out, "Stopping %s for quiesced snapshot...\n", n)
+			stoppedContainers = append(stoppedContainers, n)
 			if _, err := c.exec.Run(ctx, "docker stop "+ssh.ShellQuote(n)); err != nil {
 				// Restart anything already stopped before aborting.
-				c.restartContainers(context.WithoutCancel(ctx), stoppedContainers)
+				restartErr := c.restartContainers(context.WithoutCancel(ctx), stoppedContainers)
 				cleanup()
-				return nil, fmt.Errorf("stopping %s for quiesced snapshot: %w", n, err)
+				return nil, errors.Join(fmt.Errorf("stopping %s for quiesced snapshot: %w", n, err), restartErr)
 			}
-			stoppedContainers = append(stoppedContainers, n)
 		}
 	}
-	defer c.restartContainers(context.WithoutCancel(ctx), stoppedContainers)
+	defer func() {
+		recoveryCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 60*time.Second)
+		defer cancel()
+		if restartErr := c.restartContainers(recoveryCtx, stoppedContainers); restartErr != nil {
+			retErr = errors.Join(retErr, restartErr)
+		}
+	}()
 
 	// Secret material — only on explicit operator selection, with the
 	// manifest stating exactly what traveled.
@@ -840,16 +851,20 @@ func (c *Client) accessoryImageEnv(ctx context.Context, app, name string, cfg co
 	return cfg.Image, cfg.Env, nil
 }
 
-func (c *Client) restartContainers(ctx context.Context, names []string) {
+func (c *Client) restartContainers(ctx context.Context, names []string) error {
+	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+	var failures []error
 	for _, n := range names {
 		if n == "" {
 			continue
 		}
 		fmt.Fprintf(c.out, "Restarting %s...\n", n)
 		if _, err := c.exec.Run(ctx, "docker start "+ssh.ShellQuote(n)); err != nil {
-			fmt.Fprintf(c.out, "WARNING: could not restart %s after bundling: %v\n", n, err)
+			failures = append(failures, fmt.Errorf("restarting %s after bundling: %w", n, err))
 		}
 	}
+	return errors.Join(failures...)
 }
 
 // wsCopy copies a server file into the bundle workspace under member,
@@ -956,4 +971,85 @@ func (c *Client) collectReleaseRecords(ctx context.Context, app string) ([]json.
 		records = append(records, json.RawMessage(data))
 	}
 	return records, nil
+}
+
+func validateBundlePaths(m *BundleManifest) error {
+	if err := config.ValidateName(m.App); err != nil {
+		return err
+	}
+	seen := map[string]bool{}
+	for _, snap := range m.Snapshots {
+		if !safeName.MatchString(snap.Name) {
+			return fmt.Errorf("invalid snapshot name %q", snap.Name)
+		}
+		prefix := "accessories/"
+		if snap.Role == "app-volume" {
+			prefix = "volumes/"
+		} else if snap.Role != "accessory" {
+			return fmt.Errorf("invalid snapshot role %q", snap.Role)
+		}
+		valid := false
+		for _, ext := range []string{".tar.gz", ".sql.gz", ".archive.gz", ".rdb.gz"} {
+			if snap.Artifact == prefix+snap.Name+ext {
+				valid = true
+			}
+		}
+		if !valid || seen[snap.Artifact] {
+			return fmt.Errorf("invalid or duplicate snapshot artifact %q", snap.Artifact)
+		}
+		seen[snap.Artifact] = true
+	}
+	for _, key := range m.Secrets.Keys {
+		if err := secret.ValidateKey(key); err != nil {
+			return err
+		}
+	}
+	for _, member := range m.Secrets.Included {
+		valid := member == "env/.env"
+		if strings.HasPrefix(member, "secrets/") && strings.HasSuffix(member, ".age") {
+			key := strings.TrimSuffix(strings.TrimPrefix(member, "secrets/"), ".age")
+			valid = secret.ValidateKey(key) == nil
+		}
+		if strings.HasPrefix(member, "env/credentials/") {
+			valid = safeName.MatchString(strings.TrimPrefix(member, "env/credentials/"))
+		}
+		if !valid || seen[member] {
+			return fmt.Errorf("invalid or duplicate secret member %q", member)
+		}
+		seen[member] = true
+	}
+	if len(m.State) > 0 {
+		var st state.AppState
+		if err := json.Unmarshal(m.State, &st); err != nil {
+			return fmt.Errorf("invalid bundled state: %w", err)
+		}
+		for _, hash := range []string{st.CurrentHash, st.PreviousHash} {
+			if hash != "" {
+				if err := releasemeta.ValidateHash(hash); err != nil {
+					return err
+				}
+			}
+		}
+		if st.PreviousRelease != nil && st.PreviousRelease.Hash != "" {
+			if err := releasemeta.ValidateHash(st.PreviousRelease.Hash); err != nil {
+				return err
+			}
+		}
+	}
+	for _, raw := range m.ReleaseRecords {
+		var rec struct {
+			App  string `json:"app"`
+			Hash string `json:"hash"`
+		}
+		if err := json.Unmarshal(raw, &rec); err != nil {
+			return fmt.Errorf("invalid bundled release record: %w", err)
+		}
+		if rec.App != "" && rec.App != m.App {
+			return fmt.Errorf("bundled release belongs to a different app")
+		}
+		if err := releasemeta.ValidateHash(rec.Hash); err != nil {
+			return err
+		}
+	}
+	return nil
 }

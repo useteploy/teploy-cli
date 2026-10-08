@@ -3,6 +3,7 @@ package template
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -231,7 +232,7 @@ accessories:
 		t.Fatalf("rendered template must be valid YAML: %v\n%s", err, content)
 	}
 
-	env := doc["env"].(map[string]interface{})
+	env := doc["env_literal"].(map[string]interface{})
 	for _, key := range []string{"SECRET", "EMBEDDED", "QUOTED", "SINGLE", "URL", "BOOLEANISH"} {
 		got, ok := env[key].(string)
 		if !ok {
@@ -263,7 +264,7 @@ accessories:
 	}
 
 	acc := doc["accessories"].(map[string]interface{})["db"].(map[string]interface{})
-	accEnv := acc["env"].(map[string]interface{})
+	accEnv := acc["env_literal"].(map[string]interface{})
 	if got := accEnv["POSTGRES_PASSWORD"]; got != password {
 		t.Errorf("accessory POSTGRES_PASSWORD (with trailing comment) = %#v, want exact value", got)
 	}
@@ -289,7 +290,7 @@ func TestFetch_LookalikeValuesStayStrings(t *testing.T) {
 	}
 
 	var doc struct {
-		Env map[string]string `yaml:"env"`
+		Env map[string]string `yaml:"env_literal"`
 	}
 	if err := yaml.Unmarshal([]byte(content), &doc); err != nil {
 		t.Fatalf("parse: %v\n%s", err, content)
@@ -392,5 +393,37 @@ func TestRegistry_SizeLimits(t *testing.T) {
 	}
 	if _, _, err := reg.Fetch(context.Background(), "x", nil); err == nil || !strings.Contains(err.Error(), "size limit") {
 		t.Errorf("expected template size-limit error, got: %v", err)
+	}
+}
+
+func TestFetchPreservesDirectiveLikeUserPasswords(t *testing.T) {
+	for _, password := range []string{"generate", "auto", "p$UNSET_AUDIT", "p${UNSET_AUDIT}"} {
+		t.Run(password, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				fmt.Fprint(w, "app: demo\ningress: external\nimage: example\nenv:\n  PASSWORD: {{password}}\naccessories:\n  db:\n    image: postgres:17\n    env:\n      POSTGRES_PASSWORD: {{password}}\n")
+			}))
+			defer srv.Close()
+			reg := NewRegistry()
+			reg.SetBaseURL(srv.URL)
+			content, generated, err := reg.Fetch(context.Background(), "demo", map[string]string{"password": password})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(generated) != 0 {
+				t.Fatal("user literal generated")
+			}
+			var doc struct {
+				Env         map[string]string `yaml:"env_literal"`
+				Accessories map[string]struct {
+					Env map[string]string `yaml:"env_literal"`
+				} `yaml:"accessories"`
+			}
+			if err := yaml.Unmarshal([]byte(content), &doc); err != nil {
+				t.Fatal(err)
+			}
+			if doc.Env["PASSWORD"] != password || doc.Accessories["db"].Env["POSTGRES_PASSWORD"] != password {
+				t.Fatalf("literal mismatch: %s", content)
+			}
+		})
 	}
 }

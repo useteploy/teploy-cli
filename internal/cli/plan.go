@@ -3,11 +3,14 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sort"
+	"strings"
 
 	"github.com/spf13/cobra"
 	"github.com/useteploy/teploy/internal/config"
@@ -145,7 +148,7 @@ func buildPlanRecord(ctx context.Context, exec ssh.Executor, out io.Writer, appC
 	}
 
 	needsBuild := image == ""
-	_, manifestSHA, err := config.NormalizeAndDigest(appCfg, image)
+	manifestSHA, err := config.ExecutionBindingDigest(appCfg, image)
 	if err != nil {
 		return nil, false, fmt.Errorf("normalizing planned manifest: %w", err)
 	}
@@ -340,6 +343,9 @@ func runPlan(flags *Flags, version, image, destination, outFile string) error {
 		return err
 	}
 
+	if err := bindPlanOutput(rec, appCfg, outFile); err != nil {
+		return err
+	}
 	if err := renderPlan(flags, rec, sameVersion); err != nil {
 		return err
 	}
@@ -533,14 +539,16 @@ func desiredContainers(appCfg *config.AppConfig, version string) []desiredContai
 // provenance receipt, so apply executes them without a plan-id stamp —
 // recorded as a C05 tail.
 func planStatic(ctx context.Context, flags *Flags, appCfg *config.AppConfig, executor ssh.Executor, destination, outFile string) error {
-	_ = ctx
-	current, _ := state.Read(ctx, executor, appCfg.App)
+	current, err := state.Read(ctx, executor, appCfg.App)
+	if err != nil {
+		return err
+	}
 
 	version, err := gitShortHash()
 	if err != nil {
 		version = ""
 	}
-	_, manifestSHA, err := config.NormalizeAndDigest(appCfg, "")
+	manifestSHA, err := config.ExecutionBindingDigest(appCfg, "")
 	if err != nil {
 		return fmt.Errorf("normalizing planned manifest: %w", err)
 	}
@@ -563,7 +571,15 @@ func planStatic(ctx context.Context, flags *Flags, appCfg *config.AppConfig, exe
 	if current != nil {
 		rec.TargetState = PlanTargetState{Deployed: true, Generation: current.Generation, CurrentHash: current.CurrentHash, ManifestSHA256: current.ManifestSHA256}
 	}
-	rec.PlanID = computePlanID(rec)
+	if err := bindPlanOutput(rec, appCfg, outFile); err != nil {
+		return err
+	}
+
+	if outFile != "" {
+		if err := savePlanFile(outFile, rec); err != nil {
+			return err
+		}
+	}
 
 	if flags.JSON {
 		// Old static keys (app/server/type/note) unchanged; record
@@ -586,11 +602,71 @@ func planStatic(ctx context.Context, flags *Flags, appCfg *config.AppConfig, exe
 		fmt.Printf("? %s\n", n)
 	}
 	if outFile != "" {
-		if err := savePlanFile(outFile, rec); err != nil {
-			return err
-		}
 		fmt.Printf("\nPlan %s written to %s — apply with: teploy apply %s\n", rec.PlanID, outFile, outFile)
 	}
 	fmt.Println("\nThis is a preview. No changes were made.")
+	return nil
+}
+
+func staticPlanFingerprint(exclusions []string, configs ...*config.AppConfig) (string, error) {
+	var cfg *config.AppConfig
+	if len(configs) > 0 {
+		cfg = configs[0]
+	}
+	src, err := resolveReviewedSource(cfg)
+	if err != nil {
+		return "", err
+	}
+	excluded := make(map[string]bool, len(exclusions))
+	for _, name := range exclusions {
+		excluded[name] = true
+	}
+	entries := src.Entries[:0]
+	for _, entry := range src.Entries {
+		if !excluded[entry] {
+			entries = append(entries, entry)
+		}
+	}
+	src.Entries = entries
+	contextPath := ""
+	if cfg != nil && !cfg.IsStatic() {
+		contextPath = cfg.Context
+	}
+	return src.ReviewedFingerprint(contextPath)
+}
+
+func bindPlanOutput(rec *PlanRecord, cfg *config.AppConfig, outFile string) error {
+	if outFile != "" {
+		abs, err := filepath.Abs(outFile)
+		if err != nil {
+			return err
+		}
+		root, err := filepath.Abs(".")
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(root, abs)
+		if err != nil {
+			return err
+		}
+		if rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			rec.InputExclusions = []string{filepath.ToSlash(rel)}
+			for parent := filepath.Dir(rel); parent != "."; parent = filepath.Dir(parent) {
+				if _, err := os.Stat(parent); errors.Is(err, os.ErrNotExist) {
+					rec.InputExclusions = append(rec.InputExclusions, filepath.ToSlash(parent))
+				} else if err != nil {
+					return err
+				}
+			}
+		}
+	}
+	if rec.Image.NeedsBuild {
+		fp, err := staticPlanFingerprint(rec.InputExclusions, cfg)
+		if err != nil {
+			return fmt.Errorf("binding reviewed source inputs: %w", err)
+		}
+		rec.Image.ContextFingerprint = fp
+	}
+	rec.PlanID = computePlanID(rec)
 	return nil
 }

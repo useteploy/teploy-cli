@@ -94,7 +94,7 @@ func TestAdmission_AckWaitsForFsync(t *testing.T) {
 		logf:   func(string, ...any) {},
 	})
 
-	body := `{"ref":"refs/heads/main","after":"abc"}`
+	body := `{"ref":"refs/heads/main","after":"a9993e364706816aba3e25717850c26c9cd0d89d"}`
 	req := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body))
 	req.Header.Set("X-Hub-Signature-256", githubSign("s3cret", []byte(body)))
 	w := newRecordingWriter()
@@ -155,7 +155,7 @@ func TestAdmission_PersistenceFailureRefused(t *testing.T) {
 		logf:   func(string, ...any) {},
 	})
 
-	rec := postSigned(t, handler, "s3cret", "delivery-1", `{"ref":"refs/heads/main","after":"abc"}`)
+	rec := postSigned(t, handler, "s3cret", "delivery-1", `{"ref":"refs/heads/main","after":"a9993e364706816aba3e25717850c26c9cd0d89d"}`)
 
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Errorf("status = %d, want 503 (never ack what isn't durable)", rec.Code)
@@ -177,7 +177,7 @@ func TestAdmission_PersistenceFailureRefused(t *testing.T) {
 	ledger.mu.Lock()
 	ledger.fail = nil
 	ledger.mu.Unlock()
-	rec2 := postSigned(t, handler, "s3cret", "delivery-1", `{"ref":"refs/heads/main","after":"abc"}`)
+	rec2 := postSigned(t, handler, "s3cret", "delivery-1", `{"ref":"refs/heads/main","after":"a9993e364706816aba3e25717850c26c9cd0d89d"}`)
 	if rec2.Code != http.StatusOK {
 		t.Errorf("retry after persistence failure: status = %d, want 200 admitted", rec2.Code)
 	}
@@ -198,7 +198,7 @@ func TestAdmission_Supersede(t *testing.T) {
 	handler, ledger, queue := newAdmissionStack("s3cret", "main", "myapp", run.run)
 
 	// W starts running (blocks in the deploy).
-	if rec := postSigned(t, handler, "s3cret", "w", `{"ref":"refs/heads/main","after":"w"}`); rec.Code != http.StatusOK {
+	if rec := postSigned(t, handler, "s3cret", "w", `{"ref":"refs/heads/main","after":"aff024fe4ab0fece4091de044c58c9ae4233383a"}`); rec.Code != http.StatusOK {
 		t.Fatalf("running delivery status = %d", rec.Code)
 	} else if !strings.Contains(rec.Body.String(), `"running"`) {
 		t.Errorf("first delivery disposition = %q, want running", rec.Body.String())
@@ -206,14 +206,14 @@ func TestAdmission_Supersede(t *testing.T) {
 	run.waitCall(t) // W is inside the deploy now
 
 	// A queues behind it.
-	if rec := postSigned(t, handler, "s3cret", "a", `{"ref":"refs/heads/main","after":"a"}`); rec.Code != http.StatusOK {
+	if rec := postSigned(t, handler, "s3cret", "a", `{"ref":"refs/heads/main","after":"86f7e437faa5a7fce15d1ddcb9eaeaea377667b8"}`); rec.Code != http.StatusOK {
 		t.Fatalf("queued delivery status = %d", rec.Code)
 	} else if !strings.Contains(rec.Body.String(), `"queued"`) {
 		t.Errorf("second delivery disposition = %q, want queued", rec.Body.String())
 	}
 
 	// B supersedes A.
-	if rec := postSigned(t, handler, "s3cret", "b", `{"ref":"refs/heads/main","after":"b"}`); rec.Code != http.StatusOK {
+	if rec := postSigned(t, handler, "s3cret", "b", `{"ref":"refs/heads/main","after":"e9d71f5ee7c92d6dc9e92ffdad17b8bd49418f98"}`); rec.Code != http.StatusOK {
 		t.Fatalf("superseding delivery status = %d", rec.Code)
 	} else if !strings.Contains(rec.Body.String(), `"superseded"`) {
 		t.Errorf("third delivery disposition = %q, want superseded", rec.Body.String())
@@ -262,7 +262,7 @@ func TestAdmission_NoGoroutinePileup(t *testing.T) {
 
 	running, queued, superseded := 0, 0, 0
 	for i := 0; i < 10; i++ {
-		body := `{"ref":"refs/heads/main","after":"c` + string(rune('0'+i)) + `"}`
+		body := `{"ref":"refs/heads/main","after":"` + strings.Repeat("c", 39) + string(rune('0'+i)) + `"}`
 		rec := postSigned(t, handler, "s3cret", "", body)
 		if rec.Code != http.StatusOK {
 			t.Fatalf("delivery %d status = %d, want 200", i, rec.Code)
@@ -454,9 +454,9 @@ func TestAdmission_SameDigestWhileQueuedIsDuplicate(t *testing.T) {
 	run := newCountingRun().blocking(block)
 	handler, ledger, queue := newAdmissionStack("s3cret", "main", "myapp", run.run)
 
-	postSigned(t, handler, "s3cret", "w", `{"ref":"refs/heads/main","after":"w"}`)
+	postSigned(t, handler, "s3cret", "w", `{"ref":"refs/heads/main","after":"aff024fe4ab0fece4091de044c58c9ae4233383a"}`)
 	run.waitCall(t)
-	body := `{"ref":"refs/heads/main","after":"q"}`
+	body := `{"ref":"refs/heads/main","after":"22ea1c649c82946aa6e479e1ffd321e4a318b1b0"}`
 	if rec := postSigned(t, handler, "s3cret", "q1", body); !strings.Contains(rec.Body.String(), `"queued"`) {
 		t.Fatalf("first copy disposition = %q, want queued", rec.Body.String())
 	}

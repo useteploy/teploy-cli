@@ -16,9 +16,11 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"path/filepath"
 
 	"github.com/spf13/cobra"
 	"github.com/useteploy/teploy/internal/config"
+	"github.com/useteploy/teploy/internal/ssh"
 	"github.com/useteploy/teploy/internal/state"
 )
 
@@ -71,6 +73,22 @@ func runApply(flags *Flags, planPath string, skipDNSCheck, migrateVolumes bool) 
 		return err
 	}
 
+	if rec.Image.NeedsBuild {
+		snapshot, err := freezePlanInputs(rec.InputExclusions, appCfg)
+		if err != nil {
+			return refuseApply(fmt.Errorf("freezing reviewed inputs: %w", err))
+		}
+		defer os.RemoveAll(filepath.Dir(snapshot))
+		original, err := os.Getwd()
+		if err != nil {
+			return err
+		}
+		if err := os.Chdir(snapshot); err != nil {
+			return err
+		}
+		defer os.Chdir(original)
+	}
+
 	// Connect to the plan's target.
 	serverName := rec.ServerName
 	if serverName == "" {
@@ -92,9 +110,17 @@ func runApply(flags *Flags, planPath string, skipDNSCheck, migrateVolumes bool) 
 	// identity. This catches edits the version cannot see (a dirty-tree
 	// change between plan and apply).
 	var curFingerprint, curDockerfileSHA string
-	if rec.Image.NeedsBuild {
+	if rec.Image.NeedsBuild && appCfg.IsStatic() {
+		curFingerprint, err = staticPlanFingerprint(rec.InputExclusions, appCfg)
+		if err != nil {
+			return err
+		}
+	} else if rec.Image.NeedsBuild {
 		prov := resolveDeployProvenance(ctx, executor, io.Discard, appCfg, ".", image, rec.TargetVersion, curDigest, true)
-		curFingerprint = prov.ContextFingerprint
+		curFingerprint, err = staticPlanFingerprint(rec.InputExclusions, appCfg)
+		if err != nil {
+			return err
+		}
 		curDockerfileSHA = prov.DockerfileSHA256
 	}
 
@@ -118,7 +144,7 @@ func runApply(flags *Flags, planPath string, skipDNSCheck, migrateVolumes bool) 
 	// ONE execution path: the same deployAppConfig a direct `teploy
 	// deploy` runs, with the plan's recorded image/version/overlay. The
 	// plan id rides along and is stamped into the provenance receipt.
-	err = deployAppConfig(flags, appCfg, serverName, image, rec.TargetVersion, skipDNSCheck, migrateVolumes, rec.PlanID)
+	err = deployAppConfig(flags, appCfg, serverName, image, rec.TargetVersion, skipDNSCheck, migrateVolumes, rec.PlanID, rec)
 	if err != nil {
 		return err
 	}
@@ -154,7 +180,7 @@ func applyResolveCurrent(ctx context.Context, flags *Flags, rec *PlanRecord) (ap
 	}
 
 	image = rec.Image.Ref
-	_, curDigest, err = config.NormalizeAndDigest(appCfg, image)
+	curDigest, err = config.ExecutionBindingDigest(appCfg, image)
 	if err != nil {
 		return nil, "", "", "", fmt.Errorf("normalizing current config: %w", err)
 	}
@@ -186,4 +212,32 @@ func refuseApply(err error) error {
 		return err
 	}
 	return refuseAdmission(err)
+}
+
+func revalidateLockedPlan(ctx context.Context, exec ssh.Executor, cfg *config.AppConfig, image, version string, rec *PlanRecord) error {
+	current, err := state.Read(ctx, exec, cfg.App)
+	if err != nil {
+		return err
+	}
+	digest, err := config.ExecutionBindingDigest(cfg, image)
+	if err != nil {
+		return err
+	}
+	facts := planCurrentFacts{App: cfg.App, Server: exec.Host(), Version: version, ConfigDigest: digest, State: current}
+	if rec.Image.NeedsBuild {
+		if cfg.IsStatic() {
+			facts.ContextFingerprint, err = staticPlanFingerprint(rec.InputExclusions, cfg)
+			if err != nil {
+				return err
+			}
+		} else {
+			prov := resolveDeployProvenance(ctx, exec, io.Discard, cfg, ".", image, version, digest, true)
+			facts.ContextFingerprint, err = staticPlanFingerprint(rec.InputExclusions, cfg)
+			if err != nil {
+				return err
+			}
+			facts.DockerfileSHA256 = prov.DockerfileSHA256
+		}
+	}
+	return verifyPlanBinding(rec, facts)
 }

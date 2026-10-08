@@ -459,8 +459,8 @@ func writeFenced(ctx context.Context, exec ssh.Executor, app string, s *AppState
 		if GenerationFenced(err) {
 			return fmt.Errorf("%w: refusing to commit generation %d for %s over a newer committed generation (expected predecessor %d)", ErrGenerationFenced, s.Generation, app, *expectedGeneration)
 		}
-		// Leave the temp files for diagnosis; they are inert.
-		return err
+		// Re-observe authority before any caller can compensate.
+		return resolvePublication(exec, app, data, s.Generation, lk, err)
 	}
 	return nil
 }

@@ -47,7 +47,7 @@ func planFromConfig(t *testing.T, dir, image, destination string) *PlanRecord {
 	if err != nil {
 		t.Fatalf("LoadApp: %v", err)
 	}
-	_, digest, err := config.NormalizeAndDigest(appCfg, image)
+	digest, err := config.ExecutionBindingDigest(appCfg, image)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -256,6 +256,8 @@ func TestApplyStampReceiptThroughEngine(t *testing.T) {
 	appliedManifest, _, _ := config.NormalizeAndDigest(appCfg, image)
 
 	mock := ssh.NewMockExecutor("1.2.3.4",
+		// managed-directory admission (R2-06) precedes the engine
+		ssh.MockCommand{Match: "teploy_volume_actor", Output: ""},
 		// provenance mkdir + upload (UploadAtomic: UPLOAD + mv handled by mock)
 		ssh.MockCommand{Match: "mkdir -p /deployments/myapp/meta/att", Output: ""},
 		// .env absent

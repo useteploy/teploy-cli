@@ -129,6 +129,30 @@ func (m *MockExecutor) Run(ctx context.Context, cmd string) (string, error) {
 		m.Calls = append(m.Calls, cmd)
 	}
 
+	// Framed preview authority reads distinguish absence from failed reads.
+	if strings.HasPrefix(cmd, "if test -f ") && strings.Contains(cmd, "__TEPLOY_PREVIEW_ABSENT__") {
+		rest := strings.TrimPrefix(cmd, "if test -f ")
+		quoted, _, _ := strings.Cut(rest, "; then cat ")
+		path := strings.Trim(quoted, "'")
+		for _, registered := range m.commands {
+			if strings.HasPrefix("cat "+path, registered.Match) && registered.Match != "" {
+				m.mu.Unlock()
+				if registered.Err != nil {
+					return "", registered.Err
+				}
+				if registered.Output != "" {
+					return registered.Output, nil
+				}
+				return "__TEPLOY_PREVIEW_ABSENT__", nil
+			}
+		}
+		if data, ok := m.Files[path]; ok {
+			m.mu.Unlock()
+			return string(data), nil
+		}
+		m.mu.Unlock()
+		return "__TEPLOY_PREVIEW_ABSENT__", nil
+	}
 	// `cat <path>` answers from the recorded file state when the mock has
 	// one (the real server re-reads whatever earlier writes left); an
 	// explicit registration still wins for paths the mock has no file for.
@@ -586,16 +610,42 @@ func (m *MockExecutor) RunStream(ctx context.Context, cmd string, stdout, stderr
 }
 
 func (m *MockExecutor) RunInput(ctx context.Context, cmd string, stdin io.Reader) error {
+	var payload []byte
 	if stdin != nil {
 		data, err := io.ReadAll(stdin)
 		if err != nil {
 			return err
 		}
+		payload = data
 		m.mu.Lock()
 		m.Inputs = append(m.Inputs, string(data))
 		m.mu.Unlock()
 	}
 	_, err := m.Run(ctx, cmd)
+	if strings.Contains(cmd, "authority exceeds bound") && strings.Contains(cmd, "os.replace(tmp,name") {
+		if err != nil && !strings.HasPrefix(err.Error(), "mock: unexpected command:") {
+			return err
+		}
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		for _, registered := range m.commands {
+			if mockCommandMatches(cmd, registered.Match) && registered.Err != nil {
+				return registered.Err
+			}
+		}
+		// Evaluate the actual composed holdership guard before publishing.
+		if _, held, ok := evalFenceGuard(m.Files, cmd); ok && !held {
+			return fmt.Errorf("exit status 75: TEPLOY_FENCE_LOST")
+		}
+		parts := strings.Split(cmd, " ")
+		quoted := parts[len(parts)-1]
+		path := strings.Trim(quoted, "'")
+		if !strings.HasPrefix(path, "/deployments/") {
+			return fmt.Errorf("invalid atomic fixture path")
+		}
+		m.Files[path] = append([]byte(nil), payload...)
+		return nil
+	}
 	return err
 }
 

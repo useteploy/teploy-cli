@@ -139,7 +139,11 @@ func (c *Client) EnsureAppRole(ctx context.Context, app, accessory string) (*App
 	// 1. Least-privilege policy: read only this app's secrets. Shared with
 	// EnableDatabaseSecrets via AppReadPolicy. Detect an already-configured DB
 	// role so re-running setup after `vault db setup` preserves the DB grant.
-	if err := c.writeAppPolicy(ctx, container, root, app, c.hasDBRole(ctx, container, root, app)); err != nil {
+	withDB, err := c.discoverDBRoles(ctx, container, root, app)
+	if err != nil {
+		return nil, err
+	}
+	if err := c.writeAppPolicy(ctx, container, root, app, withDB); err != nil {
 		return nil, err
 	}
 	_ = policyName
@@ -167,8 +171,12 @@ func (c *Client) EnsureAppRole(ctx context.Context, app, accessory string) (*App
 	}
 
 	// 5. Persist for the deploy/agent paths.
-	_ = c.secrets.Set(ctx, app, secretRoleID, roleID)
-	_ = c.secrets.Set(ctx, app, secretSecretID, secretID)
+	if err := c.secrets.Set(ctx, app, secretRoleID, roleID); err != nil {
+		return nil, fmt.Errorf("persisting AppRole role ID: %w", err)
+	}
+	if err := c.secrets.Set(ctx, app, secretSecretID, secretID); err != nil {
+		return nil, fmt.Errorf("persisting AppRole secret ID (retry setup to repair partial credentials): %w", err)
+	}
 	return &AppRoleCreds{RoleID: roleID, SecretID: secretID}, nil
 }
 

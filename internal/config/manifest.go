@@ -54,7 +54,7 @@ func NormalizeAndDigest(cfg *AppConfig, appliedImage string) (json.RawMessage, s
 			"dockerfile":       cleanOptionalPath(cfg.Dockerfile),
 			"keep_versions":    cfg.KeepVersions,
 			"processes":        sortedMapKeys(cfg.Processes),
-			"env_keys":         sortedMapKeys(cfg.Env),
+			"env_keys":         bindingCombinedEnvKeys(cfg.Env, cfg.EnvLiteral),
 			"env_files":        append([]string(nil), cfg.EnvFiles...),
 			"volumes":          cfg.Volumes,
 			"memory":           cfg.Memory,
@@ -85,6 +85,9 @@ func NormalizeAndDigest(cfg *AppConfig, appliedImage string) (json.RawMessage, s
 		}
 	}
 
+	if len(cfg.VolumeOwnership) > 0 {
+		manifest["volume_ownership"] = cfg.VolumeOwnership
+	}
 	manifest["accessories"] = normalizedAccessories(cfg.Accessories)
 	manifest["tls"] = normalizedTLS(cfg.TLS)
 	manifest["firewall"] = normalizedFirewall(cfg.Firewall)
@@ -168,10 +171,13 @@ func normalizedAccessories(accessories map[string]AccessoryConfig) map[string]an
 		out[name] = map[string]any{
 			"image":       accessory.Image,
 			"port":        accessory.Port,
-			"env_keys":    sortedMapKeys(accessory.Env),
+			"env_keys":    bindingCombinedEnvKeys(accessory.Env, accessory.EnvLiteral),
 			"volumes":     accessory.Volumes,
 			"publish":     accessory.Publish,
 			"has_command": accessory.Command != "",
+		}
+		if len(accessory.VolumeOwnership) > 0 {
+			out[name].(map[string]any)["volume_ownership"] = accessory.VolumeOwnership
 		}
 	}
 	return out
@@ -213,4 +219,50 @@ func normalizedAccess(access AccessConfig) map[string]any {
 		}
 	}
 	return out
+}
+
+// ExecutionBindingDigest binds a reviewed plan to execution-bearing config.
+// The digest is private: its input is never emitted in the display manifest.
+// Environment values remain deliberately outside plan authorization; their
+// keys and references are bound, as is every other configuration field.
+func ExecutionBindingDigest(cfg *AppConfig, image string) (string, error) {
+	copyCfg := *cfg
+	copyCfg.Image = image
+	copyCfg.SourceRevision = ""
+	copyCfg.Env = bindingEnvKeys(cfg.Env)
+	copyCfg.EnvLiteral = bindingEnvKeys(cfg.EnvLiteral)
+	copyCfg.Accessories = make(map[string]AccessoryConfig, len(cfg.Accessories))
+	for name, acc := range cfg.Accessories {
+		acc.Env = bindingEnvKeys(acc.Env)
+		acc.EnvLiteral = bindingEnvKeys(acc.EnvLiteral)
+		copyCfg.Accessories[name] = acc
+	}
+	data, err := json.Marshal(copyCfg)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+func bindingEnvKeys(env map[string]string) map[string]string {
+	if len(env) == 0 {
+		return nil
+	}
+	keys := make(map[string]string, len(env))
+	for key := range env {
+		keys[key] = ""
+	}
+	return keys
+}
+
+func bindingCombinedEnvKeys(env, literal map[string]string) []string {
+	keys := bindingEnvKeys(env)
+	if keys == nil {
+		keys = map[string]string{}
+	}
+	for key := range literal {
+		keys[key] = ""
+	}
+	return sortedMapKeys(keys)
 }

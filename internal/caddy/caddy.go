@@ -439,7 +439,9 @@ func (c *Client) SetMaintenance(ctx context.Context, app, domain string) error {
 		begin := fmt.Sprintf(markerBeginFmt, app)
 		end := fmt.Sprintf(markerEndFmt, app)
 		var pol SitePolicy
+		var maintenanceGeneration uint64
 		if cur := extractCaddyfileBlock(prev, begin, end); cur != "" {
+			maintenanceGeneration, _ = RegionGeneration(cur)
 			extracted, err := ExtractPolicy(cur)
 			if err != nil {
 				return "", fmt.Errorf("reading %s's TLS/access policy for maintenance (route left unchanged): %w", app, err)
@@ -464,7 +466,11 @@ func (c *Client) SetMaintenance(ctx context.Context, app, domain string) error {
 				}
 			}
 		}
-		updated, err := renderUpdated(prev, app, hosts, maintenanceBlock(hosts, pol))
+		block := maintenanceBlock(hosts, pol)
+		if maintenanceGeneration > 0 {
+			block = fmt.Sprintf(generationStampFmt, maintenanceGeneration) + "\n" + block
+		}
+		updated, err := renderUpdated(prev, app, hosts, block)
 		if err != nil {
 			return "", err
 		}

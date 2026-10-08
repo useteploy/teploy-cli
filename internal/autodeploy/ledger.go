@@ -1,12 +1,14 @@
 package autodeploy
 
 import (
+	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"sort"
 	"strings"
@@ -96,16 +98,35 @@ type LedgerAppender interface {
 // O_APPEND|O_CREATE (0600 — same privacy class as the dedup file) and
 // fsyncs after every appended line.
 type FileLedger struct {
-	path string
-	mu   chan struct{} // binary semaphore; keeps Append a mutex-free test target
-	f    *os.File
+	path   string
+	mu     chan struct{} // binary semaphore; keeps Append a mutex-free test target
+	f      *os.File
+	failed error
 }
 
 // OpenLedger opens (or creates) the ledger at path for durable appends.
 func OpenLedger(path string) (*FileLedger, error) {
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0600)
 	if err != nil {
 		return nil, fmt.Errorf("opening webhook admission ledger %s: %w", path, err)
+	}
+	if err = lockLedgerFile(f); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("locking admission ledger: %w", err)
+	}
+	data, err := io.ReadAll(f)
+	if err == nil {
+		_, err = ParseLedger(data)
+	}
+	if err == nil && len(data) > 0 && data[len(data)-1] != '\n' {
+		err = f.Truncate(int64(bytes.LastIndexByte(data, '\n') + 1))
+		if err == nil {
+			err = f.Sync()
+		}
+	}
+	if err != nil {
+		f.Close()
+		return nil, fmt.Errorf("repairing admission ledger: %w", err)
 	}
 	return &FileLedger{path: path, mu: make(chan struct{}, 1), f: f}, nil
 }
@@ -120,9 +141,17 @@ func (l *FileLedger) Append(rec AdmissionRecord) error {
 	line = append(line, '\n')
 
 	l.mu <- struct{}{}
+	if l.failed != nil {
+		err := l.failed
+		<-l.mu
+		return err
+	}
 	_, werr := l.f.Write(line)
 	if werr == nil {
 		werr = l.f.Sync()
+	}
+	if werr != nil {
+		l.failed = werr
 	}
 	<-l.mu
 	if werr != nil {

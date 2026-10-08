@@ -152,12 +152,11 @@ func TestResolveSource_OutsideGit(t *testing.T) {
 		"teploy.yml":      "app: x",
 		"teploy.home.yml": "password: hunter2",
 		".env.local":      "SECRET=1",
-		".git/config":     "not a real repo",
 	})
 	if err := os.MkdirAll(filepath.Join(dir, "empty/dir"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	// A bare .git directory without git's own layout is not a work tree.
+	// This fixture is genuinely outside a repository; corrupt .git directories now refuse.
 	src := resolve(t, dir)
 	if src.GitAware {
 		t.Skip("temp dir resolved as a git work tree (unexpected environment)")

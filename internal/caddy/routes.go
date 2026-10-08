@@ -426,17 +426,32 @@ type SitePolicy struct {
 // directives, with nested spans (basic_auth's user list, forward_auth's
 // options) kept verbatim. Anything unparseable is an error — a maintenance
 // block built from a misread policy is worse than one built from none.
+func siteOpeningLine(lines []string) (int, error) {
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		if strings.HasSuffix(trimmed, "{") && braceNet(line) > 0 {
+			return i, nil
+		}
+		return 0, fmt.Errorf("not a site block: %q", line)
+	}
+	return 0, fmt.Errorf("site block has no opening line")
+}
+
 func ExtractPolicy(block string) (SitePolicy, error) {
 	var pol SitePolicy
 	lines := logicalLines(strings.Split(block, "\n"))
 	if len(lines) == 0 {
 		return pol, nil
 	}
-	depth := braceNet(lines[0]) // the address line's opening brace
-	if depth <= 0 {
-		return pol, fmt.Errorf("not a site block: %q", lines[0])
+	opening, err := siteOpeningLine(lines)
+	if err != nil {
+		return pol, err
 	}
-	for i := 1; i < len(lines); i++ {
+	depth := braceNet(lines[opening])
+	for i := opening + 1; i < len(lines); i++ {
 		raw := lines[i]
 		code, err := codeLine(raw)
 		if err != nil {

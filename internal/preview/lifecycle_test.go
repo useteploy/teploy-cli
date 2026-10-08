@@ -32,7 +32,7 @@ func indexOf(calls []string, needle string) int {
 // switch — that ordering was the downtime window the main deploy path
 // doesn't have.
 func TestDeploy_BlueGreenOrdering(t *testing.T) {
-	mock := ssh.NewMockExecutor("1.2.3.4",
+	mock := previewMockExecutor("1.2.3.4",
 		append(previewDeployMocks(),
 			ssh.MockCommand{Match: "curl -s -o /dev/null", Output: "200"})...)
 	var buf bytes.Buffer
@@ -93,7 +93,7 @@ func TestDeploy_FailedCandidateLeavesPredecessor(t *testing.T) {
 		}
 		mocks = append(mocks, mc)
 	}
-	mock := ssh.NewMockExecutor("1.2.3.4", mocks...)
+	mock := previewMockExecutor("1.2.3.4", mocks...)
 	var buf bytes.Buffer
 	mgr := NewManager(mock, &buf)
 	mgr.healthTimeout = 150 * time.Millisecond
@@ -146,7 +146,7 @@ func TestDeploy_FailedCandidateLeavesPredecessor(t *testing.T) {
 // candidate's name, so it is renamed aside before the candidate starts and
 // retired after the switch (the main engine's same-version pattern).
 func TestDeploy_SameVersionUpdate(t *testing.T) {
-	mock := ssh.NewMockExecutor("1.2.3.4",
+	mock := previewMockExecutor("1.2.3.4",
 		append(previewDeployMocks(),
 			ssh.MockCommand{Match: "curl -s -o /dev/null", Output: "200"},
 			ssh.MockCommand{Match: "docker rename", Output: ""})...)
@@ -200,6 +200,8 @@ func TestPrune_RemovesExactlyExpiredBothErasIdempotent(t *testing.T) {
 	otherFresh := previewStatePath("otherapp", "fresh-feature")
 
 	destroyMocks := []ssh.MockCommand{
+		{Match: "docker stop", Output: ""},
+		{Match: "docker rm", Output: ""},
 		// Per-app record listings (PruneAll enumerates apps first).
 		ssh.MockCommand{Match: "ls -d /deployments/*/previews", Output: "/deployments/myapp/previews\n/deployments/otherapp/previews"},
 		ssh.MockCommand{Match: "ls /deployments/myapp/previews/*.json", Output: myExpired + "\n" + myFresh},
@@ -211,7 +213,7 @@ func TestPrune_RemovesExactlyExpiredBothErasIdempotent(t *testing.T) {
 		ssh.MockCommand{Match: "docker exec caddy caddy reload", Output: ""},
 		ssh.MockCommand{Match: "rmdir /deployments/caddy/.lock", Output: ""},
 	}
-	mock := ssh.NewMockExecutor("1.2.3.4", destroyMocks...)
+	mock := previewMockExecutor("1.2.3.4", destroyMocks...)
 	mock.Files[myExpired] = []byte(canonicalRecordJSON("myapp", loginIDHex, loginBranch,
 		"myapp-preview-p-"+loginIDHex+"-v1", "preview-feature-login-"+loginIDHex+".myapp.com", expiredAt))
 	mock.Files[myFresh] = []byte(canonicalRecordJSON("myapp", dashIDHex, dashBranch,
@@ -222,8 +224,21 @@ func TestPrune_RemovesExactlyExpiredBothErasIdempotent(t *testing.T) {
 	// A non-preview deployment resource that must never be touched.
 	mock.Files["/deployments/myapp/state.json"] = []byte(`{"app":"myapp"}`)
 
+	// The server still runs both expired previews' containers; the fresh
+	// one is listed but must never be acted on.
+	inventory := newPreviewInventoryExecutor(mock,
+		"myapp-preview-p-"+loginIDHex+"-v1", "otherapp-preview-legacy-feature-v1",
+		"myapp-preview-p-"+dashIDHex+"-v1", "otherapp-preview-p-abcd1234-v1")
+
 	var buf bytes.Buffer
-	mgr := NewManager(mock, &buf)
+	mgr := NewManager(inventory, &buf)
+	// Capture the inventoried immutable IDs before the effects delete them.
+	expiredIDs := map[string]string{
+		"myapp-preview-p-" + loginIDHex + "-v1": inventory.containers["myapp-preview-p-"+loginIDHex+"-v1"],
+		"otherapp-preview-legacy-feature-v1":    inventory.containers["otherapp-preview-legacy-feature-v1"],
+	}
+	freshID := inventory.containers["myapp-preview-p-"+dashIDHex+"-v1"]
+
 	pruned, err := mgr.PruneAll(context.Background())
 	if err != nil {
 		t.Fatalf("PruneAll: %v", err)
@@ -241,17 +256,17 @@ func TestPrune_RemovesExactlyExpiredBothErasIdempotent(t *testing.T) {
 			t.Errorf("fresh record removed: %s", path)
 		}
 	}
-	// The expired previews' containers were stopped (canonical + legacy
-	// both by their stored container names).
-	for _, container := range []string{
-		"docker stop -t 5 'myapp-preview-p-" + loginIDHex + "-v1'",
-		"docker stop -t 5 'otherapp-preview-legacy-feature-v1'",
-	} {
-		if indexOf(mock.Calls, container) == -1 {
-			t.Errorf("expired preview's container not stopped: %q, calls: %v", container, mock.Calls)
+	// The expired previews' containers were stopped by their IMMUTABLE IDs
+	// (R2-07: effects address the inventoried ID, never a reusable name).
+	for name, id := range expiredIDs {
+		if indexOf(mock.Calls, "docker stop -t 5 '"+id+"'") == -1 {
+			t.Errorf("expired preview's container not stopped by immutable ID: %q, calls: %v", name, mock.Calls)
+		}
+		if indexOf(mock.Calls, "docker rm '"+id+"'") == -1 {
+			t.Errorf("expired preview's container not removed by immutable ID: %q, calls: %v", name, mock.Calls)
 		}
 	}
-	if indexOf(mock.Calls, "docker stop -t 5 'myapp-preview-p-"+dashIDHex+"-v1'") != -1 {
+	if indexOf(mock.Calls, "docker stop -t 5 '"+freshID+"'") != -1 {
 		t.Error("fresh preview's container was stopped")
 	}
 	if indexOf(mock.Calls, "/deployments/myapp/state.json") != -1 {
@@ -281,7 +296,7 @@ func TestPrune_RemovesExactlyExpiredBothErasIdempotent(t *testing.T) {
 // The TTL default is applied at create AND refreshed at update when the
 // caller doesn't pass one: ExpiresAt is exactly CreatedAt + 72h.
 func TestDeploy_TTLDefaultApplied(t *testing.T) {
-	mock := ssh.NewMockExecutor("1.2.3.4",
+	mock := previewMockExecutor("1.2.3.4",
 		append(previewDeployMocks(),
 			ssh.MockCommand{Match: "curl -s -o /dev/null", Output: "200"})...)
 	var buf bytes.Buffer
