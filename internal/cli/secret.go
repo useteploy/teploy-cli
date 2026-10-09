@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -70,9 +72,31 @@ func newSecretSetCmd(flags *Flags, provider *string) *cobra.Command {
 				}
 				pairs[arg[:idx]] = arg[idx+1:]
 			}
+			warnSecretTerminators(pairs, os.Stderr)
 			return runSecretSet(flags, *provider, pairs)
 		},
 	}
+}
+
+// warnSecretTerminators notes values that end in a line terminator. They are
+// stored exactly as given (secret get stays exact for every consumer), but
+// docker's --env-file cannot carry the terminator, so deploys will drop one
+// and warn. The shell's $(...) already strips trailing newlines; this only
+// fires for a deliberate or pasted terminator (e.g. KEY=$'abc\n').
+func warnSecretTerminators(pairs map[string]string, w io.Writer) {
+	var keys []string
+	for k, v := range pairs {
+		if strings.HasSuffix(v, "\n") {
+			keys = append(keys, k)
+		}
+	}
+	if len(keys) == 0 {
+		return
+	}
+	sort.Strings(keys)
+	fmt.Fprintf(w, "Warning: value(s) for %s end with a newline and are stored verbatim; "+
+		"deploys drop one trailing newline when writing the container env file. Re-run without it if it was not intended.\n",
+		strings.Join(keys, ", "))
 }
 
 func runSecretSet(flags *Flags, providerFlag string, pairs map[string]string) error {
