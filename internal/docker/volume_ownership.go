@@ -28,7 +28,8 @@ try:
   if part in ('', '.', '..'): raise RuntimeError('invalid managed path')
   parent = os.fstat(fd)
   if parent.st_uid not in (0, actor) or parent.st_mode & 0o022:
-   raise RuntimeError('unsafe mutable volume ancestor; requires trusted administrator ownership and no group/world write')
+   where = '/' + '/'.join(parts[:index])
+   raise RuntimeError('unsafe mutable volume ancestor %s (uid %d, mode %o); it must be owned by root or the deploy user and not group/world writable, e.g. sudo chmod go-w %s' % (where, parent.st_uid, stat.S_IMODE(parent.st_mode), where))
   final = index == len(parts)-1
   try:
    child = os.open(part, flags, dir_fd=fd)
