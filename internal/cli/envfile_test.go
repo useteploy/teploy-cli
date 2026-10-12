@@ -146,6 +146,113 @@ func TestBuildContainerEnvFiles_RejectsMultilineValues(t *testing.T) {
 	}
 }
 
+func TestTrimSecretTerminators(t *testing.T) {
+	var warn strings.Builder
+	in := map[string]string{
+		"LF":     "abc\n",
+		"CRLF":   "def\r\n",
+		"PLAIN":  "ghi",
+		"EMPTY":  "",
+		"TWO":    "jkl\n\n",
+		"MID":    "a\nb",
+		"LONECR": "x\r",
+	}
+	got := trimSecretTerminators(in, &warn)
+
+	want := map[string]string{
+		"LF": "abc", "CRLF": "def", "PLAIN": "ghi", "EMPTY": "",
+		"TWO": "jkl\n", // exactly one terminator removed
+		"MID": "a\nb", "LONECR": "x\r",
+	}
+	for k, w := range want {
+		if got[k] != w {
+			t.Errorf("%s = %q, want %q", k, got[k], w)
+		}
+	}
+	// The input map (stored values) is never mutated.
+	if in["LF"] != "abc\n" || in["CRLF"] != "def\r\n" {
+		t.Errorf("input map was mutated: %v", in)
+	}
+	w := warn.String()
+	if !strings.Contains(w, "CRLF, LF, TWO") {
+		t.Errorf("warning should name exactly the trimmed keys, got: %q", w)
+	}
+	for _, v := range []string{"abc", "def", "jkl"} {
+		if strings.Contains(w, v) {
+			t.Errorf("warning must not echo secret values, got: %q", w)
+		}
+	}
+	if strings.Count(w, "\n") != 1 {
+		t.Errorf("expected a single warning line, got: %q", w)
+	}
+
+	warn.Reset()
+	trimSecretTerminators(map[string]string{"A": "b"}, &warn)
+	if warn.Len() != 0 {
+		t.Errorf("no warning expected when nothing was trimmed, got: %q", warn.String())
+	}
+}
+
+func TestBuildContainerEnvFiles_TrimsOneTrailingSecretNewline(t *testing.T) {
+	mock, att := attMock()
+	secrets := map[string]string{"LF": "abc\n", "CRLF": "def\r\n", "PLAIN": "ghi"}
+	envFiles, err := buildContainerEnvFiles(context.Background(), mock, "myapp", att, "", nil, nil, secrets)
+	if err != nil {
+		t.Fatalf("buildContainerEnvFiles: %v", err)
+	}
+	data := string(mock.Files[envFiles[len(envFiles)-1]])
+	if data != "CRLF=def\nLF=abc\nPLAIN=ghi\n" {
+		t.Errorf("env file = %q", data)
+	}
+}
+
+func TestBuildContainerEnvFiles_SecretWithTwoTrailingNewlinesStillRejected(t *testing.T) {
+	mock, att := attMock()
+	_, err := buildContainerEnvFiles(context.Background(), mock, "myapp", att, "", nil, nil,
+		map[string]string{"KEY": "abc\n\n"})
+	if err == nil || !strings.Contains(err.Error(), "KEY") || !strings.Contains(err.Error(), "multiple lines") {
+		t.Fatalf("two trailing newlines must still be rejected as multi-line, got: %v", err)
+	}
+}
+
+func TestBuildContainerEnvFiles_SecretEmbeddedNewlineStillRejected(t *testing.T) {
+	mock, att := attMock()
+	for _, v := range []string{"a\nb", "a\nb\n", "a\r\nb\r\n"} {
+		_, err := buildContainerEnvFiles(context.Background(), mock, "myapp", att, "", nil, nil,
+			map[string]string{"KEY": v})
+		if err == nil || !strings.Contains(err.Error(), "multiple lines") {
+			t.Errorf("value %q must be rejected as multi-line, got: %v", v, err)
+		}
+	}
+}
+
+// Only secrets are normalised: operator-written env values with a trailing
+// newline (YAML block scalars) are still rejected rather than silently edited.
+func TestBuildContainerEnvFiles_NonSecretTrailingNewlineStillRejected(t *testing.T) {
+	mock, att := attMock()
+	if _, err := buildContainerEnvFiles(context.Background(), mock, "myapp", att, "",
+		map[string]string{"APP": "x\n"}, nil, nil); err == nil {
+		t.Error("appEnv value with trailing newline must still be rejected")
+	}
+	if _, err := buildContainerEnvFiles(context.Background(), mock, "myapp", att, "",
+		nil, map[string]string{"TAG": "x\n"}, nil); err == nil {
+		t.Error("extra (tag) value with trailing newline must still be rejected")
+	}
+}
+
+func TestWarnSecretTerminators(t *testing.T) {
+	var b strings.Builder
+	warnSecretTerminators(map[string]string{"A": "x", "B": "y\n", "C": "z\r\n"}, &b)
+	if !strings.Contains(b.String(), "B, C") || strings.Contains(b.String(), "A,") {
+		t.Errorf("unexpected warning: %q", b.String())
+	}
+	b.Reset()
+	warnSecretTerminators(map[string]string{"A": "x"}, &b)
+	if b.Len() != 0 {
+		t.Errorf("no warning expected, got %q", b.String())
+	}
+}
+
 // TestExpandEnvTemplates_StrictFailsOnUnset is TCL-32's opt-in: --strict-env
 // must fail listing every unset ${VAR} instead of silently expanding it to
 // the empty string; the default keeps the historical empty expansion.

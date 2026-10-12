@@ -4,6 +4,28 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [0.1.40] - 2026-10-11
+
+v0.1.39 was tagged from the wrong commit (`b3f9a11`, which predates the
+v0.1.38 fix), so it shipped everything below **without** the secret-newline
+fix and refused any multi-line secret again. v0.1.40 is the intended release:
+everything below plus v0.1.38. Skip v0.1.39.
+
+### Upgrade note
+
+- **Managed volume directories now refuse unsafe ancestors.** Before a
+  deploy touches `/deployments/<app>/volumes/...` or an accessory's data
+  directory, every parent directory must be owned by root or the deploy user
+  and not group/world writable. Servers whose `/deployments/<app>` was
+  created group-writable (e.g. mode 775 under a 002 umask) stop at the first
+  deploy. The error now names the directory and the fix
+  (`sudo chmod go-w <dir>`, not recursive); it used to name neither.
+
+### Fixed
+
+- Secrets keep the v0.1.38 behaviour: one trailing newline is dropped before
+  the container env file is written (lost in v0.1.39).
+
 ### Changed
 
 - **Machine interface 2: `server list --json` emits the machine
@@ -57,6 +79,23 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
   path). Both were silently DROPPED — only accessories were parsed —
   so an imported stack deployed without any of the web service's
   environment or storage.
+
+## [0.1.38] - 2026-10-08
+
+### Fixed
+
+- **Deploys no longer fail on secrets stored with a trailing newline.**
+  Since v0.1.37 secrets decrypt exactly as stored, so values written by
+  older releases (which kept one trailing line terminator) were rejected by
+  the env-file writer with "env value for X spans multiple lines". When
+  building the container `--env-file`, exactly one trailing `\n` or `\r\n`
+  is now dropped from secret values only, with a warning naming the keys
+  (never the values). Stored values, `secret get`, templates and kv are
+  untouched; embedded newlines and values with two or more trailing
+  newlines are still rejected, and `env:`/tag values are never trimmed.
+  `teploy secret set KEY=value` also warns when a value ends in a newline
+  (it still stores exactly what is passed). To clear the warning, re-set
+  the secret: `teploy secret set KEY=value`.
 
 ## [0.1.37] - 2026-09-22
 
