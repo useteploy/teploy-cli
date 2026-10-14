@@ -4,6 +4,8 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [0.1.41] - 2026-10-14
+
 ### Changed
 
 - `app list` observes a whole server in a constant number of SSH round
