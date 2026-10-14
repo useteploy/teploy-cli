@@ -143,17 +143,64 @@ func collectAppList(ctx context.Context, executor ssh.Executor, observedAt time.
 
 	names := strings.Fields(out)
 	sort.Strings(names)
+	valid := make([]string, 0, len(names))
 	for _, name := range names {
 		if err := config.ValidateName(name); err != nil {
 			result.Errors = append(result.Errors, machineError{Scope: "app:" + name, Message: err.Error()})
 			continue
 		}
-		result.Apps = append(result.Apps, collectAppStatus(ctx, executor, name, observedAt))
+		valid = append(valid, name)
+	}
+
+	// Batched observation: this used to run 5-6 sequential execs PER app
+	// (state read, docker ps, image-tag resolve, lock read, two test
+	// probes), which measured ~26s on a 41-app server — longer than any
+	// dashboard's probe budget, so fleet views reported the box as unknown.
+	// Now: one control-plane bundle per 100 apps, one docker ps for the
+	// whole host, and at most one image-tag resolve. Scope note: a docker
+	// failure is inherently host-wide, so it surfaces once at the top
+	// level instead of being duplicated into every app's errors.
+	snapshots, err := state.ReadAppSnapshots(ctx, executor, valid)
+	snapByApp := make(map[string]state.AppSnapshot, len(snapshots))
+	for _, snap := range snapshots {
+		snapByApp[snap.App] = snap
+	}
+	if err != nil {
+		result.Errors = append(result.Errors, machineError{Scope: "apps", Message: err.Error()})
+		// A wholesale failure is every app's state read failing at once;
+		// keep the per-app state-scope errors the per-reader path produced
+		// so consumers see which field is missing, not just an empty app.
+		for _, name := range valid {
+			snapByApp[name] = state.AppSnapshot{App: name, StateErr: err}
+		}
+	}
+
+	var allContainers []docker.Container
+	if len(valid) > 0 {
+		dk := docker.NewClient(executor)
+		var containersErr error
+		allContainers, containersErr = dk.ListAllContainers(ctx)
+		if containersErr == nil {
+			allContainers = dk.ResolveImageTags(ctx, allContainers)
+		} else {
+			result.Errors = append(result.Errors, machineError{Scope: "containers", Message: containersErr.Error()})
+			allContainers = nil
+		}
+	}
+
+	for _, name := range valid {
+		snap := snapByApp[name]
+		result.Apps = append(result.Apps, assembleAppStatus(
+			name, observedAt, snap, docker.ContainersByApp(allContainers, name)))
 	}
 	return result
 }
 
-func collectAppStatus(ctx context.Context, executor ssh.Executor, app string, observedAt time.Time) appStatusDTO {
+// assembleAppStatus builds one app's DTO from an already-fetched snapshot
+// and container set. It is the collection logic of the former per-app
+// collectAppStatus, unchanged, with the transport removed so the batched
+// fleet path and any future single-app path share it.
+func assembleAppStatus(app string, observedAt time.Time, snap state.AppSnapshot, containers []docker.Container) appStatusDTO {
 	result := appStatusDTO{
 		App:             app,
 		CurrentRelease:  releaseStatusDTO{Ports: []int{}},
@@ -163,9 +210,7 @@ func collectAppStatus(ctx context.Context, executor ssh.Executor, app string, ob
 		ObservedAt:      observedAt,
 		Errors:          []machineError{},
 	}
-	if current, err := state.Read(ctx, executor, app); err != nil {
-		result.Errors = append(result.Errors, machineError{Scope: "state", Message: err.Error()})
-	} else if current != nil {
+	if current := snap.State; current != nil {
 		result.Domain = current.Domain
 		result.Type = current.DeploymentType
 		result.Ingress = current.IngressMode
@@ -175,33 +220,22 @@ func collectAppStatus(ctx context.Context, executor ssh.Executor, app string, ob
 			previousVersion = current.PreviousRelease.Hash
 		}
 		result.PreviousRelease = releaseStatusDTO{Version: previousVersion, Ports: nonNilInts(current.PreviousPorts)}
+	} else if snap.StateErr != nil {
+		result.Errors = append(result.Errors, machineError{Scope: "state", Message: snap.StateErr.Error()})
 	}
 
-	dk := docker.NewClient(executor)
-	containers, err := dk.ListContainers(ctx, app)
-	if err != nil {
-		result.Errors = append(result.Errors, machineError{Scope: "containers", Message: err.Error()})
-	} else {
-		containers = dk.ResolveImageTags(ctx, containers)
-		result.Containers = containerDTOs(containers)
-		result.Processes = processDTOs(result.Containers)
-		if len(containers) > 0 && result.Type == "" {
-			result.Type = config.TypeContainer
-		}
+	result.Containers = containerDTOs(containers)
+	result.Processes = processDTOs(result.Containers)
+	if len(containers) > 0 && result.Type == "" {
+		result.Type = config.TypeContainer
 	}
-	if result.Type == "" {
-		if _, err := executor.Run(ctx, "test -d /deployments/"+app+"/releases"); err == nil {
-			result.Type = config.TypeStatic
-		}
+	if result.Type == "" && snap.HasReleases {
+		result.Type = config.TypeStatic
 	}
-	if lock, err := state.ReadLock(ctx, executor, app); err != nil {
-		result.Errors = append(result.Errors, machineError{Scope: "lock", Message: err.Error()})
-	} else if lock != nil {
-		result.Lock = &lockDTO{Type: lock.Type, User: lock.User, Message: lock.Message, TS: lock.TS}
+	if snap.Lock != nil {
+		result.Lock = &lockDTO{Type: snap.Lock.Type, User: snap.Lock.User, Message: snap.Lock.Message, TS: snap.Lock.TS}
 	}
-	if _, err := executor.Run(ctx, "test -f /deployments/"+app+"/.maintenance-block"); err == nil {
-		result.Maintenance = true
-	}
+	result.Maintenance = snap.Maintenance
 	return result
 }
 
