@@ -774,17 +774,20 @@ func (c *Client) InternalPort(ctx context.Context, name string) (int, error) {
 }
 
 // ListContainers returns all containers for the given app, including stopped ones.
+// listContainersCommand is the per-app filtered query; docker matches the
+// label value exactly, never as a substring.
+func listContainersCommand(app string) string {
+	return "docker ps --all --filter label=teploy.app=" + ssh.ShellQuote(app) + " " + containersFormat
+}
+
+// listAllContainersCommand is the unfiltered fleet query sharing the same
+// format, so both views of a host agree.
+func listAllContainersCommand() string {
+	return "docker ps --all " + containersFormat
+}
+
 func (c *Client) ListContainers(ctx context.Context, app string) ([]Container, error) {
-	// Labels are requested as a structured JSON object ({{json .Labels}}),
-	// not through `{{json .}}` — whose Labels field renders docker's
-	// comma-joined DISPLAY string. Splitting that display at commas cannot
-	// distinguish separators from commas inside values, so an unrelated
-	// label like "note=text,teploy.version=bad" forged a reserved teploy
-	// label in the parsed map and steered rollback/prune at the wrong
-	// containers (audit T15).
-	cmd := "docker ps --all --filter label=teploy.app=" + ssh.ShellQuote(app) +
-		` --format '{"ID":{{json .ID}},"Names":{{json .Names}},"Image":{{json .Image}},"State":{{json .State}},"Status":{{json .Status}},"CreatedAt":{{json .CreatedAt}},"Labels":{{json .Labels}}}'`
-	output, err := c.exec.Run(ctx, cmd)
+	output, err := c.exec.Run(ctx, listContainersCommand(app))
 	if err != nil {
 		return nil, fmt.Errorf("listing containers for %s: %w", app, err)
 	}
@@ -795,6 +798,45 @@ func (c *Client) ListContainers(ctx context.Context, app string) ([]Container, e
 	}
 
 	return ParseContainers(output)
+}
+
+// containersFormat requests Labels as a structured JSON object
+// ({{json .Labels}}), not through `{{json .}}` — whose Labels field renders
+// docker's comma-joined DISPLAY string. Splitting that display at commas
+// cannot distinguish separators from commas inside values, so an unrelated
+// label like "note=text,teploy.version=bad" forged a reserved teploy label
+// in the parsed map and steered rollback/prune at the wrong containers
+// (audit T15). Shared by the per-app filtered query and the fleet-wide
+// ListAllContainers.
+const containersFormat = `--format '{"ID":{{json .ID}},"Names":{{json .Names}},"Image":{{json .Image}},"State":{{json .State}},"Status":{{json .Status}},"CreatedAt":{{json .CreatedAt}},"Labels":{{json .Labels}}}'`
+
+// ListAllContainers returns every container on the host in ONE round trip,
+// for callers that need containers across many apps (fleet `app list`).
+// ContainersByApp groups the result with the same teploy.app-label equality
+// the per-app ListContainers filter uses, so the two views agree.
+func (c *Client) ListAllContainers(ctx context.Context) ([]Container, error) {
+	output, err := c.exec.Run(ctx, listAllContainersCommand())
+	if err != nil {
+		return nil, fmt.Errorf("listing containers: %w", err)
+	}
+	output = strings.TrimSpace(output)
+	if output == "" {
+		return nil, nil
+	}
+	return ParseContainers(output)
+}
+
+// ContainersByApp selects the containers whose teploy.app label equals app
+// exactly — the semantics of `docker ps --filter label=teploy.app=<app>`,
+// which docker matches on the whole label value, never a substring.
+func ContainersByApp(containers []Container, app string) []Container {
+	result := make([]Container, 0, len(containers))
+	for _, ct := range containers {
+		if ct.Labels["teploy.app"] == app {
+			result = append(result, ct)
+		}
+	}
+	return result
 }
 
 // PruneVersions removes containers and images for app versions older than

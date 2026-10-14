@@ -247,73 +247,24 @@ func ReadRemoteFile(ctx context.Context, exec ssh.Executor, path string) ([]byte
 // lose rollback bookkeeping and let a mutation proceed as a first deploy
 // (audit F15).
 func Read(ctx context.Context, exec ssh.Executor, app string) (*AppState, error) {
-	v2Path := fmt.Sprintf("%s/%s/state.json", deploymentsDir, app)
+	v2Path := CanonicalStatePath(app)
 	data, present, err := ReadRemoteFile(ctx, exec, v2Path)
 	if err != nil {
 		return nil, fmt.Errorf("reading canonical state for %s: %w", app, err)
 	}
 	if present {
-		if len(bytes.TrimSpace(data)) == 0 {
-			return nil, fmt.Errorf("canonical state %s exists but is empty — refusing to treat an existing state file as absent; inspect and repair it before deploying", v2Path)
-		}
-		var s AppState
-		if err := json.Unmarshal(data, &s); err != nil {
-			return nil, fmt.Errorf("parsing canonical state for %s: %w", app, err)
-		}
-		if s.SchemaVersion != SchemaVersionV2 {
-			return nil, fmt.Errorf("unsupported state schema version %d for %s", s.SchemaVersion, app)
-		}
-		if err := validateManifestDigest(&s); err != nil {
-			return nil, fmt.Errorf("validating canonical state for %s: %w", app, err)
-		}
-		if err := validateReleaseDigest(s.PreviousRelease); err != nil {
-			return nil, fmt.Errorf("validating previous release for %s: %w", app, err)
-		}
-		normalizePorts(&s)
-		return &s, nil
+		return ParseCanonical(app, data)
 	}
 
 	// Only a confirmed-missing canonical file reaches the legacy migration.
-	path := fmt.Sprintf("%s/%s/state", deploymentsDir, app)
-	data, present, err = ReadRemoteFile(ctx, exec, path)
+	data, present, err = ReadRemoteFile(ctx, exec, LegacyStatePath(app))
 	if err != nil {
 		return nil, fmt.Errorf("reading legacy state for %s: %w", app, err)
 	}
-	if !present || len(bytes.TrimSpace(data)) == 0 {
+	if !present {
 		return nil, nil
 	}
-
-	s := &AppState{}
-	for _, line := range strings.Split(string(data), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		parts := strings.SplitN(line, "=", 2)
-		if len(parts) != 2 {
-			continue
-		}
-		switch parts[0] {
-		case "current_port":
-			s.CurrentPort, _ = strconv.Atoi(parts[1])
-		case "current_hash":
-			s.CurrentHash = parts[1]
-		case "previous_port":
-			s.PreviousPort, _ = strconv.Atoi(parts[1])
-		case "previous_hash":
-			s.PreviousHash = parts[1]
-		case "domain":
-			s.Domain = parts[1]
-		case "current_ports":
-			s.CurrentPorts = parsePorts(parts[1])
-		case "previous_ports":
-			s.PreviousPorts = parsePorts(parts[1])
-		}
-	}
-	s.SchemaVersion = 1
-	s.legacyImported = true
-	normalizePorts(s)
-	return s, nil
+	return ParseLegacy(data), nil
 }
 
 func normalizePorts(s *AppState) {
@@ -565,16 +516,11 @@ type LockInfo struct {
 
 // ReadLock reads the lock info for an app. Returns nil if no lock exists.
 func ReadLock(ctx context.Context, exec ssh.Executor, app string) (*LockInfo, error) {
-	lockPath := fmt.Sprintf("%s/%s/.lock/info", deploymentsDir, app)
-	output, err := exec.Run(ctx, fmt.Sprintf("cat %s 2>/dev/null", lockPath))
-	if err != nil || strings.TrimSpace(output) == "" {
+	output, err := exec.Run(ctx, fmt.Sprintf("cat %s 2>/dev/null", LockInfoPath(app)))
+	if err != nil {
 		return nil, nil
 	}
-	var info LockInfo
-	if err := json.Unmarshal([]byte(strings.TrimSpace(output)), &info); err != nil {
-		return nil, nil
-	}
-	return &info, nil
+	return ParseLockInfo(output), nil
 }
 
 // IsStale reports whether a lock is old enough that whatever took it is

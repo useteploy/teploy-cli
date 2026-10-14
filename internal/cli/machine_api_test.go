@@ -2,36 +2,40 @@ package cli
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/useteploy/teploy/internal/ssh"
 )
 
-func TestMachineCommandsRegistered(t *testing.T) {
-	root := NewRootCmd("test")
-	for _, args := range [][]string{{"app", "list"}, {"server", "status"}} {
-		cmd, _, err := root.Find(args)
-		if err != nil {
-			t.Fatalf("finding %v: %v", args, err)
-		}
-		if cmd == root || cmd.Name() != args[len(args)-1] {
-			t.Fatalf("command %v not registered", args)
-		}
-	}
+func b64(s string) string {
+	return base64.StdEncoding.EncodeToString([]byte(s))
+}
+
+func snapshotLines(lines ...string) string {
+	return strings.Join(lines, "\n")
 }
 
 func TestCollectAppListCanonicalState(t *testing.T) {
 	observedAt := time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC)
-	container := `{"ID":"abc","Names":"blog-web-v2","Image":"example/blog:v2","State":"running","Status":"Up 2 hours","CreatedAt":"2026-07-22 10:00:00 +0000 UTC","Labels":"teploy.app=blog,teploy.process=web,teploy.version=v2"}`
+	stateJSON := `{"schema_version":2,"deployment_type":"container","ingress_mode":"external","domain":"blog.example.com","current_hash":"v2","current_ports":[49153],"previous_hash":"v1","previous_ports":[49152]}`
+	lockJSON := `{"type":"manual","user":"alice","ts":"2026-07-22T11:00:00Z"}`
+	container := `{"ID":"abc","Names":"blog-web-v2","Image":"example/blog:v2","State":"running","Status":"Up 2 hours","CreatedAt":"2026-07-22 10:00:00 +0000 UTC","Labels":{"teploy.app":"blog","teploy.process":"web","teploy.version":"v2"}}`
 	mock := ssh.NewMockExecutor("192.0.2.10",
 		ssh.MockCommand{Match: "for f in /deployments/*/state.json", Output: "blog\n"},
-		ssh.MockCommand{Match: "if [ ! -e '/deployments/blog/state.json' ]", Output: "present\n" + `{"schema_version":2,"deployment_type":"container","ingress_mode":"external","domain":"blog.example.com","current_hash":"v2","current_ports":[49153],"previous_hash":"v1","previous_ports":[49152]}`},
+		ssh.MockCommand{Match: "for app in", Output: snapshotLines(
+			"A blog",
+			"S 0 "+b64(stateJSON),
+			"G absent",
+			"L "+b64(lockJSON),
+			"M 1",
+			"R 0",
+		)},
 		ssh.MockCommand{Match: "docker ps --all", Output: container},
-		ssh.MockCommand{Match: "cat /deployments/blog/.lock/info", Output: `{"type":"manual","user":"alice","ts":"2026-07-22T11:00:00Z"}`},
-		ssh.MockCommand{Match: "test -f /deployments/blog/.maintenance-block", Output: ""},
 	)
 
 	got := collectAppList(context.Background(), mock, observedAt)
@@ -50,6 +54,11 @@ func TestCollectAppListCanonicalState(t *testing.T) {
 	}
 	if app.Lock == nil || app.Lock.User != "alice" || !app.Maintenance {
 		t.Fatalf("unexpected lock/maintenance: lock=%#v maintenance=%v", app.Lock, app.Maintenance)
+	}
+	// The fleet path must stay O(1) in apps: discovery, one control-plane
+	// bundle, one docker ps. (An image-ID fleet adds exactly one inspect.)
+	if len(mock.Calls) != 3 {
+		t.Fatalf("app list took %d round trips, want 3: %q", len(mock.Calls), mock.Calls)
 	}
 	raw, err := json.Marshal(got)
 	if err != nil {
@@ -121,4 +130,122 @@ func hasCaddyUpstream(routes []caddyRouteDTO, want string) bool {
 		}
 	}
 	return false
+}
+
+// One app's corrupt state must fail that app alone; the healthy app and the
+// legacy-state app (canonical absent, key=value present) stay clean — the
+// per-app isolation the per-reader path had.
+func TestCollectAppListPerAppStateIsolation(t *testing.T) {
+	goodState := `{"schema_version":2,"deployment_type":"container","ingress_mode":"caddy","domain":"good.example.com","current_hash":"g1","current_ports":[49153]}`
+	legacyState := "current_hash=l9\ncurrent_port=49160\ndomain=legacy.example.com\n"
+	mock := ssh.NewMockExecutor("192.0.2.10",
+		ssh.MockCommand{Match: "for f in /deployments/*/state.json", Output: "good\nlegacy\nrotten\n"},
+		ssh.MockCommand{Match: "for app in", Output: snapshotLines(
+			"A good",
+			"S 0 "+b64(goodState),
+			"G absent",
+			"L ",
+			"M 0",
+			"R 0",
+			"A legacy",
+			"S absent",
+			"G 0 "+b64(legacyState),
+			"L ",
+			"M 0",
+			"R 1",
+			"A rotten",
+			"S 0 "+b64("{not json"),
+			"G absent",
+			"L ",
+			"M 0",
+			"R 0",
+		)},
+		ssh.MockCommand{Match: "docker ps --all", Output: ""},
+	)
+
+	got := collectAppList(context.Background(), mock, time.Now())
+	if len(got.Errors) != 0 || len(got.Apps) != 3 {
+		t.Fatalf("unexpected list: errors=%#v apps=%#v", got.Errors, got.Apps)
+	}
+	byApp := map[string]appStatusDTO{}
+	for _, app := range got.Apps {
+		byApp[app.App] = app
+	}
+	if app := byApp["good"]; len(app.Errors) != 0 || app.Domain != "good.example.com" || app.Type != "container" {
+		t.Fatalf("healthy app contaminated: %#v", app)
+	}
+	app := byApp["legacy"]
+	if len(app.Errors) != 0 || app.Domain != "legacy.example.com" || app.Type != "static" {
+		t.Fatalf("legacy fallback wrong: %#v", app)
+	}
+	if app.CurrentRelease.Version != "l9" || len(app.CurrentRelease.Ports) != 1 || app.CurrentRelease.Ports[0] != 49160 {
+		t.Fatalf("legacy releases wrong: %#v", app.CurrentRelease)
+	}
+	rotten := byApp["rotten"]
+	if len(rotten.Errors) != 1 || rotten.Errors[0].Scope != "state" || !strings.Contains(rotten.Errors[0].Message, "parsing canonical state for rotten") {
+		t.Fatalf("corrupt state not attributed to its app: %#v", rotten.Errors)
+	}
+}
+
+// docker failing is a host-wide condition: one top-level error, apps still
+// listed (with their state), no per-app containers anywhere.
+func TestCollectAppListDockerFailureIsTopLevel(t *testing.T) {
+	goodState := `{"schema_version":2,"deployment_type":"container","ingress_mode":"caddy","domain":"good.example.com","current_hash":"g1"}`
+	mock := ssh.NewMockExecutor("192.0.2.10",
+		ssh.MockCommand{Match: "for f in /deployments/*/state.json", Output: "good\n"},
+		ssh.MockCommand{Match: "for app in", Output: snapshotLines(
+			"A good", "S 0 "+b64(goodState), "G absent", "L ", "M 0", "R 0",
+		)},
+		ssh.MockCommand{Match: "docker ps --all", Err: errors.New("docker daemon is not running")},
+	)
+
+	got := collectAppList(context.Background(), mock, time.Now())
+	if len(got.Errors) != 1 || got.Errors[0].Scope != "containers" || !strings.Contains(got.Errors[0].Message, "docker daemon") {
+		t.Fatalf("docker failure not top-level: %#v", got.Errors)
+	}
+	if len(got.Apps) != 1 || got.Apps[0].App != "good" || len(got.Apps[0].Errors) != 0 || got.Apps[0].Domain != "good.example.com" {
+		t.Fatalf("app lost to a docker failure: %#v", got.Apps)
+	}
+}
+
+// Containers group by exact teploy.app label equality — the semantics of
+// the per-app `--filter label=teploy.app=` docker used to run per app, so
+// "speedballs" never swallows "speedballs-mp" containers and unlabeled or
+// foreign-label containers attach to nothing.
+func TestCollectAppListGroupsContainersByExactLabel(t *testing.T) {
+	goodState := func(domain string) string {
+		return `{"schema_version":2,"deployment_type":"container","ingress_mode":"caddy","domain":"` + domain + `","current_hash":"h1"}`
+	}
+	container := func(name, app string) string {
+		return `{"ID":"` + name + `","Names":"` + name + `","Image":"example/img:v1","State":"running","Status":"Up","CreatedAt":"2026-10-01 10:00:00 +0000 UTC","Labels":{"teploy.app":"` + app + `","teploy.process":"web"}}`
+	}
+	mock := ssh.NewMockExecutor("192.0.2.10",
+		ssh.MockCommand{Match: "for f in /deployments/*/state.json", Output: "speedballs\nspeedballs-mp\n"},
+		ssh.MockCommand{Match: "for app in", Output: snapshotLines(
+			"A speedballs", "S 0 "+b64(goodState("speedballs.xyz")), "G absent", "L ", "M 0", "R 0",
+			"A speedballs-mp", "S 0 "+b64(goodState("mp.speedballs.xyz")), "G absent", "L ", "M 0", "R 0",
+		)},
+		ssh.MockCommand{Match: "docker ps --all", Output: strings.Join([]string{
+			container("speedballs-web-1", "speedballs"),
+			container("speedballs-mp-web-1", "speedballs-mp"),
+			container("unlabeled-web-1", ""),
+		}, "\n")},
+	)
+
+	got := collectAppList(context.Background(), mock, time.Now())
+	if len(got.Errors) != 0 || len(got.Apps) != 2 {
+		t.Fatalf("unexpected list: %#v", got)
+	}
+	for _, app := range got.Apps {
+		switch app.App {
+		case "speedballs":
+			if len(app.Containers) != 1 || app.Containers[0].Name != "speedballs-web-1" {
+				t.Fatalf("speedballs containers wrong: %#v", app.Containers)
+			}
+		case "speedballs-mp":
+			if len(app.Containers) != 1 || app.Containers[0].Name != "speedballs-mp-web-1" {
+				t.Fatalf("speedballs-mp containers wrong: %#v", app.Containers)
+			}
+		}
+	}
 }

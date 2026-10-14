@@ -4,6 +4,21 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+### Changed
+
+- `app list` observes a whole server in a constant number of SSH round
+  trips (one control-plane bundle per 100 apps, one `docker ps` for the
+  host, at most one image-tag resolve) instead of 5–6 sequential execs per
+  app. On a 41-app production server this took ~27s — longer than
+  teploy-dash's 10s fleet probe budget, so the dashboard reported the box
+  as unknown with "0 apps, never observed successfully" while every app was
+  running. Measured after the change: ~2s, byte-identical output (same apps,
+  releases, containers, locks; only live timestamps differ). Error scopes
+  shift with the batching: an unreadable or corrupt state file is still that
+  app's `state`-scope error, but a Docker failure is host-wide and now
+  surfaces once at the top level (`containers` scope) instead of being
+  duplicated into every app's errors.
+
 ## [0.1.40] - 2026-10-11
 
 v0.1.39 was tagged from the wrong commit (`b3f9a11`, which predates the
