@@ -25,3 +25,14 @@ same bug gets paid for twice.
 **Never cut a Neutron or Nucleus release from a Teploy session**, on the rare
 occasion something reaches that far. An upstream fix is a standalone change in
 the upstream repo plus a written handover.
+
+## Two remotes — push both
+
+- `github` (github.com/useteploy/<repo>) — authoritative: PRs, CI, releases,
+  the public history tags point at.
+- `origin` (Forgejo on infra-home, `:49152`) — the private forge: issues and
+  webhooks live here.
+- When `main` moves, push BOTH (`git push github main && git push origin
+  main`); push release tags to both too. A GitHub-only push silently leaves
+  the forge stale — an entire store migration + release once landed
+  GitHub-only and the forge sat 21 commits behind until noticed.
