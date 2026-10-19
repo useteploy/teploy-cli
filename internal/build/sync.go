@@ -64,8 +64,24 @@ func Sync(ctx context.Context, cfg SyncConfig, stdout, stderr io.Writer) error {
 	remote := ssh.RsyncTarget(cfg.User, cfg.Host, cfg.RemoteDir)
 	args = append(args, localDir, remote)
 
+	// openrsync — macOS's /usr/bin/rsync since macOS 15 — stats every
+	// --files-from entry through its symlink and aborts the whole transfer
+	// (exit 23) on a dangling one, where GNU rsync copies the link as a
+	// link. Leave those links out (they point at nothing in the context
+	// either) and say so, rather than fail the deploy.
+	list := cfg.Source.FileList()
+	if dangling := cfg.Source.DanglingSymlinks(); len(dangling) > 0 && isOpenRsync(ctx) {
+		skip := make(map[string]bool, len(dangling))
+		for _, d := range dangling {
+			skip[d] = true
+		}
+		list = cfg.Source.fileListExcluding(skip)
+		fmt.Fprintf(stderr, "Warning: the system rsync (openrsync) cannot transfer dangling symlinks; leaving %d out of the build context: %s — install GNU rsync (brew install rsync) to transfer them as links\n",
+			len(dangling), strings.Join(dangling, ", "))
+	}
+
 	cmd := exec.CommandContext(ctx, "rsync", args...)
-	cmd.Stdin = bytes.NewReader(cfg.Source.FileList())
+	cmd.Stdin = bytes.NewReader(list)
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
 
@@ -73,4 +89,12 @@ func Sync(ctx context.Context, cfg SyncConfig, stdout, stderr io.Writer) error {
 		return fmt.Errorf("rsync failed: %w", err)
 	}
 	return nil
+}
+
+// isOpenRsync reports whether the rsync on PATH is openrsync (macOS's
+// system rsync), which `rsync --version` names on its first line. A
+// variable so tests can stub the probe.
+var isOpenRsync = func(ctx context.Context) bool {
+	out, err := exec.CommandContext(ctx, "rsync", "--version").CombinedOutput()
+	return err == nil && strings.Contains(string(out), "openrsync")
 }

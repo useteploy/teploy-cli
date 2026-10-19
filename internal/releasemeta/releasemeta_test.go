@@ -245,9 +245,23 @@ func TestBackfill_FromLiveContainers(t *testing.T) {
 	if rec.ImageDigest != "sha256:"+strings.Repeat("e", 64) || rec.ImageRef != "myapp:v1" {
 		t.Errorf("image identity not captured: %s / %s", rec.ImageDigest, rec.ImageRef)
 	}
-	// Resolved env from inspect — the recoverable form of env references.
-	if rec.Env["API_KEY"] != "resolved-secret" || rec.Env["PORT"] != "3000" {
-		t.Errorf("resolved env not captured: %v", rec.Env)
+	// Resolved env from inspect: a backfill has no deploy-time provenance,
+	// so only teploy's own PORT (and image defaults) keep a value. API_KEY's
+	// value must never be persisted — only its name and an "unknown source"
+	// marker.
+	if rec.Env["PORT"] != "3000" {
+		t.Errorf("PORT not captured: %v", rec.Env)
+	}
+	if _, leaked := rec.Env["API_KEY"]; leaked {
+		t.Errorf("secret value persisted in record env: keys %v", keysOf(rec.Env))
+	}
+	if !hasRedacted(rec.EnvRedacted, "API_KEY") {
+		t.Errorf("API_KEY not named in env_redacted: %+v", rec.EnvRedacted)
+	}
+	for path, raw := range mock.Files {
+		if strings.Contains(string(raw), "resolved-secret") {
+			t.Errorf("secret value written to %s", path)
+		}
 	}
 	if len(rec.EnvFiles) != 0 {
 		t.Errorf("env-file references are NOT recoverable; recording any would lie: %v", rec.EnvFiles)
@@ -329,4 +343,21 @@ func TestBackfill_PersistFailureStillReturnsRecord(t *testing.T) {
 	if warn == nil || !strings.Contains(warn.Error(), "persisting") {
 		t.Errorf("expected a persistence warning, got %v", warn)
 	}
+}
+
+func keysOf(m map[string]string) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
+}
+
+func hasRedacted(list []docker.RedactedEnv, key string) bool {
+	for _, r := range list {
+		if r.Key == key {
+			return true
+		}
+	}
+	return false
 }

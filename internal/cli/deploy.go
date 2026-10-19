@@ -217,6 +217,20 @@ func runDeploy(flags *Flags, serverName, image, version string, skipDNSCheck boo
 // with the same env a direct deploy would resolve — one resolution
 // semantics, not a fork.
 func resolveDeployEnv(ctx context.Context, appCfg *config.AppConfig, strict bool) error {
+	// Record each key's source before resolution rewrites the values, so
+	// the release record can tell plain config from secret-capable values.
+	sources := map[string]string{}
+	for k, v := range appCfg.Env {
+		switch {
+		case strings.HasPrefix(v, "secret:") || strings.HasPrefix(v, "vault:"):
+			sources[k] = releasemeta.EnvSourceVault
+		case strings.Contains(v, "$"):
+			sources[k] = releasemeta.EnvSourceInterpolated
+		default:
+			sources[k] = releasemeta.EnvSourceConfig
+		}
+	}
+	appCfg.EnvSources = sources
 	if err := expandEnvTemplates(appCfg.Env, strict); err != nil {
 		return err
 	}
@@ -231,6 +245,7 @@ func resolveDeployEnv(ctx context.Context, appCfg *config.AppConfig, strict bool
 		for k, v := range fileVars {
 			if _, explicit := appCfg.Env[k]; !explicit {
 				appCfg.Env[k] = v
+				sources[k] = releasemeta.EnvSourceEnvFile
 			}
 		}
 	}
@@ -239,6 +254,7 @@ func resolveDeployEnv(ctx context.Context, appCfg *config.AppConfig, strict bool
 	}
 	for k, v := range appCfg.EnvLiteral {
 		appCfg.Env[k] = v
+		sources[k] = releasemeta.EnvSourceConfigLiteral
 	}
 	for name, acc := range appCfg.Accessories {
 		if acc.Env == nil {
@@ -656,6 +672,7 @@ func deployBuiltImageFenced(ctx context.Context, executor ssh.Executor, appCfg *
 	if err != nil {
 		return fmt.Errorf("decrypting secrets: %w", err)
 	}
+	ageKeys := secretKeySet(deploySecrets)
 	// Resolve any `vault:<name>#<key>` references in env: from OpenBao and merge
 	// them in (they win over plaintext env, same as decrypted secrets).
 	deploySecrets, err = mergeSecretVaultRefs(ctx, executor, appCfg, deploySecrets)
@@ -733,6 +750,7 @@ func deployBuiltImageFenced(ctx context.Context, executor ssh.Executor, appCfg *
 	deployer := deploy.NewDeployer(rawExecutor, out)
 	deployCfg := deployConfigFromApp(appCfg, image, version, envFiles, volumes, tlsCert, tlsKey, tlsInternal, appliedManifest, manifestSHA256)
 	deployCfg.Provenance = prov
+	deployCfg.EnvProvenance = envProvenance(appCfg, deploySecrets, ageKeys)
 	attachTrigger(ctx, &deployCfg)
 
 	// Vulnerability gate: scan the image on the server before any container

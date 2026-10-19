@@ -968,6 +968,13 @@ func (c *Client) collectReleaseRecords(ctx context.Context, app string) ([]json.
 		if !present {
 			continue
 		}
+		// A bundle is a copy that travels: never carry secret env values,
+		// even from records written before release metadata was redacted.
+		if clean, _, _, rerr := releasemeta.RedactRaw(data, nil); rerr == nil {
+			data = clean
+		} else {
+			return nil, fmt.Errorf("redacting release record %s: %w", line, rerr)
+		}
 		records = append(records, json.RawMessage(data))
 	}
 	return records, nil

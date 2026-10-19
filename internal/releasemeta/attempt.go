@@ -280,3 +280,24 @@ func previousAttemptSubDir(ctx context.Context, exec ssh.Executor, app, excludeI
 	}
 	return ""
 }
+
+// AttemptEnvFiles returns the entries of envFiles that are attempt-scoped
+// env files of app (<attempts dir>/<name>/env) — the plaintext resolved-env
+// files a deploy writes for docker --env-file. Other env files (the
+// persisted .env) are never returned.
+func AttemptEnvFiles(app string, envFiles []string) []string {
+	prefix := fmt.Sprintf("%s/%s/meta/att/", deploymentsDir, app)
+	var out []string
+	for _, f := range envFiles {
+		rest, ok := strings.CutPrefix(f, prefix)
+		if !ok || !strings.HasSuffix(rest, "/env") {
+			continue
+		}
+		name := strings.TrimSuffix(rest, "/env")
+		if name == "" || strings.Contains(name, "/") || strings.Contains(name, "..") {
+			continue
+		}
+		out = append(out, f)
+	}
+	return out
+}

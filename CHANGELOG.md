@@ -4,6 +4,40 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+### Security
+
+- Release metadata no longer stores secret env values. Every record
+  (`/deployments/<app>/meta/<release>.json`) used to embed the web
+  container's full `docker inspect` env in `recreate.env` (and backfilled
+  records also in `env`), secrets included, so backups, DR bundles and any
+  copy of the file carried them in plaintext. Values are now kept only when
+  their source is provably non-secret (plain `teploy.yml` `env:`/`env_literal`,
+  the image's own ENV, `PORT`); every other key is recorded as
+  `{key, source}` in `env_redacted`, with no value and no digest. Key-name
+  and URL-credential checks back this up. Redaction happens in the single
+  record writer, in DR bundle export and in DR restore, so pre-fix records
+  never travel or come back.
+- Attempt env files (`meta/att/<attempt>/env`, the plaintext resolved env
+  passed to `docker run --env-file`) are removed as soon as the release is
+  live; nothing reads them afterwards.
+- New `teploy meta scrub --host <server> [--app <name>] [--apply]` rewrites
+  records written by older versions and removes leftover attempt env files
+  (older than 30 minutes). Dry run by default; output names keys and paths,
+  never values; each app is processed under its deploy lock; idempotent.
+- A recreate spec carrying redacted env is refused instead of starting a
+  container with secrets missing. Rollback is unchanged: it recreates from
+  docker's own record of the target container, so it uses the values that
+  release was deployed with (not secrets rotated since).
+
+### Fixed
+
+- `teploy deploy` no longer aborts with `rsync failed: exit status 23` on
+  macOS's system rsync (openrsync) when the build context contains a
+  dangling symlink (e.g. a submodule link into a store absent from a fresh
+  checkout). openrsync stats every `--files-from` entry through its link;
+  such links are now left out of the transfer with a warning naming them
+  (GNU rsync still transfers them as links).
+
 ## [0.1.41] - 2026-10-14
 
 ### Changed

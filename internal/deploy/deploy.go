@@ -29,11 +29,15 @@ type Config struct {
 	Image                  string
 	Version                string   // short git hash or tag
 	EnvFiles               []string // paths to env files on the server, applied in order (later files' keys win) — see docker.RunConfig.EnvFiles
-	Env                    map[string]string
-	Volumes                map[string]string
-	VolumeOwnership        map[string]config.VolumeOwnership
-	Cmd                    string            // command override for single-process deploys
-	Processes              map[string]string // process_name -> command (overrides Cmd)
+	// EnvProvenance maps each env key the deployer resolved to its source
+	// (releasemeta.EnvSource*). It decides which values the release record
+	// may persist; keys absent from it are treated as secret.
+	EnvProvenance   map[string]string
+	Env             map[string]string
+	Volumes         map[string]string
+	VolumeOwnership map[string]config.VolumeOwnership
+	Cmd             string            // command override for single-process deploys
+	Processes       map[string]string // process_name -> command (overrides Cmd)
 	// NoHealthcheck disables the container HEALTHCHECK for specific processes.
 	// Keyed by process name; true means pass --no-healthcheck to docker run.
 	// Used when a process shouldn't be probed by the image's built-in
@@ -1054,6 +1058,18 @@ func (d *Deployer) DeployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 	// closing plan/receipt verification (17).
 	rec := d.recordRelease(ctx, cfg, assetAttempt, newState, ports, webBindHost, webContainerName)
 
+	// 13b'. Every container of this release now exists, and docker holds
+	// the env it was created with; restarts, hooks and rollback recreate
+	// from that (InspectRecreate), never from the attempt's env file. The
+	// file is a plaintext copy of resolved secrets with no remaining
+	// reader, so remove it now instead of keeping it for the rollback
+	// window. Best-effort: a failure is reported, never fails the deploy.
+	for _, f := range releasemeta.AttemptEnvFiles(cfg.App, cfg.EnvFiles) {
+		if _, err := d.exec.Run(ctx, "rm -f -- "+ssh.ShellQuote(f)); err != nil {
+			fmt.Fprintf(d.out, "Warning: could not remove the attempt env file %s: %v\n", f, err)
+		}
+	}
+
 	// 13c. Prune superseded attempts (F08): attempt directories (build
 	// contexts, env files, TLS certs) are dead weight once their release
 	// is outside the rollback window — env is baked into containers at
@@ -1739,8 +1755,30 @@ func (d *Deployer) recordRelease(ctx context.Context, cfg Config, att releasemet
 		}
 	}
 
+	// Env provenance for redaction (releasemeta.Write drops every value not
+	// provably plain config): the deployer's own sources first, then the
+	// host-held secret-capable sources (names only), then the image's ENV.
+	rec.EnvProvenance = map[string]string{}
+	for k, src := range releasemeta.HostEnvSources(ctx, d.exec, cfg.App) {
+		rec.EnvProvenance[k] = src
+	}
+	// Config.Env is documented plaintext-only (secrets ride EnvFiles), so a
+	// key it sets without an explicit source is plain config.
+	for k := range cfg.Env {
+		rec.EnvProvenance[k] = releasemeta.EnvSourceConfig
+	}
+	for k, src := range cfg.EnvProvenance {
+		rec.EnvProvenance[k] = src
+	}
 	if spec, err := d.docker.InspectRecreate(ctx, webContainerName); err == nil {
 		rec.Recreate = spec
+		image := spec.ImageID
+		if image == "" {
+			image = spec.ImageRef
+		}
+		if imageEnv, ierr := d.docker.ImageEnv(ctx, image); ierr == nil {
+			rec.ImageEnv = imageEnv
+		}
 	} else {
 		fmt.Fprintf(d.out, "Warning: could not capture the recreate spec for %s: %v (recreate falls back to live inspect)\n", webContainerName, err)
 	}

@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/useteploy/teploy/internal/config"
 	"github.com/useteploy/teploy/internal/releasemeta"
 	"github.com/useteploy/teploy/internal/ssh"
 )
@@ -179,4 +180,31 @@ func buildContainerEnvFiles(ctx context.Context, executor ssh.Executor, app stri
 		return nil, fmt.Errorf("uploading deploy env file: %w", err)
 	}
 	return append(envFiles, path), nil
+}
+
+// envProvenance returns appCfg's recorded env sources plus the keys whose
+// container values come from the age secret store (ageKeys) or OpenBao (the
+// rest of secrets). Secret values override plain env, so their source wins.
+// A fresh map: appCfg may be shared by parallel per-server deploys.
+func envProvenance(appCfg *config.AppConfig, secrets map[string]string, ageKeys map[string]bool) map[string]string {
+	out := make(map[string]string, len(appCfg.EnvSources)+len(secrets))
+	for k, v := range appCfg.EnvSources {
+		out[k] = v
+	}
+	for k := range secrets {
+		if ageKeys[k] {
+			out[k] = releasemeta.EnvSourceSecretStore
+		} else {
+			out[k] = releasemeta.EnvSourceVault
+		}
+	}
+	return out
+}
+
+func secretKeySet(m map[string]string) map[string]bool {
+	out := make(map[string]bool, len(m))
+	for k := range m {
+		out[k] = true
+	}
+	return out
 }
