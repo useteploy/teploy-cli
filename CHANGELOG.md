@@ -4,6 +4,8 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [0.1.42] - 2026-10-19
+
 ### Security
 
 - Release metadata no longer stores secret env values. Every record
