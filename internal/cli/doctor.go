@@ -655,19 +655,22 @@ func doctorRepairDebtCheck(ctx context.Context, exec ssh.Executor, appCfg *confi
 // releases, which Caddy serves to the public. The names are the protected
 // upload set (build.DefaultIgnore) minus conventional templates; base
 // teploy.yml is left out because autodeploy checkouts legitimately hold
-// it. Read-only: find -print (the probe caps the output with head).
-const doctorSecretFilesFind = "find /deployments \\( -name .git -o -name node_modules \\) -prune -o -type f " +
+// it. Directories the SSH user cannot read are pruned: build contexts are
+// always the deploy user's own, and database data or backup dirs owned by
+// another uid made the scan fail outright for a non-root user.
+// Read-only: find -print (the probe caps the output with head).
+const doctorSecretFilesFind = "find /deployments \\( -name .git -o -name node_modules -o -type d ! -readable \\) -prune -o -type f " +
 	"\\( -path '*/build/*' -o -path '/deployments/*/releases/*' \\) " +
 	"\\( -name 'teploy.*.yml' -o -name 'teploy.*.yaml' -o -name 'teploy.*.toml' -o -name .env -o -name '.env.*' " +
 	"-o -name .secrets -o -name secrets.yml -o -name secrets.yaml -o -name secrets.json -o -name secrets.toml " +
 	"-o -name secrets.env -o -name '*.secrets.env' \\) " +
-	"! -name 'teploy.example.*' ! -name .env.example ! -name .env.sample ! -name .env.template " +
+	"! -name 'teploy.example.*' ! -name '*.example' ! -name '*.sample' ! -name '*.template' " +
 	"-print"
 
 const doctorSecretFilesProbe = "scan=$(" + doctorSecretFilesFind + `) || exit $?; printf '%s\n' "$scan" | head -n 201`
 
 // doctorOpenBuildDirsProbe preserves find's status while bounding output.
-const doctorOpenBuildDirsProbe = `scan=$(find /deployments -mindepth 2 -maxdepth 3 -type d \( -path '*/build' -o -path '*/meta/att' \) -perm -001 -print) || exit $?; printf '%s\n' "$scan" | head -n 201`
+const doctorOpenBuildDirsProbe = `scan=$(find /deployments -mindepth 2 -maxdepth 3 \( -type d ! -readable -prune \) -o -type d \( -path '*/build' -o -path '*/meta/att' \) -perm -001 -print) || exit $?; printf '%s\n' "$scan" | head -n 201`
 
 // doctorSecretExposureCheck finds what teploy CLIs before L14 left behind:
 // they uploaded the whole source tree, gitignored files included, so
