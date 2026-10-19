@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/useteploy/teploy/internal/events"
 	"io"
 	"os"
 	"os/signal"
@@ -57,6 +58,7 @@ func runLock(flags *Flags, appName, message string) error {
 	if err := state.AcquireManualLock(ctx, executor, appCfg.App, username, message); err != nil {
 		return err
 	}
+	recordAppEvent(ctx, executor, appCfg.App, events.KindLock, nil, map[string]any{"message": message})
 
 	fmt.Printf("Locked %s", appCfg.App)
 	if message != "" {
@@ -221,6 +223,7 @@ func runUnlock(flags *Flags, appName string) error {
 	}
 
 	state.ReleaseLock(ctx, executor, appCfg.App)
+	recordAppEvent(ctx, executor, appCfg.App, events.KindUnlock, nil, nil)
 	fmt.Printf("Unlocked %s\n", appCfg.App)
 	return nil
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/useteploy/teploy/internal/events"
 	"io"
 	"os"
 	"os/signal"
@@ -100,7 +101,9 @@ func runEnvSet(flags *Flags, appName string, pairs map[string]string) error {
 	}
 
 	mgr := env.NewManager(executor)
-	if err := mgr.Set(ctx, appCfg.App, pairs); err != nil {
+	err = mgr.Set(ctx, appCfg.App, pairs)
+	recordAppEvent(ctx, executor, appCfg.App, events.KindEnvSet, err, map[string]any{"keys": sortedKeys(pairs)})
+	if err != nil {
 		return err
 	}
 
@@ -279,7 +282,9 @@ func runEnvUnset(flags *Flags, appName, key string) error {
 	defer executor.Close()
 
 	mgr := env.NewManager(executor)
-	if err := mgr.Unset(ctx, appCfg.App, key); err != nil {
+	err = mgr.Unset(ctx, appCfg.App, key)
+	recordAppEvent(ctx, executor, appCfg.App, events.KindEnvUnset, err, map[string]any{"keys": []string{key}})
+	if err != nil {
 		return err
 	}
 

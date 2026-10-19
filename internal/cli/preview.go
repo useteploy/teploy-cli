@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/useteploy/teploy/internal/events"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -236,6 +237,7 @@ func runPreviewDeploy(flags *Flags, branch string, opts previewDeployOpts) error
 		HTTPOnly:   opts.httpOnly,
 		AllowIPs:   opts.allowIPs,
 	})
+	recordAppEvent(ctx, executor, appCfg.App, events.KindPreviewDeploy, err, map[string]any{"branch": branch})
 
 	if n := buildNotifier(appCfg); n != nil {
 		msg := fmt.Sprintf("Preview %s deployed for %s", branch, appCfg.App)
@@ -365,7 +367,9 @@ func runPreviewDestroy(flags *Flags, branch string) error {
 	defer executor.Close()
 
 	mgr := preview.NewManager(executor, os.Stdout)
-	return mgr.Destroy(ctx, appCfg.App, branch)
+	err = mgr.Destroy(ctx, appCfg.App, branch)
+	recordAppEvent(ctx, executor, appCfg.App, events.KindPreviewDestroy, err, map[string]any{"preview": branch})
+	return err
 }
 
 func newPreviewPruneCmd(flags *Flags) *cobra.Command {

@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/useteploy/teploy/internal/events"
 	"io"
 	"io/fs"
 	"os"
@@ -122,6 +123,15 @@ func NewStaticDeployer(exec ssh.Executor, out io.Writer) *StaticDeployer {
 // Deploy executes a single static deploy end-to-end. Returns nil on success,
 // an error otherwise; callers should treat returned errors as deploy failure.
 func (d *StaticDeployer) Deploy(ctx context.Context, cfg StaticConfig) error {
+	start := time.Now()
+	events.Record(ctx, d.exec, events.Event{App: cfg.App, Kind: events.KindDeploy, Outcome: events.Started})
+	err := d.deploy(ctx, cfg)
+	events.Record(ctx, d.exec, events.Event{App: cfg.App, Kind: events.KindDeploy, Outcome: events.Outcome(err),
+		Detail: events.ErrDetail(map[string]any{"duration_ms": time.Since(start).Milliseconds()}, err)})
+	return err
+}
+
+func (d *StaticDeployer) deploy(ctx context.Context, cfg StaticConfig) error {
 	if cfg.MountBase == "" {
 		cfg.MountBase = DefaultStaticMount
 	}
@@ -648,6 +658,15 @@ type StaticRollbackConfig struct {
 // re-asserts the Caddyfile block (in case the user changed headers/cache
 // between deploys). Returns an error if no eligible release exists.
 func (d *StaticDeployer) Rollback(ctx context.Context, cfg StaticRollbackConfig) error {
+	start := time.Now()
+	events.Record(ctx, d.exec, events.Event{App: cfg.App, Kind: events.KindRollback, Outcome: events.Started, Release: cfg.ToHash})
+	err := d.rollback(ctx, cfg)
+	events.Record(ctx, d.exec, events.Event{App: cfg.App, Kind: events.KindRollback, Outcome: events.Outcome(err), Release: cfg.ToHash,
+		Detail: events.ErrDetail(map[string]any{"duration_ms": time.Since(start).Milliseconds()}, err)})
+	return err
+}
+
+func (d *StaticDeployer) rollback(ctx context.Context, cfg StaticRollbackConfig) error {
 	if cfg.MountBase == "" {
 		cfg.MountBase = DefaultStaticMount
 	}
@@ -775,6 +794,15 @@ func (d *StaticDeployer) Rollback(ctx context.Context, cfg StaticRollbackConfig)
 // tree says nothing about how it was served. No record means asking for one
 // redeploy, not guessing.
 func (d *StaticDeployer) RollbackStateOnly(ctx context.Context, app, toHash string) error {
+	start := time.Now()
+	events.Record(ctx, d.exec, events.Event{App: app, Kind: events.KindRollback, Outcome: events.Started, Release: toHash})
+	err := d.rollbackStateOnly(ctx, app, toHash)
+	events.Record(ctx, d.exec, events.Event{App: app, Kind: events.KindRollback, Outcome: events.Outcome(err), Release: toHash,
+		Detail: events.ErrDetail(map[string]any{"duration_ms": time.Since(start).Milliseconds()}, err)})
+	return err
+}
+
+func (d *StaticDeployer) rollbackStateOnly(ctx context.Context, app, toHash string) error {
 	lk, err := state.AcquireLockFenced(ctx, d.exec, app)
 	if err != nil {
 		return fmt.Errorf("acquire lock: %w", err)

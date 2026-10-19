@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/useteploy/teploy/internal/events"
 	"io"
 	"path"
 	"sort"
@@ -89,6 +90,16 @@ func (c RollbackConfig) ingressHost() bool { return c.Ingress == "host" }
 // port-conflict set — serialized execution with a stale decision is still
 // a stale decision.
 func Rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg RollbackConfig) error {
+	start := time.Now()
+	target := cfg.ToHash
+	events.Record(ctx, exec, events.Event{App: cfg.App, Kind: events.KindRollback, Outcome: events.Started, Release: target, Detail: map[string]any{"to": target}})
+	err := rollback(ctx, exec, out, cfg)
+	events.Record(ctx, exec, events.Event{App: cfg.App, Kind: events.KindRollback, Outcome: events.Outcome(err), Release: target,
+		Detail: events.ErrDetail(map[string]any{"to": target, "duration_ms": time.Since(start).Milliseconds()}, err)})
+	return err
+}
+
+func rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg RollbackConfig) error {
 	start := time.Now()
 	dk := docker.NewClient(exec)
 	cd := caddy.NewClient(exec)

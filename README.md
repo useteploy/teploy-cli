@@ -377,6 +377,18 @@ teploy unpin <version>          # remove a pin
 teploy pins                     # list pinned versions
 ```
 
+### History
+Every client (this CLI on any machine, teploy-dash, CI, the autodeploy
+listener) records what it did in one history on the app's server, so a deploy
+from a laptop shows up next to one from the dashboard:
+```
+teploy events                                   # the app in ./teploy.yml
+teploy events --host prod                       # every app on prod
+teploy events --host prod --app blog --since-seq 41 --json
+teploy deploy --actor ci:github-actions         # name the client in the history
+```
+Env and secret events record key names only.
+
 ### Secrets and env
 ```
 teploy env set KEY=value           # set env var

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/useteploy/teploy/internal/events"
 	"io"
 	"os"
 	"os/signal"
@@ -106,6 +107,7 @@ func runRemove(flags *Flags, appName string, yes, purge bool, redirect string) e
 		out = io.Discard
 	}
 	summary, err := executeRemove(ctx, executor, appCfg.App, domains, removeOptions{Purge: purge, Redirect: redirect}, out)
+	recordAppEvent(ctx, executor, appCfg.App, events.KindRemove, err, map[string]any{"purge": purge, "redirect": redirect})
 	if err != nil {
 		return err
 	}

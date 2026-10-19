@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/useteploy/teploy/internal/events"
 	"io"
 	"os"
 	"os/signal"
@@ -409,6 +410,7 @@ func runHealPass(ctx context.Context, exec ssh.Executor, app string, out io.Writ
 			Message: fmt.Sprintf("%s failed health probe — restarted in place (attempt %d)", c.Name, st.Attempts),
 		})
 		fmt.Fprintf(out, "heal: restarted %s (attempt %d)\n", c.Name, st.Attempts)
+		recordAppEvent(ctx, exec, app, events.KindHeal, restartErr, map[string]any{"container": c.Name, "attempt": st.Attempts})
 	}
 
 	writeHealState(ctx, exec, app, hs)
