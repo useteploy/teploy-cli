@@ -13,6 +13,7 @@ import (
 	"github.com/useteploy/teploy/internal/caddy"
 	"github.com/useteploy/teploy/internal/docker"
 	"github.com/useteploy/teploy/internal/ssh"
+	"github.com/useteploy/teploy/internal/state"
 )
 
 func newRemoveCmd(flags *Flags) *cobra.Command {
@@ -58,6 +59,7 @@ type removeSummary struct {
 	Server            string   `json:"server"`
 	RemovedContainers []string `json:"removed_containers"`
 	KeptAccessories   []string `json:"kept_accessories,omitempty"`
+	RemovedAutomation []string `json:"removed_automation,omitempty"`
 	Route             string   `json:"route"` // "removed", "redirected", "none"
 	PreservedData     []string `json:"preserved_data,omitempty"`
 }
@@ -134,6 +136,33 @@ func splitDomains(domain string) []string {
 func executeRemove(ctx context.Context, exec ssh.Executor, app string, domains []string, opts removeOptions, out io.Writer) (*removeSummary, error) {
 	summary := &removeSummary{App: app, Server: exec.Host(), RemovedContainers: []string{}}
 	dk := docker.NewClient(exec)
+	appDir := "/deployments/" + app
+
+	// 0. Serialize with deploys, heal and the listener under the app's
+	// fenced lock, and retire everything that could act on the app later
+	// (webhook listener, scheduled redeploy, heal and audit timers) before
+	// any container goes. Without this a listener delivery or a heal pass
+	// could re-create containers mid-removal, and a scheduled-redeploy cron
+	// kept firing against a deleted script forever.
+	var lk *state.Lock
+	if _, err := exec.Run(ctx, "[ -d "+ssh.ShellQuote(appDir)+" ]"); err == nil {
+		lk, err = state.AcquireLockFenced(ctx, exec, app)
+		if err != nil {
+			return nil, fmt.Errorf("acquiring deploy lock: %w", err)
+		}
+		defer func() {
+			state.ReleaseLockFenced(exec, lk, app)
+			exec.Run(ctx, "rmdir "+ssh.ShellQuote(appDir)+" 2>/dev/null || true")
+		}()
+	}
+	removed, err := removeAppAutomation(ctx, exec, app, opts.Purge)
+	if err != nil {
+		return nil, err
+	}
+	summary.RemovedAutomation = removed
+	for _, r := range removed {
+		fmt.Fprintf(out, "Removed %s\n", r)
+	}
 
 	// 1. Containers. Accessories (databases, caches) hold data — leave them
 	// running unless --purge.
@@ -182,8 +211,10 @@ func executeRemove(ctx context.Context, exec ssh.Executor, app string, domains [
 	}
 
 	// 3. State. Default keeps volumes/ and accessories/ (the data); --purge
-	// removes the whole tree.
-	appDir := "/deployments/" + app
+	// removes the whole tree. The held lock (.lock) goes last, on release.
+	if err := lk.Check(ctx, exec); err != nil {
+		return nil, err
+	}
 	if opts.Purge {
 		fmt.Fprintln(out, "Purging deploy state and data...")
 		if _, err := exec.Run(ctx, "rm -rf "+ssh.ShellQuote(appDir)); err != nil {
@@ -210,7 +241,7 @@ func executeRemove(ctx context.Context, exec ssh.Executor, app string, domains [
 		// (.maintenance-block etc.) are matched by find itself; the
 		// exclusion names must be bare, not dotted paths, to match .env.
 		keepArgs := ""
-		for _, keep := range []string{"volumes", "accessories", "secrets", ".env"} {
+		for _, keep := range []string{"volumes", "accessories", "secrets", ".env", ".lock"} {
 			keepArgs += " ! -name " + ssh.ShellQuote(keep)
 		}
 		delCmd := fmt.Sprintf("find %s -mindepth 1 -maxdepth 1%s -exec rm -rf {} +",
@@ -218,7 +249,6 @@ func executeRemove(ctx context.Context, exec ssh.Executor, app string, domains [
 		if _, err := exec.Run(ctx, delCmd); err != nil {
 			return nil, fmt.Errorf("removing deploy state under %s: %w", appDir, err)
 		}
-		exec.Run(ctx, "rmdir "+ssh.ShellQuote(appDir)+" 2>/dev/null || true")
 		if left, err := exec.Run(ctx, "ls "+ssh.ShellQuote(appDir)+" 2>/dev/null"); err == nil {
 			for _, d := range strings.Fields(left) {
 				summary.PreservedData = append(summary.PreservedData, appDir+"/"+d)
@@ -233,4 +263,58 @@ func executeRemove(ctx context.Context, exec ssh.Executor, app string, domains [
 		fmt.Fprintf(out, "Preserved %s\n", p)
 	}
 	return summary, nil
+}
+
+// removeAppAutomation disables and deletes the app's systemd units (webhook
+// listener, heal and audit timers) and its scheduled-redeploy cron entry in
+// one server round trip. Backup schedules are removed only with purge: the
+// default remove keeps the data they back up. Returns what it removed;
+// absent units and an empty crontab are not errors.
+func removeAppAutomation(ctx context.Context, exec ssh.Executor, app string, purge bool) ([]string, error) {
+	sudo := sudoPrefixFor(ctx, exec)
+	units := []string{
+		"teploy-webhook-" + app + ".service",
+		healTimerName(app), healServiceName(app),
+		secretAuditTimerName(app), secretAuditServiceName(app),
+	}
+	patterns := []string{"/deployments/" + app + "/scheduled-redeploy.sh"}
+	if purge {
+		patterns = append(patterns, "[teploy-backup:"+app+"]", "[teploy-accessory-backup:"+app+":")
+	}
+	var script strings.Builder
+	script.WriteString("reload=0; ")
+	for _, u := range units {
+		path := ssh.ShellQuote("/etc/systemd/system/" + u)
+		fmt.Fprintf(&script, "if [ -e %s ]; then %ssystemctl disable --now %s >/dev/null 2>&1; %srm -f -- %s || exit 1; reload=1; echo unit:%s; fi; ",
+			path, sudo, ssh.ShellQuote(u), sudo, path, u)
+	}
+	fmt.Fprintf(&script, "if [ $reload = 1 ]; then %ssystemctl daemon-reload || exit 1; fi; ", sudo)
+	grepArgs := ""
+	for _, p := range patterns {
+		grepArgs += " -e " + ssh.ShellQuote(p)
+	}
+	// Same status-checked crontab read as autodeploy.Unschedule (audit
+	// T29): only "no crontab" means empty; any other read failure aborts
+	// before the install so unrelated jobs can never be dropped.
+	fmt.Fprintf(&script, `if command -v crontab >/dev/null 2>&1; then raw=$(crontab -l 2>&1); rc=$?; `+
+		`if [ "$rc" -ne 0 ]; then case "$raw" in *"no crontab"*) raw="";; *) echo "reading crontab failed: $raw" >&2; exit 1;; esac; fi; `+
+		`n=$(printf '%%s
+' "$raw" | grep -cF%s); `+
+		`if [ "$n" -gt 0 ]; then printf '%%s
+' "$raw" | grep -vF%s | crontab - || exit 1; echo cron:$n; fi; fi`,
+		grepArgs, grepArgs)
+	out, err := exec.Run(ctx, script.String())
+	if err != nil {
+		return nil, fmt.Errorf("removing %s's listener, timers and cron entries: %w", app, err)
+	}
+	var removed []string
+	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+		switch {
+		case strings.HasPrefix(line, "unit:"):
+			removed = append(removed, "systemd unit "+strings.TrimPrefix(line, "unit:"))
+		case strings.HasPrefix(line, "cron:"):
+			removed = append(removed, strings.TrimPrefix(line, "cron:")+" cron entr(ies)")
+		}
+	}
+	return removed, nil
 }

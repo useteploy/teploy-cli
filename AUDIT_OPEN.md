@@ -2711,8 +2711,11 @@ outside this repository.
   secrets instead of env. Existing DR bundles made before this fix still
   contain plaintext values until re-made; `.env` inside `teploy backup`
   archives is the intended env store and stays as-is.
-- **SM-3 (open, owner decision)** — rollback after a secret rotation uses
-  the old values (docker's record of the stopped container). Re-resolving
-  current secrets at rollback would need a resolver over the age store,
-  `.env` and OpenBao; not built because no caller needed it and it changes
-  rollback semantics.
+- **SM-3 (decided 2026-10-19: keep release-faithful rollback, warn)** —
+  rollback after a secret rotation uses the values the target release ran
+  with (docker's record of its container). That is kept: a rollback restores
+  a known-good state, and re-resolving would turn the fast restart-the-old-
+  container path into a recreate with a resolver over the age store, `.env`
+  and OpenBao. Rollback now warns, naming the keys, when `.env` or
+  `secrets/` changed after the target release was recorded, and says to
+  redeploy. Not covered: OpenBao rotations (not observable from the host).

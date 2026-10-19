@@ -519,6 +519,12 @@ type setupEnv struct {
 	yes       bool
 }
 
+// serverTools are the packages teploy needs on every server beyond docker
+// and rsync; serverToolsProbe prints the missing ones, space separated.
+var serverTools = []string{"git", "python3"}
+
+const serverToolsProbe = "for t in git python3; do command -v $t >/dev/null 2>&1 || printf '%s ' $t; done; true"
+
 // setupStages is the ordered provisioning plan. The ORDER is part of
 // the contract: docker before the network that needs it, the network
 // before the container that joins it, directories before the files
@@ -593,6 +599,30 @@ func setupStages() []setupStage {
 				} else {
 					fmt.Fprintln(w, "  rsync already installed")
 				}
+				return nil
+			},
+		},
+		{
+			name:    "git and python3",
+			affects: "git and python3 packages (apt, if missing) — state writes need python3, server-side config and checkouts need git",
+			run: func(ctx context.Context, exec ssh.Executor, w io.Writer, env *setupEnv) error {
+				fmt.Fprintln(w, "Checking git and python3...")
+				out, err := exec.Run(ctx, serverToolsProbe)
+				if err != nil {
+					return fmt.Errorf("probing server tools: %w", err)
+				}
+				missing := strings.Fields(out)
+				if len(missing) == 0 {
+					fmt.Fprintln(w, "  git and python3 already installed")
+					return nil
+				}
+				fmt.Fprintf(w, "  Installing %s...\n", strings.Join(missing, ", "))
+				installCmd := env.sudo + "sh -c 'DEBIAN_FRONTEND=noninteractive apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq " + strings.Join(missing, " ") + "'"
+				if out, err := exec.Run(ctx, installCmd); err != nil {
+					fmt.Fprintln(w, out)
+					return fmt.Errorf("installing %s: %w", strings.Join(missing, ", "), err)
+				}
+				fmt.Fprintf(w, "  %s installed\n", strings.Join(missing, ", "))
 				return nil
 			},
 		},

@@ -19,6 +19,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -197,7 +198,7 @@ func doctorRun(ctx context.Context, deps doctorDeps, flags *Flags, serverName st
 
 	if executor == nil {
 		const sshDown = "restore SSH connectivity (see the ssh check above), then re-run teploy doctor"
-		for _, name := range []string{"docker", "disk", "registry", "caddy", "compatibility", "repair-debt", "secret-exposure"} {
+		for _, name := range []string{"docker", "disk", "registry", "caddy", "compatibility", "repair-debt", "secret-exposure", "server-tools"} {
 			skipFail(name, "SSH unreachable", sshDown)
 		}
 	} else {
@@ -214,6 +215,7 @@ func doctorRun(ctx context.Context, deps doctorDeps, flags *Flags, serverName st
 		report.Checks = append(report.Checks, doctorCompatCheck(ctx, deps, executor))
 		report.Checks = append(report.Checks, doctorRepairDebtCheck(ctx, executor, appCfg))
 		report.Checks = append(report.Checks, doctorSecretExposureCheck(ctx, executor))
+		report.Checks = append(report.Checks, doctorServerToolsCheck(ctx, executor))
 	}
 
 	report.summarize()
@@ -379,6 +381,34 @@ func doctorDockerCheck(ctx context.Context, exec ssh.Executor) doctorCheck {
 		}
 	}
 	return doctorCheck{Name: "docker", Result: doctorOK, Detail: fmt.Sprintf("Docker server %s reachable", version)}
+}
+
+// doctorServerToolsCheck verifies the server-side tools teploy shells out
+// to. python3 is required (fenced state writes, volume ownership, trigger
+// receipts), so its absence fails; git is a warning until a feature on the
+// box needs it. `teploy setup` installs both.
+func doctorServerToolsCheck(ctx context.Context, exec ssh.Executor) doctorCheck {
+	out, err := exec.Run(ctx, serverToolsProbe)
+	if err != nil {
+		return doctorCheck{
+			Name: "server-tools", Result: doctorFail, Detail: err.Error(),
+			Remediation: "check the shell on the server — the tool probe failed outright",
+		}
+	}
+	missing := strings.Fields(out)
+	switch {
+	case len(missing) == 0:
+		return doctorCheck{Name: "server-tools", Result: doctorOK, Detail: strings.Join(serverTools, ", ") + " present"}
+	case slices.Contains(missing, "python3"):
+		return doctorCheck{
+			Name: "server-tools", Result: doctorFail, Detail: "missing on the server: " + strings.Join(missing, ", "),
+			Remediation: "run `teploy setup` against the server (or apt-get install " + strings.Join(missing, " ") + ") — state writes need python3",
+		}
+	}
+	return doctorCheck{
+		Name: "server-tools", Result: doctorWarn, Detail: "missing on the server: " + strings.Join(missing, ", "),
+		Remediation: "run `teploy setup` against the server (or apt-get install " + strings.Join(missing, " ") + ")",
+	}
 }
 
 // doctorDiskCheck reports root-filesystem headroom via df over the

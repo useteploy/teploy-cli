@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"path"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/useteploy/teploy/internal/caddy"
@@ -202,6 +204,7 @@ func Rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg Rollbac
 	}
 	if rec != nil {
 		applyRecordToRollback(&cfg, rec, &healthCfg)
+		warnRotatedSinceRelease(ctx, exec, out, cfg.App, target, rec)
 	}
 
 	// The recorded primary container port (TCL-14): with more than one
@@ -878,4 +881,31 @@ func applyRecordToRollback(cfg *RollbackConfig, rec *releasemeta.Record, healthC
 			cfg.Access = *rec.Caddy.Access
 		}
 	}
+}
+
+// warnRotatedSinceRelease tells the operator when the app's env file or age
+// secret store changed after the target release was recorded (AUDIT_OPEN
+// SM-3). Rollback deliberately restores the values that release ran with
+// (docker's record of its container), which is what "go back to the last
+// good state" means; but after a rotation those may be revoked or
+// compromised, and the operator should know to redeploy. Best-effort and
+// silent on any read failure; prints file names (key names), never values.
+// Secrets resolved from OpenBao at deploy time are not visible here.
+func warnRotatedSinceRelease(ctx context.Context, exec ssh.Executor, out io.Writer, app, target string, rec *releasemeta.Record) {
+	if rec.CreatedAt.IsZero() || len(rec.EnvRedacted) == 0 {
+		return
+	}
+	dir := "/deployments/" + app
+	cmd := fmt.Sprintf("find %s %s -maxdepth 1 -type f -newermt @%d 2>/dev/null; true",
+		ssh.ShellQuote(dir+"/.env"), ssh.ShellQuote(dir+"/secrets"), rec.CreatedAt.Unix())
+	changed, err := exec.Run(ctx, cmd)
+	if err != nil || strings.TrimSpace(changed) == "" {
+		return
+	}
+	var names []string
+	for _, p := range strings.Fields(changed) {
+		names = append(names, strings.TrimSuffix(path.Base(p), ".age"))
+	}
+	fmt.Fprintf(out, "Warning: %s changed since %s was deployed (%s); this rollback restores the values %s ran with. Run `teploy deploy` afterwards to apply the current ones.\n",
+		strings.Join(names, ", "), target, rec.CreatedAt.Format(time.RFC3339), target)
 }
