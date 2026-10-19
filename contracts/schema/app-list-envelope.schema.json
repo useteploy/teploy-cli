@@ -33,6 +33,13 @@
       "items": {
         "$ref": "#/$defs/machineError"
       }
+    },
+    "undeployed": {
+      "type": "array",
+      "description": "Only with --include-undeployed (capability undeployed-list-v1): Teploy-home apps with a v3 tombstone (never deployed, or removed with their config kept). Absent otherwise.",
+      "items": {
+        "$ref": "#/$defs/undeployedApp"
+      }
     }
   },
   "$defs": {
@@ -177,6 +184,31 @@
           "items": {
             "$ref": "#/$defs/machineError"
           }
+        }
+      }
+    },
+    "undeployedApp": {
+      "type": "object",
+      "required": [
+        "app",
+        "generation",
+        "updated_at"
+      ],
+      "properties": {
+        "app": {
+          "type": "string",
+          "minLength": 1
+        },
+        "domain": {
+          "type": "string"
+        },
+        "generation": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "updated_at": {
+          "type": "string",
+          "format": "date-time"
         }
       }
     }

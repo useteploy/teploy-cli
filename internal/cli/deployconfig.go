@@ -48,5 +48,6 @@ func deployConfigFromApp(appCfg *config.AppConfig, image, version string, envFil
 		ManifestSHA256:  manifestSHA256,
 		AppliedManifest: appliedManifest,
 		SourceRevision:  appCfg.SourceRevision,
+		ConfigCommit:    appCfg.ConfigCommit,
 	}
 }

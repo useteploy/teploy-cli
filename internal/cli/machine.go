@@ -79,20 +79,34 @@ type appListDTO struct {
 	Apps             []appStatusDTO `json:"apps"`
 	ObservedAt       time.Time      `json:"observed_at"`
 	Errors           []machineError `json:"errors"`
+	// Undeployed (only with --include-undeployed) lists server-home apps
+	// that have a config but no running release: never deployed, or
+	// removed with their config kept (v3 tombstones).
+	Undeployed []undeployedAppDTO `json:"undeployed,omitempty"`
+}
+
+type undeployedAppDTO struct {
+	App        string    `json:"app"`
+	Domain     string    `json:"domain,omitempty"`
+	Generation uint64    `json:"generation"`
+	UpdatedAt  time.Time `json:"updated_at"`
 }
 
 func newAppListCmd(flags *Flags) *cobra.Command {
-	return &cobra.Command{
+	var includeUndeployed bool
+	cmd := &cobra.Command{
 		Use:   "list",
 		Short: "List apps deployed on a server",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runAppList(flags, cmd.OutOrStdout())
+			return runAppList(flags, cmd.OutOrStdout(), includeUndeployed)
 		},
 	}
+	cmd.Flags().BoolVar(&includeUndeployed, "include-undeployed", false, "also list apps edited in Teploy that have no running release (in a separate `undeployed` list)")
+	return cmd
 }
 
-func runAppList(flags *Flags, out io.Writer) error {
+func runAppList(flags *Flags, out io.Writer, includeUndeployed bool) error {
 	if flags.Host == "" {
 		return fmt.Errorf("--host is required")
 	}
@@ -110,6 +124,9 @@ func runAppList(flags *Flags, out io.Writer) error {
 	defer executor.Close()
 
 	result := collectAppList(ctx, executor, time.Now().UTC())
+	if !includeUndeployed {
+		result.Undeployed = nil
+	}
 	if flags.JSON {
 		return json.NewEncoder(out).Encode(result)
 	}
@@ -125,7 +142,7 @@ func printAppList(out io.Writer, result appListDTO) error {
 	for _, e := range result.Errors {
 		problems = append(problems, fmt.Sprintf("%s: %s", e.Scope, e.Message))
 	}
-	if len(result.Apps) == 0 && len(problems) == 0 {
+	if len(result.Apps) == 0 && len(problems) == 0 && len(result.Undeployed) == 0 {
 		fmt.Fprintln(out, "No deployed apps")
 		return nil
 	}
@@ -141,6 +158,12 @@ func printAppList(out io.Writer, result appListDTO) error {
 			}
 		}
 		fmt.Fprintf(out, "%-24s  %-12s  %-16s  %-10d  %s\n", app.App, app.Type, current, len(app.Containers), app.Domain)
+	}
+	if len(result.Undeployed) > 0 {
+		fmt.Fprintln(out, "\nNot deployed (settings edited in Teploy):")
+		for _, u := range result.Undeployed {
+			fmt.Fprintf(out, "  %s\n", u.App)
+		}
 	}
 	if len(problems) == 0 {
 		return nil
@@ -215,6 +238,10 @@ func collectAppList(ctx context.Context, executor ssh.Executor, observedAt time.
 
 	for _, name := range valid {
 		snap := snapByApp[name]
+		if snap.State != nil && snap.State.Tombstone {
+			result.Undeployed = append(result.Undeployed, undeployedAppDTO{App: name, Domain: snap.State.Domain, Generation: snap.State.Generation, UpdatedAt: snap.State.UpdatedAt})
+			continue
+		}
 		result.Apps = append(result.Apps, assembleAppStatus(
 			name, observedAt, snap, docker.ContainersByApp(allContainers, name)))
 	}

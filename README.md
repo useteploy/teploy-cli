@@ -389,6 +389,27 @@ teploy deploy --actor ci:github-actions         # name the client in the history
 ```
 Env and secret events record key names only.
 
+### Settings home (folder or Teploy)
+An app's settings live in one place. By default that is `teploy.yml` in your
+folder. Move them to the server and any client (another laptop,
+teploy-dash, CI) can edit them, with history and no silent overwrites:
+```
+teploy config home teploy                       # in the app's folder: store teploy.yml on its server
+teploy deploy --app blog --host prod            # deploy from the server config (no folder needed)
+teploy deploy --app blog --host prod --image ghcr.io/me/blog:1.4   # commit image: then deploy (CI one-liner)
+teploy config edit --app blog --host prod       # $EDITOR; concurrent edits merge key by key
+teploy config set --app blog --host prod image=nginx:1.27 env.LOG_LEVEL=debug
+teploy config get | diff [--applied] | history | restore <commit>
+teploy config pull / push                       # edit a linked local copy, push as compare-and-swap
+teploy config home folder                       # back to the folder (server copy archived)
+```
+A Teploy-home config is never expanded from anyone's environment: `$VAR` in
+`env:` is refused (write `$$` for a literal `$`), and secret values go in
+`teploy secret set`, not the file. `server:`/`servers:`, `env_files:` and
+local TLS/static-build paths are refused too: the app deploys to the server
+that stores its config. Folder deploys of a Teploy-home app are refused, and
+so are deploys by teploy CLIs older than this feature.
+
 ### Secrets and env
 ```
 teploy env set KEY=value           # set env var

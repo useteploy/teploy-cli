@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://teploy.github.io/contracts/schema/config-history-envelope.schema.json",
+  "title": "`teploy config history --json`: a Teploy-home app's config commits, newest first (rev 11)",
+  "type": "object",
+  "required": ["machine_interface", "host", "app", "commits"],
+  "properties": {
+    "machine_interface": {"type": "integer", "minimum": 1},
+    "host": {"type": "string", "minLength": 1},
+    "app": {"type": "string", "minLength": 1},
+    "applied_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+    "commits": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["commit", "author", "email", "date", "message"],
+        "properties": {
+          "commit": {"type": "string", "pattern": "^[0-9a-f]{40}$"},
+          "author": {"type": "string", "description": "The acting client, <client>[:<label>] (client-asserted)."},
+          "email": {"type": "string"},
+          "date": {"type": "string", "format": "date-time"},
+          "message": {"type": "string"}
+        }
+      }
+    }
+  }
+}

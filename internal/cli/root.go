@@ -80,6 +80,7 @@ func NewRootCmd(version string) *cobra.Command {
 	root.AddCommand(newExecCmd(flags))
 	root.AddCommand(newAppCmd(flags))
 	root.AddCommand(newEventsCmd(flags))
+	root.AddCommand(newConfigCmd(flags))
 	root.AddCommand(newSetupCmd(flags))
 	root.AddCommand(newAccessoryCmd(flags))
 	root.AddCommand(newKvCmd(flags))

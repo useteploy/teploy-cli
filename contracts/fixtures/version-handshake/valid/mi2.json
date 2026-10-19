@@ -3,6 +3,7 @@
     "actor-flag-v1",
     "app-list-machine",
     "autodeploy-redeploy",
+    "config-home-v1",
     "doctor-diagnostics",
     "env-set-stdin",
     "error-envelope",
@@ -21,7 +22,8 @@
     "server-status-machine",
     "server-update",
     "template-var-stdin",
-    "trigger-convergence-v1"
+    "trigger-convergence-v1",
+    "undeployed-list-v1"
   ],
   "machine_interface": 2,
   "version": "v0.0.0-contracts"

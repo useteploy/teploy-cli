@@ -1,0 +1,22 @@
+{
+  "machine_interface": 2,
+  "host": "192.0.2.10",
+  "app": "blog",
+  "applied_commit": "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d",
+  "commits": [
+    {
+      "commit": "8f2c1d0e9b7a6f5e4d3c2b1a0f9e8d7c6b5a4f3e",
+      "author": "dash:alice",
+      "email": "dash@teploy",
+      "date": "2026-10-19T12:00:00Z",
+      "message": "config set image"
+    },
+    {
+      "commit": "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d",
+      "author": "cli:tyler@laptop",
+      "email": "cli@teploy",
+      "date": "2026-10-19T11:00:00Z",
+      "message": "config home teploy (from teploy.yml)"
+    }
+  ]
+}

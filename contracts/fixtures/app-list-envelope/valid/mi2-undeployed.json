@@ -1,0 +1,15 @@
+{
+  "machine_interface": 2,
+  "host": "srv.example.com",
+  "apps": [],
+  "observed_at": "2026-10-19T12:00:00Z",
+  "errors": [],
+  "undeployed": [
+    {
+      "app": "blog",
+      "domain": "blog.example.com",
+      "generation": 1,
+      "updated_at": "2026-10-19T12:00:00Z"
+    }
+  ]
+}

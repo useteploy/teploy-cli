@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/useteploy/teploy/internal/config"
+	"github.com/useteploy/teploy/internal/confighome"
 	"github.com/useteploy/teploy/internal/events"
 	"github.com/useteploy/teploy/internal/preview"
 	"github.com/useteploy/teploy/internal/releasemeta"
@@ -406,4 +407,40 @@ func TestContractsEventsEnvelopeGolden(t *testing.T) {
 		t.Fatal(err)
 	}
 	writeFixture(t, "events-envelope/valid/deploy-and-env.json", v)
+}
+
+// TestContractsConfigHomeGolden pins the config-home envelopes (rev 11):
+// `config get --json` for a Teploy-home app whose config moved since the
+// deploy, `config home --json` for a folder app, `config history --json`,
+// an app list with an undeployed Teploy-home app, and a release record
+// deployed from Teploy config.
+func TestContractsConfigHomeGolden(t *testing.T) {
+	ts := time.Date(2026, 10, 19, 12, 0, 0, 0, time.UTC)
+	head := "8f2c1d0e9b7a6f5e4d3c2b1a0f9e8d7c6b5a4f3e"
+	applied := "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d"
+	writeFixture(t, "config-envelope/valid/teploy-home.json", configDTO{
+		MachineInterface: MachineInterface, Host: "192.0.2.10", App: "blog", Home: "teploy",
+		Commit: head, AppliedCommit: applied,
+		Content: "app: blog\ndomain: blog.example.com\nimage: example/blog:1.4.0\nenv:\n  LOG_LEVEL: info\n  DB_PASSWORD: secret:DB_PASSWORD\n",
+	})
+	writeFixture(t, "config-envelope/valid/folder-home.json", configDTO{
+		MachineInterface: MachineInterface, Host: "192.0.2.10", App: "legacy", Home: "folder",
+	})
+	writeFixture(t, "config-history-envelope/valid/two-commits.json", configHistoryDTO{
+		MachineInterface: MachineInterface, Host: "192.0.2.10", App: "blog", AppliedCommit: applied,
+		Commits: []confighome.Commit{
+			{OID: head, Author: "dash:alice", Email: "dash@teploy", Date: ts, Message: "config set image"},
+			{OID: applied, Author: "cli:tyler@laptop", Email: "cli@teploy", Date: ts.Add(-time.Hour), Message: "config home teploy (from teploy.yml)"},
+		},
+	})
+	writeFixture(t, "app-list-envelope/valid/mi2-undeployed.json", appListDTO{
+		MachineInterface: MachineInterface, Host: "srv.example.com", Apps: []appStatusDTO{}, ObservedAt: ts, Errors: []machineError{},
+		Undeployed: []undeployedAppDTO{{App: "blog", Domain: "blog.example.com", Generation: 1, UpdatedAt: ts}},
+	})
+	writeFixture(t, "release-record/valid/container-teploy-home.json", releasemeta.Record{
+		SchemaVersion: 1, App: "blog", Hash: "1.4.0", CreatedAt: ts,
+		DeploymentType: "container", IngressMode: "caddy", Domain: "blog.example.com",
+		ImageRef: "example/blog:1.4.0", ImageDigest: "sha256:0000", ManifestSHA256: "sha256:beef",
+		ConfigCommit: head, Actor: "dash:alice",
+	})
 }

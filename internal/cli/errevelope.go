@@ -99,7 +99,7 @@ func refuseAdmission(err error) error {
 // generalization).
 func classifyMachineError(err error) string {
 	switch {
-	case errors.Is(err, errPlanDrift):
+	case errors.Is(err, errPlanDrift), errors.Is(err, errConfigConflict):
 		return codeConflict
 	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
 		return codeUncertainOutcome
@@ -124,6 +124,9 @@ func writeMachineErrorEnvelope(out io.Writer, err error) error {
 		}
 	case codeConflict:
 		message = "plan no longer valid"
+		if errors.Is(err, errConfigConflict) {
+			message = "config changed since it was read"
+		}
 	case codeUncertainOutcome:
 		message = "interrupted — outcome unknown until reconciled"
 	}

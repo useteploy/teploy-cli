@@ -163,7 +163,12 @@ func (d *StaticDeployer) deploy(ctx context.Context, cfg StaticConfig) error {
 	// 5. Read prior state for rollback bookkeeping. A read failure aborts —
 	// treating unreadable state as "no state" would drop the rollback
 	// history and mislabel a replacement as a first deploy (audit F15).
-	prior, err := state.Read(ctx, d.exec, cfg.App)
+	// Static sites have no Teploy-home deploy path yet (they need a code
+	// source); a folder deploy of a Teploy-home app is refused.
+	if err := admitConfigHome(ctx, d.exec, cfg.App, "", lk, d.out); err != nil {
+		return err
+	}
+	prior, err := state.ReadIncludingTombstone(ctx, d.exec, cfg.App)
 	if err != nil {
 		return fmt.Errorf("refusing to deploy with unreadable state for %s: %w", cfg.App, err)
 	}
@@ -661,8 +666,12 @@ func (d *StaticDeployer) Rollback(ctx context.Context, cfg StaticRollbackConfig)
 	start := time.Now()
 	events.Record(ctx, d.exec, events.Event{App: cfg.App, Kind: events.KindRollback, Outcome: events.Started, Release: cfg.ToHash})
 	err := d.rollback(ctx, cfg)
-	events.Record(ctx, d.exec, events.Event{App: cfg.App, Kind: events.KindRollback, Outcome: events.Outcome(err), Release: cfg.ToHash,
-		Detail: events.ErrDetail(map[string]any{"duration_ms": time.Since(start).Milliseconds()}, err)})
+	target := cfg.ToHash
+	if err == nil {
+		target, _ = rolledBackTo(ctx, d.exec, cfg.App, target)
+	}
+	events.Record(ctx, d.exec, events.Event{App: cfg.App, Kind: events.KindRollback, Outcome: events.Outcome(err), Release: target,
+		Detail: events.ErrDetail(map[string]any{"to": target, "duration_ms": time.Since(start).Milliseconds()}, err)})
 	return err
 }
 

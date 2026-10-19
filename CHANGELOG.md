@@ -24,6 +24,38 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
   the observe audit forward uses the same `client:label`. Capability tokens
   `events-v1` and `actor-flag-v1`; contracts corpus rev 10 adds the
   `events-envelope` artifact.
+- Config homes. `teploy config home teploy` moves an app's `teploy.yml` from
+  its folder into a git repository on its server
+  (`/deployments/.teploy/apps/<app>/config.git`, 0700, pushes refused). Any
+  client can then edit it with `teploy config get|set|edit|diff|history|
+  restore|pull|push|purge-history`. Every write is a compare-and-swap that
+  the server builds under an flock and records as a `config.set` event, with
+  `privileged: true` when the change reaches the host (host binds,
+  `caddy_extra`, published ports, bind/ingress/network). A conflict exits 1,
+  with code `conflict` and the current commit. `config edit` merges
+  concurrent edits key by key and asks only about keys both sides changed.
+  Configs are validated for portability: no `$VAR` in `env:` (`$$` is a
+  literal `$`), no `env_files`, `server:`, local TLS or static build paths,
+  and no secret-looking values.
+- `teploy deploy --app <app> --host <server>` (or `teploy deploy <app>
+  --host <server>` outside a folder) deploys a Teploy-home app from its
+  server config under the app lock and records `config_commit` (and the
+  actor) on the release. `--image T` commits `image: T` first, so existing
+  CI one-liners keep working. Other ad-hoc overrides are refused.
+- State schema v3 (v2 plus `tombstone`) marks Teploy-home apps. Older CLIs
+  refuse it, which keeps them from deploying such an app from a stale
+  folder. Folder deploys from this CLI are refused too, at admission and
+  again in the engine at swap time. Never-deployed and removed Teploy-home
+  apps are v3 tombstones: hidden from `app list`, shown with
+  `--include-undeployed`. Under the lock the CLI repairs what an older CLI
+  left behind and records a `gate.repair` event. An app marked v3 whose
+  config.git is gone is refused as orphaned until `config home folder`.
+- `teploy remove` keeps a Teploy-home app's config and history and writes a
+  tombstone. `--purge` deletes them as well.
+- Capability tokens `config-home-v1` and `undeployed-list-v1`. Contracts
+  corpus rev 11 adds `config-envelope` and `config-history-envelope`, the
+  `undeployed` app-list array, and `config_commit`/`actor` on release
+  records.
 
 ### Fixed
 

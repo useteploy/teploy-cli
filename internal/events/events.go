@@ -57,6 +57,15 @@ type Actor struct {
 	Op         string `json:"op,omitempty"`
 }
 
+// ActorString renders an actor as client[:label], the flat form release
+// records and audit lines carry.
+func ActorString(a Actor) string {
+	if a.Label == "" {
+		return a.Client
+	}
+	return a.Client + ":" + a.Label
+}
+
 // Event is one line of the log.
 type Event struct {
 	V            int            `json:"v"`

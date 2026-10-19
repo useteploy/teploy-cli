@@ -132,6 +132,13 @@ type Record struct {
 	// NormalizeAndDigest) the release deployed under — the plan/receipt
 	// equality surface (C04).
 	ManifestSHA256 string `json:"manifest_sha256,omitempty"`
+	// ConfigCommit is the server config commit (config.git, Teploy home)
+	// this release deployed; empty for folder-home deploys. Desired vs
+	// applied = config head vs this.
+	ConfigCommit string `json:"config_commit,omitempty"`
+	// Actor is the client that deployed this release (client-asserted,
+	// spec §2.5): "<client>[:<label>]".
+	Actor string `json:"actor,omitempty"`
 	// Provenance is the plan-time provenance the deploy resolved to
 	// (C04): revision, worktree cleanliness, build context fingerprint,
 	// Dockerfile identity, platform, image digest and mutability.
