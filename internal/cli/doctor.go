@@ -198,7 +198,7 @@ func doctorRun(ctx context.Context, deps doctorDeps, flags *Flags, serverName st
 
 	if executor == nil {
 		const sshDown = "restore SSH connectivity (see the ssh check above), then re-run teploy doctor"
-		for _, name := range []string{"docker", "disk", "registry", "caddy", "compatibility", "repair-debt", "secret-exposure", "server-tools"} {
+		for _, name := range []string{"docker", "disk", "registry", "caddy", "compatibility", "repair-debt", "secret-exposure", "server-tools", "config-home"} {
 			skipFail(name, "SSH unreachable", sshDown)
 		}
 	} else {
@@ -216,6 +216,7 @@ func doctorRun(ctx context.Context, deps doctorDeps, flags *Flags, serverName st
 		report.Checks = append(report.Checks, doctorRepairDebtCheck(ctx, executor, appCfg))
 		report.Checks = append(report.Checks, doctorSecretExposureCheck(ctx, executor))
 		report.Checks = append(report.Checks, doctorServerToolsCheck(ctx, executor))
+		report.Checks = append(report.Checks, doctorConfigHomeCheck(ctx, executor))
 	}
 
 	report.summarize()
@@ -741,4 +742,48 @@ func doctorSample(lines []string) string {
 		return strings.Join(lines, ", ")
 	}
 	return strings.Join(lines[:shown], ", ") + fmt.Sprintf(" (+%d more)", len(lines)-shown)
+}
+
+// doctorConfigHomeScript prints "<app> <state schema|none> <config.git 0|1>"
+// for every app with state or a server config repository.
+const doctorConfigHomeScript = `for f in /deployments/*/state.json; do [ -e "$f" ] || continue; a=$(basename "$(dirname "$f")"); v=$(grep -o '"schema_version": *[0-9]*' "$f" | grep -o '[0-9]*$'); r=0; [ -e "/deployments/.teploy/apps/$a/config.git/HEAD" ] && r=1; echo "$a ${v:-0} $r"; done; for h in /deployments/.teploy/apps/*/config.git/HEAD; do [ -e "$h" ] || continue; a=$(basename "$(dirname "$(dirname "$h")")"); [ -e "/deployments/$a/state.json" ] || echo "$a none 1"; done`
+
+// doctorConfigHomeCheck reports which apps are edited in Teploy (older
+// CLIs are refused on them, by design), and the gate states the next
+// command repairs or refuses (spec §2.2).
+func doctorConfigHomeCheck(ctx context.Context, exec ssh.Executor) doctorCheck {
+	out, err := exec.Run(ctx, doctorConfigHomeScript)
+	if err != nil {
+		return doctorCheck{Name: "config-home", Result: doctorWarn, Detail: "could not read config homes: " + err.Error()}
+	}
+	var teploy, repair, orphaned []string
+	for _, line := range doctorLines(out) {
+		f := strings.Fields(line)
+		if len(f) != 3 {
+			continue
+		}
+		app, schema, repo := f[0], f[1], f[2] == "1"
+		switch {
+		case repo && schema == "3":
+			teploy = append(teploy, app)
+		case repo:
+			repair = append(repair, app)
+		case schema == "3":
+			orphaned = append(orphaned, app)
+		}
+	}
+	switch {
+	case len(orphaned) > 0:
+		return doctorCheck{Name: "config-home", Result: doctorFail,
+			Detail:      fmt.Sprintf("orphaned (marked as edited in Teploy, config repository missing): %s", strings.Join(orphaned, ", ")),
+			Remediation: "run `teploy config home folder --app <app>` to edit it from a folder again, or restore /deployments/.teploy/apps/<app> from a backup"}
+	case len(repair) > 0:
+		return doctorCheck{Name: "config-home", Result: doctorWarn,
+			Detail:      fmt.Sprintf("changed by an older teploy CLI (deployed from a folder or removed): %s", strings.Join(repair, ", ")),
+			Remediation: "upgrade every machine and CI image that runs teploy; the next deploy or config command repairs the marker and warns — review with `teploy config diff --applied`"}
+	case len(teploy) > 0:
+		return doctorCheck{Name: "config-home", Result: doctorOK,
+			Detail: fmt.Sprintf("%d app(s) edited in Teploy: %s — teploy CLIs older than v0.1.43 refuse to deploy them", len(teploy), strings.Join(teploy, ", "))}
+	}
+	return doctorCheck{Name: "config-home", Result: doctorOK, Detail: "every app is edited in its folder"}
 }

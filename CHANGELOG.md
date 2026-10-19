@@ -4,6 +4,25 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [0.1.43] - 2026-10-19
+
+### Upgrade notes
+
+- **Moving an app to Teploy home locks out older CLIs on purpose.** After
+  `teploy config home teploy` (or `template install --home teploy`, or a
+  dash-created Teploy-home app), teploy v0.1.42 and older refuse to deploy,
+  roll back, start/stop/restart or plan that app ("unsupported state schema
+  version 3"). `app list` shows it as an error row. Upgrade every laptop, CI
+  image and server binary that touches the app first.
+- Older CLIs never read state for `env set/unset`, `secret set`, `remove`,
+  `autodeploy setup`, `heal enable`, `preview`, `accessory`, `backup` or
+  `lock`, so those are not refused. An old `remove` followed by an old
+  `deploy` re-creates the app from a folder. The next v0.1.43 command
+  repairs the marker, warns, and records `gate.repair`; `teploy doctor`
+  reports it.
+- DR bundles created by this version are schema 2, and older CLIs refuse
+  them. This version still reads schema-1 bundles.
+
 ### Added
 
 - One server-side event history per app, shared by every client. Deploys,
@@ -79,6 +98,9 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
 - Folder deploys store the deployed `teploy.yml`, with detected secret
   values masked, as `meta/<release>.source.yml` (0600). The release record
   carries its `source_sha256`.
+- `teploy doctor` gains a `config-home` check. It lists the apps edited in
+  Teploy, and the next command repairs apps an older CLI changed (warn).
+  Orphaned apps (marked v3 with no config repository) fail.
 - Capability tokens `config-home-v1` and `undeployed-list-v1`. Contracts
   corpus rev 11 adds `config-envelope` and `config-history-envelope`, the
   `undeployed` app-list array, and `config_commit`/`actor` on release
