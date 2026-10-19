@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/useteploy/teploy/internal/confighome"
 	"github.com/useteploy/teploy/internal/ssh"
 )
 
@@ -261,6 +262,28 @@ func (c *Client) BackupVolumes(ctx context.Context, app string, s3 S3Config) err
 	if _, err := c.exec.Run(ctx, uploadCmd); err != nil {
 		cleanup()
 		return fmt.Errorf("uploading to S3: %w", err)
+	}
+
+	// The app's server data (Teploy config repository and event history)
+	// travels as a sibling object of the same timestamp, never inside the
+	// volume archive, whose root is the volumes directory.
+	teployDir := confighome.Dir(app)
+	if present, err := c.remoteExists(ctx, teployDir); err != nil {
+		cleanup()
+		return fmt.Errorf("checking %s: %w", teployDir, err)
+	} else if present {
+		teployArchive := workDir + "/teploy.tar.gz"
+		teployKey := fmt.Sprintf("s3://%s/%s/teploy/%s.tar.gz", s3.Bucket, app, timestamp)
+		tarCmd := fmt.Sprintf("tar -czf %s --exclude=./.write.lock --exclude=./events.lock .", ssh.ShellQuote(teployArchive))
+		if _, err := c.exec.Run(ctx, fmt.Sprintf("cd %s && if [ -d config.git ] && command -v flock >/dev/null 2>&1; then flock .write.lock %s; else %s; fi", ssh.ShellQuote(teployDir), tarCmd, tarCmd)); err != nil {
+			cleanup()
+			return fmt.Errorf("archiving %s: %w", teployDir, err)
+		}
+		fmt.Fprintf(c.out, "Uploading Teploy config and history to %s...\n", teployKey)
+		if _, err := c.exec.Run(ctx, s3.AWS(fmt.Sprintf("s3 cp %s %s", ssh.ShellQuote(teployArchive), ssh.ShellQuote(teployKey)))); err != nil {
+			cleanup()
+			return fmt.Errorf("uploading Teploy config to S3: %w", err)
+		}
 	}
 
 	cleanup()

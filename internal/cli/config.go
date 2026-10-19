@@ -804,6 +804,7 @@ func newConfigPushCmd(flags *Flags) *cobra.Command {
 
 func newConfigHomeCmd(flags *Flags) *cobra.Command {
 	var appName, file string
+	var fromServer bool
 	cmd := &cobra.Command{
 		Use:   "home [folder|teploy]",
 		Short: "Show or change where the app's settings are edited",
@@ -815,6 +816,12 @@ func newConfigHomeCmd(flags *Flags) *cobra.Command {
                                lives on that server), stores it on the server
                                and marks the app, so folder deploys and older
                                teploy CLIs refuse it from now on.
+  teploy config home teploy --from-server --app <app> --host <server>
+                               the same without the folder: the config is
+                               rebuilt from what the server recorded, and
+                               refused unless it reproduces the running
+                               release exactly (no mount, port or setting
+                               can be dropped).
   teploy config home folder    archives the server config (kept as
                                config.git.archived-<time>) and makes the app a
                                folder app again; writes ./teploy.yml from the
@@ -848,6 +855,9 @@ Changing the home does not redeploy.`,
 			}
 			switch args[0] {
 			case confighome.HomeTeploy:
+				if fromServer {
+					return runConfigHomeTeployFromServer(ctx, flags, appName, cmd.OutOrStdout())
+				}
 				return runConfigHomeTeploy(ctx, flags, appName, file, cmd.OutOrStdout())
 			case confighome.HomeFolder:
 				return runConfigHomeFolder(ctx, flags, appName, file, cmd.OutOrStdout())
@@ -859,6 +869,7 @@ Changing the home does not redeploy.`,
 	}
 	cmd.Flags().StringVar(&appName, "app", "", "app name (default: the app in ./teploy.yml)")
 	cmd.Flags().StringVar(&file, "file", "", "folder config to move (home teploy) or to write (home folder); default ./teploy.yml")
+	cmd.Flags().BoolVar(&fromServer, "from-server", false, "home teploy without the folder: rebuild the config from the server's records (refused unless it reproduces the running release exactly)")
 	return cmd
 }
 
@@ -873,6 +884,34 @@ func lockConfigTarget(ctx context.Context, t *configTarget) (*state.Lock, func()
 	}
 	lk.StartRenewal(t.exec)
 	return lk, func() { state.ReleaseLockFenced(t.exec, lk, t.app) }, nil
+}
+
+func runConfigHomeTeployFromServer(ctx context.Context, flags *Flags, appName string, out io.Writer) error {
+	if appName == "" || flags.Host == "" {
+		return fmt.Errorf("--from-server needs --app <name> and --host <server>")
+	}
+	t, err := openConfigTarget(ctx, flags, appName)
+	if err != nil {
+		return err
+	}
+	defer t.exec.Close()
+	lk, release, err := lockConfigTarget(ctx, t)
+	if err != nil {
+		return err
+	}
+	defer release()
+	gate, err := confighome.CheckGate(ctx, t.exec, t.app, lk, out)
+	if err != nil {
+		return err
+	}
+	if gate.Server {
+		return fmt.Errorf("%s's settings are already edited in Teploy (config %s)", t.app, short12(gate.Head))
+	}
+	seed, err := seedFromServer(ctx, t.exec, t.app)
+	if err != nil {
+		return refuseAdmission(err)
+	}
+	return commitHomeTeploy(ctx, t, lk, seed, "config home teploy (rebuilt from the server)", out)
 }
 
 func runConfigHomeTeploy(ctx context.Context, flags *Flags, appName, file string, out io.Writer) error {
@@ -927,7 +966,16 @@ func runConfigHomeTeploy(ctx context.Context, flags *Flags, appName, file string
 	if gate.Server {
 		return fmt.Errorf("%s's settings are already edited in Teploy (config %s)", t.app, short12(gate.Head))
 	}
-	commit, err := commitConfig(ctx, t, nil, content, confighome.ZeroCommit, "config home teploy (from "+file+")")
+	if err := commitHomeTeploy(ctx, t, lk, content, "config home teploy (from "+file+")", out); err != nil {
+		return err
+	}
+	fmt.Fprintf(out, "%s here is no longer used to deploy; `teploy config pull --force` replaces it with a linked copy.\n", file)
+	return nil
+}
+
+// commitHomeTeploy stores the first config commit and marks the app v3.
+func commitHomeTeploy(ctx context.Context, t *configTarget, lk *state.Lock, content []byte, message string, out io.Writer) error {
+	commit, err := commitConfig(ctx, t, nil, content, confighome.ZeroCommit, message)
 	if err != nil {
 		return err
 	}
@@ -940,7 +988,6 @@ func runConfigHomeTeploy(ctx context.Context, flags *Flags, appName, file string
 	fmt.Fprintf(out, "%s's settings are now edited in Teploy (config %s on %s).\n", t.app, short12(commit), t.server)
 	fmt.Fprintf(out, "  deploy:  teploy deploy --app %s --host %s\n", t.app, t.server)
 	fmt.Fprintf(out, "  edit:    teploy config edit --app %s --host %s\n", t.app, t.server)
-	fmt.Fprintf(out, "%s here is no longer used to deploy; `teploy config pull --force` replaces it with a linked copy.\n", file)
 	return nil
 }
 

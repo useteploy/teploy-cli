@@ -6,11 +6,13 @@ import (
 	"fmt"
 	"github.com/useteploy/teploy/internal/events"
 	"github.com/useteploy/teploy/internal/ssh"
+	"github.com/useteploy/teploy/internal/state"
 	"github.com/useteploy/teploy/internal/trigger"
 	"os"
 	"os/user"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 )
@@ -34,6 +36,9 @@ type Flags struct {
 	// the client's own operation record. Both are client-asserted.
 	Actor   string
 	ActorOp string
+	// Wait is how long a mutating command waits for another operation's
+	// app lock before refusing (0 = refuse immediately, naming the holder).
+	Wait time.Duration
 }
 
 func NewRootCmd(version string) *cobra.Command {
@@ -46,7 +51,14 @@ func NewRootCmd(version string) *cobra.Command {
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
-			events.SetProcessActor(resolveActor(flags, version))
+			actor := resolveActor(flags, version)
+			events.SetProcessActor(actor)
+			holder := events.ActorString(actor)
+			if actor.Op != "" {
+				holder += " operation " + actor.Op
+			}
+			state.SetLockHolder(holder)
+			state.SetLockWait(flags.Wait)
 			if flags.ProjectDir == "" {
 				return nil
 			}
@@ -72,6 +84,7 @@ func NewRootCmd(version string) *cobra.Command {
 	root.PersistentFlags().BoolVar(&flags.JSON, "json", false, "output in JSON format")
 	root.PersistentFlags().StringVar(&flags.Actor, "actor", "", "client recorded in the server event history, as <client>[:<label>] (default cli:<user>@<host>, or $TEPLOY_ACTOR)")
 	root.PersistentFlags().StringVar(&flags.ActorOp, "actor-op", "", "the calling client's operation id, recorded with each event")
+	root.PersistentFlags().DurationVar(&flags.Wait, "wait", 0, "wait up to this long (e.g. 2m) for another operation holding the app's lock, instead of refusing")
 	root.PersistentFlags().BoolVar(&flags.StrictEnv, "strict-env", false, "strict env/overlay mode: fail on unset ${VAR} in env:, and let an empty map/list in a destination overlay explicitly clear the base value")
 
 	root.AddCommand(newDeployCmd(flags))
@@ -103,7 +116,7 @@ func NewRootCmd(version string) *cobra.Command {
 	root.AddCommand(newDRCmd(flags, version))
 	root.AddCommand(newLockCmd(flags))
 	root.AddCommand(newUnlockCmd(flags))
-	root.AddCommand(newInitCmd())
+	root.AddCommand(newInitCmd(flags))
 	root.AddCommand(newValidateCmd(flags))
 	root.AddCommand(newDoctorCmd(flags, version))
 	root.AddCommand(newMetaCmd(flags))

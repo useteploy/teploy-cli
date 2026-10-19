@@ -314,6 +314,7 @@ func (l *Lock) renew(ctx context.Context) error {
 		Owner:   l.owner,
 		TS:      time.Now().UTC().Format(time.RFC3339),
 		RenewTS: time.Now().UTC().Format(time.RFC3339),
+		Holder:  lockHolder,
 	}
 	payload, err := json.Marshal(info)
 	if err != nil {

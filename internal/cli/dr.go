@@ -323,6 +323,7 @@ func printReceipt(r *backup.RestoreReceipt) {
 }
 
 func newDRCutoverCmd(flags *Flags) *cobra.Command {
+	var home string
 	cmd := &cobra.Command{
 		Use:   "cutover <id>",
 		Short: "Explicitly promote a validated staged restore over the live app",
@@ -330,7 +331,8 @@ func newDRCutoverCmd(flags *Flags) *cobra.Command {
 			"that PASSED validation (`teploy dr restore`). Stops live containers,\n" +
 			"restores engine dumps into fresh accessories, promotes staged volumes\n" +
 			"with two-phase recovery (pre-cutover originals are kept), and installs\n" +
-			"the bundle's state/release records/secrets. Finishes by pointing at\n" +
+			"the bundle's state/release records/secrets, its Teploy config and event\n" +
+			"history (schema-2 bundles). Finishes by pointing at\n" +
 			"`teploy deploy` to bring the app container and routing live.",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -354,6 +356,7 @@ func newDRCutoverCmd(flags *Flags) *cobra.Command {
 				App:    appCfg.App,
 				ID:     args[0],
 				Config: *appCfg,
+				Home:   home,
 			})
 			if err != nil {
 				return err
@@ -370,5 +373,6 @@ func newDRCutoverCmd(flags *Flags) *cobra.Command {
 			return nil
 		},
 	}
+	cmd.Flags().StringVar(&home, "home", "", "when the bundle's settings home differs from the target app's: bundle (restore the bundle's, archiving the target's config) or current (keep the target's)")
 	return cmd
 }

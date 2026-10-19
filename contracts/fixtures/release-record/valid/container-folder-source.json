@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "app": "legacy",
+  "hash": "abc1234",
+  "created_at": "2026-10-19T12:00:00Z",
+  "deployment_type": "container",
+  "ingress_mode": "caddy",
+  "domain": "legacy.example.com",
+  "image_ref": "example/legacy:abc1234",
+  "image_digest": "sha256:0000",
+  "manifest_sha256": "sha256:beef",
+  "actor": "cli:tyler@laptop",
+  "source_sha256": "3f0a4c6e9d1b2a5f7e8c0d4b6a9f1e3c5b7d9a0e2f4c6b8d0a1c3e5f7b9d1a3c"
+}

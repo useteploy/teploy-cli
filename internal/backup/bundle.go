@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/useteploy/teploy/internal/config"
+	"github.com/useteploy/teploy/internal/confighome"
 	"github.com/useteploy/teploy/internal/releasemeta"
 	"github.com/useteploy/teploy/internal/secret"
 	"github.com/useteploy/teploy/internal/ssh"
@@ -34,11 +35,28 @@ import (
 //	<app>/dr/<bundle-id>/env/.env                   only with --include-secrets
 //	<app>/dr/<bundle-id>/env/credentials/<name>     only with --include-secrets
 //	<app>/dr/<bundle-id>/age-key                    only with --include-age-key
+//	<app>/dr/<bundle-id>/teploy/app.tar.gz          schema 2: /deployments/.teploy/apps/<app>
+//	                                                (config.git + event history), when present
 
-// BundleSchemaVersion is the DR bundle manifest schema this CLI writes and
-// accepts. Readers refuse manifests from other versions; forward
+// BundleSchemaVersion is the DR bundle manifest schema this CLI writes.
+// Readers accept it and every older version they know; forward
 // compatibility within a version is additive fields only (X04 discipline).
-const BundleSchemaVersion = 1
+// 2 (server-authority spec §3.1): the bundle carries the app's config home
+// and server data (config.git, events) and may hold schema-v3 state; older
+// CLIs refuse it explicitly instead of restoring a Teploy-home app as a
+// folder app.
+const BundleSchemaVersion = 2
+
+// ConfigHomeMember is the bundle member holding /deployments/.teploy/apps/<app>.
+const ConfigHomeMember = "teploy/app.tar.gz"
+
+// ConfigHomeRecord is where the app's settings were edited when the bundle
+// was taken, and the server data that travels with it.
+type ConfigHomeRecord struct {
+	Home   string `json:"home"`             // "folder" | "teploy"
+	Commit string `json:"commit,omitempty"` // config head (teploy home)
+	Member string `json:"member,omitempty"` // ConfigHomeMember when captured
+}
 
 // Bundle kinds. Data-only volume archives (the `teploy backup` family) are
 // not bundles at all; Kind exists so a bundle manifest can never be confused
@@ -70,6 +88,8 @@ type BundleManifest struct {
 	// newest release record). Without the command many images exit
 	// instantly and prove nothing.
 	AppRun AppRunSpec `json:"app_run"`
+
+	ConfigHome *ConfigHomeRecord `json:"config_home,omitempty"`
 
 	Secrets   SecretsRecord    `json:"secrets"`
 	Routing   RoutingRecord    `json:"routing"`
@@ -349,8 +369,8 @@ func ParseBundleManifest(data []byte) (*BundleManifest, error) {
 	if err := json.Unmarshal(data, &m); err != nil {
 		return nil, fmt.Errorf("parsing bundle manifest: %w", err)
 	}
-	if m.SchemaVersion != BundleSchemaVersion {
-		return nil, fmt.Errorf("unsupported bundle manifest schema version %d (this CLI understands %d)", m.SchemaVersion, BundleSchemaVersion)
+	if m.SchemaVersion < 1 || m.SchemaVersion > BundleSchemaVersion {
+		return nil, fmt.Errorf("unsupported bundle manifest schema version %d (this CLI understands 1-%d)", m.SchemaVersion, BundleSchemaVersion)
 	}
 	if m.Kind != BundleKindDR {
 		return nil, fmt.Errorf("manifest kind %q is not a disaster-recovery bundle", m.Kind)
@@ -473,7 +493,7 @@ func (c *Client) CreateBundle(ctx context.Context, opts BundleOptions, store Bun
 	if err := json.Unmarshal(stateBytes, &appState); err != nil {
 		return nil, fmt.Errorf("parsing app state: %w", err)
 	}
-	if appState.SchemaVersion != state.SchemaVersionV2 {
+	if appState.SchemaVersion != state.SchemaVersionV2 && appState.SchemaVersion != state.SchemaVersionV3 {
 		return nil, fmt.Errorf("unsupported state schema version %d", appState.SchemaVersion)
 	}
 
@@ -505,6 +525,10 @@ func (c *Client) CreateBundle(ctx context.Context, opts BundleOptions, store Bun
 		return nil, err
 	}
 	m.AppRun = deriveAppRun(stateBytes, m.ReleaseRecords)
+	if m.ConfigHome, err = c.captureConfigHome(ctx, ws, opts.App); err != nil {
+		cleanup()
+		return nil, err
+	}
 
 	// Optional quiescence: stop the app's web containers so volume copies
 	// are quiesced rather than crash-consistent.
@@ -749,6 +773,12 @@ func (c *Client) CreateBundle(ctx context.Context, opts BundleOptions, store Bun
 			return nil, err
 		}
 	}
+	if m.ConfigHome.Member != "" {
+		if err := uploadMember(m.ConfigHome.Member, ws+"/"+m.ConfigHome.Member); err != nil {
+			cleanup()
+			return nil, err
+		}
+	}
 	if err := uploadMember("manifest.json", ws+"/manifest.json"); err != nil {
 		cleanup()
 		return nil, err
@@ -984,6 +1014,17 @@ func validateBundlePaths(m *BundleManifest) error {
 	if err := config.ValidateName(m.App); err != nil {
 		return err
 	}
+	if h := m.ConfigHome; h != nil {
+		if h.Home != "folder" && h.Home != "teploy" {
+			return fmt.Errorf("invalid bundled config home %q", h.Home)
+		}
+		if h.Member != "" && h.Member != ConfigHomeMember {
+			return fmt.Errorf("invalid config home member %q", h.Member)
+		}
+		if h.Home == "teploy" && h.Member == "" {
+			return fmt.Errorf("bundle says the app was edited in Teploy but carries no config")
+		}
+	}
 	seen := map[string]bool{}
 	for _, snap := range m.Snapshots {
 		if !safeName.MatchString(snap.Name) {
@@ -1059,4 +1100,33 @@ func validateBundlePaths(m *BundleManifest) error {
 		}
 	}
 	return nil
+}
+
+// captureConfigHome archives /deployments/.teploy/apps/<app> (config.git
+// and the event history) into the workspace. The archive is taken under
+// the config writer's flock so it never holds a half-moved ref.
+func (c *Client) captureConfigHome(ctx context.Context, ws, app string) (*ConfigHomeRecord, error) {
+	dir := confighome.Dir(app)
+	present, err := c.remoteExists(ctx, dir)
+	if err != nil {
+		return nil, fmt.Errorf("checking %s: %w", dir, err)
+	}
+	if !present {
+		return &ConfigHomeRecord{Home: "folder"}, nil
+	}
+	rec := &ConfigHomeRecord{Home: "folder", Member: ConfigHomeMember}
+	exists, head, err := confighome.Head(ctx, c.exec, app)
+	if err != nil {
+		return nil, err
+	}
+	if exists {
+		rec.Home, rec.Commit = "teploy", head
+	}
+	tarCmd := fmt.Sprintf("tar -czf %s --exclude=./.write.lock --exclude=./events.lock --exclude='./config.git.archived-*' .", ssh.ShellQuote(ws+"/"+ConfigHomeMember))
+	cmd := fmt.Sprintf("mkdir -p %s && cd %s && if [ -d config.git ] && command -v flock >/dev/null 2>&1; then flock .write.lock %s; else %s; fi",
+		ssh.ShellQuote(ws+"/teploy"), ssh.ShellQuote(dir), tarCmd, tarCmd)
+	if _, err := c.exec.Run(ctx, cmd); err != nil {
+		return nil, fmt.Errorf("archiving %s: %w", dir, err)
+	}
+	return rec, nil
 }

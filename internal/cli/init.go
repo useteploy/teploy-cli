@@ -16,10 +16,11 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-func newInitCmd() *cobra.Command {
+func newInitCmd(flags *Flags) *cobra.Command {
 	var (
-		force   bool
-		useTOML bool
+		force      bool
+		useTOML    bool
+		fromServer string
 	)
 
 	cmd := &cobra.Command{
@@ -28,11 +29,15 @@ func newInitCmd() *cobra.Command {
 		Long:  "Interactive config generation. Detects docker-compose.yml, Dockerfile, and other project files to pre-fill answers.\nUse --toml to generate teploy.toml instead of teploy.yml.",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if fromServer != "" {
+				return runInitFromServer(flags, fromServer, force, cmd.OutOrStdout())
+			}
 			_, err := initFlow(bufio.NewReader(os.Stdin), ".", useTOML, force)
 			return err
 		},
 	}
 
+	cmd.Flags().StringVar(&fromServer, "from-server", "", "bootstrap this folder from an app already deployed on --host: a linked copy of its Teploy config, or a teploy.yml rebuilt from what the server recorded (only when it provably reproduces the running config)")
 	cmd.Flags().BoolVar(&force, "force", false, "overwrite existing config")
 	cmd.Flags().BoolVar(&useTOML, "toml", false, "generate teploy.toml instead of teploy.yml")
 	return cmd

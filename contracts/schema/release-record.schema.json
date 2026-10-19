@@ -98,6 +98,11 @@
     "actor": {
       "type": "string",
       "description": "Client that deployed the release, <client>[:<label>] (client-asserted, rev 11)."
+    },
+    "source_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "Folder-home deploys: sha256 of meta/<hash>.source.yml, the deployed teploy.yml with detected secret values masked (rev 12). Show that file as the applied config only when its digest matches."
     }
   }
 }

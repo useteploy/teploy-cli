@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"fmt"
+	"os"
 	"sort"
 
 	"github.com/useteploy/teploy/internal/config"
@@ -79,6 +80,14 @@ func connectForApp(ctx context.Context, flags *Flags, appCfg *config.AppConfig) 
 	serverName := appCfg.Server
 	if serverName == "" && len(appCfg.Servers) > 0 {
 		serverName = appCfg.Servers[0]
+	}
+	if serverName == "" {
+		// A pulled copy of a Teploy config names its server in the header.
+		if raw, err := os.ReadFile("teploy.yml"); err == nil {
+			if h, _ := parsePulledHeader(raw); h.app == appCfg.App {
+				serverName = h.server
+			}
+		}
 	}
 	if serverName == "" {
 		return nil, fmt.Errorf("no server specified — set 'server' in teploy.yml")

@@ -184,6 +184,12 @@ func (m *MockExecutor) Run(ctx context.Context, cmd string) (string, error) {
 			return c.Output, c.Err
 		}
 	}
+	// Directory creation is idempotent and the mock records no directories:
+	// an unregistered `mkdir -p` (an app dir ensured before its lock) succeeds.
+	if strings.HasPrefix(cmd, "mkdir -p ") && !strings.ContainsAny(cmd, ";&|") {
+		m.mu.Unlock()
+		return "", nil
+	}
 	if isFileOpCommand(cmd) {
 		for _, seg := range strings.Split(cmd, " && ") {
 			if isFileOpCommand(seg) {

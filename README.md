@@ -402,7 +402,13 @@ teploy config set --app blog --host prod image=nginx:1.27 env.LOG_LEVEL=debug
 teploy config get | diff [--applied] | history | restore <commit>
 teploy config pull / push                       # edit a linked local copy, push as compare-and-swap
 teploy config home folder                       # back to the folder (server copy archived)
+teploy config home teploy --from-server --app blog --host prod   # no folder: rebuilt from server records, digest-verified
+teploy init --from-server blog --host prod      # bootstrap a folder on a new machine
+teploy template install wiki --home teploy --server prod --domain wiki.example.com
 ```
+Generated template passwords go to `teploy secret`, never into the config.
+`--wait 2m` on any mutating command waits for another client's lock.
+
 A Teploy-home config is never expanded from anyone's environment: `$VAR` in
 `env:` is refused (write `$$` for a literal `$`), and secret values go in
 `teploy secret set`, not the file. `server:`/`servers:`, `env_files:` and

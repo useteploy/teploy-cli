@@ -122,8 +122,14 @@ const (
 	// CapConfigHomeV1: `teploy config get|set|edit|diff|history|restore|
 	// pull|push|home|purge-history`, Teploy-home deploys (`deploy --app X`
 	// with no folder; `--image T` commits image: T first), schema-v3 state
-	// with tombstones, and folder deploys refused for Teploy-home apps.
+	// with tombstones, folder deploys refused for Teploy-home apps, and
+	// `config home teploy --from-server` / `init --from-server` (a config
+	// rebuilt from server records, accepted only when its digest matches
+	// the running release).
 	CapConfigHomeV1 = "config-home-v1"
+	// CapLockWaitV1: global --wait <duration> waits for another operation's
+	// app lock; a refusal names the holder (client and operation id).
+	CapLockWaitV1 = "lock-wait-v1"
 	// CapUndeployedListV1: `app list --include-undeployed` returns
 	// never-deployed and removed Teploy-home apps in an "undeployed" array.
 	CapUndeployedListV1 = "undeployed-list-v1"
@@ -157,6 +163,7 @@ func MachineCapabilities() []string {
 		CapActorFlagV1,
 		CapConfigHomeV1,
 		CapUndeployedListV1,
+		CapLockWaitV1,
 	}
 	sort.Strings(tokens)
 	return tokens

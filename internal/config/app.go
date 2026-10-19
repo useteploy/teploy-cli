@@ -472,6 +472,9 @@ type AppConfig struct {
 	// was read at), empty for a folder or ad-hoc config.
 	ConfigHome   string `yaml:"-" toml:"-"`
 	ConfigCommit string `yaml:"-" toml:"-"`
+	// SourceYAML is the folder teploy.yml this deploy loaded, with detected
+	// secret values masked, stored beside the release record (runtime only).
+	SourceYAML []byte `yaml:"-" toml:"-"`
 
 	// EnvSources maps each resolved env key to where its value came from
 	// (set by the CLI's env resolution, never loaded from a file). Release
