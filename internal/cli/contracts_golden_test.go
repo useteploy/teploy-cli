@@ -450,3 +450,16 @@ func TestContractsConfigHomeGolden(t *testing.T) {
 		SourceSHA256: "3f0a4c6e9d1b2a5f7e8c0d4b6a9f1e3c5b7d9a0e2f4c6b8d0a1c3e5f7b9d1a3c", Actor: "cli:tyler@laptop",
 	})
 }
+
+// TestContractsConfigMergeGolden pins `config merge --json` (rev 13).
+func TestContractsConfigMergeGolden(t *testing.T) {
+	writeFixture(t, "config-merge-envelope/valid/one-conflict.json", configMergeDTO{
+		MachineInterface: MachineInterface, Host: "192.0.2.10", App: "blog",
+		Base:    "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d",
+		Current: "8f2c1d0e9b7a6f5e4d3c2b1a0f9e8d7c6b5a4f3e",
+		Merged:  "app: blog\ndomain: blog.example.com\nenv:\n  LOG_LEVEL: debug\nimage: example/blog:1.5.0\n",
+		Conflicts: []configConflict{
+			{Key: "env.LOG_LEVEL", Mine: "debug", Current: "warn"},
+		},
+	})
+}

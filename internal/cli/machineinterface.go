@@ -130,6 +130,15 @@ const (
 	// CapLockWaitV1: global --wait <duration> waits for another operation's
 	// app lock; a refusal names the holder (client and operation id).
 	CapLockWaitV1 = "lock-wait-v1"
+	// CapConfigMergeV1: `config merge --base <commit> --file - --json`
+	// (read-only key-level three-way merge with the current config).
+	CapConfigMergeV1 = "config-merge-v1"
+	// CapConfigUnprivilegedV1: `config ... --unprivileged` refuses changes
+	// that reach the host (dash editors without the admin capability).
+	CapConfigUnprivilegedV1 = "config-unprivileged-v1"
+	// CapDeployHomeV1: `deploy --app X --image T --home teploy` creates a
+	// new app in Teploy home from the ad-hoc flags, then deploys it.
+	CapDeployHomeV1 = "deploy-home-v1"
 	// CapUndeployedListV1: `app list --include-undeployed` returns
 	// never-deployed and removed Teploy-home apps in an "undeployed" array.
 	CapUndeployedListV1 = "undeployed-list-v1"
@@ -164,6 +173,9 @@ func MachineCapabilities() []string {
 		CapConfigHomeV1,
 		CapUndeployedListV1,
 		CapLockWaitV1,
+		CapConfigMergeV1,
+		CapConfigUnprivilegedV1,
+		CapDeployHomeV1,
 	}
 	sort.Strings(tokens)
 	return tokens

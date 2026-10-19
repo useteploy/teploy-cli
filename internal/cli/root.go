@@ -39,6 +39,9 @@ type Flags struct {
 	// Wait is how long a mutating command waits for another operation's
 	// app lock before refusing (0 = refuse immediately, naming the holder).
 	Wait time.Duration
+	// ConfigUnprivileged (config --unprivileged) refuses config changes
+	// that reach the host.
+	ConfigUnprivileged bool
 }
 
 func NewRootCmd(version string) *cobra.Command {

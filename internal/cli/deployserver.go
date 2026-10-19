@@ -146,3 +146,71 @@ func deployServerConfig(ctx context.Context, executor ssh.Executor, host, server
 	}
 	return deployBuiltImageFenced(ctx, executor, appCfg, image, version, host, migrateVolumes, false, "", lk, &att, "")
 }
+
+// createServerConfigApp creates a NEW app in Teploy home from ad-hoc deploy
+// flags and deploys it (dash Deploy, spec P2): under the app lock it checks
+// that nothing exists yet, commits a minimal teploy.yml (app, image,
+// domain, port), marks the app v3, then deploys from that config. An
+// existing Teploy-home app deploys as usual (--image commits image: first);
+// an existing folder app is refused — convert it explicitly.
+func createServerConfigApp(flags *Flags, serverName, app, image, domain string, port int, version string, skipDNSCheck, migrateVolumes bool) error {
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer cancel()
+	host, user, key, err := config.ResolveServer(serverName, flags.Host, flags.User, flags.Key)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Connecting to %s@%s...\n", user, host)
+	executor, err := ssh.Connect(ctx, ssh.ConnectConfig{Host: host, User: user, KeyPath: key})
+	if err != nil {
+		return err
+	}
+	defer executor.Close()
+
+	fields := [][2]string{{"app", app}, {"image", strconv.Quote(image)}}
+	if domain != "" {
+		fields = append(fields, [2]string{"domain", strconv.Quote(domain)})
+	}
+	if port != 80 {
+		fields = append(fields, [2]string{"port", strconv.Itoa(port)})
+	}
+	var raw []byte
+	for _, f := range fields {
+		v := f[1]
+		if raw, err = confighome.EditPath(raw, f[0], &v); err != nil {
+			return err
+		}
+	}
+	if _, err := confighome.Load(raw, app); err != nil {
+		return refuseAdmission(err)
+	}
+
+	t := &configTarget{app: app, server: serverName, exec: executor, unprivileged: flags.ConfigUnprivileged}
+	existing, err := func() (bool, error) {
+		lk, release, err := lockConfigTarget(ctx, t)
+		if err != nil {
+			return false, err
+		}
+		defer release()
+		gate, err := confighome.CheckGate(ctx, executor, app, lk, os.Stdout)
+		if err != nil {
+			return false, refuseAdmission(err)
+		}
+		if gate.Server {
+			return true, nil
+		}
+		if st, err := state.Read(ctx, executor, app); err != nil {
+			return false, err
+		} else if st != nil {
+			return false, refuseAdmission(fmt.Errorf("%s is already deployed on %s with its settings in a folder — deploy it as before, or move it with `teploy config home teploy --from-server`", app, serverName))
+		}
+		return false, commitHomeTeploy(ctx, t, lk, raw, "create (deploy --home teploy)", os.Stdout)
+	}()
+	if err != nil {
+		return err
+	}
+	if existing {
+		fmt.Printf("%s is already edited in Teploy; deploying it with image %s\n", app, image)
+	}
+	return deployServerConfig(ctx, executor, host, serverName, app, image, version, skipDNSCheck, migrateVolumes)
+}

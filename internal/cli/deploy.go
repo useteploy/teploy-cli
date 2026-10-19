@@ -50,6 +50,7 @@ func newDeployCmd(flags *Flags) *cobra.Command {
 		migrateVolumes bool
 		role           string
 		tagFilters     []string
+		home           string
 	)
 
 	cmd := &cobra.Command{
@@ -92,7 +93,10 @@ a machine error envelope on stderr whose code distinguishes the classes
 			}
 			if appName != "" {
 				overrides := domain != "" || cmd.Flags().Changed("port")
-				return runAdHocDeploy(flags, serverName, appName, image, domain, port, version, skipDNSCheck, migrateVolumes, overrides)
+				if home != "" && home != confighome.HomeTeploy && home != confighome.HomeFolder {
+					return refuseAdmission(fmt.Errorf("--home must be teploy or folder"))
+				}
+				return runAdHocDeploy(flags, serverName, appName, image, domain, port, version, skipDNSCheck, migrateVolumes, overrides, home == confighome.HomeTeploy)
 			}
 			tags, err := parseTagFilters(tagFilters)
 			if err != nil {
@@ -114,13 +118,14 @@ a machine error envelope on stderr whose code distinguishes the classes
 	cmd.Flags().BoolVar(&migrateVolumes, "migrate-volumes", false, "auto-migrate data from foreign volume sources to teploy paths (cp -a)")
 	cmd.Flags().StringVar(&role, "role", "", "only deploy to servers with this role (from servers.yml)")
 	cmd.Flags().StringSliceVar(&tagFilters, "tag", nil, "only deploy to servers matching tag key=value (repeatable)")
+	cmd.Flags().StringVar(&home, "home", "", "with --app for a NEW app: teploy creates it in Teploy home (a server config from --image/--domain/--port that any client can edit) before deploying")
 
 	return cmd
 }
 
 // runAdHocDeploy handles deploys without a teploy.yml — used by teploy-dash
 // and scripting. Requires --app and --image at minimum.
-func runAdHocDeploy(flags *Flags, serverName, appName, image, domain string, port int, version string, skipDNSCheck, migrateVolumes, overrides bool) error {
+func runAdHocDeploy(flags *Flags, serverName, appName, image, domain string, port int, version string, skipDNSCheck, migrateVolumes, overrides bool, createHome ...bool) error {
 	// This path builds an AppConfig directly instead of going through
 	// config.LoadApp, so it never reaches AppConfig.validate() — app and
 	// domain must be validated explicitly here before either one reaches
@@ -144,6 +149,16 @@ func runAdHocDeploy(flags *Flags, serverName, appName, image, domain string, por
 	// is a config commit of image: T plus the deploy (the CI one-liner
 	// keeps working after the app moves to Teploy). Any other override is
 	// refused there. The home is re-checked under the lock either way.
+	create := len(createHome) > 0 && createHome[0]
+	if create {
+		if image == "" {
+			return refuseAdmission(fmt.Errorf("--home teploy needs --image for a new app"))
+		}
+		if port <= 0 {
+			port = 80
+		}
+		return createServerConfigApp(flags, serverName, appName, image, domain, port, version, skipDNSCheck, migrateVolumes)
+	}
 	served, err := deployServerConfigIfHome(flags, serverName, appName, image, version, skipDNSCheck, migrateVolumes, overrides)
 	if served || err != nil {
 		return err

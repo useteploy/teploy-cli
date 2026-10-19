@@ -133,3 +133,19 @@ func TestPulledHeaderRoundTrip(t *testing.T) {
 		t.Fatal("a plain config must not parse as pulled")
 	}
 }
+
+func TestUnprivilegedRefusesHostReachingChange(t *testing.T) {
+	tg := localConfigTarget(t)
+	ctx := context.Background()
+	c1, err := commitConfig(ctx, tg, nil, []byte(blogConfig), confighome.ZeroCommit, "create")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tg.unprivileged = true
+	if _, err := commitConfig(ctx, tg, []byte(blogConfig), []byte(blogConfig+"volumes:\n  /etc: /host-etc\n"), c1, "bind"); !errors.Is(err, errConfigPrivileged) {
+		t.Fatalf("a host bind under --unprivileged = %v, want refusal", err)
+	}
+	if _, err := commitConfig(ctx, tg, []byte(blogConfig), []byte(strings.Replace(blogConfig, "nginx:1.27", "nginx:1.28", 1)), c1, "bump"); err != nil {
+		t.Fatalf("an image bump is not privileged: %v", err)
+	}
+}

@@ -4,6 +4,31 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [0.1.44] - 2026-10-19
+
+### Added
+
+- `teploy config merge --base <commit> --file - [--json]` is read-only. It
+  merges an edit made from an older commit with the current config, key by
+  key, and returns the merged file plus the keys both sides changed
+  (`config-merge-v1`; contracts corpus rev 13 adds `config-merge-envelope`).
+  Editors such as teploy-dash resolve conflicts with it instead of
+  re-implementing the merge.
+- `teploy config ... --unprivileged` refuses any change that reaches the
+  host: host-bind volumes, `caddy_extra`, published or host ports, and
+  bind/ingress/network (`config-unprivileged-v1`). Dash passes it for users
+  without the admin capability. Adopting a config rebuilt from the server
+  (`--from-server`) is not a change and is allowed.
+- `teploy deploy --app X --image T [--domain D] [--port P] --home teploy`
+  creates a new app in Teploy home from those flags, then deploys it
+  (`deploy-home-v1`). An existing folder app is refused; convert it with
+  `config home teploy --from-server`.
+
+### Changed
+
+- Config files written by `config set`/`merge`/`edit` use 2-space
+  indentation and drop quotes that only marked a value as a string.
+
 ## [0.1.43] - 2026-10-19
 
 ### Upgrade notes

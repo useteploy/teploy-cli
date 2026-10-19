@@ -32,8 +32,22 @@ func Merge3(base, mine, theirs []byte) (merged []byte, conflicts []string, err e
 	}
 	out := merge3Map("", b, m, t, &conflicts)
 	sort.Strings(conflicts)
-	merged, err = yaml.Marshal(out)
+	merged, err = marshalYAML(out)
 	return merged, conflicts, err
+}
+
+// marshalYAML encodes with the 2-space indent teploy.yml files use.
+func marshalYAML(v any) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := yaml.NewEncoder(&buf)
+	enc.SetIndent(2)
+	if err := enc.Encode(v); err != nil {
+		return nil, err
+	}
+	if err := enc.Close(); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
 }
 
 func merge3Map(path string, base, mine, theirs map[string]any, conflicts *[]string) map[string]any {
@@ -113,7 +127,7 @@ func SetPath(doc []byte, path string, value any, remove bool) ([]byte, error) {
 	} else {
 		cur[last] = value
 	}
-	return yaml.Marshal(root)
+	return marshalYAML(root)
 }
 
 // GetPath reads a dotted key from a YAML document.
@@ -213,6 +227,11 @@ func EditPath(doc []byte, path string, value *string) ([]byte, error) {
 			val = &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!null"}
 		} else {
 			val = v.Content[0]
+		}
+		// Quotes only served to make the value a string; the encoder adds
+		// them back wherever the plain form would read differently.
+		if val.Kind == yaml.ScalarNode && val.Tag == "!!str" {
+			val.Style = 0
 		}
 	}
 	parts := strings.Split(path, ".")
