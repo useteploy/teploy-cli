@@ -29,6 +29,15 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
   docker's own record of the target container, so it uses the values that
   release was deployed with (not secrets rotated since).
 
+### Fixed
+
+- `teploy deploy` no longer aborts with `rsync failed: exit status 23` on
+  macOS's system rsync (openrsync) when the build context contains a
+  dangling symlink (e.g. a submodule link into a store absent from a fresh
+  checkout). openrsync stats every `--files-from` entry through its link;
+  such links are now left out of the transfer with a warning naming them
+  (GNU rsync still transfers them as links).
+
 ## [0.1.41] - 2026-10-14
 
 ### Changed

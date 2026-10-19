@@ -303,12 +303,37 @@ func (s *Source) Contains(rel string) bool {
 
 // FileList renders Entries as an rsync --from0 --files-from list.
 func (s *Source) FileList() []byte {
+	return s.fileListExcluding(nil)
+}
+
+func (s *Source) fileListExcluding(skip map[string]bool) []byte {
 	var b bytes.Buffer
 	for _, e := range s.Entries {
+		if skip[e] {
+			continue
+		}
 		b.WriteString(e)
 		b.WriteByte(0)
 	}
 	return b.Bytes()
+}
+
+// DanglingSymlinks returns the entries that are symlinks whose target does
+// not exist (e.g. a submodule's link into a store absent from a fresh
+// checkout), sorted like Entries.
+func (s *Source) DanglingSymlinks() []string {
+	var out []string
+	for _, e := range s.Entries {
+		full := filepath.Join(s.Root, filepath.FromSlash(e))
+		info, err := os.Lstat(full)
+		if err != nil || info.Mode()&os.ModeSymlink == 0 {
+			continue
+		}
+		if _, err := os.Stat(full); err != nil && errors.Is(err, fs.ErrNotExist) {
+			out = append(out, e)
+		}
+	}
+	return out
 }
 
 // Fingerprint returns the sha256 fingerprint of the entries under the
