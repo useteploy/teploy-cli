@@ -94,9 +94,30 @@ func Rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg Rollbac
 	target := cfg.ToHash
 	events.Record(ctx, exec, events.Event{App: cfg.App, Kind: events.KindRollback, Outcome: events.Started, Release: target, Detail: map[string]any{"to": target}})
 	err := rollback(ctx, exec, out, cfg)
-	events.Record(ctx, exec, events.Event{App: cfg.App, Kind: events.KindRollback, Outcome: events.Outcome(err), Release: target,
+	var configCommit string
+	if err == nil {
+		target, configCommit = rolledBackTo(ctx, exec, cfg.App, target)
+	}
+	events.Record(ctx, exec, events.Event{App: cfg.App, Kind: events.KindRollback, Outcome: events.Outcome(err), Release: target, ConfigCommit: configCommit,
 		Detail: events.ErrDetail(map[string]any{"to": target, "duration_ms": time.Since(start).Milliseconds()}, err)})
 	return err
+}
+
+// rolledBackTo names the release a successful rollback landed on (the
+// target is resolved inside the rollback when none was requested) and the
+// config commit it was deployed from, for the event.
+func rolledBackTo(ctx context.Context, exec ssh.Executor, app, requested string) (string, string) {
+	target := requested
+	if st, err := state.Read(ctx, exec, app); err == nil && st != nil && st.CurrentHash != "" {
+		target = st.CurrentHash
+	}
+	if target == "" {
+		return "", ""
+	}
+	if rec, err := releasemeta.Read(ctx, exec, app, target); err == nil && rec != nil {
+		return target, rec.ConfigCommit
+	}
+	return target, ""
 }
 
 func rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg RollbackConfig) error {

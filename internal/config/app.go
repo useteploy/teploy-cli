@@ -467,6 +467,12 @@ type AppConfig struct {
 	// emitted into the user manifest.
 	SourceRevision string `yaml:"-" toml:"-"`
 
+	// ConfigHome is runtime: "teploy" when this config was read from the
+	// app's server config repository (then ConfigCommit is the commit it
+	// was read at), empty for a folder or ad-hoc config.
+	ConfigHome   string `yaml:"-" toml:"-"`
+	ConfigCommit string `yaml:"-" toml:"-"`
+
 	// EnvSources maps each resolved env key to where its value came from
 	// (set by the CLI's env resolution, never loaded from a file). Release
 	// metadata persists only values whose source is plain configuration.
@@ -1268,6 +1274,20 @@ func LoadApp(dir string) (*AppConfig, error) {
 	}
 
 	return nil, fmt.Errorf("%w in %s", ErrNoConfig, dir)
+}
+
+// LoadAppBytes parses one teploy.yml document with LoadApp's schema and
+// validation (YAML only). Used for configs that live in a server config
+// repository rather than a folder.
+func LoadAppBytes(data []byte) (*AppConfig, error) {
+	var cfg AppConfig
+	if err := unmarshalAppYAML(data, &cfg); err != nil {
+		return nil, invalidConfig(fmt.Errorf("parsing teploy.yml: %w", err))
+	}
+	if err := cfg.validate(); err != nil {
+		return nil, invalidConfig(fmt.Errorf("invalid teploy.yml: %w", err))
+	}
+	return &cfg, nil
 }
 
 // OverlayOptions configures destination-overlay semantics (audit F57's

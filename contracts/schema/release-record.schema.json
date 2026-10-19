@@ -89,6 +89,15 @@
           }
         }
       }
+    },
+    "config_commit": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$",
+      "description": "Teploy-home deploys: the config.git commit the release was loaded from (rev 11). Absent for folder-home deploys."
+    },
+    "actor": {
+      "type": "string",
+      "description": "Client that deployed the release, <client>[:<label>] (client-asserted, rev 11)."
     }
   }
 }

@@ -12,6 +12,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/useteploy/teploy/internal/caddy"
+	"github.com/useteploy/teploy/internal/confighome"
 	"github.com/useteploy/teploy/internal/docker"
 	"github.com/useteploy/teploy/internal/ssh"
 	"github.com/useteploy/teploy/internal/state"
@@ -63,6 +64,7 @@ type removeSummary struct {
 	RemovedAutomation []string `json:"removed_automation,omitempty"`
 	Route             string   `json:"route"` // "removed", "redirected", "none"
 	PreservedData     []string `json:"preserved_data,omitempty"`
+	KeptConfig        bool     `json:"kept_config,omitempty"`
 }
 
 func runRemove(flags *Flags, appName string, yes, purge bool, redirect string) error {
@@ -217,6 +219,10 @@ func executeRemove(ctx context.Context, exec ssh.Executor, app string, domains [
 	if err := lk.Check(ctx, exec); err != nil {
 		return nil, err
 	}
+	serverHome, _, err := confighome.Head(ctx, exec, app)
+	if err != nil {
+		return nil, err
+	}
 	if opts.Purge {
 		fmt.Fprintln(out, "Purging deploy state and data...")
 		if _, err := exec.Run(ctx, "rm -rf "+ssh.ShellQuote(appDir)); err != nil {
@@ -243,7 +249,13 @@ func executeRemove(ctx context.Context, exec ssh.Executor, app string, domains [
 		// (.maintenance-block etc.) are matched by find itself; the
 		// exclusion names must be bare, not dotted paths, to match .env.
 		keepArgs := ""
-		for _, keep := range []string{"volumes", "accessories", "secrets", ".env", ".lock"} {
+		keeps := []string{"volumes", "accessories", "secrets", ".env", ".lock"}
+		if serverHome {
+			// The tombstone below replaces the state and continues its
+			// generation, so the fences stay monotonic across a re-create.
+			keeps = append(keeps, "state.json", ".generation")
+		}
+		for _, keep := range keeps {
 			keepArgs += " ! -name " + ssh.ShellQuote(keep)
 		}
 		delCmd := fmt.Sprintf("find %s -mindepth 1 -maxdepth 1%s -exec rm -rf {} +",
@@ -253,9 +265,30 @@ func executeRemove(ctx context.Context, exec ssh.Executor, app string, domains [
 		}
 		if left, err := exec.Run(ctx, "ls "+ssh.ShellQuote(appDir)+" 2>/dev/null"); err == nil {
 			for _, d := range strings.Fields(left) {
+				if serverHome && d == "state.json" {
+					continue
+				}
 				summary.PreservedData = append(summary.PreservedData, appDir+"/"+d)
 			}
 		}
+	}
+
+	// 4. Config home (spec §3.1). A Teploy-home app keeps its config and
+	// history and becomes a v3 tombstone (not deployed, still marked, so an
+	// older CLI cannot re-create it from a stale folder); --purge deletes
+	// its server data and the app returns to folder home.
+	switch {
+	case serverHome && opts.Purge:
+		fmt.Fprintln(out, "Deleting its Teploy config and history...")
+		if _, err := exec.Run(ctx, "rm -rf -- "+ssh.ShellQuote(confighome.Dir(app))); err != nil {
+			return nil, fmt.Errorf("deleting %s: %w", confighome.Dir(app), err)
+		}
+	case serverHome && lk != nil:
+		if err := state.WriteTombstone(ctx, exec, app, lk); err != nil {
+			return nil, fmt.Errorf("recording %s as not deployed: %w", app, err)
+		}
+		summary.KeptConfig = true
+		fmt.Fprintf(out, "Kept its Teploy config (redeploy with `teploy deploy --app %s`; --purge deletes it)\n", app)
 	}
 
 	for _, kept := range summary.KeptAccessories {

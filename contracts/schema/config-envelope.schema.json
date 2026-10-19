@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://teploy.github.io/contracts/schema/config-envelope.schema.json",
+  "title": "`teploy config get|home|set --json`: an app's config home and, in Teploy home, its config (server-authority spec §2.1-2.3, rev 11)",
+  "type": "object",
+  "required": ["machine_interface", "host", "app", "home"],
+  "properties": {
+    "machine_interface": {"type": "integer", "minimum": 1},
+    "host": {"type": "string", "minLength": 1},
+    "app": {"type": "string", "minLength": 1},
+    "home": {"type": "string", "enum": ["folder", "teploy", "repo"], "description": "Where the app's settings are edited. Consumers must treat an unknown value as \"managed elsewhere\" (read-only)."},
+    "commit": {"type": "string", "pattern": "^[0-9a-f]{40}$", "description": "Config commit the content was read at (get), or the config head (home), or the new commit (set). Absent in folder home and for an empty repository."},
+    "applied_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$", "description": "Config commit of the running release. Absent when nothing runs or the running release was not deployed from Teploy config. commit != applied_commit means the config changed since the last deploy."},
+    "content": {"type": "string", "maxLength": 1048576, "description": "teploy.yml at commit (get only)."}
+  },
+  "allOf": [
+    {"if": {"properties": {"home": {"const": "folder"}}}, "then": {"not": {"anyOf": [{"required": ["commit"]}, {"required": ["content"]}]}}}
+  ]
+}

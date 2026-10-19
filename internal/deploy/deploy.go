@@ -15,6 +15,7 @@ import (
 
 	"github.com/useteploy/teploy/internal/caddy"
 	"github.com/useteploy/teploy/internal/config"
+	"github.com/useteploy/teploy/internal/confighome"
 	"github.com/useteploy/teploy/internal/docker"
 	"github.com/useteploy/teploy/internal/releasemeta"
 	"github.com/useteploy/teploy/internal/ssh"
@@ -106,6 +107,9 @@ type Config struct {
 	ManifestSHA256  string
 	AppliedManifest json.RawMessage
 	SourceRevision  string
+	// ConfigCommit is the config.git commit this deploy was loaded from
+	// (Teploy home); empty for a folder-home deploy.
+	ConfigCommit string
 	// Provenance is the plan-time provenance record (C04) the CLI
 	// resolved before execution: revision, worktree cleanliness, build
 	// context fingerprint, Dockerfile identity, platform, image digest
@@ -300,10 +304,10 @@ func (d *Deployer) DeployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 	if cfg.Provenance != nil && cfg.Provenance.Dirty {
 		detail["dirty"] = true
 	}
-	events.Record(ctx, d.exec, events.Event{App: cfg.App, Kind: events.KindDeploy, Outcome: events.Started, Release: cfg.Version, Detail: detail})
+	events.Record(ctx, d.exec, events.Event{App: cfg.App, Kind: events.KindDeploy, Outcome: events.Started, Release: cfg.Version, ConfigCommit: cfg.ConfigCommit, Detail: detail})
 	err := d.deployFenced(ctx, cfg, lk)
 	done := map[string]any{"image": cfg.Image, "duration_ms": time.Since(start).Milliseconds()}
-	events.Record(ctx, d.exec, events.Event{App: cfg.App, Kind: events.KindDeploy, Outcome: events.Outcome(err), Release: cfg.Version, Detail: events.ErrDetail(done, err)})
+	events.Record(ctx, d.exec, events.Event{App: cfg.App, Kind: events.KindDeploy, Outcome: events.Outcome(err), Release: cfg.Version, ConfigCommit: cfg.ConfigCommit, Detail: events.ErrDetail(done, err)})
 	return err
 }
 
@@ -388,7 +392,10 @@ func (d *Deployer) deployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 	// (The caller owns the app lock; DeployLocked never acquires it — a
 	// mkdir lock is not reentrant, so a second acquisition fails, which is
 	// what broke every Deploy() call until TCL-01.)
-	current, err := state.Read(ctx, d.exec, cfg.App)
+	if err := admitConfigHome(ctx, d.exec, cfg.App, cfg.ConfigCommit, lk, d.out); err != nil {
+		return err
+	}
+	current, err := state.ReadIncludingTombstone(ctx, d.exec, cfg.App)
 	if err != nil {
 		return fmt.Errorf("refusing to deploy with unreadable state for %s: %w", cfg.App, err)
 	}
@@ -1720,6 +1727,8 @@ func (d *Deployer) recordRelease(ctx context.Context, cfg Config, att releasemet
 		ImageRef:        cfg.Image,
 		ImageDigest:     applied.ImageDigest,
 		ManifestSHA256:  cfg.ManifestSHA256,
+		ConfigCommit:    cfg.ConfigCommit,
+		Actor:           events.ActorString(events.ProcessActor()),
 		Replicas:        len(ports),
 		Processes:       maps.Clone(cfg.Processes),
 		Cmd:             cfg.Cmd,
@@ -1961,6 +1970,28 @@ func workerStateViable(st workerStateJSON) error {
 	}
 	if st.Health != nil && st.Health.Status == "unhealthy" {
 		return fmt.Errorf("image healthcheck reports unhealthy")
+	}
+	return nil
+}
+
+// admitConfigHome is the one place a deploy is matched against the app's
+// config home, under the app lock (spec §2.2): a deploy loaded from the
+// server config (configCommit set) needs config.git, and any other deploy
+// (a folder, an ad-hoc override, a listener checkout) is refused for an
+// app whose settings are edited in Teploy. It also repairs what an older
+// CLI left behind and refuses an orphaned app.
+func admitConfigHome(ctx context.Context, exec ssh.Executor, app, configCommit string, lk *state.Lock, out io.Writer) error {
+	gate, err := confighome.CheckGate(ctx, exec, app, lk, out)
+	if err != nil {
+		return err
+	}
+	switch {
+	case gate.Server && configCommit == "":
+		return confighome.RefuseFolderDeploy(app, gate.Head)
+	case !gate.Server && configCommit != "":
+		return fmt.Errorf("%s's settings were moved back to a folder while this deploy started; deploy it from its folder", app)
+	case gate.Server && gate.Head != configCommit:
+		return fmt.Errorf("%s's config changed while this deploy started (now %s); deploy again", app, gate.Head)
 	}
 	return nil
 }

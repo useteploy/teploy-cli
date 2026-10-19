@@ -20,6 +20,12 @@ import (
 const (
 	deploymentsDir  = "/deployments"
 	SchemaVersionV2 = 2
+	// SchemaVersionV3 is v2 plus the tombstone flag. It marks an app whose
+	// config lives on the server (Teploy or repo home): the invariant is
+	// v3 <=> /deployments/.teploy/apps/<app>/config.git exists. CLIs
+	// before v3 refuse it wherever they parse state, which is the gate that
+	// keeps an old binary from deploying such an app from a stale folder.
+	SchemaVersionV3 = 3
 )
 
 // generationFencedMarker and generationBadgenMarker are the stderr sentinels
@@ -181,6 +187,11 @@ type AppState struct {
 	CurrentPorts  []int `json:"current_ports,omitempty"`
 	PreviousPorts []int `json:"previous_ports,omitempty"`
 
+	// Tombstone (schema v3 only) marks a server-home app that was removed
+	// or never deployed: no release runs, but the generation continues so
+	// a later deploy's fences stay monotonic. Read treats it as absent.
+	Tombstone bool `json:"tombstone,omitempty"`
+
 	legacyImported bool
 }
 
@@ -240,6 +251,19 @@ func ReadRemoteFile(ctx context.Context, exec ssh.Executor, path string) ([]byte
 	return []byte(strings.TrimPrefix(out, "present\n")), true, nil
 }
 
+// ReadIncludingTombstone is Read that also returns a v3 tombstone, for the
+// writers that must continue its generation (deploys) or repair it.
+func ReadIncludingTombstone(ctx context.Context, exec ssh.Executor, app string) (*AppState, error) {
+	data, present, err := ReadRemoteFile(ctx, exec, CanonicalStatePath(app))
+	if err != nil {
+		return nil, fmt.Errorf("reading canonical state for %s: %w", app, err)
+	}
+	if present {
+		return ParseCanonical(app, data)
+	}
+	return Read(ctx, exec, app)
+}
+
 // Read reads canonical v2 state first; a CONFIRMED-MISSING v2 file falls
 // back to the legacy key=value file. Every other failure — transport,
 // permission, an existing-but-empty canonical file, malformed canonical
@@ -253,7 +277,11 @@ func Read(ctx context.Context, exec ssh.Executor, app string) (*AppState, error)
 		return nil, fmt.Errorf("reading canonical state for %s: %w", app, err)
 	}
 	if present {
-		return ParseCanonical(app, data)
+		s, err := ParseCanonical(app, data)
+		if err != nil || s.Tombstone {
+			return nil, err
+		}
+		return s, nil
 	}
 
 	// Only a confirmed-missing canonical file reaches the legacy migration.
@@ -320,6 +348,11 @@ func NewAppliedState(current *AppState, deploymentType, ingressMode, domain stri
 	}
 	if current == nil {
 		return s
+	}
+	// The home marker carries forward: a server-home app stays v3 across
+	// deploys and rollbacks; only `teploy config home` changes it.
+	if current.SchemaVersion == SchemaVersionV3 {
+		s.SchemaVersion = SchemaVersionV3
 	}
 	s.Generation = current.Generation + 1
 	if current.legacyImported {
@@ -466,8 +499,11 @@ func prepareState(s *AppState) ([]byte, error) {
 	if s.SchemaVersion == 0 {
 		s.SchemaVersion = SchemaVersionV2
 	}
-	if s.SchemaVersion != SchemaVersionV2 {
+	if s.SchemaVersion != SchemaVersionV2 && s.SchemaVersion != SchemaVersionV3 {
 		return nil, fmt.Errorf("cannot write state schema version %d", s.SchemaVersion)
+	}
+	if s.Tombstone && s.SchemaVersion != SchemaVersionV3 {
+		return nil, fmt.Errorf("a tombstone is a schema v3 state")
 	}
 	if s.DeploymentType == "" {
 		s.DeploymentType = "container"
@@ -770,4 +806,63 @@ func AppendLog(ctx context.Context, exec ssh.Executor, entry LogEntry) error {
 func EnsureAppDir(ctx context.Context, exec ssh.Executor, app string) error {
 	_, err := exec.Run(ctx, fmt.Sprintf("mkdir -p %s/%s", deploymentsDir, app))
 	return err
+}
+
+// WriteTombstone commits a v3 tombstone for a server-home app under its
+// lock: no release, generation = previous + 1 (1 for an app never
+// deployed, never 0).
+func WriteTombstone(ctx context.Context, exec ssh.Executor, app string, lk *Lock) error {
+	current, err := ReadIncludingTombstone(ctx, exec, app)
+	if err != nil {
+		return err
+	}
+	t := &AppState{SchemaVersion: SchemaVersionV3, Tombstone: true, DeploymentType: "container", IngressMode: "caddy", UpdatedAt: time.Now().UTC(), OperationID: newOperationID(), Generation: 1}
+	var expected uint64
+	if current != nil {
+		t.Generation = current.Generation + 1
+		t.DeploymentType, t.IngressMode, t.Domain = current.DeploymentType, current.IngressMode, current.Domain
+		expected = current.Generation
+	}
+	if err := EnsureAppDir(ctx, exec, app); err != nil {
+		return err
+	}
+	if current == nil {
+		return writeFenced(ctx, exec, app, t, lk, nil)
+	}
+	return WriteFencedGeneration(ctx, exec, app, t, lk, expected)
+}
+
+// SetSchemaVersion rewrites the app's state with only the home marker
+// changed (v2 folder home, v3 server home), as a new generation under the
+// lock. A missing state is left missing for v2 and becomes a tombstone for
+// v3, so the invariant v3 <=> config.git holds either way.
+func SetSchemaVersion(ctx context.Context, exec ssh.Executor, app string, version int, lk *Lock) error {
+	current, err := ReadIncludingTombstone(ctx, exec, app)
+	if err != nil {
+		return err
+	}
+	if current == nil {
+		if version == SchemaVersionV3 {
+			return WriteTombstone(ctx, exec, app, lk)
+		}
+		return nil
+	}
+	if current.SchemaVersion == version {
+		return nil
+	}
+	if current.legacyImported {
+		// A legacy key=value state becomes canonical v2 first.
+		current.SchemaVersion = SchemaVersionV2
+	}
+	if version == SchemaVersionV2 && current.Tombstone {
+		// Back to folder home with nothing deployed: no state at all.
+		_, err := lk.Guarded(ctx, exec, "rm -f -- "+ssh.ShellQuote(CanonicalStatePath(app)))
+		return err
+	}
+	next := *current
+	next.SchemaVersion = version
+	next.Generation = current.Generation + 1
+	next.OperationID = newOperationID()
+	next.UpdatedAt = time.Now().UTC()
+	return WriteFencedGeneration(ctx, exec, app, &next, lk, current.Generation)
 }

@@ -119,6 +119,14 @@ const (
 	// --actor <client>[:<label>] and --actor-op <id> are accepted on every
 	// command and recorded with each event.
 	CapActorFlagV1 = "actor-flag-v1"
+	// CapConfigHomeV1: `teploy config get|set|edit|diff|history|restore|
+	// pull|push|home|purge-history`, Teploy-home deploys (`deploy --app X`
+	// with no folder; `--image T` commits image: T first), schema-v3 state
+	// with tombstones, and folder deploys refused for Teploy-home apps.
+	CapConfigHomeV1 = "config-home-v1"
+	// CapUndeployedListV1: `app list --include-undeployed` returns
+	// never-deployed and removed Teploy-home apps in an "undeployed" array.
+	CapUndeployedListV1 = "undeployed-list-v1"
 )
 
 // MachineCapabilities returns every capability token this build
@@ -147,6 +155,8 @@ func MachineCapabilities() []string {
 		CapPreviewCompareDestroy,
 		CapEventsV1,
 		CapActorFlagV1,
+		CapConfigHomeV1,
+		CapUndeployedListV1,
 	}
 	sort.Strings(tokens)
 	return tokens

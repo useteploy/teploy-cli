@@ -22,6 +22,7 @@ import (
 	"github.com/useteploy/teploy/internal/build"
 	"github.com/useteploy/teploy/internal/caddy"
 	"github.com/useteploy/teploy/internal/config"
+	"github.com/useteploy/teploy/internal/confighome"
 	"github.com/useteploy/teploy/internal/deploy"
 	"github.com/useteploy/teploy/internal/dns"
 	"github.com/useteploy/teploy/internal/docker"
@@ -84,8 +85,14 @@ a machine error envelope on stderr whose code distinguishes the classes
 			if len(args) > 0 {
 				serverName = args[0]
 			}
+			// `teploy deploy <app> --host <server>` outside any app folder
+			// names a Teploy-home app (spec §2.3).
+			if appName == "" && serverName != "" && flags.Host != "" && !folderHasConfig(destination) {
+				appName, serverName = serverName, ""
+			}
 			if appName != "" {
-				return runAdHocDeploy(flags, serverName, appName, image, domain, port, version, skipDNSCheck, migrateVolumes)
+				overrides := domain != "" || cmd.Flags().Changed("port")
+				return runAdHocDeploy(flags, serverName, appName, image, domain, port, version, skipDNSCheck, migrateVolumes, overrides)
 			}
 			tags, err := parseTagFilters(tagFilters)
 			if err != nil {
@@ -113,10 +120,7 @@ a machine error envelope on stderr whose code distinguishes the classes
 
 // runAdHocDeploy handles deploys without a teploy.yml — used by teploy-dash
 // and scripting. Requires --app and --image at minimum.
-func runAdHocDeploy(flags *Flags, serverName, appName, image, domain string, port int, version string, skipDNSCheck, migrateVolumes bool) error {
-	if image == "" {
-		return refuseAdmission(fmt.Errorf("--image is required for ad-hoc deploy (no teploy.yml)"))
-	}
+func runAdHocDeploy(flags *Flags, serverName, appName, image, domain string, port int, version string, skipDNSCheck, migrateVolumes, overrides bool) error {
 	// This path builds an AppConfig directly instead of going through
 	// config.LoadApp, so it never reaches AppConfig.validate() — app and
 	// domain must be validated explicitly here before either one reaches
@@ -124,14 +128,31 @@ func runAdHocDeploy(flags *Flags, serverName, appName, image, domain string, por
 	if err := config.ValidateName(appName); err != nil {
 		return refuseAdmission(err)
 	}
-	if err := config.ValidateDomain(domain, false); err != nil {
-		return refuseAdmission(err)
+	if domain != "" {
+		if err := config.ValidateDomain(domain, false); err != nil {
+			return refuseAdmission(err)
+		}
 	}
 	if serverName == "" {
 		serverName = flags.Host
 	}
 	if serverName == "" {
 		return refuseAdmission(fmt.Errorf("server is required — use 'teploy deploy <server> --app ...' or --host"))
+	}
+
+	// A Teploy-home app deploys from its server config; `--image T` alone
+	// is a config commit of image: T plus the deploy (the CI one-liner
+	// keeps working after the app moves to Teploy). Any other override is
+	// refused there. The home is re-checked under the lock either way.
+	served, err := deployServerConfigIfHome(flags, serverName, appName, image, version, skipDNSCheck, migrateVolumes, overrides)
+	if served || err != nil {
+		return err
+	}
+	if image == "" {
+		return refuseAdmission(fmt.Errorf("--image is required for ad-hoc deploy (%s has no Teploy config and there is no teploy.yml)", appName))
+	}
+	if err := config.ValidateDomain(domain, false); err != nil {
+		return refuseAdmission(err)
 	}
 	if port <= 0 {
 		port = 80
@@ -153,6 +174,18 @@ func runDeploy(flags *Flags, serverName, image, version string, skipDNSCheck boo
 	// Ctrl-C from the very start of the run (audit F75).
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
+
+	// A pulled copy of a Teploy config is not a folder home: deploy the
+	// server config it links to (local edits deploy after `config push`).
+	if raw, rerr := os.ReadFile("teploy.yml"); rerr == nil && destination == "" {
+		if h, _ := parsePulledHeader(raw); h.app != "" {
+			if serverName == "" {
+				serverName = h.server
+			}
+			fmt.Printf("teploy.yml is a pulled copy of %s's Teploy config; deploying the server config (run `teploy config push` first to deploy local edits)\n", h.app)
+			return runAdHocDeploy(flags, serverName, h.app, image, "", 80, version, skipDNSCheck, migrateVolumes, false)
+		}
+	}
 
 	// 1. Load teploy.yml from current directory (with optional destination overlay).
 	var appCfg *config.AppConfig
@@ -250,6 +283,29 @@ func resolveDeployEnv(ctx context.Context, appCfg *config.AppConfig, strict bool
 			}
 		}
 	}
+	mergeLiteralEnv(appCfg, sources)
+	return nil
+}
+
+// resolveServerConfigEnv is resolveDeployEnv for a Teploy-home config:
+// nothing is expanded from the deploying client's environment (Load
+// refused every $VAR), $$ becomes a literal $, and there are no env files.
+func resolveServerConfigEnv(appCfg *config.AppConfig) {
+	sources := map[string]string{}
+	for k, v := range appCfg.Env {
+		if strings.HasPrefix(v, "secret:") || strings.HasPrefix(v, "vault:") {
+			sources[k] = releasemeta.EnvSourceVault
+		} else {
+			sources[k] = releasemeta.EnvSourceConfig
+		}
+	}
+	appCfg.EnvSources = sources
+	confighome.Unescape(appCfg.Env)
+	mergeLiteralEnv(appCfg, sources)
+}
+
+// mergeLiteralEnv folds env_literal (app and accessories) into env.
+func mergeLiteralEnv(appCfg *config.AppConfig, sources map[string]string) {
 	if appCfg.Env == nil {
 		appCfg.Env = map[string]string{}
 	}
@@ -266,8 +322,6 @@ func resolveDeployEnv(ctx context.Context, appCfg *config.AppConfig, strict bool
 		}
 		appCfg.Accessories[name] = acc
 	}
-
-	return nil
 }
 
 // parseTagFilters parses repeated "key=value" flag values into a map.
@@ -456,6 +510,13 @@ func deployAppConfig(flags *Flags, appCfg *config.AppConfig, serverName, image, 
 	}
 	defer state.ReleaseLockFenced(executor, lk, appCfg.App)
 	lk.StartRenewal(executor)
+	// Refuse a folder deploy of a Teploy-home app before anything is built
+	// (the engine checks again at the swap).
+	if gate, err := confighome.CheckGate(ctx, executor, appCfg.App, lk, os.Stdout); err != nil {
+		return refuseAdmission(err)
+	} else if gate.Server {
+		return refuseAdmission(confighome.RefuseFolderDeploy(appCfg.App, gate.Head))
+	}
 	if len(plans) > 0 && plans[0] != nil {
 		if err := revalidateLockedPlan(ctx, executor, appCfg, image, version, plans[0]); err != nil {
 			return refuseApply(err)
@@ -1196,13 +1257,8 @@ func emitDeployAudit(ctx context.Context, appCfg *config.AppConfig, action, vers
 	}
 	// Flat actor <client>:<label> (spec §2.6 observe forwarding): the same
 	// client the server event history records for this command.
-	actor := events.ProcessActor()
-	flat := actor.Client
-	if actor.Label != "" {
-		flat += ":" + actor.Label
-	}
 	if err := audit.Emit(ctx, appCfg.Audit.Endpoint, appCfg.Audit.Token, appCfg.Audit.Site, audit.Event{
-		Actor:    flat,
+		Actor:    events.ActorString(events.ProcessActor()),
 		Action:   action,
 		Target:   appCfg.App + "@" + version,
 		Result:   result,

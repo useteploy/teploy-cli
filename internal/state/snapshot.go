@@ -308,8 +308,11 @@ func ParseCanonical(app string, data []byte) (*AppState, error) {
 	if err := json.Unmarshal(data, &s); err != nil {
 		return nil, fmt.Errorf("parsing canonical state for %s: %w", app, err)
 	}
-	if s.SchemaVersion != SchemaVersionV2 {
+	if s.SchemaVersion != SchemaVersionV2 && s.SchemaVersion != SchemaVersionV3 {
 		return nil, fmt.Errorf("unsupported state schema version %d for %s", s.SchemaVersion, app)
+	}
+	if s.Tombstone && s.SchemaVersion != SchemaVersionV3 {
+		return nil, fmt.Errorf("state for %s is a tombstone without schema v3", app)
 	}
 	if err := validateManifestDigest(&s); err != nil {
 		return nil, fmt.Errorf("validating canonical state for %s: %w", app, err)

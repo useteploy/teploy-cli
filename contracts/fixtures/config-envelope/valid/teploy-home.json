@@ -1,0 +1,9 @@
+{
+  "machine_interface": 2,
+  "host": "192.0.2.10",
+  "app": "blog",
+  "home": "teploy",
+  "commit": "8f2c1d0e9b7a6f5e4d3c2b1a0f9e8d7c6b5a4f3e",
+  "applied_commit": "1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d",
+  "content": "app: blog\ndomain: blog.example.com\nimage: example/blog:1.4.0\nenv:\n  LOG_LEVEL: info\n  DB_PASSWORD: secret:DB_PASSWORD\n"
+}
