@@ -19,7 +19,7 @@ import (
 // against (adding checks is additive at the end; renaming/removing is a
 // machine-interface bump).
 var doctorCheckOrder = []string{
-	"git", "config", "ssh", "docker", "disk", "registry", "caddy", "compatibility", "repair-debt", "secret-exposure", "server-tools",
+	"git", "config", "ssh", "docker", "disk", "registry", "caddy", "compatibility", "repair-debt", "secret-exposure", "server-tools", "config-home",
 }
 
 // doctorHappyMock registers every remote read a fully healthy target
@@ -33,6 +33,7 @@ func doctorHappyMock() *ssh.MockExecutor {
 		ssh.MockCommand{Match: "'/deployments/.bin/teploy' version", Output: "teploy v0.1.37"},
 		ssh.MockCommand{Match: "scan=$(find /deployments ", Output: ""},
 		ssh.MockCommand{Match: "for t in git python3", Output: ""},
+		ssh.MockCommand{Match: "for f in /deployments/*/state.json", Output: ""},
 	)
 }
 
@@ -81,8 +82,8 @@ func TestDoctorAllChecksPass(t *testing.T) {
 	if ex == nil {
 		t.Fatal("expected an executor back")
 	}
-	if report.Summary != (doctorSummary{OK: 11, Warn: 0, Fail: 0}) {
-		t.Fatalf("summary = %+v, want 11 ok", report.Summary)
+	if report.Summary != (doctorSummary{OK: 12, Warn: 0, Fail: 0}) {
+		t.Fatalf("summary = %+v, want 12 ok", report.Summary)
 	}
 	if len(report.Checks) != len(doctorCheckOrder) {
 		t.Fatalf("got %d checks, want %d", len(report.Checks), len(doctorCheckOrder))
@@ -129,8 +130,8 @@ func TestDoctorJSONStableShape(t *testing.T) {
 		t.Fatalf("machine_interface = %v, want %d", doc["machine_interface"], MachineInterface)
 	}
 	checks, ok := doc["checks"].([]any)
-	if !ok || len(checks) != 11 {
-		t.Fatalf("checks = %#v, want 11 entries", doc["checks"])
+	if !ok || len(checks) != 12 {
+		t.Fatalf("checks = %#v, want 12 entries", doc["checks"])
 	}
 	for i, raw := range checks {
 		check, ok := raw.(map[string]any)
@@ -183,6 +184,7 @@ func TestDoctorHumanTable(t *testing.T) {
 		ssh.MockCommand{Match: "'/deployments/.bin/teploy' version", Output: "teploy v0.1.37"},
 		ssh.MockCommand{Match: "scan=$(find /deployments ", Output: ""},
 		ssh.MockCommand{Match: "for t in git python3", Output: ""},
+		ssh.MockCommand{Match: "for f in /deployments/*/state.json", Output: ""},
 	)
 	report, _ := doctorRun(context.Background(), doctorTestDeps(mock), &Flags{}, "", doctorTestApp(), nil)
 	var out bytes.Buffer
@@ -196,7 +198,7 @@ func TestDoctorHumanTable(t *testing.T) {
 	if !strings.Contains(rendered, "fix:") {
 		t.Fatalf("table missing the remediation line:\n%s", rendered)
 	}
-	if !strings.Contains(rendered, "Summary: 10 ok, 0 warn, 1 fail") {
+	if !strings.Contains(rendered, "Summary: 11 ok, 0 warn, 1 fail") {
 		t.Fatalf("table summary line wrong:\n%s", rendered)
 	}
 	assertDoctorReadOnlyCalls(t, mock.Calls)
@@ -669,7 +671,7 @@ func TestDoctorEndToEndAllOK(t *testing.T) {
 	if err := runDoctor(doctorTestDeps(mock), &Flags{}, "", &out); err != nil {
 		t.Fatalf("runDoctor: %v", err)
 	}
-	if !strings.Contains(out.String(), "Summary: 11 ok, 0 warn, 0 fail") {
+	if !strings.Contains(out.String(), "Summary: 12 ok, 0 warn, 0 fail") {
 		t.Fatalf("human report wrong:\n%s", out.String())
 	}
 	assertDoctorReadOnlyCalls(t, mock.Calls)
@@ -688,6 +690,7 @@ func assertDoctorReadOnlyCalls(t *testing.T, calls []string) {
 		"if [ ! -e '/deployments/",
 		"find /deployments ",
 		"for t in git python3",
+		"for f in /deployments/*/state.json",
 	}
 	for _, call := range calls {
 		allowed := false
@@ -783,6 +786,24 @@ func TestDoctorServerTools(t *testing.T) {
 		mock := ssh.NewMockExecutor("h", ssh.MockCommand{Match: "for t in git python3", Output: tc.out})
 		if got := doctorServerToolsCheck(context.Background(), mock); got.Result != tc.want {
 			t.Errorf("missing %q: result %s, want %s (%+v)", tc.out, got.Result, tc.want, got)
+		}
+	}
+}
+
+func TestDoctorConfigHomeCheck(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		out, result, want string
+	}{
+		{"", "ok", "edited in its folder"},
+		{"blog 3 1\nlegacy 2 0\n", "ok", "1 app(s) edited in Teploy: blog"},
+		{"blog 2 1\nwiki none 1\n", "warn", "older teploy CLI"},
+		{"blog 3 0\n", "fail", "orphaned"},
+	} {
+		mock := ssh.NewMockExecutor("h", ssh.MockCommand{Match: "for f in /deployments/*/state.json", Output: tc.out})
+		check := doctorConfigHomeCheck(ctx, mock)
+		if check.Result != tc.result || !strings.Contains(check.Detail, tc.want) {
+			t.Errorf("%q: %+v, want %s containing %q", tc.out, check, tc.result, tc.want)
 		}
 	}
 }
