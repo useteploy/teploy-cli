@@ -16,6 +16,7 @@ import (
 	"github.com/useteploy/teploy/internal/accessories"
 	"github.com/useteploy/teploy/internal/config"
 	"github.com/useteploy/teploy/internal/docker"
+	"github.com/useteploy/teploy/internal/releasemeta"
 	"github.com/useteploy/teploy/internal/secret"
 	"github.com/useteploy/teploy/internal/ssh"
 	"github.com/useteploy/teploy/internal/state"
@@ -970,21 +971,36 @@ func engineEnv(snap SnapshotRecord, liveEnv map[string]string, cfg config.Access
 
 // installBundleState writes the bundle's state.json, release records and
 // secret material into /deployments/<app> — atomically per file, 0600.
-func (c *Client) installBundleState(ctx context.Context, manifest *BundleManifest, staging string, lk *state.Lock, baseGeneration uint64) error {
-	appDir := fmt.Sprintf("%s/%s", deploymentsDir, manifest.App)
-	if _, err := c.exec.Run(ctx, "mkdir -p "+ssh.ShellQuote(appDir+"/meta")+" "+ssh.ShellQuote(appDir+"/secrets")); err != nil {
-		return fmt.Errorf("preparing state dirs: %w", err)
-	}
-	for _, rec := range manifest.ReleaseRecords {
+// installReleaseRecords writes a bundle's release records into appDir/meta.
+// Bundles made before release metadata was redacted carry secret env
+// values; restoring one must not put them back at rest, so every record is
+// redacted on the way in.
+func (c *Client) installReleaseRecords(ctx context.Context, appDir string, records []json.RawMessage) error {
+	for _, rec := range records {
 		var r struct {
 			Hash string `json:"hash"`
 		}
 		if err := json.Unmarshal(rec, &r); err != nil || r.Hash == "" {
 			continue // a record without identity cannot be keyed; skip loudly below
 		}
-		if err := c.exec.Upload(ctx, strings.NewReader(string(rec)+"\n"), fmt.Sprintf("%s/meta/%s.json", appDir, r.Hash), "0600"); err != nil {
+		clean, _, _, rerr := releasemeta.RedactRaw(rec, nil)
+		if rerr != nil {
+			return fmt.Errorf("redacting release record %s: %w", r.Hash, rerr)
+		}
+		if err := c.exec.Upload(ctx, strings.NewReader(strings.TrimRight(string(clean), "\n")+"\n"), fmt.Sprintf("%s/meta/%s.json", appDir, r.Hash), "0600"); err != nil {
 			return fmt.Errorf("writing release record %s: %w", r.Hash, err)
 		}
+	}
+	return nil
+}
+
+func (c *Client) installBundleState(ctx context.Context, manifest *BundleManifest, staging string, lk *state.Lock, baseGeneration uint64) error {
+	appDir := fmt.Sprintf("%s/%s", deploymentsDir, manifest.App)
+	if _, err := c.exec.Run(ctx, "mkdir -p "+ssh.ShellQuote(appDir+"/meta")+" "+ssh.ShellQuote(appDir+"/secrets")); err != nil {
+		return fmt.Errorf("preparing state dirs: %w", err)
+	}
+	if err := c.installReleaseRecords(ctx, appDir, manifest.ReleaseRecords); err != nil {
+		return err
 	}
 	if manifest.Secrets.Mode == "encrypted" {
 		for _, inc := range manifest.Secrets.Included {

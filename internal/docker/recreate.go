@@ -59,7 +59,13 @@ type RecreateSpec struct {
 	// Env; Recreate publishes it via --env-file instead of -e arguments so
 	// resolved values never appear in the host process list / command
 	// diagnostics (audit T19). Empty at inspect time.
-	EnvFile        string            `json:"-"`
+	EnvFile string `json:"-"`
+	// EnvRedacted lists env keys whose VALUES were deliberately not persisted
+	// (release metadata stores the key and where its value comes from, never
+	// a secret value). Empty at inspect time; set only on the persisted form.
+	// A spec carrying it is incomplete by construction: Recreate refuses it
+	// rather than start a container with a secret missing.
+	EnvRedacted    []RedactedEnv     `json:"env_redacted,omitempty"`
 	WorkingDir     string            `json:"working_dir,omitempty"`
 	User           string            `json:"user,omitempty"`
 	Labels         map[string]string `json:"labels,omitempty"`
@@ -84,6 +90,14 @@ type RecreateSpec struct {
 	SecurityOpt    []string          `json:"security_opt,omitempty"`
 	Privileged     bool              `json:"privileged,omitempty"`
 	ReadonlyRootfs bool              `json:"readonly_rootfs,omitempty"`
+}
+
+// RedactedEnv names an env key whose value is not persisted and the source
+// it is resolved from at container create time (e.g. "secret_store",
+// "persisted_env", "env_file"). It carries no value and no digest.
+type RedactedEnv struct {
+	Key    string `json:"key"`
+	Source string `json:"source"`
 }
 
 // containerInspect mirrors the subset of `docker inspect` JSON used to build
@@ -579,6 +593,17 @@ func (c *Client) recreate(ctx context.Context, spec *RecreateSpec, avoidPorts ma
 	if spec == nil || spec.Name == "" {
 		return fmt.Errorf("recreate requires a spec with a container name")
 	}
+	// A persisted (redacted) spec lacks secret values by design. Starting a
+	// container from it would silently drop them, so refuse: callers must
+	// recreate from the live container (InspectRecreate) or resolve every
+	// redacted key first.
+	if len(spec.EnvRedacted) > 0 {
+		keys := make([]string, 0, len(spec.EnvRedacted))
+		for _, r := range spec.EnvRedacted {
+			keys = append(keys, r.Key)
+		}
+		return fmt.Errorf("recreate spec for %s has unresolved redacted env (%s) — refusing to start a container with secrets missing", spec.Name, strings.Join(keys, ", "))
+	}
 
 	claimed := make(map[int]bool, len(avoidPorts))
 	for p := range avoidPorts {
@@ -774,4 +799,29 @@ func (c *Client) HostPortFor(ctx context.Context, name string, containerPort int
 		}
 	}
 	return 0, fmt.Errorf("container %s has no host binding for container port %d", name, containerPort)
+}
+
+// ImageEnv returns an image's own ENV defaults (key -> value). Release
+// metadata keeps env values identical to these (they ship inside the image
+// anyway) while redacting everything else. An unreadable image yields an
+// error; callers treat that as "unknown" and redact more, never less.
+func (c *Client) ImageEnv(ctx context.Context, image string) (map[string]string, error) {
+	if image == "" {
+		return nil, fmt.Errorf("image reference required")
+	}
+	out, err := c.exec.Run(ctx, "docker image inspect -f '{{json .Config.Env}}' "+ssh.ShellQuote(image))
+	if err != nil {
+		return nil, fmt.Errorf("reading image env for %s: %w", image, err)
+	}
+	var entries []string
+	if err := json.Unmarshal([]byte(strings.TrimSpace(out)), &entries); err != nil {
+		return nil, fmt.Errorf("parsing image env: %w", err)
+	}
+	env := make(map[string]string, len(entries))
+	for _, kv := range entries {
+		if k, v, ok := strings.Cut(kv, "="); ok {
+			env[k] = v
+		}
+	}
+	return env, nil
 }

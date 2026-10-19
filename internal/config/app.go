@@ -466,6 +466,11 @@ type AppConfig struct {
 	// points when a full git revision is provable. It is never parsed from or
 	// emitted into the user manifest.
 	SourceRevision string `yaml:"-" toml:"-"`
+
+	// EnvSources maps each resolved env key to where its value came from
+	// (set by the CLI's env resolution, never loaded from a file). Release
+	// metadata persists only values whose source is plain configuration.
+	EnvSources map[string]string `yaml:"-" toml:"-" json:"-"`
 }
 
 // SecretConfig configures the managed secrets provider for an app (the same

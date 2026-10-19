@@ -2691,3 +2691,28 @@ autodeploy deploy path onto the trigger adapter, and scheduler/manual
 tip-mode admission plumbing. Private evidence and exact receipts live
 outside this repository.
 
+
+## 2026-10-18 — secret values in release metadata (reported from the observe session)
+
+- **SM-1 (fixed, this branch)** — F14/F20 records embedded the web
+  container's full inspect env (`recreate.env`; backfills also `env`),
+  secrets included: on infra-home all 91 records carried it. Values are now
+  persisted only for provably non-secret sources (plain `env:`/`env_literal`,
+  image ENV, `PORT`); everything else is `{key, source}` in `env_redacted`.
+  Enforced in `releasemeta.Write`, DR bundle export and DR restore. Attempt
+  env files are removed once a release is live. `teploy meta scrub`
+  migrates existing hosts (dry run by default). A redacted recreate spec is
+  refused by `docker.Recreate` (fail closed). Rollback never read record env
+  (it recreates from docker's own inspect), so it is unaffected — and it
+  therefore uses the values the target release was deployed with.
+- **SM-2 (open, deliberately not changed)** — docker itself keeps every
+  container's env in `/var/lib/docker/containers/*/config.v2.json`; that is
+  docker's store, not teploy's metadata, and the only way out is file-mounted
+  secrets instead of env. Existing DR bundles made before this fix still
+  contain plaintext values until re-made; `.env` inside `teploy backup`
+  archives is the intended env store and stays as-is.
+- **SM-3 (open, owner decision)** — rollback after a secret rotation uses
+  the old values (docker's record of the stopped container). Re-resolving
+  current secrets at rollback would need a resolver over the age store,
+  `.env` and OpenBao; not built because no caller needed it and it changes
+  rollback semantics.

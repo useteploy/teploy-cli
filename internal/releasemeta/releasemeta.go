@@ -137,10 +137,13 @@ type Record struct {
 	// Dockerfile identity, platform, image digest and mutability.
 	Provenance *Provenance `json:"provenance,omitempty"`
 
-	Replicas        int                               `json:"replicas,omitempty"`
-	Processes       map[string]string                 `json:"processes,omitempty"`
-	Cmd             string                            `json:"cmd,omitempty"`
-	Env             map[string]string                 `json:"env,omitempty"`
+	Replicas  int               `json:"replicas,omitempty"`
+	Processes map[string]string `json:"processes,omitempty"`
+	Cmd       string            `json:"cmd,omitempty"`
+	Env       map[string]string `json:"env,omitempty"`
+	// EnvRedacted names env keys whose values are NOT persisted (secrets
+	// and anything of unknown provenance) and where each is resolved from.
+	EnvRedacted     []docker.RedactedEnv              `json:"env_redacted,omitempty"`
 	EnvFiles        []string                          `json:"env_files,omitempty"`
 	Volumes         map[string]string                 `json:"volumes,omitempty"`
 	VolumeOwnership map[string]config.VolumeOwnership `json:"volume_ownership,omitempty"`
@@ -160,6 +163,12 @@ type Record struct {
 	// spec (audit F20), captured from docker's own view of the container the
 	// deploy started.
 	Recreate *docker.RecreateSpec `json:"recreate,omitempty"`
+
+	// EnvProvenance (key -> EnvSource*) and ImageEnv (the image's own ENV)
+	// classify env values at Write time; never persisted. Without them every
+	// value except image defaults and PORT is redacted.
+	EnvProvenance map[string]string `json:"-"`
+	ImageEnv      map[string]string `json:"-"`
 }
 
 // ValidateHash checks a release id against the grammar safe for meta
@@ -248,14 +257,16 @@ func Write(ctx context.Context, exec ssh.Executor, rec *Record) error {
 	if _, err := exec.Run(ctx, fmt.Sprintf("mkdir -p %s/%s/meta", deploymentsDir, rec.App)); err != nil {
 		return fmt.Errorf("creating metadata directory: %w", err)
 	}
+	// Secret values never reach disk: every writer goes through here, so
+	// redaction cannot be skipped by a new call site.
+	redactRecord(rec)
 	data, err := json.Marshal(rec)
 	if err != nil {
 		return fmt.Errorf("marshaling release metadata: %w", err)
 	}
 	data = append(data, '\n')
-	// 0600: backfilled records embed resolved env; docker inspect shows the
-	// same values to someone already on the host, but the file must not
-	// make them readable to everyone with a shell account.
+	// 0600: records hold no secret values (redacted above), but still name
+	// keys, paths and config that are nobody else's business.
 	return ssh.UploadAtomic(ctx, exec, strings.NewReader(string(data)), path, "0600")
 }
 
@@ -399,6 +410,18 @@ func Backfill(ctx context.Context, exec ssh.Executor, dk *docker.Client, contain
 	// original tag reference alongside it.
 	rec.ImageDigest = spec.ImageID
 	rec.ImageRef = spec.ImageRef
+
+	// Redaction inputs (Write drops every value not provably plain): there is
+	// no deploy-time provenance for a backfill, so only image defaults and
+	// PORT keep values; host-held secret sources name the redacted keys.
+	rec.EnvProvenance = HostEnvSources(ctx, exec, app)
+	image := spec.ImageID
+	if image == "" {
+		image = spec.ImageRef
+	}
+	if imageEnv, ierr := dk.ImageEnv(ctx, image); ierr == nil {
+		rec.ImageEnv = imageEnv
+	}
 
 	// Resolved env, straight from the container's own config. PORT is the
 	// primary-port signal teploy's docker run sets; it selects the primary

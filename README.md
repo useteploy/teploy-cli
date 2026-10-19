@@ -393,6 +393,21 @@ At deploy, secrets (and `secret:` references in `env:`) override
 writes. `env set` therefore refuses a key that is a secret (use
 `secret set`) and warns when `teploy.yml` `env:` shadows the key.
 
+Release metadata (`/deployments/<app>/meta/<release>.json`) never stores a
+secret value. Plain `teploy.yml` `env:` values and image defaults are kept;
+every other key (secrets, vault references, `.env`, `env_files`, `${VAR}`
+interpolations, credential-shaped names and URLs, anything of unknown
+origin) is recorded by name and source only. Rollback is unaffected: it
+recreates the target release's containers from docker's own record of them.
+That also means a rollback uses the values the release was deployed with,
+not secrets rotated since. Records written by older versions can be
+cleaned in place:
+
+```
+teploy meta scrub --host <server> [--app <name>]          # dry run: lists records and key names, changes nothing
+teploy meta scrub --host <server> [--app <name>] --apply  # rewrite records, remove leftover attempt env files
+```
+
 ### Fleet
 ```
 teploy server add <name> <host>    # add server to ~/.teploy/servers.yml

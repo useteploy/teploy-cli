@@ -268,6 +268,7 @@ func (s *singleServerDeployer) deployApp(ctx context.Context, appCfg *config.App
 	if err != nil {
 		return fmt.Errorf("decrypting secrets: %w", err)
 	}
+	ageKeys := secretKeySet(deploySecrets)
 	// Resolve `vault:<name>#<key>` env references from OpenBao (both deploy
 	// paths must do this — see the multi-server-secrets bug noted above).
 	deploySecrets, err = mergeSecretVaultRefs(ctx, s.exec, appCfg, deploySecrets)
@@ -298,6 +299,7 @@ func (s *singleServerDeployer) deployApp(ctx context.Context, appCfg *config.App
 	deployer := deploy.NewDeployer(rawExecutor, s.out)
 	deployCfg := deployConfigFromApp(appCfg, image, version, envFiles, volumes, tlsCert, tlsKey, tlsInternal, appliedManifest, manifestSHA256)
 	deployCfg.Provenance = prov
+	deployCfg.EnvProvenance = envProvenance(appCfg, deploySecrets, ageKeys)
 
 	// Vulnerability gate (see deploy.go): fixable CRITICALs block before
 	// containers start. Per-server, so every box in a multi-server deploy
