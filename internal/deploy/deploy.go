@@ -2,6 +2,8 @@ package deploy
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -110,6 +112,9 @@ type Config struct {
 	// ConfigCommit is the config.git commit this deploy was loaded from
 	// (Teploy home); empty for a folder-home deploy.
 	ConfigCommit string
+	// SourceYAML is the masked folder teploy.yml (folder home), stored as
+	// meta/<version>.source.yml and digested into the record.
+	SourceYAML []byte
 	// Provenance is the plan-time provenance record (C04) the CLI
 	// resolved before execution: revision, worktree cleanliness, build
 	// context fingerprint, Dockerfile identity, platform, image digest
@@ -1817,6 +1822,14 @@ func (d *Deployer) recordRelease(ctx context.Context, cfg Config, att releasemet
 	if cfg.Provenance != nil {
 		provCopy := *cfg.Provenance
 		rec.Provenance = &provCopy
+	}
+	if len(cfg.SourceYAML) > 0 {
+		if err := releasemeta.WriteSource(ctx, d.exec, cfg.App, cfg.Version, cfg.SourceYAML); err != nil {
+			fmt.Fprintf(d.out, "Warning: could not store the applied folder config for %s@%s: %v\n", cfg.App, cfg.Version, err)
+		} else {
+			sum := sha256.Sum256(cfg.SourceYAML)
+			rec.SourceSHA256 = hex.EncodeToString(sum[:])
+		}
 	}
 	if err := releasemeta.Write(ctx, d.exec, rec); err != nil {
 		fmt.Fprintf(d.out, "Warning: could not record release metadata for %s@%s: %v — the deploy stays live; repair debt recorded (the next deploy rebuilds the record)\n", cfg.App, cfg.Version, err)

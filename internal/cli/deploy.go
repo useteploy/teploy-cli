@@ -216,6 +216,19 @@ func runDeploy(flags *Flags, serverName, image, version string, skipDNSCheck boo
 	if revision, revisionErr := gitRevisionIn("."); revisionErr == nil {
 		appCfg.SourceRevision = revision
 	}
+	// Keep what was deployed (spec §2.5), secrets masked. Only a plain
+	// teploy.yml is the whole config; an overlay or TOML/Compose source is
+	// not stored.
+	if destination == "" {
+		for _, name := range []string{"teploy.yml", "teploy.yaml"} {
+			if raw, rerr := os.ReadFile(name); rerr == nil {
+				if masked, merr := confighome.MaskSource(raw); merr == nil {
+					appCfg.SourceYAML = masked
+				}
+				break
+			}
+		}
+	}
 
 	// Narrow the target list by --role/--tag (no-op if neither is set). Only
 	// affects the multi-server list; an explicit `deploy <server>` arg wins.

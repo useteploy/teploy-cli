@@ -23,6 +23,7 @@ func TestBackupVolumes(t *testing.T) {
 		ssh.MockCommand{Match: "if [ -f", Output: ""},
 		ssh.MockCommand{Match: "aws s3 cp", Output: "upload: done\n"},
 		ssh.MockCommand{Match: "rm -f", Output: ""},
+		ssh.MockCommand{Match: "if [ -e '/deployments/.teploy/apps/myapp' ]", Output: "absent\n"},
 	)
 
 	var buf bytes.Buffer
@@ -962,5 +963,35 @@ func TestRedisRestore_SnapshotsAfterStopAndCompensatesStartFailure(t *testing.T)
 	}
 	if !strings.Contains(script, "if ! docker start 'myapp-cache'; then") {
 		t.Error("a failed final docker start must be a handled branch")
+	}
+}
+
+// A Teploy-home app's server data (config.git + events) is uploaded as a
+// sibling object of the same timestamp, taken under the config writer's
+// flock, never inside the volume archive.
+func TestBackupVolumesIncludesTeployServerData(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
+		ssh.MockCommand{Match: "umask 077", Output: "/tmp/teploy-backup.abc123\n"},
+		ssh.MockCommand{Match: "if [ -f", Output: ""},
+		ssh.MockCommand{Match: "aws s3 cp", Output: "upload: done\n"},
+		ssh.MockCommand{Match: "rm -f", Output: ""},
+		ssh.MockCommand{Match: "if [ -e '/deployments/.teploy/apps/myapp' ]", Output: "present\n"},
+		ssh.MockCommand{Match: "cd '/deployments/.teploy/apps/myapp'", Output: ""},
+	)
+	if err := NewClient(mock, &bytes.Buffer{}).BackupVolumes(context.Background(), "myapp", S3Config{Bucket: "my-bucket", Region: "us-east-1"}); err != nil {
+		t.Fatalf("BackupVolumes: %v", err)
+	}
+	var archived, uploaded bool
+	for _, call := range mock.Calls {
+		if strings.HasPrefix(call, "cd '/deployments/.teploy/apps/myapp'") && strings.Contains(call, "flock .write.lock tar -czf '/tmp/teploy-backup.abc123/teploy.tar.gz'") {
+			archived = true
+		}
+		if strings.Contains(call, "s3://my-bucket/myapp/teploy/") {
+			uploaded = true
+		}
+	}
+	if !archived || !uploaded {
+		t.Fatalf("Teploy server data not backed up (archived=%v uploaded=%v): %v", archived, uploaded, mock.Calls)
 	}
 }

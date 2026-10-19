@@ -52,12 +52,44 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
   config.git is gone is refused as orphaned until `config home folder`.
 - `teploy remove` keeps a Teploy-home app's config and history and writes a
   tombstone. `--purge` deletes them as well.
+- `teploy config home teploy --from-server --app X --host H` and `teploy
+  init --from-server X --host H`. Both rebuild an app's `teploy.yml` from
+  what its server recorded (the applied manifest and the running release's
+  record). The result is accepted only when its digest equals the release's
+  `manifest_sha256`, so no mount, port or setting can be dropped. Otherwise
+  they say what the server does not keep: secret or unrecorded env values,
+  hooks, accessories, custom TLS files, access rules. `init --from-server`
+  on a Teploy-home app writes a linked copy.
+- `teploy template install --home teploy` installs a template as a
+  Teploy-home app. Every generated or `--var-stdin` value is moved out
+  before the first commit: app env keys go to `teploy secret`, and accessory
+  env keys become `secret:KEY`. A template that puts such a value anywhere
+  else is refused, so no password enters the config history.
+- DR bundles are schema 2. They carry the app's config home and its server
+  data (`/deployments/.teploy/apps/<app>`: config.git and events, taken
+  under the config writer's lock) and accept schema-v3 state. Cutover
+  installs the config, merges events by id, and sets the state marker for
+  the resulting home. `--home=bundle|current` resolves a home mismatch with
+  an existing target app. Older CLIs refuse schema-2 bundles.
+  `teploy backup create` uploads the same server data next to the volume
+  archive (`<app>/teploy/<timestamp>.tar.gz`).
+- Global `--wait <duration>` waits for another operation's app lock instead
+  of refusing. A refusal now names the holder ("locked by dash:alice
+  operation op_42 since ...").
+- Folder deploys store the deployed `teploy.yml`, with detected secret
+  values masked, as `meta/<release>.source.yml` (0600). The release record
+  carries its `source_sha256`.
 - Capability tokens `config-home-v1` and `undeployed-list-v1`. Contracts
   corpus rev 11 adds `config-envelope` and `config-history-envelope`, the
   `undeployed` app-list array, and `config_commit`/`actor` on release
   records.
 
 ### Fixed
+
+- `teploy dr cutover` onto a fresh host failed to take the app lock (the app
+  directory did not exist yet). It also failed to publish the restored state
+  ("manifest_sha256 does not match applied_manifest"), because the
+  pretty-printed bundle manifest re-indented the embedded applied manifest.
 
 - `teploy doctor`'s secret-exposure scan no longer aborts with "could not
   scan /deployments" for a non-root SSH user: directories it cannot read

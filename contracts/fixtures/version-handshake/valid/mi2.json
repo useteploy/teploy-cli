@@ -10,6 +10,7 @@
     "events-v1",
     "health-modes",
     "kv-set-stdin",
+    "lock-wait-v1",
     "plan-apply",
     "preview-blue-green",
     "preview-canonical-id",

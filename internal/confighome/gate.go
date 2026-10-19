@@ -62,7 +62,7 @@ func CheckGate(ctx context.Context, exec ssh.Executor, app string, lk *state.Loc
 	}
 	switch {
 	case st == nil:
-		err = repair("missing-state", fmt.Sprintf("%s had no state (removed by an older teploy CLI); recorded it as not deployed — its Teploy config is kept", app), func() error {
+		err = repair("missing-state", fmt.Sprintf("%s had no state (removed by an older teploy CLI, or a restore that did not finish); recorded it as not deployed — its Teploy config is kept", app), func() error {
 			return state.WriteTombstone(ctx, exec, app, lk)
 		})
 	case st.SchemaVersion != state.SchemaVersionV3:

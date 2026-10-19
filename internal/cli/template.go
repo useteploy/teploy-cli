@@ -13,6 +13,10 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/useteploy/teploy/internal/config"
+	"github.com/useteploy/teploy/internal/confighome"
+	"github.com/useteploy/teploy/internal/secret"
+	"github.com/useteploy/teploy/internal/ssh"
+	"github.com/useteploy/teploy/internal/state"
 	tmpl "github.com/useteploy/teploy/internal/template"
 )
 
@@ -229,7 +233,7 @@ func applyTemplateOverrides(appCfg *config.AppConfig, domain, server string, por
 }
 
 func newTemplateInstallCmd(flags *Flags) *cobra.Command {
-	var domain, server string
+	var domain, server, home string
 	var port int
 	var vars []string
 	var varStdin bool
@@ -246,7 +250,13 @@ func newTemplateInstallCmd(flags *Flags) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			return runTemplateInstall(flags, args[0], domain, server, port, vars, stdinVars)
+			switch home {
+			case "", confighome.HomeFolder:
+				return runTemplateInstall(flags, args[0], domain, server, port, vars, stdinVars)
+			case confighome.HomeTeploy:
+				return runTemplateInstallTeploy(flags, args[0], domain, server, port, vars, stdinVars)
+			}
+			return fmt.Errorf("--home must be folder or teploy")
 		},
 	}
 
@@ -255,6 +265,7 @@ func newTemplateInstallCmd(flags *Flags) *cobra.Command {
 	cmd.Flags().IntVar(&port, "port", 0, "host port override for ingress: host templates")
 	cmd.Flags().StringArrayVar(&vars, "var", nil, "extra template variables as key=value")
 	cmd.Flags().BoolVar(&varStdin, "var-stdin", false, "read variable values as a JSON object from stdin (e.g. '{\"API_KEY\":\"...\"}'); overrides --var entries with the same name — use for secret values")
+	cmd.Flags().StringVar(&home, "home", "", "teploy: store the app's settings on the server (edit with `teploy config`), with every generated or --var-stdin value moved to `teploy secret` first so no password enters the config history")
 
 	return cmd
 }
@@ -410,4 +421,91 @@ func writePrivateTemplate(path string, content []byte) error {
 		return fmt.Errorf("refusing to replace existing output or unable to publish %s: %w", path, err)
 	}
 	return nil
+}
+
+// runTemplateInstallTeploy installs a template as a Teploy-home app (spec
+// §2.3): the rendered config is committed to the server's config
+// repository with every generated or --var-stdin value moved out first,
+// app env keys into the secret store and accessory env keys as secret:KEY
+// references, then deployed from that config.
+func runTemplateInstallTeploy(flags *Flags, name, domain, server string, port int, extraVars []string, stdinVars map[string]string) error {
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer cancel()
+
+	vars := templateVars(domain, extraVars, stdinVars)
+	content, generated, err := tmpl.NewRegistry().Fetch(ctx, name, vars)
+	if err != nil {
+		return err
+	}
+	content, err = persistTemplateOverrides(content, domain, "", port)
+	if err != nil {
+		return err
+	}
+	var secretValues []string
+	for _, v := range generated {
+		secretValues = append(secretValues, v)
+	}
+	for _, v := range stdinVars {
+		secretValues = append(secretValues, v)
+	}
+	clean, moved, err := confighome.ExtractSecrets([]byte(content), secretValues)
+	if err != nil {
+		return err
+	}
+	for _, k := range []string{"server", "servers"} {
+		if clean, err = confighome.EditPath(clean, k, nil); err != nil {
+			return err
+		}
+	}
+	parsed, err := config.ParseAppBytes(clean)
+	if err != nil {
+		return fmt.Errorf("invalid template: %w", err)
+	}
+	if _, err := confighome.Load(clean, parsed.App); err != nil {
+		return err
+	}
+
+	fmt.Printf("Installing template %q into Teploy home\n  App:    %s\n  Server: %s\n", name, parsed.App, server)
+	host, user, key, err := config.ResolveServer(server, flags.Host, flags.User, flags.Key)
+	if err != nil {
+		return err
+	}
+	executor, err := ssh.Connect(ctx, ssh.ConnectConfig{Host: host, User: user, KeyPath: key})
+	if err != nil {
+		return err
+	}
+	defer executor.Close()
+	t := &configTarget{app: parsed.App, server: server, exec: executor}
+	if err := func() error {
+		lk, release, err := lockConfigTarget(ctx, t)
+		if err != nil {
+			return err
+		}
+		defer release()
+		gate, err := confighome.CheckGate(ctx, executor, t.app, lk, os.Stdout)
+		if err != nil {
+			return err
+		}
+		if gate.Server {
+			return fmt.Errorf("%s already exists in Teploy (config %s) — edit it with `teploy config edit --app %s --host %s`", t.app, short12(gate.Head), t.app, server)
+		}
+		if st, err := state.Read(ctx, executor, t.app); err != nil {
+			return err
+		} else if st != nil {
+			return fmt.Errorf("%s is already deployed on %s from a folder — pick another app name", t.app, server)
+		}
+		mgr := secret.NewManager(executor)
+		for _, k := range sortedKeys(moved) {
+			if err := mgr.Set(ctx, t.app, k, moved[k]); err != nil {
+				return fmt.Errorf("storing secret %s: %w", k, err)
+			}
+		}
+		return commitHomeTeploy(ctx, t, lk, clean, "template install "+name, os.Stdout)
+	}(); err != nil {
+		return err
+	}
+	if len(moved) > 0 {
+		fmt.Printf("Stored %d secret(s) with `teploy secret`, never in the config: %s\n", len(moved), strings.Join(sortedKeys(moved), ", "))
+	}
+	return deployServerConfig(ctx, executor, host, server, t.app, "", "", false, false)
 }

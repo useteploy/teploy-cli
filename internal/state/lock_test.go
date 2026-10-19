@@ -354,3 +354,35 @@ func TestRenew_StagesOutsideLockDirAndUniqueNames(t *testing.T) {
 		t.Fatalf("expected two distinct owner-scoped staging names, got %v", staged)
 	}
 }
+
+// A contended acquisition names the holder; with --wait it retries until
+// the holder releases.
+func TestLockContentionNamesHolderAndWaits(t *testing.T) {
+	SetLockHolder("dash:alice operation op_1")
+	defer SetLockHolder("")
+	_, holderMock := takeFencedLock(t, "myapp")
+	held := holderMock.Files["/deployments/myapp/.lock/info"]
+	if !strings.Contains(string(held), `"holder":"dash:alice operation op_1"`) {
+		t.Fatalf("lock info does not name the holder: %s", held)
+	}
+
+	busy := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "mkdir /deployments/myapp/.lock", Err: errors.New("exit status 1")},
+		ssh.MockCommand{Match: "cat /deployments/myapp/.lock/info", Output: string(held)},
+	)
+	_, err := AcquireLockFenced(context.Background(), busy, "myapp")
+	if !errors.Is(err, ErrLockBusy) || !strings.Contains(err.Error(), "locked by dash:alice operation op_1") {
+		t.Fatalf("contended acquire = %v, want ErrLockBusy naming the holder", err)
+	}
+
+	SetLockWait(5 * time.Second)
+	defer SetLockWait(0)
+	freed := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "mkdir /deployments/myapp/.lock", Err: errors.New("exit status 1"), Once: true},
+		ssh.MockCommand{Match: "cat /deployments/myapp/.lock/info", Output: string(held), Once: true},
+		ssh.MockCommand{Match: "mkdir /deployments/myapp/.lock", Output: ""},
+	)
+	if _, err := AcquireLockFenced(context.Background(), freed, "myapp"); err != nil {
+		t.Fatalf("--wait must acquire once the holder releases: %v", err)
+	}
+}

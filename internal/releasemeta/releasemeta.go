@@ -29,6 +29,7 @@
 package releasemeta
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -139,6 +140,11 @@ type Record struct {
 	// Actor is the client that deployed this release (client-asserted,
 	// spec §2.5): "<client>[:<label>]".
 	Actor string `json:"actor,omitempty"`
+	// SourceSHA256 is the sha256 of meta/<hash>.source.yml, the folder
+	// teploy.yml this release deployed from with detected secret values
+	// masked (spec §2.5). A reader shows that file as the applied config
+	// only when its digest matches this.
+	SourceSHA256 string `json:"source_sha256,omitempty"`
 	// Provenance is the plan-time provenance the deploy resolved to
 	// (C04): revision, worktree cleanliness, build context fingerprint,
 	// Dockerfile identity, platform, image digest and mutability.
@@ -201,6 +207,24 @@ func Path(app, hash string) (string, error) {
 		return "", fmt.Errorf("invalid release id %q for app %q", hash, app)
 	}
 	return fmt.Sprintf("%s/%s/meta/%s.json", deploymentsDir, app, hash), nil
+}
+
+// SourcePath is the masked folder config a release deployed from.
+func SourcePath(app, hash string) (string, error) {
+	p, err := Path(app, hash)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSuffix(p, ".json") + ".source.yml", nil
+}
+
+// WriteSource stores the masked folder config for (app, hash), 0600.
+func WriteSource(ctx context.Context, exec ssh.Executor, app, hash string, data []byte) error {
+	p, err := SourcePath(app, hash)
+	if err != nil {
+		return err
+	}
+	return exec.Upload(ctx, bytes.NewReader(data), p, "0600")
 }
 
 // Read loads the record for (app, hash). A confirmed-missing record returns

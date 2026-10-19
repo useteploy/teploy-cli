@@ -548,6 +548,42 @@ type LockInfo struct {
 	// staleness is measured from it when present, so a live-but-slow
 	// deploy that renews is never broken as stale.
 	RenewTS string `json:"renew_ts,omitempty"`
+	// Holder names the client holding an "auto" lock (client-asserted
+	// actor and its operation id), so a refused contender can say who it
+	// is waiting for. Absent on locks written by older CLIs.
+	Holder string `json:"holder,omitempty"`
+}
+
+// lockHolder and lockWait are process-wide: the acting client (set once
+// from the CLI's --actor/--actor-op) and how long a contended acquisition
+// waits for the holder before refusing (--wait; 0 refuses immediately).
+var (
+	lockHolder string
+	lockWait   time.Duration
+)
+
+// SetLockHolder records who this process acquires locks as.
+func SetLockHolder(holder string) { lockHolder = holder }
+
+// SetLockWait sets how long a contended lock acquisition retries.
+func SetLockWait(d time.Duration) { lockWait = d }
+
+// ErrLockBusy marks a refusal because another operation holds the lock.
+var ErrLockBusy = errors.New("deploy is already in progress")
+
+func busyError(ctx context.Context, exec ssh.Executor, app string) error {
+	info, _ := ReadLock(ctx, exec, app)
+	if info == nil || info.Type == "manual" {
+		return fmt.Errorf("%w for %s", ErrLockBusy, app)
+	}
+	who := info.Holder
+	if who == "" {
+		who = "an operation"
+		if info.Type == "heal" {
+			who = "a heal restart"
+		}
+	}
+	return fmt.Errorf("%w for %s (locked by %s since %s; pass --wait <duration> to wait for it)", ErrLockBusy, app, who, info.TS)
 }
 
 // ReadLock reads the lock info for an app. Returns nil if no lock exists.
@@ -598,6 +634,21 @@ func AcquireLock(ctx context.Context, exec ssh.Executor, app string) error {
 // replacement owner must reconcile the observed world before its own
 // effects, never treat acquisition as quiescence.
 func acquireAutoLock(ctx context.Context, exec ssh.Executor, app, owner string) (bool, error) {
+	deadline := time.Now().Add(lockWait)
+	for {
+		tookOver, err := acquireAutoLockOnce(ctx, exec, app, owner)
+		if err == nil || !errors.Is(err, ErrLockBusy) || lockWait <= 0 || time.Now().After(deadline) {
+			return tookOver, err
+		}
+		select {
+		case <-ctx.Done():
+			return false, err
+		case <-time.After(2 * time.Second):
+		}
+	}
+}
+
+func acquireAutoLockOnce(ctx context.Context, exec ssh.Executor, app, owner string) (bool, error) {
 	tookOver := false
 	lockPath := fmt.Sprintf("%s/%s/.lock", deploymentsDir, app)
 	if _, err := tryMkdirLock(ctx, exec, lockPath); err != nil {
@@ -616,7 +667,7 @@ func acquireAutoLock(ctx context.Context, exec ssh.Executor, app, owner string) 
 				// Someone else's deploy won the race to re-acquire right
 				// after we broke the stale lock — fall through to the
 				// normal "in progress" error below.
-				return false, fmt.Errorf("deploy is already in progress for %s", app)
+				return false, busyError(ctx, exec, app)
 			}
 			tookOver = true
 			return tookOver, writeLockInfo(ctx, exec, lockPath, app, owner)
@@ -629,12 +680,12 @@ func acquireAutoLock(ctx context.Context, exec ssh.Executor, app, owner string) 
 		if info != nil && info.Type == "heal" && isHealStale(info.TS) {
 			ReleaseLock(ctx, exec, app)
 			if _, retryErr := tryMkdirLock(ctx, exec, lockPath); retryErr != nil {
-				return false, fmt.Errorf("deploy is already in progress for %s", app)
+				return false, busyError(ctx, exec, app)
 			}
 			tookOver = true
 			return tookOver, writeLockInfo(ctx, exec, lockPath, app, owner)
 		}
-		return false, fmt.Errorf("deploy is already in progress for %s", app)
+		return false, busyError(ctx, exec, app)
 	}
 	return false, writeLockInfo(ctx, exec, lockPath, app, owner)
 }
@@ -645,9 +696,10 @@ func tryMkdirLock(ctx context.Context, exec ssh.Executor, lockPath string) (stri
 
 func writeLockInfo(ctx context.Context, exec ssh.Executor, lockPath, app, owner string) error {
 	info, _ := json.Marshal(LockInfo{
-		Type:  "auto",
-		Owner: owner,
-		TS:    time.Now().UTC().Format(time.RFC3339),
+		Type:   "auto",
+		Owner:  owner,
+		TS:     time.Now().UTC().Format(time.RFC3339),
+		Holder: lockHolder,
 	})
 	if err := exec.Upload(ctx, bytes.NewReader(info), lockPath+"/info", "0644"); err != nil {
 		// Lock directory was created but info file failed — release and return error.

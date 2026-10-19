@@ -1,6 +1,7 @@
 package backup
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/useteploy/teploy/internal/accessories"
 	"github.com/useteploy/teploy/internal/config"
+	"github.com/useteploy/teploy/internal/confighome"
 	"github.com/useteploy/teploy/internal/docker"
 	"github.com/useteploy/teploy/internal/releasemeta"
 	"github.com/useteploy/teploy/internal/secret"
@@ -98,6 +100,10 @@ type BundleRestoreOptions struct {
 	App    string
 	ID     string
 	Config config.AppConfig // the restore-time local teploy.yml
+	// Home resolves a config-home mismatch at cutover between the bundle
+	// and an existing target app: "bundle" installs the bundle's home and
+	// config, "current" keeps the target's. Empty refuses a mismatch.
+	Home string
 	// Now overrides the clock (tests).
 	Now func() time.Time
 }
@@ -155,6 +161,23 @@ func (c *Client) RestoreBundleIsolated(ctx context.Context, opts BundleRestoreOp
 	if manifest.Secrets.AgeKeyIncluded {
 		if err := store.Download(ctx, c.exec, opts.App, manifest.ID, "age-key", staging+"/age-key"); err != nil {
 			return nil, err
+		}
+	}
+	if h := manifest.ConfigHome; h != nil && h.Member != "" {
+		if _, err := c.exec.Run(ctx, "mkdir -p "+ssh.ShellQuote(staging+"/teploy")); err != nil {
+			return nil, fmt.Errorf("preparing staging layout: %w", err)
+		}
+		if err := store.Download(ctx, c.exec, opts.App, manifest.ID, h.Member, staging+"/"+h.Member); err != nil {
+			return nil, err
+		}
+		// The member must be a readable archive, and a Teploy-home bundle
+		// must actually carry its config repository.
+		listing, err := c.exec.Run(ctx, "tar -tzf "+ssh.ShellQuote(staging+"/"+h.Member))
+		if err != nil {
+			return nil, fmt.Errorf("bundle member %s is corrupt: %w — refusing to restore from this bundle", h.Member, err)
+		}
+		if h.Home == "teploy" && !strings.Contains(listing, "config.git/HEAD") {
+			return nil, fmt.Errorf("bundle member %s does not contain the app's config repository — refusing to restore from this bundle", h.Member)
 		}
 	}
 	// Keep the manifest itself in staging: cutover re-reads it without the
@@ -680,13 +703,22 @@ func (c *Client) CutoverBundle(ctx context.Context, opts BundleRestoreOptions) (
 	}
 
 	// App lock: cutover is a mutating critical section like a deploy (C01).
+	// On a fresh host the app directory (where the lock lives) does not
+	// exist yet.
+	if err := state.EnsureAppDir(ctx, c.exec, opts.App); err != nil {
+		return nil, fmt.Errorf("preparing the app directory for cutover: %w", err)
+	}
 	lk, err := state.AcquireLockFenced(ctx, c.exec, opts.App)
 	if err != nil {
 		return nil, fmt.Errorf("acquiring the app lock for cutover: %w", err)
 	}
 	defer state.ReleaseLockFenced(c.exec, lk, opts.App)
 	lk.StartRenewal(c.exec)
-	current, err := state.Read(ctx, c.exec, opts.App)
+	current, err := state.ReadIncludingTombstone(ctx, c.exec, opts.App)
+	if err != nil {
+		return nil, err
+	}
+	home, err := c.resolveCutoverHome(ctx, manifest, opts, current != nil)
 	if err != nil {
 		return nil, err
 	}
@@ -890,7 +922,7 @@ func (c *Client) CutoverBundle(ctx context.Context, opts BundleRestoreOptions) (
 	// State, release records, and secret material land LAST — after all
 	// data promotions succeeded, so a failed promotion never leaves the
 	// target claiming a generation it does not have.
-	if err := c.installBundleState(ctx, manifest, staging, lk, baseGeneration); err != nil {
+	if err := c.installBundleState(ctx, manifest, staging, lk, baseGeneration, home); err != nil {
 		return fail(fmt.Errorf("installing restored state: %w", err))
 	}
 
@@ -994,7 +1026,7 @@ func (c *Client) installReleaseRecords(ctx context.Context, appDir string, recor
 	return nil
 }
 
-func (c *Client) installBundleState(ctx context.Context, manifest *BundleManifest, staging string, lk *state.Lock, baseGeneration uint64) error {
+func (c *Client) installBundleState(ctx context.Context, manifest *BundleManifest, staging string, lk *state.Lock, baseGeneration uint64, home cutoverHome) error {
 	appDir := fmt.Sprintf("%s/%s", deploymentsDir, manifest.App)
 	if _, err := c.exec.Run(ctx, "mkdir -p "+ssh.ShellQuote(appDir+"/meta")+" "+ssh.ShellQuote(appDir+"/secrets")); err != nil {
 		return fmt.Errorf("preparing state dirs: %w", err)
@@ -1043,6 +1075,24 @@ func (c *Client) installBundleState(ctx context.Context, manifest *BundleManifes
 	var restored state.AppState
 	if err := json.Unmarshal(manifest.State, &restored); err != nil {
 		return err
+	}
+	if err := c.installConfigHome(ctx, manifest, staging, home); err != nil {
+		return err
+	}
+	// The home marker follows the home the app ends up with (v3 <=>
+	// config.git exists).
+	// The bundle manifest is pretty-printed, which re-indents the embedded
+	// state's applied_manifest; its digest is over the compact form.
+	if len(restored.AppliedManifest) > 0 {
+		var compact bytes.Buffer
+		if err := json.Compact(&compact, restored.AppliedManifest); err != nil {
+			return fmt.Errorf("bundled applied manifest: %w", err)
+		}
+		restored.AppliedManifest = compact.Bytes()
+	}
+	restored.SchemaVersion = state.SchemaVersionV2
+	if home.final == "teploy" {
+		restored.SchemaVersion = state.SchemaVersionV3
 	}
 	restored.Generation = baseGeneration + 1
 	restored.OperationID = "dr-cutover-" + manifest.ID
@@ -1175,3 +1225,139 @@ func (c *Client) cleanupDRScratch(ctx context.Context, id, owner string) error {
 	_, err = c.exec.Run(cleanup, "docker rm -f "+ssh.ShellQuote(id))
 	return err
 }
+
+// cutoverHome is how a cutover reconciles the bundle's config home with
+// the target's.
+type cutoverHome struct {
+	final         string // "folder" | "teploy"
+	installConfig bool   // install the bundle's config.git
+	archiveTarget bool   // move the target's config.git aside first
+	mergeEvents   bool   // import the bundle's events (by id)
+}
+
+// resolveCutoverHome decides the app's home after cutover (spec §3.1). A
+// fresh target takes the bundle's home; an existing app whose home (or
+// Teploy config head) differs needs --home=bundle|current.
+func (c *Client) resolveCutoverHome(ctx context.Context, manifest *BundleManifest, opts BundleRestoreOptions, targetHasState bool) (cutoverHome, error) {
+	if opts.Home != "" && opts.Home != "bundle" && opts.Home != "current" {
+		return cutoverHome{}, fmt.Errorf("--home must be bundle or current, got %q", opts.Home)
+	}
+	bundleHome, bundleCommit := "folder", ""
+	res := cutoverHome{}
+	if h := manifest.ConfigHome; h != nil {
+		bundleHome, bundleCommit = h.Home, h.Commit
+		res.mergeEvents = h.Member != ""
+	}
+	exists, head, err := confighome.Head(ctx, c.exec, manifest.App)
+	if err != nil {
+		return res, err
+	}
+	targetHome := "folder"
+	if exists {
+		targetHome = "teploy"
+	}
+	switch {
+	case (!targetHasState && !exists) || (bundleHome == targetHome && (bundleHome == "folder" || bundleCommit == head)):
+		res.final = bundleHome
+		res.installConfig = bundleHome == "teploy" && !exists
+	case opts.Home == "bundle":
+		res.final = bundleHome
+		res.installConfig = bundleHome == "teploy"
+		res.archiveTarget = exists
+	case opts.Home == "current":
+		res.final = targetHome
+	default:
+		return res, fmt.Errorf("config home mismatch: the bundle's %s was edited in %s%s, the target's in %s%s — pass --home=bundle to restore the bundle's settings home, or --home=current to keep the target's", manifest.App, bundleHome, commitNote(bundleCommit), targetHome, commitNote(head))
+	}
+	var st state.AppState
+	if err := json.Unmarshal(manifest.State, &st); err == nil && st.Tombstone && res.final == "folder" {
+		return res, fmt.Errorf("the bundle holds no deployed release of %s (it was a Teploy-home app that was not deployed) — restore with --home=bundle or redeploy instead", manifest.App)
+	}
+	return res, nil
+}
+
+func commitNote(c string) string {
+	if len(c) < 12 {
+		return ""
+	}
+	return " (config " + c[:12] + ")"
+}
+
+// installConfigHome installs the bundle's server data for the app:
+// config.git (when the bundle's home wins) and its event history, merged
+// by event id onto the target's so nothing recorded on either side is
+// lost and sequence numbers keep increasing.
+func (c *Client) installConfigHome(ctx context.Context, manifest *BundleManifest, staging string, home cutoverHome) error {
+	if !home.installConfig && !home.archiveTarget && !home.mergeEvents {
+		return nil
+	}
+	dir := confighome.Dir(manifest.App)
+	extract := staging + "/teploy-extract"
+	prep := fmt.Sprintf("umask 077; mkdir -p %s && chmod 700 %s %s %s",
+		ssh.ShellQuote(dir), ssh.ShellQuote(dirOf(dirOf(dir))), ssh.ShellQuote(dirOf(dir)), ssh.ShellQuote(dir))
+	if manifest.ConfigHome != nil && manifest.ConfigHome.Member != "" {
+		prep += fmt.Sprintf(" && rm -rf %s && mkdir -p %s && tar -xzf %s -C %s",
+			ssh.ShellQuote(extract), ssh.ShellQuote(extract), ssh.ShellQuote(staging+"/"+manifest.ConfigHome.Member), ssh.ShellQuote(extract))
+	}
+	if _, err := c.exec.Run(ctx, prep); err != nil {
+		return fmt.Errorf("preparing %s: %w", dir, err)
+	}
+	if home.archiveTarget {
+		if _, err := c.exec.Run(ctx, fmt.Sprintf("mv %s %s", ssh.ShellQuote(dir+"/config.git"), ssh.ShellQuote(fmt.Sprintf("%s/config.git.archived-%d", dir, time.Now().Unix())))); err != nil {
+			return fmt.Errorf("archiving the target's config: %w", err)
+		}
+		fmt.Fprintf(c.out, "Archived the target's Teploy config of %s\n", manifest.App)
+	}
+	if home.installConfig {
+		if _, err := c.exec.Run(ctx, fmt.Sprintf("cp -a %s %s && chmod 700 %s", ssh.ShellQuote(extract+"/config.git"), ssh.ShellQuote(dir+"/config.git"), ssh.ShellQuote(dir+"/config.git"))); err != nil {
+			return fmt.Errorf("installing the bundled config: %w", err)
+		}
+		fmt.Fprintf(c.out, "Installed %s's Teploy config from the bundle\n", manifest.App)
+	}
+	if home.mergeEvents {
+		out, err := c.exec.Run(ctx, "python3 -c "+ssh.ShellQuote(mergeEventsHelper)+" "+ssh.ShellQuote(dir)+" "+ssh.ShellQuote(extract))
+		if err != nil {
+			return fmt.Errorf("merging the bundled event history: %w", err)
+		}
+		if n := strings.TrimSpace(out); n != "0" {
+			fmt.Fprintf(c.out, "Imported %s events from the bundle\n", n)
+		}
+	}
+	return nil
+}
+
+// mergeEventsHelper appends the bundle's events whose id the target does
+// not have, oldest first, renumbered after the target's last seq, under
+// the event writer's lock.
+const mergeEventsHelper = `
+import fcntl, json, os, sys
+d, src = sys.argv[1], sys.argv[2]
+KEEP = 5
+lk = os.open(os.path.join(d, "events.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+fcntl.flock(lk, fcntl.LOCK_EX)
+def load(base):
+    out = []
+    for name in ["events.jsonl.%d" % i for i in range(KEEP, 0, -1)] + ["events.jsonl"]:
+        try:
+            with open(os.path.join(base, name), "rb") as f:
+                for l in f:
+                    try:
+                        out.append(json.loads(l))
+                    except Exception:
+                        pass
+        except FileNotFoundError:
+            pass
+    return out
+have = load(d)
+ids = set(e.get("id") for e in have)
+seq = max([int(e.get("seq", 0)) for e in have] or [0])
+new = sorted([e for e in load(src) if e.get("id") not in ids], key=lambda e: (str(e.get("ts", "")), int(e.get("seq", 0))))
+fd = os.open(os.path.join(d, "events.jsonl"), os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+for e in new:
+    seq += 1
+    e["seq"] = seq
+    os.write(fd, (json.dumps(e, separators=(",", ":"), sort_keys=True) + "\n").encode())
+os.fsync(fd)
+os.close(fd)
+print(len(new))
+`

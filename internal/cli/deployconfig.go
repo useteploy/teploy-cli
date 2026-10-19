@@ -49,5 +49,6 @@ func deployConfigFromApp(appCfg *config.AppConfig, image, version string, envFil
 		AppliedManifest: appliedManifest,
 		SourceRevision:  appCfg.SourceRevision,
 		ConfigCommit:    appCfg.ConfigCommit,
+		SourceYAML:      appCfg.SourceYAML,
 	}
 }

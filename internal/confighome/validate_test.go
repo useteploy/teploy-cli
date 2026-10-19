@@ -78,3 +78,19 @@ func TestLoadKeepsShellVarsOutsideEnv(t *testing.T) {
 		t.Fatalf("$VAR outside env: is never expanded and must be accepted: %v", err)
 	}
 }
+
+func TestMaskSourceHidesDetectedSecrets(t *testing.T) {
+	raw := []byte("# blog\napp: blog\nserver: prod\nenv:\n  LOG_LEVEL: info\n  API_TOKEN: abc123\n  DATABASE_URL: postgres://u:pw@db/blog\naccessories:\n  db:\n    image: postgres:16\n    env:\n      POSTGRES_PASSWORD: hunter2\naudit:\n  token: t0k3n\n")
+	out, err := MaskSource(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, leaked := range []string{"abc123", "u:pw@", "hunter2", "t0k3n"} {
+		if strings.Contains(string(out), leaked) {
+			t.Fatalf("%q survived masking:\n%s", leaked, out)
+		}
+	}
+	if !strings.Contains(string(out), "LOG_LEVEL: info") || !strings.HasPrefix(string(out), "# blog\n") {
+		t.Fatalf("plain values or comments lost:\n%s", out)
+	}
+}

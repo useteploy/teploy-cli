@@ -443,4 +443,10 @@ func TestContractsConfigHomeGolden(t *testing.T) {
 		ImageRef: "example/blog:1.4.0", ImageDigest: "sha256:0000", ManifestSHA256: "sha256:beef",
 		ConfigCommit: head, Actor: "dash:alice",
 	})
+	writeFixture(t, "release-record/valid/container-folder-source.json", releasemeta.Record{
+		SchemaVersion: 1, App: "legacy", Hash: "abc1234", CreatedAt: ts,
+		DeploymentType: "container", IngressMode: "caddy", Domain: "legacy.example.com",
+		ImageRef: "example/legacy:abc1234", ImageDigest: "sha256:0000", ManifestSHA256: "sha256:beef",
+		SourceSHA256: "3f0a4c6e9d1b2a5f7e8c0d4b6a9f1e3c5b7d9a0e2f4c6b8d0a1c3e5f7b9d1a3c", Actor: "cli:tyler@laptop",
+	})
 }
