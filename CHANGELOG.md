@@ -4,6 +4,15 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+### Fixed
+
+- `teploy doctor`'s secret-exposure scan no longer aborts with "could not
+  scan /deployments" for a non-root SSH user: directories it cannot read
+  (database data and backup dirs owned by another uid) are skipped. Build
+  contexts are always the deploy user's own, so nothing reportable is lost.
+- The same scan no longer counts templates (`*.example`, `*.sample`,
+  `*.template`) as secret-bearing files.
+
 ## [0.1.42] - 2026-10-19
 
 ### Security
