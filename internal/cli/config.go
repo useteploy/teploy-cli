@@ -45,7 +45,8 @@ A Teploy-home teploy.yml holds no secrets and is never expanded from anyone's
 environment: $VAR references are refused (write $$ for a literal $), and
 secret values go in 'teploy secret set'.`,
 	}
-	cmd.AddCommand(newConfigGetCmd(flags), newConfigSetCmd(flags), newConfigEditCmd(flags),
+	cmd.PersistentFlags().BoolVar(&flags.ConfigUnprivileged, "unprivileged", false, "refuse any change that reaches the host (host-bind volumes, caddy_extra, published or host ports, bind/ingress/network) — for editors without the admin role")
+	cmd.AddCommand(newConfigGetCmd(flags), newConfigSetCmd(flags), newConfigEditCmd(flags), newConfigMergeCmd(flags),
 		newConfigDiffCmd(flags), newConfigHistoryCmd(flags), newConfigRestoreCmd(flags),
 		newConfigPullCmd(flags), newConfigPushCmd(flags), newConfigHomeCmd(flags),
 		newConfigPurgeHistoryCmd(flags))
@@ -57,6 +58,9 @@ type configTarget struct {
 	app    string
 	server string
 	exec   ssh.Executor
+	// unprivileged refuses any write whose change reaches the host
+	// (--unprivileged: a dash editor without the admin capability).
+	unprivileged bool
 }
 
 // pulledHeaderRE matches the first line `teploy config pull` writes, which
@@ -121,7 +125,7 @@ func openConfigTarget(ctx context.Context, flags *Flags, appName string) (*confi
 	if err != nil {
 		return nil, err
 	}
-	return &configTarget{app: appName, server: server, exec: ex}, nil
+	return &configTarget{app: appName, server: server, exec: ex, unprivileged: flags.ConfigUnprivileged}, nil
 }
 
 func configAuthor() confighome.Author {
@@ -137,6 +141,9 @@ type configConflictError struct {
 }
 
 var errConfigConflict = errors.New("config conflict")
+
+// errConfigPrivileged refuses a privileged change under --unprivileged.
+var errConfigPrivileged = errors.New("privileged config change refused")
 
 func (e *configConflictError) Error() string {
 	return fmt.Sprintf("%s's config changed since you read it (now at %s) — re-read it and retry, or use `teploy config edit` to merge", e.app, e.current)
@@ -164,6 +171,9 @@ func commitConfig(ctx context.Context, t *configTarget, prev, next []byte, expec
 		prevCfg, _ = config.LoadAppBytes(prev)
 	}
 	privileged := confighome.PrivilegedChange(prevCfg, nextCfg)
+	if privileged && t.unprivileged {
+		return "", refuseAdmission(fmt.Errorf("%w: this change to %s reaches the host (host-bind volumes, caddy_extra, published or host ports, bind address, ingress or network) and needs an administrator", errConfigPrivileged, t.app))
+	}
 	commit, err := confighome.Write(ctx, t.exec, t.app, next, expect, configAuthor(), message)
 	if err != nil {
 		return "", wrapConfigWriteErr(t.app, err)
@@ -911,6 +921,10 @@ func runConfigHomeTeployFromServer(ctx context.Context, flags *Flags, appName st
 	if err != nil {
 		return refuseAdmission(err)
 	}
+	// The seed reproduces what already runs: adopting it changes nothing on
+	// the host, so it is not a privileged change even under --unprivileged
+	// (later edits of those fields still are).
+	t.unprivileged = false
 	return commitHomeTeploy(ctx, t, lk, seed, "config home teploy (rebuilt from the server)", out)
 }
 
@@ -1096,4 +1110,85 @@ func warnDollarEscapes(out io.Writer, content []byte, why string) {
 			fmt.Fprintf(out, "Warning: env.%s contains $$ — %s; check the value\n", k, why)
 		}
 	}
+}
+
+// configMergeDTO is `config merge --json`: the key-level three-way merge of
+// an edit made from base against the current head. Read-only.
+type configMergeDTO struct {
+	MachineInterface int              `json:"machine_interface"`
+	Host             string           `json:"host"`
+	App              string           `json:"app"`
+	Base             string           `json:"base"`
+	Current          string           `json:"current"`
+	Merged           string           `json:"merged"`
+	Conflicts        []configConflict `json:"conflicts"`
+}
+
+type configConflict struct {
+	Key     string `json:"key"`
+	Mine    any    `json:"mine"`
+	Current any    `json:"current"`
+	// MineRemoved / CurrentRemoved distinguish a deleted key from a null.
+	MineRemoved    bool `json:"mine_removed,omitempty"`
+	CurrentRemoved bool `json:"current_removed,omitempty"`
+}
+
+func newConfigMergeCmd(flags *Flags) *cobra.Command {
+	var appName, base, file string
+	cmd := &cobra.Command{
+		Use:   "merge",
+		Short: "Merge an edit made from an older commit with the current config (read-only)",
+		Long: `Reads the edited teploy.yml (--file, - for stdin) that was made from --base and
+merges it key by key with the current config: keys only one side changed are
+taken from that side. Prints the merged config and the keys both sides
+changed differently (merged holds your value for those). Nothing is written:
+save the result with ` + "`teploy config set --file - --expect <current>`" + `.`,
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if base == "" || file == "" {
+				return fmt.Errorf("--base <commit> and --file are required")
+			}
+			mine, err := readConfigFile(file, cmd.InOrStdin())
+			if err != nil {
+				return err
+			}
+			ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+			defer cancel()
+			t, err := openConfigTarget(ctx, flags, appName)
+			if err != nil {
+				return err
+			}
+			defer t.exec.Close()
+			baseContent, baseCommit, err := confighome.Read(ctx, t.exec, t.app, base)
+			if err != nil {
+				return err
+			}
+			theirs, current, err := readHead(ctx, t)
+			if err != nil {
+				return err
+			}
+			merged, keys, err := confighome.Merge3(baseContent, mine, theirs)
+			if err != nil {
+				return err
+			}
+			dto := configMergeDTO{MachineInterface: MachineInterface, Host: t.exec.Host(), App: t.app, Base: baseCommit, Current: current, Merged: string(merged), Conflicts: []configConflict{}}
+			for _, k := range keys {
+				mv, mok := confighome.GetPath(mine, k)
+				tv, tok := confighome.GetPath(theirs, k)
+				dto.Conflicts = append(dto.Conflicts, configConflict{Key: k, Mine: mv, Current: tv, MineRemoved: !mok, CurrentRemoved: !tok})
+			}
+			if flags.JSON {
+				return json.NewEncoder(cmd.OutOrStdout()).Encode(dto)
+			}
+			fmt.Fprint(cmd.OutOrStdout(), confighome.Diff("current "+short12(current), "merged", theirs, merged))
+			for _, c := range dto.Conflicts {
+				fmt.Fprintf(cmd.OutOrStdout(), "conflict %s: yours %s, current %s (merged keeps yours)\n", c.Key, renderValue(c.Mine, !c.MineRemoved), renderValue(c.Current, !c.CurrentRemoved))
+			}
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&appName, "app", "", "app name (default: the app in ./teploy.yml)")
+	cmd.Flags().StringVar(&base, "base", "", "the commit the edit was made from")
+	cmd.Flags().StringVar(&file, "file", "", "the edited teploy.yml (- for stdin)")
+	return cmd
 }

@@ -54,7 +54,7 @@ func TestEditPathKeepsCommentsAndOrder(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasPrefix(string(out), "# blog\napp: blog\nimage: \"nginx:2\" # pinned\n") {
+	if !strings.HasPrefix(string(out), "# blog\napp: blog\nimage: nginx:2 # pinned\n") {
 		t.Fatalf("comments/order not kept:\n%s", out)
 	}
 	b := "debug"
@@ -80,5 +80,19 @@ func TestChangedKeys(t *testing.T) {
 	want := "domain,env.B,env.C,image"
 	if strings.Join(got, ",") != want {
 		t.Fatalf("ChangedKeys = %v, want %s", got, want)
+	}
+}
+
+func TestEditPathBuildsFromEmpty(t *testing.T) {
+	var doc []byte
+	var err error
+	for _, kv := range [][2]string{{"app", "blog"}, {"image", `"nginx:1.27"`}, {"port", "8080"}} {
+		v := kv[1]
+		if doc, err = EditPath(doc, kv[0], &v); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if string(doc) != "app: blog\nimage: nginx:1.27\nport: 8080\n" {
+		t.Fatalf("got %q", doc)
 	}
 }

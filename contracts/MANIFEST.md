@@ -10,6 +10,7 @@ Neutron/Nucleus dependency and a public mirror.
 
 | Corpus rev | Emitting CLI | Machine Interface | Notes |
 |---|---|---|---|
+| 13 | main (server-authority spec P2 support) | 2 | Additive. New artifact config-merge-envelope (`teploy config merge --base <commit> --file - --json`: merged config + conflicting keys, read-only), fixture GENERATED from the real configMergeDTO. version-handshake advertises `config-merge-v1`, `config-unprivileged-v1` (`config ... --unprivileged` refuses host-reaching changes) and `deploy-home-v1` (`deploy --app X --image T --home teploy` creates a new Teploy-home app) (regenerated mi2.json). No MI bump. |
 | 12 | main (server-authority spec P1 tail) | 2 | Additive. release-record gains optional `source_sha256` (folder-home deploys store the deployed teploy.yml, detected secrets masked, as meta/<hash>.source.yml 0600) with a new valid fixture. version-handshake advertises `lock-wait-v1` (global `--wait <duration>`; lock refusals name the holder) (regenerated mi2.json). `config-home-v1` now also covers `config home teploy --from-server`, `init --from-server` and `template install --home teploy`. DR bundles are schema 2 (config home + server data); they are not a wire artifact of this corpus. No MI bump. |
 | 11 | main (server-authority spec P1, config home) | 2 | Additive. New artifacts config-envelope (`teploy config get|home|set --json`: home folder/teploy, config commit, applied_commit of the running release, content) and config-history-envelope (`config history --json`), fixtures GENERATED from the real DTOs (teploy-home with config changed since deploy, folder-home, two-commit history). app-list-envelope gains optional `undeployed[]` (`--include-undeployed`, v3 tombstones) with a new valid fixture; release-record gains optional `config_commit` and `actor` with a new valid fixture. version-handshake advertises `config-home-v1` and `undeployed-list-v1` (regenerated mi2.json). State schema v3 (v2 + `tombstone`) marks Teploy-home apps; it is server state, not a wire artifact, and older CLIs refuse it by design. No MI bump. |
 | 10 | main (server-authority spec P1, events) | 2 | Additive. New artifact events-envelope: `teploy events --json` (per-app server event history, `/deployments/.teploy/apps/<app>/events.jsonl`), schema + one valid fixture GENERATED from the real `writeEventsJSON` encoder (started/succeeded deploy pair + key-names-only env.set). version-handshake advertises `events-v1` and `actor-flag-v1` (regenerated mi2.json). No MI bump. |
@@ -42,6 +43,7 @@ Neutron/Nucleus dependency and a public mirror.
 | events-envelope | yes (rev 10) | valid (real `writeEventsJSON` encoder) | teploy-cli |
 | config-envelope | yes (rev 11) | valid x2 (teploy-home, folder-home; real configDTO) | teploy-cli |
 | config-history-envelope | yes (rev 11) | valid (real configHistoryDTO) | teploy-cli |
+| config-merge-envelope | yes (rev 13) | valid (real configMergeDTO) | teploy-cli |
 
 ## Rules
 
