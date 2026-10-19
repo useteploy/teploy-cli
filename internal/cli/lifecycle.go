@@ -78,6 +78,7 @@ func runLifecycle(flags *Flags, appName, action string) error {
 	case "restart":
 		err = lc.Restart(ctx, appCfg.App, stopTimeout)
 	}
+	recordAppEvent(ctx, executor, appCfg.App, action, err, nil)
 
 	// Fire notification (best-effort). buildNotifier, not NewNotifier — see the
 	// note in rollback.go: reading only the legacy `notifications.webhook` key

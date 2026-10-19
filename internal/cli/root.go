@@ -1,10 +1,16 @@
 package cli
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/useteploy/teploy/internal/events"
+	"github.com/useteploy/teploy/internal/ssh"
 	"github.com/useteploy/teploy/internal/trigger"
 	"os"
+	"os/user"
+	"sort"
+	"strings"
 
 	"github.com/spf13/cobra"
 )
@@ -23,6 +29,11 @@ type Flags struct {
 	// (`env: {}` means "no env"). Default off: deploys relying on
 	// empty-expansion keep working.
 	StrictEnv bool
+	// Actor names the client recorded in the server event history
+	// ("<client>[:<label>]", e.g. dash:alice); ActorOp links the event to
+	// the client's own operation record. Both are client-asserted.
+	Actor   string
+	ActorOp string
 }
 
 func NewRootCmd(version string) *cobra.Command {
@@ -35,6 +46,7 @@ func NewRootCmd(version string) *cobra.Command {
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+			events.SetProcessActor(resolveActor(flags, version))
 			if flags.ProjectDir == "" {
 				return nil
 			}
@@ -58,6 +70,8 @@ func NewRootCmd(version string) *cobra.Command {
 	root.PersistentFlags().StringVar(&flags.Key, "key", "", "path to SSH private key")
 	root.PersistentFlags().StringVar(&flags.ProjectDir, "project-dir", "", "run as if teploy was started in this directory")
 	root.PersistentFlags().BoolVar(&flags.JSON, "json", false, "output in JSON format")
+	root.PersistentFlags().StringVar(&flags.Actor, "actor", "", "client recorded in the server event history, as <client>[:<label>] (default cli:<user>@<host>, or $TEPLOY_ACTOR)")
+	root.PersistentFlags().StringVar(&flags.ActorOp, "actor-op", "", "the calling client's operation id, recorded with each event")
 	root.PersistentFlags().BoolVar(&flags.StrictEnv, "strict-env", false, "strict env/overlay mode: fail on unset ${VAR} in env:, and let an empty map/list in a destination overlay explicitly clear the base value")
 
 	root.AddCommand(newDeployCmd(flags))
@@ -65,6 +79,7 @@ func NewRootCmd(version string) *cobra.Command {
 	root.AddCommand(newBuildCmd(flags))
 	root.AddCommand(newExecCmd(flags))
 	root.AddCommand(newAppCmd(flags))
+	root.AddCommand(newEventsCmd(flags))
 	root.AddCommand(newSetupCmd(flags))
 	root.AddCommand(newAccessoryCmd(flags))
 	root.AddCommand(newKvCmd(flags))
@@ -116,4 +131,60 @@ func Execute(version string) {
 		reportExecutionError(root, err, os.Stderr)
 		os.Exit(1)
 	}
+}
+
+// resolveActor builds the event actor: --actor, else $TEPLOY_ACTOR, else
+// cli:<user>@<host>. Labels are bounded and stripped of control bytes so a
+// client cannot smuggle structure into the log.
+func resolveActor(flags *Flags, version string) events.Actor {
+	raw := flags.Actor
+	if raw == "" {
+		raw = os.Getenv("TEPLOY_ACTOR")
+	}
+	client, label, _ := strings.Cut(raw, ":")
+	if client == "" {
+		client = "cli"
+		label = localActorLabel()
+	}
+	return events.Actor{Client: cleanActorPart(client, 32), Label: cleanActorPart(label, 128), CLIVersion: version, Op: cleanActorPart(flags.ActorOp, 128)}
+}
+
+func localActorLabel() string {
+	name := os.Getenv("USER")
+	if u, err := user.Current(); err == nil && u.Username != "" {
+		name = u.Username
+	}
+	host, _ := os.Hostname()
+	if host == "" {
+		return name
+	}
+	return name + "@" + host
+}
+
+func cleanActorPart(s string, max int) string {
+	s = strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, strings.TrimSpace(s))
+	if len(s) > max {
+		s = s[:max]
+	}
+	return s
+}
+
+// recordAppEvent appends a terminal event for a CLI-level command to the
+// app's server history (warns, never fails the command).
+func recordAppEvent(ctx context.Context, exec ssh.Executor, app, kind string, err error, detail map[string]any) {
+	events.Record(ctx, exec, events.Event{App: app, Kind: kind, Outcome: events.Outcome(err), Detail: events.ErrDetail(detail, err)})
+}
+
+func sortedKeys(m map[string]string) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }

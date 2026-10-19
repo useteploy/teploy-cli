@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"sort"
 	"testing"
 	"time"
 
@@ -103,6 +104,8 @@ func TestCapabilityTokenRegistry(t *testing.T) {
 		"template-var-stdin",
 		"trigger-convergence-v1",
 	}
+	want = append(want, "actor-flag-v1", "events-v1")
+	sort.Strings(want)
 	got := MachineCapabilities()
 	if len(got) != len(want) {
 		t.Fatalf("capability registry drifted: got %v, want %v", got, want)

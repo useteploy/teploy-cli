@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"fmt"
+	"github.com/useteploy/teploy/internal/events"
 	"os"
 	"os/signal"
 
@@ -109,13 +110,17 @@ func runMaintenanceToggle(flags *Flags, appName string, enable bool) error {
 
 	if enable {
 		fmt.Printf("Enabling maintenance mode for %s (%s)...\n", appCfg.App, appCfg.Domain)
-		if err := client.SetMaintenance(ctx, appCfg.App, appCfg.Domain); err != nil {
+		err := client.SetMaintenance(ctx, appCfg.App, appCfg.Domain)
+		recordAppEvent(ctx, executor, appCfg.App, events.KindMaintenanceOn, err, nil)
+		if err != nil {
 			return fmt.Errorf("enabling maintenance mode: %w", err)
 		}
 		fmt.Println("Maintenance mode enabled — all visitors see 503 page")
 	} else {
 		fmt.Printf("Disabling maintenance mode for %s...\n", appCfg.App)
-		if err := client.RemoveMaintenance(ctx, appCfg.App); err != nil {
+		err := client.RemoveMaintenance(ctx, appCfg.App)
+		recordAppEvent(ctx, executor, appCfg.App, events.KindMaintenanceOff, err, nil)
+		if err != nil {
 			return fmt.Errorf("disabling maintenance mode: %w", err)
 		}
 		fmt.Println("Maintenance mode disabled — traffic restored")

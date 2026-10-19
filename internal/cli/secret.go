@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/useteploy/teploy/internal/events"
 	"io"
 	"os"
 	"os/signal"
@@ -99,7 +100,7 @@ func warnSecretTerminators(pairs map[string]string, w io.Writer) {
 		strings.Join(keys, ", "))
 }
 
-func runSecretSet(flags *Flags, providerFlag string, pairs map[string]string) error {
+func runSecretSet(flags *Flags, providerFlag string, pairs map[string]string) (retErr error) {
 	appCfg, err := config.LoadApp(".")
 	if err != nil {
 		return err
@@ -111,6 +112,9 @@ func runSecretSet(flags *Flags, providerFlag string, pairs map[string]string) er
 		return err
 	}
 	defer executor.Close()
+	defer func() {
+		recordAppEvent(ctx, executor, appCfg.App, events.KindSecretSet, retErr, map[string]any{"keys": sortedKeys(pairs)})
+	}()
 
 	if resolveProvider(providerFlag, appCfg) == providerOpenbao {
 		client := openbao.NewClient(executor, os.Stdout)
@@ -259,7 +263,7 @@ in their environment until the app is redeployed with teploy deploy.`,
 	}
 }
 
-func runSecretRm(flags *Flags, providerFlag string, keys []string) error {
+func runSecretRm(flags *Flags, providerFlag string, keys []string) (retErr error) {
 	appCfg, err := config.LoadApp(".")
 	if err != nil {
 		return err
@@ -279,6 +283,9 @@ func runSecretRm(flags *Flags, providerFlag string, keys []string) error {
 		return fmt.Errorf("secret rm is not supported for provider openbao — delete the path with the bao CLI against the %s accessory", resolveVaultAccessory(appCfg.Secret.Accessory))
 	}
 
+	defer func() {
+		recordAppEvent(ctx, executor, appCfg.App, events.KindSecretUnset, retErr, map[string]any{"keys": keys})
+	}()
 	mgr := secret.NewManager(executor)
 	removed := 0
 	for _, key := range keys {
@@ -325,6 +332,7 @@ func runSecretRotate(flags *Flags, key string) error {
 
 	mgr := secret.NewManager(executor)
 	newVal, err := mgr.Rotate(ctx, appCfg.App, key)
+	recordAppEvent(ctx, executor, appCfg.App, events.KindSecretSet, err, map[string]any{"keys": []string{key}})
 	if err != nil {
 		return err
 	}

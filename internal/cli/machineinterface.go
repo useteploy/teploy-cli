@@ -112,6 +112,13 @@ const (
 	// same lease; a renewed preview is refused before any route, container
 	// or authority effect — including between prune's listing and destroy.
 	CapPreviewCompareDestroy = "preview-compare-destroy-v1"
+	// Server event history (server-authority spec §2.6): every mutating
+	// command appends to /deployments/.teploy/apps/<app>/events.jsonl and
+	// `teploy events [--app] [--since-seq] --json` reads it.
+	CapEventsV1 = "events-v1"
+	// --actor <client>[:<label>] and --actor-op <id> are accepted on every
+	// command and recorded with each event.
+	CapActorFlagV1 = "actor-flag-v1"
 )
 
 // MachineCapabilities returns every capability token this build
@@ -138,6 +145,8 @@ func MachineCapabilities() []string {
 		CapPreviewExposure,
 		CapTriggerConvergence,
 		CapPreviewCompareDestroy,
+		CapEventsV1,
+		CapActorFlagV1,
 	}
 	sort.Strings(tokens)
 	return tokens

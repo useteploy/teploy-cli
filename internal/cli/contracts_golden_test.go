@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/useteploy/teploy/internal/config"
+	"github.com/useteploy/teploy/internal/events"
 	"github.com/useteploy/teploy/internal/preview"
 	"github.com/useteploy/teploy/internal/releasemeta"
 	"github.com/useteploy/teploy/internal/ssh"
@@ -383,4 +384,26 @@ func TestRuntimeIdentifierSchemaParity(t *testing.T) {
 			}
 		}
 	}
+}
+
+// TestContractsEventsEnvelopeGolden drives the REAL `teploy events --json`
+// encoder with one started/terminal deploy pair and a key-names-only env
+// event (rev 10).
+func TestContractsEventsEnvelopeGolden(t *testing.T) {
+	ts := time.Date(2026, 10, 19, 12, 0, 0, 0, time.UTC)
+	actor := events.Actor{Client: "dash", Label: "alice", CLIVersion: "v0.0.0-contracts", Op: "op_0123456789abcdef"}
+	evs := []events.Event{
+		{V: 1, ID: "ev_000000000000000000000001", Seq: 1, TS: ts, App: "blog", Kind: events.KindDeploy, Outcome: events.Started, Release: "abc1234", Actor: actor, Detail: map[string]any{"image": "example/blog:abc1234"}},
+		{V: 1, ID: "ev_000000000000000000000002", Seq: 2, TS: ts.Add(40 * time.Second), App: "blog", Kind: events.KindDeploy, Outcome: events.Succeeded, Release: "abc1234", Actor: actor, Detail: map[string]any{"image": "example/blog:abc1234", "duration_ms": 40000}},
+		{V: 1, ID: "ev_000000000000000000000003", Seq: 3, TS: ts.Add(time.Minute), App: "blog", Kind: events.KindEnvSet, Outcome: events.Succeeded, Actor: events.Actor{Client: "cli", Label: "tyler@laptop", CLIVersion: "v0.0.0-contracts"}, Detail: map[string]any{"keys": []string{"LOG_LEVEL"}}},
+	}
+	var buf bytes.Buffer
+	if err := writeEventsJSON(&buf, "192.0.2.10", "blog", evs); err != nil {
+		t.Fatal(err)
+	}
+	var v any
+	if err := json.Unmarshal(buf.Bytes(), &v); err != nil {
+		t.Fatal(err)
+	}
+	writeFixture(t, "events-envelope/valid/deploy-and-env.json", v)
 }

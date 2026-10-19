@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/useteploy/teploy/internal/events"
 	"io"
 	"maps"
 	"regexp"
@@ -289,6 +290,24 @@ func (d *Deployer) DeployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 	if err := cfg.validate(); err != nil {
 		return err
 	}
+	// Server history (spec §2.6): every deploy path funnels through here,
+	// so laptop, dash, CI, listener and cron deploys share one log.
+	start := time.Now()
+	detail := map[string]any{"image": cfg.Image}
+	if cfg.SourceRevision != "" {
+		detail["source_revision"] = cfg.SourceRevision
+	}
+	if cfg.Provenance != nil && cfg.Provenance.Dirty {
+		detail["dirty"] = true
+	}
+	events.Record(ctx, d.exec, events.Event{App: cfg.App, Kind: events.KindDeploy, Outcome: events.Started, Release: cfg.Version, Detail: detail})
+	err := d.deployFenced(ctx, cfg, lk)
+	done := map[string]any{"image": cfg.Image, "duration_ms": time.Since(start).Milliseconds()}
+	events.Record(ctx, d.exec, events.Event{App: cfg.App, Kind: events.KindDeploy, Outcome: events.Outcome(err), Release: cfg.Version, Detail: events.ErrDetail(done, err)})
+	return err
+}
+
+func (d *Deployer) deployFenced(ctx context.Context, cfg Config, lk *state.Lock) error {
 
 	stopTimeout := cfg.StopTimeout
 	if stopTimeout == 0 {

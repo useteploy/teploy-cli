@@ -1,0 +1,65 @@
+{
+  "app": "blog",
+  "events": [
+    {
+      "actor": {
+        "cli_version": "v0.0.0-contracts",
+        "client": "dash",
+        "label": "alice",
+        "op": "op_0123456789abcdef"
+      },
+      "app": "blog",
+      "detail": {
+        "image": "example/blog:abc1234"
+      },
+      "id": "ev_000000000000000000000001",
+      "kind": "deploy",
+      "outcome": "started",
+      "release": "abc1234",
+      "seq": 1,
+      "ts": "2026-10-19T12:00:00Z",
+      "v": 1
+    },
+    {
+      "actor": {
+        "cli_version": "v0.0.0-contracts",
+        "client": "dash",
+        "label": "alice",
+        "op": "op_0123456789abcdef"
+      },
+      "app": "blog",
+      "detail": {
+        "duration_ms": 40000,
+        "image": "example/blog:abc1234"
+      },
+      "id": "ev_000000000000000000000002",
+      "kind": "deploy",
+      "outcome": "succeeded",
+      "release": "abc1234",
+      "seq": 2,
+      "ts": "2026-10-19T12:00:40Z",
+      "v": 1
+    },
+    {
+      "actor": {
+        "cli_version": "v0.0.0-contracts",
+        "client": "cli",
+        "label": "tyler@laptop"
+      },
+      "app": "blog",
+      "detail": {
+        "keys": [
+          "LOG_LEVEL"
+        ]
+      },
+      "id": "ev_000000000000000000000003",
+      "kind": "env.set",
+      "outcome": "succeeded",
+      "seq": 3,
+      "ts": "2026-10-19T12:01:00Z",
+      "v": 1
+    }
+  ],
+  "host": "192.0.2.10",
+  "machine_interface": 2
+}

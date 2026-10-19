@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/useteploy/teploy/internal/events"
 	"io"
 	"os"
 	"os/exec"
@@ -1193,7 +1194,15 @@ func emitDeployAudit(ctx context.Context, appCfg *config.AppConfig, action, vers
 	if actionErr != nil {
 		result = "failure"
 	}
+	// Flat actor <client>:<label> (spec §2.6 observe forwarding): the same
+	// client the server event history records for this command.
+	actor := events.ProcessActor()
+	flat := actor.Client
+	if actor.Label != "" {
+		flat += ":" + actor.Label
+	}
 	if err := audit.Emit(ctx, appCfg.Audit.Endpoint, appCfg.Audit.Token, appCfg.Audit.Site, audit.Event{
+		Actor:    flat,
 		Action:   action,
 		Target:   appCfg.App + "@" + version,
 		Result:   result,

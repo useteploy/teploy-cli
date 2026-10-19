@@ -1,10 +1,12 @@
 {
   "capabilities": [
+    "actor-flag-v1",
     "app-list-machine",
     "autodeploy-redeploy",
     "doctor-diagnostics",
     "env-set-stdin",
     "error-envelope",
+    "events-v1",
     "health-modes",
     "kv-set-stdin",
     "plan-apply",

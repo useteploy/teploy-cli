@@ -4,6 +4,27 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+### Added
+
+- One server-side event history per app, shared by every client. Deploys,
+  rollbacks (container and static), start/stop/restart, env set/unset,
+  secret set/rm/rotate, lock/unlock, maintenance on/off, heal restarts,
+  preview deploy/destroy and remove each append a line to
+  `/deployments/.teploy/apps/<app>/events.jsonl` on the app's server, through
+  one server helper that holds an flock, assigns a strictly increasing `seq`
+  and the server timestamp, rotates past 1 MiB (five files kept) and writes
+  0600. Lines carry the actor (`client`, `label`, CLI version, the client's
+  operation id); env and secret events carry key names only. A failed append
+  warns and never fails the command. The log lives outside the app directory,
+  so it survives `remove`, and older CLIs never see it.
+- `teploy events [--app <name>] [--since-seq N] [--json]` reads that history
+  (`--host` alone lists every app on the server).
+- Global `--actor <client>[:<label>]` and `--actor-op <id>` name the calling
+  client in the history (default `cli:<user>@<host>`, or `$TEPLOY_ACTOR`);
+  the observe audit forward uses the same `client:label`. Capability tokens
+  `events-v1` and `actor-flag-v1`; contracts corpus rev 10 adds the
+  `events-envelope` artifact.
+
 ### Fixed
 
 - `teploy doctor`'s secret-exposure scan no longer aborts with "could not
