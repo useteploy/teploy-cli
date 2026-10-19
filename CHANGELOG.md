@@ -27,10 +27,26 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
 - A recreate spec carrying redacted env is refused instead of starting a
   container with secrets missing. Rollback is unchanged: it recreates from
   docker's own record of the target container, so it uses the values that
-  release was deployed with (not secrets rotated since).
+  release was deployed with (not secrets rotated since). It now warns, naming
+  the keys, when `.env` or the secret store changed after the target release
+  was deployed, so a rotation is never silently undone.
 
 ### Fixed
 
+- `teploy remove` takes the app's deploy lock, so it can no longer interleave
+  with a deploy, heal pass or listener delivery, and it retires what could
+  act on the app later: the autodeploy webhook listener unit, the
+  scheduled-redeploy cron entry, and the heal and secret-audit timers
+  (previously left running against a deleted app). Backup schedules are
+  removed only with `--purge`, since a default remove keeps the data they
+  back up. The JSON summary lists what was removed (`removed_automation`).
+- `teploy app list` (human output) lists every readable app when one app's
+  state is unreadable, then reports each problem with its scope and exits
+  non-zero. It used to print only the first error and hide every app.
+- `teploy setup` installs `git` and `python3` when missing (python3 is
+  required by state writes; git by server-side checkouts), and
+  `teploy doctor` gains a `server-tools` check (python3 missing fails, git
+  missing warns).
 - `teploy deploy` no longer aborts with `rsync failed: exit status 23` on
   macOS's system rsync (openrsync) when the build context contains a
   dangling symlink (e.g. a submodule link into a store absent from a fresh

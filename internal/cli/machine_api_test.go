@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -247,5 +248,33 @@ func TestCollectAppListGroupsContainersByExactLabel(t *testing.T) {
 				t.Fatalf("speedballs-mp containers wrong: %#v", app.Containers)
 			}
 		}
+	}
+}
+
+func TestPrintAppListKeepsReadableAppsWhenOneFails(t *testing.T) {
+	var buf bytes.Buffer
+	err := printAppList(&buf, appListDTO{
+		Host: "h",
+		Apps: []appStatusDTO{
+			{App: "blog", Type: "container", CurrentRelease: releaseStatusDTO{Version: "abc123"}},
+			{App: "shop", Errors: []machineError{{Scope: "state", Message: "unsupported state schema version 3"}}},
+		},
+		Errors: []machineError{{Scope: "app:Bad Name", Message: "invalid app name"}},
+	})
+	got := buf.String()
+	if err == nil {
+		t.Fatal("a listing with problems must exit non-zero")
+	}
+	for _, want := range []string{"blog", "abc123", "shop", "(error)", "app:shop state: unsupported state schema version 3", "app:Bad Name: invalid app name"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("output misses %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestPrintAppListEmpty(t *testing.T) {
+	var buf bytes.Buffer
+	if err := printAppList(&buf, appListDTO{}); err != nil || !strings.Contains(buf.String(), "No deployed apps") {
+		t.Fatalf("err=%v out=%q", err, buf.String())
 	}
 }

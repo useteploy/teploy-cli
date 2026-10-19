@@ -8,7 +8,10 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/useteploy/teploy/internal/docker"
+	"github.com/useteploy/teploy/internal/releasemeta"
 	"github.com/useteploy/teploy/internal/ssh"
 )
 
@@ -87,5 +90,28 @@ func TestRollback_WorksWithRedactedReleaseRecord(t *testing.T) {
 	}
 	if strings.Contains(buf.String(), "live-secret") {
 		t.Error("rollback output contains a secret value")
+	}
+}
+
+// SM-3: rollback keeps the target release's own values, but says so when
+// the env file or the secret store changed after that release was recorded.
+func TestRollbackWarnsWhenSecretsChangedSinceRelease(t *testing.T) {
+	rec := &releasemeta.Record{CreatedAt: time.Unix(1_700_000_000, 0).UTC(), EnvRedacted: []docker.RedactedEnv{{Key: "DB_PASSWORD", Source: "secret_store"}}}
+
+	mock := ssh.NewMockExecutor("h", ssh.MockCommand{
+		Match:  "find '/deployments/myapp/.env' '/deployments/myapp/secrets' -maxdepth 1 -type f -newermt @1700000000",
+		Output: "/deployments/myapp/secrets/DB_PASSWORD.age\n",
+	})
+	var buf bytes.Buffer
+	warnRotatedSinceRelease(context.Background(), mock, &buf, "myapp", "v1", rec)
+	if !strings.Contains(buf.String(), "DB_PASSWORD changed since v1 was deployed") || !strings.Contains(buf.String(), "teploy deploy") {
+		t.Fatalf("warning = %q", buf.String())
+	}
+
+	quiet := ssh.NewMockExecutor("h", ssh.MockCommand{Match: "find ", Output: ""})
+	buf.Reset()
+	warnRotatedSinceRelease(context.Background(), quiet, &buf, "myapp", "v1", rec)
+	if buf.Len() != 0 {
+		t.Fatalf("no change must print nothing, got %q", buf.String())
 	}
 }

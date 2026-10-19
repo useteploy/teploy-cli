@@ -113,18 +113,43 @@ func runAppList(flags *Flags, out io.Writer) error {
 	if flags.JSON {
 		return json.NewEncoder(out).Encode(result)
 	}
-	if len(result.Errors) > 0 {
-		return fmt.Errorf("listing deployed apps: %s", result.Errors[0].Message)
+	return printAppList(out, result)
+}
+
+// printAppList renders the human table. One unreadable app (or a host-wide
+// docker failure) no longer hides every other app: readable apps are listed,
+// each failure is reported under the table with its scope, and the command
+// still exits non-zero so scripts notice.
+func printAppList(out io.Writer, result appListDTO) error {
+	var problems []string
+	for _, e := range result.Errors {
+		problems = append(problems, fmt.Sprintf("%s: %s", e.Scope, e.Message))
 	}
-	if len(result.Apps) == 0 {
+	if len(result.Apps) == 0 && len(problems) == 0 {
 		fmt.Fprintln(out, "No deployed apps")
 		return nil
 	}
-	fmt.Fprintf(out, "%-24s  %-12s  %-16s  %-10s  %s\n", "APP", "TYPE", "CURRENT", "CONTAINERS", "DOMAIN")
-	for _, app := range result.Apps {
-		fmt.Fprintf(out, "%-24s  %-12s  %-16s  %-10d  %s\n", app.App, app.Type, app.CurrentRelease.Version, len(app.Containers), app.Domain)
+	if len(result.Apps) > 0 {
+		fmt.Fprintf(out, "%-24s  %-12s  %-16s  %-10s  %s\n", "APP", "TYPE", "CURRENT", "CONTAINERS", "DOMAIN")
 	}
-	return nil
+	for _, app := range result.Apps {
+		current := app.CurrentRelease.Version
+		for _, e := range app.Errors {
+			problems = append(problems, fmt.Sprintf("app:%s %s: %s", app.App, e.Scope, e.Message))
+			if current == "" {
+				current = "(error)"
+			}
+		}
+		fmt.Fprintf(out, "%-24s  %-12s  %-16s  %-10d  %s\n", app.App, app.Type, current, len(app.Containers), app.Domain)
+	}
+	if len(problems) == 0 {
+		return nil
+	}
+	fmt.Fprintln(out, "\nErrors:")
+	for _, p := range problems {
+		fmt.Fprintf(out, "  %s\n", p)
+	}
+	return fmt.Errorf("listing deployed apps on %s: %d problem(s), listed above", result.Host, len(problems))
 }
 
 func collectAppList(ctx context.Context, executor ssh.Executor, observedAt time.Time) appListDTO {

@@ -35,6 +35,15 @@ func caddyMocks() []ssh.MockCommand {
 	}
 }
 
+// removeAutomationMocks answers the sudo probe and the one-round-trip
+// unit/cron teardown with "nothing installed".
+func removeAutomationMocks() []ssh.MockCommand {
+	return []ssh.MockCommand{
+		{Match: "id -u", Output: "1000"},
+		{Match: "reload=0; ", Output: ""},
+	}
+}
+
 func removeTestContainers() ssh.MockCommand {
 	return ssh.MockCommand{
 		Match: "docker ps --all --filter label=teploy.app=",
@@ -55,7 +64,7 @@ func TestExecuteRemoveStopsRestartingContainer(t *testing.T) {
 		{Match: "rmdir '/deployments/scratch'", Output: ""},
 		{Match: "ls '/deployments/scratch'", Output: ""},
 	}, caddyMocks()...)
-	exec := ssh.NewMockExecutor("test-host", cmds...)
+	exec := ssh.NewMockExecutor("test-host", append(cmds, removeAutomationMocks()...)...)
 
 	if _, err := executeRemove(context.Background(), exec, "scratch",
 		[]string{"scratch.com"}, removeOptions{}, io.Discard); err != nil {
@@ -81,7 +90,7 @@ func TestExecuteRemovePurgeFallsBackToContainerForForeignOwnedData(t *testing.T)
 		{Match: "docker run --rm --user 0 -v '/deployments/scratch:/teploy-data' alpine:3 sh -c 'rm -rf /teploy-data/* /teploy-data/.[!.]*'", Output: ""},
 		{Match: "rmdir '/deployments/scratch'", Output: ""},
 	}, caddyMocks()...)
-	exec := ssh.NewMockExecutor("test-host", cmds...)
+	exec := ssh.NewMockExecutor("test-host", append(cmds, removeAutomationMocks()...)...)
 
 	if _, err := executeRemove(context.Background(), exec, "scratch",
 		[]string{"scratch.com"}, removeOptions{Purge: true}, io.Discard); err != nil {
@@ -107,7 +116,7 @@ func TestExecuteRemoveDefaultPreservesData(t *testing.T) {
 		{Match: "rmdir '/deployments/scratch'", Output: ""},
 		{Match: "ls '/deployments/scratch'", Output: "volumes"},
 	}, caddyMocks()...)
-	exec := ssh.NewMockExecutor("test-host", cmds...)
+	exec := ssh.NewMockExecutor("test-host", append(cmds, removeAutomationMocks()...)...)
 
 	sum, err := executeRemove(context.Background(), exec, "scratch",
 		[]string{"scratch.com", "www.scratch.com"}, removeOptions{}, io.Discard)
@@ -167,7 +176,7 @@ func TestExecuteRemovePurge(t *testing.T) {
 		{Match: "docker rm ", Output: ""},
 		{Match: "rm -rf '/deployments/scratch'", Output: ""},
 	}, caddyMocks()...)
-	exec := ssh.NewMockExecutor("test-host", cmds...)
+	exec := ssh.NewMockExecutor("test-host", append(cmds, removeAutomationMocks()...)...)
 
 	sum, err := executeRemove(context.Background(), exec, "scratch",
 		nil, removeOptions{Purge: true}, io.Discard)
@@ -201,7 +210,7 @@ func TestExecuteRemoveRedirect(t *testing.T) {
 		{Match: "rmdir '/deployments/scratch'", Output: ""},
 		{Match: "ls '/deployments/scratch'", Output: ""},
 	}, caddyMocks()...)
-	exec := ssh.NewMockExecutor("test-host", cmds...)
+	exec := ssh.NewMockExecutor("test-host", append(cmds, removeAutomationMocks()...)...)
 
 	sum, err := executeRemove(context.Background(), exec, "scratch",
 		[]string{"scratch.com", "www.scratch.com"},
@@ -233,7 +242,7 @@ func TestExecuteRemoveNoCaddyfile(t *testing.T) {
 		{Match: "rmdir '/deployments/scratch'", Output: ""},
 		{Match: "ls '/deployments/scratch'", Output: ""},
 	}
-	exec := ssh.NewMockExecutor("test-host", cmds...)
+	exec := ssh.NewMockExecutor("test-host", append(cmds, removeAutomationMocks()...)...)
 
 	sum, err := executeRemove(context.Background(), exec, "scratch",
 		nil, removeOptions{}, io.Discard)
@@ -259,6 +268,100 @@ func TestSplitDomains(t *testing.T) {
 	for i := range want {
 		if got[i] != want[i] {
 			t.Errorf("splitDomains[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestExecuteRemoveHoldsAppLockAndRetiresAutomation(t *testing.T) {
+	cmds := append([]ssh.MockCommand{
+		{Match: "[ -d '/deployments/scratch' ]", Output: ""},
+		{Match: "mkdir /deployments/scratch/.lock", Output: ""},
+		{Match: "id -u", Output: "1000"},
+		{Match: "reload=0; ", Output: "unit:teploy-webhook-scratch.service\nunit:teploy-heal-scratch.timer\ncron:1\n"},
+		removeTestContainers(),
+		{Match: "docker stop -t 10 'scratch-web-aaa'", Output: ""},
+		{Match: "docker rm 'scratch-web-aaa'", Output: ""},
+		{Match: "find '/deployments/scratch'", Output: ""},
+		{Match: "rmdir '/deployments/scratch'", Output: ""},
+		{Match: "ls '/deployments/scratch'", Output: ""},
+	}, caddyMocks()...)
+	exec := ssh.NewMockExecutor("test-host", cmds...)
+
+	sum, err := executeRemove(context.Background(), exec, "scratch",
+		[]string{"scratch.com"}, removeOptions{}, io.Discard)
+	if err != nil {
+		t.Fatalf("executeRemove: %v", err)
+	}
+	if len(sum.RemovedAutomation) != 3 {
+		t.Errorf("removed automation = %v, want webhook unit, heal timer and the cron entry", sum.RemovedAutomation)
+	}
+
+	idx := func(prefix string) int {
+		for i, c := range exec.Calls {
+			if strings.HasPrefix(c, prefix) {
+				return i
+			}
+		}
+		return -1
+	}
+	lock, teardown, stop, find := idx("mkdir /deployments/scratch/.lock"), idx("reload=0; "), idx("docker stop"), idx("find '/deployments/scratch'")
+	release := -1
+	for i, c := range exec.Calls {
+		if strings.HasPrefix(c, "rm -rf -- '/deployments/scratch/.lock'") {
+			release = i
+		}
+	}
+	if lock < 0 || teardown < lock || stop < teardown || find < stop || release < find {
+		t.Fatalf("want lock -> teardown -> containers -> state -> release, got lock=%d teardown=%d stop=%d find=%d release=%d\ncalls: %v",
+			lock, teardown, stop, find, release, exec.Calls)
+	}
+	if !strings.Contains(exec.Calls[find], "! -name '.lock'") {
+		t.Errorf("state deletion must keep the held lock until release: %s", exec.Calls[find])
+	}
+
+	script := exec.Calls[teardown]
+	for _, want := range []string{"teploy-webhook-scratch.service", "teploy-heal-scratch.timer", "teploy-secret-audit-scratch.timer", "/deployments/scratch/scheduled-redeploy.sh"} {
+		if !strings.Contains(script, want) {
+			t.Errorf("teardown script misses %s", want)
+		}
+	}
+	if strings.Contains(script, "teploy-backup:scratch") {
+		t.Error("a default remove keeps the data, so it must keep its backup schedule")
+	}
+}
+
+func TestExecuteRemovePurgeDropsBackupSchedules(t *testing.T) {
+	exec := ssh.NewMockExecutor("test-host",
+		ssh.MockCommand{Match: "id -u", Output: "0"},
+		ssh.MockCommand{Match: "reload=0; ", Output: ""},
+	)
+	if _, err := removeAppAutomation(context.Background(), exec, "scratch", true); err != nil {
+		t.Fatal(err)
+	}
+	script := exec.Calls[len(exec.Calls)-1]
+	for _, want := range []string{"[teploy-backup:scratch]", "[teploy-accessory-backup:scratch:"} {
+		if !strings.Contains(script, want) {
+			t.Errorf("purge teardown misses %s", want)
+		}
+	}
+	if strings.Contains(script, "sudo ") {
+		t.Error("root needs no sudo")
+	}
+}
+
+func TestExecuteRemoveRefusesWhileDeployRuns(t *testing.T) {
+	exec := ssh.NewMockExecutor("test-host",
+		ssh.MockCommand{Match: "[ -d '/deployments/scratch' ]", Output: ""},
+		ssh.MockCommand{Match: "mkdir /deployments/scratch/.lock", Err: fmt.Errorf("exit status 1")},
+		ssh.MockCommand{Match: "cat /deployments/scratch/.lock/info", Output: `{"type":"auto","owner":"x","ts":"2099-01-01T00:00:00Z"}`},
+	)
+	_, err := executeRemove(context.Background(), exec, "scratch", nil, removeOptions{}, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "in progress") {
+		t.Fatalf("want an in-progress refusal, got %v", err)
+	}
+	for _, c := range exec.Calls {
+		if strings.HasPrefix(c, "docker") || strings.HasPrefix(c, "reload=0") {
+			t.Fatalf("nothing may be touched while another operation holds the lock; ran %s", c)
 		}
 	}
 }

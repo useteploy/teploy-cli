@@ -31,6 +31,7 @@ func TestSetupServer(t *testing.T) {
 		ssh.MockCommand{Match: "whoami", Output: "root"},
 		ssh.MockCommand{Match: "docker --version", Output: "Docker version 24.0.0, build abc123"},
 		ssh.MockCommand{Match: "rsync --version", Output: "rsync  version 3.2.7"},
+		ssh.MockCommand{Match: "for t in git python3", Output: ""},
 		ssh.MockCommand{Match: "ufw status", Err: fmt.Errorf("command not found")},
 		ssh.MockCommand{Match: "systemctl is-active firewalld", Err: fmt.Errorf("inactive")},
 		ssh.MockCommand{Match: "docker info", Output: ""},
@@ -116,6 +117,7 @@ func TestSetupServer_InstallDocker(t *testing.T) {
 		ssh.MockCommand{Match: "sh -c", Output: ""},                               // install stream
 		ssh.MockCommand{Match: "docker --version", Output: "Docker version 24.0"}, // verify after install
 		ssh.MockCommand{Match: "usermod", Output: ""},
+		ssh.MockCommand{Match: "for t in git python3", Output: "git "},
 		ssh.MockCommand{Match: "ufw status", Err: fmt.Errorf("not found")},
 		ssh.MockCommand{Match: "systemctl", Err: fmt.Errorf("inactive")},
 		ssh.MockCommand{Match: "docker info", Output: ""},
@@ -131,6 +133,15 @@ func TestSetupServer_InstallDocker(t *testing.T) {
 	if err := setupServer(context.Background(), mock, &buf, true); err != nil {
 		t.Fatalf("setupServer: %v", err)
 	}
+	gitInstalled := false
+	for _, c := range mock.Calls {
+		if strings.Contains(c, "apt-get install -y -qq git'") {
+			gitInstalled = true
+		}
+	}
+	if !gitInstalled {
+		t.Errorf("a server missing git must get it installed; calls: %v", mock.Calls)
+	}
 
 	if !strings.Contains(buf.String(), "Installing Docker") {
 		t.Error("should report Docker installation")
@@ -145,6 +156,7 @@ func TestSetupServer_CaddyAlreadyRunning(t *testing.T) {
 		ssh.MockCommand{Match: "whoami", Output: "root"},
 		ssh.MockCommand{Match: "docker --version", Output: "Docker version 24.0.0"},
 		ssh.MockCommand{Match: "rsync --version", Output: "rsync  version 3.2.7"},
+		ssh.MockCommand{Match: "for t in git python3", Output: ""},
 		ssh.MockCommand{Match: "ufw status", Err: fmt.Errorf("not found")},
 		ssh.MockCommand{Match: "systemctl", Err: fmt.Errorf("inactive")},
 		ssh.MockCommand{Match: "docker info", Output: ""},
@@ -188,6 +200,7 @@ func TestSetupServer_CaddyUpgradePreservesNetworksAndCaddyfile(t *testing.T) {
 		ssh.MockCommand{Match: "whoami", Output: "root"},
 		ssh.MockCommand{Match: "docker --version", Output: "Docker version 24.0.0"},
 		ssh.MockCommand{Match: "rsync --version", Output: "rsync  version 3.2.7"},
+		ssh.MockCommand{Match: "for t in git python3", Output: ""},
 		ssh.MockCommand{Match: "ufw status", Err: fmt.Errorf("not found")},
 		ssh.MockCommand{Match: "systemctl", Err: fmt.Errorf("inactive")},
 		ssh.MockCommand{Match: "docker info", Output: ""},
@@ -284,6 +297,7 @@ func TestSetupServer_PreservesForeignMountsOnRecreate(t *testing.T) {
 		ssh.MockCommand{Match: "whoami", Output: "root"},
 		ssh.MockCommand{Match: "docker --version", Output: "Docker version 24.0.0"},
 		ssh.MockCommand{Match: "rsync --version", Output: "rsync  version 3.2.7"},
+		ssh.MockCommand{Match: "for t in git python3", Output: ""},
 		ssh.MockCommand{Match: "ufw status", Err: fmt.Errorf("not found")},
 		ssh.MockCommand{Match: "systemctl", Err: fmt.Errorf("inactive")},
 		ssh.MockCommand{Match: "docker info", Output: ""},
@@ -342,6 +356,7 @@ func TestSetupServer_MigratesLegacyFileMount(t *testing.T) {
 		ssh.MockCommand{Match: "whoami", Output: "root"},
 		ssh.MockCommand{Match: "docker --version", Output: "Docker version 24.0.0"},
 		ssh.MockCommand{Match: "rsync --version", Output: "rsync  version 3.2.7"},
+		ssh.MockCommand{Match: "for t in git python3", Output: ""},
 		ssh.MockCommand{Match: "ufw status", Err: fmt.Errorf("not found")},
 		ssh.MockCommand{Match: "systemctl", Err: fmt.Errorf("inactive")},
 		ssh.MockCommand{Match: "docker info", Output: ""},
@@ -401,6 +416,7 @@ func TestSetupServer_MigratesMissingStaticMount(t *testing.T) {
 		ssh.MockCommand{Match: "whoami", Output: "root"},
 		ssh.MockCommand{Match: "docker --version", Output: "Docker version 24.0.0"},
 		ssh.MockCommand{Match: "rsync --version", Output: "rsync  version 3.2.7"},
+		ssh.MockCommand{Match: "for t in git python3", Output: ""},
 		ssh.MockCommand{Match: "ufw status", Err: fmt.Errorf("not found")},
 		ssh.MockCommand{Match: "systemctl", Err: fmt.Errorf("inactive")},
 		ssh.MockCommand{Match: "docker info", Output: ""},
@@ -451,6 +467,7 @@ func TestSetupServer_UFWActive(t *testing.T) {
 		ssh.MockCommand{Match: "whoami", Output: "root"},
 		ssh.MockCommand{Match: "docker --version", Output: "Docker version 24.0.0"},
 		ssh.MockCommand{Match: "rsync --version", Output: "rsync  version 3.2.7"},
+		ssh.MockCommand{Match: "for t in git python3", Output: ""},
 		ssh.MockCommand{Match: "ufw status", Output: "Status: active\n\nTo Action From\n22/tcp ALLOW Anywhere"},
 		ssh.MockCommand{Match: "ufw allow 80", Output: "Rule added"},
 		ssh.MockCommand{Match: "ufw allow 443", Output: "Rule added"},
@@ -641,6 +658,7 @@ func TestSetupServer_PreflightListsStagesAndAffectedResources(t *testing.T) {
 		ssh.MockCommand{Match: "whoami", Output: "root"},
 		ssh.MockCommand{Match: "docker --version", Output: "Docker version 24.0.0"},
 		ssh.MockCommand{Match: "rsync --version", Output: "rsync  version 3.2.7"},
+		ssh.MockCommand{Match: "for t in git python3", Output: ""},
 		ssh.MockCommand{Match: "ufw status", Err: fmt.Errorf("command not found")},
 		ssh.MockCommand{Match: "systemctl is-active firewalld", Err: fmt.Errorf("inactive")},
 		ssh.MockCommand{Match: "docker info", Output: ""},
@@ -679,6 +697,7 @@ func TestSetupServer_InterruptedRunIsResumable(t *testing.T) {
 		ssh.MockCommand{Match: "whoami", Output: "root"},
 		ssh.MockCommand{Match: "docker --version", Output: "Docker version 24.0.0"},
 		ssh.MockCommand{Match: "rsync --version", Output: "rsync  version 3.2.7"},
+		ssh.MockCommand{Match: "for t in git python3", Output: ""},
 		ssh.MockCommand{Match: "ufw status", Err: fmt.Errorf("command not found")},
 		ssh.MockCommand{Match: "systemctl is-active firewalld", Err: fmt.Errorf("inactive")},
 		ssh.MockCommand{Match: "docker info", Output: ""},
@@ -703,6 +722,7 @@ func TestSetupServer_InterruptedRunIsResumable(t *testing.T) {
 		ssh.MockCommand{Match: "whoami", Output: "root"},
 		ssh.MockCommand{Match: "docker --version", Output: "Docker version 24.0.0"},
 		ssh.MockCommand{Match: "rsync --version", Output: "rsync  version 3.2.7"},
+		ssh.MockCommand{Match: "for t in git python3", Output: ""},
 		ssh.MockCommand{Match: "ufw status", Err: fmt.Errorf("command not found")},
 		ssh.MockCommand{Match: "systemctl is-active firewalld", Err: fmt.Errorf("inactive")},
 		ssh.MockCommand{Match: "docker info", Output: ""},
@@ -760,6 +780,7 @@ func TestSetupServer_ConnectionLossRecoversMidStage(t *testing.T) {
 		ssh.MockCommand{Match: "whoami", Output: "root"},
 		ssh.MockCommand{Match: "docker --version", Output: "Docker version 24.0.0"},
 		ssh.MockCommand{Match: "rsync --version", Output: "rsync  version 3.2.7"},
+		ssh.MockCommand{Match: "for t in git python3", Output: ""},
 		ssh.MockCommand{Match: "ufw status", Err: fmt.Errorf("exit status 1: ufw: command not found")},
 		ssh.MockCommand{Match: "systemctl is-active firewalld", Err: fmt.Errorf("exit status 3: inactive")},
 		ssh.MockCommand{Match: "docker info", Output: ""},
