@@ -16,6 +16,7 @@ import (
 	"github.com/useteploy/teploy/internal/config"
 	"github.com/useteploy/teploy/internal/harden"
 	"github.com/useteploy/teploy/internal/network"
+	"github.com/useteploy/teploy/internal/secret"
 	"github.com/useteploy/teploy/internal/ssh"
 	"golang.org/x/term"
 )
@@ -623,6 +624,38 @@ func setupStages() []setupStage {
 					return fmt.Errorf("installing %s: %w", strings.Join(missing, ", "), err)
 				}
 				fmt.Fprintf(w, "  %s installed\n", strings.Join(missing, ", "))
+				return nil
+			},
+		},
+		{
+			name:    "age identity location",
+			affects: "/etc/teploy (created 0700) — the age identity moves there from /deployments/.age-key when one exists; the move is verified by decrypting one secret before the old file is replaced by a public-key marker",
+			run: func(ctx context.Context, exec ssh.Executor, w io.Writer, env *setupEnv) error {
+				// Cheap probe first: a fresh server (no identity yet) or an
+				// already-migrated one must not grow package installs or
+				// extra work from this stage.
+				legacy, err := secret.HasLegacyIdentity(ctx, exec)
+				if err != nil {
+					fmt.Fprintf(w, "  Warning: %v (skipped)\n", err)
+					return nil
+				}
+				if !legacy {
+					return nil
+				}
+				// age is otherwise installed on first secret use; the
+				// migration needs age-keygen/age now.
+				if err := secret.NewManager(exec).EnsureAge(ctx); err != nil {
+					fmt.Fprintf(w, "  Warning: could not ensure age is installed; the identity move was skipped: %v\n", err)
+					return nil
+				}
+				action, err := secret.MigrateIdentity(ctx, exec, w, env.sudo)
+				if err != nil {
+					// Non-fatal by design: the legacy location keeps
+					// working and `teploy doctor` reports it.
+					fmt.Fprintf(w, "  Warning: %v\n", err)
+					return nil
+				}
+				fmt.Fprintf(w, "  %s\n", action)
 				return nil
 			},
 		},

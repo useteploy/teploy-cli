@@ -28,6 +28,7 @@ func TestBaoTransport_SecretsNeverInArgv(t *testing.T) {
 		apiKey    = "sk-live-123"
 	)
 	mock := ssh.NewMockExecutor("h",
+		ssh.MockCommand{Match: "if [ -r '/etc/teploy/age-key' ]", Output: "legacy"},
 		ssh.MockCommand{Match: "if [ ! -e ", Output: "present"},
 		ssh.MockCommand{Match: "age -d", Output: rootToken},
 		ssh.MockCommand{Match: "docker exec -i 'myapp-openbao'", Output: "{}"},
@@ -116,6 +117,7 @@ func TestWriteAppPolicyTransport(t *testing.T) {
 func TestEnableDatabaseSecretsTransport(t *testing.T) {
 	const adminPass = "pg-super-secret"
 	mock := ssh.NewMockExecutor("h",
+		ssh.MockCommand{Match: "if [ -r '/etc/teploy/age-key' ]", Output: "legacy"},
 		ssh.MockCommand{Match: "if [ ! -e ", Output: "present"},
 		ssh.MockCommand{Match: "age -d", Output: "hvs.root"},
 		ssh.MockCommand{Match: "docker exec -i 'myapp-openbao'", Output: "{}"},
