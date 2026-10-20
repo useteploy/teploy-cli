@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -527,5 +528,21 @@ func TestBuild_ContextSubdirNixpacks(t *testing.T) {
 	}
 	if !strings.Contains(nixpacksCall, "nixpacks build '/deployments/myapp/build/api' ") {
 		t.Errorf("nixpacks should build the context subdir, got: %s", nixpacksCall)
+	}
+}
+
+func TestBuild_DockerfileWithSecrets(t *testing.T) {
+	exec := ssh.NewMockExecutor("host",
+		ssh.MockCommand{Match: "DOCKER_BUILDKIT=1 docker build", Output: ""},
+	)
+	builder := NewBuilder(exec, io.Discard)
+	if _, err := builder.WithSecrets([]BuildSecret{{ID: "NPM_TOKEN", Path: "/run/secrets/NPM_TOKEN"}}).Build(context.Background(), BuildConfig{
+		App: "myapp", Version: "abc1234", Mode: ModeDockerfile, BuildDir: "/deployments/myapp/build",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	want := "DOCKER_BUILDKIT=1 docker build -t 'myapp-build-abc1234' --secret id='NPM_TOKEN',src='/run/secrets/NPM_TOKEN' /deployments/myapp/build"
+	if got := exec.Calls[len(exec.Calls)-1]; got != want {
+		t.Fatalf("build command = %q, want %q", got, want)
 	}
 }

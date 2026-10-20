@@ -17,6 +17,14 @@ import (
 	"github.com/spf13/cobra"
 )
 
+// cliBuildVersion is the version NewRootCmd was built with (used where a
+// subcommand deep below root needs it, e.g. verifying a server upload).
+var cliBuildVersion = "dev"
+
+// teployVersionForServer is the version string a server-side binary
+// upload of THIS CLI is expected to report.
+func teployVersionForServer() string { return cliBuildVersion }
+
 // Flags holds the global CLI flags, passed to subcommands explicitly.
 type Flags struct {
 	Host       string
@@ -46,6 +54,7 @@ type Flags struct {
 
 func NewRootCmd(version string) *cobra.Command {
 	flags := &Flags{}
+	cliBuildVersion = version
 
 	root := &cobra.Command{
 		Use:           "teploy",

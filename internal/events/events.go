@@ -109,6 +109,7 @@ const (
 	KindMaintenanceOff = "maintenance.off"
 	KindGateRepair     = "gate.repair"
 	KindWatermarkReset = "watermark.reset"
+	KindSourceConnect  = "source.connect"
 )
 
 // detailAllow is the per-kind allowlist of detail keys. Env and secret
@@ -129,8 +130,8 @@ var detailAllow = map[string][]string{
 	KindConfigSet:      {"privileged", "keys", "previous_commit"},
 	KindConfigHome:     {"from", "to"},
 	KindRemove:         {"purge", "redirect", "error"},
-	KindTriggerAdmit:   {"ref", "commit", "delivery_id", "preview"},
-	KindTriggerRefuse:  {"ref", "commit", "delivery_id", "reason"},
+	KindTriggerAdmit:   {"ref", "commit", "delivery_id", "preview", "reason"},
+	KindTriggerRefuse:  {"ref", "commit", "delivery_id", "reason", "error"},
 	KindPreviewDeploy:  {"preview", "branch", "error"},
 	KindPreviewDestroy: {"preview", "error"},
 	KindLock:           {"message"},
@@ -139,6 +140,7 @@ var detailAllow = map[string][]string{
 	KindMaintenanceOff: {"error"},
 	KindGateRepair:     {"case", "message"},
 	KindWatermarkReset: {"ref"},
+	KindSourceConnect:  {"action", "type", "fingerprint"},
 }
 
 // maxErrorDetail bounds the "error" detail so a command's full stderr

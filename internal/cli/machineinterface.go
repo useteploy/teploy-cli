@@ -142,6 +142,20 @@ const (
 	// CapUndeployedListV1: `app list --include-undeployed` returns
 	// never-deployed and removed Teploy-home apps in an "undeployed" array.
 	CapUndeployedListV1 = "undeployed-list-v1"
+	// CapGitSourceV1: Teploy-home apps may build from a git repository
+	// (`git:` in the config; works with GitHub, GitLab, Forgejo/Gitea,
+	// Cursor Origin and any git host over SSH/HTTPS). Per-app deploy keys
+	// and HTTPS tokens live age-encrypted outside /deployments
+	// (`config source key --type ssh|token`, `config source host-key`,
+	// `show`, `remove`); builds run from a server-side mirror;
+	// `build_secrets:` passes age-store values as docker build --secret.
+	CapGitSourceV1 = "git-source-v1"
+	// CapTriggerPollV1: `trigger poll [--app|--all] [--now] [--hint]` is
+	// the one admitter (dedup, watermark + ancestry, force-push refusal
+	// until `trigger reset`, path filter, bounded retries); plus
+	// `trigger retry` and `trigger install-timer` (a systemd timer
+	// running `trigger poll --all` every minute).
+	CapTriggerPollV1 = "trigger-poll-v1"
 )
 
 // MachineCapabilities returns every capability token this build
@@ -176,6 +190,8 @@ func MachineCapabilities() []string {
 		CapConfigMergeV1,
 		CapConfigUnprivilegedV1,
 		CapDeployHomeV1,
+		CapGitSourceV1,
+		CapTriggerPollV1,
 	}
 	sort.Strings(tokens)
 	return tokens

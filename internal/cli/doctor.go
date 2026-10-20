@@ -198,7 +198,7 @@ func doctorRun(ctx context.Context, deps doctorDeps, flags *Flags, serverName st
 
 	if executor == nil {
 		const sshDown = "restore SSH connectivity (see the ssh check above), then re-run teploy doctor"
-		for _, name := range []string{"docker", "disk", "registry", "caddy", "compatibility", "repair-debt", "secret-exposure", "server-tools", "config-home"} {
+		for _, name := range []string{"docker", "disk", "registry", "caddy", "compatibility", "repair-debt", "secret-exposure", "server-tools", "config-home", "git-trigger"} {
 			skipFail(name, "SSH unreachable", sshDown)
 		}
 	} else {
@@ -217,6 +217,7 @@ func doctorRun(ctx context.Context, deps doctorDeps, flags *Flags, serverName st
 		report.Checks = append(report.Checks, doctorSecretExposureCheck(ctx, executor))
 		report.Checks = append(report.Checks, doctorServerToolsCheck(ctx, executor))
 		report.Checks = append(report.Checks, doctorConfigHomeCheck(ctx, executor))
+		report.Checks = append(report.Checks, doctorGitTriggerCheck(ctx, executor, deps))
 	}
 
 	report.summarize()
@@ -786,4 +787,34 @@ func doctorConfigHomeCheck(ctx context.Context, exec ssh.Executor) doctorCheck {
 			Detail: fmt.Sprintf("%d app(s) edited in Teploy: %s — teploy CLIs older than v0.1.43 refuse to deploy them", len(teploy), strings.Join(teploy, ", "))}
 	}
 	return doctorCheck{Name: "config-home", Result: doctorOK, Detail: "every app is edited in its folder"}
+}
+
+// doctorGitTriggerCheck verifies the git-source trigger (D4): when any
+// app on the server builds from git:, the minutely poll timer must be
+// installed and its resident teploy binary must support `trigger poll`.
+func doctorGitTriggerCheck(ctx context.Context, exec ssh.Executor, deps doctorDeps) doctorCheck {
+	apps, err := listGitApps(ctx, exec)
+	if err != nil {
+		return doctorCheck{Name: "git-trigger", Result: doctorWarn, Detail: err.Error(),
+			Remediation: "inspect /deployments/.teploy/apps on the server"}
+	}
+	if len(apps) == 0 {
+		return doctorCheck{Name: "git-trigger", Result: doctorOK, Detail: "no git-source apps"}
+	}
+	names := make([]string, len(apps))
+	for i, a := range apps {
+		names[i] = a.Name
+	}
+	if _, err := exec.Run(ctx, "systemctl is-enabled "+ssh.ShellQuote(triggerPollTimer)+" >/dev/null 2>&1"); err != nil {
+		return doctorCheck{Name: "git-trigger", Result: doctorWarn,
+			Detail:      fmt.Sprintf("git-source apps (%s) but no %s — nothing polls them", strings.Join(names, ", "), triggerPollTimer),
+			Remediation: "run `teploy trigger install-timer --host <server>` (webhook wakes still work; the timer catches missed ones)"}
+	}
+	if _, err := exec.Run(ctx, ssh.ShellQuote(serverTeployBinaryPath)+" trigger poll --help >/dev/null 2>&1"); err != nil {
+		return doctorCheck{Name: "git-trigger", Result: doctorWarn,
+			Detail:      fmt.Sprintf("the timer's teploy binary (%s) does not support `trigger poll`", serverTeployBinaryPath),
+			Remediation: "run `teploy trigger install-timer --host <server>` to refresh the server binary"}
+	}
+	return doctorCheck{Name: "git-trigger", Result: doctorOK,
+		Detail: fmt.Sprintf("%s installed; %d git-source app(s): %s", triggerPollTimer, len(apps), strings.Join(names, ", "))}
 }

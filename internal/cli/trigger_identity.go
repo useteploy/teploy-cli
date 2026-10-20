@@ -219,5 +219,7 @@ func newTriggerCmd(flags *Flags) *cobra.Command {
 	}}
 	identity.Flags().StringVar(&image, "image", "", "image reference used by the execution binding (empty for source build)")
 	cmd.AddCommand(identity)
+	cmd.AddCommand(newTriggerPollCmd(flags), newTriggerResetCmd(flags), newTriggerRetryCmd(flags),
+		newTriggerInstallTimerCmd(flags), newTriggerUninstallTimerCmd(flags))
 	return cmd
 }

@@ -14,6 +14,7 @@ import (
 	"github.com/useteploy/teploy/internal/caddy"
 	"github.com/useteploy/teploy/internal/confighome"
 	"github.com/useteploy/teploy/internal/docker"
+	"github.com/useteploy/teploy/internal/gitsource"
 	"github.com/useteploy/teploy/internal/ssh"
 	"github.com/useteploy/teploy/internal/state"
 )
@@ -282,6 +283,12 @@ func executeRemove(ctx context.Context, exec ssh.Executor, app string, domains [
 		fmt.Fprintln(out, "Deleting its Teploy config and history...")
 		if _, err := exec.Run(ctx, "rm -rf -- "+ssh.ShellQuote(confighome.Dir(app))); err != nil {
 			return nil, fmt.Errorf("deleting %s: %w", confighome.Dir(app), err)
+		}
+		// The git credential lives outside /deployments (D4); forget it
+		// with everything else. Best-effort: a missing helper or age is
+		// not a reason to keep a half-removed app.
+		if err := gitsource.Remove(ctx, exec, app); err != nil {
+			fmt.Fprintf(out, "Warning: could not remove %s's git credential: %v\n", app, err)
 		}
 	case serverHome && lk != nil:
 		if err := state.WriteTombstone(ctx, exec, app, lk); err != nil {
