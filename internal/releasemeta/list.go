@@ -41,8 +41,11 @@ func List(ctx context.Context, exec ssh.Executor, app string) ([]*Record, []stri
 	}
 	var records []*Record
 	var warns []string
-	for _, chunk := range strings.Split(out, "\n"+listMarker) {
-		chunk = strings.TrimLeft(chunk, "\n")
+	// The transport may trim the output's leading newline, so a chunk can
+	// begin with the marker itself; TrimLeft keeps the split robust
+	// either way.
+	for _, chunk := range strings.Split(out, listMarker) {
+		chunk = strings.TrimLeft(chunk, "\n\r")
 		if chunk == "" {
 			continue
 		}

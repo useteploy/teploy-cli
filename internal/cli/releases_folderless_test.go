@@ -62,6 +62,17 @@ func TestReleasemetaList(t *testing.T) {
 	if recs, warns, err = releasemeta.List(context.Background(), mock, "blog"); err != nil || len(recs) != 0 || len(warns) != 0 {
 		t.Fatalf("empty store: recs=%v warns=%v err=%v", recs, warns, err)
 	}
+
+	// The transport trims the leading newline: the first marker can start
+	// the output with no blank line before it. Both records must parse.
+	trimmed := strings.TrimLeft(out.String(), "\n")
+	mock = ssh.NewMockExecutor("h", ssh.MockCommand{Match: "d='/deployments/blog/meta'", Output: trimmed})
+	if recs, warns, err = releasemeta.List(context.Background(), mock, "blog"); err != nil || len(recs) != 2 || len(warns) != 3 {
+		t.Fatalf("trimmed-leading-newline output: recs=%d warns=%v err=%v", len(recs), warns, err)
+	}
+	if recs[0].Hash != "new1" || recs[1].Hash != "old1" {
+		t.Fatalf("records = %+v, want newest-first new1, old1", recs)
+	}
 }
 
 func TestContainerReleaseRows(t *testing.T) {
