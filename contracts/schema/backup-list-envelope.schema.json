@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://teploy.github.io/contracts/schema/backup-list-envelope.schema.json",
+  "title": "`teploy backup list --json`: parsed backups across the volumes, accessories and teploy prefixes plus schedules discovered from teploy cron markers (backup-json-v1, rev 14).",
+  "type": "object",
+  "required": ["machine_interface", "host", "app", "backups", "schedules"],
+  "properties": {
+    "machine_interface": {"type": "integer", "minimum": 1},
+    "host": {"type": "string", "minLength": 1},
+    "app": {"type": "string", "minLength": 1},
+    "target": {
+      "type": "object",
+      "description": "The stored server target in force (absent when the legacy flags overrode it).",
+      "required": ["bucket", "region", "has_credentials"],
+      "properties": {
+        "bucket": {"type": "string", "minLength": 1},
+        "region": {"type": "string", "minLength": 1},
+        "endpoint": {"type": "string"},
+        "prefix": {"type": "string"},
+        "has_credentials": {"type": "boolean"}
+      }
+    },
+    "backups": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "kind", "size_bytes", "created_at", "key", "restorable"],
+        "properties": {
+          "id": {"type": "string", "description": "Backup identity: 20060102-150405, optionally suffixed -0123456789abcdef."},
+          "kind": {"enum": ["volumes", "accessory", "teploy"]},
+          "accessory": {"type": "string", "description": "Accessory name; present only when kind is accessory."},
+          "size_bytes": {"type": "integer", "minimum": 0},
+          "created_at": {"type": "string", "description": "RFC3339 UTC derived from the backup id's timestamp."},
+          "key": {"type": "string", "pattern": "^s3://"},
+          "restorable": {"type": "boolean", "description": "Whether the id satisfies the restore grammar (teploy rows are listed but not restorable through `backup restore`)."}
+        }
+      }
+    },
+    "schedules": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["kind", "cron", "form"],
+        "properties": {
+          "kind": {"enum": ["volumes", "accessory"]},
+          "accessory": {"type": "string"},
+          "cron": {"type": "string", "description": "The five cron schedule fields."},
+          "keep_last": {"type": "integer", "minimum": 0},
+          "max_age_days": {"type": "integer", "minimum": 0},
+          "form": {"enum": ["run", "legacy", "custom"], "description": "run: `backup run` form; legacy: pre-D3 teploy-generated (bucket/credentials embedded); custom: hand-written command under a teploy marker, left alone by rewrites."}
+        }
+      }
+    }
+  }
+}

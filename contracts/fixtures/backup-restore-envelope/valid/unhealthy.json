@@ -1,0 +1,18 @@
+{
+  "machine_interface": 2,
+  "host": "192.0.2.10",
+  "app": "blog",
+  "id": "20261019-030001",
+  "kind": "accessory",
+  "accessory": "db",
+  "ok": false,
+  "stopped": [
+    "blog-web-1f2e3d4"
+  ],
+  "started": [
+    "blog-web-1f2e3d4"
+  ],
+  "health": "unhealthy",
+  "recovery_dir": "/deployments/blog/volumes.restore-old.a1b2c3",
+  "error": "health check after restore failed: ... — pre-restore data kept in /deployments/blog/volumes.restore-old.a1b2c3"
+}

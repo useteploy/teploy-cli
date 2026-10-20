@@ -1,0 +1,53 @@
+{
+  "machine_interface": 2,
+  "host": "192.0.2.10",
+  "app": "blog",
+  "target": {
+    "bucket": "teploy-backups",
+    "region": "us-east-1",
+    "has_credentials": true
+  },
+  "backups": [
+    {
+      "id": "20261020-031704-1f2e3d4c5b6a7988",
+      "kind": "volumes",
+      "size_bytes": 1048576,
+      "created_at": "2026-10-20T03:17:04Z",
+      "key": "s3://teploy-backups/blog/volumes/20261020-031704-1f2e3d4c5b6a7988.tar.gz",
+      "restorable": true
+    },
+    {
+      "id": "20261020-031704-1f2e3d4c5b6a7988",
+      "kind": "teploy",
+      "size_bytes": 4096,
+      "created_at": "2026-10-20T03:17:04Z",
+      "key": "s3://teploy-backups/blog/teploy/20261020-031704-1f2e3d4c5b6a7988.tar.gz",
+      "restorable": true
+    },
+    {
+      "id": "20261019-030001",
+      "kind": "accessory",
+      "accessory": "db",
+      "size_bytes": 2097152,
+      "created_at": "2026-10-19T03:00:01Z",
+      "key": "s3://teploy-backups/blog/accessories/db/20261019-030001.sql.gz",
+      "restorable": true
+    }
+  ],
+  "schedules": [
+    {
+      "kind": "volumes",
+      "cron": "30 3 * * *",
+      "keep_last": 7,
+      "form": "run"
+    },
+    {
+      "kind": "accessory",
+      "accessory": "db",
+      "cron": "15 2 * * *",
+      "keep_last": 5,
+      "max_age_days": 30,
+      "form": "run"
+    }
+  ]
+}
