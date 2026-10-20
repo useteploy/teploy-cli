@@ -463,3 +463,39 @@ func TestContractsConfigMergeGolden(t *testing.T) {
 		},
 	})
 }
+
+// TestContractsD2Golden pins the D2 folderless-read envelopes (rev 14):
+// `releases --app --host --json` (container app: records + rollback
+// availability), `rollback --to X --json` and `redeploy --json` results.
+func TestContractsD2Golden(t *testing.T) {
+	ts := time.Date(2026, 10, 20, 12, 0, 0, 0, time.UTC)
+	writeFixture(t, "releases-envelope/valid/container-app.json", releasesDTO{
+		MachineInterface: MachineInterface, Host: "192.0.2.10", App: "blog",
+		DeploymentType: "container", Current: "1.4.0",
+		Releases: []releaseRowDTO{
+			{Release: "1.4.0", DeployedAt: ts, Image: "example/blog:1.4.0", ImageDigest: "sha256:" + strings.Repeat("ab", 32), ConfigCommit: "8f2c1d0e9b7a6f5e4d3c2b1a0f9e8d7c6b5a4f3e", Actor: "dash:alice", Current: true, Reason: "current release"},
+			{Release: "1.3.0", DeployedAt: ts.Add(-26 * time.Hour), Image: "example/blog:1.3.0", ImageDigest: "sha256:" + strings.Repeat("cd", 32), Actor: "cli:tyler@laptop", RollbackAvailable: true},
+			{Release: "1.2.0", DeployedAt: ts.Add(-72 * time.Hour), Image: "example/blog:1.2.0", ImageDigest: "sha256:" + strings.Repeat("ef", 32), Reason: "no containers retained for this version (keep_versions retention)"},
+		},
+	})
+	writeFixture(t, "releases-envelope/valid/static-app.json", releasesDTO{
+		MachineInterface: MachineInterface, Host: "192.0.2.10", App: "site",
+		DeploymentType: "static", Current: "abc1234",
+		Releases: []releaseRowDTO{
+			{Release: "abc1234", Current: true, Reason: "current release"},
+			{Release: "9f8e7d6", RollbackAvailable: true},
+		},
+	})
+	writeFixture(t, "rollback-result/valid/success.json", rollbackResult{
+		MachineInterface: MachineInterface, App: "blog", Server: "infra-home",
+		From: "abc1234", To: "9f8e7d6", OK: true,
+	})
+	writeFixture(t, "redeploy-result/valid/teploy-home.json", redeployDTO{
+		MachineInterface: MachineInterface, App: "blog", Server: "infra-home", Home: "teploy",
+		Release: "1.4.0", Image: "example/blog:1.4.0", ConfigCommit: "8f2c1d0e9b7a6f5e4d3c2b1a0f9e8d7c6b5a4f3e", OK: true,
+	})
+	writeFixture(t, "redeploy-result/valid/folder-home.json", redeployDTO{
+		MachineInterface: MachineInterface, App: "legacy", Server: "infra-home", Home: "folder",
+		Release: "abc1234", Image: "example/legacy:abc1234", OK: true,
+	})
+}

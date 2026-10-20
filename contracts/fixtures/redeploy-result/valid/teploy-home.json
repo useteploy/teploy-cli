@@ -1,0 +1,10 @@
+{
+  "machine_interface": 2,
+  "app": "blog",
+  "server": "infra-home",
+  "home": "teploy",
+  "release": "1.4.0",
+  "image": "example/blog:1.4.0",
+  "config_commit": "8f2c1d0e9b7a6f5e4d3c2b1a0f9e8d7c6b5a4f3e",
+  "ok": true
+}

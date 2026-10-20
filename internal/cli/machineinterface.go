@@ -142,6 +142,28 @@ const (
 	// CapUndeployedListV1: `app list --include-undeployed` returns
 	// never-deployed and removed Teploy-home apps in an "undeployed" array.
 	CapUndeployedListV1 = "undeployed-list-v1"
+	// CapSecretStdinV1: `secret set KEY --stdin` reads the value verbatim
+	// from stdin (never argv), and secret set/get/list/rm/rotate accept
+	// folderless `--app X --host S` (provider from the app's Teploy
+	// config when present).
+	CapSecretStdinV1 = "secret-stdin-v1"
+	// CapReleasesJsonV1: `releases --app X --host S --json` lists release
+	// records newest first with current/rollback_available (+reason); the
+	// human form is a table.
+	CapReleasesJsonV1 = "releases-json-v1"
+	// CapRollbackJsonV1: `rollback [--to X] --json` emits the machine
+	// result {app, server, from, to, ok}; failures keep the error
+	// envelope.
+	CapRollbackJsonV1 = "rollback-json-v1"
+	// CapRedeployV1: `teploy redeploy [--app X --host S] [--json]`
+	// redeploys the current release's recorded image with env re-resolved
+	// from .env, secrets and the recorded config, through the fenced
+	// deploy engine; static apps are refused.
+	CapRedeployV1 = "redeploy-v1"
+	// CapEnvConfigGuardV1: `env set`/`env unset` refuse keys declared
+	// under env:/env_literal: by the app's Teploy-home config, pointing
+	// at `teploy config set` / dash Settings.
+	CapEnvConfigGuardV1 = "env-config-guard-v1"
 )
 
 // MachineCapabilities returns every capability token this build
@@ -176,6 +198,11 @@ func MachineCapabilities() []string {
 		CapConfigMergeV1,
 		CapConfigUnprivilegedV1,
 		CapDeployHomeV1,
+		CapSecretStdinV1,
+		CapReleasesJsonV1,
+		CapRollbackJsonV1,
+		CapRedeployV1,
+		CapEnvConfigGuardV1,
 	}
 	sort.Strings(tokens)
 	return tokens

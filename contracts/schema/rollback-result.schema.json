@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://teploy.github.io/contracts/schema/rollback-result.schema.json",
+  "title": "`teploy rollback [--to X] --json`: the machine result of a successful rollback (rev 14, token rollback-json-v1)",
+  "type": "object",
+  "required": ["machine_interface", "app", "server", "from", "to", "ok"],
+  "properties": {
+    "machine_interface": {"type": "integer", "minimum": 1},
+    "app": {"type": "string", "minLength": 1},
+    "server": {"type": "string", "minLength": 1, "description": "The servers.yml name (or host) the rollback ran against."},
+    "from": {"type": "string", "description": "Release hash the app ran before the rollback (post-rollback state's previous release; may be empty for a first-deploy edge)."},
+    "to": {"type": "string", "description": "Release hash now current."},
+    "ok": {"const": true, "description": "Always true on this document; failures use the error envelope on stderr and never emit this shape."}
+  }
+}
