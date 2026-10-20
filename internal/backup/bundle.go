@@ -607,7 +607,19 @@ func (c *Client) CreateBundle(ctx context.Context, opts BundleOptions, store Bun
 		}
 	}
 	if opts.IncludeAgeKey {
-		if err := c.wsCopy(ctx, ws, "age-key", deploymentsDir+"/.age-key"); err != nil {
+		// The identity travels from wherever it lives on this target (D2
+		// moved it out of /deployments; ResolveIdentity is shared with the
+		// secret store so the two can never disagree).
+		keyPath, err := secret.ResolveIdentity(ctx, c.exec)
+		if err != nil {
+			cleanup()
+			return nil, err
+		}
+		if keyPath == "" {
+			cleanup()
+			return nil, fmt.Errorf("--include-age-key: no age identity on the target (expected %s or %s)", secret.IdentityPath, secret.LegacyIdentityPath)
+		}
+		if err := c.wsCopy(ctx, ws, "age-key", keyPath); err != nil {
 			cleanup()
 			return nil, err
 		}

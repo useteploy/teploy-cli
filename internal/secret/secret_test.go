@@ -14,7 +14,7 @@ import (
 func TestSet(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "which age", Output: "/usr/bin/age"},
-		ssh.MockCommand{Match: "if [ ! -e '/deployments/.age-key' ]", Output: "present"},
+		ssh.MockCommand{Match: "if [ -r '/etc/teploy/age-key' ]", Output: "legacy"},
 		ssh.MockCommand{Match: "grep 'public key:'", Output: "# public key: age1abc123"},
 		ssh.MockCommand{Match: "mkdir -p", Output: ""},
 		ssh.MockCommand{Match: "umask 077", Output: ""},
@@ -54,6 +54,7 @@ func TestSet_RejectsUnsafeKeys(t *testing.T) {
 
 func TestGet(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "if [ -r '/etc/teploy/age-key' ]", Output: "legacy"},
 		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/secrets/DB_PASS.age' ]", Output: "present"},
 		ssh.MockCommand{Match: "age -d", Output: "supersecret"},
 	)
@@ -73,6 +74,8 @@ func TestGet(t *testing.T) {
 // intentionally carry leading/trailing whitespace.
 func TestGet_PreservesExactBytes(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "if [ -r '/etc/teploy/age-key' ]", Output: "legacy"},
+		ssh.MockCommand{Match: "if [ -r '/etc/teploy/age-key' ]", Output: "legacy"},
 		ssh.MockCommand{Match: "if [ ! -e ", Output: "present"},
 		ssh.MockCommand{Match: "age -d", Output: "  padded password  \n"},
 	)
@@ -137,6 +140,8 @@ func TestList_Empty(t *testing.T) {
 // proceed as though every secret was simply absent.
 func TestList_ReadFailureIsError(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "if [ -r '/etc/teploy/age-key' ]", Output: "legacy"},
+		ssh.MockCommand{Match: "if [ -r '/etc/teploy/age-key' ]", Output: "legacy"},
 		ssh.MockCommand{Match: "if [ ! -e ", Output: "present"},
 		ssh.MockCommand{Match: "find", Err: fmt.Errorf("permission denied")},
 	)
@@ -148,9 +153,10 @@ func TestList_ReadFailureIsError(t *testing.T) {
 
 func TestRotate(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "if [ -r '/etc/teploy/age-key' ]", Output: "legacy"},
 		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/secrets/DB_PASS.age' ]", Output: "present"},
 		ssh.MockCommand{Match: "which age", Output: "/usr/bin/age"},
-		ssh.MockCommand{Match: "if [ ! -e '/deployments/.age-key' ]", Output: "present"},
+		ssh.MockCommand{Match: "if [ -r '/etc/teploy/age-key' ]", Output: "legacy"},
 		ssh.MockCommand{Match: "grep 'public key:'", Output: "# public key: age1abc123"},
 		ssh.MockCommand{Match: "mkdir -p", Output: ""},
 		ssh.MockCommand{Match: "umask 077", Output: ""},
@@ -183,6 +189,7 @@ func TestEnsureAge_AlreadyInstalled(t *testing.T) {
 
 func TestRemove(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "if [ -r '/etc/teploy/age-key' ]", Output: "legacy"},
 		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/secrets/DB_PASS.age' ]", Output: "present"},
 		ssh.MockCommand{Match: "rm -f '/deployments/myapp/secrets/DB_PASS.age'", Output: ""},
 	)
@@ -231,8 +238,12 @@ func TestRemove_NotSet(t *testing.T) {
 // application secrets. DecryptAll must never hand them to a workload.
 func TestDecryptAll_ExcludesManagementSecrets(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "if [ -r '/etc/teploy/age-key' ]", Output: "legacy"},
+		ssh.MockCommand{Match: "if [ -r '/etc/teploy/age-key' ]", Output: "legacy"},
 		ssh.MockCommand{Match: "if [ ! -e ", Output: "present"},
 		ssh.MockCommand{Match: "find", Output: "API_TOKEN.age\nVAULT_ROOT_TOKEN.age\nVAULT_RECOVERY_KEYS.age\nVAULT_SEAL_KEY.age\nVAULT_SEAL_KEY_ID.age\n"},
+		ssh.MockCommand{Match: "if [ -r '/etc/teploy/age-key' ]", Output: "legacy"},
+		ssh.MockCommand{Match: "if [ -r '/etc/teploy/age-key' ]", Output: "legacy"},
 		ssh.MockCommand{Match: "if [ ! -e ", Output: "present"},
 		ssh.MockCommand{Match: "age -d", Output: "value"},
 	)
@@ -265,6 +276,8 @@ func TestGet_ExistenceCheckTransportFailureIsNotAbsence(t *testing.T) {
 // plaintext — Get captured stdout and stderr in one buffer.
 func TestGet_StderrDoesNotContaminatePlaintext(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "if [ -r '/etc/teploy/age-key' ]", Output: "legacy"},
+		ssh.MockCommand{Match: "if [ -r '/etc/teploy/age-key' ]", Output: "legacy"},
 		ssh.MockCommand{Match: "if [ ! -e ", Output: "present"},
 		ssh.MockCommand{Match: "age -d", Output: ""},
 	)

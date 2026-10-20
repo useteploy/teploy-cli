@@ -67,7 +67,48 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
   into deploy, which does not fit this change. Per-app schedules remain
   managed with `backup schedule --app X --host S` (folderless), which
   stores both halves server-side.
-
+- Folderless per-command reads (server-authority plan D2): `teploy secret
+  set/get/list/rm/rotate --app X --host S` read exactly the server facts
+  they need — no teploy.yml, no reconstructed config. The secrets provider
+  comes from the app's Teploy config when it has one, else the folder
+  config in the cwd when it is this app, else local; `--provider` still
+  overrides. `secret set KEY --stdin` reads the value verbatim from stdin,
+  never argv (`secret-stdin-v1`).
+- `teploy releases --app X --host S [--json]` for container apps: release
+  records (internal/releasemeta) newest first — release id, deployed_at,
+  image (+digest), config commit, actor — each marked current or
+  rollback-able (containers for that version still present per
+  keep_versions retention) with the reason when not (`releases-json-v1`;
+  contracts corpus rev 14 adds `releases-envelope`). Static apps keep the
+  retained-directory listing; the folder-static `--json` array is
+  unchanged.
+- `teploy rollback [--to X] --json` emits the machine result
+  `{app, server, from, to, ok}`; progress goes to stderr and failures keep
+  the structured error envelope (`rollback-json-v1`; corpus adds
+  `rollback-result`).
+- `teploy redeploy [--app X --host S] [--json]`: a fresh deploy of the
+  CURRENT release's recorded image with env re-resolved from `.env`,
+  secrets and the recorded config, through the normal fenced deploy engine
+  (same version → the existing same-version redeploy path; the deploy
+  event carries `trigger=redeploy`). Teploy-home apps deploy from their
+  server config; folderless folder-home apps deploy a config rebuilt from
+  server records and only when it digest-matches the running release —
+  anything unrecorded is an explicit error. Static apps are refused
+  (`redeploy-v1`; corpus adds `redeploy-result`).
+- CLI env guard: `env set`/`env unset` (folder and `--app`) refuse keys
+  declared under `env:`/`env_literal:` by the app's Teploy-home config,
+  pointing at `teploy config set` / dash Settings
+  (`env-config-guard-v1`).
+- The server's age identity moved out of `/deployments` (which Caddy
+  mounts read-only into the edge container) to `/etc/teploy/age-key`
+  (0600, directory 0700). Reads prefer the new path and fall back to the
+  old one, so nothing breaks mid-migration; secret resolution, accessory
+  secrets, DR bundles (`--include-age-key`) and restore installs all
+  resolve through one helper. `teploy setup` migrates after verifying the
+  copy decrypts, leaving a public-key marker (not the private key) at the
+  old path so an older teploy keeps encrypting to the same identity;
+  `teploy doctor` reports the location (`age-identity` check). Non-root
+  deploy users that cannot write `/etc/teploy` keep using the old path.
 ## [0.1.44] - 2026-10-19
 
 ### Added

@@ -841,6 +841,7 @@ func deployBuiltImageFenced(ctx context.Context, executor ssh.Executor, appCfg *
 	deployCfg := deployConfigFromApp(appCfg, image, version, envFiles, volumes, tlsCert, tlsKey, tlsInternal, appliedManifest, manifestSHA256)
 	deployCfg.Provenance = prov
 	deployCfg.EnvProvenance = envProvenance(appCfg, deploySecrets, ageKeys)
+	deployCfg.EventTrigger = eventTrigger(ctx)
 	attachTrigger(ctx, &deployCfg)
 
 	// Vulnerability gate: scan the image on the server before any container

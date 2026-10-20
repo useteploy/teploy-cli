@@ -28,11 +28,15 @@ import (
 type Config struct {
 	TriggerOperationKey    string
 	ExecutionBindingDigest string
-	App                    string
-	Domain                 string
-	Image                  string
-	Version                string   // short git hash or tag
-	EnvFiles               []string // paths to env files on the server, applied in order (later files' keys win) — see docker.RunConfig.EnvFiles
+	// EventTrigger labels the deploy event's "trigger" detail (the
+	// trigger-convergence operation key it answers, or "redeploy" for
+	// teploy redeploy). Empty means an ordinary deploy.
+	EventTrigger string
+	App          string
+	Domain       string
+	Image        string
+	Version      string   // short git hash or tag
+	EnvFiles     []string // paths to env files on the server, applied in order (later files' keys win) — see docker.RunConfig.EnvFiles
 	// EnvProvenance maps each env key the deployer resolved to its source
 	// (releasemeta.EnvSource*). It decides which values the release record
 	// may persist; keys absent from it are treated as secret.
@@ -305,6 +309,9 @@ func (d *Deployer) DeployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 	detail := map[string]any{"image": cfg.Image}
 	if cfg.SourceRevision != "" {
 		detail["source_revision"] = cfg.SourceRevision
+	}
+	if cfg.EventTrigger != "" {
+		detail["trigger"] = cfg.EventTrigger
 	}
 	if cfg.Provenance != nil && cfg.Provenance.Dirty {
 		detail["dirty"] = true

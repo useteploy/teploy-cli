@@ -1,0 +1,9 @@
+{
+  "machine_interface": 2,
+  "app": "legacy",
+  "server": "infra-home",
+  "home": "folder",
+  "release": "abc1234",
+  "image": "example/legacy:abc1234",
+  "ok": true
+}
