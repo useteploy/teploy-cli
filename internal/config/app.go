@@ -14,6 +14,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/BurntSushi/toml"
 	"gopkg.in/yaml.v3"
@@ -37,6 +38,177 @@ var validMemory = regexp.MustCompile(`(?i)^\d+(\.\d+)?[bkmg]?$`)
 
 // validCPU matches a --cpus value: a positive decimal core count ("0.5", "2").
 var validCPU = regexp.MustCompile(`^\d+(\.\d+)?$`)
+
+// validSecretKeyShape matches the age-store key grammar (mirrors
+// secret.ValidateKey, kept local so config does not import the store).
+var validSecretKeyShape = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9._-]*$`)
+
+// validateGitSource checks the `git:` block and `build_secrets:`. The
+// home rule (git: only in Teploy home) lives in the folder loader, not
+// here — LoadAppBytes is shared by both homes.
+func (c *AppConfig) validateGitSource() error {
+	if c.Git == nil {
+		if len(c.BuildSecrets) > 0 {
+			return fmt.Errorf("'build_secrets:' needs 'git:' — build secrets are passed to the repository build")
+		}
+		return nil
+	}
+	g := c.Git
+	if c.Image != "" {
+		return fmt.Errorf("'image:' cannot be set with 'git:' — remove one (git: builds from the repository, image: deploys a pre-built image)")
+	}
+	if g.Repository == "" {
+		return fmt.Errorf("git.repository: is required (e.g. git@github.com:org/repo or https://github.com/org/repo.git)")
+	}
+	if err := ValidateGitRepository(g.Repository); err != nil {
+		return fmt.Errorf("git.repository: %w", err)
+	}
+	if g.Branch == "" {
+		return fmt.Errorf("git.branch: is required (the branch the server polls and builds)")
+	}
+	if err := ValidateGitBranch(g.Branch); err != nil {
+		return fmt.Errorf("git.branch: %w", err)
+	}
+	for _, p := range g.Paths {
+		if err := validateGitPath(p); err != nil {
+			return fmt.Errorf("git.paths: %w", err)
+		}
+	}
+	switch g.Poll {
+	case "", "off":
+	default:
+		if _, err := ParseGitPoll(g.Poll); err != nil {
+			return err
+		}
+	}
+	if g.Submodules {
+		return fmt.Errorf("git.submodules: submodule fetching is not implemented yet — flatten the repository or keep this app in folder home")
+	}
+	if c.Context != "" {
+		if err := validateGitPath(c.Context); err != nil {
+			return fmt.Errorf("context: %w (with git: it is relative to the repository root)", err)
+		}
+	}
+	if c.Dockerfile != "" {
+		if err := validateGitPath(c.Dockerfile); err != nil {
+			return fmt.Errorf("dockerfile: %w (with git: it is relative to the build context)", err)
+		}
+	}
+	for _, k := range c.BuildSecrets {
+		if !validSecretKeyShape.MatchString(k) {
+			return fmt.Errorf("build_secrets: invalid key %q — letters, digits, underscore, hyphen and dot only; must not start with a dash or dot", k)
+		}
+	}
+	return nil
+}
+
+// validateGitPath accepts a relative path without traversal.
+func validateGitPath(p string) error {
+	if p == "" || p == "." {
+		return fmt.Errorf("must not be empty")
+	}
+	if strings.HasPrefix(p, "/") || strings.HasPrefix(p, "\\") || filepath.IsAbs(p) {
+		return fmt.Errorf("%q must be relative to the repository root", p)
+	}
+	if p != filepath.Clean(p) || strings.Contains(p, "..") {
+		return fmt.Errorf("%q must be a clean relative path without ..", p)
+	}
+	if strings.ContainsAny(p, "\x00\n\r") {
+		return fmt.Errorf("%q must not contain control characters", p)
+	}
+	return nil
+}
+
+// ValidateGitRepository checks a git remote locator a Teploy-home `git:`
+// block may name: ssh://, scp-like user@host:path, https:// or file://
+// (a same-server repository; changing to or from file:// is a privileged
+// config change). http://, git:// and other transports are refused — the
+// first leaks the token, the second is unauthenticated, and arbitrary
+// transports (ext::) would run commands. A URL may never embed a
+// password: it would live in the config, the mirror and the logs.
+func ValidateGitRepository(repo string) error {
+	if repo == "" {
+		return fmt.Errorf("is empty")
+	}
+	if strings.HasPrefix(repo, "-") || strings.ContainsAny(repo, " \x00\n\r\t") {
+		return fmt.Errorf("%q is not a repository URL", repo)
+	}
+	lower := strings.ToLower(repo)
+	switch {
+	case strings.HasPrefix(lower, "ssh://"), strings.HasPrefix(lower, "file://"):
+		if u, err := url.Parse(repo); err != nil || u.Path == "" {
+			return fmt.Errorf("%q is not a valid ssh:///file:// repository URL", repo)
+		}
+	case strings.HasPrefix(lower, "https://"):
+		u, err := url.Parse(repo)
+		if err != nil || u.Host == "" {
+			return fmt.Errorf("%q is not a valid https repository URL", repo)
+		}
+		if u.User != nil {
+			if _, exists := u.User.Password(); exists {
+				return fmt.Errorf("%q embeds a password — pass a token with `teploy config source key --type token` instead", repo)
+			}
+		}
+	case strings.HasPrefix(lower, "http://"), strings.HasPrefix(lower, "git://"):
+		return fmt.Errorf("%q uses an unencrypted transport — use ssh:// or https://", repo)
+	default:
+		// scp-like: user@host:path (colon before any slash, no scheme).
+		head, _, _ := strings.Cut(repo, "/")
+		if !strings.Contains(head, ":") || strings.HasPrefix(repo, "/") {
+			return fmt.Errorf("%q is not a repository URL (ssh://, user@host:path, https:// or file://)", repo)
+		}
+		host, _, ok := strings.Cut(head, ":")
+		if !ok || host == "" {
+			return fmt.Errorf("%q is not a valid scp-style repository (want user@host:path)", repo)
+		}
+		if at := strings.LastIndex(host, "@"); at >= 0 {
+			host = host[at+1:]
+		}
+		if host == "" || strings.ContainsAny(host, "()[]{}|;`$&<>\"'") {
+			return fmt.Errorf("%q is not a valid scp-style repository (want user@host:path)", repo)
+		}
+	}
+	return nil
+}
+
+// GitRepositoryIsLocal reports whether the repository is a file:// path on
+// the app's own server (a privileged locator: it reads server-local files).
+func GitRepositoryIsLocal(repo string) bool {
+	return strings.HasPrefix(strings.ToLower(repo), "file://")
+}
+
+// ValidateGitBranch enforces one branch-name component (no slashes, no
+// ref-syntax metacharacters) — the admitter maps it onto refs/heads/<name>.
+func ValidateGitBranch(branch string) error {
+	if branch == "" {
+		return fmt.Errorf("is empty")
+	}
+	if strings.HasPrefix(branch, "-") || strings.HasPrefix(branch, ".") || strings.HasSuffix(branch, ".") ||
+		strings.HasSuffix(branch, ".lock") || strings.HasSuffix(branch, "/") || strings.Contains(branch, "//") ||
+		strings.Contains(branch, "..") || strings.ContainsAny(branch, " ~^:?*[\\/\x00\n\r\t") || strings.Contains(branch, "@{") {
+		return fmt.Errorf("%q is not a valid branch name", branch)
+	}
+	if len(branch) > 200 {
+		return fmt.Errorf("is too long (max 200 chars)")
+	}
+	return nil
+}
+
+// ParseGitPoll parses a git.poll interval (minimum one minute; the server
+// timer wakes every minute and each app honors its own interval).
+func ParseGitPoll(v string) (time.Duration, error) {
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return 0, fmt.Errorf("git.poll: %q is neither \"off\" nor a duration like 5m", v)
+	}
+	if d < time.Minute {
+		return 0, fmt.Errorf("git.poll: %s is below the one-minute minimum", v)
+	}
+	if d > 24*time.Hour {
+		return 0, fmt.Errorf("git.poll: %s is above the 24h maximum", v)
+	}
+	return d, nil
+}
 
 // validateResources checks a memory/CPU pair from either an app or an accessory.
 // which names the offending block for the error message.
@@ -84,6 +256,25 @@ type RolloutConfig struct {
 // path.Match globs (`*` within a path segment, `?`, exact paths).
 type AutodeployConfig struct {
 	Paths []string `yaml:"paths,omitempty" toml:"paths"`
+}
+
+// GitSource names the git repository a Teploy-home app builds from (the
+// `git:` block). The server fetches the branch into a per-app mirror with
+// the app's stored credential and builds the admitted commit; `context:`
+// and `dockerfile:` are interpreted relative to the repository root.
+// Valid only in Teploy home (folder apps build from their folder) — the
+// folder loader refuses it. `poll` is the server poll interval ("5m",
+// minimum 1m) or "off" (webhook wakes only).
+type GitSource struct {
+	Repository string `yaml:"repository,omitempty" toml:"repository"`
+	Branch     string `yaml:"branch,omitempty" toml:"branch"`
+	// Paths restricts which changes trigger a deploy (monorepo filter);
+	// empty plus a custom `context:` defaults to that context's directory.
+	Paths []string `yaml:"paths,omitempty" toml:"paths"`
+	Poll  string   `yaml:"poll,omitempty" toml:"poll"`
+	// Submodules is accepted for forward-compatibility; true is refused
+	// until submodule fetching is implemented.
+	Submodules bool `yaml:"submodules,omitempty" toml:"submodules"`
 }
 
 // CanaryCount resolves the canary spec against the fleet size: integer count
@@ -406,6 +597,14 @@ type AppConfig struct {
 	// (monorepo change filtering); absent (nil) = every push on the watched
 	// branch deploys, the historical behavior.
 	Autodeploy *AutodeployConfig `yaml:"autodeploy,omitempty" toml:"autodeploy"`
+	// Git is the `git:` block: the repository this app builds from
+	// (Teploy home only). With it set, `image:` must be empty — the
+	// app builds from source.
+	Git *GitSource `yaml:"git,omitempty" toml:"git"`
+	// BuildSecrets names age-store keys passed to the build as
+	// `docker build --secret id=<KEY>` (values never enter the config,
+	// image layers or logs). Requires `git:`.
+	BuildSecrets []string `yaml:"build_secrets,omitempty" toml:"build_secrets"`
 	// Scan runs a Trivy vulnerability scan on the image server-side before
 	// containers start: HIGH+CRITICAL findings are reported, and fixable
 	// CRITICALs block the deploy.
@@ -1009,6 +1208,9 @@ func (c *AppConfig) validate() error {
 	default:
 		return fmt.Errorf("'type' must be 'container' or 'static' (got %q)", c.Type)
 	}
+	if err := c.validateGitSource(); err != nil {
+		return err
+	}
 	if c.TLS != nil {
 		if c.TLS.Internal {
 			if c.TLS.Cert != "" || c.TLS.Key != "" {
@@ -1261,6 +1463,9 @@ func LoadApp(dir string) (*AppConfig, error) {
 		if err := cfg.validate(); err != nil {
 			return nil, invalidConfig(fmt.Errorf("invalid %s: %w", name, err))
 		}
+		if cfg.Git != nil {
+			return nil, invalidConfig(fmt.Errorf("invalid %s: git: is a Teploy-home key — a folder app builds from its folder; move the app with `teploy config home teploy` to build from a repository", name))
+		}
 		return &cfg, nil
 	}
 
@@ -1347,6 +1552,9 @@ func LoadAppWithDestination(dir, dest string, opts OverlayOptions) (*AppConfig, 
 		mergeConfigs(base, &overlay)
 		if err := base.validate(); err != nil {
 			return nil, invalidConfig(fmt.Errorf("invalid config after merging %s: %w", name, err))
+		}
+		if base.Git != nil {
+			return nil, invalidConfig(fmt.Errorf("invalid config after merging %s: git: is a Teploy-home key — a folder app builds from its folder", name))
 		}
 		return base, nil
 	}

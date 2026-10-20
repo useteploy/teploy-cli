@@ -56,8 +56,11 @@ func Load(raw []byte, app string) (*config.AppConfig, error) {
 		if len(cfg.Build) > 0 && !cfg.BuildRemote {
 			add("build: commands would run in the deploying machine's shell — set build_remote: true")
 		}
-	} else if cfg.Image == "" {
-		add("image: is required — a Teploy-home app has no folder to build from")
+		if cfg.Git != nil {
+			add("git: static sites cannot build from a git repository yet — keep this app in folder home")
+		}
+	} else if cfg.Image == "" && cfg.Git == nil {
+		add("image: is required — a Teploy-home app has no folder to build from (or set git: to build from a repository)")
 	}
 	keys := make([]string, 0, len(cfg.Env))
 	for k := range cfg.Env {
@@ -178,6 +181,11 @@ func PrivilegedChange(prev, next *config.AppConfig) bool {
 		prev.Network != next.Network {
 		return true
 	}
+	// A file:// git repository reads server-local paths with the deploy
+	// user's rights — pointing one anywhere new reaches the host.
+	if gitLocalRepo(prev) != gitLocalRepo(next) {
+		return true
+	}
 	if (prev.Ingress == config.IngressHost || next.Ingress == config.IngressHost) && prev.Port != next.Port {
 		return true
 	}
@@ -206,4 +214,12 @@ func hostBinds(vols map[string]string) string {
 	}
 	sort.Strings(out)
 	return strings.Join(out, ",")
+}
+
+// gitLocalRepo names a config's file:// repository ("" when none/remote).
+func gitLocalRepo(cfg *config.AppConfig) string {
+	if cfg.Git != nil && config.GitRepositoryIsLocal(cfg.Git.Repository) {
+		return cfg.Git.Repository
+	}
+	return ""
 }
