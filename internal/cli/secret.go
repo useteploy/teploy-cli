@@ -13,8 +13,10 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/useteploy/teploy/internal/config"
+	"github.com/useteploy/teploy/internal/confighome"
 	"github.com/useteploy/teploy/internal/openbao"
 	"github.com/useteploy/teploy/internal/secret"
+	"github.com/useteploy/teploy/internal/ssh"
 )
 
 // Secret providers. "local" is the built-in age-encrypted store; "openbao" is
@@ -26,6 +28,7 @@ const (
 
 func newSecretCmd(flags *Flags) *cobra.Command {
 	var provider string
+	var appName string
 	cmd := &cobra.Command{
 		Use:   "secret",
 		Short: "Manage secrets (local age store or a managed provider like OpenBao)",
@@ -33,15 +36,20 @@ func newSecretCmd(flags *Flags) *cobra.Command {
 age-encrypted store (--provider local). Set --provider openbao (or
 secret.provider: openbao in teploy.yml) to use a managed OpenBao secrets
 manager — provisioned, auto-unsealed, with dynamic credentials and a
-tamper-evident audit trail.`,
+tamper-evident audit trail.
+
+Every subcommand also works without a folder: pass --app X --host S and the
+app is resolved from the server (the provider then comes from the app's
+Teploy config when it has one).`,
 	}
 	cmd.PersistentFlags().StringVar(&provider, "provider", "", "secrets provider: local (default) or openbao")
+	cmd.PersistentFlags().StringVar(&appName, "app", "", "app name — act on the server instead of teploy.yml (requires --host)")
 
-	cmd.AddCommand(newSecretSetCmd(flags, &provider))
-	cmd.AddCommand(newSecretGetCmd(flags, &provider))
-	cmd.AddCommand(newSecretListCmd(flags, &provider))
-	cmd.AddCommand(newSecretRmCmd(flags, &provider))
-	cmd.AddCommand(newSecretRotateCmd(flags))
+	cmd.AddCommand(newSecretSetCmd(flags, &provider, &appName))
+	cmd.AddCommand(newSecretGetCmd(flags, &provider, &appName))
+	cmd.AddCommand(newSecretListCmd(flags, &provider, &appName))
+	cmd.AddCommand(newSecretRmCmd(flags, &provider, &appName))
+	cmd.AddCommand(newSecretRotateCmd(flags, &appName))
 	// Managed-provider (OpenBao) operations live under `secret` too.
 	addOpenbaoSecretCommands(cmd, flags, &provider)
 	return cmd
@@ -59,24 +67,106 @@ func resolveProvider(providerFlag string, appCfg *config.AppConfig) string {
 	return providerLocal
 }
 
-func newSecretSetCmd(flags *Flags, provider *string) *cobra.Command {
-	return &cobra.Command{
-		Use:   "set KEY=value [KEY=value...]",
+// openSecretTarget resolves the app for a secret subcommand and connects.
+// Without --app this is the normal folder path (config.LoadApp +
+// connectForApp). With --app X --host S no config is reconstructed: the
+// returned AppConfig carries only the app name plus, when the app has a
+// Teploy config, the secret: block read straight from it — the only
+// server fact this command family needs. The caller owns the executor.
+func openSecretTarget(ctx context.Context, flags *Flags, providerFlag, appName string) (*config.AppConfig, ssh.Executor, error) {
+	if appName == "" {
+		appCfg, err := config.LoadApp(".")
+		if err != nil {
+			return nil, nil, err
+		}
+		executor, err := connectForApp(ctx, flags, appCfg)
+		if err != nil {
+			return nil, nil, err
+		}
+		return appCfg, executor, nil
+	}
+	if flags.Host == "" {
+		return nil, nil, fmt.Errorf("--host is required when using --app")
+	}
+	if err := config.ValidateName(appName); err != nil {
+		return nil, nil, err
+	}
+	host, user, key, err := config.ResolveServer(flags.Host, flags.Host, flags.User, flags.Key)
+	if err != nil {
+		return nil, nil, err
+	}
+	if !flags.JSON {
+		fmt.Printf("Connecting to %s@%s...\n", user, host)
+	}
+	executor, err := ssh.Connect(ctx, ssh.ConnectConfig{Host: host, User: user, KeyPath: key})
+	if err != nil {
+		return nil, nil, err
+	}
+	appCfg := &config.AppConfig{App: appName, Server: flags.Host}
+	sc, ok, err := serverSecretConfig(ctx, executor, appName)
+	if err != nil {
+		executor.Close()
+		return nil, nil, err
+	}
+	if ok {
+		appCfg.Secret = sc
+	}
+	if providerFlag == "" && appCfg.Secret.Provider == "" {
+		// Fall back to the folder config in the cwd when it is this app's.
+		if cfg, err := config.LoadApp("."); err == nil && cfg.App == appName && cfg.Secret.Provider != "" {
+			appCfg.Secret = cfg.Secret
+		}
+	}
+	return appCfg, executor, nil
+}
+
+// serverSecretConfig reads the secret: block straight from the app's
+// Teploy config (the only server fact the secret commands need). ok is
+// false when the app has no Teploy config (folder home).
+func serverSecretConfig(ctx context.Context, executor ssh.Executor, appName string) (config.SecretConfig, bool, error) {
+	exists, head, err := confighome.Head(ctx, executor, appName)
+	if err != nil {
+		return config.SecretConfig{}, false, fmt.Errorf("checking %s's Teploy config: %w", appName, err)
+	}
+	if !exists || head == "" {
+		return config.SecretConfig{}, false, nil
+	}
+	raw, _, err := confighome.Read(ctx, executor, appName, head)
+	if err != nil {
+		return config.SecretConfig{}, false, fmt.Errorf("reading %s's Teploy config: %w", appName, err)
+	}
+	// Lenient schema parse: this reads the provider fact, it does not
+	// write a config, so confighome.Load's store rules do not apply.
+	cfg, err := config.LoadAppBytes(raw)
+	if err != nil {
+		return config.SecretConfig{}, false, fmt.Errorf("%s's Teploy config is unreadable: %w", appName, err)
+	}
+	return cfg.Secret, true, nil
+}
+
+func newSecretSetCmd(flags *Flags, provider, appName *string) *cobra.Command {
+	var valueStdin bool
+	f := &cobra.Command{
+		Use:   "set KEY=value [KEY=value...] | KEY --stdin",
 		Short: "Set one or more secrets",
-		Args:  cobra.MinimumNArgs(1),
+		Long: `Set one or more secrets.
+
+With --stdin, pass the KEY alone as the argument and pipe the value in;
+stdin is taken verbatim (no trailing-newline trim), which keeps secret
+values out of the process list, where argv is visible to every local
+process. Only one KEY can be set per --stdin invocation.`,
+		Args: cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			pairs := make(map[string]string)
-			for _, arg := range args {
-				idx := strings.IndexByte(arg, '=')
-				if idx < 0 {
-					return fmt.Errorf("invalid format: %q (expected KEY=value)", arg)
-				}
-				pairs[arg[:idx]] = arg[idx+1:]
+			pairs, err := parseEnvSetArgs(cmd.InOrStdin(), args, valueStdin)
+			if err != nil {
+				return err
 			}
 			warnSecretTerminators(pairs, os.Stderr)
-			return runSecretSet(flags, *provider, pairs)
+			return runSecretSet(flags, *provider, *appName, pairs)
 		},
 	}
+	f.Flags().BoolVar(&valueStdin, "stdin", false, "read the value from stdin instead of argv (pass the KEY alone as the argument; stdin is verbatim — use for secret values)")
+	return f
 }
 
 // warnSecretTerminators notes values that end in a line terminator. They are
@@ -100,14 +190,10 @@ func warnSecretTerminators(pairs map[string]string, w io.Writer) {
 		strings.Join(keys, ", "))
 }
 
-func runSecretSet(flags *Flags, providerFlag string, pairs map[string]string) (retErr error) {
-	appCfg, err := config.LoadApp(".")
-	if err != nil {
-		return err
-	}
+func runSecretSet(flags *Flags, providerFlag, appName string, pairs map[string]string) (retErr error) {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
-	executor, err := connectForApp(ctx, flags, appCfg)
+	appCfg, executor, err := openSecretTarget(ctx, flags, providerFlag, appName)
 	if err != nil {
 		return err
 	}
@@ -139,25 +225,21 @@ func runSecretSet(flags *Flags, providerFlag string, pairs map[string]string) (r
 	return nil
 }
 
-func newSecretGetCmd(flags *Flags, provider *string) *cobra.Command {
+func newSecretGetCmd(flags *Flags, provider, appName *string) *cobra.Command {
 	return &cobra.Command{
 		Use:   "get KEY",
 		Short: "Decrypt and display a secret",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runSecretGet(flags, *provider, args[0])
+			return runSecretGet(flags, *provider, *appName, args[0])
 		},
 	}
 }
 
-func runSecretGet(flags *Flags, providerFlag, key string) error {
-	appCfg, err := config.LoadApp(".")
-	if err != nil {
-		return err
-	}
+func runSecretGet(flags *Flags, providerFlag, appName, key string) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
-	executor, err := connectForApp(ctx, flags, appCfg)
+	appCfg, executor, err := openSecretTarget(ctx, flags, providerFlag, appName)
 	if err != nil {
 		return err
 	}
@@ -188,25 +270,21 @@ func runSecretGet(flags *Flags, providerFlag, key string) error {
 	return nil
 }
 
-func newSecretListCmd(flags *Flags, provider *string) *cobra.Command {
+func newSecretListCmd(flags *Flags, provider, appName *string) *cobra.Command {
 	return &cobra.Command{
 		Use:   "list",
 		Short: "List secret keys (values masked)",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runSecretList(flags, *provider)
+			return runSecretList(flags, *provider, *appName)
 		},
 	}
 }
 
-func runSecretList(flags *Flags, providerFlag string) error {
-	appCfg, err := config.LoadApp(".")
-	if err != nil {
-		return err
-	}
+func runSecretList(flags *Flags, providerFlag, appName string) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
-	executor, err := connectForApp(ctx, flags, appCfg)
+	appCfg, executor, err := openSecretTarget(ctx, flags, providerFlag, appName)
 	if err != nil {
 		return err
 	}
@@ -244,7 +322,7 @@ func runSecretList(flags *Flags, providerFlag string) error {
 	return nil
 }
 
-func newSecretRmCmd(flags *Flags, provider *string) *cobra.Command {
+func newSecretRmCmd(flags *Flags, provider, appName *string) *cobra.Command {
 	return &cobra.Command{
 		Use:   "rm KEY [KEY...]",
 		Short: "Delete one or more secrets",
@@ -258,19 +336,15 @@ removal of an already-revoked credential is safe. Containers keep the old value
 in their environment until the app is redeployed with teploy deploy.`,
 		Args: cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runSecretRm(flags, *provider, args)
+			return runSecretRm(flags, *provider, *appName, args)
 		},
 	}
 }
 
-func runSecretRm(flags *Flags, providerFlag string, keys []string) (retErr error) {
-	appCfg, err := config.LoadApp(".")
-	if err != nil {
-		return err
-	}
+func runSecretRm(flags *Flags, providerFlag, appName string, keys []string) (retErr error) {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
-	executor, err := connectForApp(ctx, flags, appCfg)
+	appCfg, executor, err := openSecretTarget(ctx, flags, providerFlag, appName)
 	if err != nil {
 		return err
 	}
@@ -306,25 +380,21 @@ func runSecretRm(flags *Flags, providerFlag string, keys []string) (retErr error
 	return nil
 }
 
-func newSecretRotateCmd(flags *Flags) *cobra.Command {
+func newSecretRotateCmd(flags *Flags, appName *string) *cobra.Command {
 	return &cobra.Command{
 		Use:   "rotate KEY",
 		Short: "Generate a new random value for a local secret",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runSecretRotate(flags, args[0])
+			return runSecretRotate(flags, *appName, args[0])
 		},
 	}
 }
 
-func runSecretRotate(flags *Flags, key string) error {
-	appCfg, err := config.LoadApp(".")
-	if err != nil {
-		return err
-	}
+func runSecretRotate(flags *Flags, appName, key string) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
-	executor, err := connectForApp(ctx, flags, appCfg)
+	appCfg, executor, err := openSecretTarget(ctx, flags, "", appName)
 	if err != nil {
 		return err
 	}
