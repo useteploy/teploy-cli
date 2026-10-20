@@ -4,6 +4,24 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [0.1.45] - 2026-10-20
+
+### Upgrade notes
+
+- `teploy setup` moves the age identity from `/deployments/.age-key` to
+  `/etc/teploy/age-key` (0600), out of the Caddy-readable tree. It leaves
+  only a public-key marker at the old path: older CLIs can still encrypt
+  (`secret set`) but can no longer decrypt, so their deploys of apps with
+  secrets fail. Upgrade every machine and CI image to 0.1.45 before
+  running `setup` on a server. Existing secrets keep decrypting with this
+  version.
+- Backup cron lines that embed bucket, region or credentials keep working.
+  `teploy server backup-target set` rewrites them to `teploy backup run`,
+  and `teploy doctor` flags any line that still embeds credentials.
+- Apps that build from `git:` need the server poll timer (`teploy trigger
+  install-timer --host S`); `teploy doctor`'s `git-trigger` check reports
+  a missing one.
+
 ### Added
 
 - Teploy-home apps can build from a git repository: a `git:` block
@@ -49,14 +67,6 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
 - New event kinds `trigger.admit`/`trigger.refuse` detail `reason`, and
   `source.connect` records credential lifecycle (type and fingerprint
   only).
-
-### Notes
-
-- Static Teploy-home apps with `git:` remain refused (static deploys
-  still need a code source); submodules are refused pending
-  implementation; `file://` repositories are accepted as a privileged
-  config change (same-server sources).
-
 - One backup target per server, read at run time (`backup-target-v1`;
   contracts corpus rev 15). `teploy server backup-target set --host S
   --bucket B [--region] [--endpoint] [--prefix]` stores it at
@@ -102,6 +112,13 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
   allowlist: id, kind, accessory, error — never bucket or credential
   material; the server-level target event is fanned out to every app
   known on the server).
+
+### Notes
+
+- Static Teploy-home apps with `git:` remain refused (static deploys
+  still need a code source); submodules are refused pending
+  implementation; `file://` repositories are accepted as a privileged
+  config change (same-server sources).
 
 ### Changed
 
