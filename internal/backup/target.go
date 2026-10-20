@@ -243,7 +243,10 @@ func EncryptCredentials(ctx context.Context, exec ssh.Executor, accessKey, secre
 	if recipient == "" || strings.Contains(recipient, "\n") {
 		return "", fmt.Errorf("age-keygen returned an unusable recipient")
 	}
-	plaintext := "AWS_ACCESS_KEY_ID=" + accessKey + "\nAWS_SECRET_ACCESS_KEY=" + secretKey + "\n"
+	// export is required: the eval runs in the invocation's own shell and
+	// the assignments must reach the exec'd aws child (bare assignments
+	// would stay unexported shell variables).
+	plaintext := "export AWS_ACCESS_KEY_ID=" + accessKey + "\nexport AWS_SECRET_ACCESS_KEY=" + secretKey + "\n"
 	res := ssh.RunInputDetailed(ctx, exec, "age -r "+ssh.ShellQuote(recipient)+" -a", strings.NewReader(plaintext))
 	if res.Err != nil {
 		return "", fmt.Errorf("encrypting the credentials: %w", res.Err)

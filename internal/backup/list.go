@@ -67,7 +67,10 @@ func (c *Client) ListBackupsRecursive(ctx context.Context, app string, s3 S3Conf
 			continue
 		}
 		row.SizeBytes = size
-		row.Key = root + key
+		// Recursive listing keys are relative to the BUCKET root (they
+		// already carry the app prefix), so rebuild the full URI from the
+		// base, not from the listing prefix.
+		row.Key = "s3://" + s3.Base() + "/" + key
 		rows = append(rows, row)
 	}
 	sort.SliceStable(rows, func(i, j int) bool {
