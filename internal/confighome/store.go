@@ -79,6 +79,10 @@ type Author struct {
 // Dir is the app's server data directory.
 func Dir(app string) string { return rootDir() + "/apps/" + app }
 
+// AppsDir is the directory holding every app's server data (the poll
+// timer and doctor enumerate git-source apps from it).
+func AppsDir() string { return rootDir() + "/apps" }
+
 // RepoPath is the app's config repository.
 func RepoPath(app string) string { return Dir(app) + "/config.git" }
 

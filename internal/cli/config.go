@@ -49,7 +49,7 @@ secret values go in 'teploy secret set'.`,
 	cmd.AddCommand(newConfigGetCmd(flags), newConfigSetCmd(flags), newConfigEditCmd(flags), newConfigMergeCmd(flags),
 		newConfigDiffCmd(flags), newConfigHistoryCmd(flags), newConfigRestoreCmd(flags),
 		newConfigPullCmd(flags), newConfigPushCmd(flags), newConfigHomeCmd(flags),
-		newConfigPurgeHistoryCmd(flags))
+		newConfigPurgeHistoryCmd(flags), newConfigSourceCmd(flags))
 	return cmd
 }
 

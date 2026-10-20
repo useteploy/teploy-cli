@@ -2726,3 +2726,26 @@ outside this repository.
   and OpenBao. Rollback now warns, naming the keys, when `.env` or
   `secrets/` changed after the target release was recorded, and says to
   redeploy. Not covered: OpenBao rotations (not observable from the host).
+
+## 2026-10-20 — git sources (D4): deferred surface
+
+Landed in PR #44: `git:` code sources for Teploy-home apps, per-app
+credentials age-encrypted outside /deployments, the single `trigger poll`
+admitter, and the minutely systemd timer. Deliberately deferred (documented
+in README/CHANGELOG):
+
+- **Submodules**: `git.submodules: true` is refused at validation; a
+  repository carrying `.gitmodules` fails the build explicitly.
+  Credential-scoped submodule fetching needs per-submodule authorization
+  decisions (a submodule URL is attacker-chosen in a PR).
+- **Static + git**: static Teploy-home apps with `git:` stay refused
+  (static deploys still need a code source — `build_remote` on a git
+  checkout is unbuilt plumbing).
+- **Non-privileged git.repository changes**: switching to a `file://`
+  repository IS privileged (reads server-local paths); switching between
+  remote repositories is not — a non-admin editor can repoint an app at
+  any reachable remote and build its code. The build runs server-side
+  with no host mounts by default, so this is app-code authority, not host
+  authority; revisit if deploy hooks or host binds interact.
+- **Timer auto-install**: offered best-effort after `config source key`
+  only (`--no-timer` skips); `teploy setup` does not install it yet.

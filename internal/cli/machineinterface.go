@@ -139,6 +139,12 @@ const (
 	// CapDeployHomeV1: `deploy --app X --image T --home teploy` creates a
 	// new app in Teploy home from the ad-hoc flags, then deploys it.
 	CapDeployHomeV1 = "deploy-home-v1"
+	// CapGitSourceV1: Teploy-home apps may build from a git repository
+	// (`git:` config key): credential, mirror, archive into the attempt dir.
+	CapGitSourceV1 = "git-source-v1"
+	// CapTriggerPollV1: `trigger poll [--app|--all] [--now] [--hint]` is the
+	// single admitter (dedup, watermark+ancestry, force-push refusal).
+	CapTriggerPollV1 = "trigger-poll-v1"
 	// CapUndeployedListV1: `app list --include-undeployed` returns
 	// never-deployed and removed Teploy-home apps in an "undeployed" array.
 	CapUndeployedListV1 = "undeployed-list-v1"
@@ -209,6 +215,8 @@ func MachineCapabilities() []string {
 		CapConfigMergeV1,
 		CapConfigUnprivilegedV1,
 		CapDeployHomeV1,
+		CapGitSourceV1,
+		CapTriggerPollV1,
 		CapBackupTargetV1,
 		CapBackupJSONV1,
 		CapSecretStdinV1,

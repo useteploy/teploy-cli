@@ -109,6 +109,7 @@ const (
 	KindMaintenanceOff = "maintenance.off"
 	KindGateRepair     = "gate.repair"
 	KindWatermarkReset = "watermark.reset"
+	KindSourceConnect  = "source.connect"
 	KindBackupRun      = "backup.run"
 	KindBackupRestore  = "backup.restore"
 	KindBackupTarget   = "backup_target.set"
@@ -132,8 +133,8 @@ var detailAllow = map[string][]string{
 	KindConfigSet:      {"privileged", "keys", "previous_commit"},
 	KindConfigHome:     {"from", "to"},
 	KindRemove:         {"purge", "redirect", "error"},
-	KindTriggerAdmit:   {"ref", "commit", "delivery_id", "preview"},
-	KindTriggerRefuse:  {"ref", "commit", "delivery_id", "reason"},
+	KindTriggerAdmit:   {"ref", "commit", "delivery_id", "preview", "reason"},
+	KindTriggerRefuse:  {"ref", "commit", "delivery_id", "reason", "error"},
 	KindPreviewDeploy:  {"preview", "branch", "error"},
 	KindPreviewDestroy: {"preview", "error"},
 	KindLock:           {"message"},

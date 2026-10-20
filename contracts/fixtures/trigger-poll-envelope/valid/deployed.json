@@ -1,0 +1,10 @@
+{
+  "machine_interface": 2,
+  "app": "blog",
+  "host": "192.0.2.10",
+  "ref": "refs/heads/main",
+  "head": "3d9c1f0b8a7e6d5c4b3a2f1e0d9c8b7a6f5e4d3c",
+  "admitted": true,
+  "reason": "deployed",
+  "deployed_release": "3d9c1f0e8a7e"
+}

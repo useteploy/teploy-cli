@@ -4,15 +4,19 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"time"
 
+	"github.com/useteploy/teploy/internal/build"
 	"github.com/useteploy/teploy/internal/config"
 	"github.com/useteploy/teploy/internal/confighome"
 	"github.com/useteploy/teploy/internal/dns"
 	"github.com/useteploy/teploy/internal/docker"
+	"github.com/useteploy/teploy/internal/gitsource"
 	"github.com/useteploy/teploy/internal/releasemeta"
 	"github.com/useteploy/teploy/internal/ssh"
 	"github.com/useteploy/teploy/internal/state"
@@ -74,7 +78,14 @@ func deployServerConfig(ctx context.Context, executor ssh.Executor, host, server
 	}
 	defer state.ReleaseLockFenced(executor, lk, app)
 	lk.StartRenewal(executor)
+	return deployServerConfigLocked(ctx, executor, host, serverName, app, image, version, skipDNSCheck, migrateVolumes, lk, "")
+}
 
+// deployServerConfigLocked is deployServerConfig under a lock the caller
+// already holds (the poll admitter) and an optional pre-admitted git
+// commit: gitCommit != "" deploys exactly that commit; "" resolves the
+// branch head the way a manual deploy does.
+func deployServerConfigLocked(ctx context.Context, executor ssh.Executor, host, serverName, app, image, version string, skipDNSCheck, migrateVolumes bool, lk *state.Lock, gitCommit string) error {
 	gate, err := confighome.CheckGate(ctx, executor, app, lk, os.Stdout)
 	if err != nil {
 		return refuseAdmission(err)
@@ -116,22 +127,53 @@ func deployServerConfig(ctx context.Context, executor ssh.Executor, host, server
 	appCfg.ConfigHome = confighome.HomeTeploy
 	appCfg.ConfigCommit = commit
 
-	image = appCfg.Image
+	// Git source: build the admitted (or, for a manual deploy, the
+	// current) branch head from the server mirror.
+	sourceCommit := ""
+	if appCfg.Git != nil {
+		if gitCommit != "" {
+			sourceCommit = gitCommit
+		} else {
+			if refused, rerr := gitsource.RefusedHead(ctx, executor, app, appCfg.Git.Repository, appCfg.Git.Branch); rerr == nil && refused != "" {
+				return refuseAdmission(fmt.Errorf("%s's branch %s was force-pushed to %s and is refused until the watermark is reset — run `teploy trigger reset --app %s --ref refs/heads/%s`", app, appCfg.Git.Branch, short12(refused), app, appCfg.Git.Branch))
+			}
+			if sourceCommit, err = gitsource.ResolveHead(ctx, executor, app, appCfg.Git); err != nil {
+				return refuseAdmission(err)
+			}
+		}
+		appCfg.SourceRevision = sourceCommit
+	} else if appCfg.Image != "" {
+		image = appCfg.Image
+	}
+
 	if version == "" {
-		version = versionFromImage(image)
-		if version == "" {
-			version = fmt.Sprintf("%d", time.Now().Unix())
+		if appCfg.Git != nil {
+			version = short12(sourceCommit)
+		} else {
+			version = versionFromImage(image)
+			if version == "" {
+				version = fmt.Sprintf("%d", time.Now().Unix())
+			}
 		}
 	} else if err := validateVersionArg(version); err != nil {
 		return refuseAdmission(err)
 	}
 	fmt.Printf("Deploying %s from its Teploy config %s\n", app, short12(commit))
+	if appCfg.Git != nil {
+		fmt.Printf("Building %s@%s from %s (branch %s)\n", app, short12(sourceCommit), appCfg.Git.Repository, appCfg.Git.Branch)
+	}
 
 	if err := admitDeploymentVolumes(ctx, &state.FencedExecutor{Executor: executor, Lock: lk}, appCfg); err != nil {
 		return err
 	}
 	att := releasemeta.MustAttempt(app, version)
-	if err := ensureImage(ctx, docker.NewClient(executor), image, os.Stdout); err != nil {
+	if appCfg.Git != nil {
+		built, err := buildFromGitSource(ctx, executor, appCfg, att, sourceCommit, os.Stdout)
+		if err != nil {
+			return err
+		}
+		image = built
+	} else if err := ensureImage(ctx, docker.NewClient(executor), image, os.Stdout); err != nil {
 		return err
 	}
 	if !skipDNSCheck && appCfg.Domain != "" &&
@@ -144,7 +186,99 @@ func deployServerConfig(ctx context.Context, executor ssh.Executor, host, server
 			fmt.Println("  DNS validated")
 		}
 	}
-	return deployBuiltImageFenced(ctx, executor, appCfg, image, version, host, migrateVolumes, false, "", lk, &att, "")
+	err = deployBuiltImageFenced(ctx, executor, appCfg, image, version, host, migrateVolumes, appCfg.Git != nil, "", lk, &att, "")
+	if err != nil {
+		return err
+	}
+	if appCfg.Git != nil && gitCommit == "" {
+		// A manual deploy is a valid way past a retry cap; record it so
+		// the next poll does not redo the same head.
+		if rerr := gitsource.RecordManualDeploy(ctx, executor, app, appCfg.Git.Repository, appCfg.Git.Branch, sourceCommit, version); rerr != nil {
+			fmt.Printf("Warning: could not advance %s's git watermark: %v\n", app, rerr)
+		}
+	}
+	return nil
+}
+
+// buildFromGitSource exports the commit's tree from the per-app mirror
+// into the attempt's build directory and builds it server-side (context:
+// and dockerfile: are relative to the repository root). build_secrets are
+// decrypted to 0600 files outside the build context, mounted with
+// `docker build --secret`, and removed immediately after.
+func buildFromGitSource(ctx context.Context, executor ssh.Executor, appCfg *config.AppConfig, att releasemeta.Attempt, commit string, out io.Writer) (string, error) {
+	remoteDir := att.BuildDir()
+	if _, err := executor.Run(ctx, att.MkdirCmd("build")); err != nil {
+		return "", fmt.Errorf("creating build directory: %w", err)
+	}
+	contextDir := appCfg.Context
+	if contextDir == "" {
+		contextDir = "."
+	}
+	mode, hasGitmodules, err := gitsource.ExportArchive(ctx, executor, appCfg.App, remoteDir, commit, contextDir, appCfg.Dockerfile)
+	if err != nil {
+		return "", refuseAdmission(fmt.Errorf("exporting %s@%s from the mirror: %w", appCfg.App, short12(commit), err))
+	}
+	if hasGitmodules {
+		return "", refuseAdmission(fmt.Errorf("%s's repository declares submodules, which this teploy version does not build — flatten the repository or keep the app in folder home", appCfg.App))
+	}
+	var buildMode build.Mode
+	switch mode {
+	case "dockerfile":
+		buildMode = build.ModeDockerfile
+	case "nixpacks":
+		if len(appCfg.BuildSecrets) > 0 {
+			return "", refuseAdmission(fmt.Errorf("build_secrets need a Dockerfile build (RUN --mount=type=secret) — %s's repository has none", appCfg.App))
+		}
+		buildMode = build.ModeNixpacks
+	default:
+		return "", fmt.Errorf("unknown build mode %q", mode)
+	}
+	secrets, cleanup, err := prepareGitBuildSecrets(ctx, executor, appCfg)
+	if err != nil {
+		return "", err
+	}
+	defer cleanup()
+	image, err := build.NewBuilder(executor, out).WithSecrets(secrets).Build(ctx, build.BuildConfig{
+		App:        appCfg.App,
+		Version:    short12(commit),
+		Mode:       buildMode,
+		BuildDir:   remoteDir,
+		Context:    appCfg.Context,
+		Dockerfile: appCfg.Dockerfile,
+		Platform:   appCfg.Platform,
+	})
+	if err != nil {
+		return "", fmt.Errorf("building image: %w", err)
+	}
+	return image, nil
+}
+
+// prepareGitBuildSecrets decrypts each named age-store secret into a
+// server-side private directory for the duration of one build.
+func prepareGitBuildSecrets(ctx context.Context, executor ssh.Executor, appCfg *config.AppConfig) ([]build.BuildSecret, func(), error) {
+	if len(appCfg.BuildSecrets) == 0 {
+		return nil, func() {}, nil
+	}
+	dirOut, err := executor.Run(ctx, `base=/tmp; [ -d /dev/shm ] && base=/dev/shm; mktemp -d "$base/teploy-build-secrets.XXXXXXXX"`)
+	if err != nil {
+		return nil, func() {}, fmt.Errorf("creating the build-secret directory: %w", err)
+	}
+	dir := strings.TrimSpace(dirOut)
+	if dir == "" || strings.Contains(dir, "\n") {
+		return nil, func() {}, fmt.Errorf("unusable build-secret directory")
+	}
+	var out []build.BuildSecret
+	for _, key := range appCfg.BuildSecrets {
+		dest := dir + "/" + key
+		if err := gitsource.SealBuildSecret(ctx, executor, appCfg.App, key, dest); err != nil {
+			executor.Run(context.Background(), "rm -rf "+ssh.ShellQuote(dir))
+			return nil, func() {}, refuseAdmission(fmt.Errorf("preparing build secret %s: %w", key, err))
+		}
+		out = append(out, build.BuildSecret{ID: key, Path: dest})
+	}
+	return out, func() {
+		executor.Run(context.Background(), "rm -rf "+ssh.ShellQuote(dir))
+	}, nil
 }
 
 // createServerConfigApp creates a NEW app in Teploy home from ad-hoc deploy

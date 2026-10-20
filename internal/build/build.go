@@ -84,17 +84,36 @@ type BuildConfig struct {
 	// "Dockerfile" in the context root).
 	Dockerfile string
 	Platform   string // e.g. "linux/arm64" (optional)
+	// Secrets are BuildKit build secrets: id plus a server-local file
+	// holding the value (0600, outside the build context). Dockerfile
+	// mounts them with RUN --mount=type=secret,id=...; the values never
+	// enter the image layers, the command line or the logs.
+	Secrets []BuildSecret
+}
+
+// BuildSecret is one `docker build --secret` mount.
+type BuildSecret struct {
+	ID   string
+	Path string
 }
 
 // Builder runs Docker or Nixpacks builds on the server via SSH.
 type Builder struct {
-	exec   ssh.Executor
-	stdout io.Writer
+	exec    ssh.Executor
+	stdout  io.Writer
+	secrets []BuildSecret
 }
 
 // NewBuilder creates a Builder backed by the given SSH executor.
 func NewBuilder(exec ssh.Executor, stdout io.Writer) *Builder {
 	return &Builder{exec: exec, stdout: stdout}
+}
+
+// WithSecrets returns a builder that passes the given BuildKit secrets
+// to Dockerfile builds (ignored elsewhere; Nixpacks has no equivalent).
+func (b *Builder) WithSecrets(secrets []BuildSecret) *Builder {
+	b.secrets = secrets
+	return b
 }
 
 // Build runs the appropriate build command on the server and returns the image tag.
@@ -112,9 +131,17 @@ func (b *Builder) Build(ctx context.Context, cfg BuildConfig) (string, error) {
 }
 
 func (b *Builder) buildDockerfile(ctx context.Context, tag, buildDir, contextSub, dockerfile, platform string) error {
+	// The plain build keeps its historical byte-identical command;
+	// BuildKit is only forced on for --secret mounts (D4 build_secrets).
 	cmd := "docker build -t " + ssh.ShellQuote(tag)
+	if len(b.secrets) > 0 {
+		cmd = "DOCKER_BUILDKIT=1 " + cmd
+	}
 	if platform != "" {
 		cmd += " --platform " + ssh.ShellQuote(platform)
+	}
+	for _, s := range b.secrets {
+		cmd += " --secret id=" + ssh.ShellQuote(s.ID) + ",src=" + ssh.ShellQuote(s.Path)
 	}
 	// Remote paths are POSIX; use path.Join and quote for the shell.
 	cmd += remoteBuildTail(buildDir, contextSub, dockerfile)

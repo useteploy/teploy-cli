@@ -6,8 +6,59 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
 
 ### Added
 
+- Teploy-home apps can build from a git repository: a `git:` block
+  (`repository`, `branch`, `paths`, `poll`, `submodules`) in the config,
+  `image:` becoming optional when it is set (`git-source-v1`; contracts
+  corpus rev 16 adds `source-show-envelope`, `source-key-envelope` and
+  `trigger-poll-envelope`). Works with GitHub, GitLab, Forgejo/Gitea,
+  Cursor Origin and any git host over SSH or HTTPS. `context:` and
+  `dockerfile:` are relative to the repository root; `build_secrets:`
+  passes age-store values to the build as `docker build --secret`
+  (values never enter the config, image layers, argv or logs).
+- `teploy config source key --app X --host S [--type ssh|token]`
+  generates an ed25519 deploy key on the server (public half printed)
+  or stores an HTTPS token read from stdin. Credentials live
+  age-encrypted outside `/deployments` (Caddy cannot read them) and are
+  used via `GIT_SSH_COMMAND` / `GIT_ASKPASS` — never in URLs,
+  `.git/config` or command lines. `config source host-key` pins the
+  forge's SSH host key (`ssh-keyscan` on the server, fingerprint shown,
+  optional `--expected-fingerprint` verification); fetches run with
+  `StrictHostKeyChecking=yes` against it. `config source show --json`
+  (no secrets) and `config source remove` round out the surface.
+- `teploy trigger poll` is the one admitter for git sources: dedup by
+  (app, ref, commit), a per-ref watermark with an ancestry check on the
+  server-side mirror, one recorded refusal per force-push (refused until
+  `teploy trigger reset --app X --ref refs/heads/<branch>`), changed
+  paths computed on the server and filtered by `git.paths` (defaulting
+  to `context:`), a failed commit retried at most twice, and the newest
+  admitted head always deployed (`trigger-poll-v1`). `--all` polls every
+  due app for the server timer; `--now --hint <sha>` is the webhook wake
+  (the remote head wins over the hint). `teploy trigger retry --app X`
+  re-arms a failed commit.
+- `teploy trigger install-timer --host S` installs an idempotent systemd
+  timer running `trigger poll --all` every minute (each app honors its
+  own `git.poll` interval from admissions timestamps; nothing per-app in
+  crontab); it is also offered after `config source key`. `teploy doctor`
+  gains a `git-trigger` check: the timer is present and its resident
+  binary supports `trigger poll` whenever any app has a `git:` source.
+- Deploying a Teploy-home app with `git:` set (`teploy deploy --app X`)
+  builds the branch head from the mirror under the app lock and records
+  the commit as the release's `source_revision` (release provenance and
+  the deploy event); a manual deploy honors the same force-push refusal
+  and advances the watermark.
+- New event kinds `trigger.admit`/`trigger.refuse` detail `reason`, and
+  `source.connect` records credential lifecycle (type and fingerprint
+  only).
+
+### Notes
+
+- Static Teploy-home apps with `git:` remain refused (static deploys
+  still need a code source); submodules are refused pending
+  implementation; `file://` repositories are accepted as a privileged
+  config change (same-server sources).
+
 - One backup target per server, read at run time (`backup-target-v1`;
-  contracts corpus rev 14). `teploy server backup-target set --host S
+  contracts corpus rev 15). `teploy server backup-target set --host S
   --bucket B [--region] [--endpoint] [--prefix]` stores it at
   `/etc/teploy/backup-target.json` (0600, outside `/deployments`;
   `~/.config/teploy/` fallback for a non-root deploy user, said so on
