@@ -24,6 +24,7 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
+	"github.com/useteploy/teploy/internal/backup"
 	"github.com/useteploy/teploy/internal/config"
 	"github.com/useteploy/teploy/internal/deploy"
 	"github.com/useteploy/teploy/internal/ssh"
@@ -198,7 +199,7 @@ func doctorRun(ctx context.Context, deps doctorDeps, flags *Flags, serverName st
 
 	if executor == nil {
 		const sshDown = "restore SSH connectivity (see the ssh check above), then re-run teploy doctor"
-		for _, name := range []string{"docker", "disk", "registry", "caddy", "compatibility", "repair-debt", "secret-exposure", "server-tools", "config-home"} {
+		for _, name := range []string{"docker", "disk", "registry", "caddy", "compatibility", "repair-debt", "secret-exposure", "server-tools", "config-home", "backup-cron"} {
 			skipFail(name, "SSH unreachable", sshDown)
 		}
 	} else {
@@ -217,6 +218,7 @@ func doctorRun(ctx context.Context, deps doctorDeps, flags *Flags, serverName st
 		report.Checks = append(report.Checks, doctorSecretExposureCheck(ctx, executor))
 		report.Checks = append(report.Checks, doctorServerToolsCheck(ctx, executor))
 		report.Checks = append(report.Checks, doctorConfigHomeCheck(ctx, executor))
+		report.Checks = append(report.Checks, doctorBackupCronCheck(ctx, executor))
 	}
 
 	report.summarize()
@@ -786,4 +788,61 @@ func doctorConfigHomeCheck(ctx context.Context, exec ssh.Executor) doctorCheck {
 			Detail: fmt.Sprintf("%d app(s) edited in Teploy: %s — teploy CLIs older than v0.1.43 refuse to deploy them", len(teploy), strings.Join(teploy, ", "))}
 	}
 	return doctorCheck{Name: "config-home", Result: doctorOK, Detail: "every app is edited in its folder"}
+}
+
+// doctorBackupCronCheck flags backup cron lines that embed credentials or
+// bucket flags (D3). Raw line text is NEVER placed in the report — a
+// legacy line can carry plaintext S3 keys, so the check reports markers
+// and counts only.
+func doctorBackupCronCheck(ctx context.Context, exec ssh.Executor) doctorCheck {
+	lines, err := backup.ReadCrontab(ctx, exec)
+	if err != nil {
+		return doctorCheck{Name: "backup-cron", Result: doctorWarn, Detail: "could not read the crontab: " + err.Error()}
+	}
+	var credLines, legacyLines int
+	var custom, runForm int
+	for _, line := range lines {
+		hasCreds := strings.Contains(line, "TEPLOY_S3_SECRET_KEY=") ||
+			strings.Contains(line, "TEPLOY_S3_ACCESS_KEY=") ||
+			strings.Contains(line, "AWS_SECRET_ACCESS_KEY=") ||
+			strings.Contains(line, "AWS_ACCESS_KEY_ID=")
+		m := backup.FindCronMarker(line)
+		if hasCreds {
+			credLines++
+			continue
+		}
+		if m == nil {
+			continue
+		}
+		switch m.Form {
+		case backup.CronFormRun:
+			runForm++
+		case backup.CronFormLegacy:
+			legacyLines++
+		case backup.CronFormCustom:
+			custom++
+		}
+	}
+	switch {
+	case credLines > 0:
+		return doctorCheck{
+			Name:        "backup-cron",
+			Result:      doctorFail,
+			Detail:      fmt.Sprintf("%d cron line(s) embed S3 credentials in plain text", credLines),
+			Remediation: "run `teploy server backup-target set` to store the target on the server, which rewrites teploy-managed backup lines to `teploy backup run`; hand-written lines must be fixed by hand",
+		}
+	case legacyLines > 0:
+		return doctorCheck{
+			Name:        "backup-cron",
+			Result:      doctorWarn,
+			Detail:      fmt.Sprintf("%d teploy-managed backup line(s) still embed the bucket (and possibly credentials)", legacyLines),
+			Remediation: "run `teploy server backup-target set` to store the target and rewrite them to `teploy backup run`",
+		}
+	case custom > 0:
+		return doctorCheck{Name: "backup-cron", Result: doctorOK,
+			Detail: fmt.Sprintf("%d scheduled line(s) use `backup run`; %d hand-written line(s) carry a teploy marker and were left alone", runForm, custom)}
+	default:
+		return doctorCheck{Name: "backup-cron", Result: doctorOK,
+			Detail: fmt.Sprintf("%d scheduled line(s) use `backup run`; no embedded credentials or buckets", runForm)}
+	}
 }

@@ -142,6 +142,17 @@ const (
 	// CapUndeployedListV1: `app list --include-undeployed` returns
 	// never-deployed and removed Teploy-home apps in an "undeployed" array.
 	CapUndeployedListV1 = "undeployed-list-v1"
+	// CapBackupTargetV1: one backup target per server, stored outside
+	// /deployments (age-encrypted credentials) and read at run time:
+	// `server backup-target set|show|unset`, backup/DR commands defaulting
+	// to it, cron lines calling only `backup run`, and `backup-target set`
+	// rewriting teploy-managed backup cron lines to that form.
+	CapBackupTargetV1 = "backup-target-v1"
+	// CapBackupJSONV1: `backup create|list|restore --json` emit parsed,
+	// versioned envelopes (backup-json-v1 rows: id, kind, accessory,
+	// size_bytes, created_at, key; schedules discovered from teploy cron
+	// markers) and restore quiesces the app under its fenced lock.
+	CapBackupJSONV1 = "backup-json-v1"
 )
 
 // MachineCapabilities returns every capability token this build
@@ -176,6 +187,8 @@ func MachineCapabilities() []string {
 		CapConfigMergeV1,
 		CapConfigUnprivilegedV1,
 		CapDeployHomeV1,
+		CapBackupTargetV1,
+		CapBackupJSONV1,
 	}
 	sort.Strings(tokens)
 	return tokens

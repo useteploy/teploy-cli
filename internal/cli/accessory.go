@@ -14,6 +14,7 @@ import (
 	"github.com/useteploy/teploy/internal/backup"
 	"github.com/useteploy/teploy/internal/config"
 	"github.com/useteploy/teploy/internal/docker"
+	"github.com/useteploy/teploy/internal/events"
 	"github.com/useteploy/teploy/internal/ssh"
 )
 
@@ -366,12 +367,15 @@ const serverTeployPath = "/usr/local/bin/teploy"
 
 func newAccessoryBackupCmd(flags *Flags) *cobra.Command {
 	var (
-		bucket   string
-		region   string
-		endpoint string
-		schedule string
-		appName  string
-		local    bool
+		bucket     string
+		region     string
+		endpoint   string
+		prefix     string
+		schedule   string
+		appName    string
+		local      bool
+		keepLast   int
+		maxAgeDays int
 	)
 
 	cmd := &cobra.Command{
@@ -379,23 +383,29 @@ func newAccessoryBackupCmd(flags *Flags) *cobra.Command {
 		Short: "Back up an accessory (database-aware dump)",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runAccessoryBackup(flags, appName, args[0], bucket, region, endpoint, schedule, local)
+			return runAccessoryBackup(flags, appName, args[0], bucket, region, endpoint, prefix, schedule, local, keepLast, maxAgeDays)
 		},
 	}
 
-	cmd.Flags().StringVar(&bucket, "bucket", "", "S3 bucket name")
-	cmd.Flags().StringVar(&region, "region", "us-east-1", "AWS region")
+	cmd.Flags().StringVar(&bucket, "bucket", "", "S3 bucket name (default: the server's stored backup target)")
+	cmd.Flags().StringVar(&region, "region", "", "AWS region (default: the stored target's region, else us-east-1)")
 	cmd.Flags().StringVar(&endpoint, "endpoint", "", "S3-compatible endpoint URL (MinIO/B2/R2); creds from TEPLOY_S3_ACCESS_KEY/SECRET_KEY or AWS_* env")
+	cmd.Flags().StringVar(&prefix, "prefix", "", "key prefix under the bucket (default: the stored target's prefix)")
 	cmd.Flags().StringVar(&schedule, "schedule", "", "cron schedule for automated backups")
 	cmd.Flags().StringVar(&appName, "app", "", "app name — read accessory image/env from server state instead of teploy.yml")
 	cmd.Flags().BoolVar(&local, "local", false, "run against the local docker host (the mode scheduled cron jobs use; requires --app)")
+	cmd.Flags().IntVar(&keepLast, "keep-last", 0, "with --schedule: keep only the N most recent backups (stored, applied at run time)")
+	cmd.Flags().IntVar(&maxAgeDays, "max-age-days", 0, "with --schedule: delete backups older than N days (stored, applied at run time)")
 
 	return cmd
 }
 
-func runAccessoryBackup(flags *Flags, appName, name, bucket, region, endpoint, schedule string, local bool) error {
+func runAccessoryBackup(flags *Flags, appName, name, bucket, region, endpoint, prefix, schedule string, local bool, keepLast, maxAgeDays int) error {
 	if local && appName == "" {
 		return fmt.Errorf("--local requires --app (no teploy.yml exists on the server)")
+	}
+	if err := backup.ValidateBucket(name); err != nil {
+		return fmt.Errorf("invalid accessory name %q: %w", name, err)
 	}
 
 	var app string
@@ -417,19 +427,13 @@ func runAccessoryBackup(flags *Flags, appName, name, bucket, region, endpoint, s
 		app = appName
 	}
 
-	if bucket == "" {
-		return fmt.Errorf("--bucket is required")
-	}
-	if err := backup.ValidateBucket(bucket); err != nil {
-		return err
-	}
-	if err := backup.ValidateRegion(region); err != nil {
-		return err
-	}
 	if schedule != "" {
 		if err := backup.ValidateSchedule(schedule); err != nil {
 			return err
 		}
+	}
+	if keepLast < 0 || maxAgeDays < 0 {
+		return fmt.Errorf("--keep-last and --max-age-days must be >= 0")
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
@@ -453,8 +457,24 @@ func runAccessoryBackup(flags *Flags, appName, name, bucket, region, endpoint, s
 	}
 	defer executor.Close()
 
+	// Target resolution (D3): legacy flags win, else the server's stored
+	// target. Scheduling additionally bootstraps a stored target from the
+	// legacy flags when none exists, so the cron line never carries one.
+	tf := backupTargetFlags{bucket: bucket, region: region, endpoint: endpoint, prefix: prefix}
+	var target backup.Target
+	if schedule != "" {
+		var err error
+		target, err = resolveScheduleTarget(ctx, executor, &tf)
+		if err != nil {
+			return err
+		}
+	}
+	s3Cfg, err := resolveBackupS3(ctx, executor, &tf)
+	if err != nil {
+		return err
+	}
+
 	client := backup.NewClient(executor, os.Stdout)
-	s3Cfg := s3Config(bucket, region, endpoint)
 
 	// BOTH the manual and the --local (scheduled) path authenticate with the
 	// accessory's REAL credentials. teploy.yml's accessory env can carry
@@ -464,7 +484,7 @@ func runAccessoryBackup(flags *Flags, appName, name, bucket, region, endpoint, s
 	// unresolved references (audit F68).
 	if image, env, inspErr := client.InspectAccessory(ctx, app, name); inspErr == nil {
 		accImage, accEnv = image, env
-	} else {
+	} else if !local {
 		if err := requireResolvedAccessoryEnv(name, accEnv); err != nil {
 			return fmt.Errorf("accessory %s is not inspectable (%v) and its teploy.yml env cannot be used directly: %w", name, inspErr, err)
 		}
@@ -472,38 +492,60 @@ func runAccessoryBackup(flags *Flags, appName, name, bucket, region, endpoint, s
 	}
 
 	if schedule != "" {
-		// The scheduled job runs ON the server: --local --app makes it
-		// self-contained (no teploy.yml server-side), reading accessory
-		// config from the running container.
-		// serverTeployPath, not a bare "teploy": cron runs with PATH=/usr/bin:/bin
-		// and the binary is installed to /usr/local/bin (below), so a bare name
-		// resolves to nothing. That failed silently every night — the job has no
-		// output redirect, so "command not found" went to a mailbox nobody reads.
-		// Found live 2026-08-31: a nightly accessory backup scheduled on 2026-07-12
-		// had produced its last artifact on 2026-07-13, and the two that existed
-		// were made by hand at setup. The schedule had never once run.
-		backupCmd := fmt.Sprintf("%s accessory backup %s --local --app %s --bucket %s --region %s",
-			serverTeployPath, name, app, bucket, region)
-		if endpoint != "" {
-			// Cron has no TEPLOY_S3_* env — embed endpoint + creds in the
-			// crontab line (root-only readable, same trust class as
-			// ~/.aws/credentials).
-			backupCmd = fmt.Sprintf("TEPLOY_S3_ACCESS_KEY=%s TEPLOY_S3_SECRET_KEY=%s %s --endpoint %s",
-				ssh.ShellQuote(s3Cfg.AccessKey), ssh.ShellQuote(s3Cfg.SecretKey), backupCmd, ssh.ShellQuote(endpoint))
+		// The scheduled job runs ON the server as
+		// `teploy backup run --app A --accessory N`: self-contained, no
+		// teploy.yml, no bucket, no credentials in the crontab (D3).
+		binPath, err := ensureScheduledBackupBinary(ctx, executor)
+		if err != nil {
+			return err
 		}
-		// The cron job needs the teploy binary on the server; ship it via
-		// the existing checksum-verified pipeline (same as heal/autodeploy).
-		if _, err := deployTeployBinaryToServer(ctx, executor, serverTeployPath); err != nil {
-			return fmt.Errorf("installing teploy binary for the scheduled job: %w", err)
+		policy, err := backup.ReadPolicy(ctx, executor, app)
+		if err != nil {
+			return err
 		}
-		if err := client.SetSchedule(ctx, schedule, backupCmd, "teploy-accessory-backup:"+app+":"+name); err != nil {
+		if policy.Accessories == nil {
+			policy.Accessories = map[string]*backup.KindPolicy{}
+		}
+		policy.Accessories[name] = &backup.KindPolicy{Cron: schedule, KeepLast: keepLast, MaxAgeDays: maxAgeDays}
+		if err := backup.WritePolicy(ctx, executor, app, policy); err != nil {
+			return err
+		}
+		if err := client.SetSchedule(ctx, schedule, buildScheduledBackupRunCmd(binPath, app, name), "teploy-accessory-backup:"+app+":"+name); err != nil {
 			return err
 		}
 		fmt.Printf("Scheduled backup: %s\n", schedule)
+		fmt.Printf("  Target: s3://%s (read at run time from the server's stored target)\n", backupTargetLabel(target))
 		return nil
 	}
 
-	return client.AccessoryBackup(ctx, app, name, accImage, accEnv, s3Cfg)
+	res, err := client.AccessoryBackup(ctx, app, name, accImage, accEnv, s3Cfg)
+	detail := map[string]any{"id": res.ID, "kind": backup.KindAccessory, "accessory": name}
+	recordAppEvent(ctx, executor, app, events.KindBackupRun, err, detail)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Backup %s created (accessory, %d bytes)\n", res.ID, res.SizeBytes)
+	return nil
+}
+
+// resolveScheduleTarget is the schedule commands' target gate: a stored
+// target must exist afterwards (bootstrapping one from legacy flags when
+// none is stored), and legacy flags must agree with an existing one.
+func resolveScheduleTarget(ctx context.Context, executor ssh.Executor, tf *backupTargetFlags) (backup.Target, error) {
+	target, err := backup.ReadTarget(ctx, executor)
+	if err != nil {
+		return backup.Target{}, err
+	}
+	if !TargetConfigured(target) {
+		if tf.bucket == "" {
+			return backup.Target{}, fmt.Errorf("no backup target is configured for this server — set one with `teploy server backup-target set --host S --bucket B` (or pass the legacy --bucket flags to store one now)")
+		}
+		return storeTargetFromLegacyFlags(ctx, executor, tf)
+	}
+	if tf.bucket != "" && tf.bucket != target.Bucket {
+		return backup.Target{}, fmt.Errorf("a server backup target already exists (s3://%s) — change it with `teploy server backup-target set`, not schedule flags", target.Bucket)
+	}
+	return target, nil
 }
 
 func newAccessoryRestoreCmd(flags *Flags) *cobra.Command {
@@ -511,6 +553,7 @@ func newAccessoryRestoreCmd(flags *Flags) *cobra.Command {
 		bucket   string
 		region   string
 		endpoint string
+		prefix   string
 	)
 
 	cmd := &cobra.Command{
@@ -518,18 +561,19 @@ func newAccessoryRestoreCmd(flags *Flags) *cobra.Command {
 		Short: "Restore an accessory from backup",
 		Args:  cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runAccessoryRestore(flags, args[0], args[1], bucket, region, endpoint)
+			return runAccessoryRestore(flags, args[0], args[1], bucket, region, endpoint, prefix)
 		},
 	}
 
-	cmd.Flags().StringVar(&bucket, "bucket", "", "S3 bucket name")
-	cmd.Flags().StringVar(&region, "region", "us-east-1", "AWS region")
+	cmd.Flags().StringVar(&bucket, "bucket", "", "S3 bucket name (default: the server's stored backup target)")
+	cmd.Flags().StringVar(&region, "region", "", "AWS region (default: the stored target's region, else us-east-1)")
 	cmd.Flags().StringVar(&endpoint, "endpoint", "", "S3-compatible endpoint URL (MinIO/B2/R2); creds from TEPLOY_S3_ACCESS_KEY/SECRET_KEY or AWS_* env")
+	cmd.Flags().StringVar(&prefix, "prefix", "", "key prefix under the bucket (default: the stored target's prefix)")
 
 	return cmd
 }
 
-func runAccessoryRestore(flags *Flags, name, date, bucket, region, endpoint string) error {
+func runAccessoryRestore(flags *Flags, name, date, bucket, region, endpoint, prefix string) error {
 	appCfg, err := loadAppCfgForAccessory()
 	if err != nil {
 		return err
@@ -540,15 +584,6 @@ func runAccessoryRestore(flags *Flags, name, date, bucket, region, endpoint stri
 		return fmt.Errorf("accessory %q not found in teploy.yml", name)
 	}
 
-	if bucket == "" {
-		return fmt.Errorf("--bucket is required")
-	}
-	if err := backup.ValidateBucket(bucket); err != nil {
-		return err
-	}
-	if err := backup.ValidateRegion(region); err != nil {
-		return err
-	}
 	if err := backup.ValidateDate(date); err != nil {
 		return err
 	}
@@ -562,8 +597,11 @@ func runAccessoryRestore(flags *Flags, name, date, bucket, region, endpoint stri
 	}
 	defer executor.Close()
 
+	s3Cfg, err := resolveBackupS3(ctx, executor, &backupTargetFlags{bucket: bucket, region: region, endpoint: endpoint, prefix: prefix})
+	if err != nil {
+		return err
+	}
 	client := backup.NewClient(executor, os.Stdout)
-	s3Cfg := s3Config(bucket, region, endpoint)
 	// Same credential rule as manual backup: prefer the RUNNING accessory's
 	// env (the config's `auto`/`secret:` references are never what the
 	// database actually runs with) — audit F68.
@@ -631,15 +669,6 @@ func newAccessoryVerifyBackupCmd(flags *Flags) *cobra.Command {
 }
 
 func runAccessoryVerifyBackup(flags *Flags, appName, name, bucket, region, date, endpoint string, local bool) error {
-	if bucket == "" {
-		return fmt.Errorf("--bucket is required")
-	}
-	if err := backup.ValidateBucket(bucket); err != nil {
-		return err
-	}
-	if err := backup.ValidateRegion(region); err != nil {
-		return err
-	}
 	if date != "" {
 		if err := backup.ValidateDate(date); err != nil {
 			return err
@@ -672,13 +701,18 @@ func runAccessoryVerifyBackup(flags *Flags, appName, name, bucket, region, date,
 	}
 	defer executor.Close()
 
+	s3Cfg, err := resolveBackupS3(ctx, executor, &backupTargetFlags{bucket: bucket, region: region, endpoint: endpoint})
+	if err != nil {
+		return err
+	}
+
 	out := io.Writer(os.Stdout)
 	if flags.JSON {
 		// Keep stdout clean for the JSON result; progress goes to stderr.
 		out = os.Stderr
 	}
 	client := backup.NewClient(executor, out)
-	res, err := client.VerifyBackup(ctx, appCfg.App, name, date, s3Config(bucket, region, endpoint))
+	res, err := client.VerifyBackup(ctx, appCfg.App, name, date, s3Cfg)
 	if err != nil {
 		return err
 	}

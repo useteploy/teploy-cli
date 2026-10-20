@@ -27,6 +27,7 @@ func newServerCmd(flags *Flags) *cobra.Command {
 	cmd.AddCommand(newServerUpdateCmd(flags))
 	cmd.AddCommand(newServerListCmd(flags))
 	cmd.AddCommand(newServerStatusCmd(flags))
+	cmd.AddCommand(newServerBackupTargetCmd(flags))
 
 	return cmd
 }

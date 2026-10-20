@@ -249,7 +249,7 @@ type BundleStore interface {
 type S3BundleStore struct{ S3 S3Config }
 
 func (s S3BundleStore) key(app, id, member string) string {
-	return fmt.Sprintf("s3://%s/%s/dr/%s/%s", s.S3.Bucket, app, id, member)
+	return fmt.Sprintf("s3://%s/%s/dr/%s/%s", s.S3.Base(), app, id, member)
 }
 
 func (s S3BundleStore) Upload(ctx context.Context, exec ssh.Executor, app, id, member, serverPath string) error {
@@ -280,7 +280,7 @@ func (s S3BundleStore) FetchManifest(ctx context.Context, exec ssh.Executor, app
 }
 
 func (s S3BundleStore) ListIDs(ctx context.Context, exec ssh.Executor, app string) ([]string, error) {
-	prefix := fmt.Sprintf("s3://%s/%s/dr/", s.S3.Bucket, app)
+	prefix := fmt.Sprintf("s3://%s/%s/dr/", s.S3.Base(), app)
 	out, err := exec.Run(ctx, s.S3.AWS(fmt.Sprintf("s3 ls %s", ssh.ShellQuote(prefix))))
 	if err != nil {
 		return nil, fmt.Errorf("listing bundles at %s: %w", prefix, err)
