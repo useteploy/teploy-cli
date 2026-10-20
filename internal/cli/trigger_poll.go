@@ -457,6 +457,12 @@ func newTriggerUninstallTimerCmd(flags *Flags) *cobra.Command {
 // /deployments/.bin/teploy when it qualifies, a dev upload with --binary
 // (installed beside it as teploy-dev), or a fresh release download.
 func ensureTriggerBinary(ctx context.Context, exec ssh.Executor, localBinary string) (string, error) {
+	// The publish step flocks <destination>.install.lock, so the
+	// directory must exist first (a server that never ran autodeploy or
+	// heal has no /deployments/.bin yet).
+	if _, err := exec.Run(ctx, "mkdir -p "+ssh.ShellQuote(serverTeployBinDir)); err != nil {
+		return "", fmt.Errorf("creating %s: %w", serverTeployBinDir, err)
+	}
 	if localBinary != "" {
 		data, err := os.ReadFile(localBinary)
 		if err != nil {
