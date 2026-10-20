@@ -11,6 +11,7 @@
     "env-set-stdin",
     "error-envelope",
     "events-v1",
+    "git-source-v1",
     "health-modes",
     "kv-set-stdin",
     "lock-wait-v1",
@@ -27,6 +28,7 @@
     "server-update",
     "template-var-stdin",
     "trigger-convergence-v1",
+    "trigger-poll-v1",
     "undeployed-list-v1"
   ],
   "machine_interface": 2,

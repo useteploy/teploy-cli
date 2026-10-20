@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://teploy.github.io/contracts/schema/source-show-envelope.schema.json",
+  "title": "`teploy config source show --json`: an app's git source public state (no secrets, rev 14)",
+  "type": "object",
+  "required": ["machine_interface", "host", "app"],
+  "properties": {
+    "machine_interface": {"type": "integer", "minimum": 1},
+    "host": {"type": "string", "minLength": 1},
+    "app": {"type": "string", "minLength": 1},
+    "repository": {"type": "string", "minLength": 1, "description": "The git: repository URL, empty when the app has no git source."},
+    "branch": {"type": "string"},
+    "poll": {"type": "string", "description": "Effective poll interval (\"5m\" default) or \"off\"."},
+    "credential": {
+      "type": "object",
+      "required": ["type"],
+      "properties": {
+        "type": {"type": "string", "enum": ["ssh", "token"]},
+        "public_key": {"type": "string", "description": "The deploy key's public half (ssh only)."},
+        "fingerprint": {"type": "string", "description": "ssh-keygen -lf form."},
+        "username": {"type": "string", "description": "Username sent with the token (token only)."},
+        "known_host_fingerprints": {"type": "array", "items": {"type": "string"}}
+      },
+      "additionalProperties": false
+    },
+    "trigger": {
+      "type": "object",
+      "required": ["ref"],
+      "properties": {
+        "ref": {"type": "string", "pattern": "^refs/heads/"},
+        "watermark": {"type": "string", "description": "Last admitted commit for the ref (the ancestry bar)."},
+        "last_head": {"type": "string"},
+        "refused_head": {"type": "string", "description": "Non-empty while a force-push is refused (until `trigger reset`)."},
+        "last_deployed_release": {"type": "string"}
+      },
+      "additionalProperties": false
+    }
+  }
+}

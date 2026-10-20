@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://teploy.github.io/contracts/schema/source-key-envelope.schema.json",
+  "title": "`teploy config source key --json` / `host-key --json`: the credential just created or pinned (public facts only, rev 14)",
+  "type": "object",
+  "required": ["machine_interface", "host", "app", "type", "created"],
+  "properties": {
+    "machine_interface": {"type": "integer", "minimum": 1},
+    "host": {"type": "string", "minLength": 1},
+    "app": {"type": "string", "minLength": 1},
+    "type": {"type": "string", "enum": ["ssh", "token", "host-key", "none"]},
+    "public_key": {"type": "string", "description": "The generated deploy key's public half (ssh only)."},
+    "fingerprint": {"type": "string"},
+    "username": {"type": "string", "description": "Username the token is sent as (token only)."},
+    "created": {"type": "boolean", "description": "False when an equivalent credential already existed and was kept."},
+    "host_key_fingerprints": {"type": "array", "items": {"type": "string"}, "description": "Pinned host keys (host-key only)."}
+  }
+}

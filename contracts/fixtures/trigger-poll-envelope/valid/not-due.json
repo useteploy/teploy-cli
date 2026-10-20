@@ -1,0 +1,7 @@
+{
+  "machine_interface": 2,
+  "app": "blog",
+  "ref": "refs/heads/main",
+  "admitted": false,
+  "reason": "not-due"
+}

@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://teploy.github.io/contracts/schema/trigger-poll-envelope.schema.json",
+  "title": "`teploy trigger poll --json`: one app's admission result (one JSON object per app; `--all` emits one line each, rev 14)",
+  "type": "object",
+  "required": ["machine_interface", "app", "ref", "admitted"],
+  "properties": {
+    "machine_interface": {"type": "integer", "minimum": 1},
+    "app": {"type": "string", "minLength": 1},
+    "host": {"type": "string", "description": "The server the poll ran against (empty for local timer mode)."},
+    "ref": {"type": "string", "description": "The polled ref (refs/heads/<branch>), or empty for a pre-refusal result such as a busy lock."},
+    "head": {"type": "string", "description": "The remote head considered."},
+    "admitted": {"type": "boolean", "description": "True only when this poll deployed a new commit."},
+    "reason": {
+      "type": "string",
+      "enum": [
+        "deployed",
+        "up-to-date",
+        "not-due",
+        "poll-off",
+        "no-relevant-changes",
+        "force-push",
+        "retry-limit",
+        "branch-missing",
+        "failed",
+        "locked",
+        "no-git-source"
+      ]
+    },
+    "deployed_release": {"type": "string", "description": "The release version of the deploy this poll performed."}
+  }
+}

@@ -22,6 +22,7 @@ import (
 	"github.com/useteploy/teploy/internal/config"
 	"github.com/useteploy/teploy/internal/confighome"
 	"github.com/useteploy/teploy/internal/events"
+	"github.com/useteploy/teploy/internal/gitsource"
 	"github.com/useteploy/teploy/internal/preview"
 	"github.com/useteploy/teploy/internal/releasemeta"
 	"github.com/useteploy/teploy/internal/ssh"
@@ -461,5 +462,46 @@ func TestContractsConfigMergeGolden(t *testing.T) {
 		Conflicts: []configConflict{
 			{Key: "env.LOG_LEVEL", Mine: "debug", Current: "warn"},
 		},
+	})
+}
+
+// TestContractsGitSourceGolden pins the D4 git-source envelopes (rev 14):
+// config source show --json, config source key --json, and the one
+// admitter's trigger poll --json result.
+func TestContractsGitSourceGolden(t *testing.T) {
+	sha := "3d9c1f0b8a7e6d5c4b3a2f1e0d9c8b7a6f5e4d3c"
+	writeFixture(t, "source-show-envelope/valid/connected.json", sourceShowDTO{
+		MachineInterface: MachineInterface, Host: "192.0.2.10", App: "blog",
+		Repository: "git@github.com:useteploy/blog.git", Branch: "main", Poll: "5m",
+		Credential: &sourceCredentialDTO{
+			Type: "ssh", PublicKey: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPmM9PmN0c9Jl0uR0aX1w2y3z4a5b6c7d8e9f0g1h2 teploy-deploy-blog",
+			Fingerprint: "256 SHA256:5kO5b5VqPm0s9R8tT1uV2wX3yZ4a5B6c7D8e9F0g1H2 teploy-deploy-blog (ED25519)",
+			KnownHosts:  []string{"256 SHA256:u6nB4D9Jl0uR0aX1w2y3z4a5b6c7d8e9f0g1h2i3J4k5 no comment (ED25519)"},
+		},
+		Trigger: &sourceTriggerDTO{
+			Ref: "refs/heads/main", Watermark: sha, LastHead: sha, LastDeployedRelease: "3d9c1f0e8a7e",
+		},
+	})
+	writeFixture(t, "source-show-envelope/valid/no-source.json", sourceShowDTO{
+		MachineInterface: MachineInterface, Host: "192.0.2.10", App: "legacy",
+	})
+	writeFixture(t, "source-key-envelope/valid/ssh.json", sourceKeyDTO{
+		MachineInterface: MachineInterface, Host: "192.0.2.10", App: "blog", Type: "ssh", Created: true,
+		PublicKey:   "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPmM9PmN0c9Jl0uR0aX1w2y3z4a5b6c7d8e9f0g1h2 teploy-deploy-blog",
+		Fingerprint: "256 SHA256:5kO5b5VqPm0s9R8tT1uV2wX3yZ4a5B6c7D8e9F0g1H2 teploy-deploy-blog (ED25519)",
+	})
+	writeFixture(t, "source-key-envelope/valid/token.json", sourceKeyDTO{
+		MachineInterface: MachineInterface, Host: "192.0.2.10", App: "shop", Type: "token", Username: "x-access-token", Created: true,
+	})
+	writeFixture(t, "trigger-poll-envelope/valid/deployed.json", gitsource.PollResult{
+		MachineInterface: MachineInterface, App: "blog", Host: "192.0.2.10", Ref: "refs/heads/main",
+		Head: sha, Admitted: true, Reason: "deployed", Release: "3d9c1f0e8a7e",
+	})
+	writeFixture(t, "trigger-poll-envelope/valid/force-push-refusal.json", gitsource.PollResult{
+		MachineInterface: MachineInterface, App: "blog", Host: "192.0.2.10", Ref: "refs/heads/main",
+		Head: "9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b", Admitted: false, Reason: "force-push",
+	})
+	writeFixture(t, "trigger-poll-envelope/valid/not-due.json", gitsource.PollResult{
+		MachineInterface: MachineInterface, App: "blog", Host: "", Ref: "refs/heads/main", Admitted: false, Reason: "not-due",
 	})
 }

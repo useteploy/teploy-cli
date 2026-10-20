@@ -1,0 +1,22 @@
+{
+  "machine_interface": 2,
+  "host": "192.0.2.10",
+  "app": "blog",
+  "repository": "git@github.com:useteploy/blog.git",
+  "branch": "main",
+  "poll": "5m",
+  "credential": {
+    "type": "ssh",
+    "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPmM9PmN0c9Jl0uR0aX1w2y3z4a5b6c7d8e9f0g1h2 teploy-deploy-blog",
+    "fingerprint": "256 SHA256:5kO5b5VqPm0s9R8tT1uV2wX3yZ4a5B6c7D8e9F0g1H2 teploy-deploy-blog (ED25519)",
+    "known_host_fingerprints": [
+      "256 SHA256:u6nB4D9Jl0uR0aX1w2y3z4a5b6c7d8e9f0g1h2i3J4k5 no comment (ED25519)"
+    ]
+  },
+  "trigger": {
+    "ref": "refs/heads/main",
+    "watermark": "3d9c1f0b8a7e6d5c4b3a2f1e0d9c8b7a6f5e4d3c",
+    "last_head": "3d9c1f0b8a7e6d5c4b3a2f1e0d9c8b7a6f5e4d3c",
+    "last_deployed_release": "3d9c1f0e8a7e"
+  }
+}

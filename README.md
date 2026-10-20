@@ -416,6 +416,60 @@ local TLS/static-build paths are refused too: the app deploys to the server
 that stores its config. Folder deploys of a Teploy-home app are refused, and
 so are deploys by teploy CLIs older than this feature.
 
+### Code from a git repository
+
+A Teploy-home app can build from a git repository instead of a pre-built
+image — GitHub, GitLab, Forgejo/Gitea, Cursor Origin, or any git host over
+SSH or HTTPS:
+
+```yaml
+app: blog
+domain: blog.example.com
+git:
+  repository: git@github.com:me/blog.git   # or https://github.com/me/blog.git
+  branch: main
+  paths: ["web/**"]                        # optional monorepo filter
+  poll: 5m                                 # or "off": webhook wakes only
+# context: ./web                           # optional, relative to the repo root
+# dockerfile: Dockerfile                   # optional, relative to the context
+build_secrets: [NPM_TOKEN]                 # age-store keys -> docker build --secret
+```
+
+Connect it once per app:
+
+```
+teploy config source key --app blog --host prod            # ed25519 deploy key:
+                                                           # prints the public half to register
+teploy config source key --app blog --host prod --type token < token-file
+teploy config source host-key --app blog --host prod       # pin the forge's SSH host key
+teploy config source show --app blog --host prod --json    # public state, no secrets
+teploy config source remove --app blog --host prod
+```
+
+The credential never leaves the server: keys and tokens are age-encrypted
+outside `/deployments` (a compromised Caddy cannot read them), SSH fetches
+use `StrictHostKeyChecking=yes` against the pinned host key, and HTTPS
+tokens travel via `GIT_ASKPASS` — never in a URL, `.git/config` or a
+command line.
+
+`teploy trigger poll` is the single admitter: it checks the branch with the
+app's credential, dedups by (app, ref, commit), requires new heads to
+descend from the deployed watermark (a force-push is refused, once, until
+`teploy trigger reset --app blog --ref refs/heads/main`), filters changed
+paths by `git.paths` (defaulting to `context:`), retries a failed commit at
+most twice, and always deploys the newest admitted head. `teploy deploy
+--app blog --host prod` builds the head from the server-side mirror under
+the same rules. A systemd timer runs the poll for every app:
+
+```
+teploy trigger install-timer --host prod    # teploy-trigger-poll.timer, every minute
+teploy trigger poll --app blog --host prod --now   # manual / webhook wake
+teploy trigger retry --app blog --host prod        # re-arm a failed commit
+```
+
+Static apps cannot use `git:` yet (static deploys still need a code
+source), and submodules are refused pending implementation.
+
 ### Secrets and env
 ```
 teploy env set KEY=value           # set env var
