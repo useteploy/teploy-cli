@@ -386,6 +386,10 @@ into each rather than duplicated as new work items.
 - TCL-44 — F37/host-helper (constrained extractor, entry policy, bounds).
 - TCL-45 — scheduled/manual backup unification (one engine + artifact
   schema + private workspaces + protected credentials). Architectural.
+  Partially landed 2026-10-20 (D3): scheduled jobs run the same Client
+  engine as manual creates (`backup run`), artifacts share one naming
+  scheme, and S3 credentials travel encrypted at rest; MYSQL_PWD
+  transport and engine-side credential plumbing remain.
 - TCL-47 — engine auth adapters + S3 session tokens. Medium; with F37.
 - TCL-48 — F42 (durable webhook queue).
 - TCL-49 — F40 (pin webhook builds to the event commit): LANDED
@@ -628,7 +632,10 @@ all packages ok. No push performed.
   fail-open-on-parse-error that F25 closed.
 - A33 — F22: backup credentials in host-visible command text (AWS env
   assignments, MYSQL_PWD via docker exec -e); needs the container-side
-  credential-file plumbing shared with the engine images.
+  credential-file plumbing shared with the engine images. Partially
+  improved 2026-10-20 (D3): the stored server backup target decrypts its
+  S3 credentials inside the invocation's own shell (never argv, never the
+  crontab); the legacy --endpoint flag path and MYSQL_PWD remain.
 - A34 — F42 durable webhook queue (ack-before-durable-job remains; A36
   closed the dedup-race half).
 - A35 — F40 webhook build pinning to the event commit: LANDED 2026-09-22

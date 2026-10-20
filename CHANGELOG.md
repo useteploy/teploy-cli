@@ -4,6 +4,70 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+### Added
+
+- One backup target per server, read at run time (`backup-target-v1`;
+  contracts corpus rev 14). `teploy server backup-target set --host S
+  --bucket B [--region] [--endpoint] [--prefix]` stores it at
+  `/etc/teploy/backup-target.json` (0600, outside `/deployments`;
+  `~/.config/teploy/` fallback for a non-root deploy user, said so on
+  output), with the S3 credentials read from stdin as two lines (access
+  key, then secret key; prompted with echo off on a terminal) and stored
+  age-encrypted with the server's own identity — used whether or not an
+  endpoint is set, ambient AWS chain only when none are stored.
+  `show [--json]` never emits secrets; `unset` removes the target.
+  Setting a target rewrites teploy-generated backup cron lines (by marker)
+  to the `backup run` form — hand-written commands under a teploy marker
+  are left untouched and reported — and `teploy doctor` gains a
+  `backup-cron` check flagging cron lines with embedded credentials
+  (fail) or bucket flags (warn).
+- `teploy backup create|list|restore|prune|schedule [--app X --host S]
+  --json` are folderless and default to the stored target
+  (`backup-json-v1`): `list --json` reports parsed rows
+  `{id, kind: volumes|accessory|teploy, accessory?, size_bytes,
+  created_at, key}` across the volumes, accessories and teploy prefixes
+  plus schedules discovered from teploy cron markers (was: raw
+  `aws s3 ls` lines); `create --json` reports the created backup's
+  identity and size; `restore --json` reports the quiesced receipt. The
+  legacy `--bucket`-style flags still work and override the stored
+  target. `teploy dr` and `teploy accessory backup|restore|
+  verify-backup` default to the stored target as well.
+- `teploy backup run --app X [--accessory Y]` — the cron entrypoint, runs
+  on the server like `autodeploy redeploy` and reads the target and the
+  per-app retention at run time. Scheduled jobs are a single
+  argument-free cron line; retention moves to a per-app store
+  (`backup schedule` and `accessory backup --schedule` write it;
+  `--max-age-days` is new on the latter). `backup unschedule` removes a
+  schedule. Failure alerting moved from the cron line into `backup run`
+  (same `/deployments/<app>/backup-alert.sh`, same signatures).
+- Restore is now quiesced: under the app's fenced lock the app's
+  containers (and a generic accessory's container, for accessory
+  restores) are stopped, the backup is promoted with the existing
+  two-phase recovery discipline, the containers are started again and
+  health-checked. On failure — or an unhealthy app afterwards — the
+  pre-restore recovery copy is kept and named. Non-interactive restores
+  require `--yes`.
+- Events `backup.run`, `backup.restore` and `backup_target.set` (detail
+  allowlist: id, kind, accessory, error — never bucket or credential
+  material; the server-level target event is fanned out to every app
+  known on the server).
+
+### Changed
+
+- `backup list --json` now emits the versioned envelope above instead of
+  a bare array of raw `aws s3 ls` lines. The old shape was never a
+  contracts-corpus artifact and no consumer is known to parse it;
+  consumers should gate on `backup-json-v1`.
+
+### Deferred
+
+- A `backup: {schedule, keep_last, max_age_days, accessories}` app-config
+  key (schedule/retention from Teploy-home config) is deferred: making a
+  config key authoritative over crontab entries hooks cron reconciliation
+  into deploy, which does not fit this change. Per-app schedules remain
+  managed with `backup schedule --app X --host S` (folderless), which
+  stores both halves server-side.
+
 ## [0.1.44] - 2026-10-19
 
 ### Added
