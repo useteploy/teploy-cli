@@ -419,18 +419,67 @@ so are deploys by teploy CLIs older than this feature.
 ### Secrets and env
 ```
 teploy env set KEY=value           # set env var
+teploy env set KEY --stdin         # value verbatim from stdin (never argv)
 teploy env get KEY                 # read env var
 teploy env list [--reveal]         # list env vars (masked by default)
 teploy env unset KEY               # remove env var
 teploy secret set KEY <value>      # encrypted secret
+teploy secret set KEY --stdin      # value verbatim from stdin (single key)
 teploy secret rm KEY               # delete an encrypted secret (local store)
 teploy secret get / list / rotate  # secret management
+```
+
+Every `env` and `secret` subcommand also works without a folder — pass
+`--app X --host S` (the secrets provider then comes from the app's Teploy
+config when it has one):
+
+```
+teploy secret set API_KEY --stdin --app blog --host prod
+teploy secret list --json --app blog --host prod
 ```
 
 At deploy, secrets (and `secret:` references in `env:`) override
 `teploy.yml` `env:`, which overrides the server `.env` that `env set`
 writes. `env set` therefore refuses a key that is a secret (use
-`secret set`) and warns when `teploy.yml` `env:` shadows the key.
+`secret set`) and warns when `teploy.yml` `env:` shadows the key. When the
+app's settings are edited in Teploy, `env set`/`env unset` also refuse keys
+the config declares under `env:`/`env_literal:` (`env-config-guard-v1`) —
+change those with `teploy config set --app X --host S env.KEY=...` (or
+dash Settings); a value written to `.env` would be shadowed at the next
+deploy.
+
+### Releases, rollback, redeploy
+```
+teploy releases [--app X --host S] [--json]   # the app's releases, newest first
+teploy rollback [--to <version>] [--json]     # health-checked rollback to the previous (or a specific) release
+teploy redeploy [--app X --host S] [--json]   # redeploy the CURRENT release with fresh env and secrets
+```
+
+`releases` lists retained release directories for `type:static` apps and
+release records for container apps — release id, when it deployed, the
+image (and digest), config commit and actor, each marked `current` or
+`rollback available` with the reason when not (containers for that version
+pruned by `keep_versions` retention). `--json` emits the machine envelope
+for `--app` invocations.
+
+`redeploy` runs a fresh deploy of the current release's recorded image at
+the same version, re-resolving env from the server `.env`, `teploy secret`
+and the recorded config through the normal fenced deploy engine — it is
+how a secret or env edit reaches containers (`restart` only stops and
+starts them). For a Teploy-home app it is the same as deploying the server
+config. Folderless, the config is rebuilt from the server's records and
+only used when it provably reproduces the running release; anything
+unrecorded is refused with the remedy. Static apps are refused.
+
+The server's age identity (the key that decrypts `teploy secret` values)
+lives at `/etc/teploy/age-key` (directory 0700, key 0600) — outside
+`/deployments`, which the Caddy container mounts read-only. Existing
+installs keep working from the old location; `teploy setup` moves the key
+after verifying the copy decrypts, leaving a public-key marker at the old
+path so an older teploy on another machine keeps encrypting to the same
+identity. `teploy doctor` reports the state (`age-identity` check). A
+non-root deploy user that cannot write `/etc/teploy` keeps using the old
+path unchanged.
 
 Release metadata (`/deployments/<app>/meta/<release>.json`) never stores a
 secret value. Plain `teploy.yml` `env:` values and image defaults are kept;

@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://teploy.github.io/contracts/schema/releases-envelope.schema.json",
+  "title": "`teploy releases --app X --host S --json`: the app's releases, newest first (rev 14, token releases-json-v1)",
+  "type": "object",
+  "required": ["machine_interface", "host", "app", "deployment_type", "releases"],
+  "properties": {
+    "machine_interface": {"type": "integer", "minimum": 1},
+    "host": {"type": "string", "minLength": 1},
+    "app": {"type": "string", "minLength": 1},
+    "deployment_type": {"enum": ["container", "static"]},
+    "current": {"type": "string", "description": "Release id of the currently-active release; omitted when unknown."},
+    "releases": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["release", "current", "rollback_available"],
+        "properties": {
+          "release": {"type": "string", "minLength": 1, "maxLength": 128, "description": "Release id (container version or static release hash)."},
+          "deployed_at": {"type": "string", "format": "date-time", "description": "When the release deployed (record CreatedAt); omitted for pre-record releases."},
+          "image": {"type": "string", "description": "Recorded image reference; empty for static rows."},
+          "image_digest": {"type": "string", "description": "Recorded image digest (image ID or manifest digest)."},
+          "config_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$", "description": "Teploy-home config commit the release deployed."},
+          "actor": {"type": "string", "description": "Client that deployed the release, \"<client>[:<label>]\"."},
+          "current": {"type": "boolean"},
+          "rollback_available": {"type": "boolean", "description": "Containers for this version are still present (keep_versions retention) and it is not current; static: the release directory is retained."},
+          "reason": {"type": "string", "description": "Why rollback is not available; empty when it is or when current (\"current release\")."}
+        }
+      }
+    }
+  }
+}

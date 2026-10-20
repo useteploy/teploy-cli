@@ -1,0 +1,22 @@
+{
+  "machine_interface": 2,
+  "host": "192.0.2.10",
+  "app": "site",
+  "deployment_type": "static",
+  "current": "abc1234",
+  "releases": [
+    {
+      "release": "abc1234",
+      "deployed_at": "0001-01-01T00:00:00Z",
+      "current": true,
+      "rollback_available": false,
+      "reason": "current release"
+    },
+    {
+      "release": "9f8e7d6",
+      "deployed_at": "0001-01-01T00:00:00Z",
+      "current": false,
+      "rollback_available": true
+    }
+  ]
+}
