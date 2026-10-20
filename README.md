@@ -107,7 +107,7 @@ standalone.
 | **Asset bridging** | Shared volume prevents 404s on hashed assets during deploys |
 | **Destinations** | `teploy deploy -d staging` — per-environment config overlays |
 | **Notifications** | Webhook notifications on deploy/rollback/failure |
-| **Backups** | `teploy backup` — volumes to S3 |
+| **Backups** | `teploy backup` — volumes to S3; `teploy server backup-target` — the per-server target |
 | **Templates** | One-command deploys for common self-hosted apps |
 | **Deploy locking** | `teploy lock` — freeze deploys during incidents; `teploy lock status --json` reports who holds the lock |
 | **Vulnerability gate** | `scan: true` — Trivy scan blocks deploys on fixable CRITICALs |
@@ -473,18 +473,67 @@ source), and submodules are refused pending implementation.
 ### Secrets and env
 ```
 teploy env set KEY=value           # set env var
+teploy env set KEY --stdin         # value verbatim from stdin (never argv)
 teploy env get KEY                 # read env var
 teploy env list [--reveal]         # list env vars (masked by default)
 teploy env unset KEY               # remove env var
 teploy secret set KEY <value>      # encrypted secret
+teploy secret set KEY --stdin      # value verbatim from stdin (single key)
 teploy secret rm KEY               # delete an encrypted secret (local store)
 teploy secret get / list / rotate  # secret management
+```
+
+Every `env` and `secret` subcommand also works without a folder — pass
+`--app X --host S` (the secrets provider then comes from the app's Teploy
+config when it has one):
+
+```
+teploy secret set API_KEY --stdin --app blog --host prod
+teploy secret list --json --app blog --host prod
 ```
 
 At deploy, secrets (and `secret:` references in `env:`) override
 `teploy.yml` `env:`, which overrides the server `.env` that `env set`
 writes. `env set` therefore refuses a key that is a secret (use
-`secret set`) and warns when `teploy.yml` `env:` shadows the key.
+`secret set`) and warns when `teploy.yml` `env:` shadows the key. When the
+app's settings are edited in Teploy, `env set`/`env unset` also refuse keys
+the config declares under `env:`/`env_literal:` (`env-config-guard-v1`) —
+change those with `teploy config set --app X --host S env.KEY=...` (or
+dash Settings); a value written to `.env` would be shadowed at the next
+deploy.
+
+### Releases, rollback, redeploy
+```
+teploy releases [--app X --host S] [--json]   # the app's releases, newest first
+teploy rollback [--to <version>] [--json]     # health-checked rollback to the previous (or a specific) release
+teploy redeploy [--app X --host S] [--json]   # redeploy the CURRENT release with fresh env and secrets
+```
+
+`releases` lists retained release directories for `type:static` apps and
+release records for container apps — release id, when it deployed, the
+image (and digest), config commit and actor, each marked `current` or
+`rollback available` with the reason when not (containers for that version
+pruned by `keep_versions` retention). `--json` emits the machine envelope
+for `--app` invocations.
+
+`redeploy` runs a fresh deploy of the current release's recorded image at
+the same version, re-resolving env from the server `.env`, `teploy secret`
+and the recorded config through the normal fenced deploy engine — it is
+how a secret or env edit reaches containers (`restart` only stops and
+starts them). For a Teploy-home app it is the same as deploying the server
+config. Folderless, the config is rebuilt from the server's records and
+only used when it provably reproduces the running release; anything
+unrecorded is refused with the remedy. Static apps are refused.
+
+The server's age identity (the key that decrypts `teploy secret` values)
+lives at `/etc/teploy/age-key` (directory 0700, key 0600) — outside
+`/deployments`, which the Caddy container mounts read-only. Existing
+installs keep working from the old location; `teploy setup` moves the key
+after verifying the copy decrypts, leaving a public-key marker at the old
+path so an older teploy on another machine keeps encrypting to the same
+identity. `teploy doctor` reports the state (`age-identity` check). A
+non-root deploy user that cannot write `/etc/teploy` keeps using the old
+path unchanged.
 
 Release metadata (`/deployments/<app>/meta/<release>.json`) never stores a
 secret value. Plain `teploy.yml` `env:` values and image defaults are kept;
@@ -568,30 +617,60 @@ The mode is recorded with the preview, so redeploying the branch keeps it.
 `preview list --json` rows carry a `url` with the scheme actually served.
 
 ### Backups
-```
-teploy backup create               # backup volumes to S3
-teploy backup list / restore <id>
-teploy backup schedule             # cron-driven backups
-teploy backup prune                # apply a retention policy
 
-# Retention: keep only the newest N, and/or drop anything older than D days.
-teploy backup create  --bucket b --keep-last 7             # auto-prune after backup
-teploy backup schedule "0 3 * * *" --bucket b --keep-last 7 # nightly, keep 7
-teploy backup prune   --bucket b --keep-last 3 --max-age-days 30
-teploy backup prune   --bucket b --accessory db --keep-last 5
+One backup target per server, stored on the server and read at run time —
+no bucket or credentials in crontabs, scripts or laptops:
+
 ```
+# Store the target (credentials on stdin, two lines; age-encrypted on the
+# server at /etc/teploy/backup-target.json, 0600):
+printf 'ACCESS\nSECRET\n' | teploy server backup-target set --host prod \
+    --bucket b [--region r] [--endpoint https://s3.example.com] [--prefix p]
+teploy server backup-target show --host prod [--json]   # never secrets
+teploy server backup-target unset --host prod
+
+teploy backup create   --app myapp --host prod [--json]  # volumes (+ server data)
+teploy backup create   --app myapp --host prod --accessory db --json
+teploy backup list     --app myapp --host prod --json    # parsed rows + schedules
+teploy backup restore  <id> --app myapp --host prod --yes --json
+teploy backup schedule "0 3 * * *" --app myapp --host prod --keep-last 7
+teploy backup prune    --app myapp --host prod --keep-last 3 --max-age-days 30
+```
+
+Every command also works from an app directory without `--app/--host`, and
+the legacy `--bucket/--region/--endpoint` flags still work (they override
+the stored target). `teploy dr` and `teploy accessory verify-backup`
+default to the stored target too.
+
+Stored credentials are used whether or not an endpoint is set; without
+them the server's ambient AWS credential chain applies. A non-root deploy
+user who cannot write `/etc/teploy` gets `~/.config/teploy/` instead, and
+the command says so.
+
+Scheduled jobs are a single argument-free line —
+`/usr/local/bin/teploy backup run --app myapp` — with the retention half
+of the schedule stored per app and read at run time, so changing either
+never rewrites cron. `teploy server backup-target set` rewrites existing
+teploy-generated backup cron lines to that form (hand-written commands
+under a teploy marker are left alone and reported), and `teploy doctor`
+flags any cron line that still embeds credentials or bucket flags.
+
+Restore quiesces: the app's containers (and a generic accessory's) are
+stopped under the app's fenced lock, the backup is promoted with the
+two-phase recovery discipline, the containers are started again and
+health-checked. On failure — or an unhealthy app afterwards — the
+pre-restore recovery copy is kept and named. Non-interactive restores
+require `--yes`.
+
 `--keep-last N` is a floor (the newest N are always kept, even if old);
 `--max-age-days D` deletes older backups but never below that floor. A failed
 backup never triggers a prune. Both `backup create` and scheduled cron backups
 alert on failure via the app's `notifications` config — `create` uses all
-channels; the headless cron job posts to the first **webhook** channel (SMTP and
-other channels need the CLI, which isn't on the server).
-
-`backup schedule` uploads a small alert script to
-`/deployments/<app>/backup-alert.sh` (mode 0700) and points cron at it, rather
-than inlining a `curl` in the crontab line. That is what lets the alert be
-signed: the signature covers a timestamp, `date +%s` contains a `%`, and crontab
-treats `%` as a newline escape. If a signing secret is configured (see
+channels; the headless `backup run` posts to the first **webhook** channel
+through the alert script `backup schedule` uploads to
+`/deployments/<app>/backup-alert.sh` (mode 0700). That is what lets the alert
+be signed: the signature covers a timestamp, `date +%s` contains a `%`, and
+crontab treats `%` as a newline escape. If a signing secret is configured (see
 `notifications.secret` / `TEPLOY_WEBHOOK_SECRET`) the alert carries the same
 `X-Teploy-Signature` headers as every other delivery; otherwise it goes
 unsigned, and `backup schedule` says so on its output so a verifying receiver

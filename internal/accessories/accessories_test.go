@@ -194,6 +194,7 @@ func TestEnsureRunning_ReconcilesFreshVolumeOwnership(t *testing.T) {
 func TestEnsureRunning_AlreadyRunning(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4", append(admissionStubs("myapp"),
 		// Stored credentials exist (needed for connection string).
+		ssh.MockCommand{Match: "if [ -r '/etc/teploy/age-key' ]", Output: "legacy"},
 		ssh.MockCommand{Match: "if [ ! -e ", Output: "present"},
 		ssh.MockCommand{Match: "cat -- ", Output: "POSTGRES_PASSWORD=existingpass123\n"},
 		// Already running.
@@ -235,6 +236,7 @@ func TestEnsureRunning_AlreadyRunning(t *testing.T) {
 func TestEnsureRunning_StoredCredentials(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4", append(admissionStubs("myapp"),
 		// Stored credentials exist.
+		ssh.MockCommand{Match: "if [ -r '/etc/teploy/age-key' ]", Output: "legacy"},
 		ssh.MockCommand{Match: "if [ ! -e ", Output: "present"},
 		ssh.MockCommand{Match: "cat -- ", Output: "POSTGRES_PASSWORD=storedpass456\n"},
 		// Not running.
@@ -565,6 +567,7 @@ func TestInjectEnvVars_NewFile(t *testing.T) {
 func TestInjectEnvVars_SkipExisting(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		// Existing .env with DATABASE_URL already set.
+		ssh.MockCommand{Match: "if [ -r '/etc/teploy/age-key' ]", Output: "legacy"},
 		ssh.MockCommand{Match: "if [ ! -e ", Output: "present"},
 		ssh.MockCommand{Match: "cat -- ", Output: "DATABASE_URL=postgres://custom/mydb\n"},
 	)
@@ -595,6 +598,7 @@ func TestInjectEnvVars_SkipExisting(t *testing.T) {
 
 func TestInjectEnvVars_AllExist(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "if [ -r '/etc/teploy/age-key' ]", Output: "legacy"},
 		ssh.MockCommand{Match: "if [ ! -e ", Output: "present"},
 		ssh.MockCommand{Match: "cat -- ", Output: "DATABASE_URL=existing\nREDIS_URL=existing\n"},
 	)
@@ -651,6 +655,7 @@ func TestEnsureRunning_SecretReference(t *testing.T) {
 		// No stored credentials (first test -f), then the secret EXISTS
 		// (second test -f) and decrypts.
 		ssh.MockCommand{Match: "if [ ! -e ", Output: "absent", Once: true},
+		ssh.MockCommand{Match: "if [ -r '/etc/teploy/age-key' ]", Output: "legacy"},
 		ssh.MockCommand{Match: "if [ ! -e ", Output: "present"},
 		ssh.MockCommand{Match: "age -d", Output: "s3cr3t-pa$$word"},
 		// Not running.

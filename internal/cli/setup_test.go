@@ -786,6 +786,7 @@ func TestSetupServer_ConnectionLossRecoversMidStage(t *testing.T) {
 		ssh.MockCommand{Match: "docker info", Output: ""},
 		// First attempt at the network stage dies with a transport
 		// error; the redialed retry finds the network (inspect OK).
+		ssh.MockCommand{Match: "if [ -r '/deployments/.age-key' ]", Output: "no"},
 		ssh.MockCommand{Match: "docker network inspect teploy", Err: errors.New("ssh: connection reset by peer"), Once: true},
 		ssh.MockCommand{Match: "docker network inspect teploy", Output: "teploy"},
 		ssh.MockCommand{Match: "mkdir", Output: ""},

@@ -1,0 +1,12 @@
+{
+  "machine_interface": 2,
+  "host": "192.0.2.10",
+  "app": "blog",
+  "id": "20261020-031704-1f2e3d4c5b6a7988",
+  "kind": "volumes",
+  "size_bytes": 1048576,
+  "created_at": "2026-10-20T03:17:04Z",
+  "key": "s3://teploy-backups/blog/volumes/20261020-031704-1f2e3d4c5b6a7988.tar.gz",
+  "teploy_key": "s3://teploy-backups/blog/teploy/20261020-031704-1f2e3d4c5b6a7988.tar.gz",
+  "pruned": 1
+}

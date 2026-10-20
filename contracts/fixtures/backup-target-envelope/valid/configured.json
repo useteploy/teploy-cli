@@ -1,0 +1,11 @@
+{
+  "machine_interface": 2,
+  "host": "192.0.2.10",
+  "configured": true,
+  "bucket": "teploy-backups",
+  "region": "us-east-1",
+  "endpoint": "http://127.0.0.1:9100",
+  "prefix": "prod",
+  "has_credentials": true,
+  "path": "/etc/teploy/backup-target.json"
+}

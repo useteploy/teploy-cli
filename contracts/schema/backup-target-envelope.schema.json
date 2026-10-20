@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://teploy.github.io/contracts/schema/backup-target-envelope.schema.json",
+  "title": "`teploy server backup-target show --json`: the server's stored backup target (backup-target-v1, rev 14). Never carries secret material — only whether any is stored.",
+  "type": "object",
+  "required": ["machine_interface", "host", "configured", "has_credentials"],
+  "properties": {
+    "machine_interface": {"type": "integer", "minimum": 1},
+    "host": {"type": "string", "minLength": 1},
+    "configured": {"type": "boolean"},
+    "bucket": {"type": "string", "minLength": 1},
+    "region": {"type": "string", "minLength": 1},
+    "endpoint": {"type": "string", "pattern": "^https?://"},
+    "prefix": {"type": "string", "minLength": 1},
+    "has_credentials": {"type": "boolean", "description": "Whether age-encrypted credentials are stored on the server. The envelope never carries credential values."},
+    "path": {"type": "string", "description": "Server path the target was read from (/etc/teploy/backup-target.json or the ~/.config/teploy fallback)."}
+  }
+}

@@ -69,7 +69,7 @@ func (c *Client) InspectAccessory(ctx context.Context, app, name string) (image 
 // by listing the S3 prefix. Returns the bare timestamp (the <date> restore
 // arg) and the object's size in bytes.
 func (c *Client) LatestBackupDate(ctx context.Context, app, name string, s3 S3Config) (date string, size int64, err error) {
-	prefix := fmt.Sprintf("s3://%s/%s/accessories/%s/", s3.Bucket, app, name)
+	prefix := fmt.Sprintf("s3://%s/%s/accessories/%s/", s3.Base(), app, name)
 	out, err := c.exec.Run(ctx, s3.AWS(fmt.Sprintf("s3 ls %s", ssh.ShellQuote(prefix))))
 	if err != nil {
 		return "", 0, fmt.Errorf("listing backups at %s: %w", prefix, err)
@@ -254,7 +254,7 @@ func (c *Client) waitReady(ctx context.Context, scratch, probe string, attempts 
 
 func (c *Client) verifyPostgres(ctx context.Context, res *VerifyResult, app, name, image string, env map[string]string, s3 S3Config, scratch, tmpBase string) error {
 	db, user := postgresDBAndUser(app, env)
-	s3Key := fmt.Sprintf("s3://%s/%s/accessories/%s/%s.sql.gz", s3.Bucket, app, name, res.Date)
+	s3Key := fmt.Sprintf("s3://%s/%s/accessories/%s/%s.sql.gz", s3.Base(), app, name, res.Date)
 	res.S3Key = s3Key
 	dump := tmpBase + ".sql.gz"
 	if err := c.download(ctx, s3Key, dump, s3); err != nil {
@@ -301,7 +301,7 @@ func (c *Client) verifyPostgres(ctx context.Context, res *VerifyResult, app, nam
 
 func (c *Client) verifyMySQL(ctx context.Context, res *VerifyResult, app, name, image string, env map[string]string, s3 S3Config, scratch, tmpBase string) error {
 	db := mysqlDB(app, env)
-	s3Key := fmt.Sprintf("s3://%s/%s/accessories/%s/%s.sql.gz", s3.Bucket, app, name, res.Date)
+	s3Key := fmt.Sprintf("s3://%s/%s/accessories/%s/%s.sql.gz", s3.Base(), app, name, res.Date)
 	res.S3Key = s3Key
 	dump := tmpBase + ".sql.gz"
 	if err := c.download(ctx, s3Key, dump, s3); err != nil {
@@ -349,7 +349,7 @@ func (c *Client) verifyMySQL(ctx context.Context, res *VerifyResult, app, name, 
 }
 
 func (c *Client) verifyRedis(ctx context.Context, res *VerifyResult, app, name, image string, env map[string]string, s3 S3Config, scratch, tmpBase string) error {
-	s3Key := fmt.Sprintf("s3://%s/%s/accessories/%s/%s.rdb.gz", s3.Bucket, app, name, res.Date)
+	s3Key := fmt.Sprintf("s3://%s/%s/accessories/%s/%s.rdb.gz", s3.Base(), app, name, res.Date)
 	res.S3Key = s3Key
 	dump := tmpBase + ".rdb.gz"
 	if err := c.download(ctx, s3Key, dump, s3); err != nil {
@@ -379,7 +379,7 @@ func (c *Client) verifyRedis(ctx context.Context, res *VerifyResult, app, name, 
 }
 
 func (c *Client) verifyMongo(ctx context.Context, res *VerifyResult, app, name, image string, env map[string]string, s3 S3Config, scratch, tmpBase string) error {
-	s3Key := fmt.Sprintf("s3://%s/%s/accessories/%s/%s.archive.gz", s3.Bucket, app, name, res.Date)
+	s3Key := fmt.Sprintf("s3://%s/%s/accessories/%s/%s.archive.gz", s3.Base(), app, name, res.Date)
 	res.S3Key = s3Key
 	dump := tmpBase + ".archive.gz"
 	if err := c.download(ctx, s3Key, dump, s3); err != nil {
@@ -425,7 +425,7 @@ func (c *Client) verifyMongo(ctx context.Context, res *VerifyResult, app, name, 
 // tables, and stay running. The "Restored N table(s)" boot line is the
 // verification metric.
 func (c *Client) verifyNucleus(ctx context.Context, res *VerifyResult, app, name, image string, env map[string]string, s3 S3Config, scratch, tmpBase string) error {
-	s3Key := fmt.Sprintf("s3://%s/%s/accessories/%s/%s.tar.gz", s3.Bucket, app, name, res.Date)
+	s3Key := fmt.Sprintf("s3://%s/%s/accessories/%s/%s.tar.gz", s3.Base(), app, name, res.Date)
 	res.S3Key = s3Key
 	dump := tmpBase + ".tar.gz"
 	if err := c.download(ctx, s3Key, dump, s3); err != nil {
@@ -471,7 +471,7 @@ func (c *Client) verifyNucleus(ctx context.Context, res *VerifyResult, app, name
 // verifyVolume checks a generic volume archive: integrity (a truncated or
 // corrupt tar fails extraction) and non-emptiness.
 func (c *Client) verifyVolume(ctx context.Context, res *VerifyResult, app, name string, s3 S3Config, tmpBase string) error {
-	s3Key := fmt.Sprintf("s3://%s/%s/accessories/%s/%s.tar.gz", s3.Bucket, app, name, res.Date)
+	s3Key := fmt.Sprintf("s3://%s/%s/accessories/%s/%s.tar.gz", s3.Base(), app, name, res.Date)
 	res.S3Key = s3Key
 	dump := tmpBase + ".tar.gz"
 	if err := c.download(ctx, s3Key, dump, s3); err != nil {

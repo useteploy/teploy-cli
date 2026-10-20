@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://teploy.github.io/contracts/schema/redeploy-result.schema.json",
+  "title": "`teploy redeploy [--app X --host S] --json`: the machine result of a successful redeploy (rev 14, token redeploy-v1)",
+  "type": "object",
+  "required": ["machine_interface", "app", "server", "home", "release", "image", "ok"],
+  "properties": {
+    "machine_interface": {"type": "integer", "minimum": 1},
+    "app": {"type": "string", "minLength": 1},
+    "server": {"type": "string", "minLength": 1},
+    "home": {"enum": ["teploy", "folder"], "description": "Which config the redeploy deployed from."},
+    "release": {"type": "string", "description": "Release id now current (the redeployed release; same id for same-version redeploys)."},
+    "image": {"type": "string", "description": "Image the release runs (the recorded image, digest-pinned when the tag had moved)."},
+    "config_commit": {"type": "string", "pattern": "^[0-9a-f]{40}$", "description": "Present for Teploy-home redeploys."},
+    "ok": {"const": true, "description": "Always true on this document; failures and refusals (static apps, unrecorded releases) use the error envelope."}
+  }
+}

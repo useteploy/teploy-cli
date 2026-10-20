@@ -24,8 +24,10 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
+	"github.com/useteploy/teploy/internal/backup"
 	"github.com/useteploy/teploy/internal/config"
 	"github.com/useteploy/teploy/internal/deploy"
+	"github.com/useteploy/teploy/internal/secret"
 	"github.com/useteploy/teploy/internal/ssh"
 )
 
@@ -112,8 +114,11 @@ func newDoctorCmd(flags *Flags, version string) *cobra.Command {
 			"reachability for the configured image (auth failures distinguished from\n" +
 			"unreachable), the Caddy admin API (caddy ingress only), teploy version\n" +
 			"compatibility with the server's teploy binary if present, outstanding\n" +
-			"release-record repair debt, and secret-bearing files or world-traversable\n" +
-			"build directories older CLIs left under /deployments (listed, never deleted).\n\n" +
+			"release-record repair debt, secret-bearing files or world-traversable\n" +
+			"build directories older CLIs left under /deployments (listed, never deleted),\n" +
+			"and where the server's age identity lives (an age key still under\n" +
+			"/deployments is readable through Caddy's read-only mount — teploy setup\n" +
+			"moves it; doctor only reports).\n\n" +
 			"Exit codes: 0 when no check fails, 1 when any check fails, 2 never (that\n" +
 			"code stays drift --exit-code's CI signal).",
 		Args: cobra.NoArgs,
@@ -198,7 +203,7 @@ func doctorRun(ctx context.Context, deps doctorDeps, flags *Flags, serverName st
 
 	if executor == nil {
 		const sshDown = "restore SSH connectivity (see the ssh check above), then re-run teploy doctor"
-		for _, name := range []string{"docker", "disk", "registry", "caddy", "compatibility", "repair-debt", "secret-exposure", "server-tools", "config-home", "git-trigger"} {
+		for _, name := range []string{"docker", "disk", "registry", "caddy", "compatibility", "repair-debt", "secret-exposure", "server-tools", "config-home", "backup-cron", "age-identity", "git-trigger"} {
 			skipFail(name, "SSH unreachable", sshDown)
 		}
 	} else {
@@ -217,6 +222,8 @@ func doctorRun(ctx context.Context, deps doctorDeps, flags *Flags, serverName st
 		report.Checks = append(report.Checks, doctorSecretExposureCheck(ctx, executor))
 		report.Checks = append(report.Checks, doctorServerToolsCheck(ctx, executor))
 		report.Checks = append(report.Checks, doctorConfigHomeCheck(ctx, executor))
+		report.Checks = append(report.Checks, doctorBackupCronCheck(ctx, executor))
+		report.Checks = append(report.Checks, doctorAgeIdentityCheck(ctx, executor))
 		report.Checks = append(report.Checks, doctorGitTriggerCheck(ctx, executor, deps))
 	}
 
@@ -787,6 +794,117 @@ func doctorConfigHomeCheck(ctx context.Context, exec ssh.Executor) doctorCheck {
 			Detail: fmt.Sprintf("%d app(s) edited in Teploy: %s — teploy CLIs older than v0.1.43 refuse to deploy them", len(teploy), strings.Join(teploy, ", "))}
 	}
 	return doctorCheck{Name: "config-home", Result: doctorOK, Detail: "every app is edited in its folder"}
+}
+
+// doctorBackupCronCheck flags backup cron lines that embed credentials or
+// bucket flags (D3). Raw line text is NEVER placed in the report — a
+// legacy line can carry plaintext S3 keys, so the check reports markers
+// and counts only.
+func doctorBackupCronCheck(ctx context.Context, exec ssh.Executor) doctorCheck {
+	lines, err := backup.ReadCrontab(ctx, exec)
+	if err != nil {
+		return doctorCheck{Name: "backup-cron", Result: doctorWarn, Detail: "could not read the crontab: " + err.Error()}
+	}
+	var credLines, legacyLines int
+	var custom, runForm int
+	for _, line := range lines {
+		hasCreds := strings.Contains(line, "TEPLOY_S3_SECRET_KEY=") ||
+			strings.Contains(line, "TEPLOY_S3_ACCESS_KEY=") ||
+			strings.Contains(line, "AWS_SECRET_ACCESS_KEY=") ||
+			strings.Contains(line, "AWS_ACCESS_KEY_ID=")
+		m := backup.FindCronMarker(line)
+		if hasCreds {
+			credLines++
+			continue
+		}
+		if m == nil {
+			continue
+		}
+		switch m.Form {
+		case backup.CronFormRun:
+			runForm++
+		case backup.CronFormLegacy:
+			legacyLines++
+		case backup.CronFormCustom:
+			custom++
+		}
+	}
+	switch {
+	case credLines > 0:
+		return doctorCheck{
+			Name:        "backup-cron",
+			Result:      doctorFail,
+			Detail:      fmt.Sprintf("%d cron line(s) embed S3 credentials in plain text", credLines),
+			Remediation: "run `teploy server backup-target set` to store the target on the server, which rewrites teploy-managed backup lines to `teploy backup run`; hand-written lines must be fixed by hand",
+		}
+	case legacyLines > 0:
+		return doctorCheck{
+			Name:        "backup-cron",
+			Result:      doctorWarn,
+			Detail:      fmt.Sprintf("%d teploy-managed backup line(s) still embed the bucket (and possibly credentials)", legacyLines),
+			Remediation: "run `teploy server backup-target set` to store the target and rewrite them to `teploy backup run`",
+		}
+	case custom > 0:
+		return doctorCheck{Name: "backup-cron", Result: doctorOK,
+			Detail: fmt.Sprintf("%d scheduled line(s) use `backup run`; %d hand-written line(s) carry a teploy marker and were left alone", runForm, custom)}
+	default:
+		return doctorCheck{Name: "backup-cron", Result: doctorOK,
+			Detail: fmt.Sprintf("%d scheduled line(s) use `backup run`; no embedded credentials or buckets", runForm)}
+	}
+}
+
+// doctorAgeIdentityScript prints three facts about the age identity's
+// location: the new path (present | denied | absent), the legacy path
+// (real | marker | denied | absent) and whether this user could move it
+// (writable /etc/teploy, or a writable /etc to create it). Read-only.
+const doctorAgeIdentityScript = `if [ -r /etc/teploy/age-key ]; then printf 'present '; elif [ -e /etc/teploy/age-key ]; then printf 'denied '; else printf 'absent '; fi; if [ -r /deployments/.age-key ]; then grep -q '^AGE-SECRET-KEY-' /deployments/.age-key 2>/dev/null && printf 'real ' || printf 'marker '; elif [ -e /deployments/.age-key ]; then printf 'ldenied '; else printf 'labsent '; fi; if [ -w /etc/teploy ] || { [ ! -e /etc/teploy ] && [ -w /etc ]; }; then printf 'movable\n'; else printf 'immovable\n'; fi`
+
+// doctorAgeIdentityCheck reports where the server's age identity lives
+// (plan D2): /deployments/.age-key is readable through the Caddy
+// container's read-only mount of /deployments, so a real key still there
+// is a warn with the setup migration as the remediation. Read-only: the
+// check never moves, creates or removes anything.
+func doctorAgeIdentityCheck(ctx context.Context, exec ssh.Executor) doctorCheck {
+	out, err := exec.Run(ctx, doctorAgeIdentityScript)
+	if err != nil {
+		return doctorCheck{Name: "age-identity", Result: doctorWarn, Detail: "could not locate the age identity: " + err.Error()}
+	}
+	f := strings.Fields(out)
+	if len(f) != 3 {
+		return doctorCheck{Name: "age-identity", Result: doctorWarn, Detail: "could not locate the age identity: unrecognized output framing"}
+	}
+	nw, legacy, movable := f[0], f[1], f[2] == "movable"
+	const moveHint = "run teploy setup on the server — it verifies the copy decrypts, moves the key to /etc/teploy/age-key and leaves a public-key marker at the old path"
+	switch {
+	case nw == "present" && (legacy == "marker" || legacy == "labsent"):
+		return doctorCheck{Name: "age-identity", Result: doctorOK, Detail: "age identity at /etc/teploy/age-key (outside /deployments)"}
+	case nw == "present" && legacy == "real":
+		return doctorCheck{Name: "age-identity", Result: doctorWarn,
+			Detail:      "an age key is still present at /deployments/.age-key as well as /etc/teploy/age-key — the old location is readable through Caddy's read-only mount of /deployments",
+			Remediation: moveHint}
+	case nw == "present" && legacy == "ldenied":
+		return doctorCheck{Name: "age-identity", Result: doctorWarn,
+			Detail:      "an unreadable /deployments/.age-key remains beside the identity at /etc/teploy/age-key",
+			Remediation: "inspect it on the server; if it still holds a key, " + moveHint}
+	case nw == "denied" || legacy == "marker" && nw == "absent":
+		return doctorCheck{Name: "age-identity", Result: doctorFail,
+			Detail:      "the age identity is at /etc/teploy/age-key, which this user cannot read — secrets cannot be decrypted",
+			Remediation: fmt.Sprintf("have an administrator make %s readable by the deploy user (teploy setup does this)", secret.IdentityPath)}
+	case nw == "absent" && legacy == "real":
+		detail := "the age identity still lives at /deployments/.age-key, which the Caddy container mounts read-only — a Caddy compromise can read every secret"
+		if movable {
+			return doctorCheck{Name: "age-identity", Result: doctorWarn, Detail: detail, Remediation: moveHint}
+		}
+		return doctorCheck{Name: "age-identity", Result: doctorWarn, Detail: detail,
+			Remediation: moveHint + " (this user cannot write /etc/teploy — run setup with privileges that can)"}
+	case nw == "absent" && legacy == "labsent":
+		return doctorCheck{Name: "age-identity", Result: doctorOK, Detail: "no age identity yet (one is generated on first `teploy secret set`)"}
+	case nw == "absent" && legacy == "ldenied":
+		return doctorCheck{Name: "age-identity", Result: doctorWarn,
+			Detail:      "an unreadable file sits at /deployments/.age-key and no identity is at /etc/teploy/age-key",
+			Remediation: "inspect /deployments/.age-key on the server"}
+	}
+	return doctorCheck{Name: "age-identity", Result: doctorWarn, Detail: "unrecognized age identity state: " + strings.Join(f, " ")}
 }
 
 // doctorGitTriggerCheck verifies the git-source trigger (D4): when any

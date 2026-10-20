@@ -338,12 +338,13 @@ func (c *Client) decryptProof(ctx context.Context, manifest *BundleManifest, sta
 	if manifest.Secrets.Mode != "encrypted" || len(manifest.Secrets.Included) == 0 {
 		return nil
 	}
-	keyPath := deploymentsDir + "/.age-key"
-	hasKey, err := c.remoteExists(ctx, keyPath)
+	// The target's own identity, wherever it lives (D2 moved it out of
+	// /deployments; ResolveIdentity is the one shared resolver).
+	keyPath, err := secret.ResolveIdentity(ctx, c.exec)
 	if err != nil {
 		return fmt.Errorf("checking surviving target age key: %w", err)
 	}
-	if !hasKey {
+	if keyPath == "" {
 		if !manifest.Secrets.AgeKeyIncluded {
 			return fmt.Errorf("target age key missing; restore an encrypted bundle with its age key or supply matching target credentials")
 		}
@@ -1060,15 +1061,10 @@ func (c *Client) installBundleState(ctx context.Context, manifest *BundleManifes
 		if manifest.Secrets.AgeKeyIncluded {
 			// Install the bundled age key as the target's own ONLY when the
 			// target has none — never silently replace an existing key.
-			hasKey, err := c.remoteExists(ctx, deploymentsDir+"/.age-key")
-			if err != nil {
-				return fmt.Errorf("checking the target age key: %w", err)
-			}
-			if !hasKey {
-				if _, err := c.exec.Run(ctx, fmt.Sprintf("umask 077; tmp=$(mktemp /deployments/.age-key.XXXXXXXX) || exit 1; trap 'rm -f -- \"$tmp\"' EXIT; cp %s \"$tmp\" && chmod 600 \"$tmp\" && ln \"$tmp\" %s",
-					ssh.ShellQuote(staging+"/age-key"), ssh.ShellQuote(deploymentsDir+"/.age-key"))); err != nil {
-					return fmt.Errorf("installing the bundled age key: %w", err)
-				}
+			// secret.InstallBundledKey prefers the D2 location and falls
+			// back to /deployments when /etc is not writable.
+			if _, err := secret.InstallBundledKey(ctx, c.exec, staging+"/age-key"); err != nil {
+				return err
 			}
 		}
 	}
@@ -1161,15 +1157,7 @@ func (c *Client) ensureBundleAgeKey(ctx context.Context, manifest *BundleManifes
 	if manifest.Secrets.Mode != "encrypted" || !manifest.Secrets.AgeKeyIncluded {
 		return nil
 	}
-	hasKey, err := c.remoteExists(ctx, deploymentsDir+"/.age-key")
-	if err != nil {
-		return err
-	}
-	if hasKey {
-		return nil
-	}
-	cmd := fmt.Sprintf("umask 077; tmp=$(mktemp /deployments/.age-key.XXXXXXXX) || exit 1; trap 'rm -f -- \"$tmp\"' EXIT; cp %s \"$tmp\" && chmod 600 \"$tmp\" && ln \"$tmp\" %s", ssh.ShellQuote(staging+"/age-key"), ssh.ShellQuote(deploymentsDir+"/.age-key"))
-	if _, err := c.exec.Run(ctx, cmd); err != nil {
+	if _, err := secret.InstallBundledKey(ctx, c.exec, staging+"/age-key"); err != nil {
 		return fmt.Errorf("publishing bundled age key without overwriting an existing key: %w", err)
 	}
 	return nil

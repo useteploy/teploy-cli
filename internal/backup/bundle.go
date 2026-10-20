@@ -249,7 +249,7 @@ type BundleStore interface {
 type S3BundleStore struct{ S3 S3Config }
 
 func (s S3BundleStore) key(app, id, member string) string {
-	return fmt.Sprintf("s3://%s/%s/dr/%s/%s", s.S3.Bucket, app, id, member)
+	return fmt.Sprintf("s3://%s/%s/dr/%s/%s", s.S3.Base(), app, id, member)
 }
 
 func (s S3BundleStore) Upload(ctx context.Context, exec ssh.Executor, app, id, member, serverPath string) error {
@@ -280,7 +280,7 @@ func (s S3BundleStore) FetchManifest(ctx context.Context, exec ssh.Executor, app
 }
 
 func (s S3BundleStore) ListIDs(ctx context.Context, exec ssh.Executor, app string) ([]string, error) {
-	prefix := fmt.Sprintf("s3://%s/%s/dr/", s.S3.Bucket, app)
+	prefix := fmt.Sprintf("s3://%s/%s/dr/", s.S3.Base(), app)
 	out, err := exec.Run(ctx, s.S3.AWS(fmt.Sprintf("s3 ls %s", ssh.ShellQuote(prefix))))
 	if err != nil {
 		return nil, fmt.Errorf("listing bundles at %s: %w", prefix, err)
@@ -607,7 +607,19 @@ func (c *Client) CreateBundle(ctx context.Context, opts BundleOptions, store Bun
 		}
 	}
 	if opts.IncludeAgeKey {
-		if err := c.wsCopy(ctx, ws, "age-key", deploymentsDir+"/.age-key"); err != nil {
+		// The identity travels from wherever it lives on this target (D2
+		// moved it out of /deployments; ResolveIdentity is shared with the
+		// secret store so the two can never disagree).
+		keyPath, err := secret.ResolveIdentity(ctx, c.exec)
+		if err != nil {
+			cleanup()
+			return nil, err
+		}
+		if keyPath == "" {
+			cleanup()
+			return nil, fmt.Errorf("--include-age-key: no age identity on the target (expected %s or %s)", secret.IdentityPath, secret.LegacyIdentityPath)
+		}
+		if err := c.wsCopy(ctx, ws, "age-key", keyPath); err != nil {
 			cleanup()
 			return nil, err
 		}

@@ -16,7 +16,6 @@ import (
 
 const (
 	deploymentsDir = "/deployments"
-	ageKeyPath     = deploymentsDir + "/.age-key"
 )
 
 // ErrNotFound reports a secret key that is confirmed absent from the store.
@@ -68,7 +67,9 @@ func ValidateKey(key string) error {
 
 // Manager handles encrypted secrets on the server using age.
 // Secrets are stored at /deployments/<app>/secrets/<KEY>.age.
-// An age keypair is generated on first use and stored at /deployments/.age-key.
+// The age identity is generated on first use and lives at
+// /etc/teploy/age-key (see identity.go; the legacy /deployments/.age-key
+// is still read and written under non-root fallback).
 type Manager struct {
 	exec ssh.Executor
 }
@@ -117,27 +118,19 @@ func remoteFileExists(ctx context.Context, exec ssh.Executor, path string) (bool
 	return false, fmt.Errorf("checking %s: unrecognized output framing", path)
 }
 
-// ensureKey creates an age keypair on the server if one doesn't exist.
-// Returns the path to the key file.
+// ensureKey returns the path of the server's age identity, generating
+// one on first use (see identity.go for where it lives and why).
 func (m *Manager) ensureKey(ctx context.Context) (string, error) {
-	exists, err := remoteFileExists(ctx, m.exec, ageKeyPath)
-	if err != nil {
-		return "", err
-	}
-	if exists {
-		return ageKeyPath, nil
-	}
-
-	// Generate keypair.
-	if _, err := m.exec.Run(ctx, fmt.Sprintf("age-keygen -o %s 2>/dev/null && chmod 600 %s", ageKeyPath, ageKeyPath)); err != nil {
-		return "", fmt.Errorf("generating age key: %w", err)
-	}
-	return ageKeyPath, nil
+	return ensureIdentity(ctx, m.exec)
 }
 
 // recipient extracts the public key (recipient) from the age key file.
 func (m *Manager) recipient(ctx context.Context) (string, error) {
-	out, err := m.exec.Run(ctx, fmt.Sprintf("grep 'public key:' %s | awk '{print $NF}'", ageKeyPath))
+	path, err := ensureIdentity(ctx, m.exec)
+	if err != nil {
+		return "", err
+	}
+	out, err := m.exec.Run(ctx, fmt.Sprintf("grep 'public key:' %s | awk '{print $NF}'", ssh.ShellQuote(path)))
 	if err != nil {
 		return "", fmt.Errorf("reading age public key: %w", err)
 	}
@@ -224,7 +217,11 @@ func (m *Manager) Get(ctx context.Context, app, key string) (string, error) {
 	// old single-buffer form let any age warning on stderr contaminate the
 	// secret value itself (TCL-29); diagnostics surface only in the error.
 	var out, diag bytes.Buffer
-	cmd := fmt.Sprintf("age -d -i %s %s", ageKeyPath, ssh.ShellQuote(path))
+	keyPath, kerr := ensureIdentity(ctx, m.exec)
+	if kerr != nil {
+		return "", kerr
+	}
+	cmd := fmt.Sprintf("age -d -i %s %s", ssh.ShellQuote(keyPath), ssh.ShellQuote(path))
 	if err := m.exec.RunStream(ctx, cmd, &out, &diag); err != nil {
 		return "", fmt.Errorf("decrypting secret %s: %w%s", key, err, diagSuffix(diag.String()))
 	}

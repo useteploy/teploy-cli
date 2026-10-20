@@ -139,23 +139,48 @@ const (
 	// CapDeployHomeV1: `deploy --app X --image T --home teploy` creates a
 	// new app in Teploy home from the ad-hoc flags, then deploys it.
 	CapDeployHomeV1 = "deploy-home-v1"
+	// CapGitSourceV1: Teploy-home apps may build from a git repository
+	// (`git:` config key): credential, mirror, archive into the attempt dir.
+	CapGitSourceV1 = "git-source-v1"
+	// CapTriggerPollV1: `trigger poll [--app|--all] [--now] [--hint]` is the
+	// single admitter (dedup, watermark+ancestry, force-push refusal).
+	CapTriggerPollV1 = "trigger-poll-v1"
 	// CapUndeployedListV1: `app list --include-undeployed` returns
 	// never-deployed and removed Teploy-home apps in an "undeployed" array.
 	CapUndeployedListV1 = "undeployed-list-v1"
-	// CapGitSourceV1: Teploy-home apps may build from a git repository
-	// (`git:` in the config; works with GitHub, GitLab, Forgejo/Gitea,
-	// Cursor Origin and any git host over SSH/HTTPS). Per-app deploy keys
-	// and HTTPS tokens live age-encrypted outside /deployments
-	// (`config source key --type ssh|token`, `config source host-key`,
-	// `show`, `remove`); builds run from a server-side mirror;
-	// `build_secrets:` passes age-store values as docker build --secret.
-	CapGitSourceV1 = "git-source-v1"
-	// CapTriggerPollV1: `trigger poll [--app|--all] [--now] [--hint]` is
-	// the one admitter (dedup, watermark + ancestry, force-push refusal
-	// until `trigger reset`, path filter, bounded retries); plus
-	// `trigger retry` and `trigger install-timer` (a systemd timer
-	// running `trigger poll --all` every minute).
-	CapTriggerPollV1 = "trigger-poll-v1"
+	// CapBackupTargetV1: one backup target per server, stored outside
+	// /deployments (age-encrypted credentials) and read at run time:
+	// `server backup-target set|show|unset`, backup/DR commands defaulting
+	// to it, cron lines calling only `backup run`, and `backup-target set`
+	// rewriting teploy-managed backup cron lines to that form.
+	CapBackupTargetV1 = "backup-target-v1"
+	// CapBackupJSONV1: `backup create|list|restore --json` emit parsed,
+	// versioned envelopes (backup-json-v1 rows: id, kind, accessory,
+	// size_bytes, created_at, key; schedules discovered from teploy cron
+	// markers) and restore quiesces the app under its fenced lock.
+	CapBackupJSONV1 = "backup-json-v1"
+	// CapSecretStdinV1: `secret set KEY --stdin` reads the value verbatim
+	// from stdin (never argv), and secret set/get/list/rm/rotate accept
+	// folderless `--app X --host S` (provider from the app's Teploy
+	// config when present).
+	CapSecretStdinV1 = "secret-stdin-v1"
+	// CapReleasesJsonV1: `releases --app X --host S --json` lists release
+	// records newest first with current/rollback_available (+reason); the
+	// human form is a table.
+	CapReleasesJsonV1 = "releases-json-v1"
+	// CapRollbackJsonV1: `rollback [--to X] --json` emits the machine
+	// result {app, server, from, to, ok}; failures keep the error
+	// envelope.
+	CapRollbackJsonV1 = "rollback-json-v1"
+	// CapRedeployV1: `teploy redeploy [--app X --host S] [--json]`
+	// redeploys the current release's recorded image with env re-resolved
+	// from .env, secrets and the recorded config, through the fenced
+	// deploy engine; static apps are refused.
+	CapRedeployV1 = "redeploy-v1"
+	// CapEnvConfigGuardV1: `env set`/`env unset` refuse keys declared
+	// under env:/env_literal: by the app's Teploy-home config, pointing
+	// at `teploy config set` / dash Settings.
+	CapEnvConfigGuardV1 = "env-config-guard-v1"
 )
 
 // MachineCapabilities returns every capability token this build
@@ -192,7 +217,13 @@ func MachineCapabilities() []string {
 		CapDeployHomeV1,
 		CapGitSourceV1,
 		CapTriggerPollV1,
-	}
+		CapBackupTargetV1,
+		CapBackupJSONV1,
+		CapSecretStdinV1,
+		CapReleasesJsonV1,
+		CapRollbackJsonV1,
+		CapRedeployV1,
+		CapEnvConfigGuardV1}
 	sort.Strings(tokens)
 	return tokens
 }

@@ -9,7 +9,7 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
 - Teploy-home apps can build from a git repository: a `git:` block
   (`repository`, `branch`, `paths`, `poll`, `submodules`) in the config,
   `image:` becoming optional when it is set (`git-source-v1`; contracts
-  corpus rev 14 adds `source-show-envelope`, `source-key-envelope` and
+  corpus rev 16 adds `source-show-envelope`, `source-key-envelope` and
   `trigger-poll-envelope`). Works with GitHub, GitLab, Forgejo/Gitea,
   Cursor Origin and any git host over SSH or HTTPS. `context:` and
   `dockerfile:` are relative to the repository root; `build_secrets:`
@@ -57,6 +57,109 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
   implementation; `file://` repositories are accepted as a privileged
   config change (same-server sources).
 
+- One backup target per server, read at run time (`backup-target-v1`;
+  contracts corpus rev 15). `teploy server backup-target set --host S
+  --bucket B [--region] [--endpoint] [--prefix]` stores it at
+  `/etc/teploy/backup-target.json` (0600, outside `/deployments`;
+  `~/.config/teploy/` fallback for a non-root deploy user, said so on
+  output), with the S3 credentials read from stdin as two lines (access
+  key, then secret key; prompted with echo off on a terminal) and stored
+  age-encrypted with the server's own identity — used whether or not an
+  endpoint is set, ambient AWS chain only when none are stored.
+  `show [--json]` never emits secrets; `unset` removes the target.
+  Setting a target rewrites teploy-generated backup cron lines (by marker)
+  to the `backup run` form — hand-written commands under a teploy marker
+  are left untouched and reported — and `teploy doctor` gains a
+  `backup-cron` check flagging cron lines with embedded credentials
+  (fail) or bucket flags (warn).
+- `teploy backup create|list|restore|prune|schedule [--app X --host S]
+  --json` are folderless and default to the stored target
+  (`backup-json-v1`): `list --json` reports parsed rows
+  `{id, kind: volumes|accessory|teploy, accessory?, size_bytes,
+  created_at, key}` across the volumes, accessories and teploy prefixes
+  plus schedules discovered from teploy cron markers (was: raw
+  `aws s3 ls` lines); `create --json` reports the created backup's
+  identity and size; `restore --json` reports the quiesced receipt. The
+  legacy `--bucket`-style flags still work and override the stored
+  target. `teploy dr` and `teploy accessory backup|restore|
+  verify-backup` default to the stored target as well.
+- `teploy backup run --app X [--accessory Y]` — the cron entrypoint, runs
+  on the server like `autodeploy redeploy` and reads the target and the
+  per-app retention at run time. Scheduled jobs are a single
+  argument-free cron line; retention moves to a per-app store
+  (`backup schedule` and `accessory backup --schedule` write it;
+  `--max-age-days` is new on the latter). `backup unschedule` removes a
+  schedule. Failure alerting moved from the cron line into `backup run`
+  (same `/deployments/<app>/backup-alert.sh`, same signatures).
+- Restore is now quiesced: under the app's fenced lock the app's
+  containers (and a generic accessory's container, for accessory
+  restores) are stopped, the backup is promoted with the existing
+  two-phase recovery discipline, the containers are started again and
+  health-checked. On failure — or an unhealthy app afterwards — the
+  pre-restore recovery copy is kept and named. Non-interactive restores
+  require `--yes`.
+- Events `backup.run`, `backup.restore` and `backup_target.set` (detail
+  allowlist: id, kind, accessory, error — never bucket or credential
+  material; the server-level target event is fanned out to every app
+  known on the server).
+
+### Changed
+
+- `backup list --json` now emits the versioned envelope above instead of
+  a bare array of raw `aws s3 ls` lines. The old shape was never a
+  contracts-corpus artifact and no consumer is known to parse it;
+  consumers should gate on `backup-json-v1`.
+
+### Deferred
+
+- A `backup: {schedule, keep_last, max_age_days, accessories}` app-config
+  key (schedule/retention from Teploy-home config) is deferred: making a
+  config key authoritative over crontab entries hooks cron reconciliation
+  into deploy, which does not fit this change. Per-app schedules remain
+  managed with `backup schedule --app X --host S` (folderless), which
+  stores both halves server-side.
+- Folderless per-command reads (server-authority plan D2): `teploy secret
+  set/get/list/rm/rotate --app X --host S` read exactly the server facts
+  they need — no teploy.yml, no reconstructed config. The secrets provider
+  comes from the app's Teploy config when it has one, else the folder
+  config in the cwd when it is this app, else local; `--provider` still
+  overrides. `secret set KEY --stdin` reads the value verbatim from stdin,
+  never argv (`secret-stdin-v1`).
+- `teploy releases --app X --host S [--json]` for container apps: release
+  records (internal/releasemeta) newest first — release id, deployed_at,
+  image (+digest), config commit, actor — each marked current or
+  rollback-able (containers for that version still present per
+  keep_versions retention) with the reason when not (`releases-json-v1`;
+  contracts corpus rev 14 adds `releases-envelope`). Static apps keep the
+  retained-directory listing; the folder-static `--json` array is
+  unchanged.
+- `teploy rollback [--to X] --json` emits the machine result
+  `{app, server, from, to, ok}`; progress goes to stderr and failures keep
+  the structured error envelope (`rollback-json-v1`; corpus adds
+  `rollback-result`).
+- `teploy redeploy [--app X --host S] [--json]`: a fresh deploy of the
+  CURRENT release's recorded image with env re-resolved from `.env`,
+  secrets and the recorded config, through the normal fenced deploy engine
+  (same version → the existing same-version redeploy path; the deploy
+  event carries `trigger=redeploy`). Teploy-home apps deploy from their
+  server config; folderless folder-home apps deploy a config rebuilt from
+  server records and only when it digest-matches the running release —
+  anything unrecorded is an explicit error. Static apps are refused
+  (`redeploy-v1`; corpus adds `redeploy-result`).
+- CLI env guard: `env set`/`env unset` (folder and `--app`) refuse keys
+  declared under `env:`/`env_literal:` by the app's Teploy-home config,
+  pointing at `teploy config set` / dash Settings
+  (`env-config-guard-v1`).
+- The server's age identity moved out of `/deployments` (which Caddy
+  mounts read-only into the edge container) to `/etc/teploy/age-key`
+  (0600, directory 0700). Reads prefer the new path and fall back to the
+  old one, so nothing breaks mid-migration; secret resolution, accessory
+  secrets, DR bundles (`--include-age-key`) and restore installs all
+  resolve through one helper. `teploy setup` migrates after verifying the
+  copy decrypts, leaving a public-key marker (not the private key) at the
+  old path so an older teploy keeps encrypting to the same identity;
+  `teploy doctor` reports the location (`age-identity` check). Non-root
+  deploy users that cannot write `/etc/teploy` keep using the old path.
 ## [0.1.44] - 2026-10-19
 
 ### Added

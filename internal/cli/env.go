@@ -13,6 +13,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/useteploy/teploy/internal/config"
+	"github.com/useteploy/teploy/internal/confighome"
 	"github.com/useteploy/teploy/internal/env"
 	"github.com/useteploy/teploy/internal/openbao"
 	"github.com/useteploy/teploy/internal/secret"
@@ -99,6 +100,9 @@ func runEnvSet(flags *Flags, appName string, pairs map[string]string) error {
 	if err := checkEnvSetShadowing(ctx, executor, appCfg, pairs, os.Stderr); err != nil {
 		return err
 	}
+	if err := checkEnvConfigGuard(ctx, executor, appCfg.App, sortedKeys(pairs)); err != nil {
+		return err
+	}
 
 	mgr := env.NewManager(executor)
 	err = mgr.Set(ctx, appCfg.App, pairs)
@@ -111,6 +115,52 @@ func runEnvSet(flags *Flags, appName string, pairs map[string]string) error {
 		fmt.Printf("  Set %s\n", k)
 	}
 	return nil
+}
+
+// checkEnvConfigGuard (token env-config-guard-v1) refuses env set/unset
+// on keys an app's Teploy-home config declares under env:/env_literal:.
+// Those keys are edited with `teploy config set` (dash: Settings); a
+// value written to .env would be silently shadowed at the next deploy,
+// which reported success while doing nothing. The declared keys are read
+// from the server config itself — exactly the facts the guard needs, no
+// config reconstructed.
+func checkEnvConfigGuard(ctx context.Context, executor ssh.Executor, app string, keys []string) error {
+	exists, head, err := confighome.Head(ctx, executor, app)
+	if err != nil {
+		return fmt.Errorf("checking whether %s's settings are edited in Teploy: %w", app, err)
+	}
+	if !exists || head == "" {
+		return nil
+	}
+	raw, _, err := confighome.Read(ctx, executor, app, head)
+	if err != nil {
+		return fmt.Errorf("reading %s's Teploy config: %w", app, err)
+	}
+	cfg, err := config.LoadAppBytes(raw)
+	if err != nil {
+		return fmt.Errorf("%s's Teploy config is unreadable: %w", app, err)
+	}
+	declared := map[string]bool{}
+	for k := range cfg.Env {
+		declared[k] = true
+	}
+	for k := range cfg.EnvLiteral {
+		declared[k] = true
+	}
+	var refused []string
+	for _, k := range keys {
+		if declared[k] {
+			refused = append(refused, k)
+		}
+	}
+	if len(refused) == 0 {
+		return nil
+	}
+	var hints []string
+	for _, k := range refused {
+		hints = append(hints, fmt.Sprintf("%s is declared by %s's Teploy config (edited in Teploy) — change it there (`teploy config set --app %s env.%s=...`, or --unset env.%s) or in dash Settings; a .env value would be shadowed at the next deploy", k, app, app, k, k))
+	}
+	return fmt.Errorf("env operation refused (nothing written):\n  %s", strings.Join(hints, "\n  "))
 }
 
 // checkEnvSetShadowing refuses an `env set` whose value could never reach
@@ -280,6 +330,10 @@ func runEnvUnset(flags *Flags, appName, key string) error {
 		return err
 	}
 	defer executor.Close()
+
+	if err := checkEnvConfigGuard(ctx, executor, appCfg.App, []string{key}); err != nil {
+		return err
+	}
 
 	mgr := env.NewManager(executor)
 	err = mgr.Unset(ctx, appCfg.App, key)

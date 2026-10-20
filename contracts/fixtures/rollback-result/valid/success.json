@@ -1,0 +1,8 @@
+{
+  "machine_interface": 2,
+  "app": "blog",
+  "server": "infra-home",
+  "from": "abc1234",
+  "to": "9f8e7d6",
+  "ok": true
+}

@@ -19,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/useteploy/teploy/internal/backup"
 	"github.com/useteploy/teploy/internal/config"
 	"github.com/useteploy/teploy/internal/confighome"
 	"github.com/useteploy/teploy/internal/events"
@@ -465,9 +466,114 @@ func TestContractsConfigMergeGolden(t *testing.T) {
 	})
 }
 
-// TestContractsGitSourceGolden pins the D4 git-source envelopes (rev 14):
-// config source show --json, config source key --json, and the one
-// admitter's trigger poll --json result.
+// TestContractsBackupTargetGolden pins `server backup-target show --json`
+// (rev 14, backup-target-v1). Never secret material: only whether
+// credentials are stored.
+func TestContractsBackupTargetGolden(t *testing.T) {
+	writeFixture(t, "backup-target-envelope/valid/configured.json", backupTargetDTO{
+		MachineInterface: MachineInterface, Host: "192.0.2.10",
+		Configured:     true,
+		Bucket:         "teploy-backups",
+		Region:         "us-east-1",
+		Endpoint:       "http://127.0.0.1:9100",
+		Prefix:         "prod",
+		HasCredentials: true,
+		Path:           "/etc/teploy/backup-target.json",
+	})
+	writeFixture(t, "backup-target-envelope/valid/unconfigured.json", backupTargetDTO{
+		MachineInterface: MachineInterface, Host: "192.0.2.10",
+	})
+}
+
+// TestContractsBackupJSONGolden pins the backup-json-v1 envelopes (rev
+// 14): `backup list --json` (parsed rows across volumes, accessories and
+// teploy data, plus schedules discovered from teploy cron markers),
+// `backup create --json` and `backup restore --json` (the quiesced
+// restore receipt).
+func TestContractsBackupJSONGolden(t *testing.T) {
+	createdAt := "2026-10-20T03:17:04Z"
+	writeFixture(t, "backup-list-envelope/valid/app.json", backupListDTO{
+		MachineInterface: MachineInterface, Host: "192.0.2.10", App: "blog",
+		Target: &backupTargetSummary{Bucket: "teploy-backups", Region: "us-east-1", HasCredentials: true},
+		Backups: []backup.ListedBackup{
+			{ID: "20261020-031704-1f2e3d4c5b6a7988", Kind: "volumes", SizeBytes: 1048576, CreatedAt: createdAt, Key: "s3://teploy-backups/blog/volumes/20261020-031704-1f2e3d4c5b6a7988.tar.gz", Restorable: true},
+			{ID: "20261020-031704-1f2e3d4c5b6a7988", Kind: "teploy", SizeBytes: 4096, CreatedAt: createdAt, Key: "s3://teploy-backups/blog/teploy/20261020-031704-1f2e3d4c5b6a7988.tar.gz", Restorable: true},
+			{ID: "20261019-030001", Kind: "accessory", Accessory: "db", SizeBytes: 2097152, CreatedAt: "2026-10-19T03:00:01Z", Key: "s3://teploy-backups/blog/accessories/db/20261019-030001.sql.gz", Restorable: true},
+		},
+		Schedules: []backupScheduleDTO{
+			{Kind: "volumes", Cron: "30 3 * * *", KeepLast: 7, Form: "run"},
+			{Kind: "accessory", Accessory: "db", Cron: "15 2 * * *", KeepLast: 5, MaxAgeDays: 30, Form: "run"},
+		},
+	})
+	writeFixture(t, "backup-list-envelope/valid/legacy-schedule.json", backupListDTO{
+		MachineInterface: MachineInterface, Host: "192.0.2.10", App: "legacy",
+		Backups:   []backup.ListedBackup{},
+		Schedules: []backupScheduleDTO{{Kind: "volumes", Cron: "0 3 * * *", KeepLast: 7, Form: "legacy"}},
+	})
+	writeFixture(t, "backup-create-envelope/valid/volumes.json", backupCreateDTO{
+		MachineInterface: MachineInterface, Host: "192.0.2.10", App: "blog",
+		ID: "20261020-031704-1f2e3d4c5b6a7988", Kind: "volumes", SizeBytes: 1048576, CreatedAt: createdAt,
+		Key:       "s3://teploy-backups/blog/volumes/20261020-031704-1f2e3d4c5b6a7988.tar.gz",
+		TeployKey: "s3://teploy-backups/blog/teploy/20261020-031704-1f2e3d4c5b6a7988.tar.gz", Pruned: 1,
+	})
+	writeFixture(t, "backup-create-envelope/valid/accessory.json", backupCreateDTO{
+		MachineInterface: MachineInterface, Host: "192.0.2.10", App: "blog",
+		ID: "20261020-031704-1f2e3d4c5b6a7988", Kind: "accessory", Accessory: "db", SizeBytes: 2097152, CreatedAt: createdAt,
+		Key: "s3://teploy-backups/blog/accessories/db/20261020-031704-1f2e3d4c5b6a7988.sql.gz",
+	})
+	writeFixture(t, "backup-restore-envelope/valid/ok.json", backupRestoreDTO{
+		MachineInterface: MachineInterface, Host: "192.0.2.10", App: "blog",
+		ID: "20261019-030001", Kind: "volumes", OK: true,
+		Stopped: []string{"blog-web-1f2e3d4", "blog-worker-1f2e3d4"},
+		Started: []string{"blog-web-1f2e3d4", "blog-worker-1f2e3d4"},
+		Health:  "healthy",
+	})
+	writeFixture(t, "backup-restore-envelope/valid/unhealthy.json", backupRestoreDTO{
+		MachineInterface: MachineInterface, Host: "192.0.2.10", App: "blog",
+		ID: "20261019-030001", Kind: "accessory", Accessory: "db", OK: false,
+		Stopped:     []string{"blog-web-1f2e3d4"},
+		Started:     []string{"blog-web-1f2e3d4"},
+		Health:      "unhealthy",
+		RecoveryDir: "/deployments/blog/volumes.restore-old.a1b2c3",
+		Error:       "health check after restore failed: ... — pre-restore data kept in /deployments/blog/volumes.restore-old.a1b2c3",
+	})
+}
+
+// TestContractsD2Golden pins the D2 folderless-read envelopes (rev 14):
+// `releases --app --host --json` (container app: records + rollback
+// availability), `rollback --to X --json` and `redeploy --json` results.
+func TestContractsD2Golden(t *testing.T) {
+	ts := time.Date(2026, 10, 20, 12, 0, 0, 0, time.UTC)
+	writeFixture(t, "releases-envelope/valid/container-app.json", releasesDTO{
+		MachineInterface: MachineInterface, Host: "192.0.2.10", App: "blog",
+		DeploymentType: "container", Current: "1.4.0",
+		Releases: []releaseRowDTO{
+			{Release: "1.4.0", DeployedAt: ts, Image: "example/blog:1.4.0", ImageDigest: "sha256:" + strings.Repeat("ab", 32), ConfigCommit: "8f2c1d0e9b7a6f5e4d3c2b1a0f9e8d7c6b5a4f3e", Actor: "dash:alice", Current: true, Reason: "current release"},
+			{Release: "1.3.0", DeployedAt: ts.Add(-26 * time.Hour), Image: "example/blog:1.3.0", ImageDigest: "sha256:" + strings.Repeat("cd", 32), Actor: "cli:tyler@laptop", RollbackAvailable: true},
+			{Release: "1.2.0", DeployedAt: ts.Add(-72 * time.Hour), Image: "example/blog:1.2.0", ImageDigest: "sha256:" + strings.Repeat("ef", 32), Reason: "no containers retained for this version (keep_versions retention)"},
+		},
+	})
+	writeFixture(t, "releases-envelope/valid/static-app.json", releasesDTO{
+		MachineInterface: MachineInterface, Host: "192.0.2.10", App: "site",
+		DeploymentType: "static", Current: "abc1234",
+		Releases: []releaseRowDTO{
+			{Release: "abc1234", Current: true, Reason: "current release"},
+			{Release: "9f8e7d6", RollbackAvailable: true},
+		},
+	})
+	writeFixture(t, "rollback-result/valid/success.json", rollbackResult{
+		MachineInterface: MachineInterface, App: "blog", Server: "infra-home",
+		From: "abc1234", To: "9f8e7d6", OK: true,
+	})
+	writeFixture(t, "redeploy-result/valid/teploy-home.json", redeployDTO{
+		MachineInterface: MachineInterface, App: "blog", Server: "infra-home", Home: "teploy",
+		Release: "1.4.0", Image: "example/blog:1.4.0", ConfigCommit: "8f2c1d0e9b7a6f5e4d3c2b1a0f9e8d7c6b5a4f3e", OK: true,
+	})
+	writeFixture(t, "redeploy-result/valid/folder-home.json", redeployDTO{
+		MachineInterface: MachineInterface, App: "legacy", Server: "infra-home", Home: "folder",
+		Release: "abc1234", Image: "example/legacy:abc1234", OK: true})
+}
+
 func TestContractsGitSourceGolden(t *testing.T) {
 	sha := "3d9c1f0b8a7e6d5c4b3a2f1e0d9c8b7a6f5e4d3c"
 	writeFixture(t, "source-show-envelope/valid/connected.json", sourceShowDTO{

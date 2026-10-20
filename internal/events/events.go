@@ -110,6 +110,9 @@ const (
 	KindGateRepair     = "gate.repair"
 	KindWatermarkReset = "watermark.reset"
 	KindSourceConnect  = "source.connect"
+	KindBackupRun      = "backup.run"
+	KindBackupRestore  = "backup.restore"
+	KindBackupTarget   = "backup_target.set"
 )
 
 // detailAllow is the per-kind allowlist of detail keys. Env and secret
@@ -140,7 +143,9 @@ var detailAllow = map[string][]string{
 	KindMaintenanceOff: {"error"},
 	KindGateRepair:     {"case", "message"},
 	KindWatermarkReset: {"ref"},
-	KindSourceConnect:  {"action", "type", "fingerprint"},
+	KindBackupRun:      {"id", "kind", "accessory", "error"},
+	KindBackupRestore:  {"id", "kind", "accessory", "error"},
+	KindBackupTarget:   {"id", "kind", "accessory", "error"},
 }
 
 // maxErrorDetail bounds the "error" detail so a command's full stderr
