@@ -198,6 +198,124 @@ func (l *Lifecycle) Restart(ctx context.Context, app string, timeout int) error 
 	return nil
 }
 
+// QuiesceApp stops the app's running PROCESS containers (accessories
+// excluded — an accessory restore stops its own container only when its
+// data is restored as files) under the caller's fenced lock, returning
+// the stopped containers in stop order. An app with no deploy state has
+// nothing to stop and returns nil (restoring an undeployed app's volumes
+// is legal). Used by the quiesced backup restore (D3).
+func (l *Lifecycle) QuiesceApp(ctx context.Context, lk *state.Lock, app string, timeout int) ([]docker.Container, error) {
+	current, err := state.Read(ctx, l.exec, app)
+	if err != nil {
+		return nil, err
+	}
+	if current == nil {
+		return nil, nil
+	}
+	containers, err := l.appContainersByVersion(ctx, app, current.CurrentHash)
+	if err != nil {
+		return nil, err
+	}
+	var out []docker.Container
+	for _, c := range containers {
+		if c.State == "running" && c.Labels["teploy.role"] != "accessory" {
+			out = append(out, c)
+		}
+	}
+	for _, c := range out {
+		fmt.Fprintf(l.out, "Stopping %s...\n", c.Name)
+		if err := l.stop(ctx, lk, c, timeout); err != nil {
+			return out, err
+		}
+	}
+	return out, nil
+}
+
+// ResumeReport says what ResumeApp did.
+type ResumeReport struct {
+	Started   []string
+	HealthErr error
+}
+
+// HealthStatus renders the health outcome for machine consumers.
+func (r ResumeReport) HealthStatus() string {
+	switch {
+	case r.HealthErr != nil:
+		return "unhealthy"
+	case len(r.Started) == 0:
+		return "skipped"
+	default:
+		return "healthy"
+	}
+}
+
+// ResumeApp starts containers previously stopped by QuiesceApp (or any
+// guarded stop under the same lock) and health-checks the app's web
+// process exactly as Start does. nil containers means nothing was stopped
+// (undeployed app): the health check is skipped. A start or health
+// failure is returned in HealthErr — the caller decides what to keep
+// (a failed restore keeps its recovery copy).
+func (l *Lifecycle) ResumeApp(ctx context.Context, lk *state.Lock, app string, containers []docker.Container) ResumeReport {
+	report := ResumeReport{}
+	for _, c := range containers {
+		fmt.Fprintf(l.out, "Starting %s...\n", c.Name)
+		if err := l.start(ctx, lk, c); err != nil {
+			report.HealthErr = err
+			return report
+		}
+		report.Started = append(report.Started, c.Name)
+	}
+	if len(containers) == 0 {
+		return report
+	}
+	if err := l.healthCheckCurrent(ctx, app); err != nil {
+		report.HealthErr = err
+	}
+	return report
+}
+
+// healthCheckCurrent probes the current release's web container on its
+// recorded port — the same check Start and Restart run after starting.
+func (l *Lifecycle) healthCheckCurrent(ctx context.Context, app string) error {
+	current, err := state.Read(ctx, l.exec, app)
+	if err != nil || current == nil {
+		return fmt.Errorf("no deploy state found for %s", app)
+	}
+	if current.CurrentPort <= 0 {
+		return nil
+	}
+	fmt.Fprintln(l.out, "Running health check...")
+	deployer := &Deployer{exec: l.exec, out: l.out}
+	containers, err := l.appContainersByVersion(ctx, app, current.CurrentHash)
+	if err != nil {
+		return err
+	}
+	webName := ""
+	for _, c := range containers {
+		if c.Labels["teploy.process"] == "web" {
+			webName = c.Name
+			break
+		}
+	}
+	if webName == "" {
+		return fmt.Errorf("current release has no web container")
+	}
+	bindHost := l.docker.HostBindIP(ctx, webName)
+	health := defaultHealthConfig()
+	rec, recErr := releasemeta.Read(ctx, l.exec, app, current.CurrentHash)
+	if recErr != nil {
+		return recErr
+	}
+	if rec != nil {
+		applyRecordToRollback(&RollbackConfig{}, rec, &health)
+	}
+	if err := deployer.healthCheck(ctx, current.CurrentPort, health, bindHost); err != nil {
+		return fmt.Errorf("health check failed after start: %w", err)
+	}
+	fmt.Fprintln(l.out, "  Health check passed")
+	return nil
+}
+
 // Only current recorded processes and currently configured accessories belong
 // to lifecycle. Start activates configured accessories, including previously
 // stopped ones; removed/unknown accessories and historical workloads stay alone.

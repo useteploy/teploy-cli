@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://teploy.github.io/contracts/schema/backup-restore-envelope.schema.json",
+  "title": "`teploy backup restore --json`: the quiesced restore receipt (backup-json-v1, rev 14).",
+  "type": "object",
+  "required": ["machine_interface", "host", "app", "id", "kind", "ok", "stopped", "started", "health"],
+  "properties": {
+    "machine_interface": {"type": "integer", "minimum": 1},
+    "host": {"type": "string", "minLength": 1},
+    "app": {"type": "string", "minLength": 1},
+    "id": {"type": "string"},
+    "kind": {"enum": ["volumes", "accessory"]},
+    "accessory": {"type": "string"},
+    "ok": {"type": "boolean"},
+    "stopped": {"type": "array", "items": {"type": "string"}, "description": "Containers stopped for the restore (the app's processes, plus a generic accessory's container for accessory restores)."},
+    "started": {"type": "array", "items": {"type": "string"}},
+    "health": {"enum": ["healthy", "unhealthy", "skipped"], "description": "Post-restore health check of the app's web process; skipped when nothing was stopped (undeployed app)."},
+    "recovery_dir": {"type": "string", "description": "Present when the pre-restore data copy was KEPT (health failed after promotion, or a recovery-incomplete failure): the operator's way back."},
+    "error": {"type": "string"}
+  }
+}

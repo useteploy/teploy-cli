@@ -120,7 +120,7 @@ func (c *Client) PruneBackups(ctx context.Context, app, prefix string, s3 S3Conf
 
 	var deleted []string
 	for _, name := range toDelete {
-		key := fmt.Sprintf("s3://%s/%s/%s/%s", s3.Bucket, app, prefix, name)
+		key := fmt.Sprintf("s3://%s/%s/%s/%s", s3.Base(), app, prefix, name)
 		if _, err := c.exec.Run(ctx, s3.AWS("s3 rm "+ssh.ShellQuote(key))); err != nil {
 			return deleted, fmt.Errorf("deleting %s: %w", name, err)
 		}

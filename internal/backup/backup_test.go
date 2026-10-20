@@ -28,7 +28,7 @@ func TestBackupVolumes(t *testing.T) {
 
 	var buf bytes.Buffer
 	client := NewClient(mock, &buf)
-	err := client.BackupVolumes(context.Background(), "myapp", S3Config{
+	_, err := client.BackupVolumes(context.Background(), "myapp", S3Config{
 		Bucket: "my-bucket",
 		Region: "us-east-1",
 	})
@@ -86,7 +86,7 @@ func TestAccessoryBackup_Postgres(t *testing.T) {
 
 	var buf bytes.Buffer
 	client := NewClient(mock, &buf)
-	err := client.AccessoryBackup(context.Background(), "myapp", "postgres", "postgres:16", nil, S3Config{
+	_, err := client.AccessoryBackup(context.Background(), "myapp", "postgres", "postgres:16", nil, S3Config{
 		Bucket: "my-bucket",
 		Region: "us-east-1",
 	})
@@ -132,7 +132,7 @@ func TestAccessoryBackup_Postgres_CustomDBName(t *testing.T) {
 	var buf bytes.Buffer
 	client := NewClient(mock, &buf)
 	env := map[string]string{"POSTGRES_DB": "realdbname", "POSTGRES_USER": "customuser"}
-	err := client.AccessoryBackup(context.Background(), "myapp", "postgres", "postgres:16", env, S3Config{
+	_, err := client.AccessoryBackup(context.Background(), "myapp", "postgres", "postgres:16", env, S3Config{
 		Bucket: "my-bucket",
 		Region: "us-east-1",
 	})
@@ -174,7 +174,7 @@ func TestAccessoryBackup_Postgres_DumpFailureIsNotSwallowed(t *testing.T) {
 
 	var buf bytes.Buffer
 	client := NewClient(mock, &buf)
-	err := client.AccessoryBackup(context.Background(), "myapp", "postgres", "postgres:16", nil, S3Config{
+	_, err := client.AccessoryBackup(context.Background(), "myapp", "postgres", "postgres:16", nil, S3Config{
 		Bucket: "my-bucket",
 		Region: "us-east-1",
 	})
@@ -200,7 +200,7 @@ func TestAccessoryBackup_MySQL(t *testing.T) {
 
 	var buf bytes.Buffer
 	client := NewClient(mock, &buf)
-	err := client.AccessoryBackup(context.Background(), "myapp", "mysql", "mysql:8", nil, S3Config{
+	_, err := client.AccessoryBackup(context.Background(), "myapp", "mysql", "mysql:8", nil, S3Config{
 		Bucket: "my-bucket",
 		Region: "us-east-1",
 	})
@@ -233,7 +233,7 @@ func TestAccessoryBackup_RedisWaitsForBgsave(t *testing.T) {
 
 	var buf bytes.Buffer
 	client := NewClient(mock, &buf)
-	err := client.AccessoryBackup(context.Background(), "myapp", "redis", "redis:7", nil, S3Config{
+	_, err := client.AccessoryBackup(context.Background(), "myapp", "redis", "redis:7", nil, S3Config{
 		Bucket: "my-bucket",
 		Region: "us-east-1",
 	})
@@ -284,7 +284,7 @@ func TestAccessoryBackup_MySQL_UsesRootPasswordEnv(t *testing.T) {
 	var buf bytes.Buffer
 	client := NewClient(mock, &buf)
 	env := map[string]string{"MYSQL_ROOT_PASSWORD": "sekret"}
-	err := client.AccessoryBackup(context.Background(), "myapp", "mysql", "mysql:8", env, S3Config{
+	_, err := client.AccessoryBackup(context.Background(), "myapp", "mysql", "mysql:8", env, S3Config{
 		Bucket: "my-bucket",
 		Region: "us-east-1",
 	})
@@ -329,7 +329,7 @@ func TestAccessoryBackup_MySQL_PasswordFallbackAndAbsence(t *testing.T) {
 		ssh.MockCommand{Match: "rm -f", Output: ""},
 	)
 	client := NewClient(mock, &buf)
-	err := client.AccessoryBackup(context.Background(), "myapp", "mysql", "mysql:8",
+	_, err := client.AccessoryBackup(context.Background(), "myapp", "mysql", "mysql:8",
 		map[string]string{"MYSQL_PASSWORD": "fall"}, S3Config{Bucket: "my-bucket", Region: "us-east-1"})
 	if err != nil {
 		t.Fatalf("AccessoryBackup: %v", err)
@@ -359,7 +359,7 @@ func TestAccessoryBackup_MySQL_PasswordFallbackAndAbsence(t *testing.T) {
 		ssh.MockCommand{Match: "rm -f", Output: ""},
 	)
 	client = NewClient(mock, &buf)
-	err = client.AccessoryBackup(context.Background(), "myapp", "mysql", "mysql:8", nil,
+	_, err = client.AccessoryBackup(context.Background(), "myapp", "mysql", "mysql:8", nil,
 		S3Config{Bucket: "my-bucket", Region: "us-east-1"})
 	if err != nil {
 		t.Fatalf("AccessoryBackup: %v", err)
@@ -386,7 +386,7 @@ func TestAccessoryBackup_MySQL_QuotesHostilePassword(t *testing.T) {
 	var buf bytes.Buffer
 	client := NewClient(mock, &buf)
 	env := map[string]string{"MYSQL_ROOT_PASSWORD": "p@'ss word; id"}
-	err := client.AccessoryBackup(context.Background(), "myapp", "mysql", "mysql:8", env, S3Config{
+	_, err := client.AccessoryBackup(context.Background(), "myapp", "mysql", "mysql:8", env, S3Config{
 		Bucket: "my-bucket",
 		Region: "us-east-1",
 	})
@@ -550,7 +550,7 @@ func TestAccessoryBackup_Generic(t *testing.T) {
 
 	var buf bytes.Buffer
 	client := NewClient(mock, &buf)
-	err := client.AccessoryBackup(context.Background(), "myapp", "meilisearch", "meilisearch:latest", nil, S3Config{
+	_, err := client.AccessoryBackup(context.Background(), "myapp", "meilisearch", "meilisearch:latest", nil, S3Config{
 		Bucket: "my-bucket",
 		Region: "us-east-1",
 	})
@@ -638,7 +638,7 @@ func TestEnsureAWSCLI_Missing(t *testing.T) {
 
 	var buf bytes.Buffer
 	client := NewClient(mock, &buf)
-	err := client.BackupVolumes(context.Background(), "myapp", S3Config{
+	_, err := client.BackupVolumes(context.Background(), "myapp", S3Config{
 		Bucket: "my-bucket",
 		Region: "us-east-1",
 	})
@@ -979,7 +979,7 @@ func TestBackupVolumesIncludesTeployServerData(t *testing.T) {
 		ssh.MockCommand{Match: "if [ -e '/deployments/.teploy/apps/myapp' ]", Output: "present\n"},
 		ssh.MockCommand{Match: "cd '/deployments/.teploy/apps/myapp'", Output: ""},
 	)
-	if err := NewClient(mock, &bytes.Buffer{}).BackupVolumes(context.Background(), "myapp", S3Config{Bucket: "my-bucket", Region: "us-east-1"}); err != nil {
+	if _, err := NewClient(mock, &bytes.Buffer{}).BackupVolumes(context.Background(), "myapp", S3Config{Bucket: "my-bucket", Region: "us-east-1"}); err != nil {
 		t.Fatalf("BackupVolumes: %v", err)
 	}
 	var archived, uploaded bool

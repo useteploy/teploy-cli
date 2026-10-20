@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://teploy.github.io/contracts/schema/backup-create-envelope.schema.json",
+  "title": "`teploy backup create --json`: the created backup's identity (backup-json-v1, rev 14).",
+  "type": "object",
+  "required": ["machine_interface", "host", "app", "id", "kind", "size_bytes", "created_at", "key", "pruned"],
+  "properties": {
+    "machine_interface": {"type": "integer", "minimum": 1},
+    "host": {"type": "string", "minLength": 1},
+    "app": {"type": "string", "minLength": 1},
+    "id": {"type": "string"},
+    "kind": {"enum": ["volumes", "accessory"]},
+    "accessory": {"type": "string"},
+    "size_bytes": {"type": "integer", "minimum": 0, "description": "Size of the uploaded volumes archive or engine dump. 0 when the size could not be stated (the backup itself succeeded)."},
+    "created_at": {"type": "string", "description": "RFC3339 UTC derived from the backup id's timestamp."},
+    "key": {"type": "string", "pattern": "^s3://"},
+    "teploy_key": {"type": "string", "pattern": "^s3://", "description": "Sibling object holding the app's server config/history (volume backups only, when present)."},
+    "pruned": {"type": "integer", "minimum": 0, "description": "Backups removed by the requested retention policy after the upload."}
+  }
+}

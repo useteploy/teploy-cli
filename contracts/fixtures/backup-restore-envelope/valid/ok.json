@@ -1,0 +1,17 @@
+{
+  "machine_interface": 2,
+  "host": "192.0.2.10",
+  "app": "blog",
+  "id": "20261019-030001",
+  "kind": "volumes",
+  "ok": true,
+  "stopped": [
+    "blog-web-1f2e3d4",
+    "blog-worker-1f2e3d4"
+  ],
+  "started": [
+    "blog-web-1f2e3d4",
+    "blog-worker-1f2e3d4"
+  ],
+  "health": "healthy"
+}

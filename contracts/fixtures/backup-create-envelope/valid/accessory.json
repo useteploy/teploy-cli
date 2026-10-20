@@ -1,0 +1,12 @@
+{
+  "machine_interface": 2,
+  "host": "192.0.2.10",
+  "app": "blog",
+  "id": "20261020-031704-1f2e3d4c5b6a7988",
+  "kind": "accessory",
+  "accessory": "db",
+  "size_bytes": 2097152,
+  "created_at": "2026-10-20T03:17:04Z",
+  "key": "s3://teploy-backups/blog/accessories/db/20261020-031704-1f2e3d4c5b6a7988.sql.gz",
+  "pruned": 0
+}

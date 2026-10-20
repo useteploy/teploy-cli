@@ -3,6 +3,8 @@
     "actor-flag-v1",
     "app-list-machine",
     "autodeploy-redeploy",
+    "backup-json-v1",
+    "backup-target-v1",
     "config-home-v1",
     "config-merge-v1",
     "config-unprivileged-v1",

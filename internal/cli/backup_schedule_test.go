@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/useteploy/teploy/internal/backup"
 	"github.com/useteploy/teploy/internal/config"
 )
 
@@ -26,157 +27,90 @@ func TestFirstWebhookURL(t *testing.T) {
 	}
 }
 
-func TestBuildScheduledBackupCmd(t *testing.T) {
-	// Base: archive + upload + cleanup, no retention, no alert. The exact
-	// archive path is captured in $f (teploy-cli-12): re-globbing
-	// /tmp/<app>-backup-*.tar.gz uploaded and deleted leftovers from
-	// interrupted runs alongside the fresh archive.
-	base := buildScheduledBackupCmd("myapp", "1.2.3.4", "my-bucket", "us-east-1", "", 0, "")
+// The generated cron line must be the bare run form (D3): absolute binary
+// path, the app, nothing else. The bucket and the credentials live in the
+// server's stored target and are read at run time, so a leaked crontab
+// leaks nothing, and a target change never rewrites cron.
+func TestBuildScheduledBackupRunCmd(t *testing.T) {
+	vol := buildScheduledBackupRunCmd("/usr/local/bin/teploy", "myapp", "")
 	for _, want := range []string{
-		`f=/tmp/myapp-backup-$(date +`,
-		`tar -czf "$f" -C /deployments/myapp/volumes .`,
-		`aws s3 cp "$f" s3://my-bucket/myapp/volumes/ --region us-east-1`,
-		`rm -f "$f"`,
+		"/usr/local/bin/teploy backup run --app 'myapp'",
 	} {
-		if !strings.Contains(base, want) {
-			t.Errorf("base cmd missing %q:\n%s", want, base)
+		if !strings.Contains(vol, want) {
+			t.Errorf("volumes cmd missing %q: %s", want, vol)
 		}
 	}
-	if strings.Contains(base, "-backup-*") {
-		t.Errorf("upload/cleanup must target only the captured archive, not a glob:\n%s", base)
+	for _, banned := range []string{"bucket", "TEPLOY_S3", "AWS_SECRET", "AWS_ACCESS", "region"} {
+		if strings.Contains(vol, banned) {
+			t.Errorf("volumes cmd must carry no bucket/credentials/env (%s): %s", banned, vol)
+		}
 	}
-	if strings.Contains(base, "head -n -") || strings.Contains(base, "curl") {
-		t.Errorf("base cmd should have no retention/alert:\n%s", base)
-	}
-
-	// Keep-last bakes a prune clause.
-	withKeep := buildScheduledBackupCmd("myapp", "1.2.3.4", "my-bucket", "us-east-1", "", 7, "")
-	if !strings.Contains(withKeep, "head -n -7") {
-		t.Errorf("keep-last prune clause missing:\n%s", withKeep)
-	}
-
-	// teploy-cli-11: --endpoint must reach EVERY aws invocation — the
-	// upload AND the keep-last retention loop. The scheduled job runs with
-	// the server's ambient AWS config, which points at real AWS; without
-	// the flag, scheduled backups silently upload to the wrong target.
-	withEndpoint := buildScheduledBackupCmd("myapp", "1.2.3.4", "my-bucket", "us-east-1", "http://minio:9000", 2, "")
-	if n := strings.Count(withEndpoint, " --endpoint-url 'http://minio:9000'"); n != 3 {
-		t.Errorf("endpoint flag must be on all 3 aws invocations (cp, ls, rm), got %d:\n%s", n, withEndpoint)
-	}
-	if strings.Contains(base, "--endpoint-url") {
-		t.Errorf("no endpoint configured, so no endpoint flag expected:\n%s", base)
-	}
-
-	// Webhook wraps the chain in a failure alert. The alert itself is now a
-	// script on the server rather than an inline curl (see backup_alert.go): the
-	// payload and the request moved into buildBackupAlertScript, which is what
-	// makes signing possible at all, so those assertions live in
-	// TestBuildBackupAlertScript. What the cron line still has to get right is
-	// the wrapping and the exit code.
-	withHook := buildScheduledBackupCmd("myapp", "1.2.3.4", "my-bucket", "us-east-1", "", 7, "https://hooks.example.com/x")
-	if !strings.HasPrefix(withHook, "( ") || !strings.Contains(withHook, ") || {") {
-		t.Errorf("alert wrapping missing:\n%s", withHook)
-	}
-	if !strings.Contains(withHook, backupAlertScriptPath("myapp")) {
-		t.Errorf("alert clause does not invoke the alert script:\n%s", withHook)
-	}
-	// `; false` preserves the non-zero exit so cron still logs the failure.
-	if !strings.Contains(withHook, "false; }") {
-		t.Errorf("alert clause must preserve the non-zero exit:\n%s", withHook)
-	}
-	// The alert clause must still be %-free: it is the part of the crontab line
-	// that used to trip cron's %-escaping, and the reason the body moved to a
-	// file is that a file has no such restriction.
-	alertPart := withHook[strings.Index(withHook, ") || {"):]
-	if strings.Contains(alertPart, "%") {
-		t.Errorf("alert clause must contain no '%%':\n%s", alertPart)
+	acc := buildScheduledBackupRunCmd("/usr/local/bin/teploy", "myapp", "db")
+	if !strings.Contains(acc, "--accessory 'db'") {
+		t.Errorf("accessory cmd missing the accessory flag: %s", acc)
 	}
 }
 
-func TestBuildBackupAlertScript(t *testing.T) {
-	const (
-		app    = "akiroo-lite"
-		server = "deploy-home2"
-		url    = "https://akiroo.example.com/api/webhooks/teploy_cli/dlbs"
-	)
-
-	signed := buildBackupAlertScript(app, server, url, "s3cr3t")
-
-	// The payload still has to match notify.Payload, since the receiver parses
-	// the same shape from every teploy delivery.
-	for _, want := range []string{
-		`"app":"akiroo-lite"`, `"server":"deploy-home2"`,
-		`"type":"backup"`, `"success":false`,
-	} {
-		if !strings.Contains(signed, want) {
-			t.Errorf("script payload missing %q:\n%s", want, signed)
+// Marker classification drives both the `backup-target set` rewrite and
+// the doctor check: teploy-generated legacy lines rewrite, hand-written
+// commands under a teploy marker (the nucleus-backup pattern) must be
+// left alone, and the run form is already current.
+func TestFindCronMarkerForms(t *testing.T) {
+	cases := []struct {
+		name string
+		line string
+		form string
+		kind string
+		app  string
+		acc  string
+		keep int
+	}{
+		{
+			name: "run volumes",
+			line: "30 3 * * * /usr/local/bin/teploy backup run --app myapp # [teploy-backup:myapp]",
+			form: backup.CronFormRun, kind: "volumes", app: "myapp",
+		},
+		{
+			name: "run accessory",
+			line: "15 2 * * * /usr/local/bin/teploy backup run --app myapp --accessory db # [teploy-accessory-backup:myapp:db]",
+			form: backup.CronFormRun, kind: "accessory", app: "myapp", acc: "db",
+		},
+		{
+			name: "legacy volumes shell chain with retention",
+			line: "0 3 * * * f=/tmp/myapp-backup-$(date +%Y%m%d-%H%M%S).tar.gz && tar -czf \"$f\" -C /deployments/myapp/volumes . && aws s3 cp \"$f\" s3://bucket/myapp/volumes/ --region us-east-1 && rm -f \"$f\" && for x in $(aws s3 ls s3://bucket/myapp/volumes/ | head -n -7); do :; done # [teploy-backup:myapp]",
+			form: backup.CronFormLegacy, kind: "volumes", app: "myapp", keep: 7,
+		},
+		{
+			name: "legacy accessory invocation with embedded creds",
+			line: "30 4 * * * TEPLOY_S3_ACCESS_KEY=ak TEPLOY_S3_SECRET_KEY=sk /usr/local/bin/teploy accessory backup nucleus --local --app ship --bucket b --region us-east-1 # [teploy-accessory-backup:ship:nucleus]",
+			form: backup.CronFormLegacy, kind: "accessory", app: "ship", acc: "nucleus",
+		},
+		{
+			name: "hand-written script under a marker",
+			line: "30 4 * * * /usr/local/bin/teploy-nucleus-backup ship # [teploy-accessory-backup:ship:nucleus]",
+			form: backup.CronFormCustom, kind: "accessory", app: "ship", acc: "nucleus",
+		},
+	}
+	for _, tc := range cases {
+		m := backup.FindCronMarker(tc.line)
+		if m == nil {
+			t.Fatalf("%s: marker not found", tc.name)
+		}
+		if m.Form != tc.form || m.Kind != tc.kind || m.App != tc.app || m.Accessory != tc.acc {
+			t.Errorf("%s: got form=%s kind=%s app=%s acc=%s, want %s/%s/%s/%s", tc.name, m.Form, m.Kind, m.App, m.Accessory, tc.form, tc.kind, tc.app, tc.acc)
+		}
+		if m.KeepLast != tc.keep {
+			t.Errorf("%s: keep-last = %d, want %d", tc.name, m.KeepLast, tc.keep)
+		}
+		if m.Cron == "" || strings.Contains(m.Cron, "teploy") {
+			t.Errorf("%s: cron fields wrong: %q", tc.name, m.Cron)
 		}
 	}
-	// Signed with the same construction as internal/notify/sign.go: HMAC over
-	// timestamp + "." + body, in the same two headers.
-	for _, want := range []string{
-		"date +%s",
-		`printf '%s.%s' "$TS" "$BODY"`,
-		"openssl dgst -sha256 -hmac",
-		"X-Teploy-Timestamp: $TS",
-		"X-Teploy-Signature: sha256=$SIG",
-	} {
-		if !strings.Contains(signed, want) {
-			t.Errorf("signed script missing %q:\n%s", want, signed)
-		}
-	}
-	// It is a script, so % is allowed here — that is the entire reason this
-	// moved out of the crontab line.
-	if !strings.HasPrefix(signed, "#!/bin/sh\n") {
-		t.Error("script has no shebang, so cron cannot execute it")
-	}
 
-	// No secret: still delivers, unsigned, exactly as before.
-	unsigned := buildBackupAlertScript(app, server, url, "")
-	if !strings.Contains(unsigned, "curl -sf -m 10 -X POST") {
-		t.Errorf("unsigned script does not deliver:\n%s", unsigned)
+	if m := backup.FindCronMarker("17 */6 * * * /usr/local/bin/infra-maintenance.sh"); m != nil {
+		t.Errorf("unrelated cron line classified as a backup marker: %+v", m)
 	}
-	if strings.Contains(unsigned, "SECRET=''") == false {
-		t.Errorf("unsigned script should carry an empty SECRET:\n%s", unsigned)
-	}
-
-	// An unsigned fallback must exist even in the signed script: if openssl is
-	// missing on the box, a delivery that arrives and gets rejected tells the
-	// operator something, and silence tells them nothing.
-	if strings.Count(signed, "curl -sf -m 10 -X POST") < 2 {
-		t.Errorf("signed script has no unsigned fallback path:\n%s", signed)
-	}
-	if !strings.Contains(signed, "command -v openssl") {
-		t.Errorf("signed script does not check openssl is present:\n%s", signed)
-	}
-}
-
-// Every interpolated value is shell-quoted. app, server and the URL all come
-// from configuration, and this file runs as root from cron — a value able to
-// close a quote and append a command would be a root shell.
-func TestBackupAlertScriptQuotesHostileValues(t *testing.T) {
-	script := buildBackupAlertScript(
-		"app'; touch /tmp/pwned; '",
-		"srv'; id; '",
-		"https://x/'; whoami; '",
-		"sec'; echo no; '",
-	)
-	for _, injected := range []string{"touch /tmp/pwned", "; id;", "whoami", "echo no"} {
-		// The text may appear inside a quoted literal, but never as a command:
-		// an unescaped quote followed by it is what makes it executable.
-		if strings.Contains(script, "' "+injected) || strings.Contains(script, "';"+injected) {
-			t.Errorf("value escaped its quoting and became a command (%q):\n%s", injected, script)
-		}
-	}
-	// ShellQuote doubles single quotes; the payload's own quotes must survive.
-	if !strings.Contains(script, "BODY='") || !strings.Contains(script, "URL='") || !strings.Contains(script, "SECRET='") {
-		t.Errorf("script values are not single-quoted:\n%s", script)
-	}
-}
-
-func TestBackupAlertScriptPath(t *testing.T) {
-	// Under the app's own deployment directory, so removing the app removes it.
-	if got := backupAlertScriptPath("myapp"); got != "/deployments/myapp/backup-alert.sh" {
-		t.Errorf("backupAlertScriptPath = %q", got)
+	if m := backup.FindCronMarker("30 4 * * * /usr/local/bin/teploy-nucleus-backup ship"); m != nil {
+		t.Errorf("marker-less teploy line classified: %+v", m)
 	}
 }

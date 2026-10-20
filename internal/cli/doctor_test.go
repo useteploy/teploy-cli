@@ -19,8 +19,7 @@ import (
 // against (adding checks is additive at the end; renaming/removing is a
 // machine-interface bump).
 var doctorCheckOrder = []string{
-	"git", "config", "ssh", "docker", "disk", "registry", "caddy", "compatibility", "repair-debt", "secret-exposure", "server-tools", "config-home", "age-identity",
-}
+	"git", "config", "ssh", "docker", "disk", "registry", "caddy", "compatibility", "repair-debt", "secret-exposure", "server-tools", "config-home", "backup-cron", "age-identity"}
 
 // doctorHappyMock registers every remote read a fully healthy target
 // answers, for the app config returned by doctorTestApp.
@@ -34,6 +33,7 @@ func doctorHappyMock() *ssh.MockExecutor {
 		ssh.MockCommand{Match: "scan=$(find /deployments ", Output: ""},
 		ssh.MockCommand{Match: "for t in git python3", Output: ""},
 		ssh.MockCommand{Match: "for f in /deployments/*/state.json", Output: ""},
+		ssh.MockCommand{Match: "crontab -l", Output: ""},
 		ssh.MockCommand{Match: "if [ -r /etc/teploy/age-key ]", Output: "present labsent movable"},
 	)
 }
@@ -83,8 +83,8 @@ func TestDoctorAllChecksPass(t *testing.T) {
 	if ex == nil {
 		t.Fatal("expected an executor back")
 	}
-	if report.Summary != (doctorSummary{OK: 13, Warn: 0, Fail: 0}) {
-		t.Fatalf("summary = %+v, want 13 ok", report.Summary)
+	if report.Summary != (doctorSummary{OK: 14, Warn: 0, Fail: 0}) {
+		t.Fatalf("summary = %+v, want 14 ok", report.Summary)
 	}
 	if len(report.Checks) != len(doctorCheckOrder) {
 		t.Fatalf("got %d checks, want %d", len(report.Checks), len(doctorCheckOrder))
@@ -131,8 +131,8 @@ func TestDoctorJSONStableShape(t *testing.T) {
 		t.Fatalf("machine_interface = %v, want %d", doc["machine_interface"], MachineInterface)
 	}
 	checks, ok := doc["checks"].([]any)
-	if !ok || len(checks) != 13 {
-		t.Fatalf("checks = %#v, want 13 entries", doc["checks"])
+	if !ok || len(checks) != 14 {
+		t.Fatalf("checks = %#v, want 14 entries", doc["checks"])
 	}
 	for i, raw := range checks {
 		check, ok := raw.(map[string]any)
@@ -186,6 +186,7 @@ func TestDoctorHumanTable(t *testing.T) {
 		ssh.MockCommand{Match: "scan=$(find /deployments ", Output: ""},
 		ssh.MockCommand{Match: "for t in git python3", Output: ""},
 		ssh.MockCommand{Match: "for f in /deployments/*/state.json", Output: ""},
+		ssh.MockCommand{Match: "crontab -l", Output: ""},
 		ssh.MockCommand{Match: "if [ -r /etc/teploy/age-key ]", Output: "present labsent movable"},
 	)
 	report, _ := doctorRun(context.Background(), doctorTestDeps(mock), &Flags{}, "", doctorTestApp(), nil)
@@ -200,7 +201,7 @@ func TestDoctorHumanTable(t *testing.T) {
 	if !strings.Contains(rendered, "fix:") {
 		t.Fatalf("table missing the remediation line:\n%s", rendered)
 	}
-	if !strings.Contains(rendered, "Summary: 12 ok, 0 warn, 1 fail") {
+	if !strings.Contains(rendered, "Summary: 13 ok, 0 warn, 1 fail") {
 		t.Fatalf("table summary line wrong:\n%s", rendered)
 	}
 	assertDoctorReadOnlyCalls(t, mock.Calls)
@@ -673,7 +674,7 @@ func TestDoctorEndToEndAllOK(t *testing.T) {
 	if err := runDoctor(doctorTestDeps(mock), &Flags{}, "", &out); err != nil {
 		t.Fatalf("runDoctor: %v", err)
 	}
-	if !strings.Contains(out.String(), "Summary: 13 ok, 0 warn, 0 fail") {
+	if !strings.Contains(out.String(), "Summary: 14 ok, 0 warn, 0 fail") {
 		t.Fatalf("human report wrong:\n%s", out.String())
 	}
 	assertDoctorReadOnlyCalls(t, mock.Calls)
@@ -696,6 +697,7 @@ func assertDoctorReadOnlyCalls(t *testing.T, calls []string) {
 		"find /deployments ",
 		"for t in git python3",
 		"for f in /deployments/*/state.json",
+		"crontab -l",
 	}
 	for _, call := range calls {
 		allowed := false

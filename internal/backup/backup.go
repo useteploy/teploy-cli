@@ -165,34 +165,66 @@ func unsignedDecimal(s string) bool {
 	return true
 }
 
-// S3Config holds S3 bucket and credentials info (stored on server).
+// S3Config holds S3 bucket and credentials info.
 //
 // Endpoint (optional) points at an S3-compatible server instead of AWS —
 // e.g. a self-hosted MinIO accessory (`http://<app>-minio:9000`) or
 // B2/R2/Bunny. AccessKey/SecretKey (optional) are passed inline to the aws
 // CLI call as env vars for that command only, never written to disk on the
-// server — omit them to use the server's ambient AWS credentials as before.
+// server. StoredTarget (optional) names the server's backup-target file
+// (D3): when set, the encrypted credentials it carries are decrypted and
+// exported inside the invocation itself and Prefix is part of the key
+// layout (s3://<bucket>/<prefix>/<app>/...).
 type S3Config struct {
 	Bucket    string
 	Region    string
 	Endpoint  string
 	AccessKey string
 	SecretKey string
+	// Prefix is an optional key-layout prefix under the bucket.
+	Prefix string
+	// StoredTarget is the server path of backup-target.json whose encrypted
+	// credentials should back this config (set when it was resolved from
+	// the server's stored target rather than flags).
+	StoredTarget string
 }
 
-// AWS builds an aws-CLI invocation for this config: inline credential env
-// (if set), the subcommand, then --region and --endpoint-url as configured.
+// Base is the bucket-root-relative key prefix every backup key is built
+// from: the bare bucket, or bucket/prefix when a prefix is configured.
+func (s3 S3Config) Base() string {
+	if s3.Prefix == "" {
+		return s3.Bucket
+	}
+	return s3.Bucket + "/" + s3.Prefix
+}
+
+// AWS builds an aws-CLI invocation for this config. Inline credential env
+// (if set) or the stored-target decrypt prelude comes first, then the
+// subcommand, then --region and --endpoint-url as configured.
 func (s3 S3Config) AWS(args string) string {
 	var b strings.Builder
-	if s3.AccessKey != "" {
-		b.WriteString("AWS_ACCESS_KEY_ID=" + ssh.ShellQuote(s3.AccessKey) + " ")
+	awsCmd := func() string {
+		s := "aws " + args + " --region " + ssh.ShellQuote(s3.Region)
+		if s3.Endpoint != "" {
+			s += " --endpoint-url " + ssh.ShellQuote(s3.Endpoint)
+		}
+		return s
 	}
-	if s3.SecretKey != "" {
-		b.WriteString("AWS_SECRET_ACCESS_KEY=" + ssh.ShellQuote(s3.SecretKey) + " ")
-	}
-	b.WriteString("aws " + args + " --region " + ssh.ShellQuote(s3.Region))
-	if s3.Endpoint != "" {
-		b.WriteString(" --endpoint-url " + ssh.ShellQuote(s3.Endpoint))
+	switch {
+	case s3.AccessKey != "":
+		if s3.AccessKey != "" {
+			b.WriteString("AWS_ACCESS_KEY_ID=" + ssh.ShellQuote(s3.AccessKey) + " ")
+		}
+		if s3.SecretKey != "" {
+			b.WriteString("AWS_SECRET_ACCESS_KEY=" + ssh.ShellQuote(s3.SecretKey) + " ")
+		}
+		b.WriteString(awsCmd())
+	case s3.StoredTarget != "":
+		b.WriteString(StoredCredsPrefix(s3.StoredTarget))
+		b.WriteString(awsCmd())
+		b.WriteString(" )")
+	default:
+		b.WriteString(awsCmd())
 	}
 	return b.String()
 }
@@ -208,38 +240,45 @@ func NewClient(exec ssh.Executor, out io.Writer) *Client {
 	return &Client{exec: exec, out: out}
 }
 
-// The app's .env rides inside the archive as a top-level `.env` member,
-// which RestoreVolumes puts back beside the volumes directory. The old
-// command passed the absolute .env path as a second tar argument: tar
-// strips the leading slash, so restore unpacked it to
-// volumes/deployments/<app>/.env — a nested host-path artifact nobody
-// ever read back, while the live .env stayed stale.
-//
-// The archive is built inside a private 0700 mktemp workspace: it contains
-// the app's .env and volume data, and the old predictable /tmp path exposed
-// it to other local users under the default umask (audit F34).
-func (c *Client) BackupVolumes(ctx context.Context, app string, s3 S3Config) error {
+// BackupResult describes one backup as created (D3's backup-json-v1 rows).
+type BackupResult struct {
+	ID        string
+	Key       string
+	SizeBytes int64
+	// TeployKey is the sibling server-config object for volume backups,
+	// empty when the app has no .teploy directory (or for accessories).
+	TeployKey string
+}
+
+// BackupVolumes archives the app's volumes (and .env) to S3, reporting the
+// created backup's identity and size. The .env rides inside the archive as
+// a top-level member which restore puts back beside the volumes directory;
+// the archive is built inside a private 0700 mktemp workspace (audit F34).
+func (c *Client) BackupVolumes(ctx context.Context, app string, s3 S3Config) (BackupResult, error) {
+	res := BackupResult{}
 	if err := c.ensureAWSCLI(ctx); err != nil {
-		return err
+		return res, err
 	}
 
 	timestamp, err := newBackupID(time.Now())
 	if err != nil {
-		return err
+		return res, err
 	}
+	res.ID = timestamp
 	volumesDir := fmt.Sprintf("%s/%s/volumes", deploymentsDir, app)
 	appDir := fmt.Sprintf("%s/%s", deploymentsDir, app)
 
 	runOut, err := c.exec.Run(ctx, "umask 077; mktemp -d /tmp/teploy-backup.XXXXXXXX")
 	if err != nil {
-		return fmt.Errorf("creating backup workspace: %w", err)
+		return res, fmt.Errorf("creating backup workspace: %w", err)
 	}
 	workDir := strings.TrimSpace(runOut)
 	cleanup := func() {
 		c.exec.Run(context.WithoutCancel(ctx), "rm -rf "+ssh.ShellQuote(workDir))
 	}
 	archivePath := workDir + "/backup.tar.gz"
-	s3Key := fmt.Sprintf("s3://%s/%s/volumes/%s.tar.gz", s3.Bucket, app, timestamp)
+	s3Key := fmt.Sprintf("s3://%s/%s/volumes/%s.tar.gz", s3.Base(), app, timestamp)
+	res.Key = s3Key
 
 	// An explicit if/else, not `tar ... || tar ...`: the old fallback
 	// re-ran the tar without .env whenever the first tar failed for ANY
@@ -253,7 +292,10 @@ func (c *Client) BackupVolumes(ctx context.Context, app string, s3 S3Config) err
 	)
 	if _, err := c.exec.Run(ctx, cmd); err != nil {
 		cleanup()
-		return fmt.Errorf("creating archive: %w", err)
+		return res, fmt.Errorf("creating archive: %w", err)
+	}
+	if size, err := c.remoteSize(ctx, archivePath); err == nil {
+		res.SizeBytes = size
 	}
 
 	// Upload to S3.
@@ -261,7 +303,7 @@ func (c *Client) BackupVolumes(ctx context.Context, app string, s3 S3Config) err
 	uploadCmd := s3.AWS(fmt.Sprintf("s3 cp %s %s", ssh.ShellQuote(archivePath), ssh.ShellQuote(s3Key)))
 	if _, err := c.exec.Run(ctx, uploadCmd); err != nil {
 		cleanup()
-		return fmt.Errorf("uploading to S3: %w", err)
+		return res, fmt.Errorf("uploading to S3: %w", err)
 	}
 
 	// The app's server data (Teploy config repository and event history)
@@ -270,31 +312,57 @@ func (c *Client) BackupVolumes(ctx context.Context, app string, s3 S3Config) err
 	teployDir := confighome.Dir(app)
 	if present, err := c.remoteExists(ctx, teployDir); err != nil {
 		cleanup()
-		return fmt.Errorf("checking %s: %w", teployDir, err)
+		return res, fmt.Errorf("checking %s: %w", teployDir, err)
 	} else if present {
 		teployArchive := workDir + "/teploy.tar.gz"
-		teployKey := fmt.Sprintf("s3://%s/%s/teploy/%s.tar.gz", s3.Bucket, app, timestamp)
+		teployKey := fmt.Sprintf("s3://%s/%s/teploy/%s.tar.gz", s3.Base(), app, timestamp)
+		res.TeployKey = teployKey
 		tarCmd := fmt.Sprintf("tar -czf %s --exclude=./.write.lock --exclude=./events.lock .", ssh.ShellQuote(teployArchive))
 		if _, err := c.exec.Run(ctx, fmt.Sprintf("cd %s && if [ -d config.git ] && command -v flock >/dev/null 2>&1; then flock .write.lock %s; else %s; fi", ssh.ShellQuote(teployDir), tarCmd, tarCmd)); err != nil {
 			cleanup()
-			return fmt.Errorf("archiving %s: %w", teployDir, err)
+			return res, fmt.Errorf("archiving %s: %w", teployDir, err)
 		}
 		fmt.Fprintf(c.out, "Uploading Teploy config and history to %s...\n", teployKey)
 		if _, err := c.exec.Run(ctx, s3.AWS(fmt.Sprintf("s3 cp %s %s", ssh.ShellQuote(teployArchive), ssh.ShellQuote(teployKey)))); err != nil {
 			cleanup()
-			return fmt.Errorf("uploading Teploy config to S3: %w", err)
+			return res, fmt.Errorf("uploading Teploy config to S3: %w", err)
 		}
 	}
 
 	cleanup()
 	fmt.Fprintf(c.out, "Backup complete: %s\n", s3Key)
-	return nil
+	return res, nil
+}
+
+// remoteSize stats a file on the server. A stat failure is not fatal to the
+// backup — the size is reporting, not correctness.
+func (c *Client) remoteSize(ctx context.Context, path string) (int64, error) {
+	out, err := c.exec.Run(ctx, "stat -c %s "+ssh.ShellQuote(path))
+	if err != nil {
+		return 0, err
+	}
+	return strconv.ParseInt(strings.TrimSpace(out), 10, 64)
 }
 
 // RestoreVolumes downloads and extracts a volume backup from S3. If the
 // archive carries the app-level .env (see BackupVolumes), it is restored
 // beside the volumes directory in the app directory — the pre-restore file
 // is kept as .env.pre-restore so overwriting credentials is recoverable.
+func (c *Client) RestoreVolumes(ctx context.Context, app, date string, s3 S3Config) error {
+	recoveryDir, err := c.RestoreVolumesKeep(ctx, app, date, s3, "")
+	if err == nil && recoveryDir != "" {
+		c.exec.Run(context.WithoutCancel(ctx), "rm -rf "+ssh.ShellQuote(recoveryDir))
+	}
+	return err
+}
+
+// RestoreVolumesKeep is RestoreVolumes where the caller owns the recovery
+// directory: on success it is returned (empty when none was created) instead
+// of being deleted, so a caller with post-restore steps of its own (D3's
+// quiesced restore health check) can keep the pre-restore copy until those
+// steps also pass. quiesced, when non-empty, names the containers that were
+// stopped for this restore — recorded into failure messages so the operator
+// knows what is down.
 //
 // Every scratch path (download, staging, staged env) lives under one private
 // mktemp run directory: the old fixed /tmp names were shared by concurrent
@@ -303,22 +371,22 @@ func (c *Client) BackupVolumes(ctx context.Context, app string, s3 S3Config) err
 // staged env (audit F33). The promotion's recovery directory is retained
 // until the .env commit also succeeds, so volume data and env are replaced
 // as one recoverable unit (audit F35).
-func (c *Client) RestoreVolumes(ctx context.Context, app, date string, s3 S3Config) error {
+func (c *Client) RestoreVolumesKeep(ctx context.Context, app, date string, s3 S3Config, quiesced string) (string, error) {
 	if err := ValidateDate(date); err != nil {
-		return err
+		return "", err
 	}
 	if err := c.ensureAWSCLI(ctx); err != nil {
-		return err
+		return "", err
 	}
 
 	volumesDir := fmt.Sprintf("%s/%s/volumes", deploymentsDir, app)
 	appDir := fmt.Sprintf("%s/%s", deploymentsDir, app)
 	envPath := appDir + "/.env"
-	s3Key := fmt.Sprintf("s3://%s/%s/volumes/%s.tar.gz", s3.Bucket, app, date)
+	s3Key := fmt.Sprintf("s3://%s/%s/volumes/%s.tar.gz", s3.Base(), app, date)
 
 	runOut, err := c.exec.Run(ctx, "umask 077; mktemp -d /tmp/teploy-volume-restore.XXXXXXXX")
 	if err != nil {
-		return fmt.Errorf("creating restore workspace: %w", err)
+		return "", fmt.Errorf("creating restore workspace: %w", err)
 	}
 	runDir := strings.TrimSpace(runOut)
 	cleanupRun := func() {
@@ -331,7 +399,7 @@ func (c *Client) RestoreVolumes(ctx context.Context, app, date string, s3 S3Conf
 	fmt.Fprintf(c.out, "Downloading %s...\n", s3Key)
 	if _, err := c.exec.Run(ctx, s3.AWS(fmt.Sprintf("s3 cp %s %s", ssh.ShellQuote(s3Key), ssh.ShellQuote(archivePath)))); err != nil {
 		cleanupRun()
-		return fmt.Errorf("downloading from S3: %w", err)
+		return "", fmt.Errorf("downloading from S3: %w", err)
 	}
 
 	// Before the staged tree is promoted into the volumes directory, pull
@@ -362,17 +430,14 @@ func (c *Client) RestoreVolumes(ctx context.Context, app, date string, s3 S3Conf
 		if !errors.Is(err, errRecoveryIncomplete) {
 			cleanupRun()
 		}
-		return err
-	}
-	// The volumes promotion succeeded but is not yet committed: keep the
-	// recovery directory until the .env step below also succeeds, then
-	// release both together.
-	dropRecovery := func() {
-		if recoveryDir != "" {
-			c.exec.Run(context.WithoutCancel(ctx), "rm -rf "+ssh.ShellQuote(recoveryDir))
+		if quiesced != "" {
+			err = fmt.Errorf("%w (containers stopped for the restore: %s — restart them or re-run after recovering)", err, quiesced)
 		}
-		cleanupRun()
+		return recoveryDir, err
 	}
+	// The volumes promotion succeeded but is not yet committed: the
+	// recovery directory is returned to the caller, which releases it only
+	// once its own post-restore steps also succeed.
 
 	// Install the backed-up .env (if the archive carried one — older
 	// backups and volumes-only schedules don't) while keeping the previous
@@ -403,13 +468,16 @@ func (c *Client) RestoreVolumes(ctx context.Context, app, date string, s3 S3Conf
 	if out, err := c.exec.Run(ctx, envCmd); err != nil {
 		// Env commit failed: keep the recovery dir + run dir so the mixed
 		// state is manually recoverable, and say exactly that.
-		return fmt.Errorf("restoring .env: %w — volume recovery copy kept at %s, restore files kept in %s", err, recoveryDir, runDir)
+		return recoveryDir, fmt.Errorf("restoring .env: %w — volume recovery copy kept at %s, restore files kept in %s", err, recoveryDir, runDir)
 	} else if strings.TrimSpace(out) != "" {
 		fmt.Fprint(c.out, out+"\n")
 	}
-	dropRecovery()
+	// The run directory is spent; the recovery directory stays alive for
+	// the caller (the RestoreVolumes wrapper drops it once the whole
+	// command succeeds).
+	cleanupRun()
 	fmt.Fprintln(c.out, "Restore complete")
-	return nil
+	return recoveryDir, nil
 }
 
 // extractToStagingThenPromote extracts archivePath into a fresh, isolated
@@ -550,7 +618,7 @@ func (c *Client) ListBackups(ctx context.Context, app, prefix string, s3 S3Confi
 		return nil, err
 	}
 
-	s3Path := fmt.Sprintf("s3://%s/%s/%s/", s3.Bucket, app, prefix)
+	s3Path := fmt.Sprintf("s3://%s/%s/%s/", s3.Base(), app, prefix)
 	output, err := c.exec.Run(ctx, s3.AWS(fmt.Sprintf("s3 ls %s", ssh.ShellQuote(s3Path))))
 	if err != nil {
 		return nil, fmt.Errorf("listing backups: %w", err)
@@ -573,20 +641,22 @@ func (c *Client) ListBackups(ctx context.Context, app, prefix string, s3 S3Confi
 // inside one private 0700 mktemp workspace and removed on every exit — the
 // old predictable /tmp/<app>-… paths were shared across accessories of the
 // same app and exposed database dumps to other local users (audit F34).
-func (c *Client) AccessoryBackup(ctx context.Context, app, name, image string, env map[string]string, s3 S3Config) error {
+func (c *Client) AccessoryBackup(ctx context.Context, app, name, image string, env map[string]string, s3 S3Config) (BackupResult, error) {
+	res := BackupResult{}
 	if err := c.ensureAWSCLI(ctx); err != nil {
-		return err
+		return res, err
 	}
 
 	timestamp, err := newBackupID(time.Now())
 	if err != nil {
-		return err
+		return res, err
 	}
+	res.ID = timestamp
 	containerName := app + "-" + name
 
 	runOut, err := c.exec.Run(ctx, "umask 077; mktemp -d /tmp/teploy-backup.XXXXXXXX")
 	if err != nil {
-		return fmt.Errorf("creating backup workspace: %w", err)
+		return res, fmt.Errorf("creating backup workspace: %w", err)
 	}
 	workDir := strings.TrimSpace(runOut)
 	cleanup := func() {
@@ -598,34 +668,48 @@ func (c *Client) AccessoryBackup(ctx context.Context, app, name, image string, e
 	// can never drift apart.
 	plan := planAccessoryDump(app, name, image, env, workDir)
 	dumpPath := plan.artifactPath
-	s3Key := fmt.Sprintf("s3://%s/%s/accessories/%s/%s%s", s3.Bucket, app, name, timestamp, plan.ext)
+	s3Key := fmt.Sprintf("s3://%s/%s/accessories/%s/%s%s", s3.Base(), app, name, timestamp, plan.ext)
+	res.Key = s3Key
 	if err := plan.stage(ctx, c.exec); err != nil {
 		cleanup()
-		return fmt.Errorf("staging the mysql credential file for %s (no dump was run): %w", name, err)
+		return res, fmt.Errorf("staging the mysql credential file for %s (no dump was run): %w", name, err)
 	}
 	fmt.Fprintf(c.out, "Backing up %s...\n", containerName)
 	if _, err := c.exec.Run(ctx, plan.cmd); err != nil {
 		// Never leave partial backups around: they're disk-fillers at best,
 		// restore-bait at worst.
 		cleanup()
-		return fmt.Errorf("dumping %s: %w", name, err)
+		return res, fmt.Errorf("dumping %s: %w", name, err)
+	}
+	if size, err := c.remoteSize(ctx, dumpPath); err == nil {
+		res.SizeBytes = size
 	}
 
 	fmt.Fprintf(c.out, "Uploading to %s...\n", s3Key)
 	if _, err := c.exec.Run(ctx, s3.AWS(fmt.Sprintf("s3 cp %s %s", ssh.ShellQuote(dumpPath), ssh.ShellQuote(s3Key)))); err != nil {
 		cleanup()
-		return fmt.Errorf("uploading to S3: %w", err)
+		return res, fmt.Errorf("uploading to S3: %w", err)
 	}
 
 	cleanup()
 	fmt.Fprintf(c.out, "Backup complete: %s\n", s3Key)
-	return nil
+	return res, nil
 }
 
 // AccessoryRestore restores a database backup from S3.
 func (c *Client) AccessoryRestore(ctx context.Context, app, name, image, date string, env map[string]string, s3 S3Config) error {
+	recoveryDir, err := c.AccessoryRestoreKeep(ctx, app, name, image, date, env, s3)
+	if err == nil && recoveryDir != "" {
+		c.exec.Run(context.WithoutCancel(ctx), "rm -rf "+ssh.ShellQuote(recoveryDir))
+	}
+	return err
+}
+
+// AccessoryRestoreKeep is AccessoryRestore where the caller owns the
+// (generic-tar branch's) recovery directory — see RestoreVolumesKeep.
+func (c *Client) AccessoryRestoreKeep(ctx context.Context, app, name, image, date string, env map[string]string, s3 S3Config) (string, error) {
 	if err := c.ensureAWSCLI(ctx); err != nil {
-		return err
+		return "", err
 	}
 
 	// All restore scratch files live under one per-invocation temp dir. The
@@ -636,21 +720,22 @@ func (c *Client) AccessoryRestore(ctx context.Context, app, name, image, date st
 	// kept and named in the error for inspection; on success it is removed.
 	tmpOut, err := c.exec.Run(ctx, "mktemp -d "+ssh.ShellQuote("/tmp/teploy-restore.XXXXXX"))
 	if err != nil {
-		return fmt.Errorf("creating restore temp dir: %w", err)
+		return "", fmt.Errorf("creating restore temp dir: %w", err)
 	}
 	tmpdir := strings.TrimSpace(tmpOut)
-	keepTmp := func(err error) error {
-		return fmt.Errorf("%w — restore files kept in %s", err, tmpdir)
+	keepTmp := func(err error) (string, error) {
+		return "", fmt.Errorf("%w — restore files kept in %s", err, tmpdir)
 	}
 
 	// Determine file type and restore command based on DB type. The generic
 	// (tar) branch leaves restoreCmd empty and instead sets accDir, since it
 	// goes through the staging helper below rather than a single shell command.
 	var s3Key, restorePath, restoreCmd, accDir string
+	var genericRecovery string
 
 	switch {
 	case isDBType(image, "postgres"):
-		s3Key = fmt.Sprintf("s3://%s/%s/accessories/%s/%s.sql.gz", s3.Bucket, app, name, date)
+		s3Key = fmt.Sprintf("s3://%s/%s/accessories/%s/%s.sql.gz", s3.Base(), app, name, date)
 		restorePath = tmpdir + "/restore.sql.gz"
 		db, user := postgresDBAndUser(app, env)
 		restoreCmd = postgresRestoreCmd(app+"-"+name, user, db, restorePath, tmpdir+"/restore.sql")
@@ -658,7 +743,7 @@ func (c *Client) AccessoryRestore(ctx context.Context, app, name, image, date st
 		// The old branch never assigned s3Key/restorePath, so the download
 		// and gunzip below operated on empty arguments — every MySQL/MariaDB
 		// restore was deterministically broken (audit F31).
-		s3Key = fmt.Sprintf("s3://%s/%s/accessories/%s/%s.sql.gz", s3.Bucket, app, name, date)
+		s3Key = fmt.Sprintf("s3://%s/%s/accessories/%s/%s.sql.gz", s3.Base(), app, name, date)
 		restorePath = tmpdir + "/restore.sql.gz"
 		qContainer := ssh.ShellQuote(app + "-" + name)
 		db := mysqlDB(app, env)
@@ -684,12 +769,12 @@ func (c *Client) AccessoryRestore(ctx context.Context, app, name, image, date st
 
 		// The kept-on-failure scratch dir must never keep the credential.
 		innerKeep := keepTmp
-		keepTmp = func(err error) error {
+		keepTmp = func(err error) (string, error) {
 			c.exec.Run(context.WithoutCancel(ctx), "rm -f "+ssh.ShellQuote(tmpdir+"/mysql.env"))
 			return innerKeep(err)
 		}
 	case isDBType(image, "mongo"):
-		s3Key = fmt.Sprintf("s3://%s/%s/accessories/%s/%s.archive.gz", s3.Bucket, app, name, date)
+		s3Key = fmt.Sprintf("s3://%s/%s/accessories/%s/%s.archive.gz", s3.Base(), app, name, date)
 		restorePath = tmpdir + "/restore.archive.gz"
 		restoreCmd = mongoRestoreCmd(app+"-"+name, restorePath)
 	case isDBType(image, "redis"):
@@ -698,7 +783,7 @@ func (c *Client) AccessoryRestore(ctx context.Context, app, name, image, date st
 		// redis restores always failed. Stop redis first so its shutdown
 		// save can't overwrite the snapshot we copy in, then start so it
 		// loads dump.rdb (full reasoning on redisRestoreScript).
-		s3Key = fmt.Sprintf("s3://%s/%s/accessories/%s/%s.rdb.gz", s3.Bucket, app, name, date)
+		s3Key = fmt.Sprintf("s3://%s/%s/accessories/%s/%s.rdb.gz", s3.Base(), app, name, date)
 		restorePath = tmpdir + "/restore.rdb.gz"
 		if err := c.redisAOFPreflight(ctx, app, name); err != nil {
 			return keepTmp(err)
@@ -706,7 +791,7 @@ func (c *Client) AccessoryRestore(ctx context.Context, app, name, image, date st
 		restoreCmd = redisRestoreScript(app+"-"+name, restorePath, tmpdir+"/restore.rdb", tmpdir+"/old-dump.rdb")
 	default:
 		// Generic: extract tar to accessory directory.
-		s3Key = fmt.Sprintf("s3://%s/%s/accessories/%s/%s.tar.gz", s3.Bucket, app, name, date)
+		s3Key = fmt.Sprintf("s3://%s/%s/accessories/%s/%s.tar.gz", s3.Base(), app, name, date)
 		restorePath = tmpdir + "/restore.tar.gz"
 		accDir = fmt.Sprintf("%s/%s/accessories/%s", deploymentsDir, app, name)
 	}
@@ -734,18 +819,17 @@ func (c *Client) AccessoryRestore(ctx context.Context, app, name, image, date st
 			// so the retained paths stay inspectable (TCL-43).
 			return keepTmp(fmt.Errorf("restoring %s: %w", name, err))
 		}
-		// No dependent steps follow a generic accessory restore, so the
-		// retained recovery directory can be released immediately.
-		if recoveryDir != "" {
-			c.exec.Run(context.WithoutCancel(ctx), "rm -rf "+ssh.ShellQuote(recoveryDir))
-		}
+		// The recovery directory is returned to the caller (the
+		// AccessoryRestore wrapper releases it once the whole command
+		// succeeds); the staged tree in tmpdir is spent either way.
+		genericRecovery = recoveryDir
 	} else if _, err := c.exec.Run(ctx, restoreCmd); err != nil {
 		return keepTmp(fmt.Errorf("restoring %s: %w", name, err))
 	}
 
 	c.exec.Run(ctx, "rm -rf "+ssh.ShellQuote(tmpdir))
 	fmt.Fprintln(c.out, "Restore complete")
-	return nil
+	return genericRecovery, nil
 }
 
 // SetSchedule creates (or replaces) a cron job for scheduled backups. marker is

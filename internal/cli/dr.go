@@ -12,6 +12,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/useteploy/teploy/internal/backup"
 	"github.com/useteploy/teploy/internal/config"
+	"github.com/useteploy/teploy/internal/ssh"
 )
 
 // The disaster-recovery command family (C07). `teploy backup` remains the
@@ -44,17 +45,19 @@ func newDRCmd(flags *Flags, version string) *cobra.Command {
 
 // drStoreFlags registers the bundle-store selection: an S3 target
 // (--bucket) or a plain directory reachable on the server (--dir) for
-// offline bundles.
+// offline bundles. With neither, the server's stored backup target is
+// used (D3).
 func drStoreFlags(cmd *cobra.Command, bucket, region, endpoint, dir *string) {
-	cmd.Flags().StringVar(bucket, "bucket", "", "S3 bucket for bundles")
-	cmd.Flags().StringVar(region, "region", "us-east-1", "AWS region")
+	cmd.Flags().StringVar(bucket, "bucket", "", "S3 bucket for bundles (default: the server's stored backup target)")
+	cmd.Flags().StringVar(region, "region", "", "AWS region (default: the stored target's region, else us-east-1)")
 	cmd.Flags().StringVar(endpoint, "endpoint", "", "S3-compatible endpoint URL (MinIO/B2/R2); creds from TEPLOY_S3_ACCESS_KEY/SECRET_KEY or AWS_* env")
 	cmd.Flags().StringVar(dir, "dir", "", "store bundles in a directory on the server (offline bundles) instead of S3")
 }
 
-// drStore builds the BundleStore from the flags; exactly one target must
-// be selected.
-func drStore(bucket, region, endpoint, dir string) (backup.BundleStore, error) {
+// drStore builds the BundleStore from the flags; with neither --bucket nor
+// --dir the server's stored backup target is used (stored credentials and
+// all — no bucket or credentials need to travel with the command).
+func drStore(ctx context.Context, exec ssh.Executor, bucket, region, endpoint, dir string) (backup.BundleStore, error) {
 	switch {
 	case dir != "" && bucket != "":
 		return nil, fmt.Errorf("choose one bundle target: --bucket (S3) or --dir (server directory), not both")
@@ -64,12 +67,23 @@ func drStore(bucket, region, endpoint, dir string) (backup.BundleStore, error) {
 		if err := backup.ValidateBucket(bucket); err != nil {
 			return nil, err
 		}
-		if err := backup.ValidateRegion(region); err != nil {
+		r := region
+		if r == "" {
+			r = "us-east-1"
+		}
+		if err := backup.ValidateRegion(r); err != nil {
 			return nil, err
 		}
-		return backup.S3BundleStore{S3: s3Config(bucket, region, endpoint)}, nil
+		return backup.S3BundleStore{S3: s3Config(bucket, r, endpoint)}, nil
 	}
-	return nil, fmt.Errorf("a bundle target is required: --bucket (S3) or --dir (server directory)")
+	target, err := backup.ReadTarget(ctx, exec)
+	if err != nil {
+		return nil, err
+	}
+	if !TargetConfigured(target) {
+		return nil, fmt.Errorf("a bundle target is required: --bucket (S3), --dir (server directory), or a stored server backup target (`teploy server backup-target set`)")
+	}
+	return backup.S3BundleStore{S3: TargetS3(target)}, nil
 }
 
 func newDRCreateCmd(flags *Flags, version string) *cobra.Command {
@@ -93,10 +107,6 @@ func newDRCreateCmd(flags *Flags, version string) *cobra.Command {
 			"(--quiesced-volume NAME).",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			store, err := drStore(bucket, region, endpoint, dir)
-			if err != nil {
-				return err
-			}
 			if includeAgeKey && !includeSecrets {
 				return fmt.Errorf("--include-age-key requires --include-secrets (the key decrypts the material it travels with)")
 			}
@@ -111,6 +121,10 @@ func newDRCreateCmd(flags *Flags, version string) *cobra.Command {
 				return err
 			}
 			defer executor.Close()
+			store, err := drStore(ctx, executor, bucket, region, endpoint, dir)
+			if err != nil {
+				return err
+			}
 			progress := io.Writer(os.Stdout)
 			if flags.JSON {
 				progress = os.Stderr
@@ -158,10 +172,6 @@ func newDRListCmd(flags *Flags) *cobra.Command {
 		Short: "List DR bundles",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			store, err := drStore(bucket, region, endpoint, dir)
-			if err != nil {
-				return err
-			}
 			appCfg, err := config.LoadApp(".")
 			if err != nil {
 				return err
@@ -173,6 +183,10 @@ func newDRListCmd(flags *Flags) *cobra.Command {
 				return err
 			}
 			defer executor.Close()
+			store, err := drStore(ctx, executor, bucket, region, endpoint, dir)
+			if err != nil {
+				return err
+			}
 			ids, err := store.ListIDs(ctx, executor, appCfg.App)
 			if err != nil {
 				return err
@@ -201,10 +215,6 @@ func newDRShowCmd(flags *Flags) *cobra.Command {
 		Short: "Show a DR bundle's manifest",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			store, err := drStore(bucket, region, endpoint, dir)
-			if err != nil {
-				return err
-			}
 			appCfg, err := config.LoadApp(".")
 			if err != nil {
 				return err
@@ -216,6 +226,10 @@ func newDRShowCmd(flags *Flags) *cobra.Command {
 				return err
 			}
 			defer executor.Close()
+			store, err := drStore(ctx, executor, bucket, region, endpoint, dir)
+			if err != nil {
+				return err
+			}
 			data, err := store.FetchManifest(ctx, executor, appCfg.App, args[0])
 			if err != nil {
 				return err
@@ -265,10 +279,6 @@ func newDRRestoreCmd(flags *Flags) *cobra.Command {
 			"BEFORE any mutation.",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			store, err := drStore(bucket, region, endpoint, dir)
-			if err != nil {
-				return err
-			}
 			appCfg, err := config.LoadApp(".")
 			if err != nil {
 				return err
@@ -280,6 +290,10 @@ func newDRRestoreCmd(flags *Flags) *cobra.Command {
 				return err
 			}
 			defer executor.Close()
+			store, err := drStore(ctx, executor, bucket, region, endpoint, dir)
+			if err != nil {
+				return err
+			}
 			progress := io.Writer(os.Stdout)
 			if flags.JSON {
 				progress = os.Stderr

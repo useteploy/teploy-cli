@@ -104,8 +104,8 @@ func TestCapabilityTokenRegistry(t *testing.T) {
 		"template-var-stdin",
 		"trigger-convergence-v1",
 	}
-	want = append(want, "actor-flag-v1", "events-v1", "config-home-v1", "undeployed-list-v1", "lock-wait-v1", "config-merge-v1", "config-unprivileged-v1", "deploy-home-v1",
-		"secret-stdin-v1", "releases-json-v1", "rollback-json-v1", "redeploy-v1", "env-config-guard-v1")
+	want = append(want, "actor-flag-v1", "events-v1", "config-home-v1", "undeployed-list-v1", "lock-wait-v1", "config-merge-v1", "config-unprivileged-v1", "deploy-home-v1", "backup-target-v1", "backup-json-v1")
+	want = append(want, "secret-stdin-v1", "releases-json-v1", "rollback-json-v1", "redeploy-v1", "env-config-guard-v1")
 	sort.Strings(want)
 	got := MachineCapabilities()
 	if len(got) != len(want) {

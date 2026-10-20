@@ -107,7 +107,7 @@ standalone.
 | **Asset bridging** | Shared volume prevents 404s on hashed assets during deploys |
 | **Destinations** | `teploy deploy -d staging` — per-environment config overlays |
 | **Notifications** | Webhook notifications on deploy/rollback/failure |
-| **Backups** | `teploy backup` — volumes to S3 |
+| **Backups** | `teploy backup` — volumes to S3; `teploy server backup-target` — the per-server target |
 | **Templates** | One-command deploys for common self-hosted apps |
 | **Deploy locking** | `teploy lock` — freeze deploys during incidents; `teploy lock status --json` reports who holds the lock |
 | **Vulnerability gate** | `scan: true` — Trivy scan blocks deploys on fixable CRITICALs |
@@ -563,30 +563,60 @@ The mode is recorded with the preview, so redeploying the branch keeps it.
 `preview list --json` rows carry a `url` with the scheme actually served.
 
 ### Backups
-```
-teploy backup create               # backup volumes to S3
-teploy backup list / restore <id>
-teploy backup schedule             # cron-driven backups
-teploy backup prune                # apply a retention policy
 
-# Retention: keep only the newest N, and/or drop anything older than D days.
-teploy backup create  --bucket b --keep-last 7             # auto-prune after backup
-teploy backup schedule "0 3 * * *" --bucket b --keep-last 7 # nightly, keep 7
-teploy backup prune   --bucket b --keep-last 3 --max-age-days 30
-teploy backup prune   --bucket b --accessory db --keep-last 5
+One backup target per server, stored on the server and read at run time —
+no bucket or credentials in crontabs, scripts or laptops:
+
 ```
+# Store the target (credentials on stdin, two lines; age-encrypted on the
+# server at /etc/teploy/backup-target.json, 0600):
+printf 'ACCESS\nSECRET\n' | teploy server backup-target set --host prod \
+    --bucket b [--region r] [--endpoint https://s3.example.com] [--prefix p]
+teploy server backup-target show --host prod [--json]   # never secrets
+teploy server backup-target unset --host prod
+
+teploy backup create   --app myapp --host prod [--json]  # volumes (+ server data)
+teploy backup create   --app myapp --host prod --accessory db --json
+teploy backup list     --app myapp --host prod --json    # parsed rows + schedules
+teploy backup restore  <id> --app myapp --host prod --yes --json
+teploy backup schedule "0 3 * * *" --app myapp --host prod --keep-last 7
+teploy backup prune    --app myapp --host prod --keep-last 3 --max-age-days 30
+```
+
+Every command also works from an app directory without `--app/--host`, and
+the legacy `--bucket/--region/--endpoint` flags still work (they override
+the stored target). `teploy dr` and `teploy accessory verify-backup`
+default to the stored target too.
+
+Stored credentials are used whether or not an endpoint is set; without
+them the server's ambient AWS credential chain applies. A non-root deploy
+user who cannot write `/etc/teploy` gets `~/.config/teploy/` instead, and
+the command says so.
+
+Scheduled jobs are a single argument-free line —
+`/usr/local/bin/teploy backup run --app myapp` — with the retention half
+of the schedule stored per app and read at run time, so changing either
+never rewrites cron. `teploy server backup-target set` rewrites existing
+teploy-generated backup cron lines to that form (hand-written commands
+under a teploy marker are left alone and reported), and `teploy doctor`
+flags any cron line that still embeds credentials or bucket flags.
+
+Restore quiesces: the app's containers (and a generic accessory's) are
+stopped under the app's fenced lock, the backup is promoted with the
+two-phase recovery discipline, the containers are started again and
+health-checked. On failure — or an unhealthy app afterwards — the
+pre-restore recovery copy is kept and named. Non-interactive restores
+require `--yes`.
+
 `--keep-last N` is a floor (the newest N are always kept, even if old);
 `--max-age-days D` deletes older backups but never below that floor. A failed
 backup never triggers a prune. Both `backup create` and scheduled cron backups
 alert on failure via the app's `notifications` config — `create` uses all
-channels; the headless cron job posts to the first **webhook** channel (SMTP and
-other channels need the CLI, which isn't on the server).
-
-`backup schedule` uploads a small alert script to
-`/deployments/<app>/backup-alert.sh` (mode 0700) and points cron at it, rather
-than inlining a `curl` in the crontab line. That is what lets the alert be
-signed: the signature covers a timestamp, `date +%s` contains a `%`, and crontab
-treats `%` as a newline escape. If a signing secret is configured (see
+channels; the headless `backup run` posts to the first **webhook** channel
+through the alert script `backup schedule` uploads to
+`/deployments/<app>/backup-alert.sh` (mode 0700). That is what lets the alert
+be signed: the signature covers a timestamp, `date +%s` contains a `%`, and
+crontab treats `%` as a newline escape. If a signing secret is configured (see
 `notifications.secret` / `TEPLOY_WEBHOOK_SECRET`) the alert carries the same
 `X-Teploy-Signature` headers as every other delivery; otherwise it goes
 unsigned, and `backup schedule` says so on its output so a verifying receiver
