@@ -183,6 +183,9 @@ func executeRemove(ctx context.Context, exec ssh.Executor, app string, domains [
 	if err != nil {
 		return nil, fmt.Errorf("listing containers: %w", err)
 	}
+	// Containers created by image ID report the ID; resolve it to the tags
+	// so their build images are found too.
+	containers = dk.ResolveImageTags(ctx, containers)
 	var buildImages []string
 	for _, c := range containers {
 		if c.Labels["teploy.role"] == "accessory" && !opts.Purge {
@@ -201,8 +204,14 @@ func executeRemove(ctx context.Context, exec ssh.Executor, app string, domains [
 			return nil, err
 		}
 		summary.RemovedContainers = append(summary.RemovedContainers, c.Name)
-		if strings.HasPrefix(c.Image, build.ImageTag(app, "")) && !slices.Contains(buildImages, c.Image) {
-			buildImages = append(buildImages, c.Image)
+		tags := c.ImageTags
+		if len(tags) == 0 {
+			tags = []string{c.Image}
+		}
+		for _, tag := range tags {
+			if strings.HasPrefix(tag, build.ImageTag(app, "")) && !slices.Contains(buildImages, tag) {
+				buildImages = append(buildImages, tag)
+			}
 		}
 	}
 	summary.RemovedImages = removeBuildImages(ctx, exec, buildImages)
