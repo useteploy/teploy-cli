@@ -56,6 +56,7 @@ func canonicalRepository(raw string) (string, error) {
 	}
 	return u.String(), nil
 }
+
 // sameRepositoryPath compares two canonical repositories by host and path.
 // The forge API reports its HTTP clone URL, while a checkout may use SSH on
 // a different port (self-hosted forges almost always do); the transport

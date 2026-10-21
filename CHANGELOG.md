@@ -4,6 +4,15 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+### Fixed
+
+- `teploy remove` now deletes the server-built images (`<app>-build-<version>`)
+  of the containers it removes. Before, they stayed forever: the deploy-time
+  72-hour image prune skips images a kept container still uses, and remove
+  took the containers away without the images. Images are taken from the
+  app's own containers (never a name pattern), removal is never forced, and
+  pulled images are left alone. `--json` reports them as `removed_images`.
+
 ## [0.1.46] - 2026-10-21
 
 ### Fixed

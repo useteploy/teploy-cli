@@ -8,9 +8,11 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"slices"
 	"strings"
 
 	"github.com/spf13/cobra"
+	"github.com/useteploy/teploy/internal/build"
 	"github.com/useteploy/teploy/internal/caddy"
 	"github.com/useteploy/teploy/internal/confighome"
 	"github.com/useteploy/teploy/internal/docker"
@@ -28,8 +30,13 @@ func newRemoveCmd(flags *Flags) *cobra.Command {
 		Aliases: []string{"destroy"},
 		Short:   "Retire an app: containers, proxy route, and deploy state",
 		Long: `Remove is the inverse of deploy. It stops and removes the app's containers,
-removes its Caddy route (reloading the proxy), and deletes its deploy state
-under /deployments/<app>.
+removes its Caddy route (reloading the proxy), deletes the server-built images
+those containers ran (<app>-build-<version>; pulled images are left alone),
+and deletes its deploy state under /deployments/<app>.
+
+The removal itself is recorded in the app's event history (who removed it,
+and whether --purge was used). With --purge, that record is all that stays,
+so the server history can still answer what happened to the app.
 
 Data is preserved by default: volumes/, accessory data, and running accessory
 containers are left in place so a removal is never silently destructive.
@@ -61,6 +68,7 @@ type removeSummary struct {
 	App               string   `json:"app"`
 	Server            string   `json:"server"`
 	RemovedContainers []string `json:"removed_containers"`
+	RemovedImages     []string `json:"removed_images,omitempty"`
 	KeptAccessories   []string `json:"kept_accessories,omitempty"`
 	RemovedAutomation []string `json:"removed_automation,omitempty"`
 	Route             string   `json:"route"` // "removed", "redirected", "none"
@@ -175,6 +183,7 @@ func executeRemove(ctx context.Context, exec ssh.Executor, app string, domains [
 	if err != nil {
 		return nil, fmt.Errorf("listing containers: %w", err)
 	}
+	var buildImages []string
 	for _, c := range containers {
 		if c.Labels["teploy.role"] == "accessory" && !opts.Purge {
 			summary.KeptAccessories = append(summary.KeptAccessories, c.Name)
@@ -192,6 +201,13 @@ func executeRemove(ctx context.Context, exec ssh.Executor, app string, domains [
 			return nil, err
 		}
 		summary.RemovedContainers = append(summary.RemovedContainers, c.Name)
+		if strings.HasPrefix(c.Image, build.ImageTag(app, "")) && !slices.Contains(buildImages, c.Image) {
+			buildImages = append(buildImages, c.Image)
+		}
+	}
+	summary.RemovedImages = removeBuildImages(ctx, exec, buildImages)
+	for _, img := range summary.RemovedImages {
+		fmt.Fprintf(out, "Removed image %s\n", img)
 	}
 
 	// 2. Route. Servers running only ingress:host apps have no Caddyfile —
@@ -359,4 +375,35 @@ func removeAppAutomation(ctx context.Context, exec ssh.Executor, app string, pur
 		}
 	}
 	return removed, nil
+}
+
+// removeBuildImages deletes the server-built images (<app>-build-<version>)
+// of the containers remove just took away. Nothing can deploy or roll back
+// to them once the app is gone, and the deploy-time 72h prune never reached
+// them while a kept container still used them. The names come from the
+// app's own containers, never a name pattern, so another app's images are
+// never matched. Best-effort and never forced: an image some other
+// container still uses stays, and a failure does not fail the remove.
+func removeBuildImages(ctx context.Context, exec ssh.Executor, images []string) []string {
+	if len(images) == 0 {
+		return nil
+	}
+	quoted := make([]string, len(images))
+	for i, img := range images {
+		quoted[i] = ssh.ShellQuote(img)
+	}
+	out, _ := exec.Run(ctx, "docker rmi "+strings.Join(quoted, " ")+" 2>/dev/null || true")
+	var removed []string
+	for _, line := range strings.Split(out, "\n") {
+		tag, ok := strings.CutPrefix(strings.TrimSpace(line), "Untagged: ")
+		if !ok {
+			continue
+		}
+		for _, img := range images {
+			if tag == img || tag == img+":latest" {
+				removed = append(removed, img)
+			}
+		}
+	}
+	return removed
 }
