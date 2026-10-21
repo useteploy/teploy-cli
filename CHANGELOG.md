@@ -4,6 +4,8 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [0.1.47] - 2026-10-21
+
 ### Fixed
 
 - `teploy remove` now deletes the server-built images (`<app>-build-<version>`)
