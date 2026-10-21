@@ -4,6 +4,8 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [0.1.46] - 2026-10-21
+
 ### Fixed
 
 - Native repository proof for a CI checkout (`trigger` with a GitHub or
