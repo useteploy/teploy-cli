@@ -365,3 +365,45 @@ func TestExecuteRemoveRefusesWhileDeployRuns(t *testing.T) {
 		}
 	}
 }
+
+func TestExecuteRemoveDeletesItsBuildImages(t *testing.T) {
+	cmds := append([]ssh.MockCommand{
+		{
+			Match: "docker ps --all --filter label=teploy.app=",
+			Output: `{"ID":"aaa111","Names":"scratch-web-aaa","Image":"scratch-build-aaa","State":"running","Status":"Up","Labels":"teploy.app=scratch,teploy.process=web"}
+{"ID":"aaa112","Names":"scratch-worker-aaa","Image":"scratch-build-aaa","State":"running","Status":"Up","Labels":"teploy.app=scratch,teploy.process=worker"}
+{"ID":"ccc333","Names":"scratch-web-ccc","Image":"scratch-build-ccc","State":"exited","Status":"Exited","Labels":"teploy.app=scratch,teploy.process=web"}
+{"ID":"ddd444","Names":"scratch-web-ddd","Image":"nginx:alpine","State":"exited","Status":"Exited","Labels":"teploy.app=scratch,teploy.process=web"}
+{"ID":"eee555","Names":"scratch-web-eee","Image":"be6a74814c55","State":"exited","Status":"Exited","Labels":"teploy.app=scratch,teploy.process=web"}`,
+		},
+		// A container created by image ID reports the ID; its tag is resolved.
+		{Match: "docker image inspect --format", Output: "sha256:be6a74814c55" + strings.Repeat("0", 52) + ` ["scratch-build-eee:latest"]`},
+		{Match: "docker stop -t 10", Output: ""},
+		{Match: "docker rm ", Output: ""},
+		// ccc's image is still used elsewhere: docker refuses it, remove carries on.
+		{Match: "docker rmi ", Output: "Untagged: scratch-build-aaa:latest\nUntagged: scratch-build-eee:latest\nDeleted: sha256:0123"},
+		{Match: "rm -rf '/deployments/scratch'", Output: ""},
+	}, caddyMocks()...)
+	exec := ssh.NewMockExecutor("test-host", append(cmds, removeAutomationMocks()...)...)
+
+	sum, err := executeRemove(context.Background(), exec, "scratch", nil, removeOptions{Purge: true}, io.Discard)
+	if err != nil {
+		t.Fatalf("executeRemove: %v", err)
+	}
+	var rmi string
+	for _, call := range exec.Calls {
+		if strings.HasPrefix(call, "docker rmi ") {
+			if rmi != "" {
+				t.Fatalf("docker rmi ran twice: %v", exec.Calls)
+			}
+			rmi = call
+		}
+	}
+	// Each build image once, never forced, never a pulled image.
+	if rmi != "docker rmi 'scratch-build-aaa' 'scratch-build-ccc' 'scratch-build-eee:latest' 2>/dev/null || true" {
+		t.Fatalf("rmi call = %q", rmi)
+	}
+	if fmt.Sprint(sum.RemovedImages) != "[scratch-build-aaa scratch-build-eee:latest]" {
+		t.Fatalf("removed images = %v", sum.RemovedImages)
+	}
+}
