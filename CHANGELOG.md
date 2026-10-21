@@ -4,6 +4,14 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+### Fixed
+
+- Native repository proof for a CI checkout (`trigger` with a GitHub or
+  GitLab repository ID) now compares host and path only. A checkout over
+  `ssh://git@gitlab.lan:2222/g/r` matches the API's
+  `http://gitlab.lan:8080/g/r` instead of being refused; the API authority
+  stays pinned by `TEPLOY_TRIGGER_API_BASE`.
+
 ## [0.1.45] - 2026-10-20
 
 ### Upgrade notes

@@ -56,6 +56,17 @@ func canonicalRepository(raw string) (string, error) {
 	}
 	return u.String(), nil
 }
+// sameRepositoryPath compares two canonical repositories by host and path.
+// The forge API reports its HTTP clone URL, while a checkout may use SSH on
+// a different port (self-hosted forges almost always do); the transport
+// and port are not the repository. The API itself is authority-pinned, so
+// only the locator spelling is relaxed here.
+func sameRepositoryPath(a, b string) bool {
+	ua, ea := url.Parse(a)
+	ub, eb := url.Parse(b)
+	return ea == nil && eb == nil && ua.Hostname() != "" &&
+		ua.Hostname() == ub.Hostname() && ua.Path == ub.Path
+}
 func checkoutRepository(dir string) (string, error) {
 	out, err := exec.Command("git", "-C", dir, "config", "--get", "remote.origin.url").Output()
 	if err != nil {
@@ -158,7 +169,7 @@ func verifyRepositoryMapping(ctx context.Context, identity, clone string, transp
 		locator = metadata.HTTPURL
 	}
 	actual, err := canonicalRepository(locator)
-	if err != nil || actual != clone {
+	if err != nil || !sameRepositoryPath(actual, clone) {
 		return fmt.Errorf("authenticated API repository does not map to checkout origin")
 	}
 	return nil
