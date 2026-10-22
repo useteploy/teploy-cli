@@ -131,9 +131,12 @@ func (b *Builder) Build(ctx context.Context, cfg BuildConfig) (string, error) {
 }
 
 func (b *Builder) buildDockerfile(ctx context.Context, tag, buildDir, contextSub, dockerfile, platform string) error {
-	// The plain build keeps its historical byte-identical command;
-	// BuildKit is only forced on for --secret mounts (D4 build_secrets).
-	cmd := "docker build -t " + ssh.ShellQuote(tag)
+	// --pull always: a base-image tag must resolve to what the registry
+	// serves now, never what the build host happens to have cached (a
+	// stale runner cache once shipped a pre-security-release Node,
+	// 2026-10-22). BuildKit is only forced on for --secret mounts (D4
+	// build_secrets).
+	cmd := "docker build --pull -t " + ssh.ShellQuote(tag)
 	if len(b.secrets) > 0 {
 		cmd = "DOCKER_BUILDKIT=1 " + cmd
 	}
@@ -261,7 +264,8 @@ func LocalBuild(ctx context.Context, cfg LocalBuildConfig, stdout io.Writer) (st
 }
 
 func localBuildDockerfile(ctx context.Context, tag, dir, contextSub, dockerfile, platform string, stdout io.Writer) error {
-	args := []string{"build", "-t", tag}
+	// --pull: same stale-base-image rule as the remote build.
+	args := []string{"build", "--pull", "-t", tag}
 
 	// Explicit config, else the shared local-build default (Apple silicon
 	// cross-compiles for linux/amd64) — one rule for the build and its
