@@ -395,7 +395,8 @@ func doctorDockerCheck(ctx context.Context, exec ssh.Executor) doctorCheck {
 // doctorServerToolsCheck verifies the server-side tools teploy shells out
 // to. python3 is required (fenced state writes, volume ownership, trigger
 // receipts), so its absence fails; git is a warning until a feature on the
-// box needs it. `teploy setup` installs both.
+// box needs it, as is cron (backup and autodeploy schedules). `teploy
+// setup` installs all three.
 func doctorServerToolsCheck(ctx context.Context, exec ssh.Executor) doctorCheck {
 	out, err := exec.Run(ctx, serverToolsProbe)
 	if err != nil {

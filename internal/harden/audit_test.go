@@ -11,7 +11,7 @@ import (
 
 func TestEnableAuditInstallsRulesAndSudoers(t *testing.T) {
 	mock := ssh.NewMockExecutor("h",
-		ssh.MockCommand{Match: "which auditctl", Output: "/usr/sbin/auditctl"},
+		ssh.MockCommand{Match: "sh -c 'command -v auditctl'", Output: "/usr/sbin/auditctl"},
 		ssh.MockCommand{Match: "visudo -c", Output: "parsed OK"},
 		ssh.MockCommand{Match: "mv /tmp/teploy-audit.rules", Output: ""},
 		ssh.MockCommand{Match: "augenrules --load", Output: ""},
@@ -46,7 +46,7 @@ func TestEnableAuditInstallsRulesAndSudoers(t *testing.T) {
 
 func TestEnableAuditRejectsBadSudoers(t *testing.T) {
 	mock := ssh.NewMockExecutor("h",
-		ssh.MockCommand{Match: "which auditctl", Output: "/usr/sbin/auditctl"},
+		ssh.MockCommand{Match: "sh -c 'command -v auditctl'", Output: "/usr/sbin/auditctl"},
 		ssh.MockCommand{Match: "mv /tmp/teploy-audit.rules", Output: ""},
 		ssh.MockCommand{Match: "augenrules --load", Output: ""},
 		ssh.MockCommand{Match: "systemctl enable --now auditd", Output: ""},

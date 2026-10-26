@@ -4,6 +4,37 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+### Fixed
+
+Found provisioning a fresh OVH Debian 13 VPS as a non-root user with
+`--network tailscale` (2026-10-25):
+
+- SSH now offers only the host-key algorithms `known_hosts` holds for a
+  known host. A box first trusted by stock `ssh` (ed25519) failed every
+  connect with a "host key mismatch" when Go negotiated ecdsa.
+- Remote uploads apply the file mode after writing, not before. Read-only
+  modes (the 0440 sudoers audit drop-in) could not be written by a
+  non-root user, aborting `setup` hardening.
+- Hardening and setup probes for `/usr/sbin` tools (`ufw`, `auditctl`,
+  `visudo`, `ufw status`) run through sudo for non-root users. Before,
+  they missed the tools, so ufw and auditd were reinstalled on every run,
+  the firewall stage reported "No active firewall", and `visudo` was not found.
+- Tailscale and Headscale joins pass the key via `--auth-key=file:`. The
+  tailscale CLI ignores `TS_AUTHKEY`, so every join fell back to an
+  interactive login and timed out. The credential still never enters argv.
+- The tailscale `BackendState` check parses the JSON; the pretty-printed
+  output never matched the compact substring.
+- Re-running `setup --network tailscale|headscale` leaves an already-joined
+  node alone. It used to wipe `/var/lib/tailscale` every run and re-up with
+  the spent one-time key, logging the server out of the mesh.
+- A failed mesh join reports the provider's output (e.g. `invalid key`)
+  instead of a bare wait timeout.
+- `setup` installs cron (backup and autodeploy schedules need it; Debian 13
+  cloud images ship without it) and `doctor` checks for it.
+- The first-deploy DNS check accepts the server's own interface addresses,
+  so a server registered by its Tailscale IP no longer refuses a public
+  domain that points at its public IP.
+
 ## [0.1.47] - 2026-10-21
 
 ### Fixed

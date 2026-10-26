@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"strings"
@@ -55,9 +56,9 @@ func NewProvider(cfg Config) (Provider, error) {
 // key) to a private temp file on the server and returns its generated
 // path (C08): the credential must never enter a command string — the
 // session shell's argv sits in the server's process list for the life
-// of the join. The consuming shell (EnvVarJoinShell) reads the file
-// into the provider's env var, removes the file BEFORE exec'ing the
-// provider, so the on-disk window is upload-to-join. An upload failure
+// of the join. The consuming shell (EnvVarJoinShell for netbird,
+// TailscaleJoinShell for tailscale/headscale) removes the file, so the
+// on-disk window is upload-to-join. An upload failure
 // aborts before anything joins.
 func StageJoinCredential(ctx context.Context, exec ssh.Executor, credential string) (string, error) {
 	var suffix [8]byte
@@ -78,6 +79,30 @@ func StageJoinCredential(ctx context.Context, exec ssh.Executor, credential stri
 func EnvVarJoinShell(envVar, keyPath, tail string) string {
 	inner := fmt.Sprintf(`k=$(cat %s) && rm -f -- %s && export %s="$k" && exec %s`, keyPath, keyPath, envVar, tail)
 	return "sh -c " + ssh.ShellQuote(inner)
+}
+
+// TailscaleJoinShell renders `sh -c 'tailscale up --auth-key=file:KEY
+// flags; remove KEY'`, quoted for one outer shell level. The tailscale
+// CLI does not read TS_AUTHKEY (verified on 1.104: with only the env var
+// set, `tailscale up` falls back to an interactive login URL and the
+// join never completes), so the key rides the CLI's file: form of
+// --auth-key — the path, never the credential, is in the argv (C08).
+// The file is removed when the CLI exits, success or not. keyPath must
+// be a path StageJoinCredential generated.
+func TailscaleJoinShell(keyPath, flags string) string {
+	inner := fmt.Sprintf(`tailscale up --auth-key=file:%s %s; rc=$?; rm -f -- %s; exit $rc`, keyPath, flags, keyPath)
+	return "sh -c " + ssh.ShellQuote(inner)
+}
+
+// TailscaleRunning reports whether `tailscale status --json` output shows
+// a running backend. The JSON is pretty-printed (`"BackendState":
+// "Running"`, with a space), so a compact-form substring check never
+// matched: an already-joined node looked unjoined and was re-upped with
+// its spent one-time key, which logged it out of the tailnet (2026-10-25
+// live finding on a re-run of `teploy setup`).
+func TailscaleRunning(out string) bool {
+	var st struct{ BackendState string }
+	return json.Unmarshal([]byte(out), &st) == nil && st.BackendState == "Running"
 }
 
 // --- Tailscale ---
@@ -105,7 +130,7 @@ func (t *TailscaleProvider) Install(ctx context.Context, exec ssh.Executor, w io
 
 func (t *TailscaleProvider) Join(ctx context.Context, exec ssh.Executor) error {
 	out, err := exec.Run(ctx, t.Sudo+"tailscale status --json 2>/dev/null")
-	if err == nil && strings.Contains(out, `"BackendState":"Running"`) {
+	if err == nil && TailscaleRunning(out) {
 		return nil // already connected
 	}
 	// Run tailscale up in the background. Tailscale modifies iptables which can kill
@@ -115,13 +140,13 @@ func (t *TailscaleProvider) Join(ctx context.Context, exec ssh.Executor) error {
 	if err != nil {
 		return err
 	}
-	cmd := t.Sudo + "nohup " + EnvVarJoinShell("TS_AUTHKEY", keyPath, "tailscale up --accept-routes") +
+	cmd := t.Sudo + "nohup " + TailscaleJoinShell(keyPath, "--accept-routes") +
 		" >/dev/null 2>&1 & sleep 3 && " + t.Sudo + "tailscale status --json 2>/dev/null | grep -q Running"
 	if _, err := exec.Run(ctx, cmd); err != nil {
 		// SSH disconnect during tailscale up is expected — the iptables change can kill the connection.
 		// Check if tailscale actually joined by trying status again.
 		out, statusErr := exec.Run(ctx, t.Sudo+"tailscale status --json 2>/dev/null")
-		if statusErr == nil && strings.Contains(out, `"BackendState":"Running"`) {
+		if statusErr == nil && TailscaleRunning(out) {
 			return nil // joined successfully despite SSH hiccup
 		}
 		return fmt.Errorf("joining tailscale mesh: %w", err)
@@ -172,7 +197,7 @@ func (h *HeadscaleProvider) Install(ctx context.Context, exec ssh.Executor, w io
 
 func (h *HeadscaleProvider) Join(ctx context.Context, exec ssh.Executor) error {
 	out, err := exec.Run(ctx, h.Sudo+"tailscale status --json 2>/dev/null")
-	if err == nil && strings.Contains(out, `"BackendState":"Running"`) {
+	if err == nil && TailscaleRunning(out) {
 		return nil
 	}
 	// Same private-file credential transport as TailscaleProvider.Join
@@ -181,12 +206,11 @@ func (h *HeadscaleProvider) Join(ctx context.Context, exec ssh.Executor) error {
 	if err != nil {
 		return err
 	}
-	tail := "tailscale up --login-server=" + ssh.ShellQuote(h.Server) + " --accept-routes"
-	cmd := h.Sudo + "nohup " + EnvVarJoinShell("TS_AUTHKEY", keyPath, tail) +
+	cmd := h.Sudo + "nohup " + TailscaleJoinShell(keyPath, "--login-server="+ssh.ShellQuote(h.Server)+" --accept-routes") +
 		" >/dev/null 2>&1 & sleep 3 && " + h.Sudo + "tailscale status --json 2>/dev/null | grep -q Running"
 	if _, err := exec.Run(ctx, cmd); err != nil {
 		out, statusErr := exec.Run(ctx, h.Sudo+"tailscale status --json 2>/dev/null")
-		if statusErr == nil && strings.Contains(out, `"BackendState":"Running"`) {
+		if statusErr == nil && TailscaleRunning(out) {
 			return nil
 		}
 		return fmt.Errorf("joining headscale mesh: %w", err)

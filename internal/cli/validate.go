@@ -14,7 +14,6 @@ import (
 	"github.com/useteploy/teploy/internal/build"
 	"github.com/useteploy/teploy/internal/caddy"
 	"github.com/useteploy/teploy/internal/config"
-	"github.com/useteploy/teploy/internal/dns"
 	"github.com/useteploy/teploy/internal/ssh"
 )
 
@@ -105,7 +104,7 @@ func runValidate(flags *Flags) error {
 				// front (Cloudflare Tunnel / nginx / ALB) serves the domain, so
 				// it legitimately resolves there, not to the server IP.
 				if appCfg.Domain != "" && appCfg.Ingress != config.IngressExternal {
-					if err := dns.Validate(appCfg.Domain, host, nil); err != nil {
+					if err := validateDomainDNS(ctx, executor, appCfg.Domain, host); err != nil {
 						result.Warns = append(result.Warns, fmt.Sprintf("DNS: %v", err))
 					}
 				}

@@ -87,6 +87,10 @@ func Connect(ctx context.Context, cfg ConnectConfig) (*RemoteExecutor, error) {
 	}
 
 	var hostKeyCallback gossh.HostKeyCallback
+	var hostKeyAlgorithms []string
+	if home, homeErr := os.UserHomeDir(); homeErr == nil {
+		hostKeyAlgorithms = knownHostKeyAlgorithms(filepath.Join(home, ".ssh", "known_hosts"), host)
+	}
 	if cfg.AcceptNewHost {
 		home, err := os.UserHomeDir()
 		if err != nil {
@@ -102,9 +106,10 @@ func Connect(ctx context.Context, cfg ConnectConfig) (*RemoteExecutor, error) {
 	}
 
 	clientConfig := &gossh.ClientConfig{
-		User:            cfg.User,
-		Auth:            authMethods,
-		HostKeyCallback: hostKeyCallback,
+		User:              cfg.User,
+		Auth:              authMethods,
+		HostKeyCallback:   hostKeyCallback,
+		HostKeyAlgorithms: hostKeyAlgorithms,
 	}
 
 	client, err := dialWithContext(ctx, "tcp", host, clientConfig)
@@ -281,9 +286,11 @@ func (e *RemoteExecutor) runDetailed(ctx context.Context, cmd string, stdin io.R
 // normal 022 umask a freshly created secret file was briefly world-readable,
 // an interrupted write left a half-written destination, and a pre-existing
 // symlink at the destination was followed. All three are closed here:
-// mktemp(1) creates the temp 0600, umask 077 keeps it that way until the
-// requested mode is applied BEFORE any content lands, cat streams stdin
-// without buffering, and mv -f renames on the same filesystem (replacing a
+// mktemp(1) creates the temp 0600, umask 077 keeps it that way while cat
+// streams stdin in, the requested mode is applied only once the content is
+// complete (applying it first broke read-only modes such as a 0440 sudoers
+// drop-in for any non-root user, since the owner then cannot write its own
+// temp; root bypassed the check, which is why it only failed off-root), and mv -f renames on the same filesystem (replacing a
 // destination symlink itself, not its target). Readers of remotePath see
 // either the old file or the complete new one, never a partial write.
 func (e *RemoteExecutor) Upload(ctx context.Context, content io.Reader, remotePath string, mode string) error {
@@ -291,7 +298,7 @@ func (e *RemoteExecutor) Upload(ctx context.Context, content io.Reader, remotePa
 	dir := path.Dir(remotePath)
 
 	script := fmt.Sprintf(
-		`umask 077 && mkdir -p %s && tmp=$(mktemp %s) && trap 'rm -f -- "$tmp"' EXIT HUP INT TERM && chmod %s "$tmp" && cat > "$tmp" && mv -fT -- "$tmp" %s && trap - EXIT HUP INT TERM`,
+		`umask 077 && mkdir -p %s && tmp=$(mktemp %s) && trap 'rm -f -- "$tmp"' EXIT HUP INT TERM && cat > "$tmp" && chmod %s "$tmp" && mv -fT -- "$tmp" %s && trap - EXIT HUP INT TERM`,
 		ShellQuote(dir),
 		ShellQuote(dir+"/.teploy-upload.XXXXXXXX"),
 		ShellQuote(mode),

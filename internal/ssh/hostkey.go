@@ -222,3 +222,53 @@ func hostsKnownUnder(knownHostsPath string, key gossh.PublicKey) []string {
 	}
 	return hosts
 }
+
+// knownHostKeyAlgorithms returns the host-key algorithms to offer for a
+// host already on file, so negotiation picks a key known_hosts can
+// verify. Without it the server's preference wins: a host first trusted
+// by stock ssh(1) (which records ed25519) fails with a mismatch when Go
+// negotiates ecdsa (2026-10-25 live finding, fresh OVH Debian 13 box).
+// An unknown host, or an unreadable file, yields nil — Go's defaults.
+func knownHostKeyAlgorithms(knownHostsPath, hostport string) []string {
+	cb, err := loadKnownHosts(knownHostsPath)
+	if err != nil || cb == nil {
+		return nil
+	}
+	remote := &net.TCPAddr{IP: net.IPv4zero}
+	if h, _, splitErr := net.SplitHostPort(hostport); splitErr == nil {
+		if ip := net.ParseIP(h); ip != nil {
+			remote.IP = ip
+		}
+	}
+	var keyErr *knownhosts.KeyError
+	if err := cb(hostport, remote, probeHostKey{}); !errors.As(err, &keyErr) || len(keyErr.Want) == 0 {
+		return nil
+	}
+	var algos []string
+	seen := map[string]bool{}
+	add := func(a string) {
+		if !seen[a] {
+			seen[a] = true
+			algos = append(algos, a)
+		}
+	}
+	for _, known := range keyErr.Want {
+		switch t := known.Key.Type(); t {
+		case gossh.KeyAlgoRSA:
+			add(gossh.KeyAlgoRSASHA512)
+			add(gossh.KeyAlgoRSASHA256)
+			add(gossh.KeyAlgoRSA)
+		default:
+			add(t)
+		}
+	}
+	return algos
+}
+
+// probeHostKey is a key no known_hosts line can match; verifying it
+// makes knownhosts report every key on file for the host.
+type probeHostKey struct{}
+
+func (probeHostKey) Type() string                          { return "teploy-probe" }
+func (probeHostKey) Marshal() []byte                       { return []byte("teploy-probe") }
+func (probeHostKey) Verify([]byte, *gossh.Signature) error { return errors.New("probe key") }
