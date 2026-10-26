@@ -29,6 +29,10 @@ var validDomain = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9.-]+[a-zA-Z0-9]$`)
 // validPlatform matches Docker platform strings like linux/amd64, linux/arm64, linux/arm/v7.
 var validPlatform = regexp.MustCompile(`^[a-z]+/[a-z0-9]+(/v[0-9]+)?$`)
 
+// validRuntime matches a Docker runtime name as registered on the server
+// (runc, runsc, kata-*, …): letters, digits, dot, dash, underscore.
+var validRuntime = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]*$`)
+
 // validMemory matches Docker's memory-limit syntax: a positive number with an
 // optional b/k/m/g suffix ("512m", "8g", "1.5g", "536870912"). Docker rejects
 // anything else, and it does so when the container starts — i.e. mid-deploy,
@@ -551,6 +555,13 @@ type AppConfig struct {
 	// Single-replica only (see Validate) — a fixed host port can't be shared.
 	Publish    []string `yaml:"publish,omitempty" toml:"publish"`
 	Platform   string   `yaml:"platform,omitempty" toml:"platform"`
+	// Runtime names a Docker runtime registered on the server (e.g. "runsc",
+	// gVisor) that this app's containers run under. The motivating case is a
+	// container that drives a browser at hostile pages: Chromium's own sandbox
+	// is the first wall, the runtime is the kernel boundary behind it. An
+	// unknown name surfaces Docker's own error at container start, and drift
+	// detects the flag like any other run argument.
+	Runtime  string   `yaml:"runtime,omitempty" toml:"runtime"`
 	BuildLocal bool     `yaml:"build_local,omitempty" toml:"build_local"`
 	// Dockerfile names the Dockerfile to build from, resolved relative to
 	// Context (default "Dockerfile"). Set it when a monorepo's Dockerfile
@@ -1097,6 +1108,9 @@ func (c *AppConfig) validate() error {
 	}
 	if c.Platform != "" && !validPlatform.MatchString(c.Platform) {
 		return fmt.Errorf("'platform' must be os/arch (e.g. linux/amd64, linux/arm64), got %q", c.Platform)
+	}
+	if c.Runtime != "" && !validRuntime.MatchString(c.Runtime) {
+		return fmt.Errorf("'runtime' must be a runtime name (e.g. runsc), got %q", c.Runtime)
 	}
 	// 0 means "default" (80); anything else must be a real port. Direct
 	// construction of the deploy Config bypasses config-file parsing, so
@@ -1662,6 +1676,9 @@ func mergeConfigs(base, overlay *AppConfig) {
 	}
 	if overlay.Platform != "" {
 		base.Platform = overlay.Platform
+	}
+	if overlay.Runtime != "" {
+		base.Runtime = overlay.Runtime
 	}
 	if overlay.BuildLocal {
 		base.BuildLocal = overlay.BuildLocal

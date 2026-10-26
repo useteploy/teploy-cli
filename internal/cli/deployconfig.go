@@ -29,6 +29,7 @@ func deployConfigFromApp(appCfg *config.AppConfig, image, version string, envFil
 		Bind:            appCfg.Bind,
 		ContainerPort:   appCfg.Port,
 		Publish:         appCfg.Publish,
+		Runtime:         appCfg.Runtime,
 		StopTimeout:     appCfg.StopTimeout,
 		DrainSeconds:    appCfg.DrainSeconds,
 		Memory:          appCfg.Memory,

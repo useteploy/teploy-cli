@@ -73,6 +73,9 @@ type Config struct {
 	// Bind is the host IP that ingress:host publishes the fixed port on
 	// (default 0.0.0.0 for host ingress). Ignored for caddy/external.
 	Bind          string
+	// Runtime names a Docker runtime (config.Runtime) the containers run
+	// under — see AppConfig.Runtime.
+	Runtime       string
 	Memory        string
 	CPU           string
 	ContainerPort int // internal container port (default 80)
@@ -819,6 +822,7 @@ func (d *Deployer) deployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 			Cmd:           processes["web"],
 			Memory:        cfg.Memory,
 			CPU:           cfg.CPU,
+			Runtime:       cfg.Runtime,
 			Name:          name,
 			NoHealthcheck: cfg.NoHealthcheck["web"],
 		}, guardPrefix)
@@ -954,6 +958,7 @@ func (d *Deployer) deployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 			Cmd:           processes[process],
 			Memory:        cfg.Memory,
 			CPU:           cfg.CPU,
+			Runtime:       cfg.Runtime,
 			NoHealthcheck: cfg.NoHealthcheck[process],
 		}, guardPrefix)
 		if err != nil {

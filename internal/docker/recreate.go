@@ -78,6 +78,7 @@ type RecreateSpec struct {
 	MemoryBytes    int64             `json:"memory_bytes,omitempty"`
 	NanoCPUs       int64             `json:"nano_cpus,omitempty"`
 	RestartPolicy  string            `json:"restart_policy,omitempty"`
+	Runtime        string            `json:"runtime,omitempty"` // HostConfig.Runtime; re-applied so a recreated container keeps its kernel boundary
 	StopTimeout    int               `json:"stop_timeout,omitempty"`
 	StopSignal     string            `json:"stop_signal,omitempty"`
 	LogDriver      string            `json:"log_driver,omitempty"`
@@ -140,8 +141,9 @@ type containerInspect struct {
 		RestartPolicy struct {
 			Name string
 		}
-		Memory    int64 // bytes
-		NanoCpus  int64 // nano-CPUs (1 CPU = 1e9)
+		Runtime  string // HostConfig.Runtime (runc, runsc, …)
+		Memory   int64  // bytes
+		NanoCpus int64  // nano-CPUs (1 CPU = 1e9)
 		LogConfig struct {
 			Type   string
 			Config map[string]string
@@ -212,6 +214,7 @@ func specFromInspect(name string, in containerInspect) (*RecreateSpec, error) {
 		MemoryBytes:    in.HostConfig.Memory,
 		NanoCPUs:       in.HostConfig.NanoCpus,
 		RestartPolicy:  in.HostConfig.RestartPolicy.Name,
+		Runtime:        in.HostConfig.Runtime,
 		LogDriver:      in.HostConfig.LogConfig.Type,
 		ExtraHosts:     append([]string(nil), in.HostConfig.ExtraHosts...),
 		Sysctls:        in.HostConfig.Sysctls,
@@ -402,6 +405,10 @@ func RenderRecreateArgs(spec *RecreateSpec) ([]string, error) {
 
 	if spec.RestartPolicy != "" && spec.RestartPolicy != "no" {
 		args = append(args, "--restart", q(spec.RestartPolicy))
+	}
+
+	if spec.Runtime != "" {
+		args = append(args, "--runtime", q(spec.Runtime))
 	}
 
 	if spec.WorkingDir != "" {
