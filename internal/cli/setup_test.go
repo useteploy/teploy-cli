@@ -574,8 +574,12 @@ func TestJoinVPNMesh_StagesPrivateFileAndCleansUp(t *testing.T) {
 		ssh.MockCommand{Match: "nohup sh -c", Output: ""},
 	)
 	cfg := network.Config{Provider: "tailscale", AuthKey: "tskey-auth-x"}
-	if err := joinVPNMesh(context.Background(), mock, "", "tailscale", cfg); err != nil {
+	joinLog, err := joinVPNMesh(context.Background(), mock, "", "tailscale", cfg)
+	if err != nil {
 		t.Fatalf("joinVPNMesh: %v", err)
+	}
+	if !strings.HasPrefix(joinLog, "/tmp/teploy-vpn-key-") || !strings.HasSuffix(joinLog, ".log") {
+		t.Errorf("join log must be per run, beside the staged key: %q", joinLog)
 	}
 	uploads := 0
 	for _, call := range mock.Calls {

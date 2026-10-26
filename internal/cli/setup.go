@@ -349,7 +349,8 @@ func setupNetwork(ctx context.Context, exec ssh.Executor, w io.Writer, providerN
 	// Tailscale/Headscale modifies iptables which can kill the SSH connection,
 	// so detach the join and use the reconnecting authenticated executor to observe it.
 	fmt.Fprintf(w, "Joining %s mesh...\n", providerName)
-	if err := joinVPNMesh(ctx, exec, sudo, providerName, cfg); err != nil {
+	joinLog, err := joinVPNMesh(ctx, exec, sudo, providerName, cfg)
+	if err != nil {
 		return "", err
 	}
 
@@ -370,7 +371,7 @@ func setupNetwork(ctx context.Context, exec ssh.Executor, w io.Writer, providerN
 		}
 		select {
 		case <-waitCtx.Done():
-			if out, _ := exec.Run(ctx, "tail -n 3 "+vpnJoinLog+" 2>/dev/null"); strings.TrimSpace(out) != "" {
+			if out, _ := exec.Run(ctx, "tail -n 3 "+joinLog+" 2>/dev/null"); strings.TrimSpace(out) != "" {
 				return "", fmt.Errorf("waiting for %s address: %w; join output: %s", providerName, waitCtx.Err(), strings.TrimSpace(out))
 			}
 			return "", fmt.Errorf("waiting for %s address: %w", providerName, waitCtx.Err())
@@ -378,6 +379,7 @@ func setupNetwork(ctx context.Context, exec ssh.Executor, w io.Writer, providerN
 		}
 	}
 
+	_, _ = exec.Run(ctx, "rm -f -- "+joinLog)
 	fmt.Fprintf(w, "  VPN IP: %s\n", vpnIP)
 	return vpnIP, nil
 }
@@ -406,26 +408,29 @@ func vpnCredential(providerName string, cfg network.Config) (envVar, value strin
 // setup with the file path named (nothing was joined); a join failure
 // after that surfaces through the tailnet wait below, and the key file
 // is gone regardless — its only reader is the rm-ing shell itself.
-func joinVPNMesh(ctx context.Context, exec ssh.Executor, sudo, providerName string, cfg network.Config) error {
+func joinVPNMesh(ctx context.Context, exec ssh.Executor, sudo, providerName string, cfg network.Config) (string, error) {
 	_, credential, err := vpnCredential(providerName, cfg)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if credential == "" {
-		return fmt.Errorf("%s join credential is empty", providerName)
+		return "", fmt.Errorf("%s join credential is empty", providerName)
 	}
 	keyPath, err := network.StageJoinCredential(ctx, exec, credential)
 	if err != nil {
-		return err
+		return "", err
 	}
 	_, _ = exec.Run(ctx, vpnJoinCommand(providerName, cfg, sudo, keyPath))
-	return nil
+	return vpnJoinLog(keyPath), nil
 }
 
-// vpnJoinLog captures the detached join's output so a rejected key
-// surfaces as the provider's own error rather than a bare wait timeout.
-// It never holds the credential: the key is passed by file path.
-const vpnJoinLog = "/tmp/teploy-vpn-join.log"
+// vpnJoinLog is where the detached join's output lands, so a rejected
+// key surfaces as the provider's own error rather than a bare wait
+// timeout. Per run (derived from the random key path): a fixed /tmp name
+// owned by one user cannot be reopened by another under Debian's
+// fs.protected_regular, which would fail the redirect and the join with
+// it. It never holds the credential — the key is passed by file path.
+func vpnJoinLog(keyPath string) string { return keyPath + ".log" }
 
 // vpnJoinCommand renders the detached join: tailscale/headscale read the
 // key file via --auth-key=file: and remove it on exit; netbird `cat`s it
@@ -442,7 +447,7 @@ func vpnJoinCommand(providerName string, cfg network.Config, sudo, keyPath strin
 		envVar, _, _ := vpnCredential(providerName, cfg)
 		join = network.EnvVarJoinShell(envVar, keyPath, "netbird up")
 	}
-	return sudo + "nohup " + join + " >" + vpnJoinLog + " 2>&1 &"
+	return sudo + "nohup " + join + " >" + vpnJoinLog(keyPath) + " 2>&1 &"
 }
 
 // runLocal executes a command on the local machine and returns its output.
