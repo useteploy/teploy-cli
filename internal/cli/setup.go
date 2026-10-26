@@ -312,9 +312,22 @@ func setupNetwork(ctx context.Context, exec ssh.Executor, w io.Writer, providerN
 		return "", fmt.Errorf("installing %s: %w", providerName, err)
 	}
 
-	// Reset Tailscale state if present — cloned VMs inherit the previous machine's identity
-	// which causes IP conflicts. Stop tailscaled, wipe state, restart.
 	if providerName == "tailscale" || providerName == "headscale" {
+		// An already-joined node is left alone: the reset below used to run
+		// on every setup, so re-running `teploy setup --network` wiped a
+		// working node's identity and re-upped it with a (typically spent)
+		// one-time key — logging the server out of the mesh (2026-10-25
+		// live finding). A clone that inherited another machine's identity
+		// needs `tailscale logout` on it first.
+		if out, err := exec.Run(ctx, sudo+"tailscale status --json 2>/dev/null"); err == nil && network.TailscaleRunning(out) {
+			if vpnIP, err := provider.GetIP(ctx, exec); err == nil && net.ParseIP(vpnIP) != nil {
+				fmt.Fprintf(w, "  Already on the %s mesh (to re-enroll a cloned VM, run `tailscale logout` on it first)\n", providerName)
+				fmt.Fprintf(w, "  VPN IP: %s\n", vpnIP)
+				return vpnIP, nil
+			}
+		}
+		// Not joined: reset any inherited state — cloned VMs carry the
+		// previous machine's identity, which causes IP conflicts.
 		exec.Run(ctx, sudo+"systemctl stop tailscaled 2>/dev/null; "+sudo+"rm -rf /var/lib/tailscale; "+sudo+"systemctl start tailscaled 2>/dev/null; true")
 	}
 
@@ -336,7 +349,8 @@ func setupNetwork(ctx context.Context, exec ssh.Executor, w io.Writer, providerN
 	// Tailscale/Headscale modifies iptables which can kill the SSH connection,
 	// so detach the join and use the reconnecting authenticated executor to observe it.
 	fmt.Fprintf(w, "Joining %s mesh...\n", providerName)
-	if err := joinVPNMesh(ctx, exec, sudo, providerName, cfg); err != nil {
+	joinLog, err := joinVPNMesh(ctx, exec, sudo, providerName, cfg)
+	if err != nil {
 		return "", err
 	}
 
@@ -357,18 +371,22 @@ func setupNetwork(ctx context.Context, exec ssh.Executor, w io.Writer, providerN
 		}
 		select {
 		case <-waitCtx.Done():
+			if out, _ := exec.Run(ctx, "tail -n 3 "+joinLog+" 2>/dev/null"); strings.TrimSpace(out) != "" {
+				return "", fmt.Errorf("waiting for %s address: %w; join output: %s", providerName, waitCtx.Err(), strings.TrimSpace(out))
+			}
 			return "", fmt.Errorf("waiting for %s address: %w", providerName, waitCtx.Err())
 		case <-time.After(2 * time.Second):
 		}
 	}
 
+	_, _ = exec.Run(ctx, "rm -f -- "+joinLog)
 	fmt.Fprintf(w, "  VPN IP: %s\n", vpnIP)
 	return vpnIP, nil
 }
 
 // vpnCredential resolves the provider's join credential and the env var
-// its CLI documents for it (tailscale up reads TS_AUTHKEY, netbird up
-// reads NB_SETUP_KEY).
+// its CLI documents for it (netbird up reads NB_SETUP_KEY; the tailscale
+// name is unused — its CLI ignores TS_AUTHKEY, see TailscaleJoinShell).
 func vpnCredential(providerName string, cfg network.Config) (envVar, value string, err error) {
 	switch providerName {
 	case "tailscale", "headscale":
@@ -390,37 +408,46 @@ func vpnCredential(providerName string, cfg network.Config) (envVar, value strin
 // setup with the file path named (nothing was joined); a join failure
 // after that surfaces through the tailnet wait below, and the key file
 // is gone regardless — its only reader is the rm-ing shell itself.
-func joinVPNMesh(ctx context.Context, exec ssh.Executor, sudo, providerName string, cfg network.Config) error {
+func joinVPNMesh(ctx context.Context, exec ssh.Executor, sudo, providerName string, cfg network.Config) (string, error) {
 	_, credential, err := vpnCredential(providerName, cfg)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if credential == "" {
-		return fmt.Errorf("%s join credential is empty", providerName)
+		return "", fmt.Errorf("%s join credential is empty", providerName)
 	}
 	keyPath, err := network.StageJoinCredential(ctx, exec, credential)
 	if err != nil {
-		return err
+		return "", err
 	}
 	_, _ = exec.Run(ctx, vpnJoinCommand(providerName, cfg, sudo, keyPath))
-	return nil
+	return vpnJoinLog(keyPath), nil
 }
 
-// vpnJoinCommand renders the detached join: `cat` the key file into the
-// provider's env var, remove the file, then exec the provider. The
+// vpnJoinLog is where the detached join's output lands, so a rejected
+// key surfaces as the provider's own error rather than a bare wait
+// timeout. Per run (derived from the random key path): a fixed /tmp name
+// owned by one user cannot be reopened by another under Debian's
+// fs.protected_regular, which would fail the redirect and the join with
+// it. It never holds the credential — the key is passed by file path.
+func vpnJoinLog(keyPath string) string { return keyPath + ".log" }
+
+// vpnJoinCommand renders the detached join: tailscale/headscale read the
+// key file via --auth-key=file: and remove it on exit; netbird `cat`s it
+// into NB_SETUP_KEY, removes it, then execs. The
 // login-server URL (headscale) is not a secret and stays a plain flag.
 func vpnJoinCommand(providerName string, cfg network.Config, sudo, keyPath string) string {
-	envVar, _, _ := vpnCredential(providerName, cfg)
-	var tail string
+	var join string
 	switch providerName {
 	case "tailscale":
-		tail = "tailscale up --accept-routes"
+		join = network.TailscaleJoinShell(keyPath, "--accept-routes")
 	case "headscale":
-		tail = "tailscale up --login-server=" + ssh.ShellQuote(cfg.Server) + " --accept-routes"
+		join = network.TailscaleJoinShell(keyPath, "--login-server="+ssh.ShellQuote(cfg.Server)+" --accept-routes")
 	case "netbird":
-		tail = "netbird up"
+		envVar, _, _ := vpnCredential(providerName, cfg)
+		join = network.EnvVarJoinShell(envVar, keyPath, "netbird up")
 	}
-	return sudo + "nohup " + network.EnvVarJoinShell(envVar, keyPath, tail) + " >/dev/null 2>&1 &"
+	return sudo + "nohup " + join + " >" + vpnJoinLog(keyPath) + " 2>&1 &"
 }
 
 // runLocal executes a command on the local machine and returns its output.
@@ -522,9 +549,9 @@ type setupEnv struct {
 
 // serverTools are the packages teploy needs on every server beyond docker
 // and rsync; serverToolsProbe prints the missing ones, space separated.
-var serverTools = []string{"git", "python3"}
+var serverTools = []string{"git", "python3", "cron"}
 
-const serverToolsProbe = "for t in git python3; do command -v $t >/dev/null 2>&1 || printf '%s ' $t; done; true"
+const serverToolsProbe = "for t in git python3; do command -v $t >/dev/null 2>&1 || printf '%s ' $t; done; command -v crontab >/dev/null 2>&1 || printf 'cron '; true"
 
 // setupStages is the ordered provisioning plan. The ORDER is part of
 // the contract: docker before the network that needs it, the network
@@ -604,17 +631,17 @@ func setupStages() []setupStage {
 			},
 		},
 		{
-			name:    "git and python3",
-			affects: "git and python3 packages (apt, if missing) — state writes need python3, server-side config and checkouts need git",
+			name:    "git, python3 and cron",
+			affects: "git, python3 and cron packages (apt, if missing) — state writes need python3, server-side config and checkouts need git, backup and autodeploy schedules need cron",
 			run: func(ctx context.Context, exec ssh.Executor, w io.Writer, env *setupEnv) error {
-				fmt.Fprintln(w, "Checking git and python3...")
+				fmt.Fprintln(w, "Checking git, python3 and cron...")
 				out, err := exec.Run(ctx, serverToolsProbe)
 				if err != nil {
 					return fmt.Errorf("probing server tools: %w", err)
 				}
 				missing := strings.Fields(out)
 				if len(missing) == 0 {
-					fmt.Fprintln(w, "  git and python3 already installed")
+					fmt.Fprintln(w, "  git, python3 and cron already installed")
 					return nil
 				}
 				fmt.Fprintf(w, "  Installing %s...\n", strings.Join(missing, ", "))
@@ -665,7 +692,7 @@ func setupStages() []setupStage {
 			run: func(ctx context.Context, exec ssh.Executor, w io.Writer, env *setupEnv) error {
 				// 3. Check firewall
 				fmt.Fprintln(w, "Checking firewall...")
-				ufwOutput, ufwErr := exec.Run(ctx, "ufw status 2>/dev/null")
+				ufwOutput, ufwErr := exec.Run(ctx, env.sudo+"ufw status 2>/dev/null")
 				if ufwErr == nil && strings.Contains(ufwOutput, "Status: active") {
 					_, err1 := exec.Run(ctx, env.sudo+"ufw allow 80/tcp")
 					_, err2 := exec.Run(ctx, env.sudo+"ufw allow 443/tcp")

@@ -121,11 +121,8 @@ func TestTailscaleJoin_Fresh(t *testing.T) {
 			if strings.Contains(call, "tskey-auth-xxx") || strings.Contains(call, "--authkey=") {
 				t.Errorf("the auth key must never ride the argv (C08), got: %s", call)
 			}
-			if !strings.Contains(call, `export TS_AUTHKEY="$k"`) {
-				t.Errorf("the key must ride TS_AUTHKEY from the staged file, got: %s", call)
-			}
-			if !strings.Contains(call, "exec tailscale up --accept-routes") {
-				t.Errorf("join must exec tailscale up with --accept-routes, got: %s", call)
+			if !strings.Contains(call, "tailscale up --auth-key=file:/tmp/teploy-vpn-key-") || !strings.Contains(call, "--accept-routes") {
+				t.Errorf("join must pass the staged file via --auth-key=file: with --accept-routes, got: %s", call)
 			}
 		}
 	}
@@ -203,8 +200,8 @@ func TestHeadscaleJoin_UsesLoginServer(t *testing.T) {
 			if strings.Contains(call, "key123") || strings.Contains(call, "--authkey=") {
 				t.Errorf("the auth key must never ride the argv (C08), got: %s", call)
 			}
-			if !strings.Contains(call, `export TS_AUTHKEY="$k"`) {
-				t.Errorf("the key must ride TS_AUTHKEY from the staged file, got: %s", call)
+			if !strings.Contains(call, "--auth-key=file:/tmp/teploy-vpn-key-") {
+				t.Errorf("join must pass the staged file via --auth-key=file:, got: %s", call)
 			}
 		}
 	}
@@ -331,5 +328,21 @@ func TestNetbirdGetIP_NoIP(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "could not determine netbird IP") {
 		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestTailscaleRunningParsesPrettyJSON(t *testing.T) {
+	for _, tc := range []struct {
+		out  string
+		want bool
+	}{
+		{"{\n  \"Version\": \"1.104.2\",\n  \"BackendState\": \"Running\"\n}", true},
+		{`{"BackendState":"Running"}`, true},
+		{"{\n  \"BackendState\": \"NeedsLogin\"\n}", false},
+		{"", false},
+	} {
+		if got := TailscaleRunning(tc.out); got != tc.want {
+			t.Errorf("TailscaleRunning(%q) = %v, want %v", tc.out, got, tc.want)
+		}
 	}
 }

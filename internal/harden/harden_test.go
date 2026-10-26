@@ -18,7 +18,7 @@ func TestConfigureUFW_AlreadyInstalled(t *testing.T) {
 		ssh.MockCommand{Match: "sudo ufw allow 22/tcp", Output: ""},
 		ssh.MockCommand{Match: "sh -c 'set -eu; backup=", Output: ""},
 		ssh.MockCommand{Match: "sudo sh -c 'set -eu; backup=", Output: ""},
-		ssh.MockCommand{Match: "which ufw", Output: "/usr/sbin/ufw"},
+		ssh.MockCommand{Match: "sh -c 'command -v ufw'", Output: "/usr/sbin/ufw"},
 		ssh.MockCommand{Match: "ufw default deny incoming && ufw default allow outgoing", Output: ""},
 		ssh.MockCommand{Match: "ufw allow 22/tcp && ufw allow 80/tcp && ufw allow 443/tcp", Output: ""},
 		ssh.MockCommand{Match: `sh -c 'echo "y" | ufw enable'`, Output: "Firewall is active"},
@@ -49,7 +49,7 @@ func TestConfigureUFW_FreshInstall(t *testing.T) {
 		ssh.MockCommand{Match: "sudo ufw allow 22/tcp", Output: ""},
 		ssh.MockCommand{Match: "sh -c 'set -eu; backup=", Output: ""},
 		ssh.MockCommand{Match: "sudo sh -c 'set -eu; backup=", Output: ""},
-		ssh.MockCommand{Match: "which ufw", Err: fmt.Errorf("not found")},
+		ssh.MockCommand{Match: "sh -c 'command -v ufw'", Err: fmt.Errorf("not found")},
 		ssh.MockCommand{Match: "DEBIAN_FRONTEND=noninteractive apt-get update", Output: ""},
 		ssh.MockCommand{Match: "ufw default deny incoming", Output: ""},
 		ssh.MockCommand{Match: "ufw allow 22/tcp", Output: ""},
@@ -75,7 +75,7 @@ func TestConfigureUFW_WithSudo(t *testing.T) {
 		ssh.MockCommand{Match: "sudo ufw allow 22/tcp", Output: ""},
 		ssh.MockCommand{Match: "sh -c 'set -eu; backup=", Output: ""},
 		ssh.MockCommand{Match: "sudo sh -c 'set -eu; backup=", Output: ""},
-		ssh.MockCommand{Match: "which ufw", Err: fmt.Errorf("not found")},
+		ssh.MockCommand{Match: "sudo sh -c 'command -v ufw'", Err: fmt.Errorf("not found")},
 		ssh.MockCommand{Match: "sudo DEBIAN_FRONTEND=noninteractive apt-get update", Output: ""},
 		ssh.MockCommand{Match: "sudo ufw default deny incoming", Output: ""},
 		ssh.MockCommand{Match: "sudo ufw allow 22/tcp", Output: ""},
@@ -280,7 +280,7 @@ func TestHarden_RunsAllSteps_AsRoot(t *testing.T) {
 		// detectSudo
 		ssh.MockCommand{Match: "whoami", Output: "root"},
 		// UFW
-		ssh.MockCommand{Match: "which ufw", Output: "/usr/sbin/ufw"},
+		ssh.MockCommand{Match: "sh -c 'command -v ufw'", Output: "/usr/sbin/ufw"},
 		ssh.MockCommand{Match: "ufw default deny incoming", Output: ""},
 		ssh.MockCommand{Match: "ufw allow 22/tcp", Output: ""},
 		ssh.MockCommand{Match: `sh -c 'echo "y" | ufw enable'`, Output: ""},
@@ -299,7 +299,7 @@ func TestHarden_RunsAllSteps_AsRoot(t *testing.T) {
 		ssh.MockCommand{Match: "sed -i", Output: ""},
 		ssh.MockCommand{Match: "systemctl restart sshd", Output: ""},
 		// audit
-		ssh.MockCommand{Match: "which auditctl", Output: "/usr/sbin/auditctl"},
+		ssh.MockCommand{Match: "sh -c 'command -v auditctl'", Output: "/usr/sbin/auditctl"},
 		ssh.MockCommand{Match: "mv /tmp/teploy-audit.rules", Output: ""},
 		ssh.MockCommand{Match: "augenrules --load", Output: ""},
 		ssh.MockCommand{Match: "systemctl enable --now auditd", Output: ""},
@@ -335,7 +335,7 @@ func TestHarden_RunsAllSteps_WithSudo(t *testing.T) {
 		// detectSudo
 		ssh.MockCommand{Match: "whoami", Output: "tyler"},
 		// UFW
-		ssh.MockCommand{Match: "which ufw", Output: "/usr/sbin/ufw"},
+		ssh.MockCommand{Match: "sudo sh -c 'command -v ufw'", Output: "/usr/sbin/ufw"},
 		ssh.MockCommand{Match: "sudo ufw default deny incoming", Output: ""},
 		ssh.MockCommand{Match: "sudo ufw allow 22/tcp", Output: ""},
 		ssh.MockCommand{Match: "sudo sh -c", Output: ""},
@@ -354,11 +354,11 @@ func TestHarden_RunsAllSteps_WithSudo(t *testing.T) {
 		ssh.MockCommand{Match: "sudo sed -i", Output: ""},
 		ssh.MockCommand{Match: "sudo systemctl restart sshd", Output: ""},
 		// audit
-		ssh.MockCommand{Match: "which auditctl", Output: "/usr/sbin/auditctl"},
+		ssh.MockCommand{Match: "sudo sh -c 'command -v auditctl'", Output: "/usr/sbin/auditctl"},
 		ssh.MockCommand{Match: "sudo mv /tmp/teploy-audit.rules", Output: ""},
 		ssh.MockCommand{Match: "sudo augenrules --load", Output: ""},
 		ssh.MockCommand{Match: "sudo systemctl enable --now auditd", Output: ""},
-		ssh.MockCommand{Match: "visudo -c", Output: "parsed OK"},
+		ssh.MockCommand{Match: "sudo visudo -c", Output: "parsed OK"},
 		ssh.MockCommand{Match: "sudo mv /tmp/teploy-audit-sudoers", Output: ""},
 	)
 

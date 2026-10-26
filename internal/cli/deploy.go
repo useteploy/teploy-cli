@@ -24,7 +24,6 @@ import (
 	"github.com/useteploy/teploy/internal/config"
 	"github.com/useteploy/teploy/internal/confighome"
 	"github.com/useteploy/teploy/internal/deploy"
-	"github.com/useteploy/teploy/internal/dns"
 	"github.com/useteploy/teploy/internal/docker"
 	"github.com/useteploy/teploy/internal/env"
 	"github.com/useteploy/teploy/internal/multideploy"
@@ -630,7 +629,7 @@ func deployAppConfig(flags *Flags, appCfg *config.AppConfig, serverName, image, 
 		current, _ := state.Read(ctx, executor, appCfg.App)
 		if current == nil {
 			fmt.Println("Validating DNS...")
-			if err := dns.Validate(appCfg.Domain, host, nil); err != nil {
+			if err := validateDomainDNS(ctx, executor, appCfg.Domain, host); err != nil {
 				return err
 			}
 			fmt.Println("  DNS validated")

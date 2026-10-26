@@ -24,7 +24,7 @@ func detectSudo(ctx context.Context, exec ssh.Executor) string {
 func ConfigureUFW(ctx context.Context, exec ssh.Executor, w io.Writer, sudo string) error {
 	fmt.Fprintln(w, "Configuring UFW...")
 
-	if _, err := exec.Run(ctx, "which ufw"); err != nil {
+	if _, err := exec.Run(ctx, sudo+"sh -c 'command -v ufw'"); err != nil {
 		fmt.Fprintln(w, "  Installing UFW...")
 		if _, err := exec.Run(ctx, sudo+"DEBIAN_FRONTEND=noninteractive apt-get update -qq && "+sudo+"DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ufw"); err != nil {
 			return fmt.Errorf("installing ufw: %w", err)
@@ -200,7 +200,7 @@ APT::Periodic::Unattended-Upgrade "1";
 func EnableAudit(ctx context.Context, exec ssh.Executor, w io.Writer, sudo string) error {
 	fmt.Fprintln(w, "Configuring host audit (auditd + sudo session logging)...")
 
-	if _, err := exec.Run(ctx, "which auditctl"); err != nil {
+	if _, err := exec.Run(ctx, sudo+"sh -c 'command -v auditctl'"); err != nil {
 		if _, err := exec.Run(ctx, sudo+"DEBIAN_FRONTEND=noninteractive apt-get update -qq && "+sudo+"DEBIAN_FRONTEND=noninteractive apt-get install -y -qq auditd"); err != nil {
 			return fmt.Errorf("installing auditd: %w", err)
 		}
@@ -240,7 +240,7 @@ Defaults iolog_dir="/var/log/sudo-io/%{user}"
 	}
 	// visudo -c validates BEFORE install — a broken sudoers drop-in can
 	// lock everyone out of sudo on the box.
-	if _, err := exec.Run(ctx, "visudo -c -f /tmp/teploy-audit-sudoers"); err != nil {
+	if _, err := exec.Run(ctx, sudo+"visudo -c -f /tmp/teploy-audit-sudoers"); err != nil {
 		return fmt.Errorf("sudoers audit config failed validation: %w", err)
 	}
 	if _, err := exec.Run(ctx, sudo+"mv /tmp/teploy-audit-sudoers /etc/sudoers.d/teploy-audit && "+sudo+"chown root:root /etc/sudoers.d/teploy-audit && "+sudo+"chmod 0440 /etc/sudoers.d/teploy-audit"); err != nil {

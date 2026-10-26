@@ -529,7 +529,7 @@ func TestInstallSudoViaSu_WrongPassword(t *testing.T) {
 }
 
 // TestVPNJoinCommand_NoCredentialInArgv pins the join shape: the key
-// file is read, removed, and fed via the provider env var — the literal
+// file is passed by path and removed on exit — the literal
 // credential appears nowhere in the command.
 func TestVPNJoinCommand_NoCredentialInArgv(t *testing.T) {
 	cfg := network.Config{Provider: "tailscale", AuthKey: "tskey-auth-secret123"}
@@ -539,10 +539,8 @@ func TestVPNJoinCommand_NoCredentialInArgv(t *testing.T) {
 	}
 	for _, want := range []string{
 		"nohup sh -c ",
-		"k=$(cat /tmp/teploy-vpn-key-abc)",
+		"tailscale up --auth-key=file:/tmp/teploy-vpn-key-abc --accept-routes",
 		"rm -f -- /tmp/teploy-vpn-key-abc",
-		`export TS_AUTHKEY="$k"`,
-		"exec tailscale up --accept-routes",
 	} {
 		if !strings.Contains(cmd, want) {
 			t.Errorf("join command missing %q:\n%s", want, cmd)
@@ -576,8 +574,12 @@ func TestJoinVPNMesh_StagesPrivateFileAndCleansUp(t *testing.T) {
 		ssh.MockCommand{Match: "nohup sh -c", Output: ""},
 	)
 	cfg := network.Config{Provider: "tailscale", AuthKey: "tskey-auth-x"}
-	if err := joinVPNMesh(context.Background(), mock, "", "tailscale", cfg); err != nil {
+	joinLog, err := joinVPNMesh(context.Background(), mock, "", "tailscale", cfg)
+	if err != nil {
 		t.Fatalf("joinVPNMesh: %v", err)
+	}
+	if !strings.HasPrefix(joinLog, "/tmp/teploy-vpn-key-") || !strings.HasSuffix(joinLog, ".log") {
+		t.Errorf("join log must be per run, beside the staged key: %q", joinLog)
 	}
 	uploads := 0
 	for _, call := range mock.Calls {
@@ -843,6 +845,27 @@ func TestInstallAuthorizedKey_GuardedAgainstDuplicateAppend(t *testing.T) {
 	for i, call := range mock.Calls {
 		if call != guarded {
 			t.Fatalf("attempt %d must use the guarded append:\ngot:  %s\nwant: %s", i+1, call, guarded)
+		}
+	}
+}
+
+// TestSetupNetwork_AlreadyJoinedTailscaleIsLeftAlone: a re-run of setup
+// against a node already on the tailnet must not wipe its state or re-up
+// it (the spent one-time key then logs the node out).
+func TestSetupNetwork_AlreadyJoinedTailscaleIsLeftAlone(t *testing.T) {
+	m := ssh.NewMockExecutor("h",
+		ssh.MockCommand{Match: "whoami", Output: "debian"},
+		ssh.MockCommand{Match: "which tailscale", Output: "/usr/bin/tailscale"},
+		ssh.MockCommand{Match: "sudo tailscale status --json", Output: "{\n  \"BackendState\": \"Running\"\n}"},
+		ssh.MockCommand{Match: "sudo tailscale ip -4", Output: "100.118.234.58\n"},
+	)
+	got, err := setupNetwork(context.Background(), m, &bytes.Buffer{}, "tailscale", "tskey-auth-spent")
+	if err != nil || got != "100.118.234.58" {
+		t.Fatalf("got %q, %v", got, err)
+	}
+	for _, call := range m.Calls {
+		if strings.Contains(call, "rm -rf /var/lib/tailscale") || strings.Contains(call, "tailscale up") || strings.Contains(call, "teploy-vpn-key-") {
+			t.Fatalf("already-joined node was reset or re-joined: %s", call)
 		}
 	}
 }

@@ -47,3 +47,26 @@ func Validate(domain, serverHost string, resolve Resolver) error {
 		domain, domainIPs[0], serverIPs[0], serverIPs[0],
 	)
 }
+
+// Resolves reports whether the domain resolves to any of ips. It is the
+// fallback when the server is addressed by a private or mesh IP (a
+// servers.yml host set to its Tailscale address by `teploy setup
+// --network`): public DNS points at the server's public interface, which
+// Validate's comparison against the SSH host can never match.
+func Resolves(domain string, ips []string, resolve Resolver) bool {
+	if resolve == nil {
+		resolve = net.LookupHost
+	}
+	domainIPs, err := resolve(domain)
+	if err != nil {
+		return false
+	}
+	for _, dip := range domainIPs {
+		for _, ip := range ips {
+			if dip == ip {
+				return true
+			}
+		}
+	}
+	return false
+}
