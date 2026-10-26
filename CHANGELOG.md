@@ -4,7 +4,14 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [0.1.48] - 2026-10-25
+
 ### Fixed
+
+- Every local and remote `docker build` passes `--pull`, so `FROM` tags
+  resolve to the registry's current image. A stale build-host cache used to
+  pin base images indefinitely (it shipped a pre-security-release Node from
+  a runner that had last pulled weeks earlier, 2026-10-22).
 
 Found provisioning a fresh OVH Debian 13 VPS as a non-root user with
 `--network tailscale` (2026-10-25):
