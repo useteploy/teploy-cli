@@ -76,6 +76,8 @@ type Config struct {
 	// Runtime names a Docker runtime (config.Runtime) the containers run
 	// under — see AppConfig.Runtime.
 	Runtime       string
+	// SecurityOpt is passed to docker run as --security-opt (AppConfig.SecurityOpt).
+	SecurityOpt   []string
 	Memory        string
 	CPU           string
 	ContainerPort int // internal container port (default 80)
@@ -823,6 +825,7 @@ func (d *Deployer) deployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 			Memory:        cfg.Memory,
 			CPU:           cfg.CPU,
 			Runtime:       cfg.Runtime,
+			SecurityOpt:   cfg.SecurityOpt,
 			Name:          name,
 			NoHealthcheck: cfg.NoHealthcheck["web"],
 		}, guardPrefix)
@@ -959,6 +962,7 @@ func (d *Deployer) deployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 			Memory:        cfg.Memory,
 			CPU:           cfg.CPU,
 			Runtime:       cfg.Runtime,
+			SecurityOpt:   cfg.SecurityOpt,
 			NoHealthcheck: cfg.NoHealthcheck[process],
 		}, guardPrefix)
 		if err != nil {

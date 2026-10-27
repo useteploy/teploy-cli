@@ -29,6 +29,32 @@ var validDomain = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9.-]+[a-zA-Z0-9]$`)
 // validPlatform matches Docker platform strings like linux/amd64, linux/arm64, linux/arm/v7.
 var validPlatform = regexp.MustCompile(`^[a-z]+/[a-z0-9]+(/v[0-9]+)?$`)
 
+// validateSecurityOpt admits the --security-opt forms a deploy config may set
+// and refuses the ones that remove a protection rather than shape it.
+func validateSecurityOpt(o string) error {
+	k, v, _ := strings.Cut(strings.TrimSpace(o), "=")
+	if k == "" {
+		return fmt.Errorf("'security_opt' entry is empty")
+	}
+	switch k {
+	case "seccomp", "apparmor":
+		if v == "" || strings.EqualFold(v, "unconfined") {
+			return fmt.Errorf("'security_opt' %q must name a profile, not disable it", o)
+		}
+	case "no-new-privileges":
+		if v != "" && v != "true" {
+			return fmt.Errorf("'security_opt' %q may only turn no-new-privileges on", o)
+		}
+	case "label":
+		if strings.EqualFold(v, "disable") {
+			return fmt.Errorf("'security_opt' %q disables labelling", o)
+		}
+	default:
+		return fmt.Errorf("'security_opt' %q: only seccomp, apparmor, label and no-new-privileges are supported", o)
+	}
+	return nil
+}
+
 // validRuntime matches a Docker runtime name as registered on the server
 // (runc, runsc, kata-*, …): letters, digits, dot, dash, underscore.
 var validRuntime = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]*$`)
@@ -562,6 +588,13 @@ type AppConfig struct {
 	// unknown name surfaces Docker's own error at container start, and drift
 	// detects the flag like any other run argument.
 	Runtime  string   `yaml:"runtime,omitempty" toml:"runtime"`
+	// SecurityOpt passes docker run --security-opt values, e.g.
+	// "seccomp=/etc/docker/seccomp-chrome.json" for a container that runs
+	// Chromium's sandbox as an unprivileged user (Docker's default profile
+	// refuses the user namespace it needs). Values that disable a protection
+	// outright (seccomp=unconfined, apparmor=unconfined, label=disable) are
+	// refused: a config that wants none should say why somewhere else.
+	SecurityOpt []string `yaml:"security_opt,omitempty" toml:"security_opt"`
 	BuildLocal bool     `yaml:"build_local,omitempty" toml:"build_local"`
 	// Dockerfile names the Dockerfile to build from, resolved relative to
 	// Context (default "Dockerfile"). Set it when a monorepo's Dockerfile
@@ -1108,6 +1141,11 @@ func (c *AppConfig) validate() error {
 	}
 	if c.Platform != "" && !validPlatform.MatchString(c.Platform) {
 		return fmt.Errorf("'platform' must be os/arch (e.g. linux/amd64, linux/arm64), got %q", c.Platform)
+	}
+	for _, o := range c.SecurityOpt {
+		if err := validateSecurityOpt(o); err != nil {
+			return err
+		}
 	}
 	if c.Runtime != "" && !validRuntime.MatchString(c.Runtime) {
 		return fmt.Errorf("'runtime' must be a runtime name (e.g. runsc), got %q", c.Runtime)
@@ -1679,6 +1717,9 @@ func mergeConfigs(base, overlay *AppConfig) {
 	}
 	if overlay.Runtime != "" {
 		base.Runtime = overlay.Runtime
+	}
+	if len(overlay.SecurityOpt) > 0 {
+		base.SecurityOpt = append([]string(nil), overlay.SecurityOpt...)
 	}
 	if overlay.BuildLocal {
 		base.BuildLocal = overlay.BuildLocal

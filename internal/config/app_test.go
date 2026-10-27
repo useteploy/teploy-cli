@@ -125,3 +125,16 @@ func TestAccessValidate_ForwardAuthFields(t *testing.T) {
 		t.Error("header name with a space accepted")
 	}
 }
+
+func TestValidateSecurityOpt(t *testing.T) {
+	for _, ok := range []string{"seccomp=/etc/docker/seccomp-chrome.json", "apparmor=docker-default", "no-new-privileges", "no-new-privileges=true", "label=type:svirt_lxc_net_t"} {
+		if err := validateSecurityOpt(ok); err != nil {
+			t.Errorf("%q refused: %v", ok, err)
+		}
+	}
+	for _, bad := range []string{"seccomp=unconfined", "seccomp", "apparmor=unconfined", "label=disable", "no-new-privileges=false", "systempaths=unconfined", ""} {
+		if err := validateSecurityOpt(bad); err == nil {
+			t.Errorf("%q admitted", bad)
+		}
+	}
+}

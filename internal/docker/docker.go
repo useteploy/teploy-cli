@@ -63,6 +63,7 @@ type RunConfig struct {
 	CPU           string            // CPU limit, e.g. "1.0"
 	Name          string            // explicit container name (overrides auto-generated)
 	Runtime       string            // Docker runtime override (e.g. runsc); empty = engine default
+	SecurityOpt   []string          // docker run --security-opt values, in order
 	NoHealthcheck bool              // pass --no-healthcheck so the container ignores the image HEALTHCHECK
 	// Generation stamps the teploy.generation label — the identity of the
 	// deployment generation this container is created for (C01-9's
@@ -186,6 +187,9 @@ func (c *Client) run(ctx context.Context, cfg RunConfig, guardPrefix string) (st
 	// kernel boundary the default runc does not provide.
 	if cfg.Runtime != "" {
 		args = append(args, "--runtime", q(cfg.Runtime))
+	}
+	for _, o := range cfg.SecurityOpt {
+		args = append(args, "--security-opt", q(o))
 	}
 
 	// Network alias: web process gets the app name, others get app-process.

@@ -907,3 +907,32 @@ func TestListContainers_RequestsStructuredLabels(t *testing.T) {
 		t.Errorf("ambiguous whole-entry format still in use: %s", mock.Calls[0])
 	}
 }
+
+func TestClient_Run_RuntimeAndSecurityOpt(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "docker run", Output: "abc123def456"},
+	)
+	client := NewClient(mock)
+
+	_, err := client.Run(context.Background(), RunConfig{
+		App:         "akiroo",
+		Process:     "web",
+		Version:     "abc123",
+		Image:       "akiroo:latest",
+		Runtime:     "runsc",
+		SecurityOpt: []string{"seccomp=/etc/docker/seccomp-chrome.json", "no-new-privileges"},
+	})
+	if err != nil {
+		t.Fatalf("Run failed: %v", err)
+	}
+	cmd := mock.Calls[0]
+	for _, want := range []string{
+		"--runtime 'runsc'",
+		"--security-opt 'seccomp=/etc/docker/seccomp-chrome.json'",
+		"--security-opt 'no-new-privileges'",
+	} {
+		if !strings.Contains(cmd, want) {
+			t.Errorf("command missing %q\ngot: %s", want, cmd)
+		}
+	}
+}
