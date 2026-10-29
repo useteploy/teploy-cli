@@ -72,10 +72,10 @@ type Config struct {
 	Ingress string
 	// Bind is the host IP that ingress:host publishes the fixed port on
 	// (default 0.0.0.0 for host ingress). Ignored for caddy/external.
-	Bind          string
+	Bind string
 	// Runtime names a Docker runtime (config.Runtime) the containers run
 	// under — see AppConfig.Runtime.
-	Runtime       string
+	Runtime string
 	// SecurityOpt is passed to docker run as --security-opt (AppConfig.SecurityOpt).
 	SecurityOpt   []string
 	Memory        string
@@ -110,7 +110,9 @@ type Config struct {
 	// TLSInternal requests Caddy's own local CA (self-signed) instead of a
 	// custom cert or ACME — see config.TLSConfig.Internal. Mutually
 	// exclusive with TLSCert/TLSKey (enforced at config.validate() time).
-	TLSInternal     bool
+	TLSInternal bool
+	// TLSHTTPOnly renders the Caddy block plain-HTTP (see TLSConfig.HTTPOnly).
+	TLSHTTPOnly     bool
 	CaddyExtra      string            // raw Caddy directives appended into the site block
 	Cache           map[string]string // path glob -> Cache-Control, rendered into the site block
 	Firewall        caddy.Firewall    // edge hardening (IP allow/deny, UA block, body cap)
@@ -1010,7 +1012,7 @@ func (d *Deployer) deployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 		cad := d.caddy.WithCommitGuard(guardPrefix).
 			WithGeneration(nextGeneration).
 			WithRouteCAS(cfg.App, []string{resolvedRouteHash}, fromGeneration)
-		tls := caddy.TLS{Cert: cfg.TLSCert, Key: cfg.TLSKey, Internal: cfg.TLSInternal}
+		tls := caddy.TLS{Cert: cfg.TLSCert, Key: cfg.TLSKey, Internal: cfg.TLSInternal, HTTPOnly: cfg.TLSHTTPOnly}
 		if replicas > 1 {
 			upstreams := make([]caddy.Upstream, replicas)
 			for i := range replicas {
@@ -1633,7 +1635,7 @@ func (d *Deployer) restoreRouteFromReceipt(ctx context.Context, cfg Config, curr
 		domain = cfg.Domain
 	}
 
-	tls := caddy.TLS{Cert: cfg.TLSCert, Key: cfg.TLSKey, Internal: cfg.TLSInternal}
+	tls := caddy.TLS{Cert: cfg.TLSCert, Key: cfg.TLSKey, Internal: cfg.TLSInternal, HTTPOnly: cfg.TLSHTTPOnly}
 	caddyExtra := cfg.CaddyExtra
 	cache := cfg.Cache
 	fw := cfg.Firewall
@@ -1691,7 +1693,7 @@ func (d *Deployer) restoreRouteFromInspection(ctx context.Context, cfg Config, c
 	if domain == "" {
 		domain = cfg.Domain
 	}
-	tls := caddy.TLS{Cert: cfg.TLSCert, Key: cfg.TLSKey, Internal: cfg.TLSInternal}
+	tls := caddy.TLS{Cert: cfg.TLSCert, Key: cfg.TLSKey, Internal: cfg.TLSInternal, HTTPOnly: cfg.TLSHTTPOnly}
 	if replicas > 1 {
 		return cd.SetLoadBalancerHealth(ctx, cfg.App, domain, upstreams, cfg.Health.Path, tls, cfg.CaddyExtra, cfg.Cache, cfg.Firewall, cfg.Access)
 	}

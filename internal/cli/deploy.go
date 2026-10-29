@@ -1435,6 +1435,10 @@ func appTLSContainerPaths(app string) (cert, key string) {
 // by F14 the record overrides these paths with the target's own attempt
 // paths anyway; only backfilled (pre-F14) releases fall back to them.
 func uploadAppTLS(ctx context.Context, exec ssh.Executor, app string, tls *config.TLSConfig, att *releasemeta.Attempt) (cert, key string, err error) {
+	if tls.HTTPOnly {
+		// Plain HTTP by declaration: there is no cert to read or upload.
+		return "", "", nil
+	}
 	certBytes, err := os.ReadFile(tls.Cert)
 	if err != nil {
 		return "", "", fmt.Errorf("reading tls cert %s: %w", tls.Cert, err)

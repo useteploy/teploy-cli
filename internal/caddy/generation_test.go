@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -217,5 +218,20 @@ func TestRouteCASFragment_HashParityWithSed(t *testing.T) {
 	cd := NewClient(mock).WithGeneration(8).WithRouteCAS("myapp", []string{goHash}, 7)
 	if err := cd.SetRoute(context.Background(), "myapp", "myapp.com", "myapp-web-v8", 3000, TLS{}, "", nil, Firewall{}, Access{}); err != nil {
 		t.Fatalf("the Go-computed region hash must satisfy the shell-side sha256sum comparison: %v", err)
+	}
+}
+
+// A tunnel-fronted site (tls.http_only) must never redirect to HTTPS: the
+// scheme is forced to http:// on every host, public or not, and no tls
+// directive is rendered — automatic HTTPS behind a proxy that terminates
+// TLS itself is a redirect loop (found live on app.akiroo.com, 2026-10-28).
+func TestSiteAddressesHTTPOnlyForcesPlainScheme(t *testing.T) {
+	hosts := siteAddresses([]string{"app.akiroo.com"}, TLS{HTTPOnly: true})
+	if !reflect.DeepEqual(hosts, []string{"http://app.akiroo.com"}) {
+		t.Fatalf("http_only must force the http scheme, got %v", hosts)
+	}
+	block := loadBalancerBlock([]string{"app.akiroo.com"}, []Upstream{{Dial: "web:8080"}}, "", TLS{HTTPOnly: true}, "", nil, Firewall{}, Access{})
+	if strings.Contains(block, "\ttls ") || !strings.Contains(block, "http://app.akiroo.com") {
+		t.Fatalf("http_only block must be plain http with no tls directive:\n%s", block)
 	}
 }

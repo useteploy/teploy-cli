@@ -43,6 +43,7 @@ func deployConfigFromApp(appCfg *config.AppConfig, image, version string, envFil
 		TLSCert:         tlsCert,
 		TLSKey:          tlsKey,
 		TLSInternal:     tlsInternal,
+		TLSHTTPOnly:     appCfg.TLS != nil && appCfg.TLS.HTTPOnly,
 		CaddyExtra:      appCfg.CaddyExtra,
 		Cache:           appCfg.Cache,
 		Firewall:        caddyFirewall(appCfg.Firewall),

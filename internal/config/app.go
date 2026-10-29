@@ -401,6 +401,14 @@ type TLSConfig struct {
 	// see caddy.isPubliclyRoutable. Not needed for a real public domain,
 	// which should just use automatic HTTPS (the default, empty tls:).
 	Internal bool `yaml:"internal,omitempty" toml:"internal"`
+	// HTTPOnly serves the site block on plain HTTP: an explicit http://
+	// scheme on every host and no tls directive, so Caddy neither attempts
+	// ACME nor redirects to HTTPS. For origins fronted by a proxy that
+	// terminates TLS itself and reaches Caddy over plain HTTP — a Cloudflare
+	// Tunnel pointed at Caddy is the canonical case: automatic HTTPS would
+	// answer every request with a redirect to the same https URL, an
+	// instant loop. Takes precedence over Cert/Key/Internal.
+	HTTPOnly bool `yaml:"http_only,omitempty" toml:"http_only"`
 }
 
 // ProcessHealth overrides the container HEALTHCHECK behavior for a single
@@ -579,15 +587,15 @@ type AppConfig struct {
 	// bound to loopback/tailnet. Prefer an explicit bind address; a bare
 	// "3001:3001" publishes on 0.0.0.0, and Docker's port mappings bypass UFW.
 	// Single-replica only (see Validate) — a fixed host port can't be shared.
-	Publish    []string `yaml:"publish,omitempty" toml:"publish"`
-	Platform   string   `yaml:"platform,omitempty" toml:"platform"`
+	Publish  []string `yaml:"publish,omitempty" toml:"publish"`
+	Platform string   `yaml:"platform,omitempty" toml:"platform"`
 	// Runtime names a Docker runtime registered on the server (e.g. "runsc",
 	// gVisor) that this app's containers run under. The motivating case is a
 	// container that drives a browser at hostile pages: Chromium's own sandbox
 	// is the first wall, the runtime is the kernel boundary behind it. An
 	// unknown name surfaces Docker's own error at container start, and drift
 	// detects the flag like any other run argument.
-	Runtime  string   `yaml:"runtime,omitempty" toml:"runtime"`
+	Runtime string `yaml:"runtime,omitempty" toml:"runtime"`
 	// SecurityOpt passes docker run --security-opt values, e.g.
 	// "seccomp=/etc/docker/seccomp-chrome.json" for a container that runs
 	// Chromium's sandbox as an unprivileged user (Docker's default profile
@@ -595,7 +603,7 @@ type AppConfig struct {
 	// outright (seccomp=unconfined, apparmor=unconfined, label=disable) are
 	// refused: a config that wants none should say why somewhere else.
 	SecurityOpt []string `yaml:"security_opt,omitempty" toml:"security_opt"`
-	BuildLocal bool     `yaml:"build_local,omitempty" toml:"build_local"`
+	BuildLocal  bool     `yaml:"build_local,omitempty" toml:"build_local"`
 	// Dockerfile names the Dockerfile to build from, resolved relative to
 	// Context (default "Dockerfile"). Set it when a monorepo's Dockerfile
 	// lives in a subdirectory — e.g. dockerfile: server/monolith/Dockerfile
@@ -1264,12 +1272,18 @@ func (c *AppConfig) validate() error {
 		return err
 	}
 	if c.TLS != nil {
-		if c.TLS.Internal {
+		if c.TLS.HTTPOnly {
+			// Plain HTTP by name: nothing to validate, and it excludes the
+			// others by construction below.
+			if c.TLS.Internal || c.TLS.Cert != "" || c.TLS.Key != "" {
+				return fmt.Errorf("'tls.http_only' cannot be combined with 'cert'/'key' or 'internal' — plain HTTP needs none of them")
+			}
+		} else if c.TLS.Internal {
 			if c.TLS.Cert != "" || c.TLS.Key != "" {
 				return fmt.Errorf("'tls.internal' cannot be combined with 'cert'/'key' — pick one")
 			}
 		} else if c.TLS.Cert == "" || c.TLS.Key == "" {
-			return fmt.Errorf("'tls' requires both 'cert' and 'key' paths (or 'internal: true' for a self-signed cert)")
+			return fmt.Errorf("'tls' requires both 'cert' and 'key' paths (or 'internal: true' for a self-signed cert, or 'http_only: true' for plain HTTP behind a proxy that terminates TLS)")
 		}
 		// TLS only takes effect via the Caddy site block. With ingress:external
 		// the user's external ingress (Cloudflare Tunnel, nginx, ALB, …)
