@@ -4,6 +4,8 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [0.1.49] - 2026-10-31
+
 ### Added
 
 - App containers receive `TEPLOY_APP`, `TEPLOY_PROCESS` and `TEPLOY_VERSION`
@@ -11,6 +13,18 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
   report which revision is running without build-time plumbing: source
   builds sync without `.git`, so Go's embedded VCS info and similar were
   always empty.
+- `runtime:` in `teploy.yml` names the Docker runtime app containers run
+  under (`docker run --runtime`, e.g. `runsc` for gVisor). Recreated
+  containers keep it instead of falling back to runc.
+- `security_opt:` in `teploy.yml` passes `docker run --security-opt`
+  (seccomp, apparmor, label, no-new-privileges). Values that remove a
+  protection rather than shape one (`seccomp=unconfined`,
+  `apparmor=unconfined`, `label=disable`, `no-new-privileges=false`) are
+  refused.
+- `tls.http_only` serves a site on plain HTTP with no `tls` directive, for an
+  origin a proxy reaches over HTTP (a Cloudflare Tunnel pointed at Caddy).
+  Automatic HTTPS there redirected every request to itself in a loop. Wired
+  through deploy, rollback and scale.
 
 ## [0.1.48] - 2026-10-25
 
