@@ -216,6 +216,7 @@ func rollbackSingleServer(ctx context.Context, appCfg *config.AppConfig, target 
 		TLSCert:      tlsCert,
 		TLSKey:       tlsKey,
 		TLSInternal:  tlsInternal,
+		TLSHTTPOnly:  appCfg.TLS != nil && appCfg.TLS.HTTPOnly,
 		CaddyExtra:   appCfg.CaddyExtra,
 		Cache:        appCfg.Cache,
 		Firewall:     caddyFirewall(appCfg.Firewall),

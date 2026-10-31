@@ -54,6 +54,8 @@ type RollbackConfig struct {
 	// TLSInternal mirrors Config.TLSInternal — preserves Caddy's local-CA
 	// self-signed TLS across a rollback the same way TLSCert/TLSKey do.
 	TLSInternal bool
+	// TLSHTTPOnly mirrors deploy.Config.TLSHTTPOnly for the rollback path.
+	TLSHTTPOnly bool
 	CaddyExtra  string            // mirrors Config.CaddyExtra — preserves user directives across rollback
 	Cache       map[string]string // mirrors Config.Cache — preserves cache rules across rollback
 	Firewall    caddy.Firewall    // mirrors Config.Firewall — preserves firewall rules across rollback
@@ -500,7 +502,7 @@ func rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg Rollbac
 			restoreDisplaced()
 			return reason
 		}
-		tls := caddy.TLS{Cert: cfg.TLSCert, Key: cfg.TLSKey, Internal: cfg.TLSInternal}
+		tls := caddy.TLS{Cert: cfg.TLSCert, Key: cfg.TLSKey, Internal: cfg.TLSInternal, HTTPOnly: cfg.TLSHTTPOnly}
 		// The Caddy upstream port is the recorded primary container port
 		// when there is one (TCL-14); without a record the first exposed
 		// port remains the historical best-effort pick.
@@ -787,7 +789,7 @@ func restoreRollbackRouteFromReceipt(ctx context.Context, cd *caddy.Client, cfg 
 		domain = cfg.Domain
 	}
 
-	tls := caddy.TLS{Cert: cfg.TLSCert, Key: cfg.TLSKey, Internal: cfg.TLSInternal}
+	tls := caddy.TLS{Cert: cfg.TLSCert, Key: cfg.TLSKey, Internal: cfg.TLSInternal, HTTPOnly: cfg.TLSHTTPOnly}
 	caddyExtra := cfg.CaddyExtra
 	cache := cfg.Cache
 	fw := cfg.Firewall
@@ -832,7 +834,7 @@ func restoreRollbackRouteFromInspection(ctx context.Context, cd *caddy.Client, d
 	if domain == "" {
 		domain = cfg.Domain
 	}
-	tls := caddy.TLS{Cert: cfg.TLSCert, Key: cfg.TLSKey, Internal: cfg.TLSInternal}
+	tls := caddy.TLS{Cert: cfg.TLSCert, Key: cfg.TLSKey, Internal: cfg.TLSInternal, HTTPOnly: cfg.TLSHTTPOnly}
 	if len(currentWeb) == 1 {
 		port, err := dk.InternalPort(ctx, currentWeb[0].Name)
 		if err != nil {

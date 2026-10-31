@@ -151,6 +151,7 @@ func runRollback(ctx context.Context, flags *Flags, appCfg *config.AppConfig, to
 		TLSCert:      tlsCert,
 		TLSKey:       tlsKey,
 		TLSInternal:  tlsInternal,
+		TLSHTTPOnly:  appCfg.TLS != nil && appCfg.TLS.HTTPOnly,
 		CaddyExtra:   appCfg.CaddyExtra,
 		Cache:        appCfg.Cache,
 		Firewall:     caddyFirewall(appCfg.Firewall),
