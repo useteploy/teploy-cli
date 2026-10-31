@@ -4,6 +4,14 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+### Added
+
+- App containers receive `TEPLOY_APP`, `TEPLOY_PROCESS` and `TEPLOY_VERSION`
+  (the deployed version, as on the `teploy.version` label). An app can now
+  report which revision is running without build-time plumbing: source
+  builds sync without `.git`, so Go's embedded VCS info and similar were
+  always empty.
+
 ## [0.1.48] - 2026-10-25
 
 ### Fixed
