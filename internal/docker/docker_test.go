@@ -163,6 +163,9 @@ func TestClient_Run(t *testing.T) {
 		"--label 'teploy.version=abc123'",
 		"-p '127.0.0.1:49152:80'",
 		"-e PORT=80",
+		"-e 'TEPLOY_APP=myapp'",
+		"-e 'TEPLOY_PROCESS=web'",
+		"-e 'TEPLOY_VERSION=abc123'",
 		"--log-opt max-size=10m",
 		"'nginx:latest'",
 	} {

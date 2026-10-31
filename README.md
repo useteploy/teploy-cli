@@ -366,6 +366,16 @@ Server resolution precedence is flags → env vars → `servers.yml`.
 | `TEPLOY_USER` | SSH user; defaults to `root` |
 | `TEPLOY_SSH_KEY` | path to the SSH private key |
 
+Every app container also receives, alongside `PORT`:
+
+| Variable | Value |
+|---|---|
+| `TEPLOY_APP` | the app name |
+| `TEPLOY_PROCESS` | the process (`web`, `worker`, ...) |
+| `TEPLOY_VERSION` | the deployed version (the short git revision for source builds), the same value as the `teploy.version` label |
+
+They are set last, so an `env:` entry of the same name does not replace them.
+
 ### App lifecycle
 ```
 teploy lock [--message "..."]   # freeze deploys (incident/maintenance)
