@@ -264,6 +264,15 @@ func (c *Client) run(ctx context.Context, cfg RunConfig, guardPrefix string) (st
 		}
 	}
 
+	// What is running, for the app itself (health endpoints, error reports,
+	// logs): the same values as the teploy.* labels. Last, so they win over
+	// an env: entry of the same name — they describe the deploy, not config.
+	args = append(args,
+		"-e", q("TEPLOY_APP="+cfg.App),
+		"-e", q("TEPLOY_PROCESS="+cfg.Process),
+		"-e", q("TEPLOY_VERSION="+cfg.Version),
+	)
+
 	// Volume mounts, sorted for deterministic command output.
 	if len(cfg.Volumes) > 0 {
 		keys := sortedKeys(cfg.Volumes)
