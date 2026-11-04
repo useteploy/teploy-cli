@@ -23,7 +23,7 @@ func drBaseMock(extra ...ssh.MockCommand) *ssh.MockExecutor {
 		{Match: "mkdir -p /deployments/myapp/accessories/db", Output: ""},
 		{Match: "find '/deployments/myapp/meta'", Output: ""},
 		{Match: "tar -czf", Output: ""},
-		{Match: "docker exec 'myapp-db' pg_dump", Output: ""},
+		{Match: "others=", Output: ""},
 		{Match: "wc -c", Output: "4096\n"},
 		{Match: "docker inspect -f '{{.Config.Image}}' 'myapp-db'", Output: "postgres:16\n"},
 		{Match: "docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' 'myapp-db'", Output: "POSTGRES_DB=appdb\nPOSTGRES_USER=appuser\n"},

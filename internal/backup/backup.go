@@ -233,6 +233,9 @@ func (s3 S3Config) AWS(args string) string {
 type Client struct {
 	exec ssh.Executor
 	out  io.Writer
+	// retryDelay spaces retries of a postgres rename refused because
+	// sessions were still connected (0 = one second; tests shorten it).
+	retryDelay time.Duration
 }
 
 // NewClient creates a new backup client.

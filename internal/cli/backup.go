@@ -603,11 +603,15 @@ func runBackupRestore(flags *Flags, appName, accessory, date string, tf *backupT
 	}
 	accessoryStopped := false
 	if qErr == nil && accessory != "" {
+		// The ARTIFACT decides whether the accessory container stops: a
+		// file archive replaces files on disk (that includes every backup
+		// an older CLI took of a pgvector/timescale/valkey/... accessory),
+		// an engine dump restores through the running engine.
 		accessoryImage, accessoryEnv := inspectAccessoryForRestore(ctx, client, appCfg.App, accessory, appCfg)
-		det, dErr := client.ResolveEngine(ctx, appCfg.App, accessory, accessoryImage, accessoryEnv)
-		if dErr != nil {
-			qErr = dErr
-		} else if backup.RestoreStopsContainer(det.Engine) {
+		art, aErr := client.ResolveAccessoryArtifact(ctx, appCfg.App, accessory, accessoryImage, date, accessoryEnv, cfg)
+		if aErr != nil {
+			qErr = aErr
+		} else if art.FileRestore {
 			container := appCfg.App + "-" + accessory
 			if _, sErr := lk.Guarded(ctx, executor, fmt.Sprintf("docker stop --time %d %s", stopTimeout, ssh.ShellQuote(container))); sErr == nil {
 				accessoryStopped = true
@@ -625,13 +629,18 @@ func runBackupRestore(flags *Flags, appName, accessory, date string, tf *backupT
 
 	// Restore, keeping ownership of the recovery directory until the
 	// post-restore health check also passes.
-	var recoveryDir string
+	var recovery backup.RestoreRecovery
 	quiescedNote := strings.Join(dto.Stopped, ", ")
 	if accessory != "" {
 		accessoryImage, env := inspectAccessoryForRestore(ctx, client, appCfg.App, accessory, appCfg)
-		recoveryDir, err = client.AccessoryRestoreKeep(ctx, appCfg.App, accessory, accessoryImage, date, env, cfg)
+		recovery, err = client.AccessoryRestoreKeep(ctx, appCfg.App, accessory, accessoryImage, date, env, cfg)
 	} else {
-		recoveryDir, err = client.RestoreVolumesKeep(ctx, appCfg.App, date, cfg, quiescedNote)
+		var dir string
+		dir, err = client.RestoreVolumesKeep(ctx, appCfg.App, date, cfg, quiescedNote)
+		recovery = backup.RestoreRecovery{Path: dir}
+	}
+	if err != nil && !recovery.IsZero() {
+		dto.RecoveryDir = recovery.String()
 	}
 	if err != nil {
 		return finishRestoreFailure(flags, ctx, executor, lc, lk, dto, accessoryStopped, stopped, err)
@@ -656,8 +665,8 @@ func runBackupRestore(flags *Flags, appName, accessory, date string, tf *backupT
 		// The restored data is in place but did not come up healthy: keep
 		// the recovery copy so the operator can fall back.
 		dto.Health = "unhealthy"
-		dto.RecoveryDir = recoveryDir
-		dto.Error = fmt.Sprintf("health check after restore failed: %v — pre-restore data kept in %s", resume.HealthErr, recoveryDir)
+		dto.RecoveryDir = recovery.String()
+		dto.Error = fmt.Sprintf("health check after restore failed: %v — pre-restore data kept in %s", resume.HealthErr, recovery)
 		recordAppEvent(ctx, executor, appCfg.App, events.KindBackupRestore, resume.HealthErr, restoreEventDetail(dto))
 		if flags.JSON {
 			return errors.Join(resume.HealthErr, json.NewEncoder(os.Stdout).Encode(dto))
@@ -666,8 +675,10 @@ func runBackupRestore(flags *Flags, appName, accessory, date string, tf *backupT
 	}
 	dto.Health = resume.HealthStatus()
 
-	if recoveryDir != "" {
-		executor.Run(context.WithoutCancel(ctx), "rm -rf "+ssh.ShellQuote(recoveryDir))
+	if !recovery.IsZero() {
+		if relErr := client.ReleaseRecovery(context.WithoutCancel(ctx), recovery); relErr != nil {
+			fmt.Fprintf(os.Stderr, "Warning: the restore succeeded but its recovery copy was not released: %v\n", relErr)
+		}
 	}
 	dto.OK = true
 	recordAppEvent(ctx, executor, appCfg.App, events.KindBackupRestore, nil, restoreEventDetail(dto))

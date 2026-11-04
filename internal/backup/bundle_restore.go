@@ -413,7 +413,7 @@ func (c *Client) validateEngineSnapshot(ctx context.Context, manifest *BundleMan
 		if err := c.waitReady(ctx, scratchID, postgresReadyProbe(user), 30); err != nil {
 			return checkFailed(check, err)
 		}
-		if err := c.pgLoadArtifact(ctx, pgTarget{container: scratchID, user: user, db: db}, dump, staging, true); err != nil {
+		if err := c.pgLoadArtifact(ctx, pgTarget{container: scratchID, user: user, db: db}, dump, staging); err != nil {
 			return checkFailed(check, fmt.Errorf("restoring dump into scratch: %w", err))
 		}
 		out, err := c.exec.Run(ctx, fmt.Sprintf(
@@ -887,7 +887,7 @@ func (c *Client) CutoverBundle(ctx context.Context, opts BundleRestoreOptions) (
 			if err := c.waitReady(ctx, container, postgresReadyProbe(user), 30); err != nil {
 				restoreErr = err
 			} else {
-				restoreErr = c.pgLoadArtifact(ctx, pgTarget{container: container, user: user, db: db}, dump, staging, false)
+				restoreErr = c.pgLoadArtifact(ctx, pgTarget{container: container, user: user, db: db}, dump, staging)
 			}
 		case "mysql", "mariadb":
 			db := mysqlDB(opts.App, engineEnv(snap, env, accCfg))

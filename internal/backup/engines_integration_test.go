@@ -75,18 +75,87 @@ case "$op" in
 esac
 `
 
-// pathExecutor prefixes every command with the fake-aws PATH.
+// pathExecutor prefixes every command with the fake-aws PATH; with sudo
+// set it runs each command as root (production SSH users are root, and
+// file restores move engine-owned 0700 data directories).
 type pathExecutor struct {
 	ssh.Executor
 	prefix string
+	sudo   bool
+}
+
+func (p pathExecutor) wrap(cmd string) string {
+	if p.sudo {
+		return "sudo -n sh -c " + ssh.ShellQuote(p.prefix+cmd)
+	}
+	return p.prefix + cmd
 }
 
 func (p pathExecutor) Run(ctx context.Context, cmd string) (string, error) {
-	return p.Executor.Run(ctx, p.prefix+cmd)
+	return p.Executor.Run(ctx, p.wrap(cmd))
 }
 
 func (p pathExecutor) RunInput(ctx context.Context, cmd string, stdin io.Reader) error {
-	return p.Executor.RunInput(ctx, p.prefix+cmd, stdin)
+	return p.Executor.RunInput(ctx, p.wrap(cmd), stdin)
+}
+
+// itFixture is the shared integration fixture: the colima SSH executor, a
+// private work dir holding the fake aws and its "bucket", and the
+// fake-aws executor.
+type itFixture struct {
+	base ssh.Executor
+	exec pathExecutor
+	work string
+	s3   S3Config
+}
+
+func newITFixture(t *testing.T, ctx context.Context) itFixture {
+	t.Helper()
+	base := drFixtureEnv(t)
+	var nonce [6]byte
+	_, _ = rand.Read(nonce[:])
+	work := "/tmp/teploy-it-" + hex.EncodeToString(nonce[:])
+	if _, err := base.Run(ctx, "mkdir -p "+work+"/bin "+work+"/s3"); err != nil {
+		t.Fatalf("creating fixture workspace: %v", err)
+	}
+	t.Cleanup(func() {
+		base.Run(context.Background(), "sudo -n rm -rf "+ssh.ShellQuote(work)+" || rm -rf "+ssh.ShellQuote(work))
+	})
+	if err := base.Upload(ctx, strings.NewReader(strings.ReplaceAll(fakeAWS, "__ROOT__", work+"/s3")), work+"/bin/aws", "0755"); err != nil {
+		t.Fatalf("installing fake aws: %v", err)
+	}
+	return itFixture{base: base, exec: pathExecutor{Executor: base, prefix: "PATH=" + work + "/bin:$PATH; export PATH; "}, work: work, s3: S3Config{Bucket: "itbucket", Region: "us-east-1"}}
+}
+
+// container starts one engine container (removed on cleanup, along with
+// any verify scratch) and waits until probe succeeds inside it.
+func (f itFixture) container(t *testing.T, ctx context.Context, name, runArgs, probe string) func(string) string {
+	t.Helper()
+	rm := func() {
+		f.base.Run(context.Background(), "docker rm -f "+ssh.ShellQuote(name)+" >/dev/null 2>&1 || true")
+		f.base.Run(context.Background(), "docker ps -aq --filter name=teploy-backup-verify- | xargs -r docker rm -f >/dev/null 2>&1 || true")
+	}
+	rm()
+	t.Cleanup(rm)
+	f.run(t, ctx, "docker run -d --name "+ssh.ShellQuote(name)+" --restart no --memory 768m "+runArgs+" >/dev/null")
+	f.waitFor(t, ctx, name, probe)
+	return func(cmd string) string {
+		return f.run(t, ctx, "docker exec "+ssh.ShellQuote(name)+" sh -c "+ssh.ShellQuote(cmd))
+	}
+}
+
+func (f itFixture) waitFor(t *testing.T, ctx context.Context, name, probe string) {
+	t.Helper()
+	f.run(t, ctx, fmt.Sprintf("for i in $(seq 1 60); do docker exec %s %s >/dev/null 2>&1 && exit 0; sleep 2; done; docker logs --tail 30 %s; exit 1", ssh.ShellQuote(name), probe, ssh.ShellQuote(name)))
+}
+
+func (f itFixture) run(t *testing.T, ctx context.Context, cmd string) string {
+	t.Helper()
+	out, err := f.base.Run(ctx, cmd)
+	if err != nil {
+		t.Fatalf("fixture command failed: %s\nerror: %v\noutput: %s", cmd, err, out)
+	}
+	return out
 }
 
 type engineCase struct {
@@ -120,7 +189,7 @@ func engineCases() []engineCase {
 	redisCLI := func(_, args string) string { return args }
 
 	cases := []engineCase{
-		{key: "postgres", image: "postgres:17", env: pgEnv, ready: pgReady, seed: pgSeed, mutate: pgMutate, check: pgCheck, want: "1:one,2:two,3:three\n0", wantKind: "postgres"},
+		{key: "postgres", image: "postgres:17-alpine", env: pgEnv, ready: pgReady, seed: pgSeed, mutate: pgMutate, check: pgCheck, want: "1:one,2:two,3:three\n0", wantKind: "postgres"},
 		{key: "pgvector", image: "pgvector/pgvector:pg17", env: pgEnv, ready: pgReady,
 			seed:   psql("CREATE EXTENSION vector; CREATE TABLE items(id int primary key, name text, v vector(3)); INSERT INTO items VALUES (1,'one','[1,2,3]'),(2,'two','[4,5,6]'),(3,'three','[7,8,9]');"),
 			mutate: pgMutate,
@@ -136,15 +205,15 @@ func engineCases() []engineCase {
 		{key: "mysql", image: "mysql:8", env: []string{"MYSQL_ROOT_PASSWORD=rootpw", "MYSQL_DATABASE=appdb"},
 			ready:  "sh -c 'MYSQL_PWD=rootpw mysqladmin ping -u root --silent && MYSQL_PWD=rootpw mysql -u root -e \"select 1\" appdb'",
 			seed:   mysql("CREATE TABLE items(id int primary key, name varchar(20)); INSERT INTO items VALUES (1,'one'),(2,'two'),(3,'three'); CREATE TRIGGER items_bi BEFORE INSERT ON items FOR EACH ROW SET NEW.name=NEW.name; CREATE PROCEDURE p1() SELECT 1;"),
-			mutate: mysql("UPDATE items SET name='changed' WHERE id=1; DELETE FROM items WHERE id=2; INSERT INTO items VALUES (4,'four'); DROP PROCEDURE p1;"),
-			check:  mysql("SELECT GROUP_CONCAT(CONCAT(id,':',name) ORDER BY id) FROM items; SELECT COUNT(*) FROM information_schema.triggers WHERE trigger_schema='appdb'; SELECT COUNT(*) FROM information_schema.routines WHERE routine_schema='appdb';"),
-			want:   "1:one,2:two,3:three\n1\n1", wantKind: "mysql"},
-		{key: "redis", image: "redis:7", ready: "redis-cli ping",
+			mutate: mysql("UPDATE items SET name='changed' WHERE id=1; DELETE FROM items WHERE id=2; INSERT INTO items VALUES (4,'four'); DROP PROCEDURE p1; CREATE TABLE later(x int);"),
+			check:  mysql("SELECT GROUP_CONCAT(CONCAT(id,':',name) ORDER BY id) FROM items; SELECT COUNT(*) FROM information_schema.triggers WHERE trigger_schema='appdb'; SELECT COUNT(*) FROM information_schema.routines WHERE routine_schema='appdb'; SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='appdb' AND table_name='later';"),
+			want:   "1:one,2:two,3:three\n1\n1\n0", wantKind: "mysql"},
+		{key: "redis", image: "redis:7-alpine", ready: "redis-cli ping",
 			seed:   redisCLI("", ("redis-cli set a one && redis-cli set b two && redis-cli rpush l x y z")),
 			mutate: redisCLI("", ("redis-cli set a changed && redis-cli del b && redis-cli set c new")),
 			check:  redisCLI("", ("redis-cli get a; redis-cli get b; redis-cli exists c; redis-cli lrange l 0 -1")),
 			want:   "one\ntwo\n0\nx\ny\nz", wantKind: "redis"},
-		{key: "valkey", image: "valkey/valkey:8", ready: "valkey-cli ping",
+		{key: "valkey", image: "valkey/valkey:8-alpine", ready: "valkey-cli ping",
 			seed:   redisCLI("", ("valkey-cli set a one && valkey-cli set b two && valkey-cli rpush l x y z")),
 			mutate: redisCLI("", ("valkey-cli set a changed && valkey-cli del b && valkey-cli set c new")),
 			check:  redisCLI("", ("valkey-cli get a; valkey-cli get b; valkey-cli exists c; valkey-cli lrange l 0 -1")),
@@ -172,22 +241,10 @@ func engineCases() []engineCase {
 }
 
 func TestEngineIntegration(t *testing.T) {
-	base := drFixtureEnv(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Minute)
 	defer cancel()
-
-	var nonce [6]byte
-	_, _ = rand.Read(nonce[:])
-	work := "/tmp/teploy-it-" + hex.EncodeToString(nonce[:])
-	if _, err := base.Run(ctx, "mkdir -p "+work+"/bin "+work+"/s3"); err != nil {
-		t.Fatalf("creating fixture workspace: %v", err)
-	}
-	t.Cleanup(func() { base.Run(context.Background(), "rm -rf "+ssh.ShellQuote(work)) })
-	if err := base.Upload(ctx, strings.NewReader(strings.ReplaceAll(fakeAWS, "__ROOT__", work+"/s3")), work+"/bin/aws", "0755"); err != nil {
-		t.Fatalf("installing fake aws: %v", err)
-	}
-	exec := pathExecutor{Executor: base, prefix: "PATH=" + work + "/bin:$PATH; export PATH; "}
-	s3 := S3Config{Bucket: "itbucket", Region: "us-east-1"}
+	f := newITFixture(t, ctx)
+	base, exec, work, s3 := f.base, f.exec, f.work, f.s3
 
 	for _, tc := range engineCases() {
 		t.Run(tc.key, func(t *testing.T) {

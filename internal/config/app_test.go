@@ -138,3 +138,18 @@ func TestValidateSecurityOpt(t *testing.T) {
 		}
 	}
 }
+
+func TestAccessoryEngineValidated(t *testing.T) {
+	cfg := func(engine string) *AppConfig {
+		return &AppConfig{App: "myapp", Domain: "myapp.com",
+			Accessories: map[string]AccessoryConfig{"db": {Image: "postgres:16", Engine: engine}}}
+	}
+	for _, ok := range []string{"", "postgres", "valkey", "dragonfly", "none", "generic"} {
+		if err := cfg(ok).validate(); err != nil {
+			t.Errorf("engine %q rejected: %v", ok, err)
+		}
+	}
+	if err := cfg("oracle").validate(); err == nil || !strings.Contains(err.Error(), "engine") {
+		t.Errorf("unknown engine accepted: %v", err)
+	}
+}

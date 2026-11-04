@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"path"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -81,9 +80,41 @@ func (c *Client) AccessoryBackup(ctx context.Context, app, name, image string, e
 		return res, fmt.Errorf("uploading to S3: %w", err)
 	}
 
+	if det.Engine == EnginePostgres {
+		c.backupPostgresGlobals(ctx, app, name, timestamp, env, workDir, s3)
+	}
+
 	cleanup()
 	fmt.Fprintf(c.out, "Backup complete: %s\n", s3Key)
 	return res, nil
+}
+
+// postgresGlobalsKey is where a postgres backup's cluster globals (roles,
+// tablespaces: pg_dumpall --globals-only) are stored beside the dump. It
+// sits one directory below the accessory's backups, so listings, latest
+// resolution and retention counting never see it as a backup of its own.
+func postgresGlobalsKey(s3 S3Config, app, name, id string) string {
+	return fmt.Sprintf("s3://%s/%s/accessories/%s/globals/%s.sql.gz", s3.Base(), app, name, id)
+}
+
+// backupPostgresGlobals stores the cluster's roles beside the dump so a
+// restore into a fresh cluster (and verify-backup's scratch) can recreate
+// object ownership. Best effort: the database dump is the backup; a role
+// that may not read pg_authid gets the dump without role passwords.
+func (c *Client) backupPostgresGlobals(ctx context.Context, app, name, id string, env map[string]string, workDir string, s3 S3Config) {
+	_, user := postgresDBAndUser(app, env)
+	q := ssh.ShellQuote
+	container := q(app + "-" + name)
+	sql, gz := workDir+"/globals.sql", workDir+"/globals.sql.gz"
+	cmd := "{ docker exec " + container + " pg_dumpall --globals-only -U " + q(user) + " > " + q(sql) + " 2>/dev/null || docker exec " + container + " pg_dumpall --globals-only --no-role-passwords -U " + q(user) + " > " + q(sql) + "; } && grep -q 'CREATE ROLE' " + q(sql) + " && gzip -c " + q(sql) + " > " + q(gz)
+	key := postgresGlobalsKey(s3, app, name, id)
+	if _, err := c.exec.Run(ctx, cmd); err != nil {
+		fmt.Fprintf(c.out, "Warning: the cluster roles (pg_dumpall --globals-only) were not saved: %v\n", err)
+		return
+	}
+	if _, err := c.exec.Run(ctx, s3.AWS(fmt.Sprintf("s3 cp %s %s", q(gz), q(key)))); err != nil {
+		fmt.Fprintf(c.out, "Warning: uploading the cluster roles failed: %v\n", err)
+	}
 }
 
 // checkArtifactSize measures a freshly written artifact and refuses one
@@ -104,207 +135,6 @@ func (c *Client) checkArtifactSize(ctx context.Context, path string, minBytes in
 		return size, fmt.Errorf("backup artifact is implausibly small (%d bytes, minimum %d) — the dump almost certainly failed (wrong credentials, empty output); refusing to store it", size, minBytes)
 	}
 	return size, nil
-}
-
-// AccessoryRestore restores a database backup from S3.
-func (c *Client) AccessoryRestore(ctx context.Context, app, name, image, date string, env map[string]string, s3 S3Config) error {
-	recoveryDir, err := c.AccessoryRestoreKeep(ctx, app, name, image, date, env, s3)
-	if err == nil && recoveryDir != "" {
-		c.exec.Run(context.WithoutCancel(ctx), "rm -rf "+ssh.ShellQuote(recoveryDir))
-	}
-	return err
-}
-
-// RestoreStopsContainer reports whether restoring this engine replaces the
-// accessory's files on disk (so the container must be stopped first). The
-// engine branches restore through the running engine instead; redis and
-// valkey stop and restart themselves inside their restore script.
-func RestoreStopsContainer(engine string) bool {
-	return engine == EngineGeneric || engine == EngineNucleus
-}
-
-// AccessoryRestoreKeep is AccessoryRestore where the caller owns the
-// recovery directory — see RestoreVolumesKeep. For postgres and dragonfly it
-// holds the safety snapshot of the database as it was just before the
-// restore; for file-tree engines it holds the previous files.
-func (c *Client) AccessoryRestoreKeep(ctx context.Context, app, name, image, date string, env map[string]string, s3 S3Config) (string, error) {
-	if err := ValidateDate(date); err != nil {
-		return "", err
-	}
-	if err := c.ensureAWSCLI(ctx); err != nil {
-		return "", err
-	}
-	det, err := c.ResolveEngine(ctx, app, name, image, env)
-	if err != nil {
-		return "", err
-	}
-	container := app + "-" + name
-	accPrefix := fmt.Sprintf("s3://%s/%s/accessories/%s/", s3.Base(), app, name)
-
-	// All restore scratch files live under one per-invocation temp dir. The
-	// old fixed names (/tmp/restore.sql.gz, …, and the generic branch's
-	// /tmp/<app>-<name>-restore-stage) were shared by every restore: two
-	// concurrent restores (or a crash mid-restore followed by a retry)
-	// could read or stage the previous run's files. On failure the dir is
-	// kept and named in the error for inspection; on success it is removed.
-	tmpOut, err := c.exec.Run(ctx, "mktemp -d "+ssh.ShellQuote("/tmp/teploy-restore.XXXXXX"))
-	if err != nil {
-		return "", fmt.Errorf("creating restore temp dir: %w", err)
-	}
-	tmpdir := strings.TrimSpace(tmpOut)
-	keepTmp := func(err error) (string, error) {
-		return "", fmt.Errorf("%w — restore files kept in %s", err, tmpdir)
-	}
-	download := func(key, dest string) error {
-		fmt.Fprintf(c.out, "Downloading %s...\n", key)
-		if _, err := c.exec.Run(ctx, s3.AWS(fmt.Sprintf("s3 cp %s %s", ssh.ShellQuote(key), ssh.ShellQuote(dest)))); err != nil {
-			return fmt.Errorf("downloading backup: %w", err)
-		}
-		return nil
-	}
-	done := func(recovery string) (string, error) {
-		c.exec.Run(ctx, "rm -rf "+ssh.ShellQuote(tmpdir))
-		fmt.Fprintln(c.out, "Restore complete")
-		return recovery, nil
-	}
-
-	switch det.Engine {
-	case EnginePostgres:
-		key, ext, err := c.resolveAccessoryKey(ctx, s3, accPrefix, date, ".pgdump", ".sql.gz")
-		if err != nil {
-			return keepTmp(err)
-		}
-		artifact := tmpdir + "/restore" + ext
-		if err := download(key, artifact); err != nil {
-			return keepTmp(err)
-		}
-		db, user := postgresDBAndUser(app, env)
-		fmt.Fprintf(c.out, "Restoring %s (postgres database %s)...\n", name, db)
-		recovery, err := c.restorePostgresInPlace(ctx, pgTarget{container: container, user: user, db: db}, artifact, ext, tmpdir)
-		if err != nil {
-			if recovery != "" {
-				return recovery, fmt.Errorf("restoring %s: %w — restore files kept in %s", name, err, tmpdir)
-			}
-			return keepTmp(fmt.Errorf("restoring %s: %w", name, err))
-		}
-		return done(recovery)
-
-	case EngineDragonfly:
-		key := accPrefix + date + ".rdb.gz"
-		artifact := tmpdir + "/restore.rdb.gz"
-		if err := download(key, artifact); err != nil {
-			return keepTmp(err)
-		}
-		recOut, err := c.exec.Run(ctx, "umask 077; mktemp -d /var/tmp/teploy-pre-restore.XXXXXX")
-		if err != nil {
-			return keepTmp(fmt.Errorf("creating the pre-restore snapshot directory: %w", err))
-		}
-		recovery := strings.TrimSpace(recOut)
-		fmt.Fprintf(c.out, "Restoring %s (dragonfly)...\n", name)
-		if _, err := c.exec.Run(ctx, dragonflyLoadScript(container, artifact, tmpdir, recovery+"/pre-restore.rdb")); err != nil {
-			return recovery, fmt.Errorf("restoring %s: %w — the pre-restore snapshot (when taken) is at %s/pre-restore.rdb, restore files kept in %s", name, err, recovery, tmpdir)
-		}
-		return done(recovery)
-	}
-
-	// Determine file type and restore command based on DB type. The file
-	// branches (generic, nucleus) leave restoreCmd empty and instead set
-	// accDir, since they go through the staging helper below rather than a
-	// single shell command.
-	var s3Key, restorePath, restoreCmd, accDir string
-
-	switch det.Engine {
-	case EngineMySQL, EngineMariaDB:
-		// The old branch never assigned s3Key/restorePath, so the download
-		// and gunzip below operated on empty arguments — every MySQL/MariaDB
-		// restore was deterministically broken (audit F31).
-		s3Key = accPrefix + date + ".sql.gz"
-		restorePath = tmpdir + "/restore.sql.gz"
-		qContainer := ssh.ShellQuote(container)
-		db := mysqlDB(app, env)
-		// Same 0600 env-file credential transport as the backup path
-		// (see there) — the password rides in no argv. The restore
-		// failure path DELIBERATELY keeps tmpdir for inspection, so the
-		// credential file must be removed by name there: keep the SQL,
-		// never the secret (C08).
-		client, _ := mysqlTools(det.Engine)
-		sqlPath := tmpdir + "/restore.sql"
-		receiver := "docker exec -i " + qContainer + " " + client + " -u root " + ssh.ShellQuote(db) + " < " + ssh.ShellQuote(sqlPath)
-		if pwd := mysqlRootPassword(env); pwd != "" {
-			envFile := tmpdir + "/mysql.env"
-			if err := c.exec.Upload(ctx, strings.NewReader("MYSQL_PWD="+pwd+"\n"), envFile, "0600"); err != nil {
-				return keepTmp(err)
-			}
-			receiver = pipefail(
-				"cat "+ssh.ShellQuote(envFile)+" && cat "+ssh.ShellQuote(sqlPath),
-				"docker exec -i "+qContainer+" sh -c "+ssh.ShellQuote(mysqlPasswordPrelude+"exec "+client+" -u root "+ssh.ShellQuote(db)),
-				tmpdir+"/producer.failed")
-		}
-		restoreCmd = "gunzip -c " + ssh.ShellQuote(restorePath) + " > " + ssh.ShellQuote(sqlPath) + " && " + receiver
-
-		// The kept-on-failure scratch dir must never keep the credential.
-		innerKeep := keepTmp
-		keepTmp = func(err error) (string, error) {
-			c.exec.Run(context.WithoutCancel(ctx), "rm -f "+ssh.ShellQuote(tmpdir+"/mysql.env"))
-			return innerKeep(err)
-		}
-	case EngineMongo:
-		s3Key = accPrefix + date + ".archive.gz"
-		restorePath = tmpdir + "/restore.archive.gz"
-		restoreCmd = mongoRestoreCmd(container, restorePath)
-	case EngineRedis, EngineValkey:
-		// AccessoryBackup stores redis as <date>.rdb.gz; without this case
-		// the default branch looked for a .tar.gz that doesn't exist, so
-		// redis restores always failed. Stop redis first so its shutdown
-		// save can't overwrite the snapshot we copy in, then start so it
-		// loads dump.rdb (full reasoning on redisRestoreScript).
-		s3Key = accPrefix + date + ".rdb.gz"
-		restorePath = tmpdir + "/restore.rdb.gz"
-		if err := c.redisAOFPreflight(ctx, det.Engine, app, name); err != nil {
-			return keepTmp(err)
-		}
-		restoreCmd = redisRestoreScript(container, restorePath, tmpdir+"/restore.rdb", tmpdir+"/old-dump.rdb")
-	case EngineGeneric, EngineNucleus:
-		// File engines: extract the tar into the accessory directory
-		// through the staging helper.
-		s3Key = accPrefix + date + ".tar.gz"
-		restorePath = tmpdir + "/restore.tar.gz"
-		accDir = fmt.Sprintf("%s/%s/accessories/%s", deploymentsDir, app, name)
-	default:
-		return keepTmp(fmt.Errorf("engine %q has no restore path", det.Engine))
-	}
-
-	// Every engine branch must produce a complete artifact specification —
-	// an empty s3Key/restorePath means a branch forgot its convention and
-	// would otherwise download from/gunzip an empty string (the class of
-	// bug F31 fixed for MySQL).
-	if s3Key == "" || restorePath == "" {
-		return keepTmp(fmt.Errorf("internal error: incomplete backup artifact specification for %s (image %s)", name, image))
-	}
-
-	if err := download(s3Key, restorePath); err != nil {
-		return keepTmp(err)
-	}
-
-	fmt.Fprintf(c.out, "Restoring %s...\n", name)
-	var fileRecovery string
-	if accDir != "" {
-		stageDir := tmpdir + "/restore-stage"
-		recoveryDir, err := extractToStagingThenPromote(ctx, c.exec, restorePath, stageDir, accDir, c.out, nil)
-		if err != nil {
-			// Recovery-incomplete failures retain their artifacts in
-			// tmpdir/stage — keepTmp's contract already preserves tmpdir,
-			// so the retained paths stay inspectable (TCL-43).
-			return keepTmp(fmt.Errorf("restoring %s: %w", name, err))
-		}
-		// The recovery directory is returned to the caller (the
-		// AccessoryRestore wrapper releases it once the whole command
-		// succeeds); the staged tree in tmpdir is spent either way.
-		fileRecovery = recoveryDir
-	} else if _, err := c.exec.Run(ctx, restoreCmd); err != nil {
-		return keepTmp(fmt.Errorf("restoring %s: %w", name, err))
-	}
-	return done(fileRecovery)
 }
 
 // resolveAccessoryKey finds the stored object for backup date among the
@@ -427,7 +257,21 @@ func planAccessoryDump(app, name string, det EngineDetection, env map[string]str
 		p := ssh.ShellQuote(workDir + "/dump.pgdump")
 		base.method, base.consistency, base.ext, base.minBytes = "pg_dump", consistencyEngineDump, ".pgdump", minPostgresDump
 		base.artifactPath = workDir + "/dump.pgdump"
-		base.cmd = fmt.Sprintf("docker exec %s pg_dump -Fc -U %s %s > %s && { [ \"$(head -c 5 %s)\" = PGDMP ] || { echo 'pg_dump did not produce a custom-format archive' >&2; exit 1; }; }",
+		// One database is dumped. A cluster holding others would be backed
+		// up incompletely while reporting success — the raw tar this
+		// replaces at least copied them all — so that is refused, loudly.
+		// (A "postgres" maintenance database counts only when it holds
+		// tables of its own — an extension's catalog tables, such as the
+		// ones TimescaleDB installs there, do not count.) Multi-database clusters are G5 adoption's job.
+		psql := fmt.Sprintf("docker exec %s psql -X -qtA -U %s -d ", qContainer, ssh.ShellQuote(user))
+		others := "SELECT string_agg(datname, ', ' ORDER BY datname) FROM pg_database WHERE NOT datistemplate AND datallowconn AND datname NOT IN (" + pgLiteral(db) + ", 'postgres')"
+		tables := "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relkind IN ('r','p') AND n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg\\_%' AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = 'pg_class'::regclass AND d.objid = c.oid AND d.deptype = 'e')"
+		check := "others=$(" + psql + ssh.ShellQuote(db) + " -c " + ssh.ShellQuote(others) + ")"
+		if db != "postgres" {
+			check += "; pt=$(" + psql + "postgres -c " + ssh.ShellQuote(tables) + " 2>/dev/null) || pt=0; [ \"${pt:-0}\" = 0 ] || others=\"${others:+$others, }postgres\""
+		}
+		check += "; if [ -n \"$others\" ]; then echo \"this postgres cluster holds other databases teploy would not back up: $others (only " + strings.ReplaceAll(db, "'", "") + " is dumped) — refusing a backup that silently omits them\" >&2; exit 1; fi"
+		base.cmd = check + fmt.Sprintf(" && docker exec %s pg_dump -Fc -U %s %s > %s && { [ \"$(head -c 5 %s)\" = PGDMP ] || { echo 'pg_dump did not produce a custom-format archive' >&2; exit 1; }; }",
 			qContainer, ssh.ShellQuote(user), ssh.ShellQuote(db), p, p)
 		return base, nil
 
@@ -436,10 +280,7 @@ func planAccessoryDump(app, name string, det EngineDetection, env map[string]str
 		if det.Engine == EngineMariaDB {
 			client = "mariadb-dump"
 		}
-		// A consistent InnoDB snapshot without locking writers, plus the
-		// stored routines and triggers a plain dump omits (routines) or a
-		// --skip-triggers default elsewhere would drop.
-		dumpArgs := client + " --single-transaction --routines --triggers -u root " + ssh.ShellQuote(mysqlDB(app, env))
+		dumpArgs := client + " " + mysqlDumpArgs + " -u root " + ssh.ShellQuote(mysqlDB(app, env))
 		// Root password rides a 0600 env-file consumed by --env-file, never
 		// argv (mysqldump argv is visible in `ps` inside the container, and
 		// -e MYSQL_PWD puts the secret in the docker CLI's own argv on the
@@ -508,11 +349,12 @@ func planAccessoryDump(app, name string, det EngineDetection, env map[string]str
 		base.cmd = strings.Join([]string{
 			"set -eu",
 			dragonflyDirPrelude(qContainer),
+			// The in-container snapshot never outlives the script, on any
+			// exit path (a failed copy, a dropped SSH session).
+			fmt.Sprintf(`trap 'docker exec -u 0 %s rm -f "$dir"/%s.rdb >/dev/null 2>&1 || true' EXIT HUP INT TERM`, qContainer, snap),
 			fmt.Sprintf("out=$(docker exec %s redis-cli save rdb %s 2>&1) || true", qContainer, snap),
 			`if [ "$out" != OK ]; then printf 'dragonfly SAVE RDB failed: %s\n' "$out" >&2; exit 1; fi`,
-			fmt.Sprintf(`cp_ok=yes; docker cp %s:"$dir"/%s.rdb %s || cp_ok=no`, qContainer, snap, ssh.ShellQuote(rdb)),
-			fmt.Sprintf(`docker exec -u 0 %s rm -f "$dir"/%s.rdb || true`, qContainer, snap),
-			`if [ "$cp_ok" != yes ]; then echo 'copying the dragonfly snapshot out of the container failed' >&2; exit 1; fi`,
+			fmt.Sprintf(`docker cp %s:"$dir"/%s.rdb %s`, qContainer, snap, ssh.ShellQuote(rdb)),
 			rdbMagicCheck(rdb),
 			fmt.Sprintf("gzip -c %s > %s", ssh.ShellQuote(rdb), ssh.ShellQuote(dumpPath)),
 			fmt.Sprintf("rm -f %s", ssh.ShellQuote(rdb)),
@@ -530,10 +372,43 @@ func planAccessoryDump(app, name string, det EngineDetection, env map[string]str
 		accDir := fmt.Sprintf("%s/%s/accessories/%s", deploymentsDir, app, name)
 		base.method, base.consistency, base.ext, base.minBytes = "tar", consistencyCrash, ".tar.gz", minTarArchive
 		base.artifactPath = workDir + "/dump.tar.gz"
-		base.cmd = fmt.Sprintf("tar -czf %s -C %s . || [ $? -eq 1 ]", ssh.ShellQuote(workDir+"/dump.tar.gz"), ssh.ShellQuote(accDir))
+		tarCmd := fmt.Sprintf("tar -czf %s -C %s . || [ $? -eq 1 ]", ssh.ShellQuote(workDir+"/dump.tar.gz"), ssh.ShellQuote(accDir))
+		if det.Engine == EngineGeneric && det.Source != "label" && det.Source != "config" {
+			// Nothing recognised the container, but its files may still be
+			// a database teploy has no method for (ClickHouse, Elastic,
+			// Qdrant, KeyDB, a postgres fork). A live tar of those is not a
+			// backup, so a data-directory marker refuses it while the
+			// container runs; a stopped container's files are quiescent.
+			base.cmd = liveDBGuard(accDir, containerName) + " && { " + tarCmd + "; }"
+		} else {
+			base.cmd = tarCmd
+		}
 		return base, nil
 	}
 	return accessoryDumpPlan{}, fmt.Errorf("accessory %s: engine %q has no backup method — refusing to fall back to a raw file copy of a database", name, det.Engine)
+}
+
+// liveDBMarkers are file names only database data directories contain.
+var liveDBMarkers = []string{
+	"PG_VERSION",                               // postgres and forks
+	"ibdata1", "mysql.ibd", "aria_log_control", // mysql / mariadb
+	"WiredTiger", "WiredTiger.wt", // mongo
+	"*.rdb", "appendonlydir", "appendonly.aof", "*.dfs", // redis family, dragonfly
+	"raft_state.json",                          // qdrant
+	"preprocessed_configs", "metadata_dropped", // clickhouse
+	"node.lock", // elasticsearch / opensearch
+}
+
+// liveDBGuard is the shell check that refuses a raw tar of what looks like
+// a running database's data directory.
+func liveDBGuard(accDir, container string) string {
+	var names []string
+	for _, m := range liveDBMarkers {
+		names = append(names, "-name "+ssh.ShellQuote(m))
+	}
+	find := "find " + ssh.ShellQuote(accDir) + " -maxdepth 4 \\( " + strings.Join(names, " -o ") + " \\) -print 2>/dev/null | head -n 1"
+	return "m=$(" + find + "); if [ -n \"$m\" ] && [ \"$(docker inspect -f '{{.State.Running}}' " + ssh.ShellQuote(container) + " 2>/dev/null)\" = true ]; then " +
+		"echo \"refusing a raw copy of a running database: $m marks a database data directory, and teploy has no engine method for this container — stop the accessory first, or set engine: in teploy.yml (teploy.engine label; generic asserts it is plain files)\" >&2; exit 1; fi"
 }
 
 // safeSuffix derives a filename-safe unique token from a mktemp path.
@@ -576,6 +451,8 @@ func dragonflyLoadScript(container, artifactGz, workDir, preRestore string) stri
 		fmt.Sprintf("gunzip -c %s > %s", ssh.ShellQuote(artifactGz), ssh.ShellQuote(rdb)),
 		rdbMagicCheck(rdb),
 		dragonflyDirPrelude(q),
+		// Neither in-container snapshot outlives the script, on any exit.
+		fmt.Sprintf(`trap 'docker exec -u 0 %s rm -f "$dir"/%s "$dir"/%s >/dev/null 2>&1 || true' EXIT HUP INT TERM`, q, in, pre),
 		fmt.Sprintf(`out=$(docker exec %s redis-cli save rdb %s 2>&1) || true`, q, strings.TrimSuffix(pre, ".rdb")),
 		`if [ "$out" != OK ]; then printf 'pre-restore snapshot failed (dataset untouched): %s\n' "$out" >&2; exit 1; fi`,
 		fmt.Sprintf(`docker cp %s:"$dir"/%s %s`, q, pre, ssh.ShellQuote(preRestore)),
@@ -585,11 +462,10 @@ func dragonflyLoadScript(container, artifactGz, workDir, preRestore string) stri
 		fmt.Sprintf(`out=$(docker exec %s redis-cli dfly load %s 2>&1) || true`, q, in),
 		`if [ "$out" != OK ]; then`,
 		fmt.Sprintf(`  back=$(docker exec %s redis-cli dfly load %s 2>&1) || true`, q, pre),
-		fmt.Sprintf(`  docker exec -u 0 %s rm -f "$dir"/%s "$dir"/%s || true`, q, in, pre),
-		`  if [ "$back" = OK ]; then printf 'DFLY LOAD of the backup failed (%s); the pre-restore dataset was reloaded\n' "$out" >&2; else printf 'DFLY LOAD of the backup failed (%s) and reloading the pre-restore snapshot failed too (%s)\n' "$out" "$back" >&2; fi`,
-		`  exit 1`,
+		`  if [ "$back" = OK ]; then printf 'DFLY LOAD of the backup failed (%s); the pre-restore dataset was reloaded\n' "$out" >&2; exit 1; fi`,
+		`  printf '` + recoveryIncompleteMarker + `: DFLY LOAD of the backup failed (%s) and reloading the pre-restore snapshot failed too (%s)\n' "$out" "$back" >&2`,
+		`  exit 3`,
 		`fi`,
-		fmt.Sprintf(`docker exec -u 0 %s rm -f "$dir"/%s "$dir"/%s`, q, in, pre),
 		fmt.Sprintf(`out=$(docker exec %s redis-cli save 2>&1) || true`, q),
 		`if [ "$out" != OK ]; then printf 'restored, but persisting the restored dataset failed: %s\n' "$out" >&2; exit 1; fi`,
 		fmt.Sprintf("rm -f %s", ssh.ShellQuote(rdb)),
@@ -602,201 +478,6 @@ func redisCLI(engine string) string {
 		return "valkey-cli"
 	}
 	return "redis-cli"
-}
-
-// ---- postgres ----
-
-// pgTarget is one database inside a postgres container.
-type pgTarget struct {
-	container, user, db string
-}
-
-// maintDB is the database the DROP/CREATE runs from: never the target.
-func (t pgTarget) maintDB() string {
-	if t.db == "postgres" {
-		return "template1"
-	}
-	return "postgres"
-}
-
-func (t pgTarget) psql(db string, sqls ...string) string {
-	cmd := "docker exec " + ssh.ShellQuote(t.container) + " psql -X -qtA -v ON_ERROR_STOP=1 -U " + ssh.ShellQuote(t.user) + " -d " + ssh.ShellQuote(db)
-	for _, s := range sqls {
-		cmd += " -c " + ssh.ShellQuote(s)
-	}
-	return cmd
-}
-
-func pgIdent(s string) string   { return `"` + strings.ReplaceAll(s, `"`, `""`) + `"` }
-func pgLiteral(s string) string { return "'" + strings.ReplaceAll(s, "'", "''") + "'" }
-
-// pgDBProps is what CREATE DATABASE needs to recreate a database as it was.
-type pgDBProps struct {
-	version                      int
-	exists                       bool
-	owner, encoding, collate, ct string
-}
-
-func (c *Client) pgDatabaseProps(ctx context.Context, t pgTarget) (pgDBProps, error) {
-	q := "SELECT current_setting('server_version_num') || coalesce((SELECT '|' || pg_get_userbyid(datdba) || '|' || pg_encoding_to_char(encoding) || '|' || datcollate || '|' || datctype FROM pg_database WHERE datname = " + pgLiteral(t.db) + "), '')"
-	out, err := c.exec.Run(ctx, t.psql(t.maintDB(), q))
-	if err != nil {
-		return pgDBProps{}, fmt.Errorf("reading database %s properties: %w", t.db, err)
-	}
-	f := strings.Split(strings.TrimSpace(out), "|")
-	v, err := strconv.Atoi(f[0])
-	if err != nil {
-		return pgDBProps{}, fmt.Errorf("reading database %s properties: unexpected reply %q", t.db, strings.TrimSpace(out))
-	}
-	p := pgDBProps{version: v}
-	if len(f) == 5 {
-		p.exists, p.owner, p.encoding, p.collate, p.ct = true, f[1], f[2], f[3], f[4]
-	}
-	return p, nil
-}
-
-var timescaleTOC = regexp.MustCompile(`(?m) EXTENSION - timescaledb( |$)`)
-
-// pgValidateArtifact proves the artifact is readable before anything
-// destructive runs, and reports whether it carries TimescaleDB (whose
-// restore must be bracketed by timescaledb_pre_restore/post_restore).
-func (c *Client) pgValidateArtifact(ctx context.Context, t pgTarget, artifact, ext string) (timescale bool, err error) {
-	if ext == ".sql.gz" {
-		if _, err := c.exec.Run(ctx, "gzip -t "+ssh.ShellQuote(artifact)); err != nil {
-			return false, fmt.Errorf("legacy plain dump is corrupt: %w", err)
-		}
-		return false, nil
-	}
-	toc, err := c.exec.Run(ctx, "docker exec -i "+ssh.ShellQuote(t.container)+" pg_restore -l < "+ssh.ShellQuote(artifact))
-	if err != nil {
-		return false, fmt.Errorf("pg_restore cannot read the archive: %w", err)
-	}
-	return timescaleTOC.MatchString(toc), nil
-}
-
-// pgRecreateAndLoad replaces the target database with the artifact's
-// contents: DROP (forcing out connections) and CREATE from template0 with
-// the original owner/encoding/locale, then pg_restore (or psql for a
-// legacy plain dump) in a single transaction. There is no --clean path:
-// dropping the database is the only way the result equals the backup
-// (objects created after the backup do not survive), and a populated
-// database no longer makes the first CREATE fail (U4). scratch relaxes
-// ownership/ACLs for verification copies whose roles do not exist.
-func (c *Client) pgRecreateAndLoad(ctx context.Context, t pgTarget, props pgDBProps, artifact, ext, workDir string, timescale, scratch bool) error {
-	maint := t.maintDB()
-	if props.version >= 130000 {
-		if _, err := c.exec.Run(ctx, t.psql(maint, "DROP DATABASE IF EXISTS "+pgIdent(t.db)+" WITH (FORCE)")); err != nil {
-			return fmt.Errorf("dropping database %s: %w", t.db, err)
-		}
-	} else {
-		terminate := "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity WHERE datname = " + pgLiteral(t.db) + " AND pid <> pg_backend_pid()"
-		if _, err := c.exec.Run(ctx, t.psql(maint, terminate, "DROP DATABASE IF EXISTS "+pgIdent(t.db))); err != nil {
-			return fmt.Errorf("dropping database %s: %w", t.db, err)
-		}
-	}
-	owner := props.owner
-	if owner == "" || scratch {
-		owner = t.user
-	}
-	create := "CREATE DATABASE " + pgIdent(t.db) + " OWNER " + pgIdent(owner) + " TEMPLATE template0"
-	if props.exists && !scratch {
-		create += " ENCODING " + pgLiteral(props.encoding) + " LC_COLLATE " + pgLiteral(props.collate) + " LC_CTYPE " + pgLiteral(props.ct)
-	}
-	if _, err := c.exec.Run(ctx, t.psql(maint, create)); err != nil {
-		return fmt.Errorf("creating database %s: %w", t.db, err)
-	}
-	if timescale {
-		if _, err := c.exec.Run(ctx, t.psql(t.db, "CREATE EXTENSION IF NOT EXISTS timescaledb", "SELECT timescaledb_pre_restore()")); err != nil {
-			return fmt.Errorf("preparing timescaledb restore: %w", err)
-		}
-	}
-	q := ssh.ShellQuote
-	if ext == ".sql.gz" {
-		sqlPath := workDir + "/restore.sql"
-		cmd := "gunzip -c " + q(artifact) + " > " + q(sqlPath) + " && docker exec -i " + q(t.container) +
-			" psql -X -q -v ON_ERROR_STOP=1 --single-transaction -U " + q(t.user) + " -d " + q(t.db) + " < " + q(sqlPath) + " >/dev/null"
-		if _, err := c.exec.Run(ctx, cmd); err != nil {
-			return fmt.Errorf("loading the plain dump: %w", err)
-		}
-	} else {
-		flags := " --exit-on-error --single-transaction"
-		if scratch {
-			flags += " --no-owner --no-acl"
-		}
-		cmd := "docker exec -i " + q(t.container) + " pg_restore" + flags + " -U " + q(t.user) + " -d " + q(t.db) + " < " + q(artifact)
-		if _, err := c.exec.Run(ctx, cmd); err != nil {
-			return fmt.Errorf("pg_restore: %w", err)
-		}
-	}
-	if timescale {
-		if _, err := c.exec.Run(ctx, t.psql(t.db, "SELECT timescaledb_post_restore()")); err != nil {
-			return fmt.Errorf("finishing timescaledb restore: %w", err)
-		}
-	}
-	return nil
-}
-
-// restorePostgresInPlace is the G7 in-place sequence (the caller has
-// already quiesced the app): validate the artifact, take a safety dump of
-// the current database, drop + recreate it, load the backup. A failed load
-// reloads the safety dump; when that also fails the error is
-// recovery-incomplete (the app must not be restarted against it) and names
-// the safety dump. On success the safety dump's directory is returned as
-// the caller-owned recovery directory.
-func (c *Client) restorePostgresInPlace(ctx context.Context, t pgTarget, artifact, ext, workDir string) (string, error) {
-	timescale, err := c.pgValidateArtifact(ctx, t, artifact, ext)
-	if err != nil {
-		return "", fmt.Errorf("backup artifact failed validation (database untouched): %w", err)
-	}
-	props, err := c.pgDatabaseProps(ctx, t)
-	if err != nil {
-		return "", fmt.Errorf("%w (database untouched)", err)
-	}
-	recDir, safety := "", ""
-	if props.exists {
-		out, err := c.exec.Run(ctx, "umask 077; mktemp -d /var/tmp/teploy-pre-restore.XXXXXX")
-		if err != nil {
-			return "", fmt.Errorf("creating the safety-dump directory (database untouched): %w", err)
-		}
-		recDir = strings.TrimSpace(out)
-		safety = recDir + "/pre-restore.pgdump"
-		qs := ssh.ShellQuote(safety)
-		cmd := fmt.Sprintf("docker exec %s pg_dump -Fc -U %s %s > %s && [ \"$(head -c 5 %s)\" = PGDMP ]",
-			ssh.ShellQuote(t.container), ssh.ShellQuote(t.user), ssh.ShellQuote(t.db), qs, qs)
-		if _, err := c.exec.Run(ctx, cmd); err != nil {
-			c.exec.Run(context.WithoutCancel(ctx), "rm -rf "+ssh.ShellQuote(recDir))
-			return "", fmt.Errorf("safety dump of the current database failed (database untouched): %w", err)
-		}
-		fmt.Fprintf(c.out, "Safety dump of the current %s database: %s\n", t.db, safety)
-	}
-
-	loadErr := c.pgRecreateAndLoad(ctx, t, props, artifact, ext, workDir, timescale, false)
-	if loadErr == nil {
-		return recDir, nil
-	}
-	if safety == "" {
-		return "", loadErr
-	}
-	fmt.Fprintf(c.out, "Restore failed (%v); reloading the safety dump...\n", loadErr)
-	wctx := context.WithoutCancel(ctx)
-	safetyTS, err := c.pgValidateArtifact(wctx, t, safety, ".pgdump")
-	if err == nil {
-		err = c.pgRecreateAndLoad(wctx, t, props, safety, ".pgdump", workDir, safetyTS, false)
-	}
-	if err != nil {
-		return recDir, fmt.Errorf("%w: %v — reloading the safety dump also failed: %v; the pre-restore database is saved at %s", errRecoveryIncomplete, loadErr, err, safety)
-	}
-	c.exec.Run(wctx, "rm -rf "+ssh.ShellQuote(recDir))
-	return "", fmt.Errorf("%w — the previous database was reloaded from the safety dump", loadErr)
-}
-
-// postgresRestoreCmd is the legacy plain-dump loader for DR bundles taken
-// before G7 (.sql.gz members), restored into a freshly created accessory
-// (an empty database, so no recreate is needed). gunzip writes to a plain
-// file first: a pipeline reports only the LAST command's status.
-func postgresRestoreCmd(container, user, db, dumpPath, sqlPath string) string {
-	return fmt.Sprintf("gunzip -c %s > %s && docker exec -i %s psql -v ON_ERROR_STOP=1 -U %s %s < %s",
-		ssh.ShellQuote(dumpPath), ssh.ShellQuote(sqlPath), ssh.ShellQuote(container), ssh.ShellQuote(user), ssh.ShellQuote(db), ssh.ShellQuote(sqlPath))
 }
 
 // ---- mysql / mongo / redis ----
@@ -918,31 +599,6 @@ func imageName(image string) string {
 	return image
 }
 
-// postgresDBAndUser resolves the actual database name and superuser a
-// postgres accessory is running with, mirroring
-// internal/accessories.connectionEnvVars' exact fallback logic (POSTGRES_DB
-// / POSTGRES_USER, defaulting to the app name / "postgres"); Bitnami images
-// name them POSTGRESQL_DATABASE / POSTGRESQL_USERNAME. Backup/restore
-// previously hardcoded db=app unconditionally — silently wrong for any
-// accessory setting a custom POSTGRES_DB.
-func postgresDBAndUser(app string, env map[string]string) (db, user string) {
-	db = env["POSTGRES_DB"]
-	if db == "" {
-		db = env["POSTGRESQL_DATABASE"]
-	}
-	if db == "" {
-		db = app
-	}
-	user = env["POSTGRES_USER"]
-	if user == "" {
-		user = env["POSTGRESQL_USERNAME"]
-	}
-	if user == "" {
-		user = "postgres"
-	}
-	return db, user
-}
-
 // mysqlDB mirrors connectionEnvVars' MYSQL_DATABASE fallback (see
 // postgresDBAndUser). mysql/mariadb backup/restore always uses the "root"
 // user, matching connectionEnvVars' own hardcoded assumption there — no
@@ -975,33 +631,6 @@ func mysqlRootPassword(env map[string]string) string {
 }
 
 const mysqlPasswordPrelude = `IFS= read -r teploy_credential || exit 1; MYSQL_PWD=${teploy_credential#MYSQL_PWD=}; export MYSQL_PWD; `
-
-// postgresReadyProbe waits for the FINAL server: the official entrypoint
-// runs a temporary socket-only server while it initialises, and a socket
-// probe that answers during init let a restore race the restart. The
-// temporary server never listens on TCP.
-func postgresReadyProbe(user string) string {
-	return "pg_isready -h 127.0.0.1 -U " + ssh.ShellQuote(user)
-}
-
-// pgLoadArtifact loads a DR-bundle postgres member into a freshly started
-// engine: custom-format members through the recreate+pg_restore path,
-// legacy plain members (bundles taken before G7) through psql.
-func (c *Client) pgLoadArtifact(ctx context.Context, t pgTarget, artifact, workDir string, scratch bool) error {
-	if strings.HasSuffix(artifact, ".sql.gz") {
-		_, err := c.exec.Run(ctx, postgresRestoreCmd(t.container, t.user, t.db, artifact, strings.TrimSuffix(artifact, ".gz")))
-		return err
-	}
-	timescale, err := c.pgValidateArtifact(ctx, t, artifact, ".pgdump")
-	if err != nil {
-		return err
-	}
-	props, err := c.pgDatabaseProps(ctx, t)
-	if err != nil {
-		return err
-	}
-	return c.pgRecreateAndLoad(ctx, t, props, artifact, ".pgdump", workDir, timescale, scratch)
-}
 
 // dragonflyScratchLoad loads an RDB into a running scratch dragonfly with
 // DFLY LOAD and returns its key count.

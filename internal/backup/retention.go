@@ -126,6 +126,13 @@ func (c *Client) PruneBackups(ctx context.Context, app, prefix string, s3 S3Conf
 		}
 		fmt.Fprintf(c.out, "Pruned %s\n", key)
 		deleted = append(deleted, name)
+		if strings.HasPrefix(prefix, "accessories/") {
+			// A postgres backup's globals sidecar goes with it (absent
+			// for every other engine; deleting a missing key succeeds).
+			id, _, _ := strings.Cut(name, ".")
+			sidecar := fmt.Sprintf("s3://%s/%s/%s/globals/%s.sql.gz", s3.Base(), app, prefix, id)
+			c.exec.Run(ctx, s3.AWS("s3 rm "+ssh.ShellQuote(sidecar)))
+		}
 	}
 	return deleted, nil
 }

@@ -1028,3 +1028,28 @@ func TestAccessoryLiteralDirectiveValuesNeverResolve(t *testing.T) {
 		t.Fatalf("literal values changed: %q", contents)
 	}
 }
+
+// engine: in teploy.yml becomes the teploy.engine label backup detection
+// reads first; unset adds nothing.
+func TestEnsureRunning_EngineLabel(t *testing.T) {
+	for _, tc := range []struct{ engine, want string }{{"none", "--label teploy.engine=none"}, {"", ""}} {
+		mock := ssh.NewMockExecutor("1.2.3.4", append(admissionStubs("myapp"),
+			ssh.MockCommand{Match: "docker inspect", Err: fmt.Errorf("not found")},
+			ssh.MockCommand{Match: "mkdir -p", Output: ""},
+			ssh.MockCommand{Match: "docker run", Output: "abc123"},
+		)...)
+		if _, err := NewManager(mock, &bytes.Buffer{}).EnsureRunning(context.Background(), "myapp", "backup", config.AccessoryConfig{Image: "prodrigestivill/postgres-backup-local:17", Engine: tc.engine}); err != nil {
+			t.Fatal(err)
+		}
+		for _, c := range mock.Calls {
+			if strings.HasPrefix(c, "docker run") {
+				if tc.want != "" && !strings.Contains(c, tc.want) {
+					t.Errorf("engine %q: docker run lacks %q: %s", tc.engine, tc.want, c)
+				}
+				if tc.want == "" && strings.Contains(c, "teploy.engine") {
+					t.Errorf("unset engine must add no label: %s", c)
+				}
+			}
+		}
+	}
+}

@@ -36,6 +36,8 @@ func (e *redisRestoreExec) Run(ctx context.Context, cmd string) (string, error) 
 	switch {
 	case strings.HasPrefix(cmd, "which aws"):
 		return "", nil
+	case strings.Contains(cmd, "aws s3 ls "):
+		return "2026-09-19 00:00:00 99 20260919-000000.rdb.gz\n", nil
 	case strings.HasPrefix(cmd, "mktemp -d "):
 		dir, err := os.MkdirTemp("", "teploy-restore-test-")
 		if err != nil {

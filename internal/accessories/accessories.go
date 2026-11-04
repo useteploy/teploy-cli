@@ -162,6 +162,10 @@ func (m *Manager) EnsureRunning(ctx context.Context, app, name string, cfg confi
 		"--label", "teploy.role=accessory",
 		"--label", "teploy.accessory=" + name,
 	}
+	if cfg.Engine != "" {
+		// Read back by backup engine detection (backup.EngineLabel).
+		args = append(args, "--label", "teploy.engine="+cfg.Engine)
+	}
 
 	// Env rides a 0600 env-file under the accessory's own directory rather
 	// than `-e KEY=value` argv: resolved credentials (generated passwords,

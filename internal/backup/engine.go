@@ -29,7 +29,8 @@ const (
 // EngineLabel is the container label that overrides detection
 // (`teploy.engine=postgres`). Set it on images the detectors cannot
 // recognise (a custom build that dropped the upstream env markers), or
-// `generic` to assert that a container really is plain files.
+// `generic` / `none` to assert that a container really is plain files. The
+// accessory's `engine:` in teploy.yml sets it.
 const EngineLabel = "teploy.engine"
 
 var knownEngines = map[string]bool{
@@ -59,12 +60,22 @@ func (d EngineDetection) IsDB() bool { return d.Engine != EngineGeneric && d.Eng
 func DetectEngine(image string, env, labels map[string]string, entrypoint []string) (EngineDetection, error) {
 	if v, ok := labels[EngineLabel]; ok {
 		v = strings.ToLower(strings.TrimSpace(v))
+		if v == "none" {
+			v = EngineGeneric
+		}
 		if !knownEngines[v] {
 			return EngineDetection{}, fmt.Errorf("container label %s=%q is not a known engine (postgres, mysql, mariadb, redis, valkey, dragonfly, mongo, nucleus, generic)", EngineLabel, v)
 		}
 		return EngineDetection{Engine: v, Source: "label"}, nil
 	}
 	if e := engineFromEnv(env); e != "" {
+		// Images built FROM a database image inherit its version env even
+		// when they run something else (postgres-backup-local, wal-g and
+		// pgbackrest sidecars). When the container's command is known and
+		// is not the engine's server, it is not that database.
+		if bin := firstCommand(entrypoint, env); bin != "" && !serverBinaries[e][bin] {
+			return EngineDetection{Engine: EngineGeneric, Source: "env-not-server"}, nil
+		}
 		return EngineDetection{Engine: e, Source: "env"}, nil
 	}
 	if strings.Contains(labels["org.opencontainers.image.source"], "dragonflydb/dragonfly") {
@@ -119,6 +130,36 @@ func engineFromEnv(env map[string]string) string {
 		return EngineRedis
 	case has("MONGO_VERSION", "MONGO_MAJOR"):
 		return EngineMongo
+	}
+	return ""
+}
+
+// serverBinaries are the commands that run each engine's server.
+var serverBinaries = map[string]map[string]bool{
+	EnginePostgres: {"postgres": true, "postmaster": true},
+	EngineMySQL:    {"mysqld": true},
+	EngineMariaDB:  {"mariadbd": true, "mysqld": true},
+	EngineRedis:    {"redis-server": true, "redis-stack-server": true},
+	EngineValkey:   {"valkey-server": true, "redis-server": true},
+	EngineMongo:    {"mongod": true},
+}
+
+// firstCommand is the first non-wrapper token of Entrypoint+Cmd ("" when
+// unknown or when it is only flags, which the upstream entrypoints prepend
+// the server to). Bitnami images start their server through run.sh.
+func firstCommand(argv []string, env map[string]string) string {
+	for _, a := range argv {
+		base := path.Base(a)
+		if entrypointWrappers[base] || (env["BITNAMI_APP_NAME"] != "" && base == "run.sh") {
+			continue
+		}
+		if strings.HasPrefix(a, "-") {
+			return ""
+		}
+		if env["BITNAMI_APP_NAME"] != "" && strings.HasPrefix(a, "/opt/bitnami/") {
+			return ""
+		}
+		return base
 	}
 	return ""
 }

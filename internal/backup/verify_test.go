@@ -63,7 +63,7 @@ func TestVerifyBackup_Postgres(t *testing.T) {
 		ssh.MockCommand{Match: "docker exec", Output: "42\n"},
 		ssh.MockCommand{Match: "if [", Output: ""},
 	)
-	client := NewClient(mock, &bytes.Buffer{})
+	client := NewClient(pgScratchExec{mock}, &bytes.Buffer{})
 	res, err := client.VerifyBackup(context.Background(), "myapp", "db", "", S3Config{Bucket: "b", Region: "us-east-1"})
 	if err != nil {
 		t.Fatalf("VerifyBackup: %v", err)
@@ -89,13 +89,13 @@ func TestVerifyBackup_Postgres(t *testing.T) {
 				t.Errorf("scratch must not clone unrelated env like PATH: %s", call)
 			}
 		}
-		if strings.Contains(call, "gunzip -c") && strings.Contains(call, "psql") {
+		if strings.Contains(call, "gunzip -c") && strings.Contains(call, "psql") && !strings.Contains(call, "globals") {
 			sawRestore = true
 			if !strings.Contains(call, "teploy-backup-verify-") {
 				t.Errorf("restore must target the scratch container, got: %s", call)
 			}
-			if !strings.Contains(call, "'appdb'") {
-				t.Errorf("restore must target POSTGRES_DB from inspected env: %s", call)
+			if !strings.Contains(call, "'appdb_teploy_new_") {
+				t.Errorf("restore must load a replacement for POSTGRES_DB from inspected env: %s", call)
 			}
 		}
 		if strings.Contains(call, "docker rm -f") && strings.Contains(call, "teploy-backup-verify-") {
@@ -199,4 +199,21 @@ func TestVerifyBackup_VolumeArchive(t *testing.T) {
 	if !res.OK || res.Kind != "volume" || res.Metric != "files=12" {
 		t.Fatalf("unexpected result: %+v", res)
 	}
+}
+
+// pgScratchExec answers the scratch-postgres queries a verification runs
+// against a randomly named container (prefix mocks cannot): the cluster
+// state, then the table count; everything else goes to the mock.
+type pgScratchExec struct{ *ssh.MockExecutor }
+
+func (e pgScratchExec) Run(ctx context.Context, cmd string) (string, error) {
+	switch {
+	case strings.Contains(cmd, "current_setting('\"'\"'server_version_num"):
+		e.MockExecutor.Calls = append(e.MockExecutor.Calls, cmd)
+		return "170004|t|t\n", nil
+	case strings.Contains(cmd, "information_schema.tables"):
+		e.MockExecutor.Calls = append(e.MockExecutor.Calls, cmd)
+		return "42\n", nil
+	}
+	return e.MockExecutor.Run(ctx, cmd)
 }

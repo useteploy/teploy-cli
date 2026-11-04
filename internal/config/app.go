@@ -379,7 +379,17 @@ type AccessoryConfig struct {
 	// anything kills the accessory itself.
 	Memory string `yaml:"memory,omitempty" toml:"memory"`
 	CPU    string `yaml:"cpu,omitempty" toml:"cpu"`
+	// Engine overrides backup engine detection (postgres, mysql, mariadb,
+	// redis, valkey, dragonfly, mongo, nucleus; generic or none for plain
+	// files). Set on the container as the teploy.engine label, so it takes
+	// effect when the accessory is (re)created. Needed for an image the
+	// detectors misread: a sidecar built FROM postgres that is not a
+	// server, or a database image that dropped the upstream env markers.
+	Engine string `yaml:"engine,omitempty" toml:"engine"`
 }
+
+// AccessoryEngines are the accepted values of an accessory's engine:.
+var AccessoryEngines = []string{"postgres", "mysql", "mariadb", "redis", "valkey", "dragonfly", "mongo", "nucleus", "generic", "none"}
 
 // TLSConfig declares a custom certificate for terminating TLS on the app's
 // Caddy site block, instead of Caddy's automatic HTTPS (ACME). Use this when
@@ -1342,6 +1352,9 @@ func (c *AppConfig) validate() error {
 		if acc.Command != "" && len(acc.CommandArgs) > 0 {
 			return fmt.Errorf("accessory %s: set either 'command' or 'command_args', not both", name)
 		}
+		if acc.Engine != "" && !slices.Contains(AccessoryEngines, acc.Engine) {
+			return fmt.Errorf("accessory %s: engine %q is not one of %s", name, acc.Engine, strings.Join(AccessoryEngines, ", "))
+		}
 		// Accessory volume keys become path segments under the accessory's
 		// data directory (and reach mkdir/chown sites); the same grammar as
 		// top-level volume names applies, and container destinations must
@@ -1962,6 +1975,9 @@ func mergeAccessory(base, overlay AccessoryConfig) AccessoryConfig {
 	}
 	if overlay.CPU != "" {
 		out.CPU = overlay.CPU
+	}
+	if overlay.Engine != "" {
+		out.Engine = overlay.Engine
 	}
 	if len(overlay.Env) > 0 {
 		if out.Env == nil {

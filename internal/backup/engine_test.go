@@ -127,13 +127,13 @@ func TestPlanAccessoryDump_EngineCommands(t *testing.T) {
 		t.Errorf("postgres must dump custom format into a file and check its magic: %s", pg.cmd)
 	}
 	my := plan(EngineMySQL, map[string]string{"MYSQL_ROOT_PASSWORD": "pw"})
-	if !strings.Contains(my.cmd, "mysqldump --single-transaction --routines --triggers -u root") || !strings.Contains(my.cmd, "Dump completed") {
+	if !strings.Contains(my.cmd, "mysqldump --single-transaction --routines --triggers --events -u root") || !strings.Contains(my.cmd, "Dump completed") {
 		t.Errorf("mysql dump must be consistent, carry routines/triggers and check its trailer: %s", my.cmd)
 	}
 	if strings.Contains(my.cmd, "pw") {
 		t.Errorf("password in the command text: %s", my.cmd)
 	}
-	if md := plan(EngineMariaDB, nil); !strings.Contains(md.cmd, "mariadb-dump --single-transaction --routines --triggers") {
+	if md := plan(EngineMariaDB, nil); !strings.Contains(md.cmd, "mariadb-dump --single-transaction --routines --triggers --events") {
 		t.Errorf("mariadb uses mariadb-dump with the same flags: %s", md.cmd)
 	}
 	if vk := plan(EngineValkey, nil); !strings.Contains(vk.cmd, "valkey-cli bgsave") || strings.Contains(vk.cmd, "redis-cli") || !strings.Contains(vk.cmd, "REDIS|VALKE") {
@@ -151,7 +151,7 @@ func TestAccessoryBackup_PgvectorIsDumpedNotTarred(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
 		ssh.MockCommand{Match: "umask 077", Output: "/tmp/teploy-backup.abc123\n"},
-		ssh.MockCommand{Match: "docker exec 'myapp-db' pg_dump -Fc", Output: ""},
+		ssh.MockCommand{Match: "others=", Output: ""},
 		ssh.MockCommand{Match: "wc -c", Output: "2123\n"},
 		ssh.MockCommand{Match: "aws s3 cp", Output: "done\n"},
 		ssh.MockCommand{Match: "rm -rf", Output: ""},
@@ -254,9 +254,12 @@ func TestVerifyBackup_TimescaleIsVerifiedAsPostgres(t *testing.T) {
 		ssh.MockCommand{Match: "docker exec", Output: "170004\n"},
 		ssh.MockCommand{Match: "if [", Output: ""},
 	)
-	res, err := NewClient(mock, io.Discard).VerifyBackup(context.Background(), "myapp", "db", "", S3Config{Bucket: "b", Region: "us-east-1"})
+	res, err := NewClient(pgScratchExec{mock}, io.Discard).VerifyBackup(context.Background(), "myapp", "db", "", S3Config{Bucket: "b", Region: "us-east-1"})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if !res.OK {
+		t.Fatalf("verification failed: %s", res.Detail)
 	}
 	if res.Kind != "postgres" || res.Engine != EnginePostgres || res.Detection != "env" || !strings.HasSuffix(res.S3Key, ".pgdump") {
 		t.Fatalf("unexpected classification %+v", res)
@@ -271,5 +274,91 @@ func TestVerifyBackup_TimescaleIsVerifiedAsPostgres(t *testing.T) {
 	}
 	if !pre || !post {
 		t.Fatalf("a timescale archive must be restored between pre_restore/post_restore: %v", mock.Calls)
+	}
+}
+
+// Sidecars built FROM a database image inherit its version env but run
+// something else; they are not the database (and must not fail every
+// backup). Bitnami servers start through run.sh and stay recognised.
+func TestDetectEngine_NonServerContainers(t *testing.T) {
+	pg := map[string]string{"PG_MAJOR": "17"}
+	for _, tc := range []struct {
+		name   string
+		env    map[string]string
+		argv   []string
+		engine string
+	}{
+		{"postgres-backup-local", pg, []string{"/usr/bin/tini", "--", "/backup.sh"}, EngineGeneric},
+		{"wal-g sidecar", pg, []string{"wal-g", "daemon"}, EngineGeneric},
+		{"official postgres", pg, []string{"docker-entrypoint.sh", "postgres"}, EnginePostgres},
+		{"flags-only command", pg, []string{"docker-entrypoint.sh", "-c", "max_connections=200"}, EnginePostgres},
+		{"bitnami postgresql", map[string]string{"BITNAMI_APP_NAME": "postgresql"}, []string{"/opt/bitnami/scripts/postgresql/entrypoint.sh", "/opt/bitnami/scripts/postgresql/run.sh"}, EnginePostgres},
+		{"redis server", map[string]string{"REDIS_VERSION": "7"}, []string{"docker-entrypoint.sh", "redis-server", "--save", "60 1"}, EngineRedis},
+		{"redis-cli job", map[string]string{"REDIS_VERSION": "7"}, []string{"redis-cli", "monitor"}, EngineGeneric},
+		{"no container (config fallback)", pg, nil, EnginePostgres},
+	} {
+		got, err := DetectEngine("x/y:1", tc.env, nil, tc.argv)
+		if err != nil || got.Engine != tc.engine {
+			t.Errorf("%s: DetectEngine = %+v, %v; want %s", tc.name, got, err, tc.engine)
+		}
+	}
+	if got, _ := DetectEngine("postgres:17", pg, map[string]string{EngineLabel: "none"}, nil); got.Engine != EngineGeneric || got.Source != "label" {
+		t.Errorf("engine: none = %+v, want generic from label", got)
+	}
+}
+
+// An unrecognised container whose files look like a database data
+// directory is refused while it runs; an asserted generic (label) is not
+// second-guessed, and nucleus keeps its designed live tar.
+func TestPlanAccessoryDump_GenericRefusesLiveDatabaseFiles(t *testing.T) {
+	plan, err := planAccessoryDump("app", "ch", EngineDetection{Engine: EngineGeneric, Source: "none"}, nil, "/tmp/w")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"-name 'PG_VERSION'", "-name 'ibdata1'", "-name 'WiredTiger'", "-name '*.rdb'", "-name 'appendonlydir'", "{{.State.Running}}", "refusing a raw copy of a running database"} {
+		if !strings.Contains(plan.cmd, want) {
+			t.Errorf("generic plan lacks %q:\n%s", want, plan.cmd)
+		}
+	}
+	asserted, _ := planAccessoryDump("app", "files", EngineDetection{Engine: EngineGeneric, Source: "label"}, nil, "/tmp/w")
+	nucleus, _ := planAccessoryDump("app", "db", EngineDetection{Engine: EngineNucleus, Source: "entrypoint"}, nil, "/tmp/w")
+	for _, p := range []accessoryDumpPlan{asserted, nucleus} {
+		if strings.Contains(p.cmd, "PG_VERSION") || !strings.HasPrefix(p.cmd, "tar -czf") {
+			t.Errorf("no guard expected: %s", p.cmd)
+		}
+	}
+
+	// Run the guard for real against a directory holding PG_VERSION, with
+	// a stub docker reporting the container running / stopped.
+	dir := t.TempDir()
+	acc := filepath.Join(dir, "acc")
+	if err := os.MkdirAll(filepath.Join(acc, "pgdata"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(acc, "pgdata", "PG_VERSION"), []byte("17\n"), 0o644)
+	bin := filepath.Join(dir, "bin")
+	os.MkdirAll(bin, 0o755)
+	for _, state := range []string{"true", "false"} {
+		os.WriteFile(filepath.Join(bin, "docker"), []byte("#!/bin/sh\necho "+state+"\n"), 0o755)
+		cmd := exec.Command("sh", "-c", liveDBGuard(acc, "app-ch"))
+		cmd.Env = append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"))
+		out, err := cmd.CombinedOutput()
+		if state == "true" && (err == nil || !strings.Contains(string(out), "PG_VERSION")) {
+			t.Errorf("running container with PG_VERSION must be refused: %v %s", err, out)
+		}
+		if state == "false" && err != nil {
+			t.Errorf("a stopped container's files are quiescent: %v %s", err, out)
+		}
+	}
+}
+
+// A postgres dump refuses a cluster holding databases it would omit.
+func TestPlanAccessoryDump_PostgresRefusesOmittedDatabases(t *testing.T) {
+	plan, _ := planAccessoryDump("app", "db", EngineDetection{Engine: EnginePostgres}, map[string]string{"POSTGRES_DB": "appdb"}, "/tmp/w")
+	if !strings.HasPrefix(plan.cmd, "others=$(") || !strings.Contains(plan.cmd, "NOT datistemplate") || !strings.Contains(plan.cmd, "silently omits") {
+		t.Fatalf("postgres plan must check for other databases first:\n%s", plan.cmd)
+	}
+	if i, j := strings.Index(plan.cmd, "others=$("), strings.Index(plan.cmd, "pg_dump -Fc"); i > j {
+		t.Fatal("the check must run before the dump")
 	}
 }

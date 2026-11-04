@@ -7,7 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
+	"path"
 	"sort"
 	"strconv"
 	"strings"
@@ -171,7 +171,7 @@ func (c *Client) VerifyBackup(ctx context.Context, app, name, date string, s3 S3
 		return nil, fmt.Errorf("creating private verification workspace: %w", err)
 	}
 	workspace = strings.TrimSpace(workspace)
-	if !strings.HasPrefix(workspace, verifyTmpDir()+"/teploy-verify.") || strings.ContainsAny(workspace, "\n\r") || filepath.Clean(workspace) != workspace {
+	if !strings.HasPrefix(workspace, verifyTmpDir()+"/teploy-verify.") || strings.ContainsAny(workspace, "\n\r") || path.Clean(workspace) != workspace {
 		return nil, fmt.Errorf("invalid verification workspace")
 	}
 	tmpBase := workspace + "/backup"
@@ -189,6 +189,31 @@ func (c *Client) VerifyBackup(ctx context.Context, app, name, date string, s3 S3
 	}()
 	// The unique container name and owner label keep cleanup invocation-scoped.
 	env["TEPLOY_VERIFY_OWNER"] = owner
+
+	// A database engine's backup taken before detection recognised it is
+	// a raw tar of the live data directory: restorable as files, but it
+	// cannot be verified as a database, and reporting it as a passing
+	// "volume" was the U3 false green.
+	if det.IsDB() && det.Engine != EngineNucleus {
+		ext := ""
+		for _, e := range artifactExts(det.Engine) {
+			if strings.HasSuffix(latestFile, e) {
+				ext = e
+			}
+		}
+		if ext == "" && latestFile == "" {
+			if _, e, rerr := c.resolveAccessoryKey(ctx, s3, fmt.Sprintf("s3://%s/%s/accessories/%s/", s3.Base(), app, name), date, artifactExts(det.Engine)...); rerr == nil {
+				ext = e
+			}
+		}
+		if ext == ".tar.gz" {
+			res.Kind = det.Engine
+			res.S3Key = fmt.Sprintf("s3://%s/%s/accessories/%s/%s.tar.gz", s3.Base(), app, name, date)
+			res.DurationMs = time.Since(start).Milliseconds()
+			res.Detail = "this " + det.Engine + " backup is a raw file copy of the live data directory (taken before teploy detected the engine) — it can be restored as files but not verified as a database; take a new backup"
+			return res, nil
+		}
+	}
 
 	// The verification kind follows the DETECTED engine: a pgvector or
 	// timescale accessory is verified as postgres (restored and queried),
@@ -299,6 +324,11 @@ func (c *Client) verifyPostgres(ctx context.Context, res *VerifyResult, app, nam
 	if err := c.download(ctx, s3Key, dump, s3); err != nil {
 		return err
 	}
+	// The cluster's roles (pg_dumpall --globals-only, stored beside the
+	// dump) let the scratch restore keep real ownership. Older backups
+	// have none.
+	globals := tmpBase + ".globals.sql.gz"
+	haveGlobals := c.download(ctx, prefix+"globals/"+res.Date+".sql.gz", globals, s3) == nil
 
 	flags, err := c.verifyEnv(ctx, env, tmpBase, "POSTGRES_")
 	if err != nil {
@@ -313,27 +343,35 @@ func (c *Client) verifyPostgres(ctx context.Context, res *VerifyResult, app, nam
 		"docker run -d --name %s %s %s >/dev/null", ssh.ShellQuote(scratch), flags, ssh.ShellQuote(image))); err != nil {
 		return fmt.Errorf("starting scratch container: %w", err)
 	}
-	if err := c.waitReady(ctx, scratch, postgresReadyProbe(user), 30); err != nil {
+	super := postgresBootstrapUser(env)
+	if err := c.waitReady(ctx, scratch, postgresReadyProbe(super), 30); err != nil {
 		return err
 	}
 
-	fmt.Fprintf(c.out, "Restoring into scratch...\n")
-	// The same drop/recreate/load sequence an in-place restore runs, so
-	// verification exercises the real restore path, not a gentler one.
-	t := pgTarget{container: scratch, user: user, db: db}
-	timescale, err := c.pgValidateArtifact(ctx, t, dump, ext)
-	if err != nil {
-		return fmt.Errorf("restore into scratch failed: %w", err)
+	// Set the scratch cluster up as the source was, then restore as the
+	// accessory's OWN role through the same swap restore an in-place
+	// restore runs. A gentler scratch restore (superuser, --no-owner)
+	// passed backups the real restore could not load.
+	sup := pgTarget{container: scratch, user: super, db: db}
+	q := ssh.ShellQuote
+	if haveGlobals {
+		c.exec.Run(ctx, "gunzip -c "+q(globals)+" > "+q(tmpBase+".globals.sql")+" && docker exec -i "+q(scratch)+" psql -X -q -U "+q(super)+" -d postgres < "+q(tmpBase+".globals.sql")+" >/dev/null 2>&1; true")
 	}
-	props, err := c.pgDatabaseProps(ctx, t)
-	if err != nil {
-		return fmt.Errorf("restore into scratch failed: %w", err)
+	if user != super {
+		ensure := "DO $$BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = " + pgLiteral(user) + ") THEN CREATE ROLE " + pgIdent(user) + " LOGIN CREATEDB; END IF; END$$"
+		if _, err := c.exec.Run(ctx, sup.psql("postgres", ensure)); err != nil {
+			return fmt.Errorf("preparing the scratch role %s: %w", user, err)
+		}
 	}
-	if err := c.pgRecreateAndLoad(ctx, t, props, dump, ext, filepath.Dir(tmpBase), timescale, true); err != nil {
+	if err := c.pgDropDB(ctx, sup, db, 0); err != nil {
+		return fmt.Errorf("preparing the scratch database: %w", err)
+	}
+	fmt.Fprintf(c.out, "Restoring into scratch as %s...\n", user)
+	if _, err := c.restorePostgres(ctx, pgTarget{container: scratch, user: user, db: db}, dump, ext, path.Dir(tmpBase)); err != nil {
 		return fmt.Errorf("restore into scratch failed: %w", err)
 	}
 
-	out, err := c.exec.Run(ctx, t.psql(db, "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema NOT IN ('pg_catalog','information_schema') AND table_schema NOT LIKE '\\_timescaledb%' AND table_schema NOT LIKE 'timescaledb\\_%' AND table_type = 'BASE TABLE'"))
+	out, err := c.exec.Run(ctx, sup.psql(db, "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema NOT IN ('pg_catalog','information_schema') AND table_schema NOT LIKE '\\_timescaledb%' AND table_schema NOT LIKE 'timescaledb\\_%' AND table_type = 'BASE TABLE'"))
 	if err != nil {
 		return fmt.Errorf("verify query failed: %w", err)
 	}
