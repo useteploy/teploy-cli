@@ -4,6 +4,45 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+### Fixed
+
+- Accessory backups detect the database engine from the container (a
+  `teploy.engine` label, the upstream images' version env, the entrypoint,
+  then the image name). pgvector, TimescaleDB, PostGIS, Bitnami, Valkey and
+  Dragonfly images used to fall through to a raw tar of the live data
+  directory that `verify-backup` then passed as a "volume". A detected
+  database is never tarred; an engine without a backup method is refused.
+  Do not trust earlier teploy backups of those images.
+- Postgres backups are `pg_dump -Fc` (`.pgdump`). In-place restore into a
+  populated database failed on the first `CREATE`; it now takes a safety
+  dump, drops (`WITH (FORCE)`) and recreates the database with its owner
+  and encoding, and loads with `pg_restore --single-transaction`
+  (TimescaleDB between `timescaledb_pre_restore`/`post_restore`). A failed
+  load reloads the safety dump. Legacy `.sql.gz` backups still restore.
+- MySQL/MariaDB dumps use `--single-transaction --routines --triggers` and
+  must end with the completion trailer.
+- Dragonfly backs up with `SAVE RDB` (its `BGSAVE` never writes
+  `dump.rdb`) and restores online with `DFLY LOAD`; Valkey uses
+  `valkey-cli`.
+- A backup whose artifact is implausibly small (an empty dump from a wrong
+  password) fails instead of being stored.
+- `verify-backup` for MySQL no longer races the image's init server
+  (`mysqladmin ping` passes on access denied); postgres readiness probes
+  TCP for the same reason.
+- `accessory restore` stops the app while it runs (it runs through the
+  same fenced path as `backup restore --accessory`).
+- `teploy setup` enables and starts cron; `backup schedule` refuses on a
+  server with no cron daemon; `teploy doctor` gains a `scheduler` check that
+  fails when crontab or `/etc/cron.d` jobs exist but no daemon runs them.
+- ntfy notifications use plain word tags (`teploy,<type>,<outcome>`);
+  the emoji shortcode tags rendered as emoji.
+
+### Added
+
+- `backup.verify` event from `accessory verify-backup`; `backup.run` events
+  carry `size_bytes`, `key`, `duration_ms`, `engine`, `consistency` and
+  `encrypted`. `verify-backup --json` adds `engine` and `detection`.
+
 ## [0.1.49] - 2026-10-31
 
 ### Added

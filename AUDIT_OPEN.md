@@ -1,5 +1,35 @@
 # Open audit items
 
+## 2026-11-03 — Dash auto-config Slice 2: backup correctness (G6, G7)
+
+Plan: `../_internal/DASH_AUTOCONFIG_PLAN_2026-11-03.md` (U3, U4, P1 G6/G7,
+backup.verify, Slice 0 cron lesson). Branch `slice2-backup-correctness`.
+
+Closed: U3 (engine detection from label/env/entrypoint/image; detected
+databases never tarred; verify classifies by engine), U4 (postgres in-place
+restore: safety dump, DROP ... WITH (FORCE), CREATE, pg_restore; legacy
+.sql.gz still restores), mysql consistency flags, dragonfly snapshot path
+(SAVE RDB / DFLY LOAD), artifact size floors, POSIX pipefail on the mysql
+restore pipes, backup.verify event and enriched backup.run detail, cron
+daemon presence (setup / doctor / schedule refusal), plain ntfy tags.
+Integration matrix (`-tags integration`, colima fixture):
+postgres:17, pgvector:pg17, timescaledb latest-pg17, mysql:8, redis:7,
+valkey:8, dragonfly — all pass.
+
+Open / deferred:
+- G5 (adopt unmanaged containers) and MySQL one-object-per-database: not
+  in this slice. MySQL in-place restore still relies on the dump's
+  DROP TABLE / CREATE TABLE, so a table created AFTER the backup survives
+  the restore (postgres now recreates the database; mysql does not).
+- Bitnami postgres/mysql/redis images are detected but not integration
+  tested (their auth and data paths differ from the official images: redis
+  restore and verify assume /data/dump.rdb).
+- Trigger/autodeploy poll scheduling writes crontab without the scheduler
+  refusal; doctor's scheduler check reports those lines.
+- Pre-existing, unrelated: `TestDRIntegration_BundleRoundTrip` expects the
+  restored state.json generation 2 and gets 3 (same on 666491f). The DR
+  fixture also needs a 022 umask and a tyler-owned /deployments on colima.
+
 ## 2026-09-25 — local image identity
 
 Full local `sha256:<64hex>` image IDs now count as immutable in deployment
