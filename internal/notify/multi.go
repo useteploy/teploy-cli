@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -149,11 +150,13 @@ func sendNtfy(ctx context.Context, client *http.Client, url string, p Payload) e
 	}
 	req.Header.Set("User-Agent", "teploy/1.0")
 	req.Header.Set("Title", fmt.Sprintf("teploy: %s %s", p.App, p.Type))
+	// Plain word tags only: ntfy renders a tag that matches an emoji
+	// shortcode (white_check_mark, rotating_light) as an emoji, and product
+	// output carries none.
+	req.Header.Set("Tags", ntfyTags(p.Type, status))
 	if p.Success {
-		req.Header.Set("Tags", "white_check_mark")
 		req.Header.Set("Priority", "default")
 	} else {
-		req.Header.Set("Tags", "rotating_light")
 		req.Header.Set("Priority", "high")
 	}
 
@@ -167,6 +170,25 @@ func sendNtfy(ctx context.Context, client *http.Client, url string, p Payload) e
 		return fmt.Errorf("ntfy returned status %d", resp.StatusCode)
 	}
 	return nil
+}
+
+// ntfyTags is "teploy,<type>,<succeeded|failed>" with the type reduced to
+// a lowercase word (a comma would split it into extra tags).
+func ntfyTags(typ, status string) string {
+	word := strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= '0' && r <= '9', r == '-', r == '.':
+			return r
+		case r >= 'A' && r <= 'Z':
+			return r + ('a' - 'A')
+		}
+		return -1
+	}, typ)
+	tags := []string{"teploy"}
+	if word != "" && word != "teploy" {
+		tags = append(tags, word)
+	}
+	return strings.Join(append(tags, status), ",")
 }
 
 func sendWebhook(ctx context.Context, client *http.Client, url, secret string, p Payload) error {
