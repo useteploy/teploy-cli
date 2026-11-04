@@ -16,6 +16,10 @@ func TestClassifyListedKey(t *testing.T) {
 	if row, ok := classifyListedKey("myapp", "myapp/accessories/db/20261019-030001.sql.gz"); !ok || row.Kind != KindAccessory || row.Accessory != "db" {
 		t.Fatalf("accessory row: %+v ok=%v", row, ok)
 	}
+	// G7 custom-format postgres dumps list (and restore) like the legacy form.
+	if row, ok := classifyListedKey("myapp", "myapp/accessories/db/20261103-030001-0123456789abcdef.pgdump"); !ok || row.Kind != KindAccessory || !row.Restorable {
+		t.Fatalf("pgdump accessory row: %+v ok=%v", row, ok)
+	}
 	if row, ok := classifyListedKey("myapp", "myapp/teploy/20261019-030001.tar.gz"); !ok || row.Kind != KindTeployData || row.Restorable {
 		t.Fatalf("teploy row: %+v ok=%v", row, ok)
 	}
