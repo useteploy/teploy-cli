@@ -783,6 +783,7 @@ func TestSetupServer_ConnectionLossRecoversMidStage(t *testing.T) {
 		ssh.MockCommand{Match: "docker --version", Output: "Docker version 24.0.0"},
 		ssh.MockCommand{Match: "rsync --version", Output: "rsync  version 3.2.7"},
 		ssh.MockCommand{Match: "for t in git python3", Output: ""},
+		ssh.MockCommand{Match: "sched_daemon=no", Output: "daemon=yes\nenabled=enabled\ncrontab=yes\nteploy_entries=0\n"},
 		ssh.MockCommand{Match: "ufw status", Err: fmt.Errorf("exit status 1: ufw: command not found")},
 		ssh.MockCommand{Match: "systemctl is-active firewalld", Err: fmt.Errorf("exit status 3: inactive")},
 		ssh.MockCommand{Match: "docker info", Output: ""},
@@ -868,4 +869,54 @@ func TestSetupNetwork_AlreadyJoinedTailscaleIsLeftAlone(t *testing.T) {
 			t.Fatalf("already-joined node was reset or re-joined: %s", call)
 		}
 	}
+}
+
+// An installed crontab is not a running scheduler: setup enables and starts
+// a stopped/disabled cron through systemd, re-probes, and leaves a masked
+// unit alone.
+func TestSetupCronDaemonStage(t *testing.T) {
+	var stage setupStage
+	for _, s := range setupStages() {
+		if s.name == "cron daemon" {
+			stage = s
+		}
+	}
+	if stage.run == nil {
+		t.Fatal("no cron daemon stage")
+	}
+	t.Run("stopped and disabled gets enabled", func(t *testing.T) {
+		mock := ssh.NewMockExecutor("h",
+			ssh.MockCommand{Match: "sched_daemon=no", Output: "daemon=no\nenabled=disabled\ncrontab=yes\nteploy_entries=1\n", Once: true},
+			ssh.MockCommand{Match: "command -v systemctl", Output: "/usr/bin/systemctl"},
+			ssh.MockCommand{Match: "sudo sh -c 'systemctl enable --now cron", Output: ""},
+			ssh.MockCommand{Match: "sched_daemon=no", Output: "daemon=yes\nenabled=enabled\ncrontab=yes\nteploy_entries=1\n"},
+		)
+		var buf bytes.Buffer
+		if err := stage.run(context.Background(), mock, &buf, &setupEnv{sudo: "sudo "}); err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(buf.String(), "cron daemon enabled and started") {
+			t.Fatalf("output: %s calls: %v", buf.String(), mock.Calls)
+		}
+	})
+	t.Run("running is left alone", func(t *testing.T) {
+		mock := ssh.NewMockExecutor("h", ssh.MockCommand{Match: "sched_daemon=no", Output: "daemon=yes\nenabled=enabled\ncrontab=yes\nteploy_entries=0\n"})
+		var buf bytes.Buffer
+		if err := stage.run(context.Background(), mock, &buf, &setupEnv{}); err != nil {
+			t.Fatal(err)
+		}
+		if len(mock.Calls) != 1 {
+			t.Fatalf("a running daemon needs no changes: %v", mock.Calls)
+		}
+	})
+	t.Run("masked is reported, not unmasked", func(t *testing.T) {
+		mock := ssh.NewMockExecutor("h", ssh.MockCommand{Match: "sched_daemon=no", Output: "daemon=no\nenabled=masked\ncrontab=yes\nteploy_entries=0\n"})
+		var buf bytes.Buffer
+		if err := stage.run(context.Background(), mock, &buf, &setupEnv{}); err != nil {
+			t.Fatal(err)
+		}
+		if len(mock.Calls) != 1 || !strings.Contains(buf.String(), "masked") {
+			t.Fatalf("masked unit must only be reported: %s %v", buf.String(), mock.Calls)
+		}
+	})
 }

@@ -203,7 +203,7 @@ func doctorRun(ctx context.Context, deps doctorDeps, flags *Flags, serverName st
 
 	if executor == nil {
 		const sshDown = "restore SSH connectivity (see the ssh check above), then re-run teploy doctor"
-		for _, name := range []string{"docker", "disk", "registry", "caddy", "compatibility", "repair-debt", "secret-exposure", "server-tools", "config-home", "backup-cron", "age-identity", "git-trigger"} {
+		for _, name := range []string{"docker", "disk", "registry", "caddy", "compatibility", "repair-debt", "secret-exposure", "server-tools", "config-home", "backup-cron", "age-identity", "git-trigger", "scheduler"} {
 			skipFail(name, "SSH unreachable", sshDown)
 		}
 	} else {
@@ -225,6 +225,7 @@ func doctorRun(ctx context.Context, deps doctorDeps, flags *Flags, serverName st
 		report.Checks = append(report.Checks, doctorBackupCronCheck(ctx, executor))
 		report.Checks = append(report.Checks, doctorAgeIdentityCheck(ctx, executor))
 		report.Checks = append(report.Checks, doctorGitTriggerCheck(ctx, executor, deps))
+		report.Checks = append(report.Checks, doctorSchedulerCheck(ctx, executor))
 	}
 
 	report.summarize()
@@ -852,6 +853,48 @@ func doctorBackupCronCheck(ctx context.Context, exec ssh.Executor) doctorCheck {
 		return doctorCheck{Name: "backup-cron", Result: doctorOK,
 			Detail: fmt.Sprintf("%d scheduled line(s) use `backup run`; no embedded credentials or buckets", runForm)}
 	}
+}
+
+// doctorSchedulerCheck fails when jobs are scheduled that nothing will
+// run: crontab entries or /etc/cron.d files on a server with no
+// cron daemon (deploy-ovh ran none of its backup jobs for 6.5 months
+// because cron was never installed). File names and counts only — a cron
+// line can carry credentials.
+func doctorSchedulerCheck(ctx context.Context, exec ssh.Executor) doctorCheck {
+	st, err := backup.ProbeScheduler(ctx, exec)
+	if err != nil {
+		return doctorCheck{Name: "scheduler", Result: doctorWarn, Detail: err.Error(),
+			Remediation: "check the shell on the server — the scheduler probe failed"}
+	}
+	var jobs []string
+	if st.CrontabEntries > 0 || st.TeployEntries > 0 {
+		jobs = append(jobs, fmt.Sprintf("%d crontab line(s), %d of them teploy backups", max(st.CrontabEntries, st.TeployEntries), st.TeployEntries))
+	}
+	for _, f := range st.CronDTeploy {
+		jobs = append(jobs, "/etc/cron.d/"+f)
+	}
+	for _, f := range st.CronDOther {
+		jobs = append(jobs, "/etc/cron.d/"+f)
+	}
+	switch {
+	case !st.Daemon && st.HasJobs():
+		return doctorCheck{Name: "scheduler", Result: doctorFail,
+			Detail:      "no cron daemon is running, so none of these scheduled jobs run: " + strings.Join(jobs, ", "),
+			Remediation: backup.SchedulerRemedy()}
+	case !st.Daemon:
+		return doctorCheck{Name: "scheduler", Result: doctorWarn,
+			Detail:      "no cron daemon is running (nothing is scheduled yet; `backup schedule` will refuse until one is)",
+			Remediation: backup.SchedulerRemedy()}
+	case st.Enabled == "disabled" || st.Enabled == "masked":
+		return doctorCheck{Name: "scheduler", Result: doctorWarn,
+			Detail:      "the cron daemon is running but its unit is " + st.Enabled + " — scheduled jobs stop after the next reboot",
+			Remediation: "on the server: systemctl enable cron (or crond)"}
+	}
+	detail := "cron daemon running"
+	if len(jobs) > 0 {
+		detail += "; scheduled: " + strings.Join(jobs, ", ")
+	}
+	return doctorCheck{Name: "scheduler", Result: doctorOK, Detail: detail}
 }
 
 // doctorAgeIdentityScript prints three facts about the age identity's

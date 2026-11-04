@@ -849,6 +849,12 @@ func runBackupSchedule(flags *Flags, schedule, appName string, tf *backupTargetF
 		return fmt.Errorf("--keep-last and --max-age-days must be >= 0")
 	}
 
+	// A crontab line on a server with no running cron daemon is written
+	// and never runs; refuse before anything is stored.
+	if err := backup.RequireScheduler(ctx, executor); err != nil {
+		return err
+	}
+
 	target, err := resolveScheduleTarget(ctx, executor, tf)
 	if err != nil {
 		return err

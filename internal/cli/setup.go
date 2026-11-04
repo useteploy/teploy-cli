@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/useteploy/teploy/internal/backup"
 	"github.com/useteploy/teploy/internal/config"
 	"github.com/useteploy/teploy/internal/harden"
 	"github.com/useteploy/teploy/internal/network"
@@ -651,6 +652,46 @@ func setupStages() []setupStage {
 					return fmt.Errorf("installing %s: %w", strings.Join(missing, ", "), err)
 				}
 				fmt.Fprintf(w, "  %s installed\n", strings.Join(missing, ", "))
+				return nil
+			},
+		},
+		{
+			name:    "cron daemon",
+			affects: "the cron service (systemctl enable --now cron|crond, only when no cron daemon is running or its unit is disabled; a masked unit is left alone)",
+			run: func(ctx context.Context, exec ssh.Executor, w io.Writer, env *setupEnv) error {
+				// An installed crontab is not a running scheduler: a box
+				// whose cron daemon is stopped or disabled writes every
+				// schedule and runs none of them (deploy-ovh, 2026-11-03).
+				fmt.Fprintln(w, "Checking cron daemon...")
+				st, err := backup.ProbeScheduler(ctx, exec)
+				if err != nil {
+					fmt.Fprintf(w, "  Warning: %v\n", err)
+					return nil
+				}
+				if st.Enabled == "masked" {
+					// A masked unit is an operator's decision; report it.
+					fmt.Fprintf(w, "  Warning: the cron unit is masked — scheduled backups will be refused until it runs (%s)\n", backup.SchedulerRemedy())
+					return nil
+				}
+				if st.Daemon && st.Enabled != "disabled" {
+					fmt.Fprintln(w, "  cron daemon running")
+					return nil
+				}
+				if _, err := exec.Run(ctx, "command -v systemctl"); err == nil {
+					enable := env.sudo + "sh -c 'systemctl enable --now cron 2>/dev/null || systemctl enable --now crond'"
+					if out, err := exec.Run(ctx, enable); err != nil {
+						fmt.Fprintf(w, "  Warning: enabling cron failed: %v %s\n", err, strings.TrimSpace(out))
+					}
+					st, err = backup.ProbeScheduler(ctx, exec)
+					if err == nil && st.Daemon {
+						fmt.Fprintln(w, "  cron daemon enabled and started")
+						return nil
+					}
+				}
+				// No systemd (a container, an init-less box): teploy cannot
+				// start a service it does not manage. Scheduling refuses on
+				// such a host and doctor reports it, so nothing fails silently.
+				fmt.Fprintf(w, "  Warning: no cron daemon is running and teploy could not start one — scheduled backups will be refused until one runs (%s)\n", backup.SchedulerRemedy())
 				return nil
 			},
 		},

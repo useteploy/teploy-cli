@@ -348,7 +348,7 @@ teploy log                                # deploy history
 teploy exec <server> <cmd>                # run a command on the server (SSH)
 teploy app exec -- <cmd>                  # run a command in the app container (migrations, etc.)
 teploy validate                           # check config and server readiness
-teploy doctor [--server <name>]           # read-only diagnostics: toolchain, SSH, Docker, registry, Caddy, disk, compatibility, repair debt (--json for machines; exit 1 if any check fails, never 2)
+teploy doctor [--server <name>]           # read-only diagnostics: toolchain, SSH, Docker, registry, Caddy, disk, compatibility, repair debt, cron scheduler (--json for machines; exit 1 if any check fails, never 2)
 teploy plan                               # preview what a deploy would change (containers, routing, env, storage, resources; read-only)
 teploy plan --out plan.json               # write a bound plan record (config digest + target identity + generation)
 teploy apply plan.json                    # execute a reviewed plan; refuses naming what drifted since it was made
@@ -664,9 +664,33 @@ never rewrites cron. `teploy server backup-target set` rewrites existing
 teploy-generated backup cron lines to that form (hand-written commands
 under a teploy marker are left alone and reported), and `teploy doctor`
 flags any cron line that still embeds credentials or bucket flags.
+Schedules need a running cron daemon: `teploy setup` installs, enables and
+starts cron, `backup schedule` (and `accessory backup --schedule`) refuse on
+a server without one, and `teploy doctor` fails when teploy crontab lines or
+`/etc/cron.d` jobs exist but no cron daemon runs them.
 
-Restore quiesces: the app's containers (and a generic accessory's) are
-stopped under the app's fenced lock, the backup is promoted with the
+Accessory backups are engine-aware. The engine is detected from the
+container — a `teploy.engine=<postgres|mysql|mariadb|redis|valkey|dragonfly|mongo|nucleus|generic>`
+label, else the version env the upstream images set (so pgvector,
+TimescaleDB, PostGIS and Bitnami images are postgres), else the entrypoint
+or image name — and a detected database is never copied as raw files:
+
+| Engine | Backup | In-place restore |
+|---|---|---|
+| postgres (incl. pgvector, timescale, postgis) | `pg_dump -Fc` (`.pgdump`) | safety dump, `DROP DATABASE ... WITH (FORCE)`, `CREATE` (same owner/encoding), `pg_restore --single-transaction`; TimescaleDB bracketed by `timescaledb_pre_restore`/`post_restore`; a failed load reloads the safety dump. Legacy `.sql.gz` backups restore through `psql` |
+| mysql / mariadb | `mysqldump --single-transaction --routines --triggers` | the dump's `DROP TABLE`/`CREATE TABLE` through the client |
+| redis / valkey | `BGSAVE`, wait for `LASTSAVE` to move, copy `dump.rdb` (refused when AOF is on) | stop, swap `dump.rdb`, start |
+| dragonfly | `SAVE RDB` (its `BGSAVE` writes `.dfs` files, not `dump.rdb`) | online: pre-restore `SAVE RDB`, `DFLY LOAD`, `SAVE` |
+| mongo | `mongodump --archive --gzip` | `mongorestore --drop` |
+| nucleus, generic | tar of the accessory directory (crash-consistent) | staged two-phase file promotion with the container stopped |
+
+A backup whose artifact is implausibly small (an empty dump from a wrong
+password) or structurally wrong fails instead of being stored.
+`accessory verify-backup` restores through the same path into a scratch
+container and records a `backup.verify` event.
+
+Restore quiesces: the app's containers (and a file-restored accessory's) are
+stopped under the app's fenced lock (`accessory restore` takes the same path), the backup is promoted with the
 two-phase recovery discipline, the containers are started again and
 health-checked. On failure — or an unhealthy app afterwards — the
 pre-restore recovery copy is kept and named. Non-interactive restores

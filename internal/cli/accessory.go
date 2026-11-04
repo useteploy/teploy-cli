@@ -464,6 +464,9 @@ func runAccessoryBackup(flags *Flags, appName, name, bucket, region, endpoint, p
 	tf := backupTargetFlags{bucket: bucket, region: region, endpoint: endpoint, prefix: prefix}
 	var target backup.Target
 	if schedule != "" {
+		if err := backup.RequireScheduler(ctx, executor); err != nil {
+			return err
+		}
 		var err error
 		target, err = resolveScheduleTarget(ctx, executor, &tf)
 		if err != nil {
