@@ -147,7 +147,7 @@ func eventDetailSuffix(ev events.Event) string {
 		return ""
 	}
 	var parts []string
-	for _, k := range []string{"keys", "to", "branch", "preview", "container", "message", "error"} {
+	for _, k := range []string{"keys", "to", "branch", "preview", "container", "accessory", "engine", "metric", "size_bytes", "message", "error"} {
 		if v, ok := ev.Detail[k]; ok {
 			parts = append(parts, fmt.Sprintf("%s=%v", k, v))
 		}

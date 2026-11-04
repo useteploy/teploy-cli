@@ -264,11 +264,7 @@ func runBackupCreate(flags *Flags, appName, accessory string, tf *backupTargetFl
 		pruned = len(deleted)
 	}
 
-	detail := map[string]any{"id": res.ID, "kind": kind}
-	if accessory != "" {
-		detail["accessory"] = accessory
-	}
-	recordAppEvent(ctx, executor, appCfg.App, events.KindBackupRun, err, detail)
+	recordAppEvent(ctx, executor, appCfg.App, events.KindBackupRun, err, backupRunDetail(res, kind, accessory))
 
 	// Fire notification (fire-and-forget). The backup itself succeeding is
 	// what Success reflects; a prune failure is surfaced in the message +

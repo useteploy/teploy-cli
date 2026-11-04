@@ -115,11 +115,7 @@ func runBackupRunOn(ctx context.Context, executor ssh.Executor, appName, accesso
 		}
 	}
 
-	detail := map[string]any{"id": res.ID, "kind": kind}
-	if accessory != "" {
-		detail["accessory"] = accessory
-	}
-	events.Record(ctx, executor, events.Event{App: appName, Kind: events.KindBackupRun, Outcome: events.Outcome(err), Detail: detail})
+	events.Record(ctx, executor, events.Event{App: appName, Kind: events.KindBackupRun, Outcome: events.Outcome(err), Detail: events.ErrDetail(backupRunDetail(res, kind, accessory), err)})
 
 	if err != nil {
 		// The failure alert (uploaded by `backup schedule` when the app's

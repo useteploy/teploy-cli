@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/useteploy/teploy/internal/accessories"
@@ -519,8 +520,7 @@ func runAccessoryBackup(flags *Flags, appName, name, bucket, region, endpoint, p
 	}
 
 	res, err := client.AccessoryBackup(ctx, app, name, accImage, accEnv, s3Cfg)
-	detail := map[string]any{"id": res.ID, "kind": backup.KindAccessory, "accessory": name}
-	recordAppEvent(ctx, executor, app, events.KindBackupRun, err, detail)
+	recordAppEvent(ctx, executor, app, events.KindBackupRun, err, backupRunDetail(res, backup.KindAccessory, name))
 	if err != nil {
 		return err
 	}
@@ -587,6 +587,34 @@ func runAccessoryRestore(flags *Flags, name, date, bucket, region, endpoint, pre
 	// the live database with the app still writing). It has always run
 	// without a confirmation prompt, so it still does.
 	return runBackupRestore(flags, "", name, date, &backupTargetFlags{bucket: bucket, region: region, endpoint: endpoint, prefix: prefix}, true)
+}
+
+// verifyEventErr is the backup.verify outcome: an operational error, or a
+// verification that ran and failed (which VerifyBackup reports as a result).
+func verifyEventErr(res *backup.VerifyResult, err error) error {
+	if err != nil {
+		return err
+	}
+	if res != nil && !res.OK {
+		return fmt.Errorf("%s", res.Detail)
+	}
+	return nil
+}
+
+// verifyEventDetail is the backup.verify event detail.
+func verifyEventDetail(name, date string, res *backup.VerifyResult, elapsed time.Duration) map[string]any {
+	detail := map[string]any{"accessory": name, "date": date, "ok": false, "duration_ms": elapsed.Milliseconds()}
+	if res != nil {
+		detail["date"] = res.Date
+		detail["ok"] = res.OK
+		detail["engine"] = res.Engine
+		detail["kind"] = res.Kind
+		detail["metric"] = res.Metric
+		detail["key"] = res.S3Key
+		detail["size_bytes"] = res.SizeBytes
+		detail["duration_ms"] = res.DurationMs
+	}
+	return detail
 }
 
 // requireResolvedAccessoryEnv rejects config env maps that still contain
@@ -686,7 +714,9 @@ func runAccessoryVerifyBackup(flags *Flags, appName, name, bucket, region, date,
 		out = os.Stderr
 	}
 	client := backup.NewClient(executor, out)
+	start := time.Now()
 	res, err := client.VerifyBackup(ctx, appCfg.App, name, date, s3Cfg)
+	recordAppEvent(ctx, executor, appCfg.App, events.KindBackupVerify, verifyEventErr(res, err), verifyEventDetail(name, date, res, time.Since(start)))
 	if err != nil {
 		return err
 	}
