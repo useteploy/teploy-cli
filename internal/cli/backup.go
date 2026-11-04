@@ -607,8 +607,11 @@ func runBackupRestore(flags *Flags, appName, accessory, date string, tf *backupT
 	}
 	accessoryStopped := false
 	if qErr == nil && accessory != "" {
-		accessoryImage, _ := inspectAccessoryForRestore(ctx, client, appCfg.App, accessory, appCfg)
-		if backup.EngineOf(accessoryImage) == "generic" {
+		accessoryImage, accessoryEnv := inspectAccessoryForRestore(ctx, client, appCfg.App, accessory, appCfg)
+		det, dErr := client.ResolveEngine(ctx, appCfg.App, accessory, accessoryImage, accessoryEnv)
+		if dErr != nil {
+			qErr = dErr
+		} else if backup.RestoreStopsContainer(det.Engine) {
 			container := appCfg.App + "-" + accessory
 			if _, sErr := lk.Guarded(ctx, executor, fmt.Sprintf("docker stop --time %d %s", stopTimeout, ssh.ShellQuote(container))); sErr == nil {
 				accessoryStopped = true

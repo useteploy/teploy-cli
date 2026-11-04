@@ -558,7 +558,7 @@ func newAccessoryRestoreCmd(flags *Flags) *cobra.Command {
 
 	cmd := &cobra.Command{
 		Use:   "restore <name> <date>",
-		Short: "Restore an accessory from backup",
+		Short: "Restore an accessory from backup (stops the app while it runs)",
 		Args:  cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runAccessoryRestore(flags, args[0], args[1], bucket, region, endpoint, prefix)
@@ -578,41 +578,15 @@ func runAccessoryRestore(flags *Flags, name, date, bucket, region, endpoint, pre
 	if err != nil {
 		return err
 	}
-
-	accCfg, ok := appCfg.Accessories[name]
-	if !ok {
+	if _, ok := appCfg.Accessories[name]; !ok {
 		return fmt.Errorf("accessory %q not found in teploy.yml", name)
 	}
-
-	if err := backup.ValidateDate(date); err != nil {
-		return err
-	}
-
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
-	defer cancel()
-
-	executor, err := connectForApp(ctx, flags, appCfg)
-	if err != nil {
-		return err
-	}
-	defer executor.Close()
-
-	s3Cfg, err := resolveBackupS3(ctx, executor, &backupTargetFlags{bucket: bucket, region: region, endpoint: endpoint, prefix: prefix})
-	if err != nil {
-		return err
-	}
-	client := backup.NewClient(executor, os.Stdout)
-	// Same credential rule as manual backup: prefer the RUNNING accessory's
-	// env (the config's `auto`/`secret:` references are never what the
-	// database actually runs with) — audit F68.
-	if image, env, inspErr := client.InspectAccessory(ctx, appCfg.App, name); inspErr == nil {
-		accCfg.Image, accCfg.Env = image, env
-	} else {
-		if err := requireResolvedAccessoryEnv(name, accCfg.Env); err != nil {
-			return fmt.Errorf("accessory %s is not inspectable (%v) and its teploy.yml env cannot be used directly: %w", name, inspErr, err)
-		}
-	}
-	return client.AccessoryRestore(ctx, appCfg.App, name, accCfg.Image, date, accCfg.Env, s3Cfg)
+	// One restore path: the quiesced, fenced `backup restore --accessory`
+	// flow. An engine restore now drops and recreates the database, so the
+	// app must be stopped while it runs (this command used to restore into
+	// the live database with the app still writing). It has always run
+	// without a confirmation prompt, so it still does.
+	return runBackupRestore(flags, "", name, date, &backupTargetFlags{bucket: bucket, region: region, endpoint: endpoint, prefix: prefix}, true)
 }
 
 // requireResolvedAccessoryEnv rejects config env maps that still contain

@@ -199,6 +199,12 @@ func (c *Client) RestoreBundleIsolated(ctx context.Context, opts BundleRestoreOp
 				return nil, fmt.Errorf("bundle member %s is corrupt (gzip -t failed): %w — refusing to restore from this bundle", snap.Artifact, err)
 			}
 		}
+		if strings.HasSuffix(snap.Artifact, ".pgdump") {
+			p := ssh.ShellQuote(staging + "/" + snap.Artifact)
+			if _, err := c.exec.Run(ctx, "[ \"$(head -c 5 "+p+")\" = PGDMP ]"); err != nil {
+				return nil, fmt.Errorf("bundle member %s is not a pg_dump custom-format archive: %w — refusing to restore from this bundle", snap.Artifact, err)
+			}
+		}
 	}
 
 	// ---- Encrypted-material decrypt proof. When the bundle carries
@@ -404,10 +410,10 @@ func (c *Client) validateEngineSnapshot(ctx context.Context, manifest *BundleMan
 		if err != nil {
 			return checkFailed(check, fmt.Errorf("starting scratch postgres: %w", err))
 		}
-		if err := c.waitReady(ctx, scratchID, fmt.Sprintf("pg_isready -U %s", ssh.ShellQuote(user)), 30); err != nil {
+		if err := c.waitReady(ctx, scratchID, postgresReadyProbe(user), 30); err != nil {
 			return checkFailed(check, err)
 		}
-		if _, err := c.exec.Run(ctx, postgresRestoreCmd(scratchID, user, db, dump, staging+"/"+snap.Name+".sql")); err != nil {
+		if err := c.pgLoadArtifact(ctx, pgTarget{container: scratchID, user: user, db: db}, dump, staging, true); err != nil {
 			return checkFailed(check, fmt.Errorf("restoring dump into scratch: %w", err))
 		}
 		out, err := c.exec.Run(ctx, fmt.Sprintf(
@@ -485,7 +491,25 @@ func (c *Client) validateEngineSnapshot(ctx context.Context, manifest *BundleMan
 		check.Status = "pass"
 		return check
 
-	case "redis":
+	case EngineDragonfly:
+		rdb := staging + "/" + snap.Name + ".rdb"
+		if _, err := c.exec.Run(ctx, "umask 077; gunzip -c "+ssh.ShellQuote(dump)+" > "+ssh.ShellQuote(rdb)); err != nil {
+			return checkFailed(check, err)
+		}
+		scratchID, err = c.createDRScratch(ctx, scratch, invocation, "docker run -d --name "+ssh.ShellQuote(scratch)+" "+ssh.ShellQuote(image)+" --proactor_threads=2", true)
+		if err != nil {
+			return checkFailed(check, err)
+		}
+		keys, err := c.dragonflyScratchLoad(ctx, scratchID, rdb)
+		if err != nil {
+			return checkFailed(check, err)
+		}
+		check.Metric = "keys=" + keys
+		check.Status = "pass"
+		return check
+
+	case "redis", EngineValkey:
+		cli := redisCLI(snap.Engine)
 		// Seed a created (not running) container with the restored rdb, then
 		// start it: redis boots FROM the backup, and a corrupt rdb fails the
 		// readiness probe (same shape as verify.go).
@@ -501,10 +525,10 @@ func (c *Client) validateEngineSnapshot(ctx context.Context, manifest *BundleMan
 			return checkFailed(check, err)
 		}
 
-		if err := c.waitReady(ctx, scratchID, "redis-cli ping", 20); err != nil {
+		if err := c.waitReady(ctx, scratchID, cli+" ping", 20); err != nil {
 			return checkFailed(check, err)
 		}
-		out, err := c.exec.Run(ctx, fmt.Sprintf("docker exec %s redis-cli dbsize", ssh.ShellQuote(scratchID)))
+		out, err := c.exec.Run(ctx, fmt.Sprintf("docker exec %s %s dbsize", ssh.ShellQuote(scratchID), cli))
 		if err != nil {
 			return checkFailed(check, fmt.Errorf("verify query: %w", err))
 		}
@@ -860,10 +884,10 @@ func (c *Client) CutoverBundle(ctx context.Context, opts BundleRestoreOptions) (
 		switch snap.Engine {
 		case "postgres":
 			db, user := postgresDBAndUser(opts.App, engineEnv(snap, env, accCfg))
-			if err := c.waitReady(ctx, container, fmt.Sprintf("pg_isready -U %s", ssh.ShellQuote(user)), 30); err != nil {
+			if err := c.waitReady(ctx, container, postgresReadyProbe(user), 30); err != nil {
 				restoreErr = err
 			} else {
-				_, restoreErr = c.exec.Run(ctx, postgresRestoreCmd(container, user, db, dump, staging+"/"+snap.Name+".cutover.sql"))
+				restoreErr = c.pgLoadArtifact(ctx, pgTarget{container: container, user: user, db: db}, dump, staging, false)
 			}
 		case "mysql", "mariadb":
 			db := mysqlDB(opts.App, engineEnv(snap, env, accCfg))
@@ -874,11 +898,17 @@ func (c *Client) CutoverBundle(ctx context.Context, opts BundleRestoreOptions) (
 			}
 		case "mongo":
 			_, restoreErr = c.exec.Run(ctx, mongoRestoreCmd(container, dump))
-		case "redis":
-			if err := c.redisAOFPreflight(ctx, opts.App, snap.Name); err != nil {
+		case "redis", EngineValkey:
+			if err := c.redisAOFPreflight(ctx, snap.Engine, opts.App, snap.Name); err != nil {
 				restoreErr = err
 			} else {
 				_, restoreErr = c.exec.Run(ctx, redisRestoreScript(container, dump, staging+"/"+snap.Name+".cutover.rdb", staging+"/"+snap.Name+".cutover-old.rdb"))
+			}
+		case EngineDragonfly:
+			if err := c.waitReady(ctx, container, "redis-cli ping", 20); err != nil {
+				restoreErr = err
+			} else {
+				_, restoreErr = c.exec.Run(ctx, dragonflyLoadScript(container, dump, staging, staging+"/"+snap.Name+".cutover-old.rdb"))
 			}
 		default:
 			restoreErr = fmt.Errorf("engine %q has no cutover restore path", snap.Engine)

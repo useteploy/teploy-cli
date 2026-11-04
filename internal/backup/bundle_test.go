@@ -24,6 +24,7 @@ func drBaseMock(extra ...ssh.MockCommand) *ssh.MockExecutor {
 		{Match: "find '/deployments/myapp/meta'", Output: ""},
 		{Match: "tar -czf", Output: ""},
 		{Match: "docker exec 'myapp-db' pg_dump", Output: ""},
+		{Match: "wc -c", Output: "4096\n"},
 		{Match: "docker inspect -f '{{.Config.Image}}' 'myapp-db'", Output: "postgres:16\n"},
 		{Match: "docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' 'myapp-db'", Output: "POSTGRES_DB=appdb\nPOSTGRES_USER=appuser\n"},
 		{Match: "cp -p", Output: ""},
@@ -92,7 +93,7 @@ func TestCreateBundle_ManifestAndConsistency(t *testing.T) {
 	if !ok {
 		t.Fatalf("no db snapshot: %+v", m.Snapshots)
 	}
-	if dbSnap.Engine != "postgres" || dbSnap.Method != "pg_dump" || dbSnap.Consistency != consistencyEngineDump || dbSnap.Detection != "image-pattern" {
+	if dbSnap.Engine != "postgres" || dbSnap.Method != "pg_dump" || dbSnap.Consistency != consistencyEngineDump || dbSnap.Detection != "image-name" {
 		t.Errorf("db snapshot: %+v", dbSnap)
 	}
 	if dbSnap.EngineParams["db"] != "appdb" || dbSnap.EngineParams["user"] != "appuser" {

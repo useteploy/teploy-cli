@@ -33,7 +33,7 @@ func (p RetentionPolicy) IsZero() bool {
 // It matches both naming conventions in use: the Go path's bare
 // "<timestamp>.tar.gz" and the scheduled shell path's
 // "<app>-backup-<timestamp>.tar.gz", plus the accessory suffixes
-// (.sql.gz/.archive.gz/.rdb.gz).
+// (.pgdump/.sql.gz/.archive.gz/.rdb.gz).
 var backupTimestampRe = regexp.MustCompile(`\d{8}-\d{6}`)
 
 type backupEntry struct {

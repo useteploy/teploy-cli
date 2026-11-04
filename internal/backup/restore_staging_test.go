@@ -335,15 +335,7 @@ func TestAccessoryRestore_RedisRestartsAfterCopyFailure(t *testing.T) {
 // a retry could pick up the previous run's files. Each restore must allocate
 // its own temp dir, remove it on success, and keep (and name) it on failure.
 func TestAccessoryRestore_UsesPerInvocationTempDir(t *testing.T) {
-	mock := ssh.NewMockExecutor("1.2.3.4",
-		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
-		ssh.MockCommand{Match: "aws s3 cp", Output: "download: done\n"},
-		ssh.MockCommand{Match: "mktemp -d '/tmp/teploy-restore.XXXXXX'", Output: "/tmp/teploy-restore.abc123\n"},
-		ssh.MockCommand{Match: "gunzip -c", Output: ""},
-		ssh.MockCommand{Match: "docker exec", Output: ""},
-		ssh.MockCommand{Match: "rm -rf", Output: ""},
-	)
-
+	mock := pgRestoreMock(nil)
 	var buf bytes.Buffer
 	client := NewClient(mock, &buf)
 	err := client.AccessoryRestore(context.Background(), "myapp", "postgres", "postgres:16",
@@ -354,7 +346,7 @@ func TestAccessoryRestore_UsesPerInvocationTempDir(t *testing.T) {
 
 	var restoreCmd, cleanup string
 	for _, call := range mock.Calls {
-		if strings.Contains(call, "psql") {
+		if strings.Contains(call, "pg_restore --exit-on-error") {
 			restoreCmd = call
 		}
 		if strings.HasPrefix(call, "rm -rf '/tmp/teploy-restore.") {
@@ -362,13 +354,10 @@ func TestAccessoryRestore_UsesPerInvocationTempDir(t *testing.T) {
 		}
 	}
 	if restoreCmd == "" {
-		t.Fatal("expected a psql restore command")
+		t.Fatal("expected a pg_restore command")
 	}
-	if !strings.Contains(restoreCmd, "/tmp/teploy-restore.abc123/restore.sql") {
+	if !strings.Contains(restoreCmd, "/tmp/teploy-restore.abc123/restore.pgdump") {
 		t.Errorf("restore must use a per-invocation temp path, got: %s", restoreCmd)
-	}
-	if strings.Contains(restoreCmd, "'/tmp/restore.sql'") {
-		t.Errorf("restore must not use the shared fixed path /tmp/restore.sql: %s", restoreCmd)
 	}
 	if cleanup == "" {
 		t.Errorf("success must remove the temp dir, got calls: %v", mock.Calls)
@@ -376,19 +365,14 @@ func TestAccessoryRestore_UsesPerInvocationTempDir(t *testing.T) {
 }
 
 func TestAccessoryRestore_FailureKeepsTempDir(t *testing.T) {
-	mock := ssh.NewMockExecutor("1.2.3.4",
-		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
-		ssh.MockCommand{Match: "aws s3 cp", Output: "download: done\n"},
-		ssh.MockCommand{Match: "mktemp -d '/tmp/teploy-restore.XXXXXX'", Output: "/tmp/teploy-restore.abc123\n"},
-		ssh.MockCommand{Match: "gunzip -c", Err: fmt.Errorf("exit status 1: gzip: stdin: not in gzip format")},
-	)
+	mock := pgRestoreMock([]ssh.MockCommand{{Match: "docker exec -i 'myapp-postgres' pg_restore -l", Err: fmt.Errorf("exit status 1: pg_restore: error: input file does not appear to be a valid archive")}})
 
 	var buf bytes.Buffer
 	client := NewClient(mock, &buf)
 	err := client.AccessoryRestore(context.Background(), "myapp", "postgres", "postgres:16",
 		"20260101-000000", nil, S3Config{Bucket: "my-bucket", Region: "us-east-1"})
 	if err == nil {
-		t.Fatal("expected AccessoryRestore to fail when gunzip fails")
+		t.Fatal("expected AccessoryRestore to fail when the archive is unreadable")
 	}
 	if !strings.Contains(err.Error(), "/tmp/teploy-restore.abc123") {
 		t.Errorf("error must name the kept temp dir for inspection, got: %v", err)

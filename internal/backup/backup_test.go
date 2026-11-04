@@ -20,6 +20,7 @@ func TestBackupVolumes(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
 		ssh.MockCommand{Match: "umask 077", Output: "/tmp/teploy-backup.abc123\n"},
+		ssh.MockCommand{Match: "wc -c", Output: "4096\n"},
 		ssh.MockCommand{Match: "if [ -f", Output: ""},
 		ssh.MockCommand{Match: "aws s3 cp", Output: "upload: done\n"},
 		ssh.MockCommand{Match: "rm -f", Output: ""},
@@ -79,6 +80,7 @@ func TestAccessoryBackup_Postgres(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
 		ssh.MockCommand{Match: "umask 077", Output: "/tmp/teploy-backup.abc123\n"},
+		ssh.MockCommand{Match: "wc -c", Output: "4096\n"},
 		ssh.MockCommand{Match: "docker exec", Output: ""},
 		ssh.MockCommand{Match: "aws s3 cp", Output: "done\n"},
 		ssh.MockCommand{Match: "rm -f", Output: ""},
@@ -124,6 +126,7 @@ func TestAccessoryBackup_Postgres_CustomDBName(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
 		ssh.MockCommand{Match: "umask 077", Output: "/tmp/teploy-backup.abc123\n"},
+		ssh.MockCommand{Match: "wc -c", Output: "4096\n"},
 		ssh.MockCommand{Match: "docker exec", Output: ""},
 		ssh.MockCommand{Match: "aws s3 cp", Output: "done\n"},
 		ssh.MockCommand{Match: "rm -f", Output: ""},
@@ -153,7 +156,7 @@ func TestAccessoryBackup_Postgres_CustomDBName(t *testing.T) {
 	// (the app name) — check the actual pg_dump invocation (-U <user>
 	// <db>) targets the configured POSTGRES_DB/POSTGRES_USER specifically,
 	// not that "myapp" is absent from the whole command line.
-	if !strings.Contains(pgDumpCall, "pg_dump -U 'customuser' 'realdbname'") {
+	if !strings.Contains(pgDumpCall, "pg_dump -Fc -U 'customuser' 'realdbname'") {
 		t.Errorf("expected pg_dump invocation to be `-U 'customuser' 'realdbname'`, got: %s", pgDumpCall)
 	}
 }
@@ -169,6 +172,7 @@ func TestAccessoryBackup_Postgres_DumpFailureIsNotSwallowed(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
 		ssh.MockCommand{Match: "umask 077", Output: "/tmp/teploy-backup.abc123\n"},
+		ssh.MockCommand{Match: "wc -c", Output: "4096\n"},
 		ssh.MockCommand{Match: "docker exec", Err: errors.New(`exit status 1: pg_dump: error: connection to database "myapp" failed: FATAL:  database "myapp" does not exist`)},
 	)
 
@@ -193,6 +197,7 @@ func TestAccessoryBackup_MySQL(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
 		ssh.MockCommand{Match: "umask 077", Output: "/tmp/teploy-backup.abc123\n"},
+		ssh.MockCommand{Match: "wc -c", Output: "4096\n"},
 		ssh.MockCommand{Match: "docker exec", Output: ""},
 		ssh.MockCommand{Match: "aws s3 cp", Output: "done\n"},
 		ssh.MockCommand{Match: "rm -f", Output: ""},
@@ -226,6 +231,7 @@ func TestAccessoryBackup_RedisWaitsForBgsave(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
 		ssh.MockCommand{Match: "umask 077", Output: "/tmp/teploy-backup.abc123\n"},
+		ssh.MockCommand{Match: "wc -c", Output: "4096\n"},
 		ssh.MockCommand{Match: "set -eu", Output: ""},
 		ssh.MockCommand{Match: "aws s3 cp", Output: "done\n"},
 		ssh.MockCommand{Match: "rm -f", Output: ""},
@@ -276,6 +282,7 @@ func TestAccessoryBackup_MySQL_UsesRootPasswordEnv(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
 		ssh.MockCommand{Match: "umask 077", Output: "/tmp/teploy-backup.abc123\n"},
+		ssh.MockCommand{Match: "wc -c", Output: "4096\n"},
 		ssh.MockCommand{Match: "docker exec", Output: ""},
 		ssh.MockCommand{Match: "aws s3 cp", Output: "done\n"},
 		ssh.MockCommand{Match: "rm -f", Output: ""},
@@ -324,6 +331,7 @@ func TestAccessoryBackup_MySQL_PasswordFallbackAndAbsence(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
 		ssh.MockCommand{Match: "umask 077", Output: "/tmp/teploy-backup.abc123\n"},
+		ssh.MockCommand{Match: "wc -c", Output: "4096\n"},
 		ssh.MockCommand{Match: "docker exec", Output: ""},
 		ssh.MockCommand{Match: "aws s3 cp", Output: "done\n"},
 		ssh.MockCommand{Match: "rm -f", Output: ""},
@@ -354,6 +362,7 @@ func TestAccessoryBackup_MySQL_PasswordFallbackAndAbsence(t *testing.T) {
 	mock = ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
 		ssh.MockCommand{Match: "umask 077", Output: "/tmp/teploy-backup.abc123\n"},
+		ssh.MockCommand{Match: "wc -c", Output: "4096\n"},
 		ssh.MockCommand{Match: "docker exec", Output: ""},
 		ssh.MockCommand{Match: "aws s3 cp", Output: "done\n"},
 		ssh.MockCommand{Match: "rm -f", Output: ""},
@@ -378,6 +387,7 @@ func TestAccessoryBackup_MySQL_QuotesHostilePassword(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
 		ssh.MockCommand{Match: "umask 077", Output: "/tmp/teploy-backup.abc123\n"},
+		ssh.MockCommand{Match: "wc -c", Output: "4096\n"},
 		ssh.MockCommand{Match: "docker exec", Output: ""},
 		ssh.MockCommand{Match: "aws s3 cp", Output: "done\n"},
 		ssh.MockCommand{Match: "rm -f", Output: ""},
@@ -479,21 +489,13 @@ func TestAccessoryRestore_MySQL_FailureKeepsSQLNotSecret(t *testing.T) {
 	}
 }
 
-// teploy-cli-04: the restore pipelines (`gunzip -c X | docker exec -i ...
-// psql ...`) only reported the LAST command's exit status — psql without
-// ON_ERROR_STOP exits 0 on SQL errors, and a failed gunzip alone fed the
-// container an empty stdin and still "succeeded". The restore command must
-// check gunzip's exit code itself and make psql stop on SQL errors.
+// teploy-cli-04 / U4: the plain-dump restore piped into a POPULATED
+// database without --clean and failed on the first CREATE. The G7 restore
+// validates the artifact, takes a safety dump, drops (forcing out
+// connections) and recreates the database, then loads it in one
+// transaction — and no step is a pipeline.
 func TestAccessoryRestore_PostgresFailsOnErrors(t *testing.T) {
-	mock := ssh.NewMockExecutor("1.2.3.4",
-		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
-		ssh.MockCommand{Match: "aws s3 cp", Output: "download: done\n"},
-		ssh.MockCommand{Match: "mktemp -d '/tmp/teploy-restore.XXXXXX'", Output: "/tmp/teploy-restore.abc123\n"},
-		ssh.MockCommand{Match: "gunzip -c", Output: ""},
-		ssh.MockCommand{Match: "docker exec", Output: ""},
-		ssh.MockCommand{Match: "rm -rf", Output: ""},
-	)
-
+	mock := pgRestoreMock(nil)
 	var buf bytes.Buffer
 	client := NewClient(mock, &buf)
 	err := client.AccessoryRestore(context.Background(), "myapp", "postgres", "postgres:16",
@@ -501,48 +503,178 @@ func TestAccessoryRestore_PostgresFailsOnErrors(t *testing.T) {
 	if err != nil {
 		t.Fatalf("AccessoryRestore: %v", err)
 	}
-
-	var restoreCmd string
-	for _, call := range mock.Calls {
-		if strings.Contains(call, "psql") {
-			restoreCmd = call
+	order := pgCallOrder(mock.Calls)
+	for _, step := range []string{"validate", "safety", "drop", "create", "load"} {
+		if order[step] < 0 {
+			t.Fatalf("restore step %s never ran; calls: %v", step, mock.Calls)
 		}
 	}
-	if restoreCmd == "" {
-		t.Fatal("expected a psql restore command")
+	if !(order["validate"] < order["safety"] && order["safety"] < order["drop"] && order["drop"] < order["create"] && order["create"] < order["load"]) {
+		t.Fatalf("restore steps out of order %v", order)
 	}
-	if !strings.Contains(restoreCmd, "-v ON_ERROR_STOP=1") {
-		t.Errorf("psql must run with ON_ERROR_STOP so SQL errors fail the restore:\n%s", restoreCmd)
+	for _, c := range mock.Calls {
+		if strings.Contains(c, "--clean") {
+			t.Errorf("no --clean path: the database is recreated: %s", c)
+		}
+		if strings.Contains(c, "DROP DATABASE") && !strings.Contains(c, "WITH (FORCE)") {
+			t.Errorf("PG13+ drop must force out connections: %s", c)
+		}
+		if strings.Contains(c, "CREATE DATABASE") && !strings.Contains(c, `OWNER "appowner" TEMPLATE template0 ENCODING `) {
+			t.Errorf("recreate must keep the original owner/encoding from template0: %s", c)
+		}
+		if strings.Contains(c, "pg_restore --exit-on-error --single-transaction") && strings.Contains(c, "|") {
+			t.Errorf("restore must not be a pipeline: %s", c)
+		}
 	}
-	if strings.Contains(restoreCmd, "|") {
-		t.Errorf("restore must not be a pipeline (last-command exit status masks gunzip failures):\n%s", restoreCmd)
+}
+
+// A legacy plain .sql.gz backup (pre-G7) is integrity-checked with gzip -t
+// and loaded with psql ON_ERROR_STOP into the recreated database.
+func TestAccessoryRestore_PostgresLegacyPlainDump(t *testing.T) {
+	mock := pgRestoreMock([]ssh.MockCommand{{Match: "aws s3 ls", Output: "2026-01-01 00:00:00 99 20260101-000000.sql.gz\n"}})
+	client := NewClient(mock, io.Discard)
+	if err := client.AccessoryRestore(context.Background(), "myapp", "postgres", "postgres:16",
+		"20260101-000000", nil, S3Config{Bucket: "my-bucket", Region: "us-east-1"}); err != nil {
+		t.Fatalf("AccessoryRestore: %v", err)
+	}
+	var sawGzipTest, sawPsql bool
+	for _, c := range mock.Calls {
+		if strings.HasPrefix(c, "gzip -t '/tmp/teploy-restore.abc123/restore.sql.gz'") {
+			sawGzipTest = true
+		}
+		if strings.Contains(c, "gunzip -c") && strings.Contains(c, "psql -X -q -v ON_ERROR_STOP=1 --single-transaction") {
+			sawPsql = true
+		}
+	}
+	if !sawGzipTest || !sawPsql {
+		t.Fatalf("legacy restore must gzip -t then psql ON_ERROR_STOP (gzip-t=%v psql=%v): %v", sawGzipTest, sawPsql, mock.Calls)
+	}
+	if o := pgCallOrder(mock.Calls); o["drop"] < 0 || o["create"] < 0 {
+		t.Fatalf("legacy restore must also recreate the database: %v", mock.Calls)
 	}
 }
 
 func TestAccessoryRestore_CorruptArchiveFails(t *testing.T) {
-	mock := ssh.NewMockExecutor("1.2.3.4",
-		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
-		ssh.MockCommand{Match: "aws s3 cp", Output: "download: done\n"},
-		ssh.MockCommand{Match: "mktemp -d '/tmp/teploy-restore.XXXXXX'", Output: "/tmp/teploy-restore.abc123\n"},
-		ssh.MockCommand{Match: "gunzip -c", Err: errors.New("exit status 1: gzip: stdin: not in gzip format")},
-	)
-
+	mock := pgRestoreMock([]ssh.MockCommand{
+		{Match: "aws s3 ls", Output: "2026-01-01 00:00:00 99 20260101-000000.sql.gz\n"},
+		{Match: "gzip -t", Err: errors.New("exit status 1: gzip: stdin: not in gzip format")},
+	})
 	var buf bytes.Buffer
 	client := NewClient(mock, &buf)
 	err := client.AccessoryRestore(context.Background(), "myapp", "postgres", "postgres:16",
 		"20260101-000000", nil, S3Config{Bucket: "my-bucket", Region: "us-east-1"})
 	if err == nil {
-		t.Fatal("expected AccessoryRestore to fail when gunzip fails, not report success")
+		t.Fatal("expected AccessoryRestore to fail on a corrupt archive, not report success")
 	}
-	if !strings.Contains(err.Error(), "not in gzip format") {
-		t.Errorf("expected the underlying gunzip error to surface, got: %v", err)
+	if !strings.Contains(err.Error(), "not in gzip format") || !strings.Contains(err.Error(), "database untouched") {
+		t.Errorf("expected the gzip error and an untouched database, got: %v", err)
 	}
+	if o := pgCallOrder(mock.Calls); o["drop"] >= 0 || o["safety"] >= 0 {
+		t.Fatalf("a corrupt artifact must be refused before anything destructive: %v", mock.Calls)
+	}
+}
+
+// A failed load reloads the safety dump; the restore still fails, and it
+// is NOT recovery-incomplete (the database is back as it was).
+func TestAccessoryRestore_PostgresLoadFailureReloadsSafetyDump(t *testing.T) {
+	mock := pgRestoreMock([]ssh.MockCommand{
+		{Match: "docker exec -i 'myapp-postgres' pg_restore --exit-on-error --single-transaction -U 'postgres' -d 'myapp' < '/tmp/", Err: errors.New("exit status 1: pg_restore: error: could not execute query")},
+	})
+	client := NewClient(mock, io.Discard)
+	_, err := client.AccessoryRestoreKeep(context.Background(), "myapp", "postgres", "postgres:16",
+		"20260101-000000", nil, S3Config{Bucket: "my-bucket", Region: "us-east-1"})
+	if err == nil || !strings.Contains(err.Error(), "reloaded from the safety dump") {
+		t.Fatalf("expected a failure that reports the safety-dump reload, got %v", err)
+	}
+	if IsRecoveryIncomplete(err) {
+		t.Fatal("a successful safety reload is not recovery-incomplete")
+	}
+	reloaded := false
+	for _, c := range mock.Calls {
+		if strings.Contains(c, "pg_restore --exit-on-error") && strings.Contains(c, "/var/tmp/teploy-pre-restore.x/pre-restore.pgdump") {
+			reloaded = true
+		}
+	}
+	if !reloaded {
+		t.Fatalf("the safety dump was never reloaded: %v", mock.Calls)
+	}
+}
+
+// When the safety reload ALSO fails, the error is recovery-incomplete (the
+// caller must not restart the app against an empty database) and names the
+// kept safety dump.
+func TestAccessoryRestore_PostgresRollbackFailureIsRecoveryIncomplete(t *testing.T) {
+	mock := pgRestoreMock([]ssh.MockCommand{
+		{Match: "docker exec -i 'myapp-postgres' pg_restore --exit-on-error", Err: errors.New("exit status 1: pg_restore: error: disk full")},
+	})
+	client := NewClient(mock, io.Discard)
+	rec, err := client.AccessoryRestoreKeep(context.Background(), "myapp", "postgres", "postgres:16",
+		"20260101-000000", nil, S3Config{Bucket: "my-bucket", Region: "us-east-1"})
+	if err == nil || !IsRecoveryIncomplete(err) {
+		t.Fatalf("expected recovery-incomplete, got %v", err)
+	}
+	if rec != "/var/tmp/teploy-pre-restore.x" || !strings.Contains(err.Error(), "/var/tmp/teploy-pre-restore.x/pre-restore.pgdump") {
+		t.Fatalf("the safety dump must be kept and named (rec=%q): %v", rec, err)
+	}
+	for _, c := range mock.Calls {
+		if strings.HasPrefix(c, "rm -rf '/var/tmp/teploy-pre-restore.x'") {
+			t.Fatalf("the safety dump must never be deleted when recovery is incomplete: %s", c)
+		}
+	}
+}
+
+// pgRestoreMock answers the G7 postgres restore sequence; overrides are
+// matched first.
+func pgRestoreMock(overrides []ssh.MockCommand) *ssh.MockExecutor {
+	cmds := append([]ssh.MockCommand{}, overrides...)
+	cmds = append(cmds,
+		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
+		ssh.MockCommand{Match: "aws s3 ls", Output: "2026-01-01 00:00:00 2048 20260101-000000.pgdump\n"},
+		ssh.MockCommand{Match: "aws s3 cp", Output: "download: done\n"},
+		ssh.MockCommand{Match: "mktemp -d '/tmp/teploy-restore.XXXXXX'", Output: "/tmp/teploy-restore.abc123\n"},
+		ssh.MockCommand{Match: "umask 077; mktemp -d /var/tmp/teploy-pre-restore.XXXXXX", Output: "/var/tmp/teploy-pre-restore.x\n"},
+		ssh.MockCommand{Match: "gzip -t", Output: ""},
+		ssh.MockCommand{Match: "docker exec -i 'myapp-postgres' pg_restore -l", Output: "3; 2615 2200 SCHEMA - public pg_database_owner\n"},
+		ssh.MockCommand{Match: "docker exec 'myapp-postgres' psql -X -qtA -v ON_ERROR_STOP=1 -U 'postgres' -d 'postgres' -c 'SELECT current_setting", Output: "170004|appowner|UTF8|en_US.utf8|en_US.utf8\n"},
+		ssh.MockCommand{Match: "docker exec 'myapp-postgres' pg_dump -Fc", Output: ""},
+		ssh.MockCommand{Match: "docker exec 'myapp-postgres' psql", Output: ""},
+		ssh.MockCommand{Match: "docker exec -i 'myapp-postgres' pg_restore --exit-on-error", Output: ""},
+		ssh.MockCommand{Match: "gunzip -c", Output: ""},
+		ssh.MockCommand{Match: "rm -rf", Output: ""},
+	)
+	return ssh.NewMockExecutor("1.2.3.4", cmds...)
+}
+
+// pgCallOrder indexes the first call of each restore step (-1 = absent).
+func pgCallOrder(calls []string) map[string]int {
+	o := map[string]int{"validate": -1, "safety": -1, "drop": -1, "create": -1, "load": -1}
+	set := func(k string, i int) {
+		if o[k] < 0 {
+			o[k] = i
+		}
+	}
+	for i, c := range calls {
+		switch {
+		case strings.Contains(c, "pg_restore -l") || strings.HasPrefix(c, "gzip -t"):
+			set("validate", i)
+		case strings.Contains(c, "pg_dump -Fc"):
+			set("safety", i)
+		case strings.Contains(c, "DROP DATABASE"):
+			set("drop", i)
+		case strings.Contains(c, "CREATE DATABASE"):
+			set("create", i)
+		case strings.Contains(c, "pg_restore --exit-on-error") || (strings.Contains(c, "gunzip -c") && strings.Contains(c, "psql")):
+			set("load", i)
+		}
+	}
+	return o
 }
 
 func TestAccessoryBackup_Generic(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
 		ssh.MockCommand{Match: "umask 077", Output: "/tmp/teploy-backup.abc123\n"},
+		ssh.MockCommand{Match: "wc -c", Output: "4096\n"},
 		ssh.MockCommand{Match: "tar -czf", Output: ""},
 		ssh.MockCommand{Match: "aws s3 cp", Output: "done\n"},
 		ssh.MockCommand{Match: "rm -f", Output: ""},
@@ -973,6 +1105,7 @@ func TestBackupVolumesIncludesTeployServerData(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
 		ssh.MockCommand{Match: "umask 077", Output: "/tmp/teploy-backup.abc123\n"},
+		ssh.MockCommand{Match: "wc -c", Output: "4096\n"},
 		ssh.MockCommand{Match: "if [ -f", Output: ""},
 		ssh.MockCommand{Match: "aws s3 cp", Output: "upload: done\n"},
 		ssh.MockCommand{Match: "rm -f", Output: ""},

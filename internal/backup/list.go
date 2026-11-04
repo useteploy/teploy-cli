@@ -35,7 +35,7 @@ type ListedBackup struct {
 
 // listedIDRE matches the object names the CLI writes: the backup-id
 // grammar (timestamp or timestamp+hex) with each branch's extension.
-var listedIDRE = regexp.MustCompile(`^([0-9]{8}-[0-9]{6}(?:-[0-9a-f]{16})?)\.(tar\.gz|sql\.gz|archive\.gz|rdb\.gz)$`)
+var listedIDRE = regexp.MustCompile(`^([0-9]{8}-[0-9]{6}(?:-[0-9a-f]{16})?)\.(tar\.gz|pgdump|sql\.gz|archive\.gz|rdb\.gz)$`)
 
 // ListBackupsRecursive lists every object under s3://<base>/<app>/ in one
 // recursive call and classifies each by its key layout. Objects whose name
@@ -124,26 +124,4 @@ func classifyListedKey(app, key string) (ListedBackup, bool) {
 		return row, false
 	}
 	return row, true
-}
-
-// EngineOf classifies an accessory image for restore-time decisions: the
-// generic (tar) branch is the only one whose restore replaces files on
-// disk, so it is the only one where the accessory container itself must be
-// stopped (the engine branches restore through a running engine; redis
-// stops and restarts itself inside its restore script).
-func EngineOf(image string) string {
-	switch {
-	case isDBType(image, "postgres"):
-		return "postgres"
-	case isDBType(image, "mysql"):
-		return "mysql"
-	case isDBType(image, "mariadb"):
-		return "mariadb"
-	case isDBType(image, "mongo"):
-		return "mongo"
-	case isDBType(image, "redis"):
-		return "redis"
-	default:
-		return "generic"
-	}
 }

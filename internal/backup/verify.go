@@ -20,10 +20,14 @@ import (
 // was tested, what kind of restore was exercised, and the evidence that the
 // restored copy is actually usable (not just that a file exists in S3).
 type VerifyResult struct {
-	App        string `json:"app"`
-	Accessory  string `json:"accessory"`
-	Image      string `json:"image"`
-	Kind       string `json:"kind"` // postgres|mysql|mongo|redis|nucleus|volume
+	App       string `json:"app"`
+	Accessory string `json:"accessory"`
+	Image     string `json:"image"`
+	Kind      string `json:"kind"` // postgres|mysql|mongo|redis|valkey|dragonfly|nucleus|volume
+	// Engine is the detected engine (mariadb is Kind "mysql"; generic is
+	// Kind "volume") and Detection the evidence it came from.
+	Engine     string `json:"engine"`
+	Detection  string `json:"detection"`
 	Date       string `json:"date"`
 	S3Key      string `json:"s3_key"`
 	SizeBytes  int64  `json:"size_bytes"`
@@ -69,14 +73,21 @@ func (c *Client) InspectAccessory(ctx context.Context, app, name string) (image 
 // by listing the S3 prefix. Returns the bare timestamp (the <date> restore
 // arg) and the object's size in bytes.
 func (c *Client) LatestBackupDate(ctx context.Context, app, name string, s3 S3Config) (date string, size int64, err error) {
+	date, size, _, err = c.latestBackup(ctx, app, name, s3)
+	return date, size, err
+}
+
+// latestBackup is LatestBackupDate plus the object's file name (its
+// extension says which artifact format the backup is).
+func (c *Client) latestBackup(ctx context.Context, app, name string, s3 S3Config) (date string, size int64, file string, err error) {
 	prefix := fmt.Sprintf("s3://%s/%s/accessories/%s/", s3.Base(), app, name)
 	out, err := c.exec.Run(ctx, s3.AWS(fmt.Sprintf("s3 ls %s", ssh.ShellQuote(prefix))))
 	if err != nil {
-		return "", 0, fmt.Errorf("listing backups at %s: %w", prefix, err)
+		return "", 0, "", fmt.Errorf("listing backups at %s: %w", prefix, err)
 	}
 	// Lines look like: 2026-07-10 04:00:01   52428800 20260710-040000.sql.gz
 	// The teploy timestamp format sorts lexically, so track the max.
-	var best string
+	var best, bestFile string
 	var bestSize int64
 	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
 		fields := strings.Fields(line)
@@ -89,14 +100,14 @@ func (c *Client) LatestBackupDate(ctx context.Context, app, name string, s3 S3Co
 			continue
 		}
 		if ts > best {
-			best = ts
+			best, bestFile = ts, fname
 			bestSize, _ = strconv.ParseInt(fields[len(fields)-2], 10, 64)
 		}
 	}
 	if best == "" {
-		return "", 0, fmt.Errorf("no backups found at %s", prefix)
+		return "", 0, "", fmt.Errorf("no backups found at %s", prefix)
 	}
-	return best, bestSize, nil
+	return best, bestSize, bestFile, nil
 }
 
 // VerifyBackup downloads a backup (latest when date is empty), restores it
@@ -128,9 +139,15 @@ func (c *Client) VerifyBackup(ctx context.Context, app, name, date string, s3 S3
 		return nil, err
 	}
 
+	det, err := c.ResolveEngine(ctx, app, name, image, env)
+	if err != nil {
+		return nil, err
+	}
+
 	var size int64
+	var latestFile string
 	if date == "" {
-		date, size, err = c.LatestBackupDate(ctx, app, name, s3)
+		date, size, latestFile, err = c.latestBackup(ctx, app, name, s3)
 		if err != nil {
 			return nil, err
 		}
@@ -140,6 +157,7 @@ func (c *Client) VerifyBackup(ctx context.Context, app, name, date string, s3 S3
 
 	res := &VerifyResult{
 		App: app, Accessory: name, Image: image, Date: date, SizeBytes: size,
+		Engine: det.Engine, Detection: det.Source,
 	}
 
 	var nonce [16]byte
@@ -172,25 +190,34 @@ func (c *Client) VerifyBackup(ctx context.Context, app, name, date string, s3 S3
 	// The unique container name and owner label keep cleanup invocation-scoped.
 	env["TEPLOY_VERIFY_OWNER"] = owner
 
-	switch {
-	case isDBType(image, "postgres"):
+	// The verification kind follows the DETECTED engine: a pgvector or
+	// timescale accessory is verified as postgres (restored and queried),
+	// never as a "volume" that passes on files>0 (U3).
+	switch det.Engine {
+	case EnginePostgres:
 		res.Kind = "postgres"
-		err = c.verifyPostgres(ctx, res, app, name, image, env, s3, scratch, tmpBase)
-	case isDBType(image, "mysql"), isDBType(image, "mariadb"):
+		err = c.verifyPostgres(ctx, res, app, name, image, env, s3, scratch, tmpBase, latestFile)
+	case EngineMySQL, EngineMariaDB:
 		res.Kind = "mysql"
-		err = c.verifyMySQL(ctx, res, app, name, image, env, s3, scratch, tmpBase)
-	case isDBType(image, "redis"):
-		res.Kind = "redis"
-		err = c.verifyRedis(ctx, res, app, name, image, env, s3, scratch, tmpBase)
-	case isDBType(image, "mongo"):
+		err = c.verifyMySQL(ctx, res, app, name, det.Engine, image, env, s3, scratch, tmpBase)
+	case EngineRedis, EngineValkey:
+		res.Kind = det.Engine
+		err = c.verifyRedis(ctx, res, app, name, det.Engine, image, env, s3, scratch, tmpBase)
+	case EngineDragonfly:
+		res.Kind = "dragonfly"
+		err = c.verifyDragonfly(ctx, res, app, name, image, env, s3, scratch, tmpBase)
+	case EngineMongo:
 		res.Kind = "mongo"
 		err = c.verifyMongo(ctx, res, app, name, image, env, s3, scratch, tmpBase)
-	case isDBType(image, "nucleus"):
+	case EngineNucleus:
 		res.Kind = "nucleus"
 		err = c.verifyNucleus(ctx, res, app, name, image, env, s3, scratch, tmpBase)
-	default:
+	case EngineGeneric:
 		res.Kind = "volume"
 		err = c.verifyVolume(ctx, res, app, name, s3, tmpBase)
+	default:
+		res.Kind = det.Engine
+		err = fmt.Errorf("engine %q has no verification method", det.Engine)
 	}
 
 	res.DurationMs = time.Since(start).Milliseconds()
@@ -252,11 +279,23 @@ func (c *Client) waitReady(ctx context.Context, scratch, probe string, attempts 
 	return nil
 }
 
-func (c *Client) verifyPostgres(ctx context.Context, res *VerifyResult, app, name, image string, env map[string]string, s3 S3Config, scratch, tmpBase string) error {
+func (c *Client) verifyPostgres(ctx context.Context, res *VerifyResult, app, name, image string, env map[string]string, s3 S3Config, scratch, tmpBase, latestFile string) error {
 	db, user := postgresDBAndUser(app, env)
-	s3Key := fmt.Sprintf("s3://%s/%s/accessories/%s/%s.sql.gz", s3.Base(), app, name, res.Date)
+	prefix := fmt.Sprintf("s3://%s/%s/accessories/%s/", s3.Base(), app, name)
+	var s3Key, ext string
+	switch {
+	case strings.HasSuffix(latestFile, ".pgdump"):
+		s3Key, ext = prefix+latestFile, ".pgdump"
+	case strings.HasSuffix(latestFile, ".sql.gz"):
+		s3Key, ext = prefix+latestFile, ".sql.gz"
+	default:
+		var err error
+		if s3Key, ext, err = c.resolveAccessoryKey(ctx, s3, prefix, res.Date, ".pgdump", ".sql.gz"); err != nil {
+			return err
+		}
+	}
 	res.S3Key = s3Key
-	dump := tmpBase + ".sql.gz"
+	dump := tmpBase + ext
 	if err := c.download(ctx, s3Key, dump, s3); err != nil {
 		return err
 	}
@@ -274,20 +313,27 @@ func (c *Client) verifyPostgres(ctx context.Context, res *VerifyResult, app, nam
 		"docker run -d --name %s %s %s >/dev/null", ssh.ShellQuote(scratch), flags, ssh.ShellQuote(image))); err != nil {
 		return fmt.Errorf("starting scratch container: %w", err)
 	}
-	if err := c.waitReady(ctx, scratch, fmt.Sprintf("pg_isready -U %s", ssh.ShellQuote(user)), 30); err != nil {
+	if err := c.waitReady(ctx, scratch, postgresReadyProbe(user), 30); err != nil {
 		return err
 	}
 
 	fmt.Fprintf(c.out, "Restoring into scratch...\n")
-	if _, err := c.exec.Run(ctx, fmt.Sprintf(
-		"gunzip -c %s > %s.sql && docker exec -i %s psql -q -v ON_ERROR_STOP=1 -U %s %s < %s.sql >/dev/null",
-		ssh.ShellQuote(dump), ssh.ShellQuote(tmpBase), ssh.ShellQuote(scratch), ssh.ShellQuote(user), ssh.ShellQuote(db), ssh.ShellQuote(tmpBase))); err != nil {
+	// The same drop/recreate/load sequence an in-place restore runs, so
+	// verification exercises the real restore path, not a gentler one.
+	t := pgTarget{container: scratch, user: user, db: db}
+	timescale, err := c.pgValidateArtifact(ctx, t, dump, ext)
+	if err != nil {
+		return fmt.Errorf("restore into scratch failed: %w", err)
+	}
+	props, err := c.pgDatabaseProps(ctx, t)
+	if err != nil {
+		return fmt.Errorf("restore into scratch failed: %w", err)
+	}
+	if err := c.pgRecreateAndLoad(ctx, t, props, dump, ext, filepath.Dir(tmpBase), timescale, true); err != nil {
 		return fmt.Errorf("restore into scratch failed: %w", err)
 	}
 
-	out, err := c.exec.Run(ctx, fmt.Sprintf(
-		"docker exec %s psql -tA -U %s %s -c \"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='public'\"",
-		ssh.ShellQuote(scratch), ssh.ShellQuote(user), ssh.ShellQuote(db)))
+	out, err := c.exec.Run(ctx, t.psql(db, "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema NOT IN ('pg_catalog','information_schema') AND table_schema NOT LIKE '\\_timescaledb%' AND table_schema NOT LIKE 'timescaledb\\_%' AND table_type = 'BASE TABLE'"))
 	if err != nil {
 		return fmt.Errorf("verify query failed: %w", err)
 	}
@@ -299,7 +345,7 @@ func (c *Client) verifyPostgres(ctx context.Context, res *VerifyResult, app, nam
 	return nil
 }
 
-func (c *Client) verifyMySQL(ctx context.Context, res *VerifyResult, app, name, image string, env map[string]string, s3 S3Config, scratch, tmpBase string) error {
+func (c *Client) verifyMySQL(ctx context.Context, res *VerifyResult, app, name, engine, image string, env map[string]string, s3 S3Config, scratch, tmpBase string) error {
 	db := mysqlDB(app, env)
 	s3Key := fmt.Sprintf("s3://%s/%s/accessories/%s/%s.sql.gz", s3.Base(), app, name, res.Date)
 	res.S3Key = s3Key
@@ -322,12 +368,9 @@ func (c *Client) verifyMySQL(ctx context.Context, res *VerifyResult, app, name, 
 		"docker run -d --name %s %s %s >/dev/null", ssh.ShellQuote(scratch), flags, ssh.ShellQuote(image))); err != nil {
 		return fmt.Errorf("starting scratch container: %w", err)
 	}
-	client, admin := "mysql", "mysqladmin"
-	if isDBType(image, "mariadb") {
-		client, admin = "mariadb", "mariadb-admin"
-	}
+	client, _ := mysqlTools(engine)
 	prelude := `MYSQL_PWD=${MYSQL_ROOT_PASSWORD:-${MARIADB_ROOT_PASSWORD:-}}; export MYSQL_PWD; `
-	if err := c.waitReady(ctx, scratch, "sh -c "+ssh.ShellQuote(prelude+"exec "+admin+" ping -u root --silent"), 40); err != nil {
+	if err := c.waitReady(ctx, scratch, "sh -c "+ssh.ShellQuote(prelude+"exec "+client+" --protocol=TCP -h 127.0.0.1 -u root -e 'SELECT 1'"), 40); err != nil {
 		return err
 	}
 	restore := prelude + "exec " + client + " -u root " + ssh.ShellQuote(db)
@@ -348,7 +391,8 @@ func (c *Client) verifyMySQL(ctx context.Context, res *VerifyResult, app, name, 
 	return nil
 }
 
-func (c *Client) verifyRedis(ctx context.Context, res *VerifyResult, app, name, image string, env map[string]string, s3 S3Config, scratch, tmpBase string) error {
+func (c *Client) verifyRedis(ctx context.Context, res *VerifyResult, app, name, engine, image string, env map[string]string, s3 S3Config, scratch, tmpBase string) error {
+	cli := redisCLI(engine)
 	s3Key := fmt.Sprintf("s3://%s/%s/accessories/%s/%s.rdb.gz", s3.Base(), app, name, res.Date)
 	res.S3Key = s3Key
 	dump := tmpBase + ".rdb.gz"
@@ -367,14 +411,39 @@ func (c *Client) verifyRedis(ctx context.Context, res *VerifyResult, app, name, 
 	if _, err := c.exec.Run(ctx, cmd); err != nil {
 		return fmt.Errorf("seeding scratch redis: %w", err)
 	}
-	if err := c.waitReady(ctx, scratch, "redis-cli ping", 20); err != nil {
+	if err := c.waitReady(ctx, scratch, cli+" ping", 20); err != nil {
 		return err
 	}
-	out, err := c.exec.Run(ctx, fmt.Sprintf("docker exec %s redis-cli dbsize", ssh.ShellQuote(scratch)))
+	out, err := c.exec.Run(ctx, fmt.Sprintf("docker exec %s %s dbsize", ssh.ShellQuote(scratch), cli))
 	if err != nil {
 		return fmt.Errorf("verify query failed: %w", err)
 	}
 	res.Metric = "keys=" + strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(out), "(integer)"))
+	return nil
+}
+
+// verifyDragonfly boots a scratch dragonfly and loads the snapshot with
+// DFLY LOAD (the same mechanism the in-place restore uses).
+func (c *Client) verifyDragonfly(ctx context.Context, res *VerifyResult, app, name, image string, env map[string]string, s3 S3Config, scratch, tmpBase string) error {
+	s3Key := fmt.Sprintf("s3://%s/%s/accessories/%s/%s.rdb.gz", s3.Base(), app, name, res.Date)
+	res.S3Key = s3Key
+	dump := tmpBase + ".rdb.gz"
+	if err := c.download(ctx, s3Key, dump, s3); err != nil {
+		return err
+	}
+	if _, err := c.exec.Run(ctx, "gunzip -c "+ssh.ShellQuote(dump)+" > "+ssh.ShellQuote(tmpBase+".rdb")); err != nil {
+		return fmt.Errorf("decompressing the snapshot: %w", err)
+	}
+	fmt.Fprintf(c.out, "Starting scratch %s...\n", scratch)
+	if _, err := c.exec.Run(ctx, fmt.Sprintf("docker run -d --name %s --label teploy.verify.owner=%s %s --proactor_threads=2 >/dev/null",
+		ssh.ShellQuote(scratch), ssh.ShellQuote(env["TEPLOY_VERIFY_OWNER"]), ssh.ShellQuote(image))); err != nil {
+		return fmt.Errorf("starting scratch container: %w", err)
+	}
+	keys, err := c.dragonflyScratchLoad(ctx, scratch, tmpBase+".rdb")
+	if err != nil {
+		return err
+	}
+	res.Metric = "keys=" + keys
 	return nil
 }
 
@@ -404,8 +473,8 @@ func (c *Client) verifyMongo(ctx context.Context, res *VerifyResult, app, name, 
 
 	fmt.Fprintf(c.out, "Restoring into scratch...\n")
 	if _, err := c.exec.Run(ctx, fmt.Sprintf(
-		"cat %s | docker exec -i %s mongorestore --archive --gzip --quiet",
-		ssh.ShellQuote(dump), ssh.ShellQuote(scratch))); err != nil {
+		"docker exec -i %s mongorestore --archive --gzip --quiet < %s",
+		ssh.ShellQuote(scratch), ssh.ShellQuote(dump))); err != nil {
 		return fmt.Errorf("restore into scratch failed: %w", err)
 	}
 
