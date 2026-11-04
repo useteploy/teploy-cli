@@ -203,7 +203,7 @@ func doctorRun(ctx context.Context, deps doctorDeps, flags *Flags, serverName st
 
 	if executor == nil {
 		const sshDown = "restore SSH connectivity (see the ssh check above), then re-run teploy doctor"
-		for _, name := range []string{"docker", "disk", "registry", "caddy", "compatibility", "repair-debt", "secret-exposure", "server-tools", "config-home", "backup-cron", "age-identity", "git-trigger", "scheduler"} {
+		for _, name := range []string{"docker", "disk", "registry", "caddy", "compatibility", "repair-debt", "secret-exposure", "server-tools", "config-home", "backup-cron", "age-identity", "git-trigger", "scheduler", "restore-leftovers"} {
 			skipFail(name, "SSH unreachable", sshDown)
 		}
 	} else {
@@ -226,6 +226,7 @@ func doctorRun(ctx context.Context, deps doctorDeps, flags *Flags, serverName st
 		report.Checks = append(report.Checks, doctorAgeIdentityCheck(ctx, executor))
 		report.Checks = append(report.Checks, doctorGitTriggerCheck(ctx, executor, deps))
 		report.Checks = append(report.Checks, doctorSchedulerCheck(ctx, executor))
+		report.Checks = append(report.Checks, doctorRestoreLeftoversCheck(ctx, executor))
 	}
 
 	report.summarize()
@@ -866,20 +867,28 @@ func doctorSchedulerCheck(ctx context.Context, exec ssh.Executor) doctorCheck {
 		return doctorCheck{Name: "scheduler", Result: doctorWarn, Detail: err.Error(),
 			Remediation: "check the shell on the server — the scheduler probe failed"}
 	}
-	var jobs []string
-	if st.CrontabEntries > 0 || st.TeployEntries > 0 {
-		jobs = append(jobs, fmt.Sprintf("%d crontab line(s), %d of them teploy backups", max(st.CrontabEntries, st.TeployEntries), st.TeployEntries))
+	var jobs, teployJobs []string
+	if st.TeployEntries > 0 {
+		teployJobs = append(teployJobs, fmt.Sprintf("%d teploy crontab line(s)", st.TeployEntries))
+	}
+	if other := st.CrontabEntries - st.TeployEntries; other > 0 {
+		jobs = append(jobs, fmt.Sprintf("%d other crontab line(s)", other))
 	}
 	for _, f := range st.CronDTeploy {
-		jobs = append(jobs, "/etc/cron.d/"+f)
+		teployJobs = append(teployJobs, "/etc/cron.d/"+f)
 	}
 	for _, f := range st.CronDOther {
 		jobs = append(jobs, "/etc/cron.d/"+f)
 	}
+	all := append(append([]string{}, teployJobs...), jobs...)
 	switch {
-	case !st.Daemon && st.HasJobs():
+	case !st.Daemon && st.HasTeployJobs():
 		return doctorCheck{Name: "scheduler", Result: doctorFail,
-			Detail:      "no cron daemon is running, so none of these scheduled jobs run: " + strings.Join(jobs, ", "),
+			Detail:      "no cron daemon is running, so none of these scheduled jobs run: " + strings.Join(all, ", "),
+			Remediation: backup.SchedulerRemedy()}
+	case !st.Daemon && st.HasJobs():
+		return doctorCheck{Name: "scheduler", Result: doctorWarn,
+			Detail:      "no cron daemon is running; these non-teploy jobs never run: " + strings.Join(all, ", "),
 			Remediation: backup.SchedulerRemedy()}
 	case !st.Daemon:
 		return doctorCheck{Name: "scheduler", Result: doctorWarn,
@@ -891,10 +900,31 @@ func doctorSchedulerCheck(ctx context.Context, exec ssh.Executor) doctorCheck {
 			Remediation: "on the server: systemctl enable cron (or crond)"}
 	}
 	detail := "cron daemon running"
-	if len(jobs) > 0 {
-		detail += "; scheduled: " + strings.Join(jobs, ", ")
+	if len(all) > 0 {
+		detail += "; scheduled: " + strings.Join(all, ", ")
 	}
 	return doctorCheck{Name: "scheduler", Result: doctorOK, Detail: detail}
+}
+
+// restoreLeftoversProbe lists pre-restore safety copies older than a day:
+// a restore normally removes its copy once the app is healthy again, so an
+// old one is a restore that was killed (or whose health check failed) and
+// is holding disk.
+const restoreLeftoversProbe = "find /var/tmp -maxdepth 1 -name 'teploy-pre-restore.*' -mmin +1440 -print 2>/dev/null; true"
+
+// doctorRestoreLeftoversCheck reports stale pre-restore safety copies.
+func doctorRestoreLeftoversCheck(ctx context.Context, exec ssh.Executor) doctorCheck {
+	out, err := exec.Run(ctx, restoreLeftoversProbe)
+	if err != nil {
+		return doctorCheck{Name: "restore-leftovers", Result: doctorWarn, Detail: "could not list /var/tmp: " + err.Error()}
+	}
+	paths := strings.Fields(out)
+	if len(paths) == 0 {
+		return doctorCheck{Name: "restore-leftovers", Result: doctorOK, Detail: "no stale pre-restore safety copies"}
+	}
+	return doctorCheck{Name: "restore-leftovers", Result: doctorWarn,
+		Detail:      fmt.Sprintf("%d pre-restore safety copy(ies) older than a day: %s", len(paths), strings.Join(paths, ", ")),
+		Remediation: "each is the data as it was before a restore that did not finish cleanly; once the restored data is confirmed, remove them (rm -rf). A killed postgres restore can also leave <db>_teploy_old_* / _teploy_new_* databases"}
 }
 
 // doctorAgeIdentityScript prints three facts about the age identity's

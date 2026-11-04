@@ -23,9 +23,9 @@ type SchedulerStatus struct {
 	Enabled string
 	// Crontab reports the crontab binary.
 	Crontab bool
-	// CrontabEntries counts the user's active crontab lines (any job;
-	// trigger-poll lines carry no marker); TeployEntries those with a
-	// teploy backup marker.
+	// CrontabEntries counts the user's crontab schedule lines;
+	// TeployEntries those that are teploy's (backup markers, the teploy
+	// binary, a /deployments script such as the trigger-poll redeploy).
 	CrontabEntries, TeployEntries int
 	// CronDTeploy and CronDOther list /etc/cron.d files that do / do not
 	// mention teploy (package jobs that ship a systemd-timer twin are
@@ -38,12 +38,22 @@ func (s SchedulerStatus) HasJobs() bool {
 	return s.CrontabEntries > 0 || s.TeployEntries > 0 || len(s.CronDTeploy) > 0 || len(s.CronDOther) > 0
 }
 
+// HasTeployJobs reports whether any of those jobs are teploy's.
+func (s SchedulerStatus) HasTeployJobs() bool {
+	return s.TeployEntries > 0 || len(s.CronDTeploy) > 0
+}
+
 // SchedulerProbe is the read-only probe script. The daemon check scans
 // /proc/*/comm with the shell's own read (no procps or systemd needed, so
 // it works on minimal images and in containers).
-const SchedulerProbe = `sched_daemon=no; for f in /proc/[0-9]*/comm; do { read -r c < "$f"; } 2>/dev/null || continue; case "$c" in cron|crond) sched_daemon=yes; break;; esac; done; echo "daemon=$sched_daemon"; ` +
-	`e=unknown; if command -v systemctl >/dev/null 2>&1; then for u in cron crond cronie; do s=$(systemctl is-enabled "$u" 2>/dev/null); case "$s" in enabled|disabled|masked|static|indirect|alias) e=$s; break;; esac; done; fi; echo "enabled=$e"; ` +
-	`if command -v crontab >/dev/null 2>&1; then echo crontab=yes; t=$(crontab -l 2>/dev/null); n=$(printf '%s\n' "$t" | grep -c '^[[:space:]]*[^#[:space:]]'); m=$(printf '%s\n' "$t" | grep -c '# \[teploy-'); echo "crontab_entries=${n:-0}"; echo "teploy_entries=${m:-0}"; else echo crontab=no; fi; ` +
+const SchedulerProbe = `sched_daemon=no; for f in /proc/[0-9]*/comm; do { read -r c < "$f"; } 2>/dev/null || continue; case "$c" in cron|crond) sched_daemon=yes; break;; esac; done; ` +
+	// /proc hides other users' processes under hidepid=2, and systemd-cron
+	// runs jobs without a daemon process: ask systemd too.
+	`if [ "$sched_daemon" = no ] && command -v systemctl >/dev/null 2>&1; then for u in cron crond cronie cron.target; do systemctl is-active --quiet "$u" 2>/dev/null && { sched_daemon=yes; break; }; done; fi; echo "daemon=$sched_daemon"; ` +
+	`e=unknown; if command -v systemctl >/dev/null 2>&1; then for u in cron crond cronie cron.target; do s=$(systemctl is-enabled "$u" 2>/dev/null); case "$s" in enabled|disabled|masked|static|indirect|alias) e=$s; break;; esac; done; fi; echo "enabled=$e"; ` +
+	// Schedule lines only (VAR=value and comment lines are not jobs);
+	// teploy's are its backup markers, its binary, or a /deployments script.
+	`if command -v crontab >/dev/null 2>&1; then echo crontab=yes; t=$(crontab -l 2>/dev/null | grep '^[[:space:]]*[0-9*@]'); n=$(printf '%s\n' "$t" | grep -c .); m=$(printf '%s\n' "$t" | grep -c -e teploy -e /deployments/); echo "crontab_entries=${n:-0}"; echo "teploy_entries=${m:-0}"; else echo crontab=no; fi; ` +
 	`for f in /etc/cron.d/*; do [ -f "$f" ] || continue; b=${f##*/}; case "$b" in .*|e2scrub_all|php|sysstat) continue;; esac; if grep -qi teploy "$f" 2>/dev/null; then echo "crond_teploy=$b"; else echo "crond_other=$b"; fi; done; true`
 
 // ProbeScheduler runs SchedulerProbe.

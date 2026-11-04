@@ -19,7 +19,7 @@ import (
 // against (adding checks is additive at the end; renaming/removing is a
 // machine-interface bump).
 var doctorCheckOrder = []string{
-	"git", "config", "ssh", "docker", "disk", "registry", "caddy", "compatibility", "repair-debt", "secret-exposure", "server-tools", "config-home", "backup-cron", "age-identity", "git-trigger", "scheduler"}
+	"git", "config", "ssh", "docker", "disk", "registry", "caddy", "compatibility", "repair-debt", "secret-exposure", "server-tools", "config-home", "backup-cron", "age-identity", "git-trigger", "scheduler", "restore-leftovers"}
 
 // doctorHappyMock registers every remote read a fully healthy target
 // answers, for the app config returned by doctorTestApp.
@@ -37,6 +37,7 @@ func doctorHappyMock() *ssh.MockExecutor {
 		ssh.MockCommand{Match: "crontab -l", Output: ""},
 		ssh.MockCommand{Match: "if [ -r /etc/teploy/age-key ]", Output: "present labsent movable"},
 		ssh.MockCommand{Match: "sched_daemon=no", Output: "daemon=yes\nenabled=enabled\ncrontab=yes\nteploy_entries=0\n"},
+		ssh.MockCommand{Match: "find /var/tmp -maxdepth 1 -name 'teploy-pre-restore.*'", Output: ""},
 	)
 }
 
@@ -85,8 +86,8 @@ func TestDoctorAllChecksPass(t *testing.T) {
 	if ex == nil {
 		t.Fatal("expected an executor back")
 	}
-	if report.Summary != (doctorSummary{OK: 16, Warn: 0, Fail: 0}) {
-		t.Fatalf("summary = %+v, want 16 ok", report.Summary)
+	if report.Summary != (doctorSummary{OK: 17, Warn: 0, Fail: 0}) {
+		t.Fatalf("summary = %+v, want 17 ok", report.Summary)
 	}
 	if len(report.Checks) != len(doctorCheckOrder) {
 		t.Fatalf("got %d checks, want %d", len(report.Checks), len(doctorCheckOrder))
@@ -133,8 +134,8 @@ func TestDoctorJSONStableShape(t *testing.T) {
 		t.Fatalf("machine_interface = %v, want %d", doc["machine_interface"], MachineInterface)
 	}
 	checks, ok := doc["checks"].([]any)
-	if !ok || len(checks) != 16 {
-		t.Fatalf("checks = %#v, want 16 entries", doc["checks"])
+	if !ok || len(checks) != 17 {
+		t.Fatalf("checks = %#v, want 17 entries", doc["checks"])
 	}
 	for i, raw := range checks {
 		check, ok := raw.(map[string]any)
@@ -192,6 +193,7 @@ func TestDoctorHumanTable(t *testing.T) {
 		ssh.MockCommand{Match: "crontab -l", Output: ""},
 		ssh.MockCommand{Match: "if [ -r /etc/teploy/age-key ]", Output: "present labsent movable"},
 		ssh.MockCommand{Match: "sched_daemon=no", Output: "daemon=yes\nenabled=enabled\ncrontab=yes\nteploy_entries=0\n"},
+		ssh.MockCommand{Match: "find /var/tmp -maxdepth 1 -name 'teploy-pre-restore.*'", Output: ""},
 	)
 	report, _ := doctorRun(context.Background(), doctorTestDeps(mock), &Flags{}, "", doctorTestApp(), nil)
 	var out bytes.Buffer
@@ -205,7 +207,7 @@ func TestDoctorHumanTable(t *testing.T) {
 	if !strings.Contains(rendered, "fix:") {
 		t.Fatalf("table missing the remediation line:\n%s", rendered)
 	}
-	if !strings.Contains(rendered, "Summary: 15 ok, 0 warn, 1 fail") {
+	if !strings.Contains(rendered, "Summary: 16 ok, 0 warn, 1 fail") {
 		t.Fatalf("table summary line wrong:\n%s", rendered)
 	}
 	assertDoctorReadOnlyCalls(t, mock.Calls)
@@ -678,7 +680,7 @@ func TestDoctorEndToEndAllOK(t *testing.T) {
 	if err := runDoctor(doctorTestDeps(mock), &Flags{}, "", &out); err != nil {
 		t.Fatalf("runDoctor: %v", err)
 	}
-	if !strings.Contains(out.String(), "Summary: 16 ok, 0 warn, 0 fail") {
+	if !strings.Contains(out.String(), "Summary: 17 ok, 0 warn, 0 fail") {
 		t.Fatalf("human report wrong:\n%s", out.String())
 	}
 	assertDoctorReadOnlyCalls(t, mock.Calls)
@@ -704,6 +706,7 @@ func assertDoctorReadOnlyCalls(t *testing.T, calls []string) {
 		"ls -1 '/deployments/.teploy/apps'",
 		"crontab -l",
 		"sched_daemon=no; for f in /proc/",
+		"find /var/tmp -maxdepth 1 -name 'teploy-pre-restore.*'",
 	}
 	for _, call := range calls {
 		allowed := false
@@ -833,7 +836,7 @@ func TestDoctorSchedulerCheck(t *testing.T) {
 		!strings.Contains(c.Detail, "/etc/cron.d/teploy-wp-backup") || !strings.Contains(c.Detail, "/etc/cron.d/replicate") || !strings.Contains(c.Remediation, "teploy setup") {
 		t.Errorf("cron.d jobs without a daemon = %+v, want fail naming them", c)
 	}
-	if c := probe("daemon=no\nenabled=disabled\ncrontab=yes\ncrontab_entries=3\nteploy_entries=2\n"); c.Result != doctorFail || !strings.Contains(c.Detail, "3 crontab line(s), 2 of them teploy backups") {
+	if c := probe("daemon=no\nenabled=disabled\ncrontab=yes\ncrontab_entries=3\nteploy_entries=2\n"); c.Result != doctorFail || !strings.Contains(c.Detail, "2 teploy crontab line(s)") || !strings.Contains(c.Detail, "1 other crontab line(s)") {
 		t.Errorf("teploy crontab lines without a daemon = %+v, want fail", c)
 	}
 	if c := probe("daemon=no\nenabled=unknown\ncrontab=no\nteploy_entries=0\n"); c.Result != doctorWarn {
@@ -847,10 +850,31 @@ func TestDoctorSchedulerCheck(t *testing.T) {
 	}
 }
 
-// A trigger-poll line carries no teploy marker; it still needs cron.
-func TestDoctorSchedulerCountsUnmarkedCrontabLines(t *testing.T) {
-	c := doctorSchedulerCheck(context.Background(), ssh.NewMockExecutor("h", ssh.MockCommand{Match: "sched_daemon=no", Output: "daemon=no\nenabled=unknown\ncrontab=yes\ncrontab_entries=1\nteploy_entries=0\n"}))
-	if c.Result != doctorFail {
-		t.Fatalf("an unmarked crontab job without a daemon = %+v, want fail", c)
+// Package-only jobs (certbot, anacron in /etc/cron.d, a non-teploy crontab
+// line) without a daemon are a warning, not a failure; teploy's are a fail.
+func TestDoctorSchedulerSeverity(t *testing.T) {
+	probe := func(out string) doctorCheck {
+		return doctorSchedulerCheck(context.Background(), ssh.NewMockExecutor("h", ssh.MockCommand{Match: "sched_daemon=no", Output: out}))
+	}
+	if c := probe("daemon=no\nenabled=unknown\ncrontab=yes\ncrontab_entries=1\nteploy_entries=1\n"); c.Result != doctorFail {
+		t.Errorf("a teploy crontab job without a daemon = %+v, want fail", c)
+	}
+	if c := probe("daemon=no\nenabled=unknown\ncrontab=no\ncrond_other=certbot\ncrond_other=anacron\n"); c.Result != doctorWarn || !strings.Contains(c.Detail, "/etc/cron.d/certbot") {
+		t.Errorf("package-only cron.d jobs without a daemon = %+v, want warn", c)
+	}
+	if c := probe("daemon=no\nenabled=unknown\ncrontab=yes\ncrontab_entries=2\nteploy_entries=0\n"); c.Result != doctorWarn {
+		t.Errorf("non-teploy crontab lines without a daemon = %+v, want warn", c)
+	}
+}
+
+func TestDoctorRestoreLeftoversCheck(t *testing.T) {
+	ctx := context.Background()
+	clean := ssh.NewMockExecutor("h", ssh.MockCommand{Match: "find /var/tmp -maxdepth 1", Output: ""})
+	if c := doctorRestoreLeftoversCheck(ctx, clean); c.Result != doctorOK {
+		t.Errorf("clean = %+v", c)
+	}
+	stale := ssh.NewMockExecutor("h", ssh.MockCommand{Match: "find /var/tmp -maxdepth 1", Output: "/var/tmp/teploy-pre-restore.AbC123\n"})
+	if c := doctorRestoreLeftoversCheck(ctx, stale); c.Result != doctorWarn || !strings.Contains(c.Detail, "teploy-pre-restore.AbC123") {
+		t.Errorf("stale = %+v", c)
 	}
 }
