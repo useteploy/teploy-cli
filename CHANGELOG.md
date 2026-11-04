@@ -13,14 +13,34 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
   directory that `verify-backup` then passed as a "volume". A detected
   database is never tarred; an engine without a backup method is refused.
   Do not trust earlier teploy backups of those images.
-- Postgres backups are `pg_dump -Fc` (`.pgdump`). In-place restore into a
-  populated database failed on the first `CREATE`; it now takes a safety
-  dump, drops (`WITH (FORCE)`) and recreates the database with its owner
-  and encoding, and loads with `pg_restore --single-transaction`
-  (TimescaleDB between `timescaledb_pre_restore`/`post_restore`). A failed
-  load reloads the safety dump. Legacy `.sql.gz` backups still restore.
-- MySQL/MariaDB dumps use `--single-transaction --routines --triggers` and
-  must end with the completion trailer.
+- Postgres backups are `pg_dump -Fc` (`.pgdump`), with the cluster's roles
+  (`pg_dumpall --globals-only`) stored beside them. In-place restore into a
+  populated database failed on the first `CREATE`. It now loads the backup
+  into a new database and swaps it in by rename only after the load
+  completes; the previous database is kept until the app is healthy. A
+  failed load or a refused swap leaves the live database untouched (no
+  single-transaction load, so large schemas no longer exhaust the lock
+  table). Database-level settings, ACLs and comments are re-applied;
+  TimescaleDB loads between `timescaledb_pre_restore`/`post_restore`; the
+  restoring role must be a superuser or the owner with CREATEDB. Legacy
+  `.sql.gz` backups still restore. A cluster holding databases besides the
+  accessory's is refused instead of being backed up incompletely.
+- `verify-backup` restores postgres as the accessory's own role through the
+  same path (it passed backups the real restore could not load), and does
+  not pass a legacy raw `.tar.gz` of a database engine.
+- Backups older CLIs took of pgvector/TimescaleDB/PostGIS/Bitnami/Valkey/
+  Dragonfly accessories (`.tar.gz`) still restore, as files with the
+  accessory stopped; the artifact, not the engine, decides that.
+- MySQL/MariaDB dumps use `--single-transaction --routines --triggers
+  --events` and must end with the completion trailer. Restore takes a
+  safety dump and recreates the database (tables created after the backup
+  no longer survive); MySQL and Mongo restores reload the safety dump on
+  failure, and a failed reload stops with the app down
+  (recovery-incomplete), as does a Dragonfly restore whose rollback fails.
+- An unrecognised accessory whose files look like a database data
+  directory is not tarred while it runs. `engine:` on an accessory in
+  `teploy.yml` overrides detection; images built FROM a database that run
+  something else (backup sidecars) are no longer taken for the database.
 - Dragonfly backs up with `SAVE RDB` (its `BGSAVE` never writes
   `dump.rdb`) and restores online with `DFLY LOAD`; Valkey uses
   `valkey-cli`.
@@ -30,10 +50,13 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
   (`mysqladmin ping` passes on access denied); postgres readiness probes
   TCP for the same reason.
 - `accessory restore` stops the app while it runs (it runs through the
-  same fenced path as `backup restore --accessory`).
+  same fenced path as `backup restore --accessory`) and so now asks first;
+  pass `--yes` without a terminal.
 - `teploy setup` enables and starts cron; `backup schedule` refuses on a
   server with no cron daemon; `teploy doctor` gains a `scheduler` check that
-  fails when crontab or `/etc/cron.d` jobs exist but no daemon runs them.
+  fails when teploy's crontab or `/etc/cron.d` jobs exist but no daemon runs
+  them (warns for other jobs; systemd is asked when `/proc` hides the
+  daemon), and a `restore-leftovers` check for stale pre-restore copies.
 - ntfy notifications use plain word tags (`teploy,<type>,<outcome>`);
   the emoji shortcode tags rendered as emoji.
 

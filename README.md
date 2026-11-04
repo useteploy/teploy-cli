@@ -667,30 +667,43 @@ flags any cron line that still embeds credentials or bucket flags.
 Schedules need a running cron daemon: `teploy setup` installs, enables and
 starts cron, `backup schedule` (and `accessory backup --schedule`) refuse on
 a server without one, and `teploy doctor` fails when teploy crontab lines or
-`/etc/cron.d` jobs exist but no cron daemon runs them.
+`/etc/cron.d` jobs exist but no cron daemon runs them (other jobs warn).
 
 Accessory backups are engine-aware. The engine is detected from the
-container — a `teploy.engine=<postgres|mysql|mariadb|redis|valkey|dragonfly|mongo|nucleus|generic>`
-label, else the version env the upstream images set (so pgvector,
-TimescaleDB, PostGIS and Bitnami images are postgres), else the entrypoint
-or image name — and a detected database is never copied as raw files:
+container — the accessory's `engine:` in `teploy.yml` (set on the container
+as the `teploy.engine` label: postgres, mysql, mariadb, redis, valkey,
+dragonfly, mongo, nucleus, or generic/none for plain files), else the
+version env the upstream images set (so pgvector, TimescaleDB, PostGIS and
+Bitnami images are postgres) as long as the container runs that engine's
+server (a backup sidecar built FROM postgres is not postgres), else the
+entrypoint or image name. A detected database is never copied as raw
+files:
 
 | Engine | Backup | In-place restore |
 |---|---|---|
-| postgres (incl. pgvector, timescale, postgis) | `pg_dump -Fc` (`.pgdump`) | safety dump, `DROP DATABASE ... WITH (FORCE)`, `CREATE` (same owner/encoding), `pg_restore --single-transaction`; TimescaleDB bracketed by `timescaledb_pre_restore`/`post_restore`; a failed load reloads the safety dump. Legacy `.sql.gz` backups restore through `psql` |
-| mysql / mariadb | `mysqldump --single-transaction --routines --triggers` | the dump's `DROP TABLE`/`CREATE TABLE` through the client |
+| postgres (incl. pgvector, timescale, postgis) | `pg_dump -Fc` (`.pgdump`) of the accessory's database, plus the cluster's roles (`pg_dumpall --globals-only`) beside it; a cluster holding other databases is refused rather than half backed up | loaded into a new database first; only a complete load is swapped in by rename, and the previous database is kept renamed until the app is healthy, then dropped. Database-level settings, ACLs and comments are re-applied. A failed load or a refused swap leaves the live database untouched. Needs a superuser, or the database owner with CREATEDB |
+| mysql / mariadb | `mysqldump --single-transaction --routines --triggers --events` | safety dump, `DROP`/`CREATE` the database (same charset), load; a failed load reloads the safety dump |
 | redis / valkey | `BGSAVE`, wait for `LASTSAVE` to move, copy `dump.rdb` (refused when AOF is on) | stop, swap `dump.rdb`, start |
 | dragonfly | `SAVE RDB` (its `BGSAVE` writes `.dfs` files, not `dump.rdb`) | online: pre-restore `SAVE RDB`, `DFLY LOAD`, `SAVE` |
-| mongo | `mongodump --archive --gzip` | `mongorestore --drop` |
-| nucleus, generic | tar of the accessory directory (crash-consistent) | staged two-phase file promotion with the container stopped |
+| mongo | `mongodump --archive --gzip` | safety dump, `mongorestore --drop`; a failed restore reloads the safety dump |
+| nucleus, generic | tar of the accessory directory (crash-consistent); refused while the container runs when its files look like a database data directory | staged two-phase file promotion with the container stopped |
+
+Backups an older CLI took of an engine it did not recognise (pgvector,
+TimescaleDB, Valkey, Dragonfly, ...) are `.tar.gz` file copies: they still
+restore, as files with the accessory stopped, but `verify-backup` reports
+them as not verifiable as a database. A restore that cannot finish and
+cannot roll back stops with the app down and names what it kept;
+`teploy doctor` reports pre-restore copies left in `/var/tmp`.
 
 A backup whose artifact is implausibly small (an empty dump from a wrong
 password) or structurally wrong fails instead of being stored.
-`accessory verify-backup` restores through the same path into a scratch
-container and records a `backup.verify` event.
+`accessory verify-backup` restores into a scratch container as the
+accessory's own role, through the same path, and records a `backup.verify`
+event.
 
 Restore quiesces: the app's containers (and a file-restored accessory's) are
-stopped under the app's fenced lock (`accessory restore` takes the same path), the backup is promoted with the
+stopped under the app's fenced lock (`accessory restore` takes the same path
+and, like `backup restore`, needs `--yes` without a terminal), the backup is promoted with the
 two-phase recovery discipline, the containers are started again and
 health-checked. On failure — or an unhealthy app afterwards — the
 pre-restore recovery copy is kept and named. Non-interactive restores

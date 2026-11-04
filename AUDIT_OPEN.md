@@ -16,14 +16,38 @@ Integration matrix (`-tags integration`, colima fixture):
 postgres:17, pgvector:pg17, timescaledb latest-pg17, mysql:8, redis:7,
 valkey:8, dragonfly — all pass.
 
+Independent review (2026-11-03, same day) found the first cut unsafe;
+fixed on the branch: postgres restore now loads into a new database and
+swaps by rename (a failed load or refused swap leaves the live database
+untouched; the previous database is the recovery copy), database-level
+settings/ACLs re-applied, restore preflight (superuser or owner+CREATEDB,
+free space), verify restores as the accessory's own role, legacy .tar.gz
+of reclassified engines restore as files (artifact decides the stop),
+multi-database clusters refused, globals stored beside postgres dumps,
+MySQL/Mongo safety dumps + recovery-incomplete classification, mysqldump
+--events, dragonfly rollback classification + trap cleanup, live-DB guard
+on generic tars, `engine:` accessory config, sidecar detection, scheduler
+probe systemd fallback + severity split, restore-leftovers doctor check,
+`accessory restore --yes`. Regression tests (unit + real postgres):
+250 tables at max_locks_per_transaction=10, non-superuser owner + superuser
+extension, refused swap, database settings/ACL preserved with an open
+connection, legacy pgvector tarball, MySQL table created after backup.
+
 Open / deferred:
-- G5 (adopt unmanaged containers) and MySQL one-object-per-database: not
-  in this slice. MySQL in-place restore still relies on the dump's
-  DROP TABLE / CREATE TABLE, so a table created AFTER the backup survives
-  the restore (postgres now recreates the database; mysql does not).
-- Bitnami postgres/mysql/redis images are detected but not integration
-  tested (their auth and data paths differ from the official images: redis
-  restore and verify assume /data/dump.rdb).
+- G5 (adopt unmanaged containers, multi-database clusters) and MySQL
+  one-object-per-database: not in this slice. A postgres cluster with
+  other databases now FAILS its backup (loudly) rather than omitting them.
+- Mongo restore (`--drop`) still leaves collections created after the
+  backup; Mongo is not in the integration matrix (unit tests only).
+- Bitnami images are detected but not integration tested; redis/valkey
+  restore and verify assume /data/dump.rdb.
+- DR bundles do not carry postgres globals; database-level settings are
+  re-applied at cutover from the archive.
+- Dragonfly's pre-restore snapshot in /var/tmp has no free-space preflight
+  (its size is the in-memory dataset).
+- A killed postgres restore can leave <db>_teploy_new_* / _teploy_old_*
+  databases; doctor cannot see inside engines, so only the /var/tmp
+  copies are reported.
 - Trigger/autodeploy poll scheduling writes crontab without the scheduler
   refusal; doctor's scheduler check reports those lines.
 - Pre-existing, unrelated: `TestDRIntegration_BundleRoundTrip` expects the
