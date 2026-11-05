@@ -905,7 +905,7 @@ http.server.HTTPServer(("127.0.0.1",` + itHookPort + `),H).serve_forever()
 		// Versioning needs erasure coding: a second MinIO on four directories.
 		const port = "19101"
 		endpoint := "http://127.0.0.1:" + port
-		f.sh("docker rm -fv teploy-it-minio2 >/dev/null 2>&1; docker run -d --name teploy-it-minio2 --memory 512m -p 127.0.0.1:" + port + ":9000 -e MINIO_ROOT_USER=" + itAK + " -e MINIO_ROOT_PASSWORD=" + itSK + " cgr.dev/chainguard/minio:latest server /tmp/d{1...4} >/dev/null")
+		f.sh("docker rm -fv teploy-it-minio2 >/dev/null 2>&1; docker run -d --name teploy-it-minio2 --memory 512m -p 127.0.0.1:" + port + ":9000 -e MINIO_CI_CD=1 -e MINIO_ROOT_USER=" + itAK + " -e MINIO_ROOT_PASSWORD=" + itSK + " cgr.dev/chainguard/minio:latest server /tmp/d{1...4} >/dev/null")
 		defer f.sh("docker rm -fv teploy-it-minio2 >/dev/null 2>&1; true")
 		aws := "AWS_ACCESS_KEY_ID=" + itAK + " AWS_SECRET_ACCESS_KEY=" + itSK + " aws --region us-east-1 --endpoint-url " + endpoint + " "
 		f.waitFor("the second minio", aws+"s3 mb s3://itv")
@@ -1582,6 +1582,8 @@ http.server.HTTPServer(("127.0.0.1",` + itHookPort + `),H).serve_forever()
 			t.Fatalf("--all: exit %d\n%s%s", res.ExitCode, res.Stdout, res.Stderr)
 		}
 		// Back to the user with sudo: rotation lands where reads look, no second copy.
+		// (Earlier scenarios ran with no /etc/teploy, so this user may hold its own.)
+		f.sh(`rm -f "$HOME"/.config/teploy/backup-policy.json`)
 		rotated := strings.TrimSpace(strings.Split(strings.SplitN(func() string {
 			c := exec.Command(f.local, "backup", "keygen")
 			b, err := c.Output()
