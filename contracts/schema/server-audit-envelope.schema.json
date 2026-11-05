@@ -1,0 +1,83 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://teploy.github.io/contracts/schema/server-audit-envelope.schema.json",
+  "title": "`teploy server audit <server> --json` envelope: what is left over on a server, with evidence and the command that fixes it where one can (rev 19). The audit itself is read-only; a source that could not be read is an unknown check, never a clean bill.",
+  "type": "object",
+  "required": ["machine_interface", "server", "host", "audited_at", "state", "checks", "disk", "findings"],
+  "properties": {
+    "machine_interface": {"type": "integer", "minimum": 1},
+    "server": {"type": "string", "minLength": 1},
+    "host": {"type": "string"},
+    "audited_at": {"type": "string", "format": "date-time"},
+    "state": {"enum": ["ok", "partial", "unreachable"]},
+    "error": {"type": "string"},
+    "checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "status"],
+        "properties": {
+          "name": {"type": "string", "minLength": 1},
+          "status": {"enum": ["ok", "unknown"]},
+          "detail": {"type": "string"}
+        }
+      }
+    },
+    "disk": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "required": ["path", "available_bytes", "used_percent", "attribution"],
+          "properties": {
+            "path": {"type": "string"},
+            "available_bytes": {"type": "integer", "minimum": 0},
+            "used_percent": {"type": "integer", "minimum": 0, "maximum": 100},
+            "attribution": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["name", "size_bytes"],
+                "properties": {
+                  "name": {"type": "string"},
+                  "size_bytes": {"type": "integer", "minimum": 0}
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "kind", "severity", "subject", "evidence", "remedy"],
+        "properties": {
+          "id": {"type": "string", "minLength": 1, "description": "kind:subject — stable across runs so a finding can be dismissed"},
+          "kind": {"enum": ["stale_route", "empty_managed_region", "managed_route_dead_upstream", "orphan_state", "manual_route_dead_upstream", "manual_route_nonlocal_address", "versions_beyond_policy", "reclaimable_build_artifacts", "large_writable_layer", "unmanaged_container", "dangling_volumes", "caddyfile_without_caddy", "scheduler_missing", "disk_pressure"]},
+          "severity": {"enum": ["critical", "warning", "info"]},
+          "subject": {"type": "string", "minLength": 1},
+          "app": {"type": "string", "description": "set when the finding belongs to one app: the name a destructive confirmation asks for"},
+          "evidence": {"type": "string", "minLength": 1},
+          "size_bytes": {"type": "integer", "minimum": 0},
+          "related": {"type": "array", "items": {"type": "string"}, "description": "finding ids whose remedies would free space on a disk_pressure"},
+          "remedy": {
+            "type": "object",
+            "required": ["destructive", "confirm"],
+            "properties": {
+              "argv": {
+                "oneOf": [
+                  {"type": "null", "description": "nothing the CLI can do safely: report only"},
+                  {"type": "array", "items": {"type": "string"}, "minItems": 1, "description": "the command that fixes it; argv[0] is teploy"}
+                ]
+              },
+              "destructive": {"type": "boolean"},
+              "confirm": {"type": "boolean", "description": "ask a person before running (a destructive remedy always confirms)"}
+            }
+          }
+        }
+      }
+    }
+  }
+}

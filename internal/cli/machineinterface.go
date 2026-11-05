@@ -193,6 +193,12 @@ const (
 	// failures and the route per (server, app, host); read-only, runs from the
 	// caller over SSH with nothing new on the server.
 	CapDomainsCheckV1 = "domains-check-v1"
+	// CapServerAuditV1: `teploy server audit <server> --json` (read-only
+	// findings with evidence and a remedy argv or null) and its remedies
+	// `route remove --app X`, `releases prune --keep N` and
+	// `server prune --build-cache --dangling`. keep_versions unset now means 5
+	// after a notice period. server-audit-envelope pins the JSON.
+	CapServerAuditV1 = "server-audit-v1"
 )
 
 // MachineCapabilities returns every capability token this build
@@ -237,7 +243,8 @@ func MachineCapabilities() []string {
 		CapRollbackJsonV1,
 		CapRedeployV1,
 		CapEnvConfigGuardV1,
-		CapDomainsCheckV1}
+		CapDomainsCheckV1,
+		CapServerAuditV1}
 	sort.Strings(tokens)
 	return tokens
 }
