@@ -1035,6 +1035,10 @@ func doctorBackupPolicyCheck(ctx context.Context, exec ssh.Executor, now time.Ti
 			remedies = append(remedies, "printf '<url>\\n' | teploy server backup-policy set --host <server> --heartbeat-stdin")
 		}
 	}
+	if len(st.Target.OtherServers) > 0 {
+		warns = append(warns, fmt.Sprintf("this policy runs with no prefix in a bucket other servers also write to (%s): same-named apps share a namespace, and that server's backups cannot be told from this one's until it has upgraded", strings.Join(st.Target.OtherServers, ", ")))
+		remedies = append(remedies, "give each server its own prefix: teploy server backup-target set --host <server> --bucket <bucket> --prefix <server>")
+	}
 	if st.LastRun != nil && len(st.LastRun.Warnings) > 0 {
 		warns = append(warns, "the last backup run warned: "+strings.Join(st.LastRun.Warnings, "; "))
 		remedies = append(remedies, "a refused prune means retention has stopped and storage keeps growing: `teploy server backup-target owners` for a stale marker")

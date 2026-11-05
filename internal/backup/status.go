@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -99,6 +100,9 @@ type StatusTarget struct {
 	// Reachable says the listing this report needed worked.
 	Reachable bool   `json:"reachable"`
 	Error     string `json:"error,omitempty"`
+	// OtherServers are fingerprints of servers that also write at this target's
+	// base. Only looked for with no prefix, where same-named apps would collide.
+	OtherServers []string `json:"other_servers,omitempty"`
 }
 
 // StatusPolicy summarizes the policy (no heartbeat tokens).
@@ -230,6 +234,17 @@ func ReadFleetStatus(ctx context.Context, exec ssh.Executor, now time.Time) (Fle
 		} else {
 			st.Target.Reachable = true
 		}
+	}
+	if st.Target.Reachable && target.Prefix == "" && policy.Configured() && c.fingerprint(ctx) != "" {
+		mctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+		if markers, err := c.ListNamespaceMarkers(mctx, cfg); err == nil {
+			for _, m := range markers {
+				if !m.Self && !slices.Contains(st.Target.OtherServers, m.Fingerprint) {
+					st.Target.OtherServers = append(st.Target.OtherServers, m.Fingerprint)
+				}
+			}
+		}
+		cancel()
 	}
 	listed := map[string][]ListedBackup{}
 	listNS := func(app string) []ListedBackup {

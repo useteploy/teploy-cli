@@ -67,3 +67,30 @@ func TestDoctorBackupPolicyCheck(t *testing.T) {
 		t.Fatalf("%s", c.Remediation)
 	}
 }
+
+// No prefix in a bucket another server writes to: same-named apps would collide,
+// and a server that has not upgraded carries no marker to refuse on.
+func TestDoctorFlagsNoPrefixInASharedBucket(t *testing.T) {
+	now := time.Date(2026, 11, 4, 12, 0, 0, 0, time.UTC)
+	mk := func(prefix string) *ssh.MockExecutor {
+		return ssh.NewMockExecutor("h",
+			ssh.MockCommand{Match: "if [ -d /etc/teploy ] && [ ! -x /etc/teploy ]", Output: "path /etc/teploy/backup-policy.json\n" + `{"v":"1","interval":"1h","recipient":"` + testRecipient + `","heartbeat_urls":["https://d/x"]}`},
+			ssh.MockCommand{Match: "for p in /etc/teploy/backup-target.json", Output: "path /etc/teploy/backup-target.json\n" + `{"v":"1","bucket":"b","region":"r","prefix":"` + prefix + `"}`},
+			ssh.MockCommand{Match: "command -v aws >/dev/null", Output: "aws\nage\n"},
+			ssh.MockCommand{Match: "crontab -l", Output: "5 * * * * /usr/local/bin/teploy backup run --all # [teploy-backup-all]\n"},
+			ssh.MockCommand{Match: "ids=$(docker ps -aq", Output: ""},
+			ssh.MockCommand{Match: "{ cat /etc/machine-id", Output: "0123456789abcdef0123456789abcdef  -\n"},
+			ssh.MockCommand{Match: "aws s3 ls", Output: "d t 20 shop/.owners/aaaaaaaaaaaaaaaa\nd t 20 shop/.owners/0123456789abcdef\n"},
+			ssh.MockCommand{Match: "python3 -c", Output: `{"v":1,"id":"1","seq":1,"ts":"2026-11-04T11:30:00Z","app":"_fleet","kind":"backup.all","outcome":"succeeded","detail":{"status":"ok"}}` + "\n"},
+			ssh.MockCommand{Match: "for d in /deployments/*/volumes", Output: ""},
+		)
+	}
+	c := doctorBackupPolicyCheck(context.Background(), mk(""), now)
+	if c.Result != doctorWarn || !strings.Contains(c.Detail, "aaaaaaaaaaaaaaaa") || !strings.Contains(c.Remediation, "--prefix") || strings.Contains(c.Detail, "0123456789abcdef") {
+		t.Fatalf("%+v", c)
+	}
+	// A prefix is the answer: not even looked for.
+	if c := doctorBackupPolicyCheck(context.Background(), mk("srv1"), now); strings.Contains(c.Detail, "no prefix") {
+		t.Fatalf("%+v", c)
+	}
+}

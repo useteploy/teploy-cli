@@ -815,7 +815,8 @@ policy's retention. As a second guard every server leaves a marker at
 `<base>/<app>/.owners/<fingerprint>` before its first prune, and a namespace holding
 another server's marker, or one whose owners cannot be listed, is never pruned. `teploy
 server backup-target owners` lists the markers; `--clear <fingerprint>` removes those of
-a server that is gone, or this one before a rebuild.
+a server that is gone, or this one before a rebuild. A policy with no prefix in a bucket another server
+writes to is flagged by `teploy doctor`.
 
 #### Before anything destructive
 
