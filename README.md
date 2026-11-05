@@ -357,6 +357,7 @@ teploy plan --out plan.json               # write a bound plan record (config di
 teploy apply plan.json                    # execute a reviewed plan; refuses naming what drifted since it was made
 teploy scale <count>                      # multi-server deploy + LB update
 teploy server audit <server>              # read-only: what is left over and what fixes it
+teploy server siblings <server>           # read-only: teploy products and forgejo running on a server
 teploy version / update                   # version info and self-update
 ```
 
@@ -631,6 +632,43 @@ carrying the name, no upstream that still resolves (asked inside Caddy's
 network), no files it still serves, nothing unreadable — and commits under
 an exact-block compare-and-swap, so a deploy that rewrites the block in
 between is never undone.
+
+### Sibling discovery
+
+```bash
+teploy server siblings <server>           # teploy products + forgejo on that server
+teploy server siblings <server> --json    # contracts/schema/siblings-envelope.schema.json
+```
+
+What Dash (or you) runs before offering to connect the products that share a
+server. Each teploy product image carries
+`LABEL dev.teploy.product=<dash|observe|ship>` and serves an unauthenticated
+`GET /.well-known/teploy.json`; this command finds the candidates without
+probing anything:
+
+- **product**: the container's `dev.teploy.product` label (`source: label`),
+  else its image's (`source: image_label`), else — for the forgejo family,
+  whose images carry no teploy label — the image's OCI labels
+  (`org.opencontainers.image.title`/`source` naming forgejo or gitea →
+  `source: oci_label`). A `dev.teploy.product` value the CLI does not
+  recognise passes through verbatim under `unknown_labeled`: a product newer
+  than the CLI stays visible, and the consumer decides what it knows.
+- **version / app**: hints only — `dev.teploy.version`, else the teploy
+  release label when the container is teploy-managed, else the image's
+  `org.opencontainers.image.version`.
+- **port_hints**: the container's published host binds (loopback and
+  tailnet/mesh binds included as-is) — where
+  `/.well-known/teploy.json` (or forgejo's `/api/v1/version`) may live.
+
+One row per container: an app with web + worker containers yields two rows,
+grouped by the consumer's probe. Observation only — no DNS, no HTTP, no URL
+guessing, no env or credentials — and read-only end to end (a test pins every
+command it issues only reads; the whole thing is at most two SSH round
+trips). Confirming a candidate, minting credentials or writing env needs its
+confirmed `instance_id` and an admin's consent — that is the consumer's
+surface, never this command's. With `--json` the exit code is 0 whenever the
+envelope was produced; read `state` (`ok` / `partial` / `unreachable`) — an
+unobserved server is never a clean "no siblings".
 
 ### Accessories
 ```

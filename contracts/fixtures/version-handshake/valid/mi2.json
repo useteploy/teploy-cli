@@ -36,6 +36,7 @@
     "server-rename",
     "server-status-machine",
     "server-update",
+    "siblings-v1",
     "template-var-stdin",
     "trigger-convergence-v1",
     "trigger-poll-v1",

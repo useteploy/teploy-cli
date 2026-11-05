@@ -199,6 +199,15 @@ const (
 	// `server prune --build-cache --dangling`. keep_versions unset now means 5
 	// after a notice period. server-audit-envelope pins the JSON.
 	CapServerAuditV1 = "server-audit-v1"
+	// CapServerSiblingsV1: `teploy server siblings <server> --json` —
+	// read-only sibling discovery (Programme B): teploy products by the
+	// dev.teploy.product label (container's own, else its image's) and the
+	// forgejo family by its OCI image labels, each row with version hints,
+	// the teploy app name when managed, and published-port hints. No
+	// probing, no DNS, no env, no credentials: the consumer probes and
+	// confirms; unrecognised dev.teploy.product values pass through
+	// verbatim. siblings-envelope pins the JSON.
+	CapServerSiblingsV1 = "siblings-v1"
 )
 
 // MachineCapabilities returns every capability token this build
@@ -244,7 +253,8 @@ func MachineCapabilities() []string {
 		CapRedeployV1,
 		CapEnvConfigGuardV1,
 		CapDomainsCheckV1,
-		CapServerAuditV1}
+		CapServerAuditV1,
+		CapServerSiblingsV1}
 	sort.Strings(tokens)
 	return tokens
 }

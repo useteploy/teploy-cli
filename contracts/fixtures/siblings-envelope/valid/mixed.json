@@ -1,0 +1,93 @@
+{
+  "machine_interface": 2,
+  "server": "infra-home",
+  "host": "192.0.2.10",
+  "observed_at": "2026-11-05T12:00:00Z",
+  "state": "ok",
+  "siblings": [
+    {
+      "container": "dash-web-1a2b3c4",
+      "product": "dash",
+      "version": "v0.3.1",
+      "state": "running",
+      "image": "ghcr.io/useteploy/dash:v0.3.1",
+      "port_hints": [
+        {
+          "host_ip": "127.0.0.1",
+          "host_port": 49221,
+          "container_port": 3000,
+          "proto": "tcp"
+        },
+        {
+          "host_ip": "::",
+          "host_port": 49221,
+          "container_port": 3000,
+          "proto": "tcp"
+        }
+      ],
+      "source": "image_label"
+    },
+    {
+      "container": "forgejo",
+      "product": "forgejo",
+      "version": "11.0.1",
+      "state": "running",
+      "image": "codeberg.org/forgejo/forgejo:11",
+      "port_hints": [
+        {
+          "host_ip": "127.0.0.1",
+          "host_port": 3000,
+          "container_port": 3000,
+          "proto": "tcp"
+        }
+      ],
+      "source": "oci_label"
+    },
+    {
+      "container": "observe-web-7cf98cae",
+      "product": "observe",
+      "version": "7cf98cae",
+      "app": "observe",
+      "state": "running",
+      "image": "ghcr.io/useteploy/observe:7cf98cae",
+      "port_hints": [
+        {
+          "host_ip": "100.108.123.49",
+          "host_port": 3000,
+          "container_port": 3000,
+          "proto": "tcp"
+        }
+      ],
+      "source": "label"
+    },
+    {
+      "container": "observe-worker-7cf98cae",
+      "product": "observe",
+      "version": "7cf98cae",
+      "app": "observe",
+      "state": "running",
+      "image": "ghcr.io/useteploy/observe:7cf98cae",
+      "port_hints": [],
+      "source": "label"
+    }
+  ],
+  "unknown_labeled": [
+    {
+      "container": "lullmail-web-9f8e7d6",
+      "product": "lullmail",
+      "version": "9f8e7d6",
+      "app": "lullmail",
+      "state": "running",
+      "image": "ghcr.io/fylun/lullmail:latest",
+      "port_hints": [
+        {
+          "host_ip": "0.0.0.0",
+          "host_port": 8080,
+          "container_port": 8080,
+          "proto": "tcp"
+        }
+      ],
+      "source": "label"
+    }
+  ]
+}
