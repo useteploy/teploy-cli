@@ -3,6 +3,7 @@ package backup
 import (
 	"context"
 	"errors"
+	"os"
 	"os/exec"
 	"strings"
 	"testing"
@@ -65,5 +66,19 @@ func TestSchedulerProbeRunsUnderSh(t *testing.T) {
 	}
 	if _, err := parseSchedulerProbe(string(out)); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// `backup list --json` on a cron-less host: no crontab binary means nothing is
+// scheduled, not a failure. Any other failure still is one.
+func TestReadCrontabWithoutCron(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	if err := os.Symlink("/bin/sh", dir+"/sh"); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+	if lines, err := ReadCrontab(ctx, ssh.NewLocalExecutor()); err != nil || lines != nil {
+		t.Fatalf("no crontab binary = %v, %v", lines, err)
 	}
 }

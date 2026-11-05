@@ -39,7 +39,7 @@ func doctorHappyMock() *ssh.MockExecutor {
 		ssh.MockCommand{Match: "crontab -l", Output: ""},
 		ssh.MockCommand{Match: "if [ -r /etc/teploy/age-key ]", Output: "present labsent movable"},
 		ssh.MockCommand{Match: "sched_daemon=no", Output: "daemon=yes\nenabled=enabled\ncrontab=yes\nteploy_entries=0\n"},
-		ssh.MockCommand{Match: "find /var/tmp -maxdepth 1 -name 'teploy-pre-restore.*'", Output: ""},
+		ssh.MockCommand{Match: "for d in /var/tmp/teploy-pre-restore.*", Output: ""},
 		ssh.MockCommand{Match: "docker ps --filter label=teploy.role=accessory", Output: ""},
 	)
 }
@@ -196,7 +196,7 @@ func TestDoctorHumanTable(t *testing.T) {
 		ssh.MockCommand{Match: "crontab -l", Output: ""},
 		ssh.MockCommand{Match: "if [ -r /etc/teploy/age-key ]", Output: "present labsent movable"},
 		ssh.MockCommand{Match: "sched_daemon=no", Output: "daemon=yes\nenabled=enabled\ncrontab=yes\nteploy_entries=0\n"},
-		ssh.MockCommand{Match: "find /var/tmp -maxdepth 1 -name 'teploy-pre-restore.*'", Output: ""},
+		ssh.MockCommand{Match: "for d in /var/tmp/teploy-pre-restore.*", Output: ""},
 		ssh.MockCommand{Match: "docker ps --filter label=teploy.role=accessory", Output: ""},
 	)
 	report, _ := doctorRun(context.Background(), doctorTestDeps(mock), &Flags{}, "", doctorTestApp(), nil)
@@ -710,7 +710,7 @@ func assertDoctorReadOnlyCalls(t *testing.T, calls []string) {
 		"ls -1 '/deployments/.teploy/apps'",
 		"crontab -l",
 		"sched_daemon=no; for f in /proc/",
-		"find /var/tmp -maxdepth 1 -name 'teploy-pre-restore.*'",
+		"for d in /var/tmp/teploy-pre-restore.*",
 		"docker ps --filter label=teploy.role=accessory",
 	}
 	for _, call := range calls {
@@ -874,20 +874,31 @@ func TestDoctorSchedulerSeverity(t *testing.T) {
 
 func TestDoctorRestoreLeftoversCheck(t *testing.T) {
 	ctx := context.Background()
-	clean := ssh.NewMockExecutor("h", ssh.MockCommand{Match: "find /var/tmp -maxdepth 1", Output: ""})
+	clean := ssh.NewMockExecutor("h", ssh.MockCommand{Match: "for d in /var/tmp", Output: ""})
 	if c := doctorRestoreLeftoversCheck(ctx, clean, nil); c.Result != doctorOK {
 		t.Errorf("clean = %+v", c)
 	}
-	stale := ssh.NewMockExecutor("h", ssh.MockCommand{Match: "find /var/tmp -maxdepth 1", Output: "/var/tmp/teploy-pre-restore.AbC123\n"})
-	if c := doctorRestoreLeftoversCheck(ctx, stale, nil); c.Result != doctorWarn || !strings.Contains(c.Detail, "teploy-pre-restore.AbC123") {
+	stale := ssh.NewMockExecutor("h", ssh.MockCommand{Match: "for d in /var/tmp", Output: "done /var/tmp/teploy-pre-restore.AbC123\n"})
+	c := doctorRestoreLeftoversCheck(ctx, stale, nil)
+	if c.Result != doctorWarn || !strings.Contains(c.Detail, "teploy-pre-restore.AbC123") || strings.Contains(c.Remediation, "only copy of the data") {
 		t.Errorf("stale = %+v", c)
+	}
+	// The reproduced trap: doctor told the operator --release "confirms the
+	// restore" for a copy that was the only data left.
+	open := ssh.NewMockExecutor("h", ssh.MockCommand{Match: "for d in /var/tmp", Output: "open /var/tmp/teploy-pre-restore.a@b@1\n"})
+	c = doctorRestoreLeftoversCheck(ctx, open, nil)
+	if c.Result != doctorWarn || !strings.Contains(c.Detail, "only copy of the data") || !strings.Contains(c.Remediation, "do NOT discard") {
+		t.Errorf("unconfirmed = %+v", c)
+	}
+	if strings.Contains(c.Remediation, "confirms the restore") {
+		t.Errorf("must not call --release a confirmation: %s", c.Remediation)
 	}
 }
 
 func TestDoctorPostgresLeftoversAndCoverage(t *testing.T) {
 	ctx := context.Background()
 	mock := ssh.NewMockExecutor("h",
-		ssh.MockCommand{Match: "find /var/tmp -maxdepth 1", Output: ""},
+		ssh.MockCommand{Match: "for d in /var/tmp", Output: ""},
 		ssh.MockCommand{Match: "docker ps --filter label=teploy.role=accessory", Output: "myapp|db\nmyapp|cache\n"},
 		ssh.MockCommand{Match: "docker inspect -f '{{.Config.Image}}' 'myapp-db'", Output: "postgres:17\n"},
 		ssh.MockCommand{Match: "docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' 'myapp-db'", Output: "PG_MAJOR=17\nPOSTGRES_DB=appdb\n"},
@@ -896,7 +907,7 @@ func TestDoctorPostgresLeftoversAndCoverage(t *testing.T) {
 		ssh.MockCommand{Match: "docker exec 'myapp-db' psql -X -qtA -v ON_ERROR_STOP=1 -U 'postgres' -d 'postgres' -c 'SELECT datname", Output: "appdb\nother\nappdb_teploy_old_0123abcd\npostgres\n"},
 		ssh.MockCommand{Match: "docker exec 'myapp-db' psql", Output: "0\n"},
 	)
-	reports, err := backup.NewClient(mock, io.Discard).PostgresAccessories(ctx)
+	reports, err := backup.NewClient(mock, io.Discard).AccessoryReports(ctx)
 	if err != nil || len(reports) != 1 {
 		t.Fatalf("reports = %+v, %v (redis is not reported)", reports, err)
 	}

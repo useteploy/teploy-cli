@@ -320,9 +320,9 @@ func mysqlRestoreMock(overrides ...ssh.MockCommand) *ssh.MockExecutor {
 		ssh.MockCommand{Match: "aws s3 cp", Output: ""},
 		ssh.MockCommand{Match: "mktemp -d '/tmp/teploy-restore.XXXXXX'", Output: "/tmp/teploy-restore.abc123\n"},
 		ssh.MockCommand{Match: "umask 077; gunzip -c", Output: ""},
-		ssh.MockCommand{Match: "docker exec -i 'myapp-db' sh -c 'IFS= read -r teploy_credential || exit 1; MYSQL_PWD=${teploy_credential#MYSQL_PWD=}; export MYSQL_PWD; exec mysql -u root -N -B", Output: "utf8mb4|utf8mb4_0900_ai_ci|16384\n"},
+		ssh.MockCommand{Match: "docker exec -i 'myapp-db' sh -c 'IFS= read -r teploy_credential || exit 1; MYSQL_PWD=${teploy_credential#MYSQL_PWD=}; export MYSQL_PWD; exec mysql -u root -N -B", Output: "utf8mb4|utf8mb4_0900_ai_ci|16384|0|0\n"},
 		ssh.MockCommand{Match: "df -Pk '/var/tmp'", Output: "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/vda1 100000 10 90000 1% /\n"},
-		ssh.MockCommand{Match: "umask 077; mktemp -d '/var/tmp/teploy-pre-restore.myapp-db.XXXXXX'", Output: "/var/tmp/teploy-pre-restore.m\n"},
+		ssh.MockCommand{Match: "umask 077; mktemp -d '/var/tmp/teploy-pre-restore.myapp@db@XXXXXX'", Output: "/var/tmp/teploy-pre-restore.m\n"},
 		ssh.MockCommand{Match: "docker exec -i 'myapp-db' sh -c 'IFS= read -r teploy_credential || exit 1; MYSQL_PWD=${teploy_credential#MYSQL_PWD=}; export MYSQL_PWD; exec mysqldump", Output: ""},
 		ssh.MockCommand{Match: "docker exec -i 'myapp-db' sh -c 'IFS= read -r teploy_credential || exit 1; MYSQL_PWD=${teploy_credential#MYSQL_PWD=}; export MYSQL_PWD; exec mysql -u root -e", Output: ""},
 		ssh.MockCommand{Match: "rm -f ", Output: ""},
@@ -406,7 +406,7 @@ func TestMongoRestore_FailureClassification(t *testing.T) {
 			ssh.MockCommand{Match: "aws s3 cp", Output: ""},
 			ssh.MockCommand{Match: "mktemp -d '/tmp/teploy-restore.XXXXXX'", Output: "/tmp/teploy-restore.abc123\n"},
 			ssh.MockCommand{Match: "gzip -t", Output: ""},
-			ssh.MockCommand{Match: "umask 077; mktemp -d '/var/tmp/teploy-pre-restore.myapp-db.XXXXXX'", Output: "/var/tmp/teploy-pre-restore.g\n"},
+			ssh.MockCommand{Match: "umask 077; mktemp -d '/var/tmp/teploy-pre-restore.myapp@db@XXXXXX'", Output: "/var/tmp/teploy-pre-restore.g\n"},
 			ssh.MockCommand{Match: "docker exec 'myapp-db' mongodump", Output: ""},
 			ssh.MockCommand{Match: "docker exec 'myapp-db' sh -c", Output: ""},
 			ssh.MockCommand{Match: "docker exec -i 'myapp-db' mongorestore", Output: ""},
@@ -420,11 +420,11 @@ func TestMongoRestore_FailureClassification(t *testing.T) {
 	if rec, err := run(base()); err != nil || rec.Path != "/var/tmp/teploy-pre-restore.g" {
 		t.Fatalf("success keeps the safety dump as recovery: %+v %v", rec, err)
 	}
-	first := ssh.MockCommand{Match: "docker exec -i 'myapp-db' mongorestore --archive --gzip --drop < '/tmp/", Err: errors.New("exit status 1")}
+	first := ssh.MockCommand{Match: "docker exec -i 'myapp-db' mongorestore --archive --gzip --drop --nsExclude='teploy_check_*.*' < '/tmp/", Err: errors.New("exit status 1")}
 	if _, err := run(base(first)); err == nil || IsRecoveryIncomplete(err) {
 		t.Fatalf("a reloaded safety dump is recoverable: %v", err)
 	}
-	both := ssh.MockCommand{Match: "docker exec -i 'myapp-db' mongorestore --archive --gzip --drop < '/var/tmp/", Err: errors.New("exit status 1")}
+	both := ssh.MockCommand{Match: "docker exec -i 'myapp-db' mongorestore --archive --gzip --drop --nsExclude='teploy_check_*.*' < '/var/tmp/", Err: errors.New("exit status 1")}
 	if _, err := run(base(first, both)); err == nil || !IsRecoveryIncomplete(err) {
 		t.Fatalf("a failed reload is recovery-incomplete: %v", err)
 	}
@@ -438,7 +438,7 @@ func TestDragonflyDoubleFailureIsRecoveryIncomplete(t *testing.T) {
 		ssh.MockCommand{Match: "aws s3 ls", Output: "2026-01-01 00:00:00 2048 20260101-000000.rdb.gz\n"},
 		ssh.MockCommand{Match: "aws s3 cp", Output: ""},
 		ssh.MockCommand{Match: "mktemp -d '/tmp/teploy-restore.XXXXXX'", Output: "/tmp/teploy-restore.abc123\n"},
-		ssh.MockCommand{Match: "umask 077; mktemp -d '/var/tmp/teploy-pre-restore.myapp-cache.XXXXXX'", Output: "/var/tmp/teploy-pre-restore.d\n"},
+		ssh.MockCommand{Match: "umask 077; mktemp -d '/var/tmp/teploy-pre-restore.myapp@cache@XXXXXX'", Output: "/var/tmp/teploy-pre-restore.d\n"},
 		ssh.MockCommand{Match: "set -eu", Err: errors.New("Process exited with status 3: " + recoveryIncompleteMarker + ": DFLY LOAD of the backup failed")},
 		ssh.MockCommand{Match: "rm -", Output: ""},
 	)
@@ -842,32 +842,95 @@ func copiesMock(databases string, overrides ...ssh.MockCommand) *ssh.MockExecuto
 		ssh.MockCommand{Match: "docker exec 'myapp-postgres' psql -X -qtA -v ON_ERROR_STOP=1 -U 'postgres' -d 'postgres' -c 'SELECT current_setting", Output: "170004|t|t|postgres|UTF8|C|C|100\n"},
 		ssh.MockCommand{Match: "docker exec 'myapp-postgres' psql -X -qtA -v ON_ERROR_STOP=1 -U 'postgres' -d 'postgres' -c 'SELECT datname FROM pg_database WHERE NOT", Output: databases},
 		ssh.MockCommand{Match: "docker exec 'myapp-postgres' psql", Output: ""},
-		ssh.MockCommand{Match: "for d in '/var/tmp/teploy-pre-restore.myapp-postgres'.*", Output: "/var/tmp/teploy-pre-restore.myapp-postgres.abc\n"},
+		ssh.MockCommand{Match: "for d in '/var/tmp/teploy-pre-restore.myapp@postgres@'*", Output: "done /var/tmp/teploy-pre-restore.myapp@postgres@abc\n"},
 		ssh.MockCommand{Match: "rm -rf", Output: ""},
 	)
 	return ssh.NewMockExecutor("h", cmds...)
 }
 
 func TestReleaseRecoveryCopies(t *testing.T) {
-	mock := copiesMock("myapp\nmyapp_teploy_old_0123abcd\nmyapp_teploy_new_89abcdef\nother_teploy_old_00000000\n")
+	ctx := context.Background()
+	mock := copiesMock("myapp\nreports\nmyapp_teploy_old_0123abcd\nmyapp_teploy_new_89abcdef\nreports_teploy_old_00000000\n")
 	c := NewClient(mock, io.Discard)
-	rc, err := c.FindRecoveryCopies(context.Background(), "myapp", "postgres", "postgres:17", nil)
+	rc, err := c.FindRecoveryCopies(ctx, "myapp", "postgres", "postgres:17", "", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(rc.Previous) != 1 || len(rc.Partial) != 1 || len(rc.Paths) != 1 {
-		t.Fatalf("copies = %+v (another database's copy is not this accessory's)", rc)
+	if len(rc.Previous) != 2 || len(rc.Partial) != 1 || len(rc.Paths) != 1 || len(rc.MissingLive) != 0 {
+		t.Fatalf("copies = %+v (a --database restore's copy is this accessory's too)", rc)
 	}
-	released, err := c.ReleaseRecoveryCopies(context.Background(), rc)
-	if err != nil || len(released) != 3 {
+	released, err := c.ReleaseRecoveryCopies(ctx, rc, false)
+	if err != nil || len(released) != 4 {
 		t.Fatalf("released %v, %v", released, err)
 	}
-	if !pgCalled(mock.Calls, `DROP DATABASE IF EXISTS "myapp_teploy_old_0123abcd" WITH (FORCE)`) || pgCalled(mock.Calls, `DROP DATABASE IF EXISTS "myapp" `) {
-		t.Fatalf("release must drop only the copies: %v", mock.Calls)
+	if !pgCalled(mock.Calls, `DROP DATABASE IF EXISTS "reports_teploy_old_00000000" WITH (FORCE)`) || pgCalled(mock.Calls, `DROP DATABASE IF EXISTS "myapp" `) {
+		t.Fatalf("release must drop the copies and nothing else: %v", mock.Calls)
+	}
+	// --database scopes to one database's copies.
+	rc, err = NewClient(copiesMock("myapp\nreports\nmyapp_teploy_old_0123abcd\nreports_teploy_old_00000000\n"), io.Discard).FindRecoveryCopies(ctx, "myapp", "postgres", "postgres:17", "reports", nil)
+	if err != nil || len(rc.Previous) != 1 || rc.Previous[0] != "reports_teploy_old_00000000" {
+		t.Fatalf("scoped copies = %+v, %v", rc, err)
 	}
 }
 
-// exec wrapper shared with the swap tests: rollback swaps previous -> live.
+// The reproduced data loss: appdb gone, only appdb_teploy_old_* left, and
+// --release --yes dropped it. Refused, with or without --force.
+func TestReleaseRefusedWhileTheLiveDatabaseIsMissing(t *testing.T) {
+	mock := copiesMock("myapp_teploy_old_0123abcd\n")
+	c := NewClient(mock, io.Discard)
+	rc, err := c.FindRecoveryCopies(context.Background(), "myapp", "postgres", "postgres:17", "", nil)
+	if err != nil || len(rc.MissingLive) != 1 {
+		t.Fatalf("copies = %+v, %v", rc, err)
+	}
+	for _, force := range []bool{false, true} {
+		if _, err := c.ReleaseRecoveryCopies(context.Background(), rc, force); err == nil || !strings.Contains(err.Error(), "--rollback") {
+			t.Fatalf("force=%v: want a refusal pointing at --rollback, got %v", force, err)
+		}
+	}
+	if pgCalled(mock.Calls, "DROP DATABASE") {
+		t.Fatalf("nothing may be dropped: %v", mock.Calls)
+	}
+}
+
+// The other reproduced loss: mysql killed after DROP, 0 live tables, the only
+// copy in /var/tmp. Its restore never wrote the marker: refused without --force.
+func TestReleaseRefusesUnconfirmedSafetyCopyWithoutForce(t *testing.T) {
+	path := "/var/tmp/teploy-pre-restore.myapp@db@abc"
+	mock := ssh.NewMockExecutor("h",
+		ssh.MockCommand{Match: "docker exec 'myapp-db' sh -c", Output: ""},
+		ssh.MockCommand{Match: "for d in '/var/tmp/teploy-pre-restore.myapp@db@'*", Output: "open " + path + "\n"},
+		ssh.MockCommand{Match: "rm -rf", Output: ""},
+	)
+	c := NewClient(mock, io.Discard)
+	rc, err := c.FindRecoveryCopies(context.Background(), "myapp", "db", "mariadb:11", "", map[string]string{"MARIADB_VERSION": "11"})
+	if err != nil || len(rc.Unconfirmed) != 1 {
+		t.Fatalf("copies = %+v, %v", rc, err)
+	}
+	if _, err := c.ReleaseRecoveryCopies(context.Background(), rc, false); err == nil || !strings.Contains(err.Error(), "only copy") || !strings.Contains(err.Error(), "--force") {
+		t.Fatalf("got %v", err)
+	}
+	if pgCalled(mock.Calls, "rm -rf") {
+		t.Fatal("nothing may be removed")
+	}
+	if released, err := c.ReleaseRecoveryCopies(context.Background(), rc, true); err != nil || len(released) != 1 {
+		t.Fatalf("--force: %v %v", released, err)
+	}
+}
+
+// Prefixes cannot collide: app a + accessory b-c used to share a prefix with
+// app a-b + accessory c, and --release on one deleted the other's copies.
+func TestRecoveryPrefixIsUnambiguous(t *testing.T) {
+	one, two := recoveryPrefix("a", "b-c"), recoveryPrefix("a-b", "c")
+	if strings.HasPrefix(one, two) || strings.HasPrefix(two, one) {
+		t.Fatalf("%s and %s collide", one, two)
+	}
+	if strings.HasPrefix(recoveryPrefix("a", "b-c"), recoveryPrefix("a", "b")) {
+		t.Fatal("accessory b must not match accessory b-c")
+	}
+}
+
+// exec wrapper for rollback: the swap and the pg_database re-read carry a
+// random displaced name.
 type pgRollbackExec struct {
 	*ssh.MockExecutor
 	present map[string]bool
@@ -876,7 +939,7 @@ type pgRollbackExec struct {
 
 func (e *pgRollbackExec) Run(ctx context.Context, cmd string) (string, error) {
 	switch {
-	case strings.Contains(cmd, `RENAME TO "myapp"`):
+	case strings.Contains(cmd, "RENAME TO"):
 		e.MockExecutor.Calls = append(e.MockExecutor.Calls, cmd)
 		return "", e.swapErr
 	case strings.Contains(cmd, "SELECT datname FROM pg_database WHERE datname IN"):
@@ -895,12 +958,16 @@ func TestRollbackRestore(t *testing.T) {
 	ctx := context.Background()
 	t2 := pgTarget{container: "myapp-postgres", user: "postgres", db: "myapp"}
 	old := "myapp_teploy_old_0123abcd"
+	rc := RecoveryCopies{engine: EnginePostgres, Previous: []string{old}, pg: t2, version: 170004}
+	plan, err := rc.PlanRollback("", "")
+	if err != nil || plan.Previous != old || plan.Database != "myapp" {
+		t.Fatalf("plan = %+v, %v", plan, err)
+	}
 
-	e := &pgRollbackExec{MockExecutor: ssh.NewMockExecutor("h"), present: map[string]bool{"myapp\n": false}}
-	e.present = map[string]bool{"myapp": true, old: true}
-	restored, displaced, err := NewClient(e, io.Discard).RollbackRestore(ctx, RecoveryCopies{Previous: []string{old}, pg: t2, version: 170004}, "")
-	if err != nil || restored != old || !strings.HasPrefix(displaced, "myapp_teploy_new_") {
-		t.Fatalf("rollback = %s %s %v", restored, displaced, err)
+	e := &pgRollbackExec{MockExecutor: ssh.NewMockExecutor("h"), present: map[string]bool{"myapp": true, old: true}}
+	displaced, err := NewClient(e, io.Discard).RollbackRestore(ctx, plan)
+	if err != nil || !strings.HasPrefix(displaced, "myapp_teploy_new_") {
+		t.Fatalf("rollback = %s %v", displaced, err)
 	}
 	if !pgCalled(e.Calls, `ALTER DATABASE "myapp" RENAME TO "`+displaced+`"; ALTER DATABASE "`+old+`" RENAME TO "myapp"`) {
 		t.Fatalf("the swap back must be one statement: %v", e.Calls)
@@ -908,21 +975,337 @@ func TestRollbackRestore(t *testing.T) {
 
 	// After a recovery-incomplete restore the live name may be gone.
 	e = &pgRollbackExec{MockExecutor: ssh.NewMockExecutor("h"), present: map[string]bool{old: true}}
-	restored, displaced, err = NewClient(e, io.Discard).RollbackRestore(ctx, RecoveryCopies{Previous: []string{old}, pg: t2, version: 170004}, "")
-	if err != nil || restored != old || displaced != "" || pgCalled(e.Calls, `ALTER DATABASE "myapp" RENAME TO`) {
-		t.Fatalf("rollback with no live database = %s %q %v: %v", restored, displaced, err, e.Calls)
+	displaced, err = NewClient(e, io.Discard).RollbackRestore(ctx, plan)
+	if err != nil || displaced != "" || pgCalled(e.Calls, `ALTER DATABASE "myapp" RENAME TO`) {
+		t.Fatalf("rollback with no live database = %q %v: %v", displaced, err, e.Calls)
 	}
 
-	for name, rc := range map[string]RecoveryCopies{
-		"none":    {pg: t2},
-		"several": {Previous: []string{old, "myapp_teploy_old_89abcdef"}, pg: t2},
+	for name, bad := range map[string]RecoveryCopies{
+		"none":      {engine: EnginePostgres, pg: t2},
+		"several":   {engine: EnginePostgres, Previous: []string{old, "myapp_teploy_old_89abcdef"}, pg: t2},
+		"other db":  {engine: EnginePostgres, Previous: []string{"reports_teploy_old_00000000"}, pg: t2},
+		"not an pg": {engine: EngineMySQL, Paths: []string{"/var/tmp/x"}},
 	} {
-		if _, _, err := NewClient(ssh.NewMockExecutor("h"), io.Discard).RollbackRestore(ctx, rc, ""); err == nil {
+		if _, err := bad.PlanRollback("", ""); err == nil {
 			t.Errorf("%s: want a refusal", name)
 		}
 	}
-	if _, _, err := NewClient(ssh.NewMockExecutor("h"), io.Discard).RollbackRestore(ctx, RecoveryCopies{Previous: []string{old}, pg: t2}, "myapp"); err == nil {
+	if _, err := rc.PlanRollback("", "myapp"); err == nil {
 		t.Error("pick must name a kept previous database")
+	}
+	// A --database restore's copy rolls back into that database.
+	other := RecoveryCopies{engine: EnginePostgres, Previous: []string{"reports_teploy_old_00000000"}, pg: t2}
+	if p, err := other.PlanRollback("reports", ""); err != nil || p.Database != "reports" {
+		t.Fatalf("--database rollback = %+v, %v", p, err)
+	}
+}
+
+// A name with a space must not read as an unknown state after a committed swap.
+func TestPgSwapStateHandlesSpacesInNames(t *testing.T) {
+	mock := ssh.NewMockExecutor("h", ssh.MockCommand{Match: "docker exec 'c' psql", Output: "my db\nmy db_old\n"})
+	st, err := NewClient(mock, io.Discard).pgSwapState(context.Background(), pgTarget{container: "c", user: "u", db: "my db"}, "my db_new", "my db_old")
+	if err != nil || !st.live || !st.previous || st.replacement {
+		t.Fatalf("state = %+v, %v", st, err)
+	}
+}
+
+// Disk: WAL counts. 593 MB recorded and 695 MB free passed a 1.1x check, and
+// the load PANICed writing WAL.
+func TestPostgresRestore_SpaceCheckIncludesWAL(t *testing.T) {
+	const mb = "000000"
+	wal := func(mbs string) ssh.MockCommand {
+		return ssh.MockCommand{Match: "docker exec 'myapp-postgres' psql -X -qtA -v ON_ERROR_STOP=1 -U 'postgres' -d 'postgres' -c 'SELECT setting FROM pg_settings", Output: mbs + "\n"}
+	}
+	mock := pgRestoreMock(dfMock("695000"), recordedMock("593"+mb), wal("1024"))
+	if _, err := pgRestore(t, mock); err == nil || !strings.Contains(err.Error(), "not enough free space") {
+		t.Fatalf("593 MB + WAL must not fit in 695 MB: %v", err)
+	}
+	// A small max_wal_size is what the server recycles at.
+	mock = pgRestoreMock(dfMock("695000"), recordedMock("593"+mb), wal("32"))
+	if _, err := pgRestore(t, mock); err != nil {
+		t.Fatalf("593 MB x 1.1 + 32 MB fits in 695 MB: %v", err)
+	}
+}
+
+func mysqlQuery(t *testing.T, sql string) string {
+	t.Helper()
+	m := mysqlTarget{engine: EngineMySQL, container: "myapp-db", credFile: "/tmp/x"}
+	cmd := m.client("mysql", "-N -B -e "+ssh.ShellQuote(sql))
+	return strings.TrimSuffix(cmd, " < '/tmp/x'")
+}
+
+// A dry run does not write the binlog (a full copy, sent to every replica).
+func TestMySQLRestore_DryRunSkipsTheBinlog(t *testing.T) {
+	mock := mysqlRestoreMock(
+		ssh.MockCommand{Match: mysqlQuery(t, "SELECT @@log_bin"), Output: "1\n"},
+	)
+	if _, err := mysqlRestore(mock); err != nil {
+		t.Fatal(err)
+	}
+	if !pgCalled(mock.Calls, "SET sql_log_bin=0; CREATE DATABASE `appdb_teploy_check`") || !pgCalled(mock.Calls, "SET sql_log_bin=0; DROP DATABASE IF EXISTS `appdb_teploy_check`") {
+		t.Fatalf("DDL must skip the binlog: %v", mock.Calls)
+	}
+	var load string
+	for _, c := range mock.Calls {
+		if strings.Contains(c, "check.failed'; {") {
+			load = c
+		}
+	}
+	if !strings.Contains(load, "SET sql_log_bin=0;") || strings.Contains(load, "s3cret") {
+		t.Fatalf("the load session must skip the binlog: %s", load)
+	}
+	for _, c := range mock.Calls {
+		if strings.Contains(c, "load.failed'; {") && strings.Contains(c, "sql_log_bin") {
+			t.Fatalf("the REAL load must reach the binlog and replicas: %s", c)
+		}
+	}
+}
+
+// Without the privilege to skip it, the binlog's copy counts toward the room
+// needed, and the dry run still runs with what the server allows.
+func TestMySQLRestore_SpaceCheckCountsBinlog(t *testing.T) {
+	binlogOn := ssh.MockCommand{Match: mysqlQuery(t, "SELECT @@log_bin"), Output: "1\n"}
+	noPriv := ssh.MockCommand{Match: strings.TrimSuffix(mysqlQuery(t, "SET sql_log_bin=0"), ""), Err: errors.New("exit status 1: ERROR 1227: Access denied")}
+	noPriv.Match = strings.ReplaceAll(noPriv.Match, "-N -B ", "")
+	live := ssh.MockCommand{Match: "docker exec -i 'myapp-db' sh -c 'IFS= read -r teploy_credential || exit 1; MYSQL_PWD=${teploy_credential#MYSQL_PWD=}; export MYSQL_PWD; exec mysql -u root -N -B -e '\"'\"'SELECT CONCAT_WS", Output: "utf8mb4|c|60000000|0|0\n"}
+	dump := ssh.MockCommand{Match: "wc -c < '/tmp/teploy-restore.abc123/restore.sql'", Output: "52000000\n"}
+	df := ssh.MockCommand{Match: "docker exec 'myapp-db' df -Pk", Output: "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/x 1000000 10 75000 1% /var/lib/mysql\n"}
+	// 52 MB dump over a 60 MB live database, 75 MB free: fits only if the dry
+	// run skips the binlog (the real load's binlog is paid for by the DROP).
+	if _, err := mysqlRestore(mysqlRestoreMock(binlogOn, live, dump, df)); err != nil {
+		t.Fatalf("with the binlog skipped it fits: %v", err)
+	}
+	_, err := mysqlRestore(mysqlRestoreMock(binlogOn, noPriv, live, dump, df))
+	if err == nil || !strings.Contains(err.Error(), "not enough free space") {
+		t.Fatalf("without the privilege the binlog must count: %v", err)
+	}
+}
+
+// exec that hangs like a mysqld "waiting for someone to free space".
+type hangExec struct {
+	*ssh.MockExecutor
+	hangOn []string
+}
+
+func (e *hangExec) Run(ctx context.Context, cmd string) (string, error) {
+	for _, h := range e.hangOn {
+		if strings.Contains(cmd, h) {
+			e.MockExecutor.Calls = append(e.MockExecutor.Calls, cmd)
+			<-ctx.Done()
+			return "", ctx.Err()
+		}
+	}
+	return e.MockExecutor.Run(ctx, cmd)
+}
+
+// A wedged server cannot hold the restore (and the stopped app) forever.
+func TestMySQLRestore_DryRunAndCleanupHaveDeadlines(t *testing.T) {
+	e := &hangExec{MockExecutor: mysqlRestoreMock(), hangOn: []string{"check.failed", "DROP DATABASE IF EXISTS `appdb_teploy_check`"}}
+	c := NewClient(e, io.Discard)
+	c.loadDeadline = 50 * time.Millisecond
+	done := make(chan error, 1)
+	go func() {
+		_, err := c.AccessoryRestoreKeep(context.Background(), "myapp", "db", "mysql:8", "20260101-000000",
+			map[string]string{"MYSQL_VERSION": "8.4", "MYSQL_ROOT_PASSWORD": "s3cret", "MYSQL_DATABASE": "appdb"}, S3Config{Bucket: "b", Region: "us-east-1"})
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "could not be dropped") || !strings.Contains(err.Error(), "database untouched") {
+			t.Fatalf("got %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the restore hung on a wedged server")
+	}
+	if pgCalled(e.Calls, "DROP DATABASE IF EXISTS `appdb`;") {
+		t.Fatal("the live database must not be dropped")
+	}
+}
+
+// A real database that happens to be called <db>_teploy_check is not ours.
+func TestMySQLRestore_RefusesARealCheckNamedDatabase(t *testing.T) {
+	mock := mysqlRestoreMock(ssh.MockCommand{Match: "docker exec -i 'myapp-db' sh -c 'IFS= read -r teploy_credential || exit 1; MYSQL_PWD=${teploy_credential#MYSQL_PWD=}; export MYSQL_PWD; exec mysql -u root -N -B -e '\"'\"'SELECT CONCAT_WS", Output: "utf8mb4|c|16384|1|0\n"})
+	_, err := mysqlRestore(mock)
+	if err == nil || !strings.Contains(err.Error(), "is not a teploy dry run") {
+		t.Fatalf("got %v", err)
+	}
+	if pgCalled(mock.Calls, "DROP DATABASE") {
+		t.Fatalf("nothing may be dropped: %v", mock.Calls)
+	}
+	// Ours (a killed restore's): cleared and the restore proceeds.
+	mock = mysqlRestoreMock(ssh.MockCommand{Match: "docker exec -i 'myapp-db' sh -c 'IFS= read -r teploy_credential || exit 1; MYSQL_PWD=${teploy_credential#MYSQL_PWD=}; export MYSQL_PWD; exec mysql -u root -N -B -e '\"'\"'SELECT CONCAT_WS", Output: "utf8mb4|c|16384|1|1\n"})
+	if _, err := mysqlRestore(mock); err != nil {
+		t.Fatal(err)
+	}
+	if !pgCalled(mock.Calls, "CREATE TABLE `appdb_teploy_check`."+mysqlDryRunMarker) {
+		t.Fatal("the dry run must carry the marker")
+	}
+}
+
+// A successful restore's copy is marked; a release can tell.
+func TestMySQLRestore_MarksTheSafetyCopyCompleted(t *testing.T) {
+	mock := mysqlRestoreMock(ssh.MockCommand{Match: ": > '/var/tmp/teploy-pre-restore.m/restore-completed'", Output: ""})
+	rec, err := mysqlRestore(mock)
+	if err != nil || len(rec.Warnings) != 0 {
+		t.Fatalf("%v %v", err, rec.Warnings)
+	}
+	if !pgCalled(mock.Calls, ": > '/var/tmp/teploy-pre-restore.m/restore-completed'") {
+		t.Fatal("marker not written")
+	}
+	// A load killed mid-way never writes it.
+	mock = mysqlRestoreMock(ssh.MockCommand{Match: "rm -f '/tmp/teploy-restore.abc123/load.failed'", Err: errors.New("exit status 1")},
+		ssh.MockCommand{Match: "rm -f '/tmp/teploy-restore.abc123/reload.failed'", Err: errors.New("exit status 1")})
+	if _, err := mysqlRestore(mock); !IsRecoveryIncomplete(err) {
+		t.Fatalf("got %v", err)
+	}
+	if pgCalled(mock.Calls, "restore-completed") {
+		t.Fatal("a failed restore must not mark its copy completed")
+	}
+}
+
+// A second schema: uncovered, same as postgres. The dry-run leftover is not.
+func TestMySQLBackup_SecondSchemaWarns(t *testing.T) {
+	q := mysqlEnvClient(EngineMariaDB, "myapp-db", "X", "-N", "-B")
+	prefix := q[:strings.Index(q, "-e ")]
+	mock := ssh.NewMockExecutor("h",
+		ssh.MockCommand{Match: prefix, Output: "appdb\t0\nreports\t0\nappdb_teploy_check\t1\n"},
+		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
+		ssh.MockCommand{Match: "umask 077", Output: "/tmp/teploy-backup.abc123\n"},
+		ssh.MockCommand{Match: "docker exec", Output: ""},
+		ssh.MockCommand{Match: "wc -c", Output: "4096\n"},
+		ssh.MockCommand{Match: "aws s3 cp", Output: ""},
+		ssh.MockCommand{Match: "rm -rf", Output: ""},
+	)
+	res, err := NewClient(mock, io.Discard).AccessoryBackup(context.Background(), "myapp", "db", "mariadb:11", map[string]string{"MARIADB_VERSION": "11", "MARIADB_DATABASE": "appdb"}, S3Config{Bucket: "b", Region: "r"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.UncoveredDatabases) != 1 || res.UncoveredDatabases[0] != "reports" {
+		t.Fatalf("uncovered = %v", res.UncoveredDatabases)
+	}
+	if j := strings.Join(res.Warnings, " | "); !strings.Contains(j, "also holds reports") || !strings.Contains(j, "appdb_teploy_check") {
+		t.Fatalf("warnings = %s", j)
+	}
+}
+
+// Mongo: preflight on the data volume, honoring the override, and a dry run
+// that kills mongod is recovery-incomplete, not "untouched".
+func TestMongoRestore_SpaceAndLiveness(t *testing.T) {
+	base := func(o ...ssh.MockCommand) *ssh.MockExecutor {
+		return ssh.NewMockExecutor("h", append(o,
+			ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
+			ssh.MockCommand{Match: "aws s3 ls", Output: "2026-01-01 00:00:00 2048 20260101-000000.archive.gz\n"},
+			ssh.MockCommand{Match: "aws s3 cp", Output: ""},
+			ssh.MockCommand{Match: "mktemp -d '/tmp/teploy-restore.XXXXXX'", Output: "/tmp/teploy-restore.abc123\n"},
+			ssh.MockCommand{Match: "gzip -t", Output: ""},
+			ssh.MockCommand{Match: "wc -c", Output: "62000000\n"},
+			ssh.MockCommand{Match: "docker exec 'myapp-db' df -Pk", Output: "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/x 1000000 10 25000 1% /data/db\n"},
+			ssh.MockCommand{Match: "umask 077; mktemp -d '/var/tmp/teploy-pre-restore.myapp@db@XXXXXX'", Output: "/var/tmp/teploy-pre-restore.g\n"},
+			ssh.MockCommand{Match: "docker exec 'myapp-db' mongodump", Output: ""},
+			ssh.MockCommand{Match: "docker exec 'myapp-db' sh -c", Output: ""},
+			ssh.MockCommand{Match: "docker exec -i 'myapp-db' mongorestore", Output: ""},
+			ssh.MockCommand{Match: ": > ", Output: ""},
+			ssh.MockCommand{Match: "rm -", Output: ""},
+		)...)
+	}
+	run := func(m *ssh.MockExecutor, opts RestoreOptions) (RestoreRecovery, error) {
+		c := NewClient(m, io.Discard)
+		c.retryDelay = time.Millisecond
+		return c.AccessoryRestoreWith(context.Background(), "myapp", "db", "mongo:7", "20260101-000000", map[string]string{"MONGO_VERSION": "7.0"}, S3Config{Bucket: "b", Region: "us-east-1"}, opts)
+	}
+	mock := base()
+	if _, err := run(mock, RestoreOptions{}); err == nil || !strings.Contains(err.Error(), "not enough free space") {
+		t.Fatalf("62 MB archive into 25 MB free must be refused: %v", err)
+	}
+	if pgCalled(mock.Calls, "mongorestore") {
+		t.Fatal("refused before loading")
+	}
+	if _, err := run(base(), RestoreOptions{IgnoreSpaceCheck: true}); err != nil {
+		t.Fatalf("--ignore-space-check: %v", err)
+	}
+	dead := base(
+		ssh.MockCommand{Match: "docker exec -i 'myapp-db' mongorestore --archive --gzip --drop --nsExclude='admin.*'", Err: errors.New("exit status 1: connection lost")},
+		ssh.MockCommand{Match: "docker exec 'myapp-db' sh -c 'mongosh --quiet --eval '\"'\"'db.runCommand", Err: errors.New("exit status 1: connection refused")},
+	)
+	_, err := run(dead, RestoreOptions{IgnoreSpaceCheck: true})
+	if err == nil || !IsRecoveryIncomplete(err) || strings.Contains(err.Error(), "database untouched") {
+		t.Fatalf("got %v", err)
+	}
+}
+
+// One throwaway database with a short random name fits any database name in
+// 63 bytes; leftovers are excluded from every real restore and dropped.
+func TestMongoRestore_ThrowawayNameAndExclusions(t *testing.T) {
+	mock := ssh.NewMockExecutor("h",
+		ssh.MockCommand{Match: "gzip -t", Output: ""},
+		ssh.MockCommand{Match: "wc -c", Output: "100\n"},
+		ssh.MockCommand{Match: "docker exec 'c' df -Pk", Err: errors.New("exit status 1")},
+		ssh.MockCommand{Match: "df -Pk", Err: errors.New("exit status 1")},
+		ssh.MockCommand{Match: "docker exec 'c' sh -c", Output: ""},
+		ssh.MockCommand{Match: "docker exec -i 'c' mongorestore", Output: ""},
+		ssh.MockCommand{Match: "umask 077; mktemp -d", Output: "/var/tmp/p\n"},
+		ssh.MockCommand{Match: "docker exec 'c' mongodump", Output: ""},
+		ssh.MockCommand{Match: ": > ", Output: ""},
+	)
+	if _, err := NewClient(mock, io.Discard).restoreMongoInPlace(context.Background(), "c", "/tmp/a.gz", "/var/tmp/teploy-pre-restore.a@b@", false); err != nil {
+		t.Fatal(err)
+	}
+	re := regexp.MustCompile(`--nsTo='(teploy_check_[0-9a-f]{8})\.\$db\$\.\$coll\$'`)
+	var dry, real string
+	for _, c := range mock.Calls {
+		if strings.Contains(c, "--nsTo=") {
+			dry = c
+		} else if strings.Contains(c, "mongorestore") {
+			real = c
+		}
+	}
+	if !re.MatchString(dry) {
+		t.Fatalf("throwaway name: %s", dry)
+	}
+	if !strings.Contains(real, "--nsExclude='teploy_check_*.*'") {
+		t.Fatalf("a real restore must exclude throwaways: %s", real)
+	}
+}
+
+// A backup clears a killed restore's throwaway first: mongodump takes the
+// whole server, so it would land in this backup silently.
+func TestMongoBackup_ClearsThrowawaysFirst(t *testing.T) {
+	var order []string
+	mock := ssh.NewMockExecutor("h",
+		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
+		ssh.MockCommand{Match: "umask 077", Output: "/tmp/teploy-backup.abc123\n"},
+		ssh.MockCommand{Match: "docker exec 'myapp-db' sh -c", Output: "teploy_check_0123abcd\n"},
+		ssh.MockCommand{Match: "docker exec 'myapp-db' mongodump", Output: ""},
+		ssh.MockCommand{Match: "wc -c", Output: "4096\n"},
+		ssh.MockCommand{Match: "aws s3 cp", Output: ""},
+		ssh.MockCommand{Match: "rm -rf", Output: ""},
+	)
+	res, err := NewClient(mock, io.Discard).AccessoryBackup(context.Background(), "myapp", "db", "mongo:7", map[string]string{"MONGO_VERSION": "7"}, S3Config{Bucket: "b", Region: "r"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range mock.Calls {
+		if strings.Contains(c, "dropDatabase") {
+			order = append(order, "drop")
+		}
+		if strings.Contains(c, "mongodump") {
+			order = append(order, "dump")
+		}
+	}
+	if strings.Join(order, ",") != "drop,dump" {
+		t.Fatalf("order = %v", order)
+	}
+	if !strings.Contains(strings.Join(res.Warnings, " "), "teploy_check_0123abcd") {
+		t.Fatalf("warnings = %v", res.Warnings)
+	}
+}
+
+// A missing --database dump is found before anything stops.
+func TestResolveRestoreArtifact_ExtraDatabaseMustExist(t *testing.T) {
+	mock := ssh.NewMockExecutor("h", ssh.MockCommand{Match: "aws s3 ls", Err: errors.New("exit status 1")})
+	_, err := NewClient(mock, io.Discard).ResolveRestoreArtifact(context.Background(), "myapp", "db", "postgres:17", "20260101-000000", map[string]string{"PG_MAJOR": "17", "POSTGRES_DB": "appdb"}, S3Config{Bucket: "b", Region: "r"}, RestoreOptions{Database: "reports"})
+	if err == nil || !strings.Contains(err.Error(), "no backup") {
+		t.Fatalf("got %v", err)
 	}
 }
 
@@ -960,7 +1343,7 @@ func TestMongoRestore_DryRunRefusesBeforeTouching(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "database untouched") || IsRecoveryIncomplete(err) {
 		t.Fatalf("got %v", err)
 	}
-	if pgCalled(mock.Calls, "mongodump") || pgCalled(mock.Calls, "mongorestore --archive --gzip --drop < ") {
+	if pgCalled(mock.Calls, "mongodump") || pgCalled(mock.Calls, "--drop --nsExclude='teploy_check_*.*' < ") {
 		t.Fatalf("nothing may run after a failed dry run: %v", mock.Calls)
 	}
 	if !pgCalled(mock.Calls, "teploy_check_") {

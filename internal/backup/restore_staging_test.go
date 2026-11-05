@@ -211,6 +211,7 @@ func TestAccessoryRestore_MySQL_DownloadsAndRestoresRealPaths(t *testing.T) {
 		ssh.MockCommand{Match: "mktemp -d '/tmp/teploy-restore.XXXXXX'", Output: "/tmp/teploy-restore.abc123\n"},
 		ssh.MockCommand{Match: "umask 077; gunzip -c", Output: ""},
 		ssh.MockCommand{Match: "docker exec", Output: ""},
+		ssh.MockCommand{Match: "rm -f ", Output: ""},
 		ssh.MockCommand{Match: "rm -rf", Output: ""},
 	)
 

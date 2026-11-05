@@ -229,8 +229,9 @@ func (c *Client) pgSwapState(ctx context.Context, t pgTarget, newDB, oldDB strin
 		var out string
 		if out, err = c.exec.Run(ctx, t.psql(t.maintDB(), q)); err == nil {
 			var st pgSwapStatus
-			for _, name := range strings.Fields(out) {
-				switch name {
+			// Line by line: a database name may contain a space.
+			for _, name := range strings.Split(out, "\n") {
+				switch strings.TrimRight(name, "\r") {
 				case t.db:
 					st.live = true
 				case newDB:
@@ -371,9 +372,14 @@ const pgArtifactSizeFactor = 4
 // need gigabytes, and a bloated one being recovered from a runaway table
 // needs only what the backup holds. Live size only raises an estimate; a
 // recorded size is known, so it stands alone.
-func (c *Client) pgRequiredBytes(ctx context.Context, artifact string, cl pgCluster, opts pgRestoreOpts) (int64, string) {
+func (c *Client) pgRequiredBytes(ctx context.Context, t pgTarget, artifact string, cl pgCluster, opts pgRestoreOpts) (int64, string) {
+	withWAL := func(size int64) int64 {
+		// Loading writes WAL too, on this volume, up to max_wal_size before
+		// checkpoints recycle it. Running out of it is a PANIC.
+		return size + size/10 + min(size, c.pgMaxWALBytes(ctx, t))
+	}
 	if opts.logicalBytes > 0 {
-		return opts.logicalBytes + opts.logicalBytes/10, "the size recorded at backup time"
+		return withWAL(opts.logicalBytes), "the size recorded at backup time, plus WAL"
 	}
 	var est int64
 	if out, err := c.exec.Run(ctx, "wc -c < "+ssh.ShellQuote(artifact)); err == nil {
@@ -381,10 +387,25 @@ func (c *Client) pgRequiredBytes(ctx context.Context, artifact string, cl pgClus
 			est = n * pgArtifactSizeFactor
 		}
 	}
-	if live := cl.sizeBytes + cl.sizeBytes/10; cl.exists && live > est {
-		est = live
+	if cl.exists && cl.sizeBytes > est {
+		est = cl.sizeBytes
 	}
-	return est, fmt.Sprintf("an estimate (%dx the artifact, at least the live database)", pgArtifactSizeFactor)
+	return withWAL(est), fmt.Sprintf("an estimate (%dx the artifact, at least the live database), plus WAL", pgArtifactSizeFactor)
+}
+
+// pgMaxWALBytes reads max_wal_size from the server (its default 1 GB when it
+// cannot be read).
+func (c *Client) pgMaxWALBytes(ctx context.Context, t pgTarget) int64 {
+	const defaultWAL = 1 << 30
+	out, err := c.exec.Run(ctx, t.psql(t.maintDB(), "SELECT setting FROM pg_settings WHERE name = 'max_wal_size'"))
+	if err != nil {
+		return defaultWAL
+	}
+	mb, err := strconv.ParseInt(strings.TrimSpace(out), 10, 64)
+	if err != nil || mb <= 0 {
+		return defaultWAL
+	}
+	return mb << 20
 }
 
 // pgLocale is a database's collation provider, for CREATE DATABASE.
@@ -480,7 +501,7 @@ func (c *Client) restorePostgres(ctx context.Context, t pgTarget, artifact, ext,
 	if !opts.ignoreSpace {
 		// The replacement is built beside the live database on the same
 		// data volume, so that volume must hold it.
-		need, basis := c.pgRequiredBytes(ctx, artifact, cl, opts)
+		need, basis := c.pgRequiredBytes(ctx, t, artifact, cl, opts)
 		pgdata, ok := c.containerEnv(ctx, t.container, "PGDATA")
 		if !ok || pgdata == "" {
 			pgdata = "/var/lib/postgresql/data"
@@ -680,7 +701,7 @@ func postgresBootstrapUser(env map[string]string) string {
 const BackupDatabasesLabel = "teploy.backup-databases"
 
 var (
-	pgLeftoverName = regexp.MustCompile(`_teploy_(old|new)_[0-9a-f]{8}$`)
+	pgLeftoverName = regexp.MustCompile(`^(.*)_teploy_(old|new)_[0-9a-f]{8}$`)
 	pgSafeDBName   = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_.-]*$`)
 )
 
@@ -698,7 +719,7 @@ type pgCoverage struct {
 // restore left behind are reported separately, never as uncovered.
 func (c *Client) pgReadCoverage(ctx context.Context, t pgTarget, listed []string) (pgCoverage, error) {
 	var cov pgCoverage
-	out, err := c.exec.Run(ctx, t.psql(t.maintDB(), "SELECT datname FROM pg_database WHERE NOT datistemplate AND datallowconn ORDER BY datname"))
+	names, err := c.pgDatabaseNames(ctx, t)
 	if err != nil {
 		return cov, err
 	}
@@ -710,10 +731,9 @@ func (c *Client) pgReadCoverage(ctx context.Context, t pgTarget, listed []string
 		}
 		want[l] = true
 	}
-	for _, name := range strings.Split(out, "\n") {
-		name = strings.TrimSpace(name)
+	for _, name := range names {
 		switch {
-		case name == "" || name == t.db:
+		case name == t.db:
 		case pgLeftoverName.MatchString(name):
 			if strings.Contains(name, "_teploy_old_") {
 				cov.KeptOld = append(cov.KeptOld, name)
@@ -738,6 +758,15 @@ func (c *Client) pgReadCoverage(ctx context.Context, t pgTarget, listed []string
 		}
 	}
 	return cov, nil
+}
+
+// pgDatabaseNames lists the cluster's connectable non-template databases.
+func (c *Client) pgDatabaseNames(ctx context.Context, t pgTarget) ([]string, error) {
+	out, err := c.exec.Run(ctx, t.psql(t.maintDB(), "SELECT datname FROM pg_database WHERE NOT datistemplate AND datallowconn ORDER BY datname"))
+	if err != nil {
+		return nil, err
+	}
+	return splitLines(out), nil
 }
 
 // warnings renders the coverage problems for messages and events.
@@ -781,33 +810,25 @@ func (c *Client) pgRecordedSize(ctx context.Context, s3 S3Config, app, name, id,
 	return m.LogicalBytes
 }
 
-// PostgresAccessoryReport is what doctor shows about one running postgres
-// accessory.
-type PostgresAccessoryReport struct {
+// AccessoryReport is what doctor shows about one running database accessory.
+type AccessoryReport struct {
 	App, Accessory string
-	Coverage       pgCoverage
+	Uncovered      []string // databases its backups leave out
+	Leftovers      []string // databases a restore left behind
 	Err            error
 }
 
-// Uncovered lists databases its backups leave out.
-func (r PostgresAccessoryReport) Uncovered() []string { return r.Coverage.Uncovered }
+// AccessoryProbe lists the running accessories (read-only).
+const AccessoryProbe = `docker ps --filter label=teploy.role=accessory --format '{{.Label "teploy.app"}}|{{.Label "teploy.accessory"}}'`
 
-// Leftovers lists databases a restore left behind.
-func (r PostgresAccessoryReport) Leftovers() []string {
-	return append(append([]string{}, r.Coverage.KeptOld...), r.Coverage.PartialNew...)
-}
-
-// PostgresAccessoryProbe lists the running accessories (read-only).
-const PostgresAccessoryProbe = `docker ps --filter label=teploy.role=accessory --format '{{.Label "teploy.app"}}|{{.Label "teploy.accessory"}}'`
-
-// PostgresAccessories inspects every running postgres accessory on the
-// server for uncovered databases and restore leftovers (read-only).
-func (c *Client) PostgresAccessories(ctx context.Context) ([]PostgresAccessoryReport, error) {
-	out, err := c.exec.Run(ctx, PostgresAccessoryProbe)
+// AccessoryReports inspects every running database accessory on the server for
+// uncovered databases and restore leftovers (read-only).
+func (c *Client) AccessoryReports(ctx context.Context) ([]AccessoryReport, error) {
+	out, err := c.exec.Run(ctx, AccessoryProbe)
 	if err != nil {
 		return nil, err
 	}
-	var reports []PostgresAccessoryReport
+	var reports []AccessoryReport
 	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
 		app, name, ok := strings.Cut(strings.TrimSpace(line), "|")
 		if !ok || app == "" || name == "" {
@@ -818,13 +839,25 @@ func (c *Client) PostgresAccessories(ctx context.Context) ([]PostgresAccessoryRe
 			continue
 		}
 		det, err := c.ResolveEngine(ctx, app, name, image, env)
-		if err != nil || det.Engine != EnginePostgres {
+		if err != nil {
 			continue
 		}
-		db, user := postgresDBAndUser(app, env)
-		labels, _ := c.inspectEngineHints(ctx, app+"-"+name)
-		r := PostgresAccessoryReport{App: app, Accessory: name}
-		r.Coverage, r.Err = c.pgReadCoverage(ctx, newPGTarget(app+"-"+name, db, user, env), listedDatabases(labels))
+		container := app + "-" + name
+		r := AccessoryReport{App: app, Accessory: name}
+		switch det.Engine {
+		case EnginePostgres:
+			db, user := postgresDBAndUser(app, env)
+			labels, _ := c.inspectEngineHints(ctx, container)
+			cov, err := c.pgReadCoverage(ctx, newPGTarget(container, db, user, env), listedDatabases(labels))
+			r.Err, r.Uncovered = err, cov.Uncovered
+			r.Leftovers = append(append(r.Leftovers, cov.KeptOld...), cov.PartialNew...)
+		case EngineMySQL, EngineMariaDB:
+			r.Uncovered, r.Leftovers, r.Err = c.mysqlReadCoverage(ctx, det.Engine, container, mysqlDB(app, env))
+		case EngineMongo:
+			r.Leftovers, r.Err = c.mongoCheckDatabases(ctx, container)
+		default:
+			continue
+		}
 		reports = append(reports, r)
 	}
 	return reports, nil

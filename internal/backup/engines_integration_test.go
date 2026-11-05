@@ -100,6 +100,15 @@ func (p pathExecutor) RunInput(ctx context.Context, cmd string, stdin io.Reader)
 	return p.Executor.RunInput(ctx, p.wrap(cmd), stdin)
 }
 
+// Upload writes through sudo too when the commands do: the scratch dirs a
+// root executor makes are 0700 root.
+func (p pathExecutor) Upload(ctx context.Context, r io.Reader, path, mode string) error {
+	if !p.sudo {
+		return p.Executor.Upload(ctx, r, path, mode)
+	}
+	return p.Executor.RunInput(ctx, "sudo -n sh -c "+ssh.ShellQuote("umask 077; cat > "+ssh.ShellQuote(path)+" && chmod "+mode+" "+ssh.ShellQuote(path)), r)
+}
+
 // itFixture is the shared integration fixture: the colima SSH executor, a
 // private work dir holding the fake aws and its "bucket", and the
 // fake-aws executor.
@@ -120,7 +129,7 @@ func newITFixture(t *testing.T, ctx context.Context) itFixture {
 		t.Fatalf("creating fixture workspace: %v", err)
 	}
 	t.Cleanup(func() {
-		base.Run(context.Background(), "sudo -n rm -rf "+ssh.ShellQuote(work)+" || rm -rf "+ssh.ShellQuote(work))
+		base.Run(context.Background(), "sudo -n rm -rf "+ssh.ShellQuote(work)+" /tmp/teploy-restore.* /var/tmp/teploy-pre-restore.teployit* || rm -rf "+ssh.ShellQuote(work))
 	})
 	if err := base.Upload(ctx, strings.NewReader(strings.ReplaceAll(fakeAWS, "__ROOT__", work+"/s3")), work+"/bin/aws", "0755"); err != nil {
 		t.Fatalf("installing fake aws: %v", err)
@@ -143,6 +152,25 @@ func (f itFixture) container(t *testing.T, ctx context.Context, name, runArgs, p
 	return func(cmd string) string {
 		return f.run(t, ctx, "docker exec "+ssh.ShellQuote(name)+" sh -c "+ssh.ShellQuote(cmd))
 	}
+}
+
+// loopVolume mounts a real ext4 volume of sizeMB (no reserved blocks), the way
+// a small data disk behaves, and returns its mountpoint; bind mnt/data into a
+// container, and fill the rest with fill.
+func (f itFixture) loopVolume(t *testing.T, ctx context.Context, sizeMB int) string {
+	t.Helper()
+	img, mnt := f.work+"/vol.img", f.work+"/vol"
+	f.run(t, ctx, fmt.Sprintf("truncate -s %dM %s && mkfs.ext4 -q -F -m 0 %s && mkdir -p %s && sudo -n mount -o loop %s %s && sudo -n mkdir -p %s/data", sizeMB, img, img, mnt, img, mnt, mnt))
+	t.Cleanup(func() {
+		f.base.Run(context.Background(), "sudo -n umount "+mnt+" 2>/dev/null; rm -f "+img)
+	})
+	return mnt
+}
+
+// fill leaves about freeMB free on the volume.
+func (f itFixture) fill(t *testing.T, ctx context.Context, mnt string, freeMB int) {
+	t.Helper()
+	f.run(t, ctx, fmt.Sprintf("sudo -n rm -f %s/fill; sync; sudo -n dd if=/dev/zero of=%s/fill bs=1M count=$(( $(df -Pk %s | tail -1 | awk '{print $4}') / 1024 - %d )) 2>/dev/null; sync; df -Pk %s | tail -1", mnt, mnt, mnt, freeMB, mnt))
 }
 
 func (f itFixture) waitFor(t *testing.T, ctx context.Context, name, probe string) {

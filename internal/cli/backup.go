@@ -284,6 +284,9 @@ func runBackupCreate(flags *Flags, appName, accessory string, tf *backupTargetFl
 		case pruned > 0:
 			msg = fmt.Sprintf("Backup created for %s (pruned %d old backup(s))", appCfg.App, pruned)
 		}
+		if err == nil && len(res.UncoveredDatabases) > 0 {
+			msg += fmt.Sprintf(" — WARNING: not covered: %s", strings.Join(res.UncoveredDatabases, ", "))
+		}
 		n.Send(ctx, notify.Payload{
 			App:     appCfg.App,
 			Server:  executor.Host(),
@@ -507,6 +510,8 @@ type backupRestoreDTO struct {
 	// the restore is confirmed (--release) or undone (--rollback).
 	RecoveryDatabase string   `json:"recovery_database,omitempty"`
 	Warnings         []string `json:"warnings,omitempty"`
+	// Database names a non-primary database (--database).
+	Database string `json:"database,omitempty"`
 	// Action and Released report --release / --rollback.
 	Action   string   `json:"action,omitempty"`
 	Released []string `json:"released,omitempty"`
@@ -555,9 +560,10 @@ func newBackupRestoreCmd(flags *Flags) *cobra.Command {
 	addBackupTargetFlags(cmd, &tf)
 	cmd.Flags().BoolVar(&yes, "yes", false, "proceed without interactive confirmation")
 	cmd.Flags().BoolVar(&opts.release, "release", false, "discard this accessory's kept recovery copies (needs --accessory, no <date>)")
+	cmd.Flags().BoolVar(&opts.force, "force", false, "with --release: discard safety copies whose restore never recorded finishing")
 	cmd.Flags().BoolVar(&opts.rollback, "rollback", false, "swap a kept previous postgres database back into place (needs --accessory, no <date>)")
 	cmd.Flags().StringVar(&opts.recoveryDatabase, "recovery-database", "", "with --rollback: which kept database, when several are")
-	cmd.Flags().StringVar(&opts.database, "database", "", "restore this database from a backup_databases: dump instead of the accessory's primary")
+	cmd.Flags().StringVar(&opts.database, "database", "", "restore this database from a backup_databases: dump instead of the accessory's primary; with --release or --rollback, act on its copies")
 	cmd.Flags().BoolVar(&opts.ignoreSpace, "ignore-space-check", false, "skip the free-space preflight")
 
 	return cmd
@@ -565,8 +571,8 @@ func newBackupRestoreCmd(flags *Flags) *cobra.Command {
 
 // restoreFlags are the accessory-restore options of `backup restore`.
 type restoreFlags struct {
-	release, rollback, ignoreSpace bool
-	recoveryDatabase, database     string
+	release, rollback, ignoreSpace, force bool
+	recoveryDatabase, database            string
 }
 
 func (o *restoreFlags) restoreOptions() backup.RestoreOptions {
@@ -583,15 +589,17 @@ func (o *restoreFlags) validate(date, accessory string) error {
 		return fmt.Errorf("--release and --rollback need --accessory")
 	case action && date != "":
 		return fmt.Errorf("--release and --rollback act on kept copies, not on a backup id")
-	case action && (o.database != "" || o.ignoreSpace):
-		return fmt.Errorf("--database and --ignore-space-check apply to a restore, not to --release/--rollback")
+	case action && o.ignoreSpace:
+		return fmt.Errorf("--ignore-space-check applies to a restore, not to --release/--rollback")
+	case o.force && !o.release:
+		return fmt.Errorf("--force applies to --release")
 	case !action && date == "":
 		return fmt.Errorf("a backup id is required (or --release / --rollback)")
 	case !action && o.recoveryDatabase != "":
 		return fmt.Errorf("--recovery-database applies to --rollback")
 	case o.release && o.recoveryDatabase != "":
 		return fmt.Errorf("--recovery-database applies to --rollback")
-	case !action && o.database != "" && accessory == "":
+	case o.database != "" && accessory == "":
 		return fmt.Errorf("--database needs --accessory")
 	}
 	return nil
@@ -663,25 +671,28 @@ func runBackupRestoreWith(flags *Flags, appName, accessory, date string, tf *bac
 	if stopTimeout == 0 {
 		stopTimeout = 10
 	}
+	// The ARTIFACT decides whether the accessory container stops: a file
+	// archive replaces files on disk (that includes every backup an older CLI
+	// took of a pgvector/timescale/valkey/... accessory), an engine dump
+	// restores through the running engine. It is resolved before anything
+	// stops, so a restore with nothing to restore leaves the app running.
+	dto.Database = restoreOpts.Database
+	var art backup.AccessoryArtifact
+	if accessory != "" {
+		accessoryImage, accessoryEnv := inspectAccessoryForRestore(ctx, client, appCfg.App, accessory, appCfg)
+		var aErr error
+		art, aErr = client.ResolveRestoreArtifact(ctx, appCfg.App, accessory, accessoryImage, date, accessoryEnv, cfg, restoreOpts)
+		if aErr != nil {
+			return finishRestoreFailure(flags, ctx, executor, lc, lk, dto, false, nil, aErr)
+		}
+	}
 	stopped, qErr := lc.QuiesceApp(ctx, lk, appCfg.App, stopTimeout)
 	for _, c := range stopped {
 		dto.Stopped = append(dto.Stopped, c.Name)
 	}
 	accessoryStopped := false
 	if qErr == nil && accessory != "" {
-		// The ARTIFACT decides whether the accessory container stops: a
-		// file archive replaces files on disk (that includes every backup
-		// an older CLI took of a pgvector/timescale/valkey/... accessory),
-		// an engine dump restores through the running engine.
-		accessoryImage, accessoryEnv := inspectAccessoryForRestore(ctx, client, appCfg.App, accessory, appCfg)
-		var art backup.AccessoryArtifact
-		var aErr error
-		if restoreOpts.Database == "" {
-			art, aErr = client.ResolveAccessoryArtifact(ctx, appCfg.App, accessory, accessoryImage, date, accessoryEnv, cfg)
-		}
-		if aErr != nil {
-			qErr = aErr
-		} else if art.FileRestore {
+		if art.FileRestore {
 			container := appCfg.App + "-" + accessory
 			if _, sErr := lk.Guarded(ctx, executor, fmt.Sprintf("docker stop --time %d %s", stopTimeout, ssh.ShellQuote(container))); sErr == nil {
 				accessoryStopped = true
@@ -784,15 +795,38 @@ func runBackupRecoveryAction(flags *Flags, appName, accessory string, opts *rest
 	if opts.rollback {
 		action = "rollback"
 	}
+	progress := backupProgressOut(flags)
+	client := backup.NewClient(executor, progress)
+	image, env := inspectAccessoryForRestore(ctx, client, appCfg.App, accessory, appCfg)
+	rc, err := client.FindRecoveryCopies(ctx, appCfg.App, accessory, image, opts.database, env)
+	if err != nil {
+		return err
+	}
+	// Decide before anything stops: a rollback with nothing to do leaves the
+	// app running, and a release that would destroy the only copy never asks.
+	var plan backup.RollbackPlan
+	if opts.rollback {
+		if plan, err = rc.PlanRollback(opts.database, opts.recoveryDatabase); err != nil {
+			return err
+		}
+	} else if err := rc.CheckRelease(opts.force); err != nil {
+		return err
+	}
+	var prompt string
+	if opts.rollback {
+		prompt = fmt.Sprintf("Swap %s back into place as %s in %s/%s (stops the app while it runs)?", plan.Previous, plan.Database, appCfg.App, accessory)
+	} else {
+		if len(rc.All()) == 0 {
+			return fmt.Errorf("%s/%s has no kept recovery copies", appCfg.App, accessory)
+		}
+		prompt = fmt.Sprintf("Discard these kept recovery copies of %s/%s: %s?", appCfg.App, accessory, strings.Join(rc.All(), ", "))
+	}
+	fmt.Fprintln(progress, prompt)
 	if !yes {
 		if !stdinIsTerminal() {
 			return fmt.Errorf("--yes is required to %s without an interactive terminal", action)
 		}
-		prompt := fmt.Sprintf("Discard the kept recovery copies of %s/%s?", appCfg.App, accessory)
-		if opts.rollback {
-			prompt = fmt.Sprintf("Swap the previous database of %s/%s back (stops the app while it runs)?", appCfg.App, accessory)
-		}
-		if !confirm(os.Stdout, prompt) {
+		if !confirm(os.Stdout, "Continue") {
 			return fmt.Errorf("aborted")
 		}
 	}
@@ -804,25 +838,15 @@ func runBackupRecoveryAction(flags *Flags, appName, accessory string, opts *rest
 	lk.StartRenewal(executor)
 	defer state.ReleaseLockFenced(executor, lk, appCfg.App)
 
-	progress := backupProgressOut(flags)
-	client := backup.NewClient(executor, progress)
 	dto := backupRestoreDTO{
 		MachineInterface: MachineInterface, Host: executor.Host(), App: appCfg.App,
-		Kind: backup.KindAccessory, Accessory: accessory, Action: action,
+		Kind: backup.KindAccessory, Accessory: accessory, Action: action, Database: opts.database,
 		Stopped: []string{}, Started: []string{},
-	}
-	image, env := inspectAccessoryForRestore(ctx, client, appCfg.App, accessory, appCfg)
-	rc, err := client.FindRecoveryCopies(ctx, appCfg.App, accessory, image, env)
-	if err != nil {
-		return err
 	}
 
 	var actionErr error
 	if opts.release {
-		dto.Released, actionErr = client.ReleaseRecoveryCopies(ctx, rc)
-		if actionErr == nil && len(dto.Released) == 0 {
-			actionErr = fmt.Errorf("%s/%s has no kept recovery copies", appCfg.App, accessory)
-		}
+		dto.Released, actionErr = client.ReleaseRecoveryCopies(ctx, rc, opts.force)
 	} else {
 		lc := deploy.NewLifecycle(executor, progress)
 		stopTimeout := appCfg.StopTimeout
@@ -836,10 +860,10 @@ func runBackupRecoveryAction(flags *Flags, appName, accessory string, opts *rest
 		if qErr != nil {
 			actionErr = qErr
 		} else {
-			var restored, displaced string
-			restored, displaced, actionErr = client.RollbackRestore(ctx, rc, opts.recoveryDatabase)
+			var displaced string
+			displaced, actionErr = client.RollbackRestore(ctx, plan)
 			if actionErr == nil {
-				fmt.Fprintf(progress, "%s swapped back into place\n", restored)
+				fmt.Fprintf(progress, "%s swapped back into place\n", plan.Previous)
 				dto.RecoveryDatabase = displaced
 			}
 		}
@@ -860,7 +884,7 @@ func runBackupRecoveryAction(flags *Flags, appName, accessory string, opts *rest
 		dto.Error = actionErr.Error()
 	}
 	recordAppEvent(ctx, executor, appCfg.App, events.KindBackupRestore, actionErr, map[string]any{
-		"kind": backup.KindAccessory, "accessory": accessory, "action": action, "released": dto.Released,
+		"kind": backup.KindAccessory, "accessory": accessory, "action": action, "database": opts.database, "released": dto.Released,
 	})
 	if flags.JSON {
 		return errors.Join(actionErr, json.NewEncoder(os.Stdout).Encode(dto))
@@ -922,6 +946,9 @@ func restoreEventDetail(dto backupRestoreDTO) map[string]any {
 	detail := map[string]any{"id": dto.ID, "kind": dto.Kind}
 	if dto.Accessory != "" {
 		detail["accessory"] = dto.Accessory
+	}
+	if dto.Database != "" {
+		detail["database"] = dto.Database
 	}
 	return detail
 }

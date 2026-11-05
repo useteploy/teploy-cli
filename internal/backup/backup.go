@@ -236,6 +236,9 @@ type Client struct {
 	// retryDelay spaces retries of a postgres rename refused because
 	// sessions were still connected (0 = one second; tests shorten it).
 	retryDelay time.Duration
+	// loadDeadline overrides the deadlines on dump loads and their cleanup
+	// (0 = scaled to the dump; tests shorten it).
+	loadDeadline time.Duration
 }
 
 // NewClient creates a new backup client.

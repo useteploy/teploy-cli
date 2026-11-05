@@ -741,16 +741,21 @@ func (c *Client) CreateBundle(ctx context.Context, opts BundleOptions, store Bun
 				rec.Globals = gz
 			}
 			// A partial bundle beats none; the manifest says what is missing.
-			if cov, err := c.pgReadCoverage(ctx, t, nil); err == nil {
-				rec.Notes = strings.Join(cov.warnings(db), "; ")
-				for _, w := range cov.warnings(db) {
-					fmt.Fprintf(c.out, "Warning: %s: %s\n", accName, w)
-				}
-			} else {
-				rec.Notes = fmt.Sprintf("could not list the cluster's databases, so coverage is unknown: %v", err)
+			_, _, warnings := c.backupCoverage(ctx, opts.App, accName, EngineDetection{Engine: EnginePostgres}, t, env)
+			rec.Notes = strings.Join(warnings, "; ")
+			for _, w := range warnings {
+				fmt.Fprintf(c.out, "Warning: %s: %s\n", accName, w)
 			}
 		case "mysql", "mariadb":
 			rec.EngineParams = map[string]string{"db": mysqlDB(opts.App, env)}
+			_, _, warnings := c.backupCoverage(ctx, opts.App, accName, EngineDetection{Engine: plan.engine}, pgTarget{}, env)
+			rec.Notes = strings.Join(warnings, "; ")
+			for _, w := range warnings {
+				fmt.Fprintf(c.out, "Warning: %s: %s\n", accName, w)
+			}
+		case EngineMongo:
+			_, _, warnings := c.backupCoverage(ctx, opts.App, accName, EngineDetection{Engine: EngineMongo}, pgTarget{}, env)
+			rec.Notes = strings.Join(warnings, "; ")
 		}
 		switch plan.engine {
 		case EngineGeneric:

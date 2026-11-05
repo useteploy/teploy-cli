@@ -515,8 +515,8 @@ func (c *Client) verifyMongo(ctx context.Context, res *VerifyResult, app, name, 
 
 	fmt.Fprintf(c.out, "Restoring into scratch...\n")
 	if _, err := c.exec.Run(ctx, fmt.Sprintf(
-		"docker exec -i %s mongorestore --archive --gzip --quiet < %s",
-		ssh.ShellQuote(scratch), ssh.ShellQuote(dump))); err != nil {
+		"docker exec -i %s mongorestore --archive --gzip --quiet --nsExclude=%s < %s",
+		ssh.ShellQuote(scratch), ssh.ShellQuote(mongoCheckExclude), ssh.ShellQuote(dump))); err != nil {
 		return fmt.Errorf("restore into scratch failed: %w", err)
 	}
 

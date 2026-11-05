@@ -101,14 +101,16 @@ func (c *Client) RemoveSchedule(ctx context.Context, marker string) error {
 
 // ReadCrontab returns the user's crontab lines (nil when none). The read
 // is exit-status-checked (the TCL-46 discipline): only the canonical "no
-// crontab for <user>" failure means empty; every other failure is an error.
+// crontab for <user>" failure and a missing crontab binary mean empty; every
+// other failure is an error.
 func ReadCrontab(ctx context.Context, exec ssh.Executor) ([]string, error) {
 	res := ssh.RunDetailed(ctx, exec, "crontab -l")
 	if res.Err != nil {
 		return nil, fmt.Errorf("reading crontab: %w", res.Err)
 	}
 	if res.ExitCode != 0 {
-		if strings.Contains(string(res.Stderr), "no crontab") {
+		// No crontab, or no cron at all: either way, nothing is scheduled.
+		if strings.Contains(string(res.Stderr), "no crontab") || res.ExitCode == 127 {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("reading crontab: %s", res.ExitErrorText())

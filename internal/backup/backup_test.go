@@ -374,7 +374,9 @@ func TestAccessoryBackup_MySQL_PasswordFallbackAndAbsence(t *testing.T) {
 		t.Fatalf("AccessoryBackup: %v", err)
 	}
 	for _, call := range mock.Calls {
-		if strings.Contains(call, "MYSQL_PWD") {
+		// The read-only coverage query reads whatever the container's env
+		// holds, in the container; the dump is what must not expect one.
+		if strings.Contains(call, "MYSQL_PWD") && !strings.Contains(call, "information_schema.SCHEMATA") {
 			t.Errorf("no password configured, so no MYSQL_PWD expected: %s", call)
 		}
 	}

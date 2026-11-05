@@ -342,23 +342,27 @@ func TestPGIntegration_CoverageRollbackRelease(t *testing.T) {
 	}
 
 	// Rollback: the pre-restore data (3 rows) comes back.
-	rc, err := client.FindRecoveryCopies(ctx, app, "db", image, env)
+	rc, err := client.FindRecoveryCopies(ctx, app, "db", image, "appdb", env)
 	if err != nil || len(rc.Previous) != 1 {
 		t.Fatalf("copies = %+v, %v", rc, err)
 	}
-	restored, displaced, err := client.RollbackRestore(ctx, rc, "")
-	if err != nil || restored != kept.PGDatabase || displaced == "" {
-		t.Fatalf("rollback = %s %s %v", restored, displaced, err)
+	plan, err := rc.PlanRollback("", "")
+	if err != nil || plan.Previous != kept.PGDatabase {
+		t.Fatalf("plan = %+v, %v", plan, err)
+	}
+	displaced, err := client.RollbackRestore(ctx, plan)
+	if err != nil || displaced == "" {
+		t.Fatalf("rollback = %s %v", displaced, err)
 	}
 	if got := strings.TrimSpace(dexec(pgQ("app", "appdb", "SELECT count(*) FROM items"))); got != "3" {
 		t.Fatalf("after rollback rows = %s, want the pre-restore 3", got)
 	}
 	// Release: the displaced restored copy goes, and nothing else does.
-	rc, err = client.FindRecoveryCopies(ctx, app, "db", image, env)
+	rc, err = client.FindRecoveryCopies(ctx, app, "db", image, "appdb", env)
 	if err != nil || len(rc.Partial) != 1 {
 		t.Fatalf("copies after rollback = %+v, %v", rc, err)
 	}
-	if released, err := client.ReleaseRecoveryCopies(ctx, rc); err != nil || len(released) != 1 {
+	if released, err := client.ReleaseRecoveryCopies(ctx, rc, false); err != nil || len(released) != 1 {
 		t.Fatalf("released %v, %v", released, err)
 	}
 	if got := strings.TrimSpace(dexec(pgQ("app", "postgres", "SELECT count(*) FROM pg_database WHERE datname LIKE '%teploy_%'"))); got != "0" {
@@ -622,4 +626,397 @@ func TestMongoIntegration_UnloadableArchiveRefused(t *testing.T) {
 	if got != "1:0" {
 		t.Fatalf("after refusal = %q, want 1:0", got)
 	}
+}
+
+// Reproduced data loss: appdb gone, only its kept copy left. --release must
+// refuse; --rollback brings it back. A --database restore's kept copy is
+// findable and clearable.
+func TestPGIntegration_ReleaseRefusedWhenLiveMissing(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+	defer cancel()
+	f := newITFixture(t, ctx)
+	app := "teployitrelease"
+	name := app + "-db"
+	dexec := f.container(t, ctx, name, "--label "+BackupDatabasesLabel+"=reports -e POSTGRES_USER=app -e POSTGRES_PASSWORD=pw -e POSTGRES_DB=appdb "+pgITImage, pgITReady("app"))
+	time.Sleep(3 * time.Second)
+	f.waitFor(t, ctx, name, pgITReady("app"))
+	dexec(pgQ("app", "appdb", "CREATE TABLE items(id int); INSERT INTO items VALUES (1)"))
+	dexec(pgQ("app", "postgres", "CREATE DATABASE reports"))
+	dexec(pgQ("app", "reports", "CREATE TABLE r(id int); INSERT INTO r VALUES (1)"))
+	client := NewClient(f.exec, os.Stdout)
+	image, env, _ := client.InspectAccessory(ctx, app, "db")
+
+	// A --database restore keeps reports_teploy_old_*: the next steps must find it.
+	res, err := client.AccessoryBackup(ctx, app, "db", image, env, f.s3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dexec(pgQ("app", "reports", "INSERT INTO r VALUES (2)"))
+	if _, err := client.AccessoryRestoreWith(ctx, app, "db", image, res.ID, env, f.s3, RestoreOptions{Database: "reports"}); err != nil {
+		t.Fatal(err)
+	}
+	rc, err := client.FindRecoveryCopies(ctx, app, "db", image, "", env)
+	if err != nil || len(rc.Previous) != 1 || !strings.HasPrefix(rc.Previous[0], "reports_teploy_old_") {
+		t.Fatalf("copies = %+v, %v", rc, err)
+	}
+	plan, err := rc.PlanRollback("reports", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.RollbackRestore(ctx, plan); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(dexec(pgQ("app", "reports", "SELECT count(*) FROM r"))); got != "2" {
+		t.Fatalf("after rollback rows = %s, want the pre-restore 2", got)
+	}
+	rc, _ = client.FindRecoveryCopies(ctx, app, "db", image, "reports", env)
+	if _, err := client.ReleaseRecoveryCopies(ctx, rc, false); err != nil {
+		t.Fatal(err)
+	}
+
+	// The live database gone, the kept copy all that is left.
+	dexec(pgQ("app", "postgres", "ALTER DATABASE appdb RENAME TO appdb_teploy_old_0123abcd"))
+	rc, err = client.FindRecoveryCopies(ctx, app, "db", image, "appdb", env)
+	if err != nil || len(rc.MissingLive) != 1 {
+		t.Fatalf("copies = %+v, %v", rc, err)
+	}
+	if _, err := client.ReleaseRecoveryCopies(ctx, rc, true); err == nil || !strings.Contains(err.Error(), "--rollback") {
+		t.Fatalf("release of the only copy must be refused, even with force: %v", err)
+	}
+	plan, err = rc.PlanRollback("appdb", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.RollbackRestore(ctx, plan); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(dexec(pgQ("app", "appdb", "SELECT count(*) FROM items"))); got != "1" {
+		t.Fatalf("the kept copy must be back: %s", got)
+	}
+}
+
+// backup_databases: all dumps every database, a populated "postgres" too.
+func TestPGIntegration_BackupDatabasesAll(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+	defer cancel()
+	f := newITFixture(t, ctx)
+	app := "teployitall"
+	name := app + "-db"
+	dexec := f.container(t, ctx, name, "--label "+BackupDatabasesLabel+"=all -e POSTGRES_USER=app -e POSTGRES_PASSWORD=pw -e POSTGRES_DB=appdb "+pgITImage, pgITReady("app"))
+	time.Sleep(3 * time.Second)
+	f.waitFor(t, ctx, name, pgITReady("app"))
+	dexec(pgQ("app", "appdb", "CREATE TABLE items(id int)"))
+	dexec(pgQ("app", "postgres", "CREATE DATABASE one") + " && " + pgQ("app", "postgres", "CREATE DATABASE two") + " && " + pgQ("app", "postgres", "CREATE TABLE stray(x int); INSERT INTO stray VALUES (1)"))
+	dexec(pgQ("app", "two", "CREATE TABLE t(id int); INSERT INTO t VALUES (1)"))
+	client := NewClient(f.exec, os.Stdout)
+	image, env, _ := client.InspectAccessory(ctx, app, "db")
+	res, err := client.AccessoryBackup(ctx, app, "db", image, env, f.s3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.UncoveredDatabases) != 0 {
+		t.Fatalf("all covers everything: %v", res.UncoveredDatabases)
+	}
+	base := f.work + "/s3/itbucket/" + app + "/accessories/db/databases"
+	for _, db := range []string{"one", "two", "postgres"} {
+		f.run(t, ctx, "test -s "+base+"/"+db+"/"+res.ID+".pgdump")
+	}
+	// Restoring one of them on its own.
+	dexec(pgQ("app", "two", "INSERT INTO t VALUES (2)"))
+	if err := restoreAndRelease(ctx, client, app, image, res.ID, env, f.s3, "two"); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(dexec(pgQ("app", "two", "SELECT count(*) FROM t"))); got != "1" {
+		t.Fatalf("rows = %s", got)
+	}
+}
+
+// Real ext4: WAL counts toward the room a restore needs. Between 1.1x and
+// 1.1x + WAL the preflight refuses (it used to pass and PANIC). The explicit
+// override proceeds, and the outcome is truthful either way.
+func TestPGIntegration_WALHeadroomAndOverride(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
+	defer cancel()
+	f := newITFixture(t, ctx)
+	f.exec.sudo = true
+	app := "teployitwal"
+	name := app + "-db"
+	mnt := f.loopVolume(t, ctx, 700)
+	dexec := f.container(t, ctx, name, "-v "+mnt+"/data:/var/lib/postgresql/data -e POSTGRES_USER=app -e POSTGRES_PASSWORD=pw -e POSTGRES_DB=appdb "+pgITImage+" -c max_wal_size=64MB -c min_wal_size=32MB", pgITReady("app"))
+	time.Sleep(3 * time.Second)
+	f.waitFor(t, ctx, name, pgITReady("app"))
+	dexec(pgQ("app", "appdb", "CREATE TABLE keep(id int); INSERT INTO keep VALUES (1); CREATE TABLE big AS SELECT i, md5(i::text)||md5((i+1)::text)||md5((i+2)::text) AS v FROM generate_series(1,800000) i"))
+	client := NewClient(f.exec, os.Stdout)
+	client.retryDelay = 2 * time.Second
+	image, env, _ := client.InspectAccessory(ctx, app, "db")
+	res, err := client.AccessoryBackup(ctx, app, "db", image, env, f.s3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logical := strings.TrimSpace(f.run(t, ctx, "sudo -n cat "+f.work+"/s3/itbucket/"+app+"/accessories/db/meta/"+res.ID+".json"))
+	t.Logf("recorded %s, artifact %d", logical, res.SizeBytes)
+	dexec(pgQ("app", "appdb", "DROP TABLE big; CHECKPOINT"))
+
+	// Recorded is ~115 MB: 1.1x = 127 MB, + 64 MB WAL = 191 MB. Leave 150.
+	f.fill(t, ctx, mnt, 150)
+	_, err = client.AccessoryRestoreKeep(ctx, app, "db", image, res.ID, env, f.s3)
+	if err == nil || !strings.Contains(err.Error(), "plus WAL") {
+		t.Fatalf("150 MB free must be refused: %v", err)
+	}
+	t.Logf("preflight: %v", err)
+	f.dropKeptTmp(err)
+	if got := strings.TrimSpace(dexec(pgQ("app", "appdb", "SELECT count(*) FROM keep"))); got != "1" {
+		t.Fatalf("live changed: %s", got)
+	}
+
+	// --ignore-space-check: with room it just works.
+	f.fill(t, ctx, mnt, 260)
+	rec, err := client.AccessoryRestoreWith(ctx, app, "db", image, res.ID, env, f.s3, RestoreOptions{IgnoreSpaceCheck: true})
+	if err != nil {
+		t.Fatalf("--ignore-space-check with room: %v", err)
+	}
+	if got := strings.TrimSpace(dexec(pgQ("app", "appdb", "SELECT count(*) FROM big"))); got != "800000" {
+		t.Fatalf("rows = %s", got)
+	}
+	if err := client.ReleaseRecovery(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func mysqlSQL(s string) string {
+	return "MYSQL_PWD=rootpw mysql -u root -N appdb -e " + ssh.ShellQuote(s)
+}
+
+const mysqlITReady = `sh -c 'MYSQL_PWD=rootpw mysql --protocol=TCP -h 127.0.0.1 -u root -e "select 1" appdb'`
+
+// mysql:8 has the binlog on: the dry run must not write it (a full copy of the
+// dump, to every replica), and on a nearly full disk the restore must end, not
+// hang on "Waiting for someone to free space".
+func TestMySQLIntegration_DryRunBinlogAndFullDisk(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Minute)
+	defer cancel()
+	f := newITFixture(t, ctx)
+	f.exec.sudo = true
+	app := "teployitbinlog"
+	name := app + "-db"
+	mnt := f.loopVolume(t, ctx, 900)
+	dexec := f.container(t, ctx, name, "-v "+mnt+"/data:/var/lib/mysql -e MYSQL_ROOT_PASSWORD=rootpw -e MYSQL_DATABASE=appdb mysql:8", mysqlITReady)
+	dexec(mysqlSQL("CREATE TABLE keep(id int); INSERT INTO keep VALUES (1); CREATE TABLE big(n int primary key, a char(32), b char(32), c char(32)); SET SESSION cte_max_recursion_depth=500000; INSERT INTO big WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM s WHERE n<400000) SELECT n, MD5(n), MD5(n+1), MD5(n+2) FROM s"))
+	client := NewClient(f.exec, os.Stdout)
+	client.loadDeadline = 4 * time.Minute
+	image, env, _ := client.InspectAccessory(ctx, app, "db")
+	res, err := client.AccessoryBackup(ctx, app, "db", image, env, f.s3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("artifact %d bytes", res.SizeBytes)
+	dexec(mysqlSQL("UPDATE keep SET id=2"))
+
+	rec, err := client.AccessoryRestoreKeep(ctx, app, "db", image, res.ID, env, f.s3)
+	if err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	if err := client.ReleaseRecovery(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(dexec(mysqlSQL("SELECT id FROM keep"))); got != "1" {
+		t.Fatalf("keep = %s", got)
+	}
+	// The real load reaches the binlog; the dry run never does.
+	binlogs := f.run(t, ctx, "docker exec "+name+" sh -c 'mysqlbinlog /var/lib/mysql/binlog.[0-9]* | grep -c teploy_check; true'")
+	if strings.TrimSpace(binlogs) != "0" {
+		t.Fatalf("the dry run reached the binlog: %s mentions", strings.TrimSpace(binlogs))
+	}
+
+	// Nearly full: the outcome must be prompt and truthful, whatever it is.
+	dexec(mysqlSQL("DROP TABLE big"))
+	dexec("MYSQL_PWD=rootpw mysql -u root -e 'PURGE BINARY LOGS BEFORE NOW()'")
+	dexec(mysqlSQL("UPDATE keep SET id=3"))
+	f.fill(t, ctx, mnt, 75)
+	start := time.Now()
+	rec, err = client.AccessoryRestoreKeep(ctx, app, "db", image, res.ID, env, f.s3)
+	t.Logf("low-disk restore in %s: %v", time.Since(start).Round(time.Second), err)
+	f.dropKeptTmp(err)
+	if time.Since(start) > 12*time.Minute {
+		t.Fatalf("hung for %s", time.Since(start))
+	}
+	if err != nil && !IsRecoveryIncomplete(err) {
+		if !strings.Contains(err.Error(), "not enough free space") && !strings.Contains(err.Error(), "untouched") {
+			t.Fatalf("unexpected: %v", err)
+		}
+		if got := strings.TrimSpace(dexec(mysqlSQL("SELECT id FROM keep"))); got != "3" {
+			t.Fatalf("refused, but live changed: %s", got)
+		}
+	}
+	if err == nil {
+		client.ReleaseRecovery(ctx, rec)
+	}
+
+	// --ignore-space-check on the same disk: the dry run fits now that it skips
+	// the binlog, and the binlogged real load does not. mysqld does not fail on
+	// a full disk, it waits; the deadlines end the restore, and it says so.
+	client.loadDeadline = 90 * time.Second
+	start = time.Now()
+	_, err = client.AccessoryRestoreWith(ctx, app, "db", image, res.ID, env, f.s3, RestoreOptions{IgnoreSpaceCheck: true})
+	t.Logf("forced restore in %s: %v", time.Since(start).Round(time.Second), err)
+	f.dropKeptTmp(err)
+	if time.Since(start) > 6*time.Minute {
+		t.Fatalf("hung for %s", time.Since(start))
+	}
+}
+
+// Reproduced loss on MariaDB: killed after the real DROP, 0 tables live, the
+// only copy in /var/tmp, and doctor said --release "confirms" it. The safety
+// copy of an unfinished restore has no marker: refused without --force. And a
+// second schema warns.
+func TestMariaDBIntegration_SafetyCopyAndSecondSchema(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+	defer cancel()
+	f := newITFixture(t, ctx)
+	f.exec.sudo = true
+	app := "teployitmaria2"
+	name := app + "-db"
+	sql := func(s string) string {
+		return "MYSQL_PWD=rootpw mariadb -u root -N appdb -e " + ssh.ShellQuote(s)
+	}
+	dexec := f.container(t, ctx, name, "-e MARIADB_ROOT_PASSWORD=rootpw -e MARIADB_DATABASE=appdb mariadb:11", `sh -c 'MYSQL_PWD=rootpw mariadb --protocol=TCP -h 127.0.0.1 -u root -e "select 1" appdb'`)
+	dexec(sql("CREATE TABLE a(id int); INSERT INTO a VALUES (1); CREATE DATABASE reports"))
+	client := NewClient(f.exec, os.Stdout)
+	image, env, _ := client.InspectAccessory(ctx, app, "db")
+	res, err := client.AccessoryBackup(ctx, app, "db", image, env, f.s3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(res.UncoveredDatabases) != 1 || res.UncoveredDatabases[0] != "reports" {
+		t.Fatalf("uncovered = %v, warnings %v", res.UncoveredDatabases, res.Warnings)
+	}
+	// A restore records finishing beside its safety copy.
+	rec, err := client.AccessoryRestoreKeep(ctx, app, "db", image, res.ID, env, f.s3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.run(t, ctx, "sudo -n test -e "+rec.Path+"/"+restoreCompletedMarker)
+	// A kill between DROP and load: same copy, no marker, live database empty.
+	f.run(t, ctx, "sudo -n rm -f "+rec.Path+"/"+restoreCompletedMarker)
+	t.Cleanup(func() { f.base.Run(context.Background(), "sudo -n rm -rf "+rec.Path) })
+	dexec(sql("DROP TABLE a"))
+	rc, err := client.FindRecoveryCopies(ctx, app, "db", image, "", env)
+	if err != nil || len(rc.Unconfirmed) != 1 {
+		t.Fatalf("copies = %+v, %v", rc, err)
+	}
+	if _, err := client.ReleaseRecoveryCopies(ctx, rc, false); err == nil || !strings.Contains(err.Error(), "only copy") {
+		t.Fatalf("got %v", err)
+	}
+	f.run(t, ctx, "sudo -n test -s "+rec.Path+"/pre-restore.sql")
+	// With --force it goes.
+	if released, err := client.ReleaseRecoveryCopies(ctx, rc, true); err != nil || len(released) != 1 {
+		t.Fatalf("--force: %v %v", released, err)
+	}
+	// A real database called appdb_teploy_check is left alone.
+	dexec(sql("CREATE DATABASE appdb_teploy_check"))
+	_, rerr := client.AccessoryRestoreKeep(ctx, app, "db", image, res.ID, env, f.s3)
+	if rerr == nil || !strings.Contains(rerr.Error(), "not a teploy dry run") {
+		t.Fatalf("got %v", rerr)
+	}
+	f.dropKeptTmp(rerr)
+	if got := strings.TrimSpace(dexec(sql("SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name='appdb_teploy_check'"))); got != "1" {
+		t.Fatalf("the real database was dropped: %s", got)
+	}
+}
+
+const mongoITReady = "mongosh --quiet --eval 'db.runCommand({ping:1}).ok'"
+
+// A 25 MB free volume and a much larger archive: preflight refuses; forced, the
+// dry run takes mongod down, and that is recovery-incomplete, not "untouched".
+func TestMongoIntegration_DiskFull(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
+	defer cancel()
+	f := newITFixture(t, ctx)
+	f.exec.sudo = true
+	app := "teployitmongofull"
+	name := app + "-db"
+	mnt := f.loopVolume(t, ctx, 700)
+	dexec := f.container(t, ctx, name, "-v "+mnt+"/data:/data/db mongo:7 --wiredTigerCacheSizeGB 0.25", mongoITReady)
+	dexec("mongosh --quiet appdb --eval " + ssh.ShellQuote("var b=[];for(var i=0;i<300000;i++){b.push({_id:i,v:Math.random().toString(16)+Math.random().toString(16)+Math.random().toString(16)+Math.random().toString(16)});if(b.length==5000){db.big.insertMany(b);b=[]}};db.keep.insertOne({_id:1})"))
+	client := NewClient(f.exec, os.Stdout)
+	client.retryDelay = 2 * time.Second
+	image, env, _ := client.InspectAccessory(ctx, app, "db")
+	res, err := client.AccessoryBackup(ctx, app, "db", image, env, f.s3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("artifact %d bytes", res.SizeBytes)
+	dexec("mongosh --quiet appdb --eval 'db.big.drop()'")
+	f.fill(t, ctx, mnt, 25)
+
+	_, err = client.AccessoryRestoreKeep(ctx, app, "db", image, res.ID, env, f.s3)
+	if err == nil || !strings.Contains(err.Error(), "not enough free space") {
+		t.Fatalf("preflight must refuse: %v", err)
+	}
+	t.Logf("preflight: %v", err)
+	f.dropKeptTmp(err)
+
+	_, err = client.AccessoryRestoreWith(ctx, app, "db", image, res.ID, env, f.s3, RestoreOptions{IgnoreSpaceCheck: true})
+	if err == nil {
+		t.Fatal("the archive cannot fit in 25 MB")
+	}
+	t.Logf("forced: %v", err)
+	f.dropKeptTmp(err)
+	state, _ := f.base.Run(ctx, "docker inspect -f '{{.State.Status}} exit={{.State.ExitCode}}' "+name)
+	t.Logf("container: %s", state)
+	out, aliveErr := f.base.Run(ctx, "docker exec "+name+" "+mongoITReady)
+	if aliveErr != nil {
+		if !IsRecoveryIncomplete(err) || strings.Contains(err.Error(), "database untouched") {
+			t.Fatalf("mongod is down but the error claims otherwise: %v", err)
+		}
+	} else if !IsRecoveryIncomplete(err) && !strings.Contains(err.Error(), "database untouched") {
+		t.Fatalf("mongod answered %q; error: %v", out, err)
+	}
+}
+
+// A database name long enough to overflow 63 bytes with a prefix still
+// restores; a killed restore's throwaway is dropped before the next backup and
+// never restored.
+func TestMongoIntegration_LongNameAndLeftovers(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+	defer cancel()
+	f := newITFixture(t, ctx)
+	app := "teployitmongoname"
+	name := app + "-db"
+	long := strings.Repeat("d", 55)
+	js := func(db, script string) string { return "mongosh --quiet " + db + " --eval " + ssh.ShellQuote(script) }
+	dexec := f.container(t, ctx, name, "mongo:7", mongoITReady)
+	dexec(js(long, "db.items.insertMany([{_id:1},{_id:2}]); db.items.createIndex({x:1})"))
+	dexec(js(mongoCheckPrefix+"deadbeef", "db.junk.insertOne({_id:1})"))
+	client := NewClient(f.exec, os.Stdout)
+	image, env, _ := client.InspectAccessory(ctx, app, "db")
+	res, err := client.AccessoryBackup(ctx, app, "db", image, env, f.s3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(strings.Join(res.Warnings, " "), mongoCheckPrefix+"deadbeef") {
+		t.Fatalf("warnings = %v", res.Warnings)
+	}
+	dexec(js(mongoCheckPrefix+"cafef00d", "db.junk.insertOne({_id:2})"))
+	dexec(js(long, "db.items.deleteOne({_id:1}); db.items.insertOne({_id:3})"))
+	rec, err := client.AccessoryRestoreKeep(ctx, app, "db", image, res.ID, env, f.s3)
+	if err != nil {
+		t.Fatalf("restore with a %d-byte database name: %v", len(long), err)
+	}
+	f.base.Run(ctx, "rm -f "+rec.Path+"/x")
+	if err := client.ReleaseRecovery(ctx, rec); err != nil {
+		t.Fatal(err)
+	}
+	got := strings.TrimSpace(dexec(js(long, "print(db.items.find().sort({_id:1}).toArray().map(function(d){return d._id}).join(',')+':'+db.getMongo().getDBNames().filter(function(n){return n.indexOf('"+mongoCheckPrefix+"')===0}).length)")))
+	if got != "1,2:0" {
+		t.Fatalf("after restore = %q, want 1,2:0 (the backed-up rows, no throwaways)", got)
+	}
+}
+
+func restoreAndRelease(ctx context.Context, c *Client, app, image, id string, env map[string]string, s3 S3Config, db string) error {
+	rec, err := c.AccessoryRestoreWith(ctx, app, "db", image, id, env, s3, RestoreOptions{Database: db})
+	if err != nil {
+		return err
+	}
+	return c.ReleaseRecovery(ctx, rec)
 }

@@ -62,24 +62,19 @@ func (c *Client) AccessoryBackup(ctx context.Context, app, name, image string, e
 		cleanup()
 		return res, fmt.Errorf("staging the mysql credential file for %s (no dump was run): %w", name, err)
 	}
-	// A cluster with more databases than this backup covers is still backed
-	// up: a partial backup and a loud warning beat none. The coverage
-	// reaches the backup.run event and doctor, and the fleet watchdog alerts.
+	// A server with more databases than this backup covers is still backed
+	// up: a partial backup and a loud warning beat none. The coverage reaches
+	// the backup.run event, doctor and `backup run`'s alert script; Dash
+	// alerting on it arrives in Slice 4.
 	var pgT pgTarget
 	var coverage pgCoverage
 	if det.Engine == EnginePostgres {
 		db, user := postgresDBAndUser(app, env)
 		pgT = newPGTarget(containerName, db, user, env)
-		labels, _ := c.inspectEngineHints(ctx, containerName)
-		var covErr error
-		if coverage, covErr = c.pgReadCoverage(ctx, pgT, listedDatabases(labels)); covErr != nil {
-			res.Warnings = append(res.Warnings, fmt.Sprintf("could not list the cluster's databases, so coverage is unknown: %v", covErr))
-		}
-		res.UncoveredDatabases = coverage.Uncovered
-		res.Warnings = append(res.Warnings, coverage.warnings(db)...)
-		for _, w := range res.Warnings {
-			fmt.Fprintf(c.out, "Warning: %s\n", w)
-		}
+	}
+	coverage, res.UncoveredDatabases, res.Warnings = c.backupCoverage(ctx, app, name, det, pgT, env)
+	for _, w := range res.Warnings {
+		fmt.Fprintf(c.out, "Warning: %s\n", w)
 	}
 	fmt.Fprintf(c.out, "Backing up %s (%s, detected from %s)...\n", containerName, det.Engine, det.Source)
 	if _, err := c.exec.Run(ctx, plan.cmd); err != nil {
@@ -160,6 +155,45 @@ func (c *Client) applyPostgresGlobals(ctx context.Context, super pgTarget, gz st
 	q := ssh.ShellQuote
 	sql := strings.TrimSuffix(gz, ".gz")
 	c.exec.Run(ctx, "gunzip -c "+q(gz)+" > "+q(sql)+" && "+super.tool("psql", true)+" -X -q -U "+q(super.user)+" -d postgres < "+q(sql)+" >/dev/null 2>&1; true")
+}
+
+// backupCoverage says what a backup of this accessory leaves out, per engine.
+// Mongo dumps the whole server, so its killed-restore throwaways are dropped
+// first: they would otherwise land in this backup silently.
+func (c *Client) backupCoverage(ctx context.Context, app, name string, det EngineDetection, t pgTarget, env map[string]string) (pgCoverage, []string, []string) {
+	container := app + "-" + name
+	switch det.Engine {
+	case EnginePostgres:
+		labels, _ := c.inspectEngineHints(ctx, container)
+		cov, err := c.pgReadCoverage(ctx, t, listedDatabases(labels))
+		if err != nil {
+			return cov, nil, []string{fmt.Sprintf("could not list the cluster's databases, so coverage is unknown: %v", err)}
+		}
+		return cov, cov.Uncovered, cov.warnings(t.db)
+	case EngineMySQL, EngineMariaDB:
+		db := mysqlDB(app, env)
+		uncovered, left, err := c.mysqlReadCoverage(ctx, det.Engine, container, db)
+		if err != nil {
+			return pgCoverage{}, nil, []string{fmt.Sprintf("could not list the server's schemas, so coverage is unknown: %v", err)}
+		}
+		var w []string
+		if len(uncovered) > 0 {
+			w = append(w, fmt.Sprintf("this backup covers only %s: the server also holds %s, not backed up", db, strings.Join(uncovered, ", ")))
+		}
+		if len(left) > 0 {
+			w = append(w, fmt.Sprintf("a killed restore left the dry-run database %s: `teploy backup restore --accessory <name> --release` removes it", strings.Join(left, ", ")))
+		}
+		return pgCoverage{}, uncovered, w
+	case EngineMongo:
+		dropped, err := c.dropMongoCheckDatabases(ctx, container)
+		if err != nil {
+			return pgCoverage{}, nil, []string{fmt.Sprintf("could not clear dry-run databases, so this backup may include them: %v", err)}
+		}
+		if len(dropped) > 0 {
+			return pgCoverage{}, nil, []string{fmt.Sprintf("dropped the dry-run databases a killed restore left: %s", strings.Join(dropped, ", "))}
+		}
+	}
+	return pgCoverage{}, nil, nil
 }
 
 // recordPostgresSize stores the database's logical size beside the dump: a
@@ -592,7 +626,7 @@ func mysqlReadyProbe(engine string) string {
 
 // mongoRestoreCmd streams a mongodump archive into mongorestore.
 func mongoRestoreCmd(container, dumpPath string) string {
-	return fmt.Sprintf("docker exec -i %s mongorestore --archive --gzip --drop < %s", ssh.ShellQuote(container), ssh.ShellQuote(dumpPath))
+	return fmt.Sprintf("docker exec -i %s mongorestore --archive --gzip --drop --nsExclude=%s < %s", ssh.ShellQuote(container), ssh.ShellQuote(mongoCheckExclude), ssh.ShellQuote(dumpPath))
 }
 
 // redisRestoreScript stops the container (so its shutdown save cannot

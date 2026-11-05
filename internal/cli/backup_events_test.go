@@ -2,6 +2,9 @@ package cli
 
 import (
 	"errors"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -74,7 +77,11 @@ func TestRestoreFlagsValidate(t *testing.T) {
 		{"pick without rollback", restoreFlags{recoveryDatabase: "x"}, "20260101-000000", "db", "--recovery-database"},
 		{"release with pick", restoreFlags{release: true, recoveryDatabase: "x"}, "", "db", "--recovery-database"},
 		{"database needs accessory", restoreFlags{database: "x"}, "20260101-000000", "", "--database needs --accessory"},
-		{"override only on a restore", restoreFlags{rollback: true, ignoreSpace: true}, "", "db", "apply to a restore"},
+		{"override only on a restore", restoreFlags{rollback: true, ignoreSpace: true}, "", "db", "applies to a restore"},
+		{"force only on release", restoreFlags{rollback: true, force: true}, "", "db", "--force applies"},
+		{"force on release", restoreFlags{release: true, force: true}, "", "db", ""},
+		{"release one database", restoreFlags{release: true, database: "reports"}, "", "db", ""},
+		{"rollback one database", restoreFlags{rollback: true, database: "reports"}, "", "db", ""},
 	} {
 		err := tc.o.validate(tc.date, tc.acc)
 		if tc.wantErrSubstr == "" && err != nil {
@@ -83,5 +90,56 @@ func TestRestoreFlagsValidate(t *testing.T) {
 		if tc.wantErrSubstr != "" && (err == nil || !strings.Contains(err.Error(), tc.wantErrSubstr)) {
 			t.Errorf("%s: err = %v, want %q", tc.name, err, tc.wantErrSubstr)
 		}
+	}
+}
+
+func TestRestoreEventCarriesDatabase(t *testing.T) {
+	d := restoreEventDetail(backupRestoreDTO{ID: "x", Kind: backup.KindAccessory, Accessory: "db", Database: "reports"})
+	if d["database"] != "reports" {
+		t.Errorf("detail = %v", d)
+	}
+}
+
+// The coverage warning reaches the alert script, only one that understands it:
+// an older script would report this successful backup as failed.
+func TestBackupAlertWarning(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "bin")
+	if err := os.MkdirAll(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sent := filepath.Join(dir, "sent")
+	stub := "#!/bin/sh\nwhile [ $# -gt 0 ]; do if [ \"$1\" = -d ]; then printf '%s' \"$2\" > " + sent + "; fi; shift; done\n"
+	if err := os.WriteFile(filepath.Join(bin, "curl"), []byte(stub), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	script := filepath.Join(dir, "alert.sh")
+	body := buildBackupAlertScript("myapp", "srv", "http://example.invalid/hook", "")
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	run := func(args ...string) string {
+		t.Helper()
+		os.Remove(sent)
+		cmd := exec.Command(script, args...)
+		cmd.Env = append(os.Environ(), "PATH="+bin+":"+os.Getenv("PATH"))
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("%v: %s", err, out)
+		}
+		data, _ := os.ReadFile(sent)
+		return string(data)
+	}
+	if got := run(); !strings.Contains(got, "Scheduled backup failed") {
+		t.Errorf("failure body = %q", got)
+	}
+	if got := run("warning"); !strings.Contains(got, `"warning":true`) || !strings.Contains(got, "does not cover every database") || strings.Contains(got, "backup failed") {
+		t.Errorf("warning body = %q", got)
+	}
+	cmd := backupWarningCmd("myapp")
+	if !strings.Contains(cmd, "grep -qF '"+backupAlertWarningMarker+"'") || !strings.Contains(cmd, " warning; fi") {
+		t.Errorf("warning command = %s", cmd)
+	}
+	if !strings.Contains(body, backupAlertWarningMarker) {
+		t.Error("the script must carry the marker")
 	}
 }
