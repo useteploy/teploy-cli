@@ -48,9 +48,29 @@ real Bitnami images work (password from the container's env), warnings and
 recovery_database in the restore DTO, names truncated on rune boundaries.
 Integration matrix now includes mariadb:11 and mongo:7 against real containers.
 
+Third independent review (2026-11-05) kept the swap, backup_databases:, the
+size sidecar and .sql.gz settings, and found the new code's holes; fixed on the
+branch: --release refused when the live postgres database is missing and,
+without --force, for a safety copy with no restore-completed marker, listing
+what it discards; doctor no longer calls it a confirmation and flags unfinished
+copies; MySQL dry run skips the binlog (SET sql_log_bin=0), counts it when it
+cannot, deadlines on loads and cleanup; Mongo dry run has a space preflight and
+liveness check; Postgres sizing adds min(size, max_wal_size); --database copies
+findable, releasable and rollback-able; scheduled backups warn the alert channel
+on uncovered databases (script marker; older scripts are not invoked); MySQL and
+MariaDB warn about other schemas; teploy_check_* excluded from restores, dropped
+before a mongodump, listed by doctor; one short-named Mongo throwaway database;
+safety-copy prefix unambiguous (app@name@); <db>_teploy_check only dropped with
+its marker table; checks run before the app stops; `database` in the restore
+event; `backup list` works without cron.
+
 Open / deferred:
 - G5 adoption of unmanaged containers and MySQL one-object-per-database: not
-  in this slice.
+  in this slice. MySQL/MariaDB backups cover one schema and warn about the rest.
+- A scheduled backup alerts on coverage only where `backup schedule` has
+  uploaded the current script (rescheduling updates it). Dash alerting: Slice 4.
+- Safety copies are not rolled back automatically for mysql/mongo/dragonfly:
+  --rollback names them and they are loaded by hand.
 - Mongo with auth (MONGO_INITDB_ROOT_USERNAME): mongodump/mongorestore run
   without credentials, so backup fails loudly (Unauthorized). Pre-existing;
   needs credentials via --config inside the container, not argv.

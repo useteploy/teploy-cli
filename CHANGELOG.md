@@ -16,7 +16,8 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
 - Postgres backups are `pg_dump -Fc` (`.pgdump`), with the cluster's roles
   (`pg_dumpall --globals-only`) and the database's size stored beside them. A
   cluster holding other databases is still backed up, with a coverage warning
-  in the output, the `backup.run` event and `teploy doctor`; `backup_databases:`
+  in the output, the `backup.run` event, `teploy doctor` and, for scheduled
+  backups, a warning on the alert channel; `backup_databases:`
   on an accessory (names, or `all`) also dumps them, and `backup restore
   --database` restores one. In-place restore into a populated database failed
   on the first `CREATE`. It now loads the backup into a new database and swaps
@@ -25,14 +26,16 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
   refused swap leaves the live database untouched (no single-transaction load,
   so large schemas no longer exhaust the lock table), and a load that takes the
   server down is reported as that. Free space is checked against what the
-  backup holds (`--ignore-space-check` overrides). Database-level settings,
+  backup holds plus its WAL (`--ignore-space-check` overrides). Database-level settings,
   ACLs and comments are re-applied (from the live database for a legacy plain
   dump); the collation provider and locale are kept; TimescaleDB loads between
   `timescaledb_pre_restore`/`post_restore`; the restoring role must be a
   superuser or the owner with CREATEDB. Legacy `.sql.gz` backups still restore.
 - `backup restore --accessory X --rollback` swaps a kept previous database
-  back, and `--release` discards kept recovery copies. `backup restore --json`
-  gains `recovery_database` and `warnings`.
+  back, and `--release` discards kept recovery copies, refusing while one may
+  be the only copy of the data (a missing live database; without `--force`, a
+  safety copy whose restore never recorded finishing). `--database` scopes both.
+  `backup restore --json` gains `recovery_database`, `database` and `warnings`.
 - `verify-backup`'s scratch containers no longer leave an anonymous volume (an
   unencrypted copy of the database) on the host, here and in DR validation.
   Real Bitnami images back up, verify and restore.
@@ -48,7 +51,10 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
   --events` and must end with the completion trailer. MySQL and Mongo restores
   first load the backup into a throwaway database and refuse, with the data
   untouched, one the server cannot load (a table created under
-  `innodb_strict_mode=0` used to leave only the tables before it). MySQL then
+  `innodb_strict_mode=0` used to leave only the tables before it). Those dry
+  runs check free space (MySQL counting the binlog, which the dry run skips),
+  have deadlines, and report a server they took down. MySQL warns about other
+  schemas it does not back up. MySQL then
   takes a safety dump and recreates the database (tables created after the
   backup no longer survive); both reload the safety dump on failure, and a
   failed reload stops with the app down (recovery-incomplete), as does a
@@ -65,6 +71,7 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
 - `verify-backup` for MySQL no longer races the image's init server
   (`mysqladmin ping` passes on access denied); postgres readiness probes
   TCP for the same reason.
+- `backup list` works on a host without cron.
 - `accessory restore` stops the app while it runs (it runs through the
   same fenced path as `backup restore --accessory`) and so now asks first;
   pass `--yes` without a terminal.
