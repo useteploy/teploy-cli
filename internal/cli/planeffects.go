@@ -10,12 +10,16 @@ package cli
 // unknown" entries rather than fabricated "no change".
 
 import (
+	"context"
 	"fmt"
+	"io"
 	"sort"
 	"strconv"
 	"strings"
 
+	"github.com/useteploy/teploy/internal/caddy"
 	"github.com/useteploy/teploy/internal/config"
+	"github.com/useteploy/teploy/internal/ssh"
 	"github.com/useteploy/teploy/internal/state"
 )
 
@@ -104,6 +108,29 @@ func routingEffects(appCfg *config.AppConfig, current *state.AppState, view *con
 	sort.Strings(wantPublish)
 	effects = append(effects, setDiffEffects("publish", dep.publish, wantPublish, "extra docker -p mapping")...)
 	return effects
+}
+
+// staleRouteEffects shows the managed Caddy block a non-caddy deploy will
+// remove: left by an earlier caddy release, it is a visible part of the plan.
+// It reads the server, so it sits beside the pure diffs rather than among them.
+func staleRouteEffects(ctx context.Context, exec ssh.Executor, out io.Writer, appCfg *config.AppConfig) []planEffect {
+	if appCfg.UsesCaddy() || appCfg.IsStatic() {
+		return nil
+	}
+	region, present, err := caddy.NewClient(exec).ReadManagedBlock(ctx, appCfg.App)
+	if err != nil {
+		fmt.Fprintf(out, "Warning: could not check for a stale Caddy route: %v\n", err)
+		return nil
+	}
+	if !present {
+		return nil
+	}
+	return []planEffect{{
+		Action: "remove",
+		Name:   "stale caddy route",
+		From:   strings.Join(caddy.RegionHosts(region), ","),
+		Detail: "left by an earlier caddy-ingress release; removed after the state commit, kept if this deploy fails",
+	}}
 }
 
 // envEffects diffs environment KEY presence (values are redacted by the

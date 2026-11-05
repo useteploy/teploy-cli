@@ -91,6 +91,7 @@ type CaddyRoute struct {
 	TLSCert     string            `json:"tls_cert,omitempty"`
 	TLSKey      string            `json:"tls_key,omitempty"`
 	TLSInternal bool              `json:"tls_internal,omitempty"`
+	TLSHTTPOnly bool              `json:"tls_http_only,omitempty"`
 	CaddyExtra  string            `json:"caddy_extra,omitempty"`
 	Cache       map[string]string `json:"cache,omitempty"`
 	Firewall    *caddy.Firewall   `json:"firewall,omitempty"`
