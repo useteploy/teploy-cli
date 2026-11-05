@@ -1,5 +1,66 @@
 # Open audit items
 
+## 2026-11-05 — Dash auto-config Slice 4 CLI: fleet backup engine (G1, G3, G4, G5)
+
+Plan: `../_internal/DASH_AUTOCONFIG_PLAN_2026-11-03.md` (sections 2.1-2.3, 5). Branch
+`slice4-fleet-engine`. Closes the Slice 2 opens on G5/one-object-per-database, role
+hashes unencrypted in sidecars, and `backup list` having no rows for `backup_databases:`.
+
+Decisions worth reviewing:
+- `max_age_days` is a keep rule (restic keep-within), unioned with the rest, not a cap:
+  it is what it already was with `keep_last`, and a cap could not express deploy-ovh's
+  "hourly for 48h, then daily/weekly/monthly". `max_age 2 + daily 7 + weekly 4 + monthly 12`
+  is that policy, with no separate hourly rule.
+- The recovery key lives in the policy, not the target: Dash forgets bucket credentials,
+  and setting a target needs them.
+- Upload commit is `.incoming/` + verify + server-side copy, sidecars first, primary last,
+  rather than a manifest: every existing reader already treats "the primary object exists"
+  as the backup existing, and legacy objects have no manifest to find.
+- `--all` skips targets with a `run`/`legacy` cron line (override) but not `custom` ones:
+  a hand-written job is not evidence of anything, and policy coverage is how they retire.
+- `.owners/<fingerprint>` markers refuse a prune in a namespace another server wrote to,
+  because a reused prefix or a same-named app is the failure a prefix alone cannot catch.
+
+Verified live (colima, MinIO via the real aws CLI, real age, the real linux binary):
+`go test -tags integration -run TestFleetIntegration ./internal/cli`, 17 scenarios. Only
+unit-tested: the deploy hook, healthchecks.io's /fail form, the janitors' age thresholds and
+multipart abort, setup's aws install, the space preflights' refusal, a bucket refusing deletes.
+Regressions: `TEPLOY_IT_ENGINES=postgres,mysql,redis go test -tags integration ./internal/backup`.
+The other Slice 2 engines were not re-run. The DR fixture still needs a 022 umask (open below).
+
+Open / deferred:
+- A schema name holding `'` or `\`: `mysqldump` mangles it in its own `USE` (seen live on
+  mysql:8), so it is reported as not backed up in omissions and status, never silently.
+  A Postgres or MySQL name with `=`, a leading `-`, a control character or over 64 bytes
+  likewise. Fixing needs dumping through `--databases`-free stdin tricks; not worth it yet.
+- Adopted MySQL dumps schemas, not `mysql.user`: per-site database users must be recreated
+  when recovering `wordpress-shared-mysql` onto a new server. The postgres side has globals.
+- An adopted container's password comes from its env. A root password changed after creation
+  (deploy-ovh's was stale) fails the dump loudly. There is no policy credential yet.
+- Mongo with auth still fails loudly (Slice 2 item), now as a failing target.
+- `aws` stays the transport (G8 deferred). Credential charset is restricted as before.
+- Restore and verify of an adopted database stop nothing; the operator stops its users.
+- Volume and generic estimates use the live tree's size, so a small disk can refuse an
+  archive that would have compressed to fit (`--ignore-space-check`, or a larger
+  `TEPLOY_BACKUP_TMPDIR`). The previous object's size would sharpen this.
+- A provider's own checksum is not verified beyond the 256 MiB read-back: above that it is
+  stored size plus the recorded SHA-256 plus the aws CLI's transfer checksums.
+- Heartbeat redirects are followed by Go's default client. Dash's push monitor does not
+  redirect; a receiver that does would see the token on the redirect target.
+- Dash must read `backup-fleet-v1` before using any of this (plan: version-gated). Behavior
+  Dash and scripts see: `remove --purge` now needs a target or `--no-backup`; restores take a
+  backup first; a `backup_databases:` name that is missing now fails that accessory's backup.
+- Pre-existing, seen live: `accessory upgrade` stops and removes the container before
+  `EnsureRunning`, so a failure there (an unsafe directory mode, here) leaves the accessory
+  down until re-run. Its data and the new safety backup are intact. Not changed in this slice.
+- `AGENTS.md` points at a repo `CLAUDE.md` that does not exist.
+- `backup status` runs one bucket listing per app and adopted namespace, and reads each
+  app's event log. Fine at fleet sizes here; a very large bucket would want a cache.
+- Encrypted objects cannot be restored by a CLI older than this one: the `.age` suffix is
+  invisible to its listing. Release order: CLI on servers first (plan section 4).
+- `TEPLOY_SERVER_BINARY` was used in the live test; on real servers `ensureFleetBinary`
+  upgrades via the release pipeline, so the policy cannot be set until this ships.
+
 ## 2026-11-03 — Dash auto-config Slice 2: backup correctness (G6, G7)
 
 Plan: `../_internal/DASH_AUTOCONFIG_PLAN_2026-11-03.md` (U3, U4, P1 G6/G7,
@@ -65,8 +126,8 @@ its marker table; checks run before the app stops; `database` in the restore
 event; `backup list` works without cron.
 
 Open / deferred:
-- G5 adoption of unmanaged containers and MySQL one-object-per-database: not
-  in this slice. MySQL/MariaDB backups cover one schema and warn about the rest.
+- ~~G5 adoption of unmanaged containers and MySQL one-object-per-database~~ closed
+  by Slice 4.
 - A scheduled backup alerts on coverage only where `backup schedule` has
   uploaded the current script (rescheduling updates it). Dash alerting: Slice 4.
 - Safety copies are not rolled back automatically for mysql/mongo/dragonfly:
@@ -77,10 +138,9 @@ Open / deferred:
 - Mongo restore (--drop) leaves collections created after the backup.
 - verify-backup covers the primary database only, not backup_databases: dumps;
   DR bundles carry the primary only (their manifest notes what is missing).
-- `backup list` shows one row per id; backup_databases: dumps have no rows of
-  their own.
-- Role password hashes are in the postgres globals sidecar and DR member,
-  unencrypted until G1 (the dump beside them is too).
+- ~~`backup list` one row per id~~ closed by Slice 4 (`database` on each row).
+- ~~Role password hashes unencrypted in sidecars~~ closed by G1 when a recovery key
+  is configured.
 - Redis/valkey restore and verify assume /data/dump.rdb (Bitnami redis differs).
 - Dragonfly's pre-restore snapshot in /var/tmp has no free-space preflight
   (its size is the in-memory dataset).
