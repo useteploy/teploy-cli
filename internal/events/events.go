@@ -117,6 +117,7 @@ const (
 	KindBackupOwners   = "backup_target.owners_clear"
 	KindBackupAll      = "backup.all"
 	KindBackupPolicy   = "backup_policy.set"
+	KindRouteRemove    = "route.remove"
 	KindReleasesPrune  = "releases.prune"
 )
 
@@ -155,6 +156,7 @@ var detailAllow = map[string][]string{
 	KindBackupOwners:   {"fingerprint", "force", "removed", "error"},
 	KindBackupAll:      {"status", "targets_ok", "targets_failed", "omissions", "encrypted", "duration_ms", "heartbeats_ok", "heartbeats_failed", "warnings", "error"},
 	KindBackupPolicy:   {"interval", "encrypted", "volumes", "adopted", "error"},
+	KindRouteRemove:    {"route", "hosts", "upstreams", "reason", "error"},
 	KindReleasesPrune:  {"keep", "pruned", "protected", "trigger", "error"},
 }
 
