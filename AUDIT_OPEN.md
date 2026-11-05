@@ -39,7 +39,7 @@ multipart abort, TEPLOY_BACKUP_TMPDIR workspaces invisible, postgresql:// names,
 holder's children, self-referential checksums above 256 MiB, safety copies prunable.
 
 Verified live (colima, MinIO via the real aws CLI, real age, the real linux binary):
-`go test -tags integration -run TestFleetIntegration ./internal/cli`, 22 scenarios, on real
+`go test -tags integration -run TestFleetIntegration ./internal/cli`, 23 scenarios, on real
 multi-database accessories; `TEPLOY_IT_INSTALL_AWS=1 go test -tags integration -run
 TestAWSCLIInstallScriptLive ./internal/backup` installs AWS's bundle for real and refuses a wrong
 pin. Only unit-tested: the deploy hook, healthchecks.io's /fail form, the janitors' age thresholds
@@ -47,8 +47,9 @@ and multipart abort, the space preflights' refusal, a bucket refusing deletes, a
 upload checksums, a musl host, the clock checks and an empty machine-id, setup's stage itself
 (the script it runs is the live one), the /etc/teploy root path (the fixture is non-root; the
 non-root paths, both with sudo and without, ran live).
-Regressions: `TEPLOY_IT_ENGINES=postgres,mysql,redis go test -tags integration ./internal/backup`.
-The Engine matrix's other Slice 2 engines were not re-run. The DR fixture still needs a 022 umask.
+Regressions: `go test -tags integration ./internal/backup`, the full engine matrix after merging
+v0.1.51 (postgres, pgvector, timescale, mysql, mariadb, mongo, redis, valkey, dragonfly). The DR
+fixture still needs a 022 umask.
 
 Open / deferred:
 - Legacy objects from a server that has not upgraded yet carry no marker. A first prune in
