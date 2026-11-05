@@ -50,7 +50,7 @@ func TestValidateResources_AcceptsDockerSyntax(t *testing.T) {
 func TestValidate_NamesTheOffendingAccessory(t *testing.T) {
 	cfg := &AppConfig{
 		App:    "myapp",
-		Domain: "example.com",
+		Domain: "teploy-fixture.dev",
 		Accessories: map[string]AccessoryConfig{
 			"redis":   {Image: "redis:7"},
 			"nucleus": {Image: "nucleus:latest", Memory: "8gb"},

@@ -10,6 +10,7 @@
     "config-unprivileged-v1",
     "deploy-home-v1",
     "doctor-diagnostics",
+    "domains-check-v1",
     "env-config-guard-v1",
     "env-set-stdin",
     "error-envelope",

@@ -1,5 +1,45 @@
 # Open audit items
 
+## 2026-11-05 — Dash auto-config Slice 5: domain health (CLI side)
+
+Plan: `../_internal/DASH_AUTOCONFIG_PLAN_2026-11-03.md` section 8. Branch
+`slice5-domain-health`.
+
+Closed: U5 root cause and TCL-10's stale half (a release leaving caddy ingress
+retires the block after the state commit, CAS + fence; rollback both directions);
+reserved names under caddy ingress; compose placeholder; the three DNS bugs
+(multi-host, validate/deploy disagreement, equality-only); `domains check`.
+Found along the way and fixed: host-to-caddy rollback rendered an empty CAS list;
+the release record dropped `tls.http_only`; rollback state kept the old domain.
+
+Review fixes (same branch): the reserved-name rule moved out of `validate()` to
+deploy admission (`ValidateDeployDomain`: deploy, multi-server, server-config,
+autodeploy, plan, validate), after overlays merge, so rollback, logs and other
+read and recovery commands never refuse, and Compose-only folders load; redeploy
+skips it. Custom certificates and localhost names are exempt. Public address is
+known per family. A wildcard's failing obtain covers its hosts. `tls_http_only` is
+a `*bool`, so the record can turn the flag off. Log parsing: an empty log is
+short, and a matched line that cannot be attributed makes logs `partial`.
+
+Open:
+- teploy-observe's `teploy.yml` still carries `domain:` and `server:
+  observe.example.com` under `ingress: host`. Legal (label-only warning); remove
+  it there.
+- A crash between the state commit and the block removal leaves the block until
+  the next deploy; `domains check` reports it as `stale_managed` meanwhile.
+- A managed block whose owner is not deployed is reported (`orphan_managed`), not
+  removed. Removal is plan P5 (`route remove`).
+- The DNS lookup uses Go's resolver with a fixed dial target, which still honors
+  the local /etc/hosts before asking. A hosts entry for a public name would hide
+  the public answer.
+- `tls.obtain`/`tls.renew` parsing assumes Caddy's default JSON log; another log
+  format reads `unknown` for the whole server (`unavailable`), never zero.
+- `teploy scale` builds its deploy config without deploy admission: it resizes
+  what is already running, the same reasoning as redeploy.
+- Public address detection: interface addresses plus a best-effort probe of
+  1.1.1.1's trace endpoint from the server. Without either a foreign answer reads
+  `unknown`. Explicit `public_ips` server fields remain plan v2.
+
 ## 2026-11-03 — Dash auto-config Slice 2: backup correctness (G6, G7)
 
 Plan: `../_internal/DASH_AUTOCONFIG_PLAN_2026-11-03.md` (U3, U4, P1 G6/G7,

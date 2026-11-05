@@ -1456,11 +1456,13 @@ func TestDeploy_IngressExternalSkipsCaddy(t *testing.T) {
 		t.Fatalf("Deploy: %v", err)
 	}
 
-	// No call should reach Caddy admin API or Caddyfile.
+	// No call should reach Caddy's admin API or change the Caddyfile. Reading
+	// it is allowed: that is how a stale block from a caddy release is found,
+	// and this server has none.
 	for _, call := range mock.Calls {
 		lower := strings.ToLower(call)
 		if strings.Contains(call, "localhost:2019") ||
-			strings.Contains(call, "/deployments/caddy/Caddyfile") ||
+			(strings.Contains(call, "/deployments/caddy/Caddyfile") && !strings.HasPrefix(call, "if [ ! -e ")) ||
 			strings.Contains(call, "caddy reload") ||
 			strings.Contains(lower, "/config/apps/http/servers") {
 			t.Errorf("ingress: external should issue zero Caddy commands; got: %s", call)

@@ -4,6 +4,40 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+### Added
+
+- `teploy domains check [--server X] [--app A] [--log-window D] [--json]`: DNS
+  from fixed public resolvers, Caddy certificate failures and route health per
+  (server, app, host). Read-only; advertised as `domains-check-v1`. What cannot
+  be established reads `unknown`, never healthy.
+
+### Changed
+
+- Reserved names (RFC 2606/6761: example.com/.net/.org, *.example, .test,
+  .invalid) are refused by `deploy`, `plan` and `validate` under caddy ingress,
+  after overlays merge, unless `tls.internal`, `tls.http_only` or your own
+  `tls: {cert, key}` is set. They are warned as label-only under host and external
+  ingress. The file still loads: `rollback`, `logs` and other read and recovery
+  commands never refuse over it. localhost names are not refused.
+- Compose import no longer fabricates `<app>.example.com`; `deploy` asks for a
+  domain, and the folder still loads for everything else.
+
+### Fixed
+
+- A deploy or rollback that leaves caddy ingress removes the managed Caddy block
+  the earlier release left, after the state commit, under the fence and a CAS on
+  the block's hash, and `teploy plan` shows it. Those blocks kept Caddy retrying
+  certificates for names nothing served. A failed deploy leaves the block alone.
+- Rollback from a host or external release to a caddy release works: it resolved
+  its route expectation against the wrong ingress and rendered an empty CAS.
+- A release record keeps `tls.http_only`, so a rollback or a route restore follows
+  what that release served, in both directions.
+- State after a rollback names the target release's domain.
+- Multi-host domains pass the first-deploy DNS check (the comma list went to the
+  resolver as one name), `validate` no longer DNS-checks host-ingress apps that
+  `deploy` skips, addresses compare by value, and a Cloudflare answer is a note
+  rather than a mismatch.
+
 ## [0.1.50] - 2026-11-04
 
 ### Fixed

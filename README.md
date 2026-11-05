@@ -568,6 +568,32 @@ teploy network setup <provider>    # VPN mesh (tailscale, headscale, netbird)
 teploy network status / join       # VPN management
 ```
 
+### Domains
+
+```bash
+teploy domains check                       # every server in servers.yml
+teploy domains check --server edge --app web
+teploy domains check --json                # contracts/schema/domains-check-envelope.schema.json
+```
+
+One row per (server, app, host), plus hosts only a hand-written Caddy block
+serves. Read-only, run from your machine over SSH, nothing new on the server:
+
+- **dns**: what 1.1.1.1 and 8.8.8.8 say, not your local resolver: `ok`,
+  `nxdomain`, `wrong_target`, `proxied` (Cloudflare answers; a hint, not a
+  failure), `unknown` (no resolver answered, or the server's public address
+  could not be determined), `skipped`.
+- **tls**: certificate failures per name from Caddy's logs (`--log-window`,
+  default 14 days), with how long the name has been failing; a wildcard's failure
+  covers the names under it. Logs under a day old, unreadable, or with a line
+  that cannot be attributed give `unknown`, never 0.
+- **route**: `managed`, `manual`, `stale_managed` (the app is no longer
+  caddy-routed), `orphan_managed` (no such app here), `none`, and whether each
+  upstream resolves in Caddy's network.
+
+`ingress: external` and an unfronted `ingress: host` domain are labels: they
+carry a `skip` reason. A server that cannot be reached is reported as such.
+
 ### Accessories
 ```
 teploy accessory list              # list running accessories

@@ -194,6 +194,7 @@ func buildPlanRecord(ctx context.Context, exec ssh.Executor, out io.Writer, appC
 	rec.User = exec.User()
 
 	rec.Effects.Routing = routingEffects(appCfg, current, view)
+	rec.Effects.Routing = append(rec.Effects.Routing, staleRouteEffects(ctx, exec, out, appCfg)...)
 	rec.Effects.Env = envEffects(appCfg, view)
 	rec.Effects.Storage = storageEffects(appCfg.App, appCfg, view)
 	rec.Effects.Resources = resourceEffects(appCfg, view)
@@ -294,6 +295,9 @@ func runPlan(flags *Flags, version, image, destination, outFile string) error {
 	}
 	if err != nil {
 		return err
+	}
+	if err := config.ValidateDeployDomain(appCfg); err != nil {
+		return refuseAdmission(err)
 	}
 	serverName := resolvePlanServerName(appCfg)
 	executor, err := connectForApp(ctx, flags, appCfg)

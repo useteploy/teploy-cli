@@ -136,6 +136,10 @@ func runAdHocDeploy(flags *Flags, serverName, appName, image, domain string, por
 		if err := config.ValidateDomain(domain, false); err != nil {
 			return refuseAdmission(err)
 		}
+		// Ad-hoc deploys are always caddy-routed and have no tls: settings.
+		if err := config.ValidateRoutableDomain(domain, nil); err != nil {
+			return refuseAdmission(err)
+		}
 	}
 	if serverName == "" {
 		serverName = flags.Host
@@ -432,6 +436,9 @@ func selectServersByRoleTag(names []string, all map[string]config.Server, role s
 // and runApply (a verified C05 plan record — planID stamps the receipt).
 func deployAppConfig(flags *Flags, appCfg *config.AppConfig, serverName, image, version string, skipDNSCheck, migrateVolumes bool, planID string, plans ...*PlanRecord) error {
 	var err error
+	if err := config.ValidateDeployDomain(appCfg); err != nil {
+		return refuseAdmission(err)
+	}
 
 	// 2. Resolve server (single-server deploy).
 	if serverName == "" {
@@ -624,13 +631,16 @@ func deployAppConfig(flags *Flags, appCfg *config.AppConfig, serverName, image, 
 	// Skipped for host ingress (publishes a raw port, no domain) and for
 	// external ingress (the user's own front — Cloudflare Tunnel / nginx /
 	// ALB — serves the domain, so it resolves there, not to the server IP).
-	if !skipDNSCheck && appCfg.Domain != "" &&
-		appCfg.Ingress != config.IngressHost && appCfg.Ingress != config.IngressExternal {
+	if !skipDNSCheck && dnsCheckApplies(appCfg) {
 		current, _ := state.Read(ctx, executor, appCfg.App)
 		if current == nil {
 			fmt.Println("Validating DNS...")
-			if err := validateDomainDNS(ctx, executor, appCfg.Domain, host); err != nil {
+			notes, err := validateDomainDNS(ctx, executor, appCfg.Domain, host)
+			if err != nil {
 				return err
+			}
+			for _, note := range notes {
+				fmt.Printf("  Note: %s\n", note)
 			}
 			fmt.Println("  DNS validated")
 		}
@@ -1008,6 +1018,9 @@ func versionFromImage(image string) string {
 
 // runMultiDeploy handles deploying to multiple servers in parallel.
 func runMultiDeploy(flags *Flags, appCfg *config.AppConfig, image, version string, skipDNSCheck bool, parallel int, migrateVolumes bool) error {
+	if err := config.ValidateDeployDomain(appCfg); err != nil {
+		return refuseAdmission(err)
+	}
 	// Resolve parallel setting.
 	if parallel <= 0 {
 		parallel = appCfg.Parallel

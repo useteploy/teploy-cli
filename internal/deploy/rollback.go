@@ -183,17 +183,11 @@ func rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg Rollbac
 	fromGeneration := current.Generation
 	nextGeneration := fromGeneration + 1
 	// The exact-block route CAS expectation (A12/T05): the app's managed
-	// region as resolved NOW, under the lock. The route switch commits
-	// only if this is still the live region; a successor's block refuses
-	// the switch with both generations named.
-	resolvedRouteHash := ""
-	if cfg.usesCaddy() {
-		region, _, rerr := cd.ReadManagedBlock(ctx, cfg.App)
-		if rerr != nil {
-			return fmt.Errorf("refusing to roll back %s with an unreadable route authority: %w", cfg.App, rerr)
-		}
-		resolvedRouteHash = caddy.ManagedRegionHash(region)
-	}
+	// region as resolved NOW, under the lock. The route switch commits only
+	// if this is still the live region; a successor's block refuses the switch
+	// with both generations named.
+	routeRegion, routePresent, routeReadErr := cd.ReadManagedBlock(ctx, cfg.App)
+	resolvedRouteHash := caddy.ManagedRegionHash(routeRegion)
 	// switchedRouteHash is re-resolved after a SUCCESSFUL switch: the block
 	// this rollback wrote but has not committed.
 	switchedRouteHash := resolvedRouteHash
@@ -239,6 +233,20 @@ func rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg Rollbac
 	if rec != nil {
 		applyRecordToRollback(&cfg, rec, &healthCfg)
 		warnRotatedSinceRelease(ctx, exec, out, cfg.App, target, rec)
+	}
+
+	// The target's record decides the ingress this rollback lands on. A
+	// caddy target refuses an unreadable route authority; a non-caddy target
+	// never needed the Caddyfile and retires any block after the state commit.
+	var staleRoute staleRouteBlock
+	if cfg.usesCaddy() {
+		if routeReadErr != nil {
+			return fmt.Errorf("refusing to roll back %s with an unreadable route authority: %w", cfg.App, routeReadErr)
+		}
+	} else if routeReadErr != nil {
+		fmt.Fprintf(out, "Warning: could not check for a stale Caddy route for %s: %v\n", cfg.App, routeReadErr)
+	} else if routePresent {
+		staleRoute = staleRouteFromRegion(routeRegion)
 	}
 
 	// The recorded primary container port (TCL-14): with more than one
@@ -563,8 +571,16 @@ func rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg Rollbac
 	if ingress == "" && current.IngressMode != "" {
 		ingress = current.IngressMode
 	}
+	// The target release's record names its domain: a rollback across an
+	// ingress or domain change must not keep the rolled-back-from release's.
 	domain := current.Domain
-	if domain == "" {
+	switch {
+	case rec != nil && rec.Domain != "":
+		domain = rec.Domain
+	case rec != nil && !rec.Backfilled && !cfg.usesCaddy():
+		domain = ""
+	}
+	if domain == "" && cfg.usesCaddy() {
 		domain = cfg.Domain
 	}
 	newState := state.NewAppliedState(current, deploymentType, ingress, domain)
@@ -651,6 +667,16 @@ func rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg Rollbac
 		return fmt.Errorf("committing authoritative applied state after rollback route switch: %w; the original route was restored, the original workload was left running, and the uncommitted target was stopped", err)
 	}
 
+	// The non-caddy target is authoritative: retire the route the rolled-back-
+	// from caddy release left. Degraded, never a failed rollback: the next
+	// deploy retries it and `teploy domains check` reports it until then.
+	degradedReason := ""
+	if !cfg.usesCaddy() {
+		if err := retireStaleRoute(ctx, cd, out, cfg.App, cfg.Ingress, staleRoute, fromGeneration, lk.GuardPrefix()); err != nil {
+			degradedReason = fmt.Sprintf("stale Caddy route not removed: %v", err)
+		}
+	}
+
 	// 6. The authoritative commit succeeded; the prior current workload can
 	// now be stopped (match by version label — see step 2). A fence loss
 	// here (F16) means another operation owns the app: refuse further
@@ -700,12 +726,14 @@ func rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg Rollbac
 
 	// 7. Log.
 	state.AppendLog(ctx, exec, state.LogEntry{
-		Timestamp:  time.Now().UTC(),
-		App:        cfg.App,
-		Type:       "rollback",
-		Hash:       target,
-		Success:    true,
-		DurationMs: time.Since(start).Milliseconds(),
+		Timestamp:      time.Now().UTC(),
+		App:            cfg.App,
+		Type:           "rollback",
+		Hash:           target,
+		Success:        true,
+		Degraded:       degradedReason != "",
+		DegradedReason: degradedReason,
+		DurationMs:     time.Since(start).Milliseconds(),
 	})
 
 	duration := time.Since(start)
@@ -734,6 +762,11 @@ func restoreRollbackRoute(ctx context.Context, exec ssh.Executor, out io.Writer,
 	restoreCaddy := cd.WithGeneration(generation)
 	if len(routeCAS) > 0 {
 		restoreCaddy = restoreCaddy.WithRouteCAS(cfg.App, routeCAS, generation)
+	}
+	// The rolled-back-from release is not caddy-routed: it has no route to put
+	// back, only the block this rollback wrote to take out.
+	if current.IngressMode != "" && current.IngressMode != "caddy" {
+		return restoreCaddy.RemoveRoute(ctx, cfg.App)
 	}
 
 	rec, recErr := releasemeta.Read(ctx, exec, cfg.App, current.CurrentHash)
@@ -795,7 +828,7 @@ func restoreRollbackRouteFromReceipt(ctx context.Context, cd *caddy.Client, cfg 
 	fw := cfg.Firewall
 	access := cfg.Access
 	if rec.Caddy != nil {
-		tls = caddy.TLS{Cert: rec.Caddy.TLSCert, Key: rec.Caddy.TLSKey, Internal: rec.Caddy.TLSInternal}
+		tls = caddy.TLS{Cert: rec.Caddy.TLSCert, Key: rec.Caddy.TLSKey, Internal: rec.Caddy.TLSInternal, HTTPOnly: rec.Caddy.HTTPOnlyOr(cfg.TLSHTTPOnly)}
 		caddyExtra = rec.Caddy.CaddyExtra
 		cache = rec.Caddy.Cache
 		if rec.Caddy.Firewall != nil {
@@ -906,6 +939,8 @@ func applyRecordToRollback(cfg *RollbackConfig, rec *releasemeta.Record, healthC
 		cfg.TLSCert = rec.Caddy.TLSCert
 		cfg.TLSKey = rec.Caddy.TLSKey
 		cfg.TLSInternal = rec.Caddy.TLSInternal
+		// Records written before this field keep what the caller resolved.
+		cfg.TLSHTTPOnly = rec.Caddy.HTTPOnlyOr(cfg.TLSHTTPOnly)
 		cfg.CaddyExtra = rec.Caddy.CaddyExtra
 		cfg.Cache = rec.Caddy.Cache
 		if rec.Caddy.Firewall != nil {

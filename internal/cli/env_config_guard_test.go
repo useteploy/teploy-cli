@@ -36,7 +36,7 @@ func TestCheckEnvConfigGuard(t *testing.T) {
 	ctx := context.Background()
 	ex := localConfigHome(t)
 
-	if _, err := confighome.Write(ctx, ex, "blog", []byte("app: blog\nimage: nginx:1\ndomain: blog.example.com\nenv:\n  LOG_LEVEL: debug\nenv_literal:\n  FEATURE_FLAG: 'on'\n"), "", confighome.Author{Name: "t", Email: "t@teploy"}, "create"); err != nil {
+	if _, err := confighome.Write(ctx, ex, "blog", []byte("app: blog\nimage: nginx:1\ndomain: blog.teploy-fixture.dev\nenv:\n  LOG_LEVEL: debug\nenv_literal:\n  FEATURE_FLAG: 'on'\n"), "", confighome.Author{Name: "t", Email: "t@teploy"}, "create"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -86,7 +86,7 @@ func TestServerSecretConfig(t *testing.T) {
 	ctx := context.Background()
 	ex := localConfigHome(t)
 
-	if _, err := confighome.Write(ctx, ex, "vaultapp", []byte("app: vaultapp\nimage: nginx:1\ndomain: vault.example.com\nsecret:\n  provider: openbao\n  accessory: bao\n"), "", confighome.Author{Name: "t", Email: "t@teploy"}, "create"); err != nil {
+	if _, err := confighome.Write(ctx, ex, "vaultapp", []byte("app: vaultapp\nimage: nginx:1\ndomain: vault.teploy-fixture.dev\nsecret:\n  provider: openbao\n  accessory: bao\n"), "", confighome.Author{Name: "t", Email: "t@teploy"}, "create"); err != nil {
 		t.Fatal(err)
 	}
 	sc, ok, err := serverSecretConfig(ctx, ex, "vaultapp")

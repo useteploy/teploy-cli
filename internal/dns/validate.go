@@ -1,6 +1,7 @@
 package dns
 
 import (
+	"errors"
 	"fmt"
 	"net"
 )
@@ -8,8 +9,14 @@ import (
 // Resolver resolves a hostname to IP addresses.
 type Resolver func(host string) ([]string, error)
 
+// ErrProxied marks a domain whose answers all belong to Cloudflare: it may well
+// reach this server through the proxy, which DNS cannot show. Callers treat it
+// as a hint, not a mismatch.
+var ErrProxied = errors.New("domain is proxied by Cloudflare")
+
 // Validate checks that the domain's DNS A record points at the server IP.
-// Returns nil if any resolved IP matches, or an error with the expected IP.
+// Returns nil if any resolved IP matches, an error wrapping ErrProxied when
+// every answer is a Cloudflare address, or an error with the expected IP.
 // It also returns an error when either name resolves to no addresses.
 // Pass nil for resolve to use the default net.LookupHost.
 func Validate(domain, serverHost string, resolve Resolver) error {
@@ -33,12 +40,11 @@ func Validate(domain, serverHost string, resolve Resolver) error {
 		return fmt.Errorf("could not resolve server %s: no addresses returned", serverHost)
 	}
 
-	for _, dip := range domainIPs {
-		for _, sip := range serverIPs {
-			if dip == sip {
-				return nil
-			}
-		}
+	if anyMatch(domainIPs, serverIPs) {
+		return nil
+	}
+	if AllCloudflare(domainIPs) {
+		return fmt.Errorf("%w: %s resolves to %s", ErrProxied, domain, domainIPs[0])
 	}
 
 	return fmt.Errorf(
@@ -61,12 +67,26 @@ func Resolves(domain string, ips []string, resolve Resolver) bool {
 	if err != nil {
 		return false
 	}
-	for _, dip := range domainIPs {
-		for _, ip := range ips {
-			if dip == ip {
+	return anyMatch(domainIPs, ips)
+}
+
+// anyMatch compares addresses by value, so two spellings of one IPv6 address
+// match.
+func anyMatch(a, b []string) bool {
+	for _, x := range a {
+		for _, y := range b {
+			if sameIP(x, y) {
 				return true
 			}
 		}
 	}
 	return false
+}
+
+func sameIP(a, b string) bool {
+	if a == b {
+		return true
+	}
+	x, y := net.ParseIP(a), net.ParseIP(b)
+	return x != nil && y != nil && x.Equal(y)
 }

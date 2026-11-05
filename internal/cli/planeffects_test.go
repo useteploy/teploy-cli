@@ -1,12 +1,15 @@
 package cli
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"strings"
 	"testing"
 
 	"github.com/useteploy/teploy/internal/config"
 	"github.com/useteploy/teploy/internal/releasemeta"
+	"github.com/useteploy/teploy/internal/ssh"
 	"github.com/useteploy/teploy/internal/state"
 )
 
@@ -298,5 +301,35 @@ func TestPlanRecordJSON_Shape(t *testing.T) {
 	}
 	if img["needs_build"] != true {
 		t.Errorf("image.needs_build = %v", img["needs_build"])
+	}
+}
+
+func TestStaleRouteEffects(t *testing.T) {
+	block := "# TEPLOY BEGIN blog\n# TEPLOY GENERATION 2\nblog.dev, www.blog.dev {\n\treverse_proxy blog-web-a:3000\n}\n# TEPLOY END blog\n"
+	var out bytes.Buffer
+	withFile := func(content string) *ssh.MockExecutor {
+		m := ssh.NewMockExecutor("1.2.3.4")
+		m.Files["/deployments/caddy/Caddyfile"] = []byte(content)
+		return m
+	}
+	host := &config.AppConfig{App: "blog", Ingress: config.IngressHost, Port: 3000}
+	effects := staleRouteEffects(context.Background(), withFile(block), &out, host)
+	if len(effects) != 1 || effects[0].Action != "remove" || effects[0].From != "blog.dev,www.blog.dev" {
+		t.Fatalf("a non-caddy plan must show the block going: %+v", effects)
+	}
+	if got := staleRouteEffects(context.Background(), withFile("# nothing\n"), &out, host); got != nil {
+		t.Errorf("no block, no effect: %+v", got)
+	}
+	if d := effects[0].Detail; strings.Contains(d, "WARNING") {
+		t.Errorf("an ordinary block warns about nothing: %s", d)
+	}
+	risky := "# TEPLOY BEGIN blog\nblog.dev {\n\t# TEPLOY WEBHOOK BEGIN blog\n\t@h {\n\t\tpath /x\n\t}\n\t# TEPLOY WEBHOOK END blog\n\treverse_proxy other-box:8080\n}\n# TEPLOY END blog\n"
+	got := staleRouteEffects(context.Background(), withFile(risky), &out, host)
+	if len(got) != 1 || !strings.Contains(got[0].Detail, "webhook") || !strings.Contains(got[0].Detail, "other-box:8080") {
+		t.Errorf("the plan must warn about what removal cuts: %+v", got)
+	}
+	caddy := &config.AppConfig{App: "blog", Domain: "blog.dev"}
+	if got := staleRouteEffects(context.Background(), withFile(block), &out, caddy); got != nil {
+		t.Errorf("a caddy plan keeps its route: %+v", got)
 	}
 }

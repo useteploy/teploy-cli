@@ -20,7 +20,7 @@ func writeAndLoad(t *testing.T, body string) (*AppConfig, error) {
 
 func TestLoadApp_DockerfileAndContextParse(t *testing.T) {
 	cfg, err := writeAndLoad(t, `app: myapp
-domain: app.example.com
+domain: app.teploy-fixture.dev
 context: .
 dockerfile: server/monolith/Dockerfile
 `)
@@ -37,7 +37,7 @@ dockerfile: server/monolith/Dockerfile
 
 func TestLoadApp_DockerfileWithImageRejected(t *testing.T) {
 	_, err := writeAndLoad(t, `app: myapp
-domain: app.example.com
+domain: app.teploy-fixture.dev
 image: registry.example.com/myapp:latest
 dockerfile: server/Dockerfile
 `)
@@ -51,7 +51,7 @@ dockerfile: server/Dockerfile
 
 func TestLoadApp_ContextOnStaticRejected(t *testing.T) {
 	_, err := writeAndLoad(t, `app: myapp
-domain: app.example.com
+domain: app.teploy-fixture.dev
 type: static
 source: ./dist
 context: web
@@ -66,7 +66,7 @@ context: web
 
 func TestLoadApp_AbsoluteContextRejected(t *testing.T) {
 	_, err := writeAndLoad(t, `app: myapp
-domain: app.example.com
+domain: app.teploy-fixture.dev
 context: /etc
 `)
 	if err == nil {
@@ -79,7 +79,7 @@ context: /etc
 
 func TestLoadApp_EscapingDockerfileRejected(t *testing.T) {
 	_, err := writeAndLoad(t, `app: myapp
-domain: app.example.com
+domain: app.teploy-fixture.dev
 dockerfile: ../../etc/Dockerfile
 `)
 	if err == nil {

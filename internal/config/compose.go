@@ -225,8 +225,9 @@ func mapCompose(dir string, compose composeFile) (*AppConfig, error) {
 	cfg.Context = webBuildContext
 	cfg.Dockerfile = webDockerfile
 
-	// Set domain placeholder — user must set this.
-	cfg.Domain = cfg.App + ".example.com"
+	// Compose has no domain: nothing is fabricated. A placeholder that deploys
+	// sends Caddy after a certificate it can never get, forever. Deploy admission
+	// asks for the real name (ValidateDeployDomain).
 
 	// Web process gets empty command (use image CMD).
 	cfg.Processes["web"] = parseCommand(webService.Command)

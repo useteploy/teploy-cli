@@ -7,7 +7,7 @@ import (
 
 func TestLoadApp_FirewallParses(t *testing.T) {
 	cfg, err := writeAndLoad(t, `app: myapp
-domain: app.example.com
+domain: app.teploy-fixture.dev
 firewall:
   allow_ips:
     - 10.0.0.0/8
@@ -31,7 +31,7 @@ firewall:
 
 func TestLoadApp_FirewallBadIPRejected(t *testing.T) {
 	_, err := writeAndLoad(t, `app: myapp
-domain: app.example.com
+domain: app.teploy-fixture.dev
 firewall:
   deny_ips:
     - not-an-ip
@@ -43,7 +43,7 @@ firewall:
 
 func TestLoadApp_FirewallBadBodySizeRejected(t *testing.T) {
 	_, err := writeAndLoad(t, `app: myapp
-domain: app.example.com
+domain: app.teploy-fixture.dev
 firewall:
   max_body_size: 10 potatoes
 `)
@@ -54,7 +54,7 @@ firewall:
 
 func TestLoadApp_FirewallUserAgentInjectionRejected(t *testing.T) {
 	_, err := writeAndLoad(t, `app: myapp
-domain: app.example.com
+domain: app.teploy-fixture.dev
 firewall:
   block_user_agents:
     - "bad}\nexample.com {"
@@ -66,7 +66,7 @@ firewall:
 
 func TestLoadApp_FirewallOnStaticRejected(t *testing.T) {
 	_, err := writeAndLoad(t, `app: myapp
-domain: app.example.com
+domain: app.teploy-fixture.dev
 type: static
 source: dist
 firewall:
@@ -80,7 +80,7 @@ firewall:
 
 func TestLoadApp_FirewallOnExternalIngressRejected(t *testing.T) {
 	_, err := writeAndLoad(t, `app: myapp
-domain: app.example.com
+domain: app.teploy-fixture.dev
 ingress: external
 firewall:
   deny_ips:

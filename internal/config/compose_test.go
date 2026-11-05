@@ -1628,3 +1628,24 @@ services:
 		t.Errorf("bind classification broken for the imported keys")
 	}
 }
+
+// Compose carries no domain, and none is invented: a fabricated
+// <app>.example.com is what sent Caddy after certificates it could never get.
+// The folder still loads for read and recovery commands; deploying asks for one.
+func TestLoadApp_ComposeLoadsButDeployNeedsADomain(t *testing.T) {
+	dir := t.TempDir()
+	content := "services:\n  web:\n    image: nginx:1\n    ports:\n      - \"80:80\"\n"
+	if err := os.WriteFile(filepath.Join(dir, "docker-compose.yml"), []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadApp(dir)
+	if err != nil {
+		t.Fatalf("a Compose-only folder must load: %v", err)
+	}
+	if cfg.Domain != "" {
+		t.Fatalf("Compose import fabricated a domain: %q", cfg.Domain)
+	}
+	if err := ValidateDeployDomain(cfg); err == nil || !strings.Contains(err.Error(), "Compose files carry no domain") {
+		t.Fatalf("deploy admission should ask for a domain, got %v", err)
+	}
+}

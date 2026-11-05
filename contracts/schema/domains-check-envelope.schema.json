@@ -1,0 +1,107 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://teploy.github.io/contracts/schema/domains-check-envelope.schema.json",
+  "title": "`teploy domains check --json` envelope: DNS, certificate and route evidence per (server, app, host) (rev 17). What could not be established reads unknown, never healthy.",
+  "type": "object",
+  "required": ["machine_interface", "checked_at", "log_window_seconds", "resolvers", "cloudflare_ranges_as_of", "servers", "domains"],
+  "properties": {
+    "machine_interface": {"type": "integer", "minimum": 1},
+    "checked_at": {"type": "string", "format": "date-time"},
+    "log_window_seconds": {"type": "integer", "minimum": 1},
+    "resolvers": {"type": "array", "items": {"type": "string"}},
+    "cloudflare_ranges_as_of": {"type": "string"},
+    "servers": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["server", "host", "state", "checked_at", "addresses", "public_address_known", "public_ipv4_known", "public_ipv6_known", "caddy", "issues"],
+        "properties": {
+          "server": {"type": "string", "minLength": 1},
+          "host": {"type": "string"},
+          "state": {"enum": ["ok", "partial", "unreachable"]},
+          "checked_at": {"type": "string", "format": "date-time"},
+          "error": {"type": "string"},
+          "addresses": {"type": "array", "items": {"type": "string"}},
+          "public_address_known": {"type": "boolean"},
+          "public_ipv4_known": {"type": "boolean"},
+          "public_ipv6_known": {"type": "boolean"},
+          "caddy": {
+            "type": "object",
+            "required": ["container", "caddyfile", "logs", "log_coverage_seconds"],
+            "properties": {
+              "container": {"enum": ["present", "absent", "stopped", "unknown"]},
+              "caddyfile": {"enum": ["present", "absent", "unparseable", "unreadable"]},
+              "logs": {"enum": ["ok", "short", "partial", "unavailable", "no_caddy"]},
+              "log_coverage_seconds": {"type": "integer", "minimum": 0},
+              "logs_truncated": {"type": "boolean"}
+            }
+          },
+          "issues": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["scope", "message"],
+              "properties": {"scope": {"type": "string"}, "message": {"type": "string"}}
+            }
+          }
+        }
+      }
+    },
+    "domains": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["server", "app", "host", "ingress", "dns", "tls", "route"],
+        "properties": {
+          "server": {"type": "string", "minLength": 1},
+          "app": {"type": "string", "description": "empty for a hand-written block no app claims"},
+          "host": {"type": "string", "minLength": 1},
+          "ingress": {"enum": ["caddy", "host", "external", ""]},
+          "skip": {"enum": ["external_label", "host_label", "ip_literal", "wildcard", "private_name", "reserved_name", "invalid_name"]},
+          "dns": {
+            "type": "object",
+            "required": ["status", "answers"],
+            "properties": {
+              "status": {"enum": ["ok", "nxdomain", "wrong_target", "proxied", "unknown", "skipped"]},
+              "answers": {"type": "array", "items": {"type": "string"}},
+              "detail": {"type": "string"}
+            }
+          },
+          "tls": {
+            "type": "object",
+            "required": ["status", "failures"],
+            "properties": {
+              "status": {"enum": ["ok", "failing", "unknown", "not_applicable"]},
+              "failures": {"type": ["integer", "null"], "minimum": 0, "description": "null when unknown; never 0 on short or unavailable logs"},
+              "failing_since": {"type": "string", "format": "date-time"},
+              "last_failure_at": {"type": "string", "format": "date-time"},
+              "last_success_at": {"type": "string", "format": "date-time"},
+              "last_error": {"type": "string"}
+            }
+          },
+          "route": {
+            "type": "object",
+            "required": ["kind", "upstreams", "upstream_resolves"],
+            "properties": {
+              "kind": {"enum": ["managed", "manual", "stale_managed", "orphan_managed", "none", "unknown"]},
+              "owner": {"type": "string"},
+              "tls": {"enum": ["acme", "internal", "custom", "http_only"]},
+              "upstreams": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": ["dial", "resolves"],
+                  "properties": {
+                    "dial": {"type": "string"},
+                    "resolves": {"enum": ["yes", "no", "unknown", "not_applicable"]}
+                  }
+                }
+              },
+              "upstream_resolves": {"enum": ["yes", "no", "partial", "unknown", "not_applicable"]}
+            }
+          }
+        }
+      }
+    }
+  }
+}
