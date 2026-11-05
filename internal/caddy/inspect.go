@@ -6,6 +6,7 @@ package caddy
 import (
 	"context"
 	"net"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -181,6 +182,7 @@ func inspectSite(owner string, b SiteBlock) RouteSite {
 		}
 	}
 	sort.Strings(site.Upstreams)
+	site.Upstreams = slices.Compact(site.Upstreams)
 	return site
 }
 

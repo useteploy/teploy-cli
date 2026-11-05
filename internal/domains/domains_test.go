@@ -434,3 +434,36 @@ func TestTLSResult_UnknownFailuresEncodeAsNull(t *testing.T) {
 		t.Errorf("got %s", raw)
 	}
 }
+
+// A placeholder on an unrouted host-ingress app is a label, not a missing route,
+// and nothing is looked up for it.
+func TestCheckServer_ReservedHostIngressNameIsALabel(t *testing.T) {
+	m := fleetMock("hand.dev {\n\trespond ok\n}\n", logsOK(), map[string]string{"dash": appState("host", "dash.example.com")}, "")
+	looked := map[string]bool{}
+	cache := NewDNSCacheWith(func(ctx context.Context, host string) dns.PublicAnswer {
+		looked[host] = true
+		return dns.PublicAnswer{Answers: []string{"192.0.2.10"}}
+	})
+	_, rows := runCheck(t, m, cache, Options{})
+	r := rows["dash.example.com"]
+	if r.Skip != SkipHostLabel || r.Route.Kind != RouteNone || r.DNS.Status != dns.StatusSkipped {
+		t.Errorf("row = %+v", r)
+	}
+	if looked["dash.example.com"] {
+		t.Error("a reserved name was looked up")
+	}
+}
+
+// A preview has no app state: live while its containers resolve, left behind
+// once they do not. Repeated dials of one upstream are listed once.
+func TestCheckServer_PreviewRoutes(t *testing.T) {
+	caddyfile := "# TEPLOY BEGIN app-preview-p-live\nlive.dev {\n\treverse_proxy a:80\n\treverse_proxy a:80\n}\n# TEPLOY END app-preview-p-live\n\n# TEPLOY BEGIN app-preview-p-dead\ndead.dev {\n\treverse_proxy b:80\n}\n# TEPLOY END app-preview-p-dead\n"
+	m := fleetMock(caddyfile, logsOK(), map[string]string{}, "0 a\n2 b\n")
+	_, rows := runCheck(t, m, staticDNS(nil), Options{})
+	if r := rows["live.dev"]; r.Route.Kind != RouteManaged || len(r.Route.Upstreams) != 1 {
+		t.Errorf("live preview = %+v", r.Route)
+	}
+	if r := rows["dead.dev"]; r.Route.Kind != RouteOrphanManaged || r.Route.UpstreamResolves != ResolvesNo {
+		t.Errorf("dead preview = %+v", r.Route)
+	}
+}

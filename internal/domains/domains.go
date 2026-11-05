@@ -784,10 +784,9 @@ func routeFor(site caddy.RouteSite, ingressOf map[string]string, stateKnown bool
 	return r
 }
 
+// skipFor checks the label case first: an unrouted host or external domain is
+// a label whatever its name looks like, including a reserved placeholder.
 func skipFor(row Domain, host string) string {
-	if reason := classifyName(host); reason != "" {
-		return reason
-	}
 	if row.Route.Kind == RouteNone {
 		switch row.Ingress {
 		case config.IngressExternal:
@@ -796,7 +795,7 @@ func skipFor(row Domain, host string) string {
 			return SkipHostLabel
 		}
 	}
-	return ""
+	return classifyName(host)
 }
 
 var upstreamHostRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
@@ -876,6 +875,11 @@ func resolveUpstreams(ctx context.Context, exec ssh.Executor, rows []Domain, srv
 				unknown++
 			}
 		}
+		// Preview routes have no app state of their own; a preview whose
+		// containers still resolve is live, and only a dead one is left behind.
+		if r.Kind == RouteOrphanManaged && strings.Contains(r.Owner, "-preview-") && len(r.Upstreams) > 0 && yes == len(r.Upstreams) {
+			r.Kind = RouteManaged
+		}
 		switch {
 		case len(r.Upstreams) == 0:
 		case no > 0 && yes == 0 && unknown == 0:
@@ -937,14 +941,19 @@ func applyDNS(ctx context.Context, rows []Domain, addrs []string, publicKnown bo
 	var wg sync.WaitGroup
 	for i := range rows {
 		row := &rows[i]
-		switch row.Skip {
+		if row.Skip == SkipExternalLabel {
+			continue
+		}
+		// Name rules apply to a label too: a host-ingress placeholder has no
+		// public record to look for.
+		switch classifyName(row.Host) {
 		case SkipReservedName:
 			row.DNS.Detail = "reserved name: never publicly resolvable"
 			continue
 		case SkipPrivateName:
 			row.DNS.Detail = "private name: only resolves inside a network"
 			continue
-		case SkipIPLiteral, SkipWildcard, SkipInvalidName, SkipExternalLabel:
+		case SkipIPLiteral, SkipWildcard, SkipInvalidName:
 			continue
 		}
 		wg.Add(1)
