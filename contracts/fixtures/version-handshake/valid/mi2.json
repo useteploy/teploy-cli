@@ -3,6 +3,7 @@
     "actor-flag-v1",
     "app-list-machine",
     "autodeploy-redeploy",
+    "backup-fleet-v1",
     "backup-json-v1",
     "backup-target-v1",
     "config-home-v1",

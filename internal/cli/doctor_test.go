@@ -21,7 +21,7 @@ import (
 // against (adding checks is additive at the end; renaming/removing is a
 // machine-interface bump).
 var doctorCheckOrder = []string{
-	"git", "config", "ssh", "docker", "disk", "registry", "caddy", "compatibility", "repair-debt", "secret-exposure", "server-tools", "config-home", "backup-cron", "age-identity", "git-trigger", "scheduler", "restore-leftovers", "backup-coverage"}
+	"git", "config", "ssh", "docker", "disk", "registry", "caddy", "compatibility", "repair-debt", "secret-exposure", "server-tools", "config-home", "backup-cron", "age-identity", "git-trigger", "scheduler", "restore-leftovers", "backup-coverage", "backup-policy"}
 
 // doctorHappyMock registers every remote read a fully healthy target
 // answers, for the app config returned by doctorTestApp.
@@ -41,6 +41,13 @@ func doctorHappyMock() *ssh.MockExecutor {
 		ssh.MockCommand{Match: "sched_daemon=no", Output: "daemon=yes\nenabled=enabled\ncrontab=yes\nteploy_entries=0\n"},
 		ssh.MockCommand{Match: "for d in /var/tmp/teploy-pre-restore.*", Output: ""},
 		ssh.MockCommand{Match: "docker ps --filter label=teploy.role=accessory", Output: ""},
+		ssh.MockCommand{Match: "if [ -d /etc/teploy ]", Output: "absent\n"},
+		ssh.MockCommand{Match: "for p in /etc/teploy/backup-target.json", Output: "absent\n"},
+		ssh.MockCommand{Match: "command -v aws >/dev/null", Output: "aws\nage\n"},
+		ssh.MockCommand{Match: "ids=$(docker ps -aq", Output: ""},
+		ssh.MockCommand{Match: "for d in /deployments/*/volumes", Output: ""},
+		ssh.MockCommand{Match: "for d in '/var/tmp'/teploy-backup", Output: ""},
+		ssh.MockCommand{Match: "python3 -c", Output: ""},
 	)
 }
 
@@ -89,8 +96,8 @@ func TestDoctorAllChecksPass(t *testing.T) {
 	if ex == nil {
 		t.Fatal("expected an executor back")
 	}
-	if report.Summary != (doctorSummary{OK: 18, Warn: 0, Fail: 0}) {
-		t.Fatalf("summary = %+v, want 18 ok", report.Summary)
+	if report.Summary != (doctorSummary{OK: 19, Warn: 0, Fail: 0}) {
+		t.Fatalf("summary = %+v, want 19 ok", report.Summary)
 	}
 	if len(report.Checks) != len(doctorCheckOrder) {
 		t.Fatalf("got %d checks, want %d", len(report.Checks), len(doctorCheckOrder))
@@ -137,7 +144,7 @@ func TestDoctorJSONStableShape(t *testing.T) {
 		t.Fatalf("machine_interface = %v, want %d", doc["machine_interface"], MachineInterface)
 	}
 	checks, ok := doc["checks"].([]any)
-	if !ok || len(checks) != 18 {
+	if !ok || len(checks) != 19 {
 		t.Fatalf("checks = %#v, want 18 entries", doc["checks"])
 	}
 	for i, raw := range checks {
@@ -198,6 +205,13 @@ func TestDoctorHumanTable(t *testing.T) {
 		ssh.MockCommand{Match: "sched_daemon=no", Output: "daemon=yes\nenabled=enabled\ncrontab=yes\nteploy_entries=0\n"},
 		ssh.MockCommand{Match: "for d in /var/tmp/teploy-pre-restore.*", Output: ""},
 		ssh.MockCommand{Match: "docker ps --filter label=teploy.role=accessory", Output: ""},
+		ssh.MockCommand{Match: "for p in /etc/teploy/backup-", Output: "absent\n"},
+		ssh.MockCommand{Match: "if [ -d /etc/teploy ]", Output: "absent\n"},
+		ssh.MockCommand{Match: "command -v aws >/dev/null", Output: "aws\nage\n"},
+		ssh.MockCommand{Match: "ids=$(docker ps -aq", Output: ""},
+		ssh.MockCommand{Match: "for d in /deployments/*/volumes", Output: ""},
+		ssh.MockCommand{Match: "for d in '/var/tmp'/teploy-backup", Output: ""},
+		ssh.MockCommand{Match: "python3 -c", Output: ""},
 	)
 	report, _ := doctorRun(context.Background(), doctorTestDeps(mock), &Flags{}, "", doctorTestApp(), nil)
 	var out bytes.Buffer
@@ -211,7 +225,7 @@ func TestDoctorHumanTable(t *testing.T) {
 	if !strings.Contains(rendered, "fix:") {
 		t.Fatalf("table missing the remediation line:\n%s", rendered)
 	}
-	if !strings.Contains(rendered, "Summary: 17 ok, 0 warn, 1 fail") {
+	if !strings.Contains(rendered, "Summary: 18 ok, 0 warn, 1 fail") {
 		t.Fatalf("table summary line wrong:\n%s", rendered)
 	}
 	assertDoctorReadOnlyCalls(t, mock.Calls)
@@ -684,7 +698,7 @@ func TestDoctorEndToEndAllOK(t *testing.T) {
 	if err := runDoctor(doctorTestDeps(mock), &Flags{}, "", &out); err != nil {
 		t.Fatalf("runDoctor: %v", err)
 	}
-	if !strings.Contains(out.String(), "Summary: 18 ok, 0 warn, 0 fail") {
+	if !strings.Contains(out.String(), "Summary: 19 ok, 0 warn, 0 fail") {
 		t.Fatalf("human report wrong:\n%s", out.String())
 	}
 	assertDoctorReadOnlyCalls(t, mock.Calls)
@@ -712,6 +726,15 @@ func assertDoctorReadOnlyCalls(t *testing.T, calls []string) {
 		"sched_daemon=no; for f in /proc/",
 		"for d in /var/tmp/teploy-pre-restore.*",
 		"docker ps --filter label=teploy.role=accessory",
+		"for p in /etc/teploy/backup-",
+		"if [ -d /etc/teploy ]",
+		"command -v aws >/dev/null",
+		"aws s3api get-bucket-lifecycle-configuration",
+		"aws s3 ls",
+		"ids=$(docker ps -aq",
+		"for d in /deployments/*/volumes",
+		"for d in '/var/tmp'/teploy-backup",
+		"python3 -c",
 	}
 	for _, call := range calls {
 		allowed := false

@@ -14,7 +14,8 @@
       "size_bytes": 1048576,
       "created_at": "2026-10-20T03:17:04Z",
       "key": "s3://teploy-backups/blog/volumes/20261020-031704-1f2e3d4c5b6a7988.tar.gz",
-      "restorable": true
+      "restorable": true,
+      "encrypted": false
     },
     {
       "id": "20261020-031704-1f2e3d4c5b6a7988",
@@ -22,7 +23,8 @@
       "size_bytes": 4096,
       "created_at": "2026-10-20T03:17:04Z",
       "key": "s3://teploy-backups/blog/teploy/20261020-031704-1f2e3d4c5b6a7988.tar.gz",
-      "restorable": true
+      "restorable": true,
+      "encrypted": false
     },
     {
       "id": "20261019-030001",
@@ -31,7 +33,8 @@
       "size_bytes": 2097152,
       "created_at": "2026-10-19T03:00:01Z",
       "key": "s3://teploy-backups/blog/accessories/db/20261019-030001.sql.gz",
-      "restorable": true
+      "restorable": true,
+      "encrypted": false
     }
   ],
   "schedules": [

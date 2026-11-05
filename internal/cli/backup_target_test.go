@@ -2,10 +2,14 @@ package cli
 
 import (
 	"context"
+	"errors"
+	"io"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/useteploy/teploy/internal/backup"
+	"github.com/useteploy/teploy/internal/events"
 	"github.com/useteploy/teploy/internal/ssh"
 )
 
@@ -154,5 +158,51 @@ func TestBackupRunNeedsTarget(t *testing.T) {
 		if strings.Contains(call, "docker") || strings.Contains(call, "aws s3") {
 			t.Errorf("no docker/aws work may run without a target: %s", call)
 		}
+	}
+}
+
+// A marker is all that stops a prune deleting that server's objects: removing one,
+// or being refused, is on the record.
+func TestClearOwnerMarkersIsRecorded(t *testing.T) {
+	now := time.Date(2026, 11, 5, 12, 0, 0, 0, time.Local)
+	mk := func() *ssh.MockExecutor {
+		return ssh.NewMockExecutor("h",
+			ssh.MockCommand{Match: "{ cat /etc/machine-id", Output: "0123456789abcdef0123456789abcdef  -\n"},
+			ssh.MockCommand{Match: "aws s3 ls", Output: now.Add(-time.Hour).Format("2006-01-02 15:04:05") + " 20 app/.owners/aaaaaaaaaaaaaaaa\n"},
+			ssh.MockCommand{Match: "aws s3 rm", Output: ""},
+			ssh.MockCommand{Match: "python3 -c", Output: `{"seq":1,"ts":"2026-01-01T00:00:00Z"}`},
+		)
+	}
+	s3 := []backup.S3Config{{Bucket: "b", Region: "r"}}
+	recorded := func(mock *ssh.MockExecutor) {
+		t.Helper()
+		for _, c := range mock.Calls {
+			if strings.HasPrefix(c, "python3 -c") && strings.Contains(c, "append '_fleet'") {
+				return
+			}
+		}
+		t.Fatalf("no event: %v", mock.Calls)
+	}
+	mock := mk()
+	n, err := clearOwnerMarkers(context.Background(), mock, backup.NewClient(mock, io.Discard), s3, "aaaaaaaaaaaaaaaa", false, now)
+	if !errors.Is(err, backup.ErrMarkerRecent) || n != 0 {
+		t.Fatalf("%d %v", n, err)
+	}
+	recorded(mock)
+	mock = mk()
+	if n, err = clearOwnerMarkers(context.Background(), mock, backup.NewClient(mock, io.Discard), s3, "aaaaaaaaaaaaaaaa", true, now); err != nil || n != 1 {
+		t.Fatalf("%d %v", n, err)
+	}
+	recorded(mock)
+	// Through Sanitize, which is what reaches the log: a kind's detail is allowlisted.
+	ev := ownerClearEvent("f", false, 0, backup.ErrMarkerRecent)
+	events.Sanitize(&ev)
+	if ev.Outcome != events.Refused || ev.Detail["fingerprint"] != "f" || ev.Detail["error"] == nil {
+		t.Fatalf("%+v", ev)
+	}
+	ev = ownerClearEvent("f", true, 1, nil)
+	events.Sanitize(&ev)
+	if ev.Outcome != events.Succeeded || ev.Detail["force"] != true || ev.Detail["removed"] != 1 {
+		t.Fatalf("%+v", ev)
 	}
 }

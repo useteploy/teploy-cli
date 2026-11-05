@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"path"
 	"sort"
 	"strings"
 	"time"
@@ -111,6 +113,10 @@ type SecretsRecord struct {
 	// can only be decrypted with the ORIGINAL host's age key — Recovery
 	// states that requirement in operator language.
 	AgeKeyIncluded bool `json:"age_key_included"`
+	// AgeKeyWrapped says the bundled key is the member age-key.age, encrypted to
+	// the owner's recovery key only: restoring it needs `dr restore --identity`.
+	// A bundle with AgeKeyIncluded and not this is from before G1 (plain member).
+	AgeKeyWrapped bool `json:"age_key_wrapped,omitempty"`
 	// Included lists the secret-material members inside the bundle
 	// (populated only in "encrypted" mode).
 	Included []string `json:"included,omitempty"`
@@ -256,18 +262,41 @@ func (s S3BundleStore) key(app, id, member string) string {
 	return fmt.Sprintf("s3://%s/%s/dr/%s/%s", s.S3.Base(), app, id, member)
 }
 
+// Upload stores a member through the same verified path as every other backup
+// object, encrypted when a recovery key is configured (key.age). The manifest
+// stays plaintext (it is the completeness marker and a list of what is inside;
+// its members' names are visible in the bucket anyway) and a member that is
+// already age ciphertext is not wrapped twice.
 func (s S3BundleStore) Upload(ctx context.Context, exec ssh.Executor, app, id, member, serverPath string) error {
-	_, err := exec.Run(ctx, s.S3.AWS(fmt.Sprintf("s3 cp %s %s", ssh.ShellQuote(serverPath), ssh.ShellQuote(s.key(app, id, member)))))
-	if err != nil {
+	cfg := s.S3
+	if member == "manifest.json" || strings.HasSuffix(member, ageSuffix) {
+		cfg.OwnerRecipient = ""
+	}
+	if _, err := NewClient(exec, io.Discard).put(ctx, cfg, serverPath, s.key(app, id, member)); err != nil {
 		return fmt.Errorf("uploading %s: %w", s.key(app, id, member), err)
 	}
 	return nil
 }
 
+// Download fetches a member, decrypting it when it was stored encrypted:
+// bundles from before G1, and bundles made with no recovery key, have the plain
+// member name.
 func (s S3BundleStore) Download(ctx context.Context, exec ssh.Executor, app, id, member, destPath string) error {
-	_, err := exec.Run(ctx, s.S3.AWS(fmt.Sprintf("s3 cp %s %s", ssh.ShellQuote(s.key(app, id, member)), ssh.ShellQuote(destPath))))
+	key := s.key(app, id, member)
+	client := NewClient(exec, io.Discard)
+	if out, err := exec.Run(ctx, s.S3.AWS("s3 ls "+ssh.ShellQuote(key+ageSuffix))); err == nil && !strings.HasSuffix(member, ageSuffix) {
+		for _, line := range strings.Split(out, "\n") {
+			if f := strings.Fields(line); len(f) > 0 && f[len(f)-1] == path.Base(member)+ageSuffix {
+				if err := client.fetch(ctx, s.S3, key+ageSuffix, destPath); err != nil {
+					return fmt.Errorf("downloading %s: %w", key+ageSuffix, err)
+				}
+				return nil
+			}
+		}
+	}
+	_, err := exec.Run(ctx, s.S3.AWS(fmt.Sprintf("s3 cp %s %s", ssh.ShellQuote(key), ssh.ShellQuote(destPath))))
 	if err != nil {
-		return fmt.Errorf("downloading %s: %w", s.key(app, id, member), err)
+		return fmt.Errorf("downloading %s: %w", key, err)
 	}
 	return nil
 }
@@ -402,6 +431,10 @@ type BundleOptions struct {
 	// IncludeAgeKey also carries /deployments/.age-key so a fresh host can
 	// decrypt the ciphertexts. Even more sensitive; never default.
 	IncludeAgeKey bool
+	// OwnerRecipient is the recovery key an included age key is wrapped to.
+	// IncludeAgeKey refuses without one: the key is the keys to every secret on
+	// the server, and a bucket must not hold it readable.
+	OwnerRecipient string
 
 	// StopApp stops the app's web containers before snapshotting volumes
 	// (and restarts them after): the copies are then QUIESCED rather than
@@ -614,6 +647,14 @@ func (c *Client) CreateBundle(ctx context.Context, opts BundleOptions, store Bun
 		// The identity travels from wherever it lives on this target (D2
 		// moved it out of /deployments; ResolveIdentity is shared with the
 		// secret store so the two can never disagree).
+		if opts.OwnerRecipient == "" {
+			cleanup()
+			return nil, fmt.Errorf("--include-age-key needs a recovery key to wrap the server's private key to: nothing was created. Generate one with `teploy backup keygen` and store it with `teploy server backup-policy set --recipient <age1...>`")
+		}
+		if err := ValidateRecipient(opts.OwnerRecipient); err != nil {
+			cleanup()
+			return nil, err
+		}
 		keyPath, err := secret.ResolveIdentity(ctx, c.exec)
 		if err != nil {
 			cleanup()
@@ -623,13 +664,17 @@ func (c *Client) CreateBundle(ctx context.Context, opts BundleOptions, store Bun
 			cleanup()
 			return nil, fmt.Errorf("--include-age-key: no age identity on the target (expected %s or %s)", secret.IdentityPath, secret.LegacyIdentityPath)
 		}
-		if err := c.wsCopy(ctx, ws, "age-key", keyPath); err != nil {
+		// Straight from the identity file to ciphertext: no plaintext copy of the
+		// key ever sits in the bundle workspace.
+		wrapped := ws + "/age-key" + ageSuffix
+		if _, err := c.exec.Run(ctx, "umask 077; age -r "+ssh.ShellQuote(opts.OwnerRecipient)+" -o "+ssh.ShellQuote(wrapped)+" "+ssh.ShellQuote(keyPath)); err != nil {
 			cleanup()
-			return nil, err
+			return nil, fmt.Errorf("wrapping the age key to the recovery key: %w", err)
 		}
 		m.Secrets.AgeKeyIncluded = true
+		m.Secrets.AgeKeyWrapped = true
 		if !opts.IncludeSecrets {
-			m.Secrets.Recovery += " — the bundle carries the age key itself (--include-age-key); use it to re-key a fresh target's secret store"
+			m.Secrets.Recovery += " — the bundle carries the age key itself (--include-age-key), wrapped to the recovery key; `teploy dr restore --identity <recovery key file>` unwraps it to re-key a fresh target's secret store"
 		}
 	}
 
@@ -829,7 +874,7 @@ func (c *Client) CreateBundle(ctx context.Context, opts BundleOptions, store Bun
 		}
 	}
 	if opts.IncludeAgeKey {
-		if err := uploadMember("age-key", ws+"/age-key"); err != nil {
+		if err := uploadMember("age-key"+ageSuffix, ws+"/age-key"+ageSuffix); err != nil {
 			cleanup()
 			return nil, err
 		}

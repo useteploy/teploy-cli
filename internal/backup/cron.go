@@ -33,7 +33,13 @@ type CronMarker struct {
 	Command    string
 }
 
-var cronMarkerRE = regexp.MustCompile(`\[(teploy-backup:[A-Za-z0-9._-]+|teploy-accessory-backup:[A-Za-z0-9._-]+:[A-Za-z0-9._-]+)\]\s*$`)
+var cronMarkerRE = regexp.MustCompile(`\[(teploy-backup-all|teploy-backup:[A-Za-z0-9._-]+|teploy-accessory-backup:[A-Za-z0-9._-]+:[A-Za-z0-9._-]+)\]\s*$`)
+
+// FleetCronMarker tags the one policy cron line, `teploy backup run --all`.
+const FleetCronMarker = "teploy-backup-all"
+
+// KindFleet is the CronMarker kind of the policy line.
+const KindFleet = "fleet"
 
 var legacyKeepLastRE = regexp.MustCompile(`head -n -([0-9]+)`)
 
@@ -50,6 +56,10 @@ func FindCronMarker(line string) *CronMarker {
 		return nil
 	}
 	mk := &CronMarker{Tag: tag, Cron: strings.Join(fields[:5], " "), Command: strings.Join(fields[5:], " ")}
+	if tag == FleetCronMarker {
+		mk.Kind, mk.Form = KindFleet, CronFormRun
+		return mk
+	}
 	if rest, ok := strings.CutPrefix(tag, "teploy-accessory-backup:"); ok {
 		app, acc, found := strings.Cut(rest, ":")
 		if !found {

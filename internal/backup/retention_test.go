@@ -79,12 +79,12 @@ func TestSelectForDeletion(t *testing.T) {
 
 func TestPruneBackups(t *testing.T) {
 	ls := strings.Join([]string{
-		"2024-01-01 00:00:00 100 20240101-000000.tar.gz",
-		"2024-01-02 00:00:00 100 20240102-000000.tar.gz",
-		"2024-01-03 00:00:00 100 20240103-000000.tar.gz",
+		"2024-01-01 00:00:00 100 myapp/volumes/20240101-000000.tar.gz",
+		"2024-01-02 00:00:00 100 myapp/volumes/20240102-000000.tar.gz",
+		"2024-01-03 00:00:00 100 myapp/volumes/20240103-000000.tar.gz",
 	}, "\n")
 
-	mock := ssh.NewMockExecutor("1.2.3.4",
+	mock := newStoreMock("1.2.3.4",
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
 		ssh.MockCommand{Match: "aws s3 ls", Output: ls},
 		ssh.MockCommand{Match: "aws s3 rm", Output: "delete: done\n"},
@@ -108,10 +108,10 @@ func TestPruneBackups(t *testing.T) {
 
 	var rmCalls int
 	for _, c := range mock.Calls {
-		if strings.HasPrefix(c, "aws s3 rm") {
+		if strings.HasPrefix(c, "aws s3 rm") && !strings.Contains(c, "/.clock-") {
 			rmCalls++
 		}
-		if strings.Contains(c, "20240103-000000") && strings.HasPrefix(c, "aws s3 rm") {
+		if strings.Contains(c, "20240103-000000") && strings.HasPrefix(c, "aws s3 rm") && !strings.Contains(c, "/.clock-") {
 			t.Errorf("newest backup must not be deleted: %s", c)
 		}
 	}
@@ -121,7 +121,7 @@ func TestPruneBackups(t *testing.T) {
 }
 
 func TestPruneBackupsZeroPolicyNoop(t *testing.T) {
-	mock := ssh.NewMockExecutor("1.2.3.4") // no commands registered — any call would error
+	mock := newStoreMock("1.2.3.4") // no commands registered — any call would error
 	var buf bytes.Buffer
 	client := NewClient(mock, &buf)
 	deleted, err := client.PruneBackups(context.Background(), "myapp", "volumes",
@@ -136,9 +136,9 @@ func TestPruneBackupsZeroPolicyNoop(t *testing.T) {
 
 // Pruning an accessory backup also removes its postgres globals sidecar.
 func TestPruneRemovesGlobalsSidecar(t *testing.T) {
-	mock := ssh.NewMockExecutor("h",
+	mock := newStoreMock("h",
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
-		ssh.MockCommand{Match: "aws s3 ls", Output: "2024-01-01 00:00:00 100 20240101-000000.pgdump\n2024-01-02 00:00:00 100 20240102-000000.pgdump\n"},
+		ssh.MockCommand{Match: "aws s3 ls", Output: "2024-01-01 00:00:00 1000 myapp/accessories/db/20240101-000000.pgdump\n2024-01-02 00:00:00 1000 myapp/accessories/db/20240102-000000.pgdump\n2024-01-01 00:00:00 500 myapp/accessories/db/globals/20240101-000000.sql.gz\n"},
 		ssh.MockCommand{Match: "aws s3 rm", Output: ""},
 	)
 	deleted, err := NewClient(mock, io.Discard).PruneBackups(context.Background(), "myapp", "accessories/db", S3Config{Bucket: "b", Region: "r"}, RetentionPolicy{KeepLast: 1})

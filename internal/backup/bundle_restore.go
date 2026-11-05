@@ -97,9 +97,12 @@ type CutoverReceipt struct {
 
 // BundleRestoreOptions configures an isolated restore or cutover.
 type BundleRestoreOptions struct {
-	App    string
-	ID     string
-	Config config.AppConfig // the restore-time local teploy.yml
+	// Identity is a server-side age identity file: the recovery key, to unwrap a
+	// wrapped age key on a host that is not the one that made the bundle.
+	Identity string
+	App      string
+	ID       string
+	Config   config.AppConfig // the restore-time local teploy.yml
 	// Home resolves a config-home mismatch at cutover between the bundle
 	// and an existing target app: "bundle" installs the bundle's home and
 	// config, "current" keeps the target's. Empty refuses a mismatch.
@@ -164,7 +167,17 @@ func (c *Client) RestoreBundleIsolated(ctx context.Context, opts BundleRestoreOp
 		}
 	}
 	if manifest.Secrets.AgeKeyIncluded {
-		if err := store.Download(ctx, c.exec, opts.App, manifest.ID, "age-key", staging+"/age-key"); err != nil {
+		if manifest.Secrets.AgeKeyWrapped {
+			if opts.Identity == "" {
+				return nil, fmt.Errorf("this bundle's age key is wrapped to the owner's recovery key: pass --identity <recovery key file> (nothing was changed)")
+			}
+			if err := store.Download(ctx, c.exec, opts.App, manifest.ID, "age-key"+ageSuffix, staging+"/age-key"+ageSuffix); err != nil {
+				return nil, err
+			}
+			if _, err := c.exec.Run(ctx, "umask 077; age -d -i "+ssh.ShellQuote(opts.Identity)+" -o "+ssh.ShellQuote(staging+"/age-key")+" "+ssh.ShellQuote(staging+"/age-key"+ageSuffix)); err != nil {
+				return nil, fmt.Errorf("unwrapping the bundle's age key with the given identity: %w", err)
+			}
+		} else if err := store.Download(ctx, c.exec, opts.App, manifest.ID, "age-key", staging+"/age-key"); err != nil {
 			return nil, err
 		}
 	}

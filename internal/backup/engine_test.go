@@ -72,7 +72,7 @@ func TestDetectEngine(t *testing.T) {
 }
 
 func TestResolveEngineReadsContainerHints(t *testing.T) {
-	mock := ssh.NewMockExecutor("h",
+	mock := newStoreMock("h",
 		ssh.MockCommand{Match: "docker inspect -f '{{json .Config.Labels}}", Output: `{"teploy.engine":"valkey"}` + "\nnull\n" + `["valkey-server"]` + "\n"},
 	)
 	det, err := NewClient(mock, io.Discard).ResolveEngine(context.Background(), "app", "cache", "acme/kv:1", nil)
@@ -80,7 +80,7 @@ func TestResolveEngineReadsContainerHints(t *testing.T) {
 		t.Fatalf("ResolveEngine = %+v, %v", det, err)
 	}
 	// An absent container still classifies from image and env.
-	det, err = NewClient(ssh.NewMockExecutor("h"), io.Discard).ResolveEngine(context.Background(), "app", "db", "pgvector/pgvector:pg17", map[string]string{"PG_MAJOR": "17"})
+	det, err = NewClient(newStoreMock("h"), io.Discard).ResolveEngine(context.Background(), "app", "db", "pgvector/pgvector:pg17", map[string]string{"PG_MAJOR": "17"})
 	if err != nil || det.Engine != EnginePostgres {
 		t.Fatalf("ResolveEngine without container = %+v, %v", det, err)
 	}
@@ -148,7 +148,7 @@ func TestPlanAccessoryDump_EngineCommands(t *testing.T) {
 // A detected pgvector accessory is dumped with pg_dump even though its
 // image is not called "postgres" — the U3 false green.
 func TestAccessoryBackup_PgvectorIsDumpedNotTarred(t *testing.T) {
-	mock := ssh.NewMockExecutor("1.2.3.4",
+	mock := newStoreMock("1.2.3.4",
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
 		ssh.MockCommand{Match: "umask 077", Output: "/tmp/teploy-backup.abc123\n"},
 		ssh.MockCommand{Match: "docker exec 'myapp-db' pg_dump -Fc", Output: ""},
@@ -161,7 +161,7 @@ func TestAccessoryBackup_PgvectorIsDumpedNotTarred(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.Engine != EnginePostgres || res.Consistency != consistencyEngineDump || res.SizeBytes != 2123 || !strings.HasSuffix(res.Key, ".pgdump") {
+	if res.Engine != EnginePostgres || res.Consistency != consistencyEngineDump || res.SizeBytes != 4096 || !strings.HasSuffix(res.Key, ".pgdump") {
 		t.Fatalf("unexpected result %+v", res)
 	}
 	for _, c := range mock.Calls {
@@ -174,7 +174,7 @@ func TestAccessoryBackup_PgvectorIsDumpedNotTarred(t *testing.T) {
 // The deploy-ovh incident: a dump that "succeeds" with an implausibly small
 // artifact (gzip of an empty stream) must fail and never be uploaded.
 func TestAccessoryBackup_RefusesImplausiblySmallArtifact(t *testing.T) {
-	mock := ssh.NewMockExecutor("1.2.3.4",
+	mock := newStoreMock("1.2.3.4",
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
 		ssh.MockCommand{Match: "umask 077", Output: "/tmp/teploy-backup.abc123\n"},
 		ssh.MockCommand{Match: "docker exec", Output: ""},
@@ -241,7 +241,7 @@ func TestDragonflyLoadScriptOrder(t *testing.T) {
 // verify-backup classifies a timescale accessory as postgres (restored and
 // queried), never as a volume archive that passes on files>0.
 func TestVerifyBackup_TimescaleIsVerifiedAsPostgres(t *testing.T) {
-	mock := ssh.NewMockExecutor("1.2.3.4",
+	mock := newStoreMock("1.2.3.4",
 		ssh.MockCommand{Match: "umask 077; mktemp -d", Output: "/var/tmp/teploy-verify.test\n"},
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
 		ssh.MockCommand{Match: "docker inspect -f '{{.Config.Image}}'", Output: "timescale/timescaledb:latest-pg17\n"},

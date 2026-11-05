@@ -327,17 +327,23 @@ func runAccessoryLogs(flags *Flags, appName, name string, lines int) error {
 }
 
 func newAccessoryUpgradeCmd(flags *Flags) *cobra.Command {
-	return &cobra.Command{
+	var noBackup bool
+	cmd := &cobra.Command{
 		Use:   "upgrade <name> <new_image>",
 		Short: "Upgrade an accessory to a new image",
-		Args:  cobra.ExactArgs(2),
+		Long: "Recreates the accessory on a new image. A new major version can rewrite its\n" +
+			"data in place with no way down, so a fresh backup is taken first; if that\n" +
+			"fails the upgrade is refused, unless --no-backup.",
+		Args: cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runAccessoryUpgrade(flags, args[0], args[1])
+			return runAccessoryUpgrade(flags, args[0], args[1], noBackup)
 		},
 	}
+	cmd.Flags().BoolVar(&noBackup, "no-backup", false, "skip the automatic backup taken before the upgrade")
+	return cmd
 }
 
-func runAccessoryUpgrade(flags *Flags, name, newImage string) error {
+func runAccessoryUpgrade(flags *Flags, name, newImage string, noBackup bool) error {
 	appCfg, err := loadAppCfgForAccessory()
 	if err != nil {
 		return err
@@ -356,6 +362,20 @@ func runAccessoryUpgrade(flags *Flags, name, newImage string) error {
 		return err
 	}
 	defer executor.Close()
+
+	if !noBackup {
+		cfg, err := resolvePreBackupTarget(ctx, executor, "accessory upgrade")
+		if err != nil {
+			return err
+		}
+		id, err := preOperationBackup(ctx, backup.NewClient(executor, os.Stdout), executor, appCfg.App, name, cfg, "this upgrade", preBackupScope{All: true})
+		if err != nil {
+			return err
+		}
+		if id != "" {
+			fmt.Printf("Backed up the current data first: %s\n", id)
+		}
+	}
 
 	mgr := accessories.NewManager(executor, os.Stdout)
 	return mgr.Upgrade(ctx, appCfg.App, name, newImage, accCfg)
@@ -559,6 +579,9 @@ func newAccessoryRestoreCmd(flags *Flags) *cobra.Command {
 		prefix   string
 		yes      bool
 		ignore   bool
+		noBackup bool
+		identity string
+		deadline time.Duration
 	)
 
 	cmd := &cobra.Command{
@@ -566,7 +589,7 @@ func newAccessoryRestoreCmd(flags *Flags) *cobra.Command {
 		Short: "Restore an accessory from backup (stops the app while it runs)",
 		Args:  cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runAccessoryRestore(flags, args[0], args[1], bucket, region, endpoint, prefix, yes, ignore)
+			return runAccessoryRestore(flags, args[0], args[1], bucket, region, endpoint, prefix, identity, yes, ignore, noBackup, deadline)
 		},
 	}
 
@@ -576,11 +599,14 @@ func newAccessoryRestoreCmd(flags *Flags) *cobra.Command {
 	cmd.Flags().StringVar(&prefix, "prefix", "", "key prefix under the bucket (default: the stored target's prefix)")
 	cmd.Flags().BoolVar(&yes, "yes", false, "proceed without interactive confirmation (the app is stopped while the restore runs)")
 	cmd.Flags().BoolVar(&ignore, "ignore-space-check", false, "skip the free-space preflight")
+	cmd.Flags().BoolVar(&noBackup, "no-backup", false, "skip the automatic backup taken before the restore")
+	cmd.Flags().StringVar(&identity, "identity", "", "recovery key file, to decrypt a backup this host's identity cannot")
+	cmd.Flags().DurationVar(&deadline, "deadline", 0, "deadline of the backup taken first, and of the restore (default 6h each)")
 
 	return cmd
 }
 
-func runAccessoryRestore(flags *Flags, name, date, bucket, region, endpoint, prefix string, yes, ignoreSpace bool) error {
+func runAccessoryRestore(flags *Flags, name, date, bucket, region, endpoint, prefix, identity string, yes, ignoreSpace, noBackup bool, deadline time.Duration) error {
 	appCfg, err := loadAppCfgForAccessory()
 	if err != nil {
 		return err
@@ -594,7 +620,7 @@ func runAccessoryRestore(flags *Flags, name, date, bucket, region, endpoint, pre
 	// the live database with the app still writing). Stopping the app is
 	// an effect it never had, so it now asks first (--yes skips it, and is
 	// required without a terminal) — the same contract as backup restore.
-	return runBackupRestoreWith(flags, "", name, date, &backupTargetFlags{bucket: bucket, region: region, endpoint: endpoint, prefix: prefix}, yes, backup.RestoreOptions{IgnoreSpaceCheck: ignoreSpace})
+	return runBackupRestoreWith(flags, "", name, false, date, &backupTargetFlags{bucket: bucket, region: region, endpoint: endpoint, prefix: prefix}, yes, backup.RestoreOptions{IgnoreSpaceCheck: ignoreSpace, NoPreBackup: noBackup, IdentityFile: identity, Deadline: deadline})
 }
 
 // verifyEventErr is the backup.verify outcome: an operational error, or a
@@ -621,6 +647,10 @@ func verifyEventDetail(name, date string, res *backup.VerifyResult, elapsed time
 		detail["key"] = res.S3Key
 		detail["size_bytes"] = res.SizeBytes
 		detail["duration_ms"] = res.DurationMs
+		detail["encrypted"] = res.Encrypted
+		if res.Database != "" {
+			detail["database"] = res.Database
+		}
 	}
 	return detail
 }
@@ -648,6 +678,11 @@ func newAccessoryVerifyBackupCmd(flags *Flags) *cobra.Command {
 		date     string
 		endpoint string
 		local    bool
+		database string
+		adopted  bool
+		identity string
+		deadline time.Duration
+		prefix   string
 	)
 
 	cmd := &cobra.Command{
@@ -663,22 +698,28 @@ func newAccessoryVerifyBackupCmd(flags *Flags) *cobra.Command {
 			"Examples:\n" +
 			"  teploy accessory verify-backup postgres --bucket my-backups\n" +
 			"  teploy accessory verify-backup db --app myapp --host 1.2.3.4 --bucket b --json\n" +
-			"  teploy accessory verify-backup nucleus --local --app ship --bucket b --endpoint http://127.0.0.1:9100",
+			"  teploy accessory verify-backup nucleus --local --app ship --bucket b --endpoint http://127.0.0.1:9100\n" +
+			"  teploy accessory verify-backup wordpress-shared-mysql --adopted --database wp_blog --host prod --json",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runAccessoryVerifyBackup(flags, appName, args[0], bucket, region, date, endpoint, local)
+			return runAccessoryVerifyBackup(flags, appName, args[0], bucket, region, date, endpoint, prefix, database, identity, local, adopted, deadline)
 		},
 	}
+	cmd.Flags().StringVar(&database, "database", "", "verify this database's own backups instead of the primary")
+	cmd.Flags().BoolVar(&adopted, "adopted", false, "<name> is an adopted container's docker name (see `server backup-policy`)")
+	cmd.Flags().StringVar(&identity, "identity", "", "recovery key file, to decrypt a backup this host's identity cannot")
+	cmd.Flags().DurationVar(&deadline, "deadline", 0, "deadline of this verification (default 6h)")
 	cmd.Flags().StringVar(&appName, "app", "", "app name — act on server state instead of teploy.yml (requires --host)")
 	cmd.Flags().StringVar(&bucket, "bucket", "", "S3 bucket name")
 	cmd.Flags().StringVar(&region, "region", "us-east-1", "AWS region")
 	cmd.Flags().StringVar(&endpoint, "endpoint", "", "S3-compatible endpoint URL (MinIO/B2/R2); creds from TEPLOY_S3_ACCESS_KEY/SECRET_KEY or AWS_* env")
 	cmd.Flags().StringVar(&date, "date", "", "backup timestamp to verify (default: latest)")
+	cmd.Flags().StringVar(&prefix, "prefix", "", "key prefix under --bucket (default: the stored target's prefix)")
 	cmd.Flags().BoolVar(&local, "local", false, "run against the local docker host (the mode scheduled cron jobs use; requires --app)")
 	return cmd
 }
 
-func runAccessoryVerifyBackup(flags *Flags, appName, name, bucket, region, date, endpoint string, local bool) error {
+func runAccessoryVerifyBackup(flags *Flags, appName, name, bucket, region, date, endpoint, prefix, database, identity string, local, adopted bool, deadline time.Duration) error {
 	if date != "" {
 		if err := backup.ValidateDate(date); err != nil {
 			return err
@@ -697,13 +738,22 @@ func runAccessoryVerifyBackup(flags *Flags, appName, name, bucket, region, date,
 	var appCfg *config.AppConfig
 	var executor ssh.Executor
 	var err error
-	if local {
+	switch {
+	case local && adopted:
+		appCfg = &config.AppConfig{App: backup.AdoptedApp}
+		executor = ssh.NewLocalExecutor()
+	case local:
 		if appName == "" {
 			return fmt.Errorf("--local requires --app (no teploy.yml exists on the server)")
 		}
 		appCfg = &config.AppConfig{App: appName}
 		executor = ssh.NewLocalExecutor()
-	} else {
+	case adopted:
+		appCfg, executor, err = resolveBackupApp(ctx, flags, appName, true)
+		if err != nil {
+			return err
+		}
+	default:
 		appCfg, executor, err = resolveAppForAccessory(ctx, flags, appName)
 		if err != nil {
 			return err
@@ -711,19 +761,32 @@ func runAccessoryVerifyBackup(flags *Flags, appName, name, bucket, region, date,
 	}
 	defer executor.Close()
 
-	s3Cfg, err := resolveBackupS3(ctx, executor, &backupTargetFlags{bucket: bucket, region: region, endpoint: endpoint})
+	s3Cfg, err := resolveBackupS3(ctx, executor, &backupTargetFlags{bucket: bucket, region: region, endpoint: endpoint, prefix: prefix})
 	if err != nil {
 		return err
 	}
+	identityPath, cleanupIdentity, err := placeIdentity(ctx, executor, identity)
+	if err != nil {
+		return err
+	}
+	defer cleanupIdentity()
+	s3Cfg.ExtraIdentity = identityPath
 
 	out := io.Writer(os.Stdout)
 	if flags.JSON {
 		// Keep stdout clean for the JSON result; progress goes to stderr.
 		out = os.Stderr
 	}
+	if err := backup.ValidateDeadline(deadline); err != nil {
+		return err
+	}
 	client := backup.NewClient(executor, out)
+	client.SetDeadline(deadline)
+	if err := applyAdoptedEngine(ctx, client, executor, appCfg.App, name); err != nil {
+		return err
+	}
 	start := time.Now()
-	res, err := client.VerifyBackup(ctx, appCfg.App, name, date, s3Cfg)
+	res, err := client.VerifyBackupDatabase(ctx, appCfg.App, name, date, database, s3Cfg)
 	recordAppEvent(ctx, executor, appCfg.App, events.KindBackupVerify, verifyEventErr(res, err), verifyEventDetail(name, date, res, time.Since(start)))
 	if err != nil {
 		return err

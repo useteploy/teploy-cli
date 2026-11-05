@@ -4,8 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"os"
 	"path"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -13,14 +16,97 @@ import (
 	"github.com/useteploy/teploy/internal/ssh"
 )
 
+// BackupOptions tune an accessory backup.
+type BackupOptions struct {
+	// AllDatabases backs up every database on the server, each as its own
+	// object: what a policy-managed run does, so a database created tomorrow is
+	// covered with no action.
+	AllDatabases bool
+	// Databases names exactly the extra databases to back up (an adopted
+	// entry's databases: [...]). A listed database that is missing is a failure.
+	Databases []string
+	// SingleDatabase backs up only this database (the safety backup before a
+	// `restore --database`).
+	SingleDatabase string
+	// IgnoreSpace skips the free-space preflight.
+	IgnoreSpace bool
+	// SafetyCopy marks what this backup stores as a destructive operation's way
+	// back: retention leaves it alone for safetyWindow.
+	SafetyCopy bool
+}
+
+// PrimaryDatabase names the database a default restore of this accessory would
+// replace ("" for an engine without named databases).
+func (c *Client) PrimaryDatabase(ctx context.Context, app, name, image string, env map[string]string) string {
+	det, err := c.ResolveEngine(ctx, app, name, image, env)
+	if err != nil {
+		return ""
+	}
+	switch det.Engine {
+	case EnginePostgres:
+		db, _ := postgresDBAndUser(app, env)
+		return db
+	case EngineMySQL, EngineMariaDB:
+		return mysqlDB(app, env)
+	}
+	return ""
+}
+
+// BackupDeadline bounds one backup of one target, so a wedged dump or upload
+// cannot hold a run (and its lock) forever.
+const BackupDeadline = 6 * time.Hour
+
+func (c *Client) backupDeadline() time.Duration {
+	if c.deadline > 0 {
+		return c.deadline
+	}
+	return BackupDeadline
+}
+
+// backupTmpDir is where a backup builds its artifacts: disk, not the tmpfs /tmp
+// is on many hosts, which a database dump would fill along with the RAM.
+func backupTmpDir() string {
+	if d := strings.TrimSpace(os.Getenv("TEPLOY_BACKUP_TMPDIR")); d != "" {
+		return strings.TrimRight(d, "/")
+	}
+	return "/var/tmp"
+}
+
+func (c *Client) newBackupWorkspace(ctx context.Context) (string, func(), error) {
+	runOut, err := c.exec.Run(ctx, "umask 077; mktemp -d "+ssh.ShellQuote(backupTmpDir()+"/teploy-backup.XXXXXXXX"))
+	if err != nil {
+		return "", nil, fmt.Errorf("creating backup workspace: %w", err)
+	}
+	workDir := strings.TrimSpace(runOut)
+	// Says how long this run may live, for a janitor that does not know its deadline.
+	// Best effort: without it the fixed leftover age applies.
+	c.exec.Run(ctx, fmt.Sprintf(`printf '%%s\n' "$(( $(date +%%s) + %d ))" > %s`, int64((c.backupDeadline()+time.Hour).Seconds()), ssh.ShellQuote(workDir+"/"+workspaceExpiry)))
+	return workDir, func() {
+		rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
+		defer cancel()
+		c.exec.Run(rctx, "rm -rf "+ssh.ShellQuote(workDir))
+	}, nil
+}
+
 // AccessoryBackup performs a database-aware backup for an accessory.
+func (c *Client) AccessoryBackup(ctx context.Context, app, name, image string, env map[string]string, s3 S3Config) (BackupResult, error) {
+	return c.AccessoryBackupWith(ctx, app, name, image, env, s3, BackupOptions{})
+}
+
+// AccessoryBackupWith is AccessoryBackup with options.
 //
 // All intermediate artifacts (dumps, snapshots, scratch tars) are built
 // inside one private 0700 mktemp workspace and removed on every exit — the
 // old predictable /tmp/<app>-… paths were shared across accessories of the
 // same app and exposed database dumps to other local users (audit F34).
-func (c *Client) AccessoryBackup(ctx context.Context, app, name, image string, env map[string]string, s3 S3Config) (res BackupResult, err error) {
+//
+// Objects are stored sidecars first, primary last (see store.go), and one
+// database failing does not stop the others: the result names it and the
+// returned error makes the backup a failure, so nothing is pruned.
+func (c *Client) AccessoryBackupWith(ctx context.Context, app, name, image string, env map[string]string, s3 S3Config, opts BackupOptions) (res BackupResult, err error) {
 	start := time.Now()
+	ctx, cancel := context.WithTimeout(ctx, c.backupDeadline())
+	defer cancel()
 	defer func() { res.DurationMs = time.Since(start).Milliseconds() }()
 	if err := c.ensureAWSCLI(ctx); err != nil {
 		return res, err
@@ -30,87 +116,308 @@ func (c *Client) AccessoryBackup(ctx context.Context, app, name, image string, e
 		return res, err
 	}
 	res.Engine = det.Engine
+	res.Encrypted = s3.Encrypted()
+	if err := c.prepareEncryption(ctx, s3); err != nil {
+		return res, err
+	}
+	adopted := app == AdoptedApp
+	if adopted && !det.IsDB() || adopted && det.Engine == EngineNucleus {
+		return res, fmt.Errorf("adopted container %s: engine %q has no adopted backup method (adopted containers need a database engine; set engine: in the policy entry if detection is wrong)", name, det.Engine)
+	}
 
 	timestamp, err := newBackupID(time.Now())
 	if err != nil {
 		return res, err
 	}
 	res.ID = timestamp
-	containerName := app + "-" + name
+	containerName := ContainerName(app, name)
 
-	runOut, err := c.exec.Run(ctx, "umask 077; mktemp -d /tmp/teploy-backup.XXXXXXXX")
+	workDir, cleanup, err := c.newBackupWorkspace(ctx)
 	if err != nil {
-		return res, fmt.Errorf("creating backup workspace: %w", err)
-	}
-	workDir := strings.TrimSpace(runOut)
-	cleanup := func() {
-		c.exec.Run(context.WithoutCancel(ctx), "rm -rf "+ssh.ShellQuote(workDir))
-	}
-
-	// Consistency classification + the dump command come from the shared
-	// planner (also used by the DR bundle path) so the two snapshot paths
-	// can never drift apart.
-	plan, err := planAccessoryDump(app, name, det, env, workDir)
-	if err != nil {
-		cleanup()
 		return res, err
 	}
-	res.Consistency = plan.consistency
-	s3Key := fmt.Sprintf("s3://%s/%s/accessories/%s/%s%s", s3.Base(), app, name, timestamp, plan.ext)
-	res.Key = s3Key
-	if err := plan.stage(ctx, c.exec); err != nil {
-		cleanup()
-		return res, fmt.Errorf("staging the mysql credential file for %s (no dump was run): %w", name, err)
-	}
-	// A server with more databases than this backup covers is still backed
-	// up: a partial backup and a loud warning beat none. The coverage reaches
-	// the backup.run event, doctor and `backup run`'s alert script; Dash
-	// alerting on it arrives in Slice 4.
+	defer cleanup()
+
+	// What this backup covers. A server with more databases than it covers is
+	// still backed up: a partial backup and a loud warning beat none.
 	var pgT pgTarget
-	var coverage pgCoverage
 	if det.Engine == EnginePostgres {
 		db, user := postgresDBAndUser(app, env)
+		if adopted {
+			db = ""
+		}
 		pgT = newPGTarget(containerName, db, user, env)
 	}
-	coverage, res.UncoveredDatabases, res.Warnings = c.backupCoverage(ctx, app, name, det, pgT, env)
+	coverage, cerr := c.coverageWith(ctx, app, name, det, pgT, env, opts)
+	res.UncoveredDatabases = coverage.Uncovered
+	res.Warnings = coverage.warningsFor(app, name, det, env)
+	multi := opts.AllDatabases || len(opts.Databases) > 0 || opts.SingleDatabase != "" || adopted
+	if cerr != nil {
+		if multi && (det.Engine == EnginePostgres || det.Engine == EngineMySQL || det.Engine == EngineMariaDB) {
+			return res, fmt.Errorf("listing the databases of %s, so what to back up is unknown: %w", containerName, cerr)
+		}
+		res.Warnings = append(res.Warnings, cerr.Error())
+	}
 	for _, w := range res.Warnings {
 		fmt.Fprintf(c.out, "Warning: %s\n", w)
 	}
 	fmt.Fprintf(c.out, "Backing up %s (%s, detected from %s)...\n", containerName, det.Engine, det.Source)
+
+	failed := map[string]string{}
+	for _, missing := range coverage.Missing {
+		failed[missing] = "listed for backup but not on the server"
+	}
+
+	primary := true
+	switch {
+	case opts.SingleDatabase != "" && (!coverage.PrimaryIsSingle || coverage.PrimaryMissing):
+		primary = false
+	case (det.Engine == EnginePostgres || det.Engine == EngineMySQL || det.Engine == EngineMariaDB) && (adopted || (multi && coverage.PrimaryMissing)):
+		// Nothing named this container's primary database: every database has
+		// its own series. Pruning sees that as one series per database.
+		primary = false
+	}
+
+	// Sidecars and extra databases first: the primary object commits the backup.
+	// No database, no sidecar: a roles file alone is not a backup of anything.
+	if det.Engine == EnginePostgres && (primary || len(coverage.Extra) > 0) {
+		if w := c.backupPostgresGlobals(ctx, pgT, timestamp, workDir, s3, app, name); w != "" {
+			res.Warnings = append(res.Warnings, w)
+			fmt.Fprintf(c.out, "Warning: %s\n", w)
+		}
+	}
+	for i, db := range coverage.Extra {
+		obj, derr := c.backupOneDatabase(ctx, app, name, det, env, db, workDir, i, timestamp, s3, opts)
+		if derr != nil {
+			failed[db] = derr.Error()
+			fmt.Fprintf(c.out, "Backing up database %s FAILED: %v\n", db, derr)
+			continue
+		}
+		res.Objects = append(res.Objects, obj)
+		res.SizeBytes += obj.Size
+		fmt.Fprintf(c.out, "Backed up database %s\n", db)
+	}
+
+	if primary {
+		obj, consistency, perr := c.backupPrimary(ctx, app, name, det, env, pgT, workDir, timestamp, s3, opts)
+		res.Consistency = consistency
+		if perr != nil {
+			return res, joinDatabaseFailures(failed, perr)
+		}
+		res.Key = obj.Key
+		res.SizeBytes += obj.Size
+		res.Objects = append(res.Objects, obj)
+	} else if plan, perr := planAccessoryDump(app, name, det, env, workDir); perr == nil {
+		res.Consistency = plan.consistency
+	}
+	if res.Key == "" && len(res.Objects) > 0 {
+		res.Key = res.Objects[0].Key
+	}
+	if len(res.Objects) == 0 && len(failed) == 0 {
+		// An empty server (no schema yet) has nothing to store. Not a failure,
+		// but never a silent success either.
+		res.Warnings = append(res.Warnings, containerName+" holds no database yet, so nothing was stored")
+		return res, nil
+	}
+	res.FailedDatabases = failed
+	c.markNamespaceOwner(ctx, s3, app)
+	if opts.SafetyCopy {
+		c.markSafetyCopy(ctx, s3, seriesPrefix(s3, app, name, ""), timestamp, &res)
+	}
+	if len(failed) > 0 {
+		return res, joinDatabaseFailures(failed, nil)
+	}
+	fmt.Fprintf(c.out, "Backup complete: %s\n", res.Key)
+	return res, nil
+}
+
+// markSafetyCopy records an id as a safety copy. Failing to is reported, not fatal:
+// the copy exists, and only its protection from retention is lost.
+func (c *Client) markSafetyCopy(ctx context.Context, s3 S3Config, prefix, id string, res *BackupResult) {
+	key := prefix + safetyDir + "/" + id + ".safety"
+	if _, err := c.exec.Run(ctx, "printf '%s\\n' safety | "+s3.AWS("s3 cp - "+ssh.ShellQuote(key))); err != nil {
+		res.Warnings = append(res.Warnings, fmt.Sprintf("could not protect safety copy %s from retention: %v", id, err))
+	}
+}
+
+// joinDatabaseFailures renders per-database failures into one error.
+func joinDatabaseFailures(failed map[string]string, primary error) error {
+	if len(failed) == 0 {
+		return primary
+	}
+	names := make([]string, 0, len(failed))
+	for db := range failed {
+		names = append(names, db)
+	}
+	sort.Strings(names)
+	parts := make([]string, 0, len(names))
+	for _, db := range names {
+		parts = append(parts, db+": "+failed[db])
+	}
+	msg := "database(s) not backed up: " + strings.Join(parts, "; ")
+	if primary != nil {
+		return fmt.Errorf("%w; %s", primary, msg)
+	}
+	return errors.New(msg)
+}
+
+// backupPrimary dumps and stores the accessory's primary object: the backup's
+// commit point. It is also the only object a single-database engine has.
+func (c *Client) backupPrimary(ctx context.Context, app, name string, det EngineDetection, env map[string]string, pgT pgTarget, workDir, id string, s3 S3Config, opts BackupOptions) (BackupObject, string, error) {
+	var obj BackupObject
+	plan, err := planAccessoryDump(app, name, det, env, workDir)
+	if err != nil {
+		return obj, "", err
+	}
+	if err := c.preflightDumpSpace(ctx, app, name, det, env, pgT, workDir, opts); err != nil {
+		return obj, plan.consistency, err
+	}
+	if err := plan.stage(ctx, c.exec); err != nil {
+		return obj, plan.consistency, fmt.Errorf("staging the mysql credential file for %s (no dump was run): %w", name, err)
+	}
 	if _, err := c.exec.Run(ctx, plan.cmd); err != nil {
 		// Never leave partial backups around: they're disk-fillers at best,
 		// restore-bait at worst.
-		cleanup()
-		return res, fmt.Errorf("dumping %s: %w", name, err)
+		return obj, plan.consistency, fmt.Errorf("dumping %s: %w", name, err)
 	}
 	size, err := c.checkArtifactSize(ctx, plan.artifactPath, plan.minBytes)
-	res.SizeBytes = size
 	if err != nil {
-		cleanup()
-		return res, fmt.Errorf("dumping %s: %w", name, err)
+		return obj, plan.consistency, fmt.Errorf("dumping %s: %w", name, err)
 	}
-
-	fmt.Fprintf(c.out, "Uploading to %s...\n", s3Key)
-	if _, err := c.exec.Run(ctx, s3.AWS(fmt.Sprintf("s3 cp %s %s", ssh.ShellQuote(plan.artifactPath), ssh.ShellQuote(s3Key)))); err != nil {
-		cleanup()
-		return res, fmt.Errorf("uploading to S3: %w", err)
-	}
-
 	if det.Engine == EnginePostgres {
-		c.backupPostgresGlobals(ctx, app, name, timestamp, env, workDir, s3)
-		c.recordPostgresSize(ctx, pgT, s3, app, name, timestamp, workDir)
-		for _, extra := range coverage.Extra {
-			if err := c.backupPostgresExtra(ctx, pgT, extra, s3, app, name, timestamp, workDir); err != nil {
-				cleanup()
-				return res, fmt.Errorf("backing up database %s (backup_databases): %w", extra, err)
-			}
-			fmt.Fprintf(c.out, "Backed up database %s\n", extra)
-		}
+		c.storeDatabaseMeta(ctx, pgT, pgT.db, s3, seriesPrefix(s3, app, name, "")+"meta/"+id+".json", workDir)
 	}
+	key := seriesPrefix(s3, app, name, "") + id + plan.ext
+	fmt.Fprintf(c.out, "Uploading to %s...\n", key)
+	stored, err := c.put(ctx, s3, plan.artifactPath, key)
+	if err != nil {
+		return obj, plan.consistency, fmt.Errorf("storing %s: %w", name, err)
+	}
+	_ = size
+	return BackupObject{Key: stored.Key, Size: stored.Size, Encrypted: stored.Encrypted}, plan.consistency, nil
+}
 
-	cleanup()
-	fmt.Fprintf(c.out, "Backup complete: %s\n", s3Key)
-	return res, nil
+// backupOneDatabase dumps and stores one more database as its own object.
+// Series objects sit below the accessory's backups, so primary listings see one
+// backup per id; `backup restore --database` restores one.
+func (c *Client) backupOneDatabase(ctx context.Context, app, name string, det EngineDetection, env map[string]string, db, workDir string, n int, id string, s3 S3Config, opts BackupOptions) (BackupObject, error) {
+	obj := BackupObject{Database: db}
+	sub := fmt.Sprintf("%s/db-%d", workDir, n)
+	if _, err := c.exec.Run(ctx, "mkdir -p "+ssh.ShellQuote(sub)); err != nil {
+		return obj, err
+	}
+	defer c.exec.Run(context.WithoutCancel(ctx), "rm -rf "+ssh.ShellQuote(sub))
+	envDB := envForDatabase(env, det.Engine, db)
+	plan, err := planAccessoryDump(app, name, det, envDB, sub)
+	if err != nil {
+		return obj, err
+	}
+	var pgT pgTarget
+	if det.Engine == EnginePostgres {
+		_, user := postgresDBAndUser(app, env)
+		pgT = newPGTarget(ContainerName(app, name), db, user, env)
+	}
+	if err := c.preflightDumpSpace(ctx, app, name, det, envDB, pgT, sub, opts); err != nil {
+		return obj, err
+	}
+	if err := plan.stage(ctx, c.exec); err != nil {
+		return obj, fmt.Errorf("staging the credential file (no dump was run): %w", err)
+	}
+	if _, err := c.exec.Run(ctx, plan.cmd); err != nil {
+		return obj, err
+	}
+	if _, err := c.checkArtifactSize(ctx, plan.artifactPath, plan.minBytes); err != nil {
+		return obj, err
+	}
+	series := seriesPrefix(s3, app, name, db)
+	if det.Engine == EnginePostgres {
+		c.storeDatabaseMeta(ctx, pgT, db, s3, series+"meta/"+id+".json", sub)
+	}
+	stored, err := c.put(ctx, s3, plan.artifactPath, series+id+plan.ext)
+	if err != nil {
+		return obj, err
+	}
+	obj.Key, obj.Size, obj.Encrypted = stored.Key, stored.Size, stored.Encrypted
+	return obj, nil
+}
+
+// envForDatabase is the accessory's env with its database variables naming db,
+// so the shared planner dumps that database with the same flags and checks.
+func envForDatabase(env map[string]string, engine, db string) map[string]string {
+	out := make(map[string]string, len(env)+2)
+	for k, v := range env {
+		out[k] = v
+	}
+	switch engine {
+	case EnginePostgres:
+		out["POSTGRES_DB"] = db
+		delete(out, "POSTGRESQL_DATABASE")
+	case EngineMySQL, EngineMariaDB:
+		out["MYSQL_DATABASE"] = db
+		delete(out, "MARIADB_DATABASE")
+	}
+	return out
+}
+
+// dumpReserveBytes is free space a dump must leave: a database on the same
+// filesystem as the workspace panics when the disk fills.
+const dumpReserveBytes = 256 << 20
+
+// preflightDumpSpace refuses a dump that would fill the workspace's disk: on a
+// small host the same disk holds the live database. It measures what the backup
+// will occupy, plaintext and ciphertext at once, not the size of the live data
+// alone. A size it cannot measure is not a refusal.
+func (c *Client) preflightDumpSpace(ctx context.Context, app, name string, det EngineDetection, env map[string]string, pgT pgTarget, workDir string, opts BackupOptions) error {
+	if opts.IgnoreSpace {
+		return nil
+	}
+	q := ssh.ShellQuote
+	container := ContainerName(app, name)
+	var live int64
+	var known bool
+	readInt := func(out string, err error) (int64, bool) {
+		if err != nil {
+			return 0, false
+		}
+		f := strings.Fields(out)
+		if len(f) == 0 {
+			return 0, false
+		}
+		n, perr := strconv.ParseInt(f[0], 10, 64)
+		return n, perr == nil
+	}
+	var need int64
+	switch det.Engine {
+	case EnginePostgres:
+		live, known = readInt(c.exec.Run(ctx, pgT.psql(pgT.db, "SELECT pg_database_size(current_database())")))
+		// A compressed custom-format archive, plus its ciphertext.
+		need = live
+	case EngineMySQL, EngineMariaDB:
+		sql := "SELECT COALESCE(SUM(data_length + index_length), 0) FROM information_schema.TABLES WHERE table_schema = '" + strings.ReplaceAll(mysqlDB(app, env), "'", "''") + "'"
+		live, known = readInt(c.exec.Run(ctx, mysqlEnvClient(det.Engine, container, sql, "-N", "-B")))
+		// The plain SQL and its gzip side by side, then the gzip and its ciphertext.
+		need = live + live/2
+	case EngineMongo:
+		live, known = readInt(c.exec.Run(ctx, "docker exec "+q(container)+" du -sk /data/db"))
+		live *= 1024
+		need = live
+	case EngineRedis, EngineValkey, EngineDragonfly:
+		live, known = readInt(c.exec.Run(ctx, "docker exec "+q(container)+" du -sk /data"))
+		live *= 1024
+		need = live
+	default:
+		live, known = readInt(c.exec.Run(ctx, "du -sk "+q(fmt.Sprintf("%s/%s/accessories/%s", deploymentsDir, app, name))))
+		live *= 1024
+		need = live
+	}
+	if !known {
+		return nil
+	}
+	free, freeKnown := c.freeBytes(ctx, "", workDir)
+	if freeKnown && free < need+dumpReserveBytes {
+		return fmt.Errorf("not enough free space in %s for this dump: %d bytes free, about %d needed plus a %d byte reserve (live size %d); nothing was dumped. Set TEPLOY_BACKUP_TMPDIR to a larger disk or pass --ignore-space-check", workDir, free, need, int64(dumpReserveBytes), live)
+	}
+	return nil
 }
 
 // postgresGlobalsKey is where a postgres backup's cluster globals (roles,
@@ -118,23 +425,22 @@ func (c *Client) AccessoryBackup(ctx context.Context, app, name, image string, e
 // sits one directory below the accessory's backups, so listings, latest
 // resolution and retention counting never see it as a backup of its own.
 func postgresGlobalsKey(s3 S3Config, app, name, id string) string {
-	return fmt.Sprintf("s3://%s/%s/accessories/%s/globals/%s.sql.gz", s3.Base(), app, name, id)
+	return seriesPrefix(s3, app, name, "") + "globals/" + id + ".sql.gz"
 }
 
 // backupPostgresGlobals stores the cluster's roles beside the dump so a
 // restore into a fresh cluster (and verify-backup's scratch) can recreate
-// object ownership. Best effort: the database dump is the backup.
-func (c *Client) backupPostgresGlobals(ctx context.Context, app, name, id string, env map[string]string, workDir string, s3 S3Config) {
-	_, user := postgresDBAndUser(app, env)
+// object ownership. Best effort: the database dump is the backup. A failure
+// comes back as a warning, so it is reported and not only printed.
+func (c *Client) backupPostgresGlobals(ctx context.Context, t pgTarget, id, workDir string, s3 S3Config, app, name string) string {
 	gz := workDir + "/globals.sql.gz"
-	if err := c.dumpPostgresGlobals(ctx, newPGTarget(app+"-"+name, "", user, env), workDir, gz); err != nil {
-		fmt.Fprintf(c.out, "Warning: the cluster roles (pg_dumpall --globals-only) were not saved: %v\n", err)
-		return
+	if err := c.dumpPostgresGlobals(ctx, t, workDir, gz); err != nil {
+		return fmt.Sprintf("the cluster roles (pg_dumpall --globals-only) were not saved: %v", err)
 	}
-	key := postgresGlobalsKey(s3, app, name, id)
-	if _, err := c.exec.Run(ctx, s3.AWS(fmt.Sprintf("s3 cp %s %s", ssh.ShellQuote(gz), ssh.ShellQuote(key)))); err != nil {
-		fmt.Fprintf(c.out, "Warning: uploading the cluster roles failed: %v\n", err)
+	if _, err := c.put(ctx, s3, gz, postgresGlobalsKey(s3, app, name, id)); err != nil {
+		return fmt.Sprintf("uploading the cluster roles failed: %v", err)
 	}
+	return ""
 }
 
 // dumpPostgresGlobals writes pg_dumpall --globals-only, gzipped, to gz. A
@@ -157,50 +463,105 @@ func (c *Client) applyPostgresGlobals(ctx context.Context, super pgTarget, gz st
 	c.exec.Run(ctx, "gunzip -c "+q(gz)+" > "+q(sql)+" && "+super.tool("psql", true)+" -X -q -U "+q(super.user)+" -d postgres < "+q(sql)+" >/dev/null 2>&1; true")
 }
 
-// backupCoverage says what a backup of this accessory leaves out, per engine.
+// backupCoverage says what a default backup of this accessory leaves out, per
+// engine (the DR bundle's question; it stores one object per accessory).
+func (c *Client) backupCoverage(ctx context.Context, app, name string, det EngineDetection, t pgTarget, env map[string]string) (pgCoverage, []string, []string) {
+	cov, err := c.coverageWith(ctx, app, name, det, t, env, BackupOptions{})
+	w := cov.warningsFor(app, name, det, env)
+	if err != nil {
+		w = append(w, err.Error())
+	}
+	return cov, cov.Uncovered, w
+}
+
+// coverageWith works out which databases a backup with these options stores.
 // Mongo dumps the whole server, so its killed-restore throwaways are dropped
 // first: they would otherwise land in this backup silently.
-func (c *Client) backupCoverage(ctx context.Context, app, name string, det EngineDetection, t pgTarget, env map[string]string) (pgCoverage, []string, []string) {
-	container := app + "-" + name
+func (c *Client) coverageWith(ctx context.Context, app, name string, det EngineDetection, t pgTarget, env map[string]string, opts BackupOptions) (pgCoverage, error) {
+	container := ContainerName(app, name)
+	listed := func() []string {
+		switch {
+		case opts.SingleDatabase != "":
+			return []string{opts.SingleDatabase}
+		case opts.AllDatabases:
+			return []string{"all"}
+		case len(opts.Databases) > 0:
+			return opts.Databases
+		}
+		labels, _ := c.inspectEngineHints(ctx, container)
+		return listedDatabases(labels)
+	}
 	switch det.Engine {
 	case EnginePostgres:
-		labels, _ := c.inspectEngineHints(ctx, container)
-		cov, err := c.pgReadCoverage(ctx, t, listedDatabases(labels))
+		cov, err := c.pgReadCoverage(ctx, t, listed())
 		if err != nil {
-			return cov, nil, []string{fmt.Sprintf("could not list the cluster's databases, so coverage is unknown: %v", err)}
+			return cov, fmt.Errorf("could not list the cluster's databases, so coverage is unknown: %w", err)
 		}
-		return cov, cov.Uncovered, cov.warnings(t.db)
+		cov.applySingle(t.db, opts)
+		return cov, nil
 	case EngineMySQL, EngineMariaDB:
 		db := mysqlDB(app, env)
-		uncovered, left, err := c.mysqlReadCoverage(ctx, det.Engine, container, db)
+		if app == AdoptedApp {
+			db = ""
+		}
+		cov, err := c.mysqlCoverage(ctx, det.Engine, container, db, listed())
 		if err != nil {
-			return pgCoverage{}, nil, []string{fmt.Sprintf("could not list the server's schemas, so coverage is unknown: %v", err)}
+			return cov, fmt.Errorf("could not list the server's schemas, so coverage is unknown: %w", err)
 		}
-		var w []string
-		if len(uncovered) > 0 {
-			w = append(w, fmt.Sprintf("this backup covers only %s: the server also holds %s, not backed up", db, strings.Join(uncovered, ", ")))
-		}
-		if len(left) > 0 {
-			w = append(w, fmt.Sprintf("a killed restore left the dry-run database %s: `teploy backup restore --accessory <name> --release` removes it", strings.Join(left, ", ")))
-		}
-		return pgCoverage{}, uncovered, w
+		cov.applySingle(db, opts)
+		return cov, nil
 	case EngineMongo:
 		dropped, err := c.dropMongoCheckDatabases(ctx, container)
 		if err != nil {
-			return pgCoverage{}, nil, []string{fmt.Sprintf("could not clear dry-run databases, so this backup may include them: %v", err)}
+			return pgCoverage{}, fmt.Errorf("could not clear dry-run databases, so this backup may include them: %w", err)
 		}
-		if len(dropped) > 0 {
-			return pgCoverage{}, nil, []string{fmt.Sprintf("dropped the dry-run databases a killed restore left: %s", strings.Join(dropped, ", "))}
-		}
+		return pgCoverage{DroppedThrowaway: dropped}, nil
 	}
-	return pgCoverage{}, nil, nil
+	return pgCoverage{}, nil
 }
 
-// recordPostgresSize stores the database's logical size beside the dump: a
+// applySingle narrows a coverage to the one database a safety backup is for.
+func (cov *pgCoverage) applySingle(primary string, opts BackupOptions) {
+	if opts.SingleDatabase == "" {
+		return
+	}
+	// A database that does not exist has nothing to protect: restoring it after
+	// it was dropped is the point, not a failure of its safety backup.
+	cov.Uncovered, cov.Missing = nil, nil
+	cov.PrimaryIsSingle = opts.SingleDatabase == primary
+	if cov.PrimaryIsSingle {
+		cov.Extra = nil
+	}
+}
+
+// warningsFor renders the coverage problems for messages and events, by engine.
+func (cov pgCoverage) warningsFor(app, name string, det EngineDetection, env map[string]string) []string {
+	switch det.Engine {
+	case EnginePostgres:
+		db, _ := postgresDBAndUser(app, env)
+		return cov.warnings(db)
+	case EngineMySQL, EngineMariaDB:
+		var w []string
+		if len(cov.Uncovered) > 0 {
+			w = append(w, fmt.Sprintf("this backup covers only %s: the server also holds %s, not backed up", strings.Join(append([]string{mysqlDB(app, env)}, cov.Extra...), ", "), strings.Join(cov.Uncovered, ", ")))
+		}
+		if len(cov.Throwaway) > 0 {
+			w = append(w, fmt.Sprintf("a killed restore left the dry-run database %s: `teploy backup restore --accessory <name> --release` removes it", strings.Join(cov.Throwaway, ", ")))
+		}
+		return w
+	case EngineMongo:
+		if len(cov.DroppedThrowaway) > 0 {
+			return []string{fmt.Sprintf("dropped the dry-run databases a killed restore left: %s", strings.Join(cov.DroppedThrowaway, ", "))}
+		}
+	}
+	return nil
+}
+
+// storeDatabaseMeta stores a database's logical size beside its dump: a
 // restore's free-space check needs what the BACKUP will occupy, which
 // neither the compressed artifact nor the live database says. Best effort.
-func (c *Client) recordPostgresSize(ctx context.Context, t pgTarget, s3 S3Config, app, name, id, workDir string) {
-	out, err := c.exec.Run(ctx, t.psql(t.db, "SELECT pg_database_size(current_database())"))
+func (c *Client) storeDatabaseMeta(ctx context.Context, t pgTarget, db string, s3 S3Config, key, workDir string) {
+	out, err := c.exec.Run(ctx, t.psql(db, "SELECT pg_database_size(current_database())"))
 	if err != nil {
 		return
 	}
@@ -213,28 +574,11 @@ func (c *Client) recordPostgresSize(ctx context.Context, t pgTarget, s3 S3Config
 	if err := c.exec.Upload(ctx, bytes.NewReader(body), local, "0600"); err != nil {
 		return
 	}
-	c.exec.Run(ctx, s3.AWS(fmt.Sprintf("s3 cp %s %s", ssh.ShellQuote(local), ssh.ShellQuote(pgSidecarKey(s3, app, name, "meta", id, ".json")))))
-}
-
-// backupPostgresExtra dumps one more database of the cluster. Extras sit
-// below the accessory's backups, so retention counting and listings see one
-// backup per id; `backup restore --database` restores one.
-func (c *Client) backupPostgresExtra(ctx context.Context, t pgTarget, db string, s3 S3Config, app, name, id, workDir string) error {
-	q := ssh.ShellQuote
-	local := workDir + "/extra.pgdump"
-	cmd := fmt.Sprintf("%s -Fc -U %s %s > %s && [ \"$(head -c 5 %s)\" = PGDMP ]", t.tool("pg_dump", false), q(t.user), q(db), q(local), q(local))
-	if _, err := c.exec.Run(ctx, cmd); err != nil {
-		return err
-	}
-	if _, err := c.checkArtifactSize(ctx, local, minPostgresDump); err != nil {
-		return err
-	}
-	_, err := c.exec.Run(ctx, s3.AWS(fmt.Sprintf("s3 cp %s %s", q(local), q(pgExtraKey(s3, app, name, db, id)))))
-	return err
+	c.put(ctx, s3, local, key)
 }
 
 func pgExtraKey(s3 S3Config, app, name, db, id string) string {
-	return fmt.Sprintf("s3://%s/%s/accessories/%s/databases/%s/%s.pgdump", s3.Base(), app, name, db, id)
+	return seriesPrefix(s3, app, name, db) + id + ".pgdump"
 }
 
 // checkArtifactSize measures a freshly written artifact and refuses one
@@ -255,31 +599,6 @@ func (c *Client) checkArtifactSize(ctx context.Context, path string, minBytes in
 		return size, fmt.Errorf("backup artifact is implausibly small (%d bytes, minimum %d) — the dump almost certainly failed (wrong credentials, empty output); refusing to store it", size, minBytes)
 	}
 	return size, nil
-}
-
-// resolveAccessoryKey finds the stored object for backup date among the
-// extensions an engine has used over time (postgres: custom-format
-// .pgdump since G7, plain .sql.gz before), by listing the date's prefix.
-func (c *Client) resolveAccessoryKey(ctx context.Context, s3 S3Config, prefix, date string, exts ...string) (key, ext string, err error) {
-	out, lsErr := c.exec.Run(ctx, s3.AWS("s3 ls "+ssh.ShellQuote(prefix+date+".")))
-	names := map[string]bool{}
-	if lsErr == nil {
-		for _, line := range strings.Split(out, "\n") {
-			if f := strings.Fields(line); len(f) > 0 {
-				names[f[len(f)-1]] = true
-			}
-		}
-	}
-	for _, e := range exts {
-		if names[date+e] {
-			return prefix + date + e, e, nil
-		}
-	}
-	detail := ""
-	if lsErr != nil {
-		detail = fmt.Sprintf(" (listing: %v)", lsErr)
-	}
-	return "", "", fmt.Errorf("no backup %s found under %s (looked for %s)%s", date, prefix, strings.Join(exts, ", "), detail)
 }
 
 // pipefail joins producer | consumer so that a failure of EITHER side fails
@@ -360,7 +679,7 @@ const (
 // raw-tar branch: generic is chosen only when detection found no engine
 // (or the teploy.engine=generic label asserts it).
 func planAccessoryDump(app, name string, det EngineDetection, env map[string]string, workDir string) (accessoryDumpPlan, error) {
-	containerName := app + "-" + name
+	containerName := ContainerName(app, name)
 	qContainer := ssh.ShellQuote(containerName)
 
 	// Dumps are redirected into files with `>`, never piped: a shell
@@ -402,7 +721,7 @@ func planAccessoryDump(app, name string, det EngineDetection, env map[string]str
 		base.method, base.consistency, base.ext, base.minBytes = client, consistencyEngineDump, ".sql.gz", minMySQLDump
 		base.cmd = command + " > " + qTmp +
 			" && { tail -c 512 " + qTmp + " | grep -q 'Dump completed' || { echo '" + client + " output has no completion trailer (truncated or failed dump)' >&2; exit 1; }; }" +
-			" && gzip -c " + qTmp + " > " + ssh.ShellQuote(dumpPath)
+			" && gzip -c " + qTmp + " > " + ssh.ShellQuote(dumpPath) + " && rm -f " + qTmp
 		return base, nil
 
 	case EngineMongo:
@@ -671,7 +990,7 @@ func redisRestoreScript(container, dumpPath, rdbPath, oldRdb string) string {
 // stop/copy (A40): "not proven yes" is not "proven no", and an AOF-enabled
 // redis/valkey would ignore a dump.rdb restore on restart.
 func (c *Client) redisAOFPreflight(ctx context.Context, engine, app, name string) error {
-	containerName := app + "-" + name
+	containerName := ContainerName(app, name)
 	aofOut, aofErr := c.exec.Run(ctx, fmt.Sprintf("docker exec %s %s --raw config get appendonly", ssh.ShellQuote(containerName), redisCLI(engine)))
 	if aofErr != nil {
 		return fmt.Errorf("cannot establish the %s persistence mode for %s: %w", engine, containerName, aofErr)

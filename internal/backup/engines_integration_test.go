@@ -36,14 +36,25 @@ import (
 const fakeAWS = `#!/bin/sh
 set -eu
 root=__ROOT__
+[ "${1:-}" = --version ] && { echo "fake aws"; exit 0; }
+if [ "$1" = s3api ]; then
+  # head-object --bucket B --key K [--region R] [--endpoint-url E]
+  [ "$2" = head-object ] || exit 1
+  shift 2; b=""; k=""
+  while [ $# -gt 0 ]; do case "$1" in --bucket) b=$2; shift 2;; --key) k=$2; shift 2;; *) shift;; esac; done
+  f="$root/$b/$k"; [ -f "$f" ] || { echo "An error occurred (404) when calling the HeadObject operation" >&2; exit 254; }
+  printf '{"ContentLength":%s,"LastModified":"%s","Metadata":{"sha256":"%s"}}\n' "$(wc -c < "$f" | tr -d ' ')" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(sha256sum "$f" | cut -d' ' -f1)"
+  exit 0
+fi
 [ "$1" = s3 ] || { echo "fake aws: only s3 is supported" >&2; exit 2; }
 op=$2; shift 2
 args=""
 recursive=no
 while [ $# -gt 0 ]; do
   case "$1" in
-    --region|--endpoint-url) shift 2 ;;
+    --region|--endpoint-url|--metadata|--copy-props) shift 2 ;;
     --recursive) recursive=yes; shift ;;
+    --only-show-errors) shift ;;
     *) args="$args $1"; shift ;;
   esac
 done
@@ -52,13 +63,22 @@ map() { case "$1" in s3://*) printf '%s/%s' "$root" "${1#s3://}" ;; *) printf '%
 case "$op" in
   cp)
     src=$(map "$1"); dst=$(map "$2")
+    if [ "$1" = - ]; then mkdir -p "$(dirname "$dst")"; cat > "$dst"; exit 0; fi
     [ -f "$src" ] || { echo "fatal error: An error occurred (404) when calling the HeadObject operation: Key \"$1\" does not exist" >&2; exit 1; }
+    if [ "$2" = - ]; then cat "$src"; exit 0; fi
     mkdir -p "$(dirname "$dst")"
     cp "$src" "$dst" ;;
   rm)
     rm -f "$(map "$1")" ;;
   ls)
     p=$(map "$1")
+    if [ "$recursive" = yes ]; then
+      [ -d "${p%/}" ] || exit 1
+      (cd "$root/${1#s3://}" 2>/dev/null && find . -type f | sed 's|^\./||') | while read -r f; do
+        printf '2026-11-03 00:00:00 %s %s\n' "$(wc -c < "${p%/}/$f" | tr -d ' ')" "${1#s3://}$f"
+      done | sed "s| itbucket/| |"
+      exit 0
+    fi
     case "$p" in
       */) dir=${p%/}; pre="" ;;
       *) dir=$(dirname "$p"); pre=$(basename "$p") ;;
@@ -96,6 +116,10 @@ func (p pathExecutor) Run(ctx context.Context, cmd string) (string, error) {
 	return p.Executor.Run(ctx, p.wrap(cmd))
 }
 
+func (p pathExecutor) RunStream(ctx context.Context, cmd string, stdout, stderr io.Writer) error {
+	return p.Executor.RunStream(ctx, p.wrap(cmd), stdout, stderr)
+}
+
 func (p pathExecutor) RunInput(ctx context.Context, cmd string, stdin io.Reader) error {
 	return p.Executor.RunInput(ctx, p.wrap(cmd), stdin)
 }
@@ -129,7 +153,7 @@ func newITFixture(t *testing.T, ctx context.Context) itFixture {
 		t.Fatalf("creating fixture workspace: %v", err)
 	}
 	t.Cleanup(func() {
-		base.Run(context.Background(), "sudo -n rm -rf "+ssh.ShellQuote(work)+" /tmp/teploy-restore.* /var/tmp/teploy-pre-restore.teployit* || rm -rf "+ssh.ShellQuote(work))
+		base.Run(context.Background(), "sudo -n rm -rf "+ssh.ShellQuote(work)+" /var/tmp/teploy-restore.* /var/tmp/teploy-pre-restore.teployit* || rm -rf "+ssh.ShellQuote(work))
 	})
 	if err := base.Upload(ctx, strings.NewReader(strings.ReplaceAll(fakeAWS, "__ROOT__", work+"/s3")), work+"/bin/aws", "0755"); err != nil {
 		t.Fatalf("installing fake aws: %v", err)

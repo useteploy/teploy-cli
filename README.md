@@ -107,7 +107,7 @@ standalone.
 | **Asset bridging** | Shared volume prevents 404s on hashed assets during deploys |
 | **Destinations** | `teploy deploy -d staging` — per-environment config overlays |
 | **Notifications** | Webhook notifications on deploy/rollback/failure |
-| **Backups** | `teploy backup` — volumes to S3; `teploy server backup-target` — the per-server target |
+| **Backups** | `teploy backup` — volumes and databases to S3; `teploy server backup-target` and `backup-policy` — one target and one policy per server; `teploy backup status` — every database at a glance |
 | **Templates** | One-command deploys for common self-hosted apps |
 | **Deploy locking** | `teploy lock` — freeze deploys during incidents; `teploy lock status --json` reports who holds the lock |
 | **Vulnerability gate** | `scan: true` — Trivy scan blocks deploys on fixable CRITICALs |
@@ -135,6 +135,7 @@ drain_seconds: 10             # request drain: keep the old container serving in
 memory: 2g                    # cgroup RAM cap (docker units: 512m, 2g). Unset = unlimited.
 cpu: "1.5"                    # CPU cap in cores. Unset = unlimited.
 keep_versions: 3              # auto-prune older versions after deploy (0 = keep all, default)
+backup_before_hooks: true     # back up running databases before a deploy whose pre_deploy hook will run (default off)
                               # `teploy pin <version>` protects a version from this prune
 
 # Build a Dockerfile that lives in a subdirectory (monorepos). Omit both
@@ -695,6 +696,195 @@ starts cron, `backup schedule` (and `accessory backup --schedule`) refuse on
 a server without one, and `teploy doctor` fails when teploy crontab lines or
 `/etc/cron.d` jobs exist but no cron daemon runs them (other jobs warn).
 
+#### Server policy: one cron line for the whole server
+
+```bash
+teploy server backup-policy set --host prod --interval 1h \
+  --max-age-days 2 --keep-daily 7 --keep-weekly 4 --keep-monthly 12 \
+  --recipient age1...                       # encrypt (see below)
+teploy server backup-policy set --host prod --adopt omni_postgres:postgres:all \
+  --adopt wordpress-shared-mysql:mysql:all --volumes --volume-max-gb 20
+printf 'https://dash.example/api/push/TOKEN\n' | teploy server backup-policy set --host prod --heartbeat-stdin
+teploy server backup-policy show --host prod [--json]   # heartbeat URLs only as hosts
+teploy server backup-policy unset --host prod            # stored backups stay
+teploy backup status --host prod --json                  # every database, one call
+```
+
+The policy lives on the server (`/etc/teploy/backup-policy.json`, 0600; a user
+who cannot write `/etc/teploy` gets `~/.config/teploy/backup-policy.json`). One
+cron line, `teploy backup run --all`, works out at run time what to back up:
+every labelled accessory and every database in it (each with its own object),
+app volumes when enabled, and adopted containers. A database deployed tomorrow is
+covered with no command. A per-app `backup schedule` stays as an override for its
+target; a hand-written job under a teploy marker does not count as one.
+
+Targets run one at a time. One failing does not stop the next, and nothing of a
+failed target is pruned. The exit status is nonzero unless every target succeeded,
+and `backup.all` (under the pseudo-app `_fleet`) and `--json` both report `ok`,
+`partial` or `failed` plus `omissions`: everything left out (exclusions, size-guard
+hits, a DB-like container nothing adopts, including engines teploy has no method for
+such as ClickHouse or Qdrant, a schema the tools cannot address). A clean status with
+omissions is not a complete backup. Zero targets is a failure unless the policy says
+`--allow-empty`: a lost accessory and an empty docker daemon look the same (and a run
+warns while `allow_empty` is set on a server that has targets, since losing them all
+would then report ok). A target that has earlier backups and now holds nothing to back
+up (its databases dropped) is a failure too, whose message names the `--exclude` that
+ends it. `--tmp-dir` builds on another disk and `--target-deadline` replaces the 6h
+per-target deadline; manual commands take `--deadline`. Neither may exceed the 23h a run
+may last: that is refused, not capped. A run that finds another running stands down; the
+lock is an `flock`, so a killed run cannot block the next, and a holder alive past the
+23h run deadline is killed. The lock sits beside the policy, or in `~/.config/teploy`
+when this user cannot write there.
+
+A killed run's leftovers are invisible to later runs and visible to doctor: a final
+key only ever holds a verified object (the upload goes to one `<prefix>/.incoming/`
+tree, its size and SHA-256 are checked, up to 256 MiB its bytes are read back, above that
+the store's own `--checksum-algorithm SHA256` is used, and only then is it copied into
+place), sidecars are stored before the primary object that commits a backup, and objects
+below their engine's plausibility floor are never a good copy. A store that refuses the
+server-side copy gets the verified file uploaded straight to its final name instead, and
+verified there. A workspace records its own deadline, so a janitor never cleans a live
+long run; a pending upload is a leftover after 24h.
+
+**Give `.incoming/` a 1-day lifecycle rule.** Every backup passes through it, and on a
+store that keeps versions (B2 only hides on delete; a versioned bucket) what was deleted
+there stays billed: about one extra copy of every backup, forever. `teploy doctor` reads
+the rule through `GetBucketLifecycleConfiguration` and warns when there is none, or when
+the store will not say. Scope the rule to `.incoming/` under the server's prefix: a rule
+on the whole bucket deletes the backups.
+
+```sh
+aws s3api put-bucket-lifecycle-configuration --bucket B --lifecycle-configuration '{"Rules":[{
+  "ID":"teploy-incoming","Status":"Enabled","Filter":{"Prefix":"PREFIX/.incoming/"},
+  "Expiration":{"Days":1},"NoncurrentVersionExpiration":{"NoncurrentDays":1},
+  "AbortIncompleteMultipartUpload":{"DaysAfterInitiation":1}}]}'
+```
+
+On B2 the same thing in its own terms is a lifecycle rule with `fileNamePrefix`
+`PREFIX/.incoming/`, `daysFromUploadingToHiding` 1 and `daysFromHidingToDeleting` 1.
+
+The aws CLI must be at least 2.23.0 (or 1.37.0), the first to send a checksum on every
+upload, which a bucket with Object Lock requires. An older one is refused with the remedy,
+and doctor fails on it; `teploy setup` replaces it.
+
+**Retention** is a union of rules over the good backups, restic `forget` style:
+`--keep-last N`; `--keep-daily/-weekly/-monthly N` keep the newest backup of the last
+N UTC days, ISO weeks and months that have one (an empty period does not use one up);
+`--max-age-days D` keeps everything younger than D days (restic's `keep-within`), and
+anything older goes unless another rule keeps it. The newest good backup is never
+deleted, and the newest 5 safety copies a destructive operation took, per target, outlast
+every rule for 7 days.
+The primary and each database's series are selected on their own, so a database that
+fails in the last run of each day still gets its `keep_daily`; ids the primary keeps
+are also kept for the databases. A pruned backup takes its sidecars with it. The same
+flags work on `teploy backup prune`. A run that stored nothing prunes nothing. A prune
+refuses (a warning in the run's output, event and doctor: the backup is stored, retention
+has stopped) when this machine's clock is over an hour from the store's, when the store's
+clock cannot be read (`backup prune --ignore-clock` for both), and when one run would
+delete most of a series, at least 3 backups and over half of it: a store on the same host
+shares a wrong clock, and a mistaken policy looks the same. Tighten retention on purpose
+with one `backup prune --allow-mass-delete`. A backup dated in the future is left out of
+selection: never deleted, never counted as the newest, and warned about on every run.
+
+**Heartbeats**: after every run the server GETs each URL, adding `?status=down` on
+anything but `ok` (`/fail` for healthchecks.io). A failing receiver is reported and
+never fails the backup; tokens appear in no log, event or output. Policy-managed
+runs do not use the per-app alert script (one signal, one owner); `backup run --app`
+still does.
+
+**Adopted containers** have no teploy labels and are addressed by their docker name,
+under the `_adopted` namespace:
+`teploy backup restore <id> --adopted --accessory wordpress-shared-mysql --database wp_blog --host prod`,
+`teploy accessory verify-backup wordpress-shared-mysql --adopted --database wp_blog --host prod`,
+`teploy backup list --adopted --host prod`. `backup list` shows per-database rows only
+with `--databases`. Nothing that uses an adopted container
+is stopped for you, and the prompt says so. MySQL and MariaDB get one object per
+schema, so one WordPress site restores alone. Postgres clusters get one per database
+plus the roles (`pg_dumpall --globals-only`).
+
+#### Encryption and recovery
+
+```bash
+teploy backup keygen                # prints a recovery keypair once; stored nowhere
+teploy server backup-policy set --host prod --recipient age1...
+# The drill, and the way back from a lost server (runs here, needs only aws,
+# the bucket credentials and the recovery key):
+TEPLOY_S3_ACCESS_KEY=... TEPLOY_S3_SECRET_KEY=... \
+  teploy backup fetch s3://bucket/prod/app/accessories/db/<id>.pgdump.age \
+    --identity recovery.txt --endpoint https://s3.example.com
+```
+
+With a recipient every object, sidecars and DR members included, is age-encrypted
+to the owner key and the server's own identity (`.age` suffix), the ciphertext is
+proven to decrypt before it leaves the server, and a failure to encrypt fails the
+backup rather than uploading plaintext. Restore and verify run on the server with
+its own identity. Older objects keep restoring. Rotation is forward-only: older
+objects still need the old key. Without a recipient backups keep working unencrypted
+(`encrypted: false` everywhere, so Dash can warn), and `.env`, which holds resolved
+secrets, is left out of volume archives with a warning (restoring such a backup keeps
+the server's current `.env`). `dr create --include-age-key` needs a recipient and
+wraps the server's private key to it alone.
+
+On a host with no server identity (a rebuilt server), the normal commands recover with
+the owner key alone, placing it on the host privately for that one command:
+`teploy backup restore <id> --app A --accessory db --identity recovery.txt --bucket B
+--endpoint E --prefix P --host H`, likewise `accessory restore` and `accessory
+verify-backup`, and `teploy dr restore <id> --identity recovery.txt --bucket B --endpoint
+E --prefix P`.
+
+A non-root SSH user usually cannot see into `/etc/teploy` (0700 once root has used it),
+where a policy would be invisible rather than absent. Teploy reads, writes and removes the
+policy there through passwordless sudo when it can, so there is one policy and rotating a
+key rotates it. A user with neither sudo nor write access keeps its own
+`~/.config/teploy/backup-policy.json` when nothing in `/etc` would shadow it; if it can see
+one there, `set` and `unset` refuse rather than store a copy nothing reads. A user that
+cannot tell is refused rather than risk uploading plaintext on a server configured to
+encrypt: connect as root, give it passwordless sudo, or set its own policy.
+
+#### Shared buckets
+
+Give each server its own `--prefix` on `server backup-target set`. Changing the
+prefix keeps the old one on record: list, verify and restore still find objects under
+it (`previous_prefix: true`). Its objects are never pruned, since they may be another
+server's, unless `--previous-prefix-owned` says only this server wrote under the prefix
+being left (`--claim-previous-prefix` for an earlier one); then they age out under the
+policy's retention. As a second guard every server leaves a marker at
+`<base>/<app>/.owners/<fingerprint>` before its first prune, and a namespace holding
+another server's marker, or one whose owners cannot be listed, is never pruned. `teploy
+server backup-target owners` lists the markers; `--clear <fingerprint>` removes those of
+a server that is gone, or this one before a rebuild. Without its marker a prune here deletes
+that server's backups, so a namespace written to in the last week needs `--force`, and every
+clear or refusal is an event in the `_fleet` log. A policy with no prefix in a bucket another
+server writes to is flagged by `teploy doctor`.
+
+The fingerprint is a hash of `/etc/machine-id` and the hostname, plus the server's age public
+key in the marker. Two things follow, on purpose rather than papered over with an id file a
+clone would copy too. Renaming a host gives it a new fingerprint: it sees its old marker as
+another server's and refuses to prune, which is safe, and `owners --clear <old> --force` ends
+it. A clone that keeps the machine-id and hostname and has no age identity is the same server
+to this check, so clones need their own `--prefix` (Dash always sets one) or a fresh
+`/etc/machine-id`.
+
+#### Before anything destructive
+
+`backup restore`, `accessory restore`, `accessory upgrade` and `remove --purge` first
+store a fresh backup of what they are about to replace, through the same path: the one
+database a restore replaces, and every database of the accessory for a purge or upgrade,
+refusing if any cannot be stored. If that fails, or a purge or upgrade has no target to
+save to, the operation is refused with what is at stake named; `--no-backup` goes ahead
+without one (a restore over corrupt data, where the dump cannot succeed, is what it is
+for). A database or container that no longer exists has nothing to protect and is not a
+refusal; a docker that does not answer is. With
+`backup_before_hooks: true` in `teploy.yml`, a deploy whose `hooks.pre_deploy` is set
+does the same for each running database accessory (default off; `deploy --no-backup`).
+
+`teploy doctor` flags a policy with no target, no running cron line, no recipient or
+stale runs, no heartbeat, a missing `aws` or `age`, a target that does not answer,
+leftover workspaces and uploads, a refused prune, a legacy shell cron line (which
+uploads plaintext whatever the policy says), and databases nothing backs up. `teploy
+setup` installs `aws` (AWS's bundle, signature checked, where the distribution has no
+package) and `age`.
+
 Accessory backups are engine-aware. The engine is detected from the
 container — the accessory's `engine:` in `teploy.yml` (set on the container
 as the `teploy.engine` label: postgres, mysql, mariadb, redis, valkey,
@@ -750,8 +940,8 @@ health-checked. On failure — or an unhealthy app afterwards — the
 pre-restore recovery copy is kept and named. Non-interactive restores
 require `--yes`.
 
-`--keep-last N` is a floor (the newest N are always kept, even if old);
-`--max-age-days D` deletes older backups but never below that floor. A failed
+`--keep-last N` keeps the newest N even if old; `--max-age-days D` keeps everything
+younger and lets the rest go (see Retention above for the full rule set). A failed
 backup never triggers a prune. Both `backup create` and scheduled cron backups
 alert on failure via the app's `notifications` config — `create` uses all
 channels; the headless `backup run` posts to the first **webhook** channel

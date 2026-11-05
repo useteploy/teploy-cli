@@ -46,11 +46,23 @@ type Target struct {
 	Region   string `json:"region"`
 	Endpoint string `json:"endpoint,omitempty"`
 	Prefix   string `json:"prefix,omitempty"`
+	// PreviousPrefixes are prefixes this target used before, in this bucket:
+	// list, latest and restore search them; prune only touches owned ones.
+	PreviousPrefixes []PreviousPrefix `json:"-"`
 	// HasCredentials reports whether the stored file carries an encrypted
 	// credentials blob. The blob itself is never decoded into this struct.
 	HasCredentials bool `json:"-"`
 	// Path is the server path the target was read from (diagnostics only).
 	Path string `json:"-"`
+}
+
+// PreviousPrefix is a key prefix this server's backups used to go under. Owned
+// means the operator has said only this server ever wrote there, which is what
+// allows its old objects to age out; otherwise they may be another server's, so
+// they are found and restorable but never deleted.
+type PreviousPrefix struct {
+	Prefix string `json:"prefix"`
+	Owned  bool   `json:"owned,omitempty"`
 }
 
 // targetFile is the on-disk shape. Credentials holds age armor (empty when
@@ -62,6 +74,8 @@ type targetFile struct {
 	Endpoint    string `json:"endpoint"`
 	Prefix      string `json:"prefix"`
 	Credentials string `json:"credentials,omitempty"`
+	// PreviousPrefixes is additive: an older CLI ignores it.
+	PreviousPrefixes []PreviousPrefix `json:"previous_prefixes,omitempty"`
 }
 
 // credentialValueRE is the charset a stored S3 access key or secret may
@@ -138,6 +152,7 @@ func ReadTarget(ctx context.Context, exec ssh.Executor) (Target, error) {
 		return Target{}, fmt.Errorf("%s: unsupported backup target version %q", t.Path, f.V)
 	}
 	t.Bucket, t.Region, t.Endpoint, t.Prefix = f.Bucket, f.Region, f.Endpoint, f.Prefix
+	t.PreviousPrefixes = f.PreviousPrefixes
 	t.HasCredentials = f.Credentials != ""
 	return t, nil
 }
@@ -153,7 +168,7 @@ echo absent`
 // age-encrypted credentials blob) on the server and returns the path
 // written plus whether the non-root fallback location was used.
 func WriteTarget(ctx context.Context, exec ssh.Executor, t Target, credsArmor string) (path string, fallback bool, err error) {
-	f := targetFile{V: "1", Bucket: t.Bucket, Region: t.Region, Endpoint: t.Endpoint, Prefix: t.Prefix, Credentials: credsArmor}
+	f := targetFile{V: "1", Bucket: t.Bucket, Region: t.Region, Endpoint: t.Endpoint, Prefix: t.Prefix, Credentials: credsArmor, PreviousPrefixes: t.PreviousPrefixes}
 	payload, err := json.Marshal(f)
 	if err != nil {
 		return "", false, err

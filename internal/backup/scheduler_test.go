@@ -39,7 +39,7 @@ func TestRequireScheduler(t *testing.T) {
 		{name: "running", out: "daemon=yes\nenabled=enabled\ncrontab=yes\nteploy_entries=0\n"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			mock := ssh.NewMockExecutor("h", ssh.MockCommand{Match: "sched_daemon=no", Output: tc.out, Err: tc.err})
+			mock := newStoreMock("h", ssh.MockCommand{Match: "sched_daemon=no", Output: tc.out, Err: tc.err})
 			err := RequireScheduler(ctx, mock)
 			if tc.wantSub == "" {
 				if err != nil {

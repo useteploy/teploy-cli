@@ -114,6 +114,9 @@ const (
 	KindBackupRestore  = "backup.restore"
 	KindBackupVerify   = "backup.verify"
 	KindBackupTarget   = "backup_target.set"
+	KindBackupOwners   = "backup_target.owners_clear"
+	KindBackupAll      = "backup.all"
+	KindBackupPolicy   = "backup_policy.set"
 )
 
 // detailAllow is the per-kind allowlist of detail keys. Env and secret
@@ -144,10 +147,13 @@ var detailAllow = map[string][]string{
 	KindMaintenanceOff: {"error"},
 	KindGateRepair:     {"case", "message"},
 	KindWatermarkReset: {"ref"},
-	KindBackupRun:      {"id", "kind", "accessory", "size_bytes", "key", "duration_ms", "engine", "consistency", "encrypted", "uncovered_databases", "warnings", "error"},
-	KindBackupVerify:   {"accessory", "date", "ok", "engine", "kind", "metric", "key", "size_bytes", "duration_ms", "error"},
-	KindBackupRestore:  {"id", "kind", "accessory", "action", "database", "released", "error"},
+	KindBackupRun:      {"id", "kind", "accessory", "size_bytes", "key", "duration_ms", "engine", "consistency", "encrypted", "uncovered_databases", "failed_databases", "databases", "warnings", "error", "policy_managed", "trigger", "pruned", "reason"},
+	KindBackupVerify:   {"accessory", "database", "date", "ok", "engine", "kind", "metric", "key", "size_bytes", "duration_ms", "encrypted", "error"},
+	KindBackupRestore:  {"id", "kind", "accessory", "action", "database", "released", "pre_backup_id", "error"},
 	KindBackupTarget:   {"id", "kind", "accessory", "error"},
+	KindBackupOwners:   {"fingerprint", "force", "removed", "error"},
+	KindBackupAll:      {"status", "targets_ok", "targets_failed", "omissions", "encrypted", "duration_ms", "heartbeats_ok", "heartbeats_failed", "warnings", "error"},
+	KindBackupPolicy:   {"interval", "encrypted", "volumes", "adopted", "error"},
 }
 
 // maxErrorDetail bounds the "error" detail so a command's full stderr

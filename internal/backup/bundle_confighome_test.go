@@ -15,7 +15,7 @@ const (
 )
 
 func homeMock(targetRepo string) *ssh.MockExecutor {
-	mock := ssh.NewMockExecutor("1.2.3.4")
+	mock := newStoreMock("1.2.3.4")
 	if targetRepo != "" {
 		repo := "/deployments/.teploy/apps/blog/config.git"
 		mock.Files[repo+"/HEAD"] = []byte("ref: refs/heads/teploy\n")

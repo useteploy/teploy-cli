@@ -16,7 +16,7 @@ import (
 const drTestState = `{"schema_version":2,"deployment_type":"container","ingress_mode":"caddy","domain":"myapp.example.com","updated_at":"2026-09-20T10:00:00Z","image_ref":"nginx:1.27","generation":4,"current_port":3000,"current_hash":"abc123"}`
 
 func drBaseMock(extra ...ssh.MockCommand) *ssh.MockExecutor {
-	mock := ssh.NewMockExecutor("dr-host", append([]ssh.MockCommand{
+	mock := newStoreMock("dr-host", append([]ssh.MockCommand{
 		{Match: "umask 077; mktemp -d /tmp/teploy-dr.XXXXXXXX", Output: "/tmp/drws1\n"},
 		{Match: "mkdir -p '/tmp/drws1", Output: ""},
 		{Match: "mkdir -p '/var/drstore/myapp/dr/", Output: ""},
@@ -135,7 +135,7 @@ func TestCreateBundle_ManifestAndConsistency(t *testing.T) {
 // nothing to recover — the error must say so and name the data-only
 // command, not mint a bundle that lies about scope.
 func TestCreateBundle_NoStateRefuses(t *testing.T) {
-	mock := ssh.NewMockExecutor("dr-host",
+	mock := newStoreMock("dr-host",
 		ssh.MockCommand{Match: "umask 077; mktemp -d /tmp/teploy-dr.XXXXXXXX", Output: "/tmp/drws1\n"},
 	)
 	client := NewClient(mock, &bytes.Buffer{})
@@ -338,7 +338,7 @@ func TestDeriveAppRun_PicksNewestRecord(t *testing.T) {
 // only directories that CONTAIN manifest.json.
 func TestDirStore_ListIDs(t *testing.T) {
 	root := "/var/drstore"
-	mock := ssh.NewMockExecutor("h",
+	mock := newStoreMock("h",
 		ssh.MockCommand{
 			Match:  "find '/var/drstore/myapp/dr'",
 			Output: root + "/myapp/dr/20260923-101500-0123456789abcdef\n",

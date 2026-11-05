@@ -229,8 +229,28 @@ func engineFromImageName(image string) string {
 // labels and entrypoint are read best-effort (an absent container — the
 // teploy.yml fallback — still classifies from image and env).
 func (c *Client) ResolveEngine(ctx context.Context, app, name, image string, env map[string]string) (EngineDetection, error) {
-	labels, argv := c.inspectEngineHints(ctx, app+"-"+name)
+	container := ContainerName(app, name)
+	if e := c.engineOverride[container]; e != "" {
+		return EngineDetection{Engine: e, Source: "policy"}, nil
+	}
+	labels, argv := c.inspectEngineHints(ctx, container)
 	return DetectEngine(image, env, labels, argv)
+}
+
+// SetEngineOverride forces a container's engine (an adopted policy entry's
+// engine:, which has no label to live on).
+func (c *Client) SetEngineOverride(container, engine string) error {
+	if engine == "" {
+		return nil
+	}
+	if !knownEngines[engine] {
+		return fmt.Errorf("unknown engine %q (postgres, mysql, mariadb, redis, valkey, dragonfly, mongo)", engine)
+	}
+	if c.engineOverride == nil {
+		c.engineOverride = map[string]string{}
+	}
+	c.engineOverride[container] = engine
+	return nil
 }
 
 // inspectEngineHints reads the container's labels and Entrypoint+Cmd.

@@ -109,6 +109,7 @@ a machine error envelope on stderr whose code distinguishes the classes
 	cmd.Flags().StringVar(&image, "image", "", "Docker image to deploy (skips build if set)")
 	cmd.Flags().StringVar(&version, "version", "", "version identifier (default: git short hash)")
 	cmd.Flags().BoolVar(&skipDNSCheck, "skip-dns-check", false, "skip DNS validation (for proxied domains like Cloudflare)")
+	cmd.Flags().BoolVar(&deployNoBackup, "no-backup", false, "skip the backup_before_hooks backup")
 	cmd.Flags().IntVar(&parallel, "parallel", 0, "max concurrent deploys for multi-server (default: from teploy.yml or 1)")
 	cmd.Flags().StringVarP(&destination, "destination", "d", "", "destination overlay (e.g. staging merges teploy.staging.yml)")
 	cmd.Flags().StringVar(&appName, "app", "", "app name for ad-hoc deploy (bypasses teploy.yml)")
@@ -858,6 +859,14 @@ func deployBuiltImageFenced(ctx context.Context, executor ssh.Executor, appCfg *
 	if appCfg.Scan {
 		fmt.Fprintln(out, "Scanning image for vulnerabilities (trivy)...")
 		if err := docker.NewClient(executor).ScanImage(ctx, image, out); err != nil {
+			return err
+		}
+	}
+
+	// backup_before_hooks: a pre_deploy hook is usually a migration, and a
+	// migration rewrites data with no way down.
+	if appCfg.BackupBeforeHooks && appCfg.Hooks.PreDeploy != "" && !deployNoBackup {
+		if err := backupBeforeDeployHook(ctx, rawExecutor, appCfg, out); err != nil {
 			return err
 		}
 	}

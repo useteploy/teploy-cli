@@ -1,0 +1,134 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://teploy.github.io/contracts/schema/backup-policy-envelope.schema.json",
+  "title": "`teploy server backup-policy show|set --json` (backup-fleet-v1, rev 18). Heartbeat URLs appear only as hosts.",
+  "type": "object",
+  "required": [
+    "machine_interface",
+    "host",
+    "configured",
+    "retention",
+    "volumes",
+    "heartbeat_count",
+    "encrypted"
+  ],
+  "properties": {
+    "machine_interface": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "host": {
+      "type": "string",
+      "minLength": 1
+    },
+    "configured": {
+      "type": "boolean"
+    },
+    "path": {
+      "type": "string"
+    },
+    "interval": {
+      "type": "string"
+    },
+    "cron": {
+      "type": "string",
+      "description": "The installed cron line's five fields; empty when there is none."
+    },
+    "retention": {
+      "type": "object",
+      "properties": {
+        "keep_last": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "keep_daily": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "keep_weekly": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "keep_monthly": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "max_age_days": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "description": "Union of rules over the good backups (restic forget semantics). keep_daily/weekly/monthly: newest backup of the last N UTC days / ISO weeks / months that have one. max_age_days: keep everything younger (keep-within). The newest good backup always stays."
+    },
+    "excludes": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "adopted": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "container",
+          "databases"
+        ],
+        "properties": {
+          "container": {
+            "type": "string"
+          },
+          "engine": {
+            "type": "string"
+          },
+          "databases": {
+            "oneOf": [
+              {
+                "const": "all"
+              },
+              {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    "volumes": {
+      "type": "boolean"
+    },
+    "volume_max_gb": {
+      "type": "number",
+      "minimum": 0
+    },
+    "heartbeat_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "heartbeat_hosts": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "recipient": {
+      "type": "string"
+    },
+    "encrypted": {
+      "type": "boolean"
+    },
+    "allow_empty": {
+      "type": "boolean",
+      "description": "Zero targets is not a failure."
+    },
+    "tmp_dir": {
+      "type": "string"
+    },
+    "target_deadline": {
+      "type": "string"
+    }
+  }
+}

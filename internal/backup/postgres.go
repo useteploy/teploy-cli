@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -702,7 +703,6 @@ const BackupDatabasesLabel = "teploy.backup-databases"
 
 var (
 	pgLeftoverName = regexp.MustCompile(`^(.*)_teploy_(old|new)_[0-9a-f]{8}$`)
-	pgSafeDBName   = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_.-]*$`)
 )
 
 // pgCoverage says what a backup of t.db leaves out of the cluster.
@@ -711,6 +711,17 @@ type pgCoverage struct {
 	Uncovered  []string // in the cluster, not backed up
 	KeptOld    []string // <db>_teploy_old_*: a previous database kept by a restore
 	PartialNew []string // <db>_teploy_new_*: a replacement left by a killed restore
+	// Missing are databases listed by name that the server does not have.
+	Missing []string
+	// PrimaryMissing says the accessory's own database does not exist (with
+	// AllDatabases, every database then has a series of its own).
+	PrimaryMissing bool
+	// PrimaryIsSingle says a SingleDatabase backup is of the primary database.
+	PrimaryIsSingle bool
+	// Throwaway are mysql dry-run databases a killed restore left.
+	Throwaway []string
+	// DroppedThrowaway are mongo dry-run databases this backup cleared.
+	DroppedThrowaway []string
 }
 
 // pgReadCoverage lists the cluster's databases. A "postgres" maintenance
@@ -731,16 +742,18 @@ func (c *Client) pgReadCoverage(ctx context.Context, t pgTarget, listed []string
 		}
 		want[l] = true
 	}
+	primaryFound := false
 	for _, name := range names {
 		switch {
 		case name == t.db:
+			primaryFound = true
 		case pgLeftoverName.MatchString(name):
 			if strings.Contains(name, "_teploy_old_") {
 				cov.KeptOld = append(cov.KeptOld, name)
 			} else {
 				cov.PartialNew = append(cov.PartialNew, name)
 			}
-		case want[name] && pgSafeDBName.MatchString(name):
+		case want[name] && addressableDB(name):
 			cov.Extra = append(cov.Extra, name)
 		case name == "postgres":
 			tables := "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relkind IN ('r','p') AND n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg\\_%' AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = 'pg_class'::regclass AND d.objid = c.oid AND d.deptype = 'e')"
@@ -751,10 +764,16 @@ func (c *Client) pgReadCoverage(ctx context.Context, t pgTarget, listed []string
 					cov.Uncovered = append(cov.Uncovered, name)
 				}
 			}
-		case all && pgSafeDBName.MatchString(name):
+		case all && addressableDB(name):
 			cov.Extra = append(cov.Extra, name)
 		default:
 			cov.Uncovered = append(cov.Uncovered, name)
+		}
+	}
+	cov.PrimaryMissing = t.db != "" && !primaryFound
+	for _, l := range listed {
+		if l != "all" && !slices.Contains(names, l) && l != t.db {
+			cov.Missing = append(cov.Missing, l)
 		}
 	}
 	return cov, nil
@@ -789,14 +808,11 @@ type pgBackupMeta struct {
 	LogicalBytes int64 `json:"logical_bytes"`
 }
 
-func pgSidecarKey(s3 S3Config, app, name, kind, id, ext string) string {
-	return fmt.Sprintf("s3://%s/%s/accessories/%s/%s/%s%s", s3.Base(), app, name, kind, id, ext)
-}
-
-// pgRecordedSize reads the size recorded at backup time (0 when absent).
-func (c *Client) pgRecordedSize(ctx context.Context, s3 S3Config, app, name, id, workDir string) int64 {
+// pgRecordedSize reads the size recorded at backup time (0 when absent), for
+// the primary database or one with its own series.
+func (c *Client) pgRecordedSize(ctx context.Context, s3 S3Config, app, name, db, id, workDir string) int64 {
 	local := workDir + "/meta.json"
-	if _, err := c.exec.Run(ctx, s3.AWS(fmt.Sprintf("s3 cp %s %s", ssh.ShellQuote(pgSidecarKey(s3, app, name, "meta", id, ".json")), ssh.ShellQuote(local)))); err != nil {
+	if !c.fetchSidecar(ctx, s3, seriesPrefix(s3, app, name, db)+"meta/"+id+".json", local) {
 		return 0
 	}
 	out, err := c.exec.Run(ctx, "cat "+ssh.ShellQuote(local))
@@ -842,7 +858,7 @@ func (c *Client) AccessoryReports(ctx context.Context) ([]AccessoryReport, error
 		if err != nil {
 			continue
 		}
-		container := app + "-" + name
+		container := ContainerName(app, name)
 		r := AccessoryReport{App: app, Accessory: name}
 		switch det.Engine {
 		case EnginePostgres:
@@ -853,6 +869,11 @@ func (c *Client) AccessoryReports(ctx context.Context) ([]AccessoryReport, error
 			r.Leftovers = append(append(r.Leftovers, cov.KeptOld...), cov.PartialNew...)
 		case EngineMySQL, EngineMariaDB:
 			r.Uncovered, r.Leftovers, r.Err = c.mysqlReadCoverage(ctx, det.Engine, container, mysqlDB(app, env))
+			labels, _ := c.inspectEngineHints(ctx, container)
+			if listed := listedDatabases(labels); len(listed) > 0 && r.Err == nil {
+				cov, err := c.mysqlCoverage(ctx, det.Engine, container, mysqlDB(app, env), listed)
+				r.Err, r.Uncovered = err, cov.Uncovered
+			}
 		case EngineMongo:
 			r.Leftovers, r.Err = c.mongoCheckDatabases(ctx, container)
 		default:

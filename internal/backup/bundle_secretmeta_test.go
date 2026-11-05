@@ -26,7 +26,7 @@ func assertNoOldSecrets(t *testing.T, where string, data []byte) {
 // A DR bundle is a copy that travels: records written before redaction must
 // be exported without their secret env values, other fields intact.
 func TestCollectReleaseRecords_RedactsSecretEnv(t *testing.T) {
-	mock := ssh.NewMockExecutor("dr-host",
+	mock := newStoreMock("dr-host",
 		ssh.MockCommand{Match: "find '/deployments/myapp/meta'", Output: "/deployments/myapp/meta/abc123.json\n"},
 	)
 	mock.Files["/deployments/myapp/meta/abc123.json"] = []byte(oldShapeRecord)
@@ -50,7 +50,7 @@ func TestCollectReleaseRecords_RedactsSecretEnv(t *testing.T) {
 // Restoring a bundle made before redaction must not put secret values back
 // at rest on the target.
 func TestInstallReleaseRecords_RedactsOldBundles(t *testing.T) {
-	mock := ssh.NewMockExecutor("dr-host")
+	mock := newStoreMock("dr-host")
 	err := NewClient(mock, &bytes.Buffer{}).installReleaseRecords(context.Background(), "/deployments/myapp", []json.RawMessage{json.RawMessage(oldShapeRecord)})
 	if err != nil {
 		t.Fatal(err)

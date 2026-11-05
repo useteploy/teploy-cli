@@ -31,7 +31,7 @@ func TestBundleManifestRejectsUnsafeMembersBeforeStaging(t *testing.T) {
 }
 
 func TestS3BundleListRecognizesPrefixRows(t *testing.T) {
-	mock := ssh.NewMockExecutor("host", ssh.MockCommand{Match: "aws", Output: "                           PRE 20260923-101500-0123456789abcdef/\n2026-09-23 10:15:00 12 manifest.json\n"})
+	mock := newStoreMock("host", ssh.MockCommand{Match: "aws", Output: "                           PRE 20260923-101500-0123456789abcdef/\n2026-09-23 10:15:00 12 manifest.json\n"})
 	ids, err := (S3BundleStore{S3: S3Config{Bucket: "dummy"}}).ListIDs(context.Background(), mock, "myapp")
 	if err != nil {
 		t.Fatal(err)

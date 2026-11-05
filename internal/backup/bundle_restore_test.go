@@ -41,7 +41,7 @@ func drRestoreMock(manifest *BundleManifest, extra ...ssh.MockCommand) *ssh.Mock
 	staging := DRStagingPath("myapp", manifest.ID)
 	manifestJSON, _ := json.Marshal(manifest)
 	// extras are PREPENDED so injected failures outrank the base successes.
-	mock := ssh.NewMockExecutor("dr-host", append(extra, []ssh.MockCommand{
+	mock := newStoreMock("dr-host", append(extra, []ssh.MockCommand{
 		{Match: "rm -rf '" + staging, Output: ""},
 		{Match: "umask 077; mkdir -p '" + staging, Output: ""},
 		{Match: "mkdir -p '" + staging, Output: ""},
@@ -231,7 +231,7 @@ func drCutoverMock(receipt *RestoreReceipt, manifest *BundleManifest, extra ...s
 	receiptJSON, _ := json.Marshal(receipt)
 	manifestJSON, _ := json.Marshal(manifest)
 	// extras are PREPENDED so injected failures outrank the base successes.
-	mock := ssh.NewMockExecutor("dr-host", append(extra, []ssh.MockCommand{
+	mock := newStoreMock("dr-host", append(extra, []ssh.MockCommand{
 		{Match: "mkdir /deployments/myapp/.lock", Output: ""},
 		// Accessory admission (R2-06) runs before any cutover effect.
 		{Match: "teploy_volume_actor", Output: ""},
@@ -281,7 +281,7 @@ func drOKReceipt() *RestoreReceipt {
 func TestCutover_RequiresValidatedStaging(t *testing.T) {
 	manifest := drTestManifest()
 
-	noReceipt := ssh.NewMockExecutor("dr-host")
+	noReceipt := newStoreMock("dr-host")
 	_, err := NewClient(noReceipt, &bytes.Buffer{}).CutoverBundle(context.Background(),
 		BundleRestoreOptions{App: "myapp", ID: manifest.ID, Config: drTestConfig()})
 	if !errors.Is(err, ErrValidationRequired) {

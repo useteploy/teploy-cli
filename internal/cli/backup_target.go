@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/useteploy/teploy/internal/config"
 
@@ -43,7 +45,118 @@ func newServerBackupTargetCmd(flags *Flags) *cobra.Command {
 	cmd.AddCommand(newServerBackupTargetSetCmd(flags))
 	cmd.AddCommand(newServerBackupTargetShowCmd(flags))
 	cmd.AddCommand(newServerBackupTargetUnsetCmd(flags))
+	cmd.AddCommand(newServerBackupTargetOwnersCmd(flags))
 	return cmd
+}
+
+// newServerBackupTargetOwnersCmd shows and clears namespace markers: a prune
+// refuses a namespace holding another server's, so a rebuilt server's old self
+// would stop retention there forever, and growth is the only symptom.
+func newServerBackupTargetOwnersCmd(flags *Flags) *cobra.Command {
+	var (
+		clear string
+		force bool
+	)
+	cmd := &cobra.Command{
+		Use:   "owners",
+		Short: "List which servers have written under this target; --clear removes one's markers",
+		Long: "Each server leaves a marker in every namespace it writes to, and a prune\n" +
+			"refuses a namespace holding another server's. --clear <fingerprint> removes a\n" +
+			"server's markers, under the current and previous prefixes: for a server that\n" +
+			"no longer exists, or this one before a rebuild. Backups are not touched. Do not\n" +
+			"clear a server that still writes here: give it its own --prefix. A namespace\n" +
+			"written to in the last week is refused without --force, and every clear is\n" +
+			"recorded in the server's event log.",
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+			defer cancel()
+			host, user, key, err := configResolveServerForTarget(flags)
+			if err != nil {
+				return err
+			}
+			executor, err := ssh.Connect(ctx, ssh.ConnectConfig{Host: host, User: user, KeyPath: key})
+			if err != nil {
+				return err
+			}
+			defer executor.Close()
+			target, err := backup.ReadTarget(ctx, executor)
+			if err != nil {
+				return err
+			}
+			if !TargetConfigured(target) {
+				return fmt.Errorf("no backup target is configured for this server")
+			}
+			client := backup.NewClient(executor, io.Discard)
+			cfg := TargetS3(target)
+			locs := []backup.S3Config{cfg}
+			for _, p := range target.PreviousPrefixes {
+				l := cfg
+				l.Prefix, l.PreviousPrefixes = p.Prefix, nil
+				locs = append(locs, l)
+			}
+			if clear != "" {
+				total, err := clearOwnerMarkers(ctx, executor, client, locs, clear, force, time.Now())
+				if err != nil {
+					return err
+				}
+				fmt.Printf("Removed %d marker(s) of %s\n", total, clear)
+				return nil
+			}
+			markers := []backup.NamespaceMarker{}
+			for _, l := range locs {
+				m, err := client.ListNamespaceMarkers(ctx, l)
+				if err != nil {
+					return err
+				}
+				markers = append(markers, m...)
+			}
+			if flags.JSON {
+				return json.NewEncoder(os.Stdout).Encode(map[string]any{"machine_interface": MachineInterface, "host": executor.Host(), "markers": markers})
+			}
+			for _, m := range markers {
+				who := "another server"
+				if m.Self {
+					who = "this server"
+				}
+				fmt.Printf("%-24s %s (%s) %s\n", m.Namespace, m.Fingerprint, who, m.Key)
+			}
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&clear, "clear", "", "remove this fingerprint's markers (a namespace written to in the last week needs --force)")
+	cmd.Flags().BoolVar(&force, "force", false, "with --clear: remove them even though the namespace is in use, which lets a prune here delete that server's backups")
+	return cmd
+}
+
+// clearOwnerMarkers removes a fingerprint's markers from every location, and records
+// it: the marker is all that stops a prune deleting that server's objects, so its
+// removal is an event whether it went through or was refused.
+func clearOwnerMarkers(ctx context.Context, exec ssh.Executor, client *backup.Client, locs []backup.S3Config, fingerprint string, force bool, now time.Time) (int, error) {
+	total := 0
+	var err error
+	for _, l := range locs {
+		removed, cerr := client.ClearNamespaceMarkers(ctx, l, fingerprint, force, now)
+		total += len(removed)
+		if cerr != nil {
+			err = cerr
+			break
+		}
+	}
+	events.Record(ctx, exec, ownerClearEvent(fingerprint, force, total, err))
+	return total, err
+}
+
+func ownerClearEvent(fingerprint string, force bool, removed int, err error) events.Event {
+	ev := events.Event{App: backup.FleetApp, Kind: events.KindBackupOwners, Outcome: events.Succeeded, Detail: map[string]any{"fingerprint": fingerprint, "force": force, "removed": removed}}
+	if err != nil {
+		ev.Outcome = events.Failed
+		if errors.Is(err, backup.ErrMarkerRecent) {
+			ev.Outcome = events.Refused
+		}
+		ev.Detail = events.ErrDetail(ev.Detail, err)
+	}
+	return ev
 }
 
 // backupTargetDTO is the `server backup-target show --json` envelope
@@ -59,6 +172,8 @@ type backupTargetDTO struct {
 	Prefix           string `json:"prefix,omitempty"`
 	HasCredentials   bool   `json:"has_credentials"`
 	Path             string `json:"path,omitempty"`
+	// PreviousPrefixes are old prefixes of this bucket list and restore search.
+	PreviousPrefixes []backup.PreviousPrefix `json:"previous_prefixes,omitempty"`
 }
 
 func newServerBackupTargetSetCmd(flags *Flags) *cobra.Command {
@@ -68,6 +183,9 @@ func newServerBackupTargetSetCmd(flags *Flags) *cobra.Command {
 		endpoint      string
 		prefix        string
 		noCredentials bool
+		prevOwned     bool
+		dropPrevious  bool
+		claimPrevious []string
 	)
 	cmd := &cobra.Command{
 		Use:   "set",
@@ -77,10 +195,17 @@ func newServerBackupTargetSetCmd(flags *Flags) *cobra.Command {
 			"lines: the access key, then the secret key. With a terminal, both are\n" +
 			"prompted with echo off.\n\n" +
 			"Example:\n" +
-			"  printf 'ACCESS\\nSECRET\\n' | teploy server backup-target set --host prod --bucket b --endpoint https://s3.example.com",
+			"  printf 'ACCESS\\nSECRET\\n' | teploy server backup-target set --host prod --bucket b --endpoint https://s3.example.com\n\n" +
+			"Give each server its own --prefix when servers share a bucket. Changing the\n" +
+			"prefix keeps the old one on record: list, verify and restore still find the\n" +
+			"objects there. They are not pruned, because they may be another server's;\n" +
+			"--previous-prefix-owned says only this server ever wrote under the prefix\n" +
+			"being left, and --claim-previous-prefix says it of an earlier one, which lets\n" +
+			"them age out under the policy's retention (never where another server's\n" +
+			"marker says otherwise).",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runServerBackupTargetSet(flags, bucket, region, endpoint, prefix, noCredentials)
+			return runServerBackupTargetSet(flags, bucket, region, endpoint, prefix, noCredentials, prevOwned, dropPrevious, claimPrevious)
 		},
 	}
 	cmd.Flags().StringVar(&bucket, "bucket", "", "S3 bucket name")
@@ -88,10 +213,58 @@ func newServerBackupTargetSetCmd(flags *Flags) *cobra.Command {
 	cmd.Flags().StringVar(&endpoint, "endpoint", "", "S3-compatible endpoint URL (MinIO/B2/R2)")
 	cmd.Flags().StringVar(&prefix, "prefix", "", "key prefix under the bucket (optional)")
 	cmd.Flags().BoolVar(&noCredentials, "no-credentials", false, "store no credentials — use the server's ambient AWS credential chain")
+	cmd.Flags().BoolVar(&prevOwned, "previous-prefix-owned", false, "the prefix being left holds only this server's objects: let retention age them out")
+	cmd.Flags().StringArrayVar(&claimPrevious, "claim-previous-prefix", nil, "an earlier prefix (from `backup-target show`) that holds only this server's objects")
+	cmd.Flags().BoolVar(&dropPrevious, "forget-previous-prefixes", false, "stop looking under previous prefixes (their objects are left in the bucket)")
 	return cmd
 }
 
-func runServerBackupTargetSet(flags *Flags, bucket, region, endpoint, prefix string, noCredentials bool) error {
+// mergePreviousPrefixes carries a target's prefix history across a `set`: the
+// prefix being left joins the list, the prefix being entered leaves it. A new
+// bucket or endpoint starts fresh, since the old location is not reachable from
+// the new config.
+//
+// owned applies only to the prefix being left: earlier ones, the shared root
+// among them, may hold other servers' objects, and one word about one move must
+// not make them deletable. An earlier one is claimed by name.
+func mergePreviousPrefixes(old backup.Target, bucket, endpoint, prefix string, owned, drop bool, claim []string) (prev []backup.PreviousPrefix, lost bool, err error) {
+	if !TargetConfigured(old) {
+		if len(claim) > 0 {
+			return nil, false, fmt.Errorf("--claim-previous-prefix: this server has no previous prefixes")
+		}
+		return nil, false, nil
+	}
+	if old.Bucket != bucket || old.Endpoint != endpoint {
+		return nil, true, nil
+	}
+	if drop {
+		return nil, false, nil
+	}
+	for _, p := range old.PreviousPrefixes {
+		if p.Prefix != prefix && p.Prefix != old.Prefix {
+			prev = append(prev, p)
+		}
+	}
+	if old.Prefix != prefix {
+		prev = append(prev, backup.PreviousPrefix{Prefix: old.Prefix, Owned: owned})
+	} else if owned {
+		fmt.Fprintln(os.Stderr, "Warning: --previous-prefix-owned applies to the prefix being left and this set leaves none; use --claim-previous-prefix for an earlier one")
+	}
+	for _, c := range claim {
+		found := false
+		for i := range prev {
+			if prev[i].Prefix == c {
+				prev[i].Owned, found = true, true
+			}
+		}
+		if !found {
+			return nil, false, fmt.Errorf("--claim-previous-prefix %q is not one of this target's previous prefixes", c)
+		}
+	}
+	return prev, false, nil
+}
+
+func runServerBackupTargetSet(flags *Flags, bucket, region, endpoint, prefix string, noCredentials, prevOwned, dropPrevious bool, claimPrevious []string) error {
 	if bucket == "" {
 		return fmt.Errorf("--bucket is required")
 	}
@@ -142,7 +315,16 @@ func runServerBackupTargetSet(flags *Flags, bucket, region, endpoint, prefix str
 			return err
 		}
 	}
+	old, err := backup.ReadTarget(ctx, executor)
+	if err != nil {
+		return err
+	}
 	t := backup.Target{Bucket: bucket, Region: region, Endpoint: endpoint, Prefix: prefix, HasCredentials: credsArmor != ""}
+	var lostOld bool
+	t.PreviousPrefixes, lostOld, err = mergePreviousPrefixes(old, bucket, endpoint, prefix, prevOwned, dropPrevious, claimPrevious)
+	if err != nil {
+		return err
+	}
 	path, fallback, err := backup.WriteTarget(ctx, executor, t, credsArmor)
 	if err != nil {
 		return err
@@ -151,6 +333,19 @@ func runServerBackupTargetSet(flags *Flags, bucket, region, endpoint, prefix str
 
 	fmt.Printf("Backup target stored: s3://%s at %s\n", backupTargetLabel(t), path)
 	fmt.Printf("  Credentials: %s\n", credentialMode(t))
+	if lostOld {
+		fmt.Printf("  Note: backups under the old target s3://%s are not reachable from this one and are no longer listed; they were not touched\n", backupTargetLabel(old))
+	}
+	for _, p := range t.PreviousPrefixes {
+		owned := "kept until you remove them (they may be another server's; --previous-prefix-owned lets them age out)"
+		if p.Owned {
+			owned = "ages out under the policy's retention"
+		}
+		fmt.Printf("  Previous prefix %q: still searched by list and restore; %s\n", p.Prefix, owned)
+	}
+	if prefix == "" {
+		fmt.Println("  No prefix: if other servers share this bucket, give each its own --prefix. A namespace another server has written to is never pruned")
+	}
 	if fallback {
 		fmt.Println("  /etc/teploy is not writable by this user — the target lives in ~/.config/teploy instead")
 	}
@@ -187,12 +382,13 @@ func checkReachability(ctx context.Context, executor ssh.Executor, t backup.Targ
 	cfg := TargetS3(t)
 	client := backup.NewClient(executor, io.Discard)
 	if err := client.EnsureAWSCLIPublic(ctx); err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: could not verify the target: %v\n", err)
+		// The target is stored, and every backup through it will fail until this
+		// is fixed: say so in the terms that fix it.
+		fmt.Fprintf(os.Stderr, "Warning: backups through this target will fail: %v\n", err)
 		return
 	}
-	res := ssh.RunDetailed(ctx, executor, cfg.AWS("s3 ls s3://"+cfg.Bucket+"/"))
-	if res.Failed() {
-		fmt.Fprintf(os.Stderr, "Warning: the stored target did not answer `aws s3 ls` (%s) — check the bucket, endpoint and credentials\n", oneLine(res.ExitErrorText()))
+	if err := client.ProbeTarget(ctx, cfg); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: the stored target did not answer `aws s3 ls` (%s) — check the bucket, endpoint and credentials\n", oneLine(err.Error()))
 		return
 	}
 	fmt.Println("  Reachability: aws s3 ls answered")
@@ -346,6 +542,7 @@ func writeBackupTargetJSON(w io.Writer, host string, target backup.Target) error
 		Host:             host,
 		HasCredentials:   target.HasCredentials,
 		Path:             target.Path,
+		PreviousPrefixes: target.PreviousPrefixes,
 	}
 	if TargetConfigured(target) {
 		dto.Configured = true
@@ -527,7 +724,8 @@ func serverAppNames(ctx context.Context, executor ssh.Executor) ([]string, error
 	seen := map[string]bool{}
 	var apps []string
 	for _, line := range strings.Split(string(res.Stdout), "\n") {
-		if app := strings.TrimSpace(line); app != "" && !seen[app] {
+		// _adopted and _fleet are event-log namespaces, not apps.
+		if app := strings.TrimSpace(line); app != "" && !strings.HasPrefix(app, "_") && !seen[app] {
 			seen[app] = true
 			apps = append(apps, app)
 		}

@@ -187,6 +187,17 @@ type S3Config struct {
 	// credentials should back this config (set when it was resolved from
 	// the server's stored target rather than flags).
 	StoredTarget string
+	// OwnerRecipient, when set, encrypts every object written with this config
+	// to this age public key and the server's own identity (G1).
+	OwnerRecipient string
+	// ExtraIdentity is a server-side identity file fetch also tries (a DR
+	// restore on a host that is not the one that wrote the backup).
+	ExtraIdentity string
+	// PreviousPrefixes are old key prefixes of this bucket, searched by list,
+	// latest and restore. Only owned ones are ever pruned (G3).
+	PreviousPrefixes []PreviousPrefix
+	isPrevious       bool
+	previousOwned    bool
 }
 
 // Base is the bucket-root-relative key prefix every backup key is built
@@ -239,6 +250,24 @@ type Client struct {
 	// loadDeadline overrides the deadlines on dump loads and their cleanup
 	// (0 = scaled to the dump; tests shorten it).
 	loadDeadline time.Duration
+	// serverRecip and serverFP memoize the server's age recipient and
+	// fingerprint for this client's lifetime.
+	serverRecip, serverFP string
+	// engineOverride forces a container's engine: an adopted entry's engine:,
+	// which has no label to live on.
+	engineOverride map[string]string
+	// deadline overrides BackupDeadline (--deadline, the policy, tests).
+	deadline time.Duration
+	// readBack overrides readBackMax (tests shorten it).
+	readBack int64
+}
+
+// SetDeadline overrides the per-operation deadline of backups, restores and
+// verifies through this client.
+func (c *Client) SetDeadline(d time.Duration) {
+	if d > 0 {
+		c.deadline = d
+	}
 }
 
 // NewClient creates a new backup client.
@@ -264,17 +293,44 @@ type BackupResult struct {
 	// does not contain; Warnings are non-fatal coverage problems.
 	UncoveredDatabases []string
 	Warnings           []string
+	// Encrypted says the objects are age-encrypted (G1).
+	Encrypted bool
+	// Objects are every primary and per-database object this backup stored.
+	Objects []BackupObject
+	// FailedDatabases are databases of this server whose dump failed this run,
+	// with the reason. Non-empty always comes with a returned error.
+	FailedDatabases map[string]string
 }
 
-// BackupVolumes archives the app's volumes (and .env) to S3, reporting the
-// created backup's identity and size. The .env rides inside the archive as
-// a top-level member which restore puts back beside the volumes directory;
-// the archive is built inside a private 0700 mktemp workspace (audit F34).
-func (c *Client) BackupVolumes(ctx context.Context, app string, s3 S3Config) (res BackupResult, err error) {
+// BackupObject is one stored backup object.
+type BackupObject struct {
+	Database  string `json:"database,omitempty"`
+	Key       string `json:"key"`
+	Size      int64  `json:"size_bytes"`
+	Encrypted bool   `json:"encrypted"`
+}
+
+// BackupVolumes archives the app's volumes (and, only when the archive will be
+// encrypted, .env) to S3, reporting the created backup's identity and size. The
+// .env rides inside the archive as a top-level member which restore puts back
+// beside the volumes directory. It holds resolved secrets, so an unencrypted
+// archive leaves it out and says so. The archive is built inside a private 0700
+// mktemp workspace (audit F34).
+func (c *Client) BackupVolumes(ctx context.Context, app string, s3 S3Config) (BackupResult, error) {
+	return c.BackupVolumesWith(ctx, app, s3, BackupOptions{})
+}
+
+// BackupVolumesWith is BackupVolumes with options.
+func (c *Client) BackupVolumesWith(ctx context.Context, app string, s3 S3Config, opts BackupOptions) (res BackupResult, err error) {
 	start := time.Now()
-	res = BackupResult{Engine: "volumes", Consistency: consistencyCrash}
+	ctx, cancel := context.WithTimeout(ctx, c.backupDeadline())
+	defer cancel()
+	res = BackupResult{Engine: "volumes", Consistency: consistencyCrash, Encrypted: s3.Encrypted()}
 	defer func() { res.DurationMs = time.Since(start).Milliseconds() }()
 	if err := c.ensureAWSCLI(ctx); err != nil {
+		return res, err
+	}
+	if err := c.prepareEncryption(ctx, s3); err != nil {
 		return res, err
 	}
 
@@ -285,70 +341,100 @@ func (c *Client) BackupVolumes(ctx context.Context, app string, s3 S3Config) (re
 	res.ID = timestamp
 	volumesDir := fmt.Sprintf("%s/%s/volumes", deploymentsDir, app)
 	appDir := fmt.Sprintf("%s/%s", deploymentsDir, app)
+	q := ssh.ShellQuote
 
-	runOut, err := c.exec.Run(ctx, "umask 077; mktemp -d /tmp/teploy-backup.XXXXXXXX")
+	workDir, cleanup, err := c.newBackupWorkspace(ctx)
 	if err != nil {
-		return res, fmt.Errorf("creating backup workspace: %w", err)
+		return res, err
 	}
-	workDir := strings.TrimSpace(runOut)
-	cleanup := func() {
-		c.exec.Run(context.WithoutCancel(ctx), "rm -rf "+ssh.ShellQuote(workDir))
-	}
+	defer cleanup()
 	archivePath := workDir + "/backup.tar.gz"
 	s3Key := fmt.Sprintf("s3://%s/%s/volumes/%s.tar.gz", s3.Base(), app, timestamp)
 	res.Key = s3Key
 
-	// An explicit if/else, not `tar ... || tar ...`: the old fallback
-	// re-ran the tar without .env whenever the first tar failed for ANY
-	// reason, masking real archive failures as successes.
-	fmt.Fprintf(c.out, "Archiving volumes for %s...\n", app)
-	cmd := fmt.Sprintf(
-		"if [ -f %s ]; then tar -czf %s -C %s . -C %s .env; else tar -czf %s -C %s .; fi",
-		ssh.ShellQuote(appDir+"/.env"),
-		ssh.ShellQuote(archivePath), ssh.ShellQuote(volumesDir), ssh.ShellQuote(appDir),
-		ssh.ShellQuote(archivePath), ssh.ShellQuote(volumesDir),
-	)
-	if _, err := c.exec.Run(ctx, cmd); err != nil {
-		cleanup()
-		return res, fmt.Errorf("creating archive: %w", err)
-	}
-	if size, err := c.remoteSize(ctx, archivePath); err == nil {
-		res.SizeBytes = size
+	if !opts.IgnoreSpace {
+		// A live tree gives no better estimate than its own size for the tar;
+		// encrypting holds a second copy until the plaintext is removed.
+		if out, derr := c.exec.Run(ctx, "du -sk "+q(volumesDir)); derr == nil {
+			if f := strings.Fields(out); len(f) > 0 {
+				if kb, perr := strconv.ParseInt(f[0], 10, 64); perr == nil {
+					need := kb * 1024
+					if s3.Encrypted() {
+						need += need / 2
+					}
+					if free, known := c.freeBytes(ctx, "", workDir); known && free < need+dumpReserveBytes {
+						return res, fmt.Errorf("not enough free space in %s for this volume archive: %d bytes free, about %d needed plus a %d byte reserve; nothing was archived. Set TEPLOY_BACKUP_TMPDIR to a larger disk or pass --ignore-space-check", workDir, free, need, int64(dumpReserveBytes))
+					}
+				}
+			}
+		}
 	}
 
-	// Upload to S3.
-	fmt.Fprintf(c.out, "Uploading to %s...\n", s3Key)
-	uploadCmd := s3.AWS(fmt.Sprintf("s3 cp %s %s", ssh.ShellQuote(archivePath), ssh.ShellQuote(s3Key)))
-	if _, err := c.exec.Run(ctx, uploadCmd); err != nil {
-		cleanup()
-		return res, fmt.Errorf("uploading to S3: %w", err)
+	// The .env holds resolved secrets: it only travels encrypted.
+	if !s3.Encrypted() {
+		if out, _ := c.exec.Run(ctx, "if [ -f "+q(appDir+"/.env")+" ]; then echo yes; fi"); strings.TrimSpace(out) == "yes" {
+			w := fmt.Sprintf("%s/.env was left out of this backup: it holds secrets and no recovery key is configured to encrypt it (teploy backup keygen; teploy server backup-policy set --recipient). Restoring this backup keeps the server's current .env", app)
+			res.Warnings = append(res.Warnings, w)
+			fmt.Fprintf(c.out, "Warning: %s\n", w)
+		}
+	}
+
+	// An explicit if/else, not `tar ... || tar ...`: the old fallback
+	// re-ran the tar without .env whenever the first tar failed for ANY
+	// reason, masking real archive failures as successes. GNU tar exits 1 with
+	// "file changed" when a live app writes mid-read (the artifact is labelled
+	// crash-consistent); real failures exit 2.
+	fmt.Fprintf(c.out, "Archiving volumes for %s...\n", app)
+	cmd := fmt.Sprintf("tar -czf %s -C %s . || [ $? -eq 1 ]", q(archivePath), q(volumesDir))
+	if s3.Encrypted() {
+		cmd = fmt.Sprintf(
+			"if [ -f %s ]; then tar -czf %s -C %s . -C %s .env || [ $? -eq 1 ]; else tar -czf %s -C %s . || [ $? -eq 1 ]; fi",
+			q(appDir+"/.env"),
+			q(archivePath), q(volumesDir), q(appDir),
+			q(archivePath), q(volumesDir),
+		)
+	}
+	if _, err := c.exec.Run(ctx, cmd); err != nil {
+		return res, fmt.Errorf("creating archive: %w", err)
+	}
+	if _, err := c.checkArtifactSize(ctx, archivePath, minTarArchive); err != nil {
+		return res, fmt.Errorf("creating archive: %w", err)
 	}
 
 	// The app's server data (Teploy config repository and event history)
 	// travels as a sibling object of the same timestamp, never inside the
-	// volume archive, whose root is the volumes directory.
+	// volume archive, whose root is the volumes directory. Stored first: the
+	// volumes object commits the backup.
 	teployDir := confighome.Dir(app)
 	if present, err := c.remoteExists(ctx, teployDir); err != nil {
-		cleanup()
 		return res, fmt.Errorf("checking %s: %w", teployDir, err)
 	} else if present {
 		teployArchive := workDir + "/teploy.tar.gz"
 		teployKey := fmt.Sprintf("s3://%s/%s/teploy/%s.tar.gz", s3.Base(), app, timestamp)
-		res.TeployKey = teployKey
-		tarCmd := fmt.Sprintf("tar -czf %s --exclude=./.write.lock --exclude=./events.lock .", ssh.ShellQuote(teployArchive))
-		if _, err := c.exec.Run(ctx, fmt.Sprintf("cd %s && if [ -d config.git ] && command -v flock >/dev/null 2>&1; then flock .write.lock %s; else %s; fi", ssh.ShellQuote(teployDir), tarCmd, tarCmd)); err != nil {
-			cleanup()
+		tarCmd := fmt.Sprintf("tar -czf %s --exclude=./.write.lock --exclude=./events.lock .", q(teployArchive))
+		if _, err := c.exec.Run(ctx, fmt.Sprintf("cd %s && if [ -d config.git ] && command -v flock >/dev/null 2>&1; then flock .write.lock %s; else %s; fi", q(teployDir), tarCmd, tarCmd)); err != nil {
 			return res, fmt.Errorf("archiving %s: %w", teployDir, err)
 		}
 		fmt.Fprintf(c.out, "Uploading Teploy config and history to %s...\n", teployKey)
-		if _, err := c.exec.Run(ctx, s3.AWS(fmt.Sprintf("s3 cp %s %s", ssh.ShellQuote(teployArchive), ssh.ShellQuote(teployKey)))); err != nil {
-			cleanup()
-			return res, fmt.Errorf("uploading Teploy config to S3: %w", err)
+		stored, err := c.put(ctx, s3, teployArchive, teployKey)
+		if err != nil {
+			return res, fmt.Errorf("storing Teploy config: %w", err)
 		}
+		res.TeployKey = stored.Key
 	}
 
-	cleanup()
-	fmt.Fprintf(c.out, "Backup complete: %s\n", s3Key)
+	fmt.Fprintf(c.out, "Uploading to %s...\n", s3Key)
+	stored, err := c.put(ctx, s3, archivePath, s3Key)
+	if err != nil {
+		return res, fmt.Errorf("storing volume archive: %w", err)
+	}
+	res.Key, res.SizeBytes = stored.Key, stored.Size
+	res.Objects = append(res.Objects, BackupObject{Key: stored.Key, Size: stored.Size, Encrypted: stored.Encrypted})
+	c.markNamespaceOwner(ctx, s3, app)
+	if opts.SafetyCopy {
+		c.markSafetyCopy(ctx, s3, fmt.Sprintf("s3://%s/%s/volumes/", s3.Base(), app), timestamp, &res)
+	}
+	fmt.Fprintf(c.out, "Backup complete: %s\n", res.Key)
 	return res, nil
 }
 
@@ -360,6 +446,12 @@ func (c *Client) remoteSize(ctx context.Context, path string) (int64, error) {
 		return 0, err
 	}
 	return strconv.ParseInt(strings.TrimSpace(out), 10, 64)
+}
+
+// FindVolumeBackup finds a volume backup by id across the current and previous
+// prefixes, so a restore with nothing to restore stops nothing.
+func (c *Client) FindVolumeBackup(ctx context.Context, app, date string, s3 S3Config) (string, string, S3Config, error) {
+	return c.findObject(ctx, s3, app+"/volumes/", date, ".tar.gz")
 }
 
 // RestoreVolumes downloads and extracts a volume backup from S3. If the
@@ -400,7 +492,10 @@ func (c *Client) RestoreVolumesKeep(ctx context.Context, app, date string, s3 S3
 	volumesDir := fmt.Sprintf("%s/%s/volumes", deploymentsDir, app)
 	appDir := fmt.Sprintf("%s/%s", deploymentsDir, app)
 	envPath := appDir + "/.env"
-	s3Key := fmt.Sprintf("s3://%s/%s/volumes/%s.tar.gz", s3.Base(), app, date)
+	s3Key, _, loc, err := c.findObject(ctx, s3, app+"/volumes/", date, ".tar.gz")
+	if err != nil {
+		return "", err
+	}
 
 	runOut, err := c.exec.Run(ctx, "umask 077; mktemp -d /tmp/teploy-volume-restore.XXXXXXXX")
 	if err != nil {
@@ -415,7 +510,7 @@ func (c *Client) RestoreVolumesKeep(ctx context.Context, app, date string, s3 S3
 	stagedEnv := runDir + "/new.env"
 
 	fmt.Fprintf(c.out, "Downloading %s...\n", s3Key)
-	if _, err := c.exec.Run(ctx, s3.AWS(fmt.Sprintf("s3 cp %s %s", ssh.ShellQuote(s3Key), ssh.ShellQuote(archivePath)))); err != nil {
+	if err := c.fetch(ctx, loc, s3Key, archivePath); err != nil {
 		cleanupRun()
 		return "", fmt.Errorf("downloading from S3: %w", err)
 	}
@@ -704,9 +799,119 @@ func (c *Client) SetSchedule(ctx context.Context, schedule, command, marker stri
 	return nil
 }
 
+// AWSCLIRemedy is the exact way to give a server the aws CLI. `teploy setup`
+// runs AWSCLIInstallScript; Ubuntu 24.04+ has no apt package for it.
+const AWSCLIRemedy = "run `teploy setup` against the server (it installs the distribution's package if that is new enough, else AWS's bundle with its signature checked), or on the server: AWS's installer as documented at https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html"
+
+// The oldest aws CLIs teploy runs on: the first to send a checksum header on every
+// upload by default. A store with Object Lock (B2's included) refuses an upload with
+// neither that nor Content-MD5. --checksum-algorithm came earlier (2.18, 1.35); aws
+// CLI's own changelog, "default integrity protections".
+const (
+	awsCLIMinV2Minor = 23
+	awsCLIMinV1Minor = 37
+)
+
+var awsCLIMinimum = fmt.Sprintf("2.%d.0 (or 1.%d.0)", awsCLIMinV2Minor, awsCLIMinV1Minor)
+
+var awsVersionRE = regexp.MustCompile(`aws-cli/(\d+)\.(\d+)\.(\d+)`)
+
+// AWSCLIVersionProblem reads `aws --version` output and says what is wrong with it,
+// "" when nothing is, or when it is not a version (a wrapper): the first upload would
+// answer for that.
+func AWSCLIVersionProblem(versionOutput string) string {
+	m := awsVersionRE.FindStringSubmatch(versionOutput)
+	if m == nil {
+		return ""
+	}
+	major, _ := strconv.Atoi(m[1])
+	minor, _ := strconv.Atoi(m[2])
+	if (major == 2 && minor < awsCLIMinV2Minor) || (major == 1 && minor < awsCLIMinV1Minor) || major < 1 {
+		return fmt.Sprintf("aws CLI %s.%s.%s is older than %s, the first to send a checksum on every upload, which a bucket with Object Lock requires", m[1], m[2], m[3], awsCLIMinimum)
+	}
+	return ""
+}
+
+// awsCLIShellOK is a shell function: is the installed aws new enough. Same numbers
+// as above (a test holds them together).
+const awsCLIShellOK = `aws_ok() { v=$(aws --version 2>&1) || return 1; v=${v#aws-cli/}; v=${v%% *}; a=${v%%.*}; r=${v#*.}; b=${r%%.*}; case "$a" in 1) [ "$b" -ge 37 ];; 2) [ "$b" -ge 23 ];; *) [ "$a" -gt 2 ];; esac; }`
+
+// awsCLIKeyFingerprint and awsCLIPublicKey pin AWS's bundle signer, from
+// docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html (key
+// A6310ACC4672475C, expires 2027-07-01; a signature made before expiry stays
+// VALIDSIG, and a new key means updating this, not trusting whatever is served).
+const awsCLIKeyFingerprint = "FB5DB77FD5C118B80511ADA8A6310ACC4672475C"
+
+const awsCLIPublicKey = `-----BEGIN PGP PUBLIC KEY BLOCK-----
+
+mQINBF2Cr7UBEADJZHcgusOJl7ENSyumXh85z0TRV0xJorM2B/JL0kHOyigQluUG
+ZMLhENaG0bYatdrKP+3H91lvK050pXwnO/R7fB/FSTouki4ciIx5OuLlnJZIxSzx
+PqGl0mkxImLNbGWoi6Lto0LYxqHN2iQtzlwTVmq9733zd3XfcXrZ3+LblHAgEt5G
+TfNxEKJ8soPLyWmwDH6HWCnjZ/aIQRBTIQ05uVeEoYxSh6wOai7ss/KveoSNBbYz
+gbdzoqI2Y8cgH2nbfgp3DSasaLZEdCSsIsK1u05CinE7k2qZ7KgKAUIcT/cR/grk
+C6VwsnDU0OUCideXcQ8WeHutqvgZH1JgKDbznoIzeQHJD238GEu+eKhRHcz8/jeG
+94zkcgJOz3KbZGYMiTh277Fvj9zzvZsbMBCedV1BTg3TqgvdX4bdkhf5cH+7NtWO
+lrFj6UwAsGukBTAOxC0l/dnSmZhJ7Z1KmEWilro/gOrjtOxqRQutlIqG22TaqoPG
+fYVN+en3Zwbt97kcgZDwqbuykNt64oZWc4XKCa3mprEGC3IbJTBFqglXmZ7l9ywG
+EEUJYOlb2XrSuPWml39beWdKM8kzr1OjnlOm6+lpTRCBfo0wa9F8YZRhHPAkwKkX
+XDeOGpWRj4ohOx0d2GWkyV5xyN14p2tQOCdOODmz80yUTgRpPVQUtOEhXQARAQAB
+tCFBV1MgQ0xJIFRlYW0gPGF3cy1jbGlAYW1hem9uLmNvbT6JAlQEEwEIAD4CGwMF
+CwkIBwIGFQoJCAsCBBYCAwECHgECF4AWIQT7Xbd/1cEYuAURraimMQrMRnJHXAUC
+akV0ygUJDqP4lQAKCRCmMQrMRnJHXFHjD/9eyZLYcKuQOlLvtqSDtUBiEZf6ZZjM
+i3ygYH8rJNtuToUH+HvSpe819urJCquXhDrlK6N+aqW0hCLtNABJG/vsafIgvIYJ
+hSGgpgtNnQyMV1jViRWqPjbouw8OkYKBThUfT1i2Y+wn58ifs6ODBCmTexWtXspA
+Si+Gt49xDOW0APmbOPnI+a4HJW6tVEo6MWS0WjzpiBayR3d1A4pt4YrPfSdDgpLo
+h2SLQqlRqvvVZJaWBjhkErNFpfsBA06sDcPEOb0G8LBUbR4WOcdvhe5LubJbZuxC
+AG9kNPCVeQP1ixwjgjXKysaxeQ6rv0VzIQgRp6tLVLWhy6AKDNvLjFSsmXZ1Wl08
+Y/RlOHXlzLuQMRE6sR1wOdRxc9TsrNWTGiBK65cvSWOy03JeBkQQ8pesqltiyxI9
+U21kkgiXtTSKNGfKK8pO27D81YANhRqPK7iTp6kuFiY2WtOg90KTMNlIT+Ff85Y2
+b1rHj6Z0SrCkJujhWk3IBPic/wJgz01LEc/OAdUPlby90RJZcIBhSlWhT7mXnXIO
+c0HWlNQrns2s3CTyYwZSiSlYe9ApeLwhjDo8NhbFuCAy61l6O5UsR4AfZxx/rGKv
+2wFb1/RN/P4gNe6vmxZAPjR0AQcwD3tc2McimOLr/22kmPz8IH3I0X7WoSFr0Biz
+E91G7bb0hOb/cA==
+=knv7
+-----END PGP PUBLIC KEY BLOCK-----
+`
+
+// AWSCLIInstallScript installs the aws CLI: the distribution package when it has
+// one, else AWS's own bundle, which runs as root, so its signature is checked
+// against the pinned key first (TLS alone is not enough for that). python3 unpacks
+// it (unzip may be absent), which drops the file modes, so they are restored for
+// every user before installing: with u+x alone the installed aws runs for root and
+// "Permission denied"s for cron. Success is `aws --version` running at the minimum
+// version, not `command -v aws`: the glibc bundle on a musl host is present and cannot
+// start. A distribution package too old to use is removed, because cron's PATH would
+// find it before the bundle in /usr/local/bin.
+const AWSCLIInstallScript = `set -e
+export DEBIAN_FRONTEND=noninteractive
+` + awsCLIShellOK + `
+if aws_ok; then exit 0; fi
+if apt-get install -y -qq awscli >/dev/null 2>&1 && aws_ok; then exit 0; fi
+apt-get remove -y -qq awscli >/dev/null 2>&1 || true
+command -v gpg >/dev/null 2>&1 || apt-get install -y -qq gnupg >/dev/null 2>&1 || { echo "gpg is needed to verify AWS's bundle" >&2; exit 1; }
+d=$(mktemp -d /tmp/teploy-awscli.XXXXXXXX)
+trap 'rm -rf "$d"' EXIT
+GNUPGHOME="$d/g"; export GNUPGHOME; mkdir -m 700 "$GNUPGHOME"
+u="https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip"
+curl -fsSL --max-time 300 "$u" -o "$d/a.zip"
+curl -fsSL --max-time 60 "$u.sig" -o "$d/a.sig"
+cat > "$d/key" <<'TEPLOY_KEY'
+` + awsCLIPublicKey + `TEPLOY_KEY
+gpg --batch --quiet --import "$d/key" 2>/dev/null
+gpg --batch --status-fd 1 --verify "$d/a.sig" "$d/a.zip" 2>/dev/null | grep -q "^\[GNUPG:\] VALIDSIG ` + awsCLIKeyFingerprint + ` " || { echo "AWS's bundle did not verify against the pinned signing key; nothing was installed" >&2; exit 1; }
+python3 -m zipfile -e "$d/a.zip" "$d/x"
+chmod -R 755 "$d/x/aws"
+"$d/x/aws/install" --update
+aws_ok || { echo "AWS's bundle installed but does not run here (a musl libc?): install your distribution's aws-cli package, at least 2.23.0" >&2; exit 1; }`
+
 func (c *Client) ensureAWSCLI(ctx context.Context) error {
-	if _, err := c.exec.Run(ctx, "which aws"); err != nil {
-		return fmt.Errorf("aws CLI not found on server — install with: apt install awscli")
+	// That it runs, not only that it is there: a glibc bundle on a musl host is.
+	out, err := c.exec.Run(ctx, "which aws >/dev/null && aws --version 2>&1")
+	if err != nil {
+		return fmt.Errorf("aws CLI not found or not runnable on server — %s", AWSCLIRemedy)
+	}
+	if problem := AWSCLIVersionProblem(out); problem != "" {
+		return fmt.Errorf("%s — %s", problem, AWSCLIRemedy)
 	}
 	return nil
 }

@@ -52,12 +52,19 @@ func drStoreFlags(cmd *cobra.Command, bucket, region, endpoint, dir *string) {
 	cmd.Flags().StringVar(region, "region", "", "AWS region (default: the stored target's region, else us-east-1)")
 	cmd.Flags().StringVar(endpoint, "endpoint", "", "S3-compatible endpoint URL (MinIO/B2/R2); creds from TEPLOY_S3_ACCESS_KEY/SECRET_KEY or AWS_* env")
 	cmd.Flags().StringVar(dir, "dir", "", "store bundles in a directory on the server (offline bundles) instead of S3")
+	cmd.Flags().StringVar(&drPrefix, "prefix", "", "key prefix under --bucket (a stored target has its own)")
 }
 
 // drStore builds the BundleStore from the flags; with neither --bucket nor
 // --dir the server's stored backup target is used (stored credentials and
 // all — no bucket or credentials need to travel with the command).
 func drStore(ctx context.Context, exec ssh.Executor, bucket, region, endpoint, dir string) (backup.BundleStore, error) {
+	if drPrefix != "" && (bucket == "" || dir != "") {
+		return nil, fmt.Errorf("--prefix goes with --bucket: the stored target already has its own")
+	}
+	if err := backup.ValidatePrefix(drPrefix); err != nil {
+		return nil, err
+	}
 	switch {
 	case dir != "" && bucket != "":
 		return nil, fmt.Errorf("choose one bundle target: --bucket (S3) or --dir (server directory), not both")
@@ -74,7 +81,12 @@ func drStore(ctx context.Context, exec ssh.Executor, bucket, region, endpoint, d
 		if err := backup.ValidateRegion(r); err != nil {
 			return nil, err
 		}
-		return backup.S3BundleStore{S3: s3Config(bucket, r, endpoint)}, nil
+		cfg := s3Config(bucket, r, endpoint)
+		cfg.Prefix = drPrefix
+		if err := backup.ApplyPolicyEncryption(ctx, exec, &cfg); err != nil {
+			return nil, err
+		}
+		return backup.S3BundleStore{S3: cfg}, nil
 	}
 	target, err := backup.ReadTarget(ctx, exec)
 	if err != nil {
@@ -83,7 +95,37 @@ func drStore(ctx context.Context, exec ssh.Executor, bucket, region, endpoint, d
 	if !TargetConfigured(target) {
 		return nil, fmt.Errorf("a bundle target is required: --bucket (S3), --dir (server directory), or a stored server backup target (`teploy server backup-target set`)")
 	}
-	return backup.S3BundleStore{S3: TargetS3(target)}, nil
+	cfg := TargetS3(target)
+	if err := backup.ApplyPolicyEncryption(ctx, exec, &cfg); err != nil {
+		return nil, err
+	}
+	return backup.S3BundleStore{S3: cfg}, nil
+}
+
+// drPrefix is the shared --prefix of the dr commands.
+var drPrefix string
+
+// withBundleIdentity places the recovery key for a bundle restore (placeIdentity):
+// an encrypted bundle on a host that did not make it can be read no other way.
+func withBundleIdentity(ctx context.Context, exec ssh.Executor, store backup.BundleStore, identity string) (backup.BundleStore, string, func(), error) {
+	path, cleanup, err := placeIdentity(ctx, exec, identity)
+	if err != nil {
+		return nil, "", cleanup, err
+	}
+	if s3, ok := store.(backup.S3BundleStore); ok && path != "" {
+		s3.S3.ExtraIdentity = path
+		store = s3
+	}
+	return store, path, cleanup, nil
+}
+
+// bundleRecipient is the recovery key an included age key is wrapped to.
+func bundleRecipient(ctx context.Context, exec ssh.Executor) (string, error) {
+	p, err := backup.ReadFleetPolicy(ctx, exec)
+	if err != nil {
+		return "", err
+	}
+	return p.Recipient, nil
 }
 
 func newDRCreateCmd(flags *Flags, version string) *cobra.Command {
@@ -130,11 +172,18 @@ func newDRCreateCmd(flags *Flags, version string) *cobra.Command {
 				progress = os.Stderr
 			}
 			client := backup.NewClient(executor, progress)
+			recipient := ""
+			if includeAgeKey {
+				if recipient, err = bundleRecipient(ctx, executor); err != nil {
+					return err
+				}
+			}
 			m, err := client.CreateBundle(ctx, backup.BundleOptions{
 				App:            appCfg.App,
 				Config:         *appCfg,
 				IncludeSecrets: includeSecrets,
 				IncludeAgeKey:  includeAgeKey,
+				OwnerRecipient: recipient,
 				StopApp:        stopApp,
 				VolumeQuiesced: quiescedVolumes,
 				Version:        version,
@@ -159,7 +208,7 @@ func newDRCreateCmd(flags *Flags, version string) *cobra.Command {
 	}
 	drStoreFlags(cmd, &bucket, &region, &endpoint, &dir)
 	cmd.Flags().BoolVar(&includeSecrets, "include-secrets", false, "include encrypted secret material (age ciphertexts, resolved .env, accessory credentials) — never default")
-	cmd.Flags().BoolVar(&includeAgeKey, "include-age-key", false, "also include /deployments/.age-key so a fresh host can decrypt (requires --include-secrets)")
+	cmd.Flags().BoolVar(&includeAgeKey, "include-age-key", false, "also include the server's age key, wrapped to the recovery key, so a fresh host can decrypt (requires --include-secrets and a policy --recipient)")
 	cmd.Flags().BoolVar(&stopApp, "stop-app", false, "stop app containers for quiesced volume snapshots (restarted after)")
 	cmd.Flags().StringSliceVar(&quiescedVolumes, "quiesced-volume", nil, "volume NAME whose writer you stopped by hand (repeatable); recorded as quiesced, operator-asserted")
 	return cmd
@@ -266,7 +315,7 @@ func newDRShowCmd(flags *Flags) *cobra.Command {
 }
 
 func newDRRestoreCmd(flags *Flags) *cobra.Command {
-	var bucket, region, endpoint, dir string
+	var bucket, region, endpoint, dir, identity string
 	cmd := &cobra.Command{
 		Use:   "restore <id>",
 		Short: "Restore a DR bundle to an ISOLATED target and validate it (live state untouched)",
@@ -276,7 +325,10 @@ func newDRRestoreCmd(flags *Flags) *cobra.Command {
 			"RPO/RTO. Nothing under /deployments is touched — promotion happens only\n" +
 			"via `teploy dr cutover`.\n" +
 			"Missing secret keys (references mode) and undecryptable material fail\n" +
-			"BEFORE any mutation.",
+			"BEFORE any mutation.\n" +
+			"--identity is the recovery key file: needed for a bundle encrypted on another\n" +
+			"host or carrying a wrapped age key. It is placed on the target privately for\n" +
+			"this restore and removed afterwards.",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			appCfg, err := config.LoadApp(".")
@@ -299,10 +351,16 @@ func newDRRestoreCmd(flags *Flags) *cobra.Command {
 				progress = os.Stderr
 			}
 			client := backup.NewClient(executor, progress)
+			store, identityPath, cleanupIdentity, err := withBundleIdentity(ctx, executor, store, identity)
+			if err != nil {
+				return err
+			}
+			defer cleanupIdentity()
 			receipt, err := client.RestoreBundleIsolated(ctx, backup.BundleRestoreOptions{
-				App:    appCfg.App,
-				ID:     args[0],
-				Config: *appCfg,
+				App:      appCfg.App,
+				ID:       args[0],
+				Config:   *appCfg,
+				Identity: identityPath,
 			}, store)
 			if err != nil {
 				return err
@@ -322,6 +380,7 @@ func newDRRestoreCmd(flags *Flags) *cobra.Command {
 		},
 	}
 	drStoreFlags(cmd, &bucket, &region, &endpoint, &dir)
+	cmd.Flags().StringVar(&identity, "identity", "", "recovery key file, for a bundle encrypted elsewhere or a wrapped age key")
 	return cmd
 }
 

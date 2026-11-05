@@ -1,0 +1,204 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://teploy.github.io/contracts/schema/backup-run-envelope.schema.json",
+  "title": "`teploy backup run --all --json` (backup-fleet-v1, rev 18). Exit status is nonzero unless status is ok or skipped. omissions lists everything not backed up: a status of ok with omissions is not a complete backup.",
+  "type": "object",
+  "required": [
+    "machine_interface",
+    "status",
+    "started_at",
+    "duration_ms",
+    "encrypted",
+    "targets"
+  ],
+  "properties": {
+    "machine_interface": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "status": {
+      "enum": [
+        "ok",
+        "partial",
+        "failed",
+        "skipped"
+      ],
+      "description": "skipped: another run holds the overlap lock."
+    },
+    "started_at": {
+      "type": "string"
+    },
+    "duration_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "encrypted": {
+      "type": "boolean"
+    },
+    "targets": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "kind",
+          "status",
+          "size_bytes",
+          "duration_ms",
+          "encrypted",
+          "pruned"
+        ],
+        "properties": {
+          "kind": {
+            "enum": [
+              "accessory",
+              "volumes",
+              "adopted"
+            ]
+          },
+          "app": {
+            "type": "string"
+          },
+          "accessory": {
+            "type": "string"
+          },
+          "container": {
+            "type": "string"
+          },
+          "engine": {
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "ok",
+              "failed",
+              "excluded",
+              "own-schedule"
+            ]
+          },
+          "reason": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "size_bytes": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "duration_ms": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "encrypted": {
+            "type": "boolean"
+          },
+          "objects": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "key",
+                "size_bytes",
+                "encrypted"
+              ],
+              "properties": {
+                "database": {
+                  "type": "string"
+                },
+                "key": {
+                  "type": "string"
+                },
+                "size_bytes": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "encrypted": {
+                  "type": "boolean"
+                }
+              }
+            }
+          },
+          "pruned": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "warnings": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "failed_databases": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            }
+          },
+          "uncovered_databases": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "size_guard": {
+            "type": "boolean"
+          }
+        }
+      }
+    },
+    "uncovered_containers": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "omissions": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "warnings": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "heartbeats": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "host",
+          "ok"
+        ],
+        "properties": {
+          "host": {
+            "type": "string"
+          },
+          "ok": {
+            "type": "boolean"
+          },
+          "status": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "error": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "cleaned_workspaces": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "aborted_uploads": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "error": {
+      "type": "string"
+    }
+  }
+}

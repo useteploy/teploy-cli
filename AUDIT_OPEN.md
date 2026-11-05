@@ -1,5 +1,130 @@
 # Open audit items
 
+## 2026-11-05 — Dash auto-config Slice 4 CLI: fleet backup engine (G1, G3, G4, G5)
+
+Plan: `../_internal/DASH_AUTOCONFIG_PLAN_2026-11-03.md` (sections 2.1-2.3, 5). Branch
+`slice4-fleet-engine`. Closes the Slice 2 opens on G5/one-object-per-database, role
+hashes unencrypted in sidecars, and `backup list` having no rows for `backup_databases:`.
+
+Decisions worth reviewing:
+- `max_age_days` is a keep rule (restic keep-within), unioned with the rest, not a cap:
+  it is what it already was with `keep_last`, and a cap could not express deploy-ovh's
+  "hourly for 48h, then daily/weekly/monthly". `max_age 2 + daily 7 + weekly 4 + monthly 12`
+  is that policy, with no separate hourly rule.
+- The recovery key lives in the policy, not the target: Dash forgets bucket credentials,
+  and setting a target needs them.
+- Upload commit is `.incoming/` + verify + server-side copy, sidecars first, primary last,
+  rather than a manifest: every existing reader already treats "the primary object exists"
+  as the backup existing, and legacy objects have no manifest to find.
+- `--all` skips targets with a `run`/`legacy` cron line (override) but not `custom` ones:
+  a hand-written job is not evidence of anything, and policy coverage is how they retire.
+- `.owners/<fingerprint>` markers refuse a prune in a namespace another server wrote to,
+  because a reused prefix or a same-named app is the failure a prefix alone cannot catch.
+
+Independent review (2026-11-05, same day) reproduced real holes and all are fixed on the
+branch: purge and upgrade backed up only the primary (now every database, refusing what
+it cannot cover); a leftover backup-schedule.json decided a policy run's retention; a run
+that stored nothing still pruned and reported ok; a database's objects followed the
+primary's ids (each series is selected on its own now); the .owners guard failed open on
+a listing error, an empty machine-id and a late marker; status never looked at the
+bucket; owner-key recovery could not work through normal commands; a non-root user reading
+a 0700 /etc/teploy saw "no policy" and uploaded plaintext; per-database rows reached Dash,
+whose restore by id would have replaced the primary. Medium/low: refused prunes invisible,
+pre-restore not forwarding --ignore-space-check, zero targets reading as ok, .incoming only
+at one depth, a docker blip reading as no container, a wrong clock deleting real backups,
+--previous-prefix-owned marking every earlier prefix, AWS's bundle unverified, a 6h deadline
+with no override, legacy lines reported encrypted, ClickHouse and friends in no report, a
+--no-credentials target never working, --stdin dropping the recipient silently, bucket-wide
+multipart abort, TEPLOY_BACKUP_TMPDIR workspaces invisible, postgresql:// names, a stale
+holder's children, self-referential checksums above 256 MiB, safety copies prunable.
+
+Verified live (colima, MinIO via the real aws CLI, real age, the real linux binary):
+`go test -tags integration -run TestFleetIntegration ./internal/cli`, 25 scenarios, on real
+multi-database accessories; `TEPLOY_IT_INSTALL_AWS=1 go test -tags integration -run
+TestAWSCLIInstallScriptLive ./internal/backup` installs AWS's bundle for real and refuses a wrong
+pin. Only unit-tested: the deploy hook, healthchecks.io's /fail form, the janitors' thresholds
+(the expiry check ran in a real shell, not on a live run) and multipart abort, the space preflights'
+refusal, a bucket refusing deletes, a store without upload checksums, a musl host, the clock checks
+and an empty machine-id, an old aws CLI on a server and an old distribution package being replaced,
+a previous prefix that does not answer, the stuck-holder kill order (the kill itself ran live),
+setup's stage itself (the script it runs is the live one), the /etc/teploy root path (the fixture
+is non-root; the non-root paths, both with sudo and without, ran live).
+Regressions: `go test -tags integration ./internal/backup`, the full engine matrix after merging
+v0.1.51 (postgres, pgvector, timescale, mysql, mariadb, mongo, redis, valkey, dragonfly). The DR
+fixture still needs a 022 umask.
+
+Re-review (2026-11-05, 16 items), all on the branch. Blocker and highs: a publish copy of 8 MB
+or more becomes UploadPartCopy, which B2 documents cannot change a checksum algorithm, and R2
+cannot do with its default tag read (`--copy-props metadata-directive`, then a re-upload of the
+verified local file on any refusal); pending uploads at every depth billed forever on a store
+that keeps versions (one `.incoming/` tree, doctor reads the lifecycle rule, the marker is not
+rewritten); a sudoer read /etc and wrote ~/.config, so rotation did nothing (one path, a read-back
+in `WriteFleetPolicy`, and the lock falls back). Medium and low: `owners --clear` on a live marker,
+a prune trusting a same-host clock and skipping an unreadable one, a janitor fixed at 7h, uncapped
+safety copies, an unreachable previous prefix staling everything, the wrong chmod 711 remedy,
+future-dated objects, the checksum head with no fallback, `--exclude` unnamed, no minimum aws
+version, the kill order on a stuck holder. Decisions: the clone and renamed-host limits of the
+fingerprint are documented, not papered over (an id file is copied by a clone too); marker recency
+is the namespace's newest write, since a marker that is not rewritten says nothing about liveness;
+the minimum aws is 2.23.0/1.37.0 from aws-cli's own changelog (first default checksum on upload).
+
+Proven only against MinIO, not real B2 or R2: every publish path. The refusal is simulated by a
+shim, with an assumed error text, and a re-upload follows anything shaped like a store's error
+reply rather than one exact string for that reason. Also unverified on B2: whether its S3 API
+answers `GetBucketLifecycleConfiguration` (if not, doctor warns "unknown", which is true and
+permanent there), whether `--copy-props metadata-directive` carries metadata through its multipart
+copy, and Object Lock with aws 2.23+. The real-B2 smoke test is the coordinator's.
+
+Open / deferred:
+- The run lock falls back per user when the policy's directory is not writable, so a root run
+  and a sudoer's run do not exclude each other. Only one of them has the cron line.
+- Legacy objects from a server that has not upgraded yet carry no marker. A first prune in
+  a shared root by an upgraded server cannot tell them from its own: only markers from the
+  moment each server upgrades protect it. Per-server prefixes close this (decided: Dash always
+  sets one): the set command warns when there is none, and doctor flags a policy with no prefix
+  once another server's marker is at the bucket root. Attributing unmarked objects would stop a
+  single server's own legacy history ever ageing out.
+- A dropped database in an accessory whose other databases are fine keeps its series (its
+  newest good object forever) and raises nothing. It reads as history, not as a problem.
+- An external kill -9 of a run leaves its children (own process groups) running until they
+  finish; they cannot block the next run, and a stale holder's are killed. A Pdeathsig
+  would reach only the shell.
+- AWS's signing key is pinned (expires 2027-07-01; old signatures stay valid). A rotated
+  key makes setup refuse the bundle until the pin is updated: the safe way to fail.
+- Unsupported databases are recognised by image name only; a renamed image reads as generic
+  (and a labelled accessory still hits the live-data guard).
+- A schema name holding `'` or `\`: `mysqldump` mangles it in its own `USE` (seen live on
+  mysql:8), so it is reported as not backed up in omissions and status, never silently.
+  A Postgres or MySQL name with `=`, a leading `-`, a control character or over 64 bytes
+  likewise. Fixing needs dumping through `--databases`-free stdin tricks; not worth it yet.
+- Adopted MySQL dumps schemas, not `mysql.user`: per-site database users must be recreated
+  when recovering `wordpress-shared-mysql` onto a new server. The postgres side has globals.
+- An adopted container's password comes from its env. A root password changed after creation
+  (deploy-ovh's was stale) fails the dump loudly. There is no policy credential yet.
+- Mongo with auth still fails loudly (Slice 2 item), now as a failing target.
+- `aws` stays the transport (G8 deferred). Credential charset is restricted as before.
+- Restore and verify of an adopted database stop nothing; the operator stops its users.
+- Volume and generic estimates use the live tree's size, so a small disk can refuse an
+  archive that would have compressed to fit (`--ignore-space-check`, or a larger
+  `TEPLOY_BACKUP_TMPDIR`). The previous object's size would sharpen this.
+- A provider's own checksum is not verified beyond the 256 MiB read-back: above that it is
+  stored size plus the recorded SHA-256 plus the aws CLI's transfer checksums.
+- Heartbeat redirects are followed by Go's default client. Dash's push monitor does not
+  redirect; a receiver that does would see the token on the redirect target.
+- Dash must read `backup-fleet-v1` before using any of this (plan: version-gated). Behavior
+  Dash and scripts see: `remove --purge` now needs a target or `--no-backup`; restores take a
+  backup first; a `backup_databases:` name that is missing now fails that accessory's backup.
+- Pre-existing, seen live: `accessory upgrade` stops and removes the container before
+  `EnsureRunning`, so a failure there (an unsafe directory mode, here) leaves the accessory
+  down until re-run. Its data and the new safety backup are intact. Not changed in this slice.
+- `AGENTS.md` points at a repo `CLAUDE.md` that does not exist.
+- `backup status` runs one bucket listing per app and adopted namespace, and reads each
+  app's event log. Fine at fleet sizes here; a very large bucket would want a cache.
+- Encrypted objects cannot be restored by a CLI older than this one: the `.age` suffix is
+  invisible to its listing. Release order: CLI on servers first (plan section 4).
+- `TEPLOY_SERVER_BINARY` was used in the live test; on real servers `ensureFleetBinary`
+  upgrades via the release pipeline, so the policy cannot be set until this ships.
+
 ## 2026-11-05 — Dash auto-config Slice 5: domain health (CLI side)
 
 Plan: `../_internal/DASH_AUTOCONFIG_PLAN_2026-11-03.md` section 8. Branch
@@ -105,8 +230,8 @@ its marker table; checks run before the app stops; `database` in the restore
 event; `backup list` works without cron.
 
 Open / deferred:
-- G5 adoption of unmanaged containers and MySQL one-object-per-database: not
-  in this slice. MySQL/MariaDB backups cover one schema and warn about the rest.
+- ~~G5 adoption of unmanaged containers and MySQL one-object-per-database~~ closed
+  by Slice 4.
 - A scheduled backup alerts on coverage only where `backup schedule` has
   uploaded the current script (rescheduling updates it). Dash alerting: Slice 4.
 - Safety copies are not rolled back automatically for mysql/mongo/dragonfly:
@@ -117,10 +242,9 @@ Open / deferred:
 - Mongo restore (--drop) leaves collections created after the backup.
 - verify-backup covers the primary database only, not backup_databases: dumps;
   DR bundles carry the primary only (their manifest notes what is missing).
-- `backup list` shows one row per id; backup_databases: dumps have no rows of
-  their own.
-- Role password hashes are in the postgres globals sidecar and DR member,
-  unencrypted until G1 (the dump beside them is too).
+- ~~`backup list` one row per id~~ closed by Slice 4 (`database` on each row).
+- ~~Role password hashes unencrypted in sidecars~~ closed by G1 when a recovery key
+  is configured.
 - Redis/valkey restore and verify assume /data/dump.rdb (Bitnami redis differs).
 - Dragonfly's pre-restore snapshot in /var/tmp has no free-space preflight
   (its size is the in-memory dataset).

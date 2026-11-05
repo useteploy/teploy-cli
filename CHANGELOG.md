@@ -4,6 +4,99 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+### Added
+
+- Server backup policy: `teploy server backup-policy set/show/unset`, one cron
+  line, `teploy backup run --all`, enumerating at run time every labelled
+  accessory and each database in it, app volumes and adopted containers. A new
+  database is covered with no command. An overlap lock (an `flock`: a killed run
+  cannot block the next), per-target and per-run deadlines, one target failing
+  does not stop the others, and the exit status and `backup.all` event report
+  `ok`/`partial`/`failed` plus every omission. A per-app schedule stays an override.
+- Adopted containers: policy entries `{container, engine, databases: all|[...]}`
+  bring unlabelled containers (`omni_postgres`, `wordpress-shared-mysql`) under the
+  policy, addressed by docker name (`--adopted`) in `backup restore/list/create/prune`
+  and `accessory verify-backup`.
+- One object per database. MySQL/MariaDB schemas and Postgres databases each get
+  their own series (`databases/<name>/`), restored and verified alone with
+  `--database`; `backup_databases:` now works on MySQL too.
+- GFS retention: `--keep-daily/-weekly/-monthly` beside `--keep-last` and
+  `--max-age-days`, a union of rules with restic `forget` semantics. `--max-age-days`
+  is restic's keep-within, which is also what it always was with `--keep-last`.
+- Payload encryption: with a recovery key (`teploy backup keygen`; `backup-policy set
+  --recipient`), every object is age-encrypted to the owner key and the server's
+  identity, sidecars and DR members included. `teploy backup fetch <key> --identity`
+  downloads and decrypts locally, for the recovery drill and a lost server.
+- Heartbeats: `heartbeat_urls` are pinged after every `--all` run, with
+  `?status=down` on anything but a clean run. Policy-managed backups do not use the
+  per-app alert script.
+- `teploy backup status --host S --json`: every DB-like container, labelled or not,
+  and every app's volumes, with coverage state, last success and failure, newest
+  object, last verify, uncovered databases, target and policy. No secrets.
+- Automatic backup before `backup restore`, `accessory restore`, `accessory upgrade`
+  and `remove --purge` (refused if it fails, `--no-backup` overrides), and optionally
+  before a deploy with a `pre_deploy` hook (`backup_before_hooks: true`).
+- Volume size guard: `volume_max_gb` warns and excludes, visible in status and events.
+- `teploy doctor` check `backup-policy`; `teploy setup` installs the aws CLI (AWS's
+  bundle with its PGP signature checked, where the distribution has none, as on Ubuntu
+  24.04) and age.
+- `backup restore`, `accessory restore` and `accessory verify-backup` take `--identity`,
+  `dr` commands take `--prefix`: a rebuilt host recovers with only the owner key and the
+  bucket credentials, through the normal commands. `--deadline` on manual backups,
+  restores and verifies; `--tmp-dir`, `--target-deadline`, `--allow-empty` on the policy.
+- `teploy server backup-target owners [--clear <fingerprint>]`.
+
+### Changed
+
+- Volume backups leave `.env` out when no recovery key is configured, with a warning:
+  it holds resolved secrets. Restoring such a backup keeps the server's current `.env`.
+- `dr create --include-age-key` needs a recovery key and wraps the server's private
+  key to it (a plaintext key in a bucket is the keys to everything); `dr restore
+  --identity <file>` unwraps it. Bundles made before this keep restoring.
+- `remove --purge` needs a backup target or `--no-backup`, names what it will delete,
+  and removes containers with `docker rm -v`.
+- Backups and accessory restores build in `/var/tmp` (`TEPLOY_BACKUP_TMPDIR`), not a
+  `/tmp` that may be tmpfs, and refuse a dump that would not fit: plaintext, ciphertext
+  and a reserve, measured against what the backup will occupy.
+- `backup list` and status no longer treat below-floor objects as restorable, and a
+  newest good backup is never pruned even with only `--max-age-days` set.
+- `backup list` shows per-database rows only with `--databases`: a caller restoring a
+  row by id and accessory alone would replace the primary with another database's dump.
+- Pending uploads live in one `<prefix>/.incoming/` tree, so a 1-day lifecycle rule can
+  expire them on a store that keeps versions; doctor reads the rule and warns without one.
+  Owner markers are written once, not on every prune.
+- A publish copy names `--copy-props metadata-directive`. A store that refuses the copy
+  gets the verified file uploaded straight to its final name.
+- The policy is written and removed through passwordless sudo when that is how it is
+  read, and `set`/`unset` refuse when a policy would stay in force. The run lock falls
+  back to `~/.config/teploy` when the policy's directory is not writable.
+- `owners --clear` refuses a namespace written to in the last week without `--force`,
+  and records every clear or refusal (`backup_target.owners_clear`).
+- A prune refuses when it would delete most of a series (`--allow-mass-delete`) and when
+  the store's clock cannot be read. A future-dated object no longer stops retention: it
+  is left out of selection, never deleted, and warned about.
+- `target_deadline` and `--deadline` over 23h are refused rather than capped. A workspace
+  records its own deadline for the janitor; a pending upload is a leftover after 24h.
+- Safety copies are capped at the newest 5 per target. An unreachable previous prefix is
+  a warning, not a failed listing and a stale status.
+- The aws CLI must be at least 2.23.0 (or 1.37.0), the first to send a checksum on every
+  upload, which Object Lock requires. `teploy setup` replaces an older one.
+
+### Fixed
+
+- `server backup-target set --prefix` broke listing: keys were matched without the
+  prefix and rebuilt with it twice. Previous prefixes stay searchable after a change,
+  and are pruned only when marked owned; a namespace another server has written to is
+  never pruned.
+- A backup's sidecars could outlive it and a volume backup's server-data sibling was
+  never pruned; a pruned backup now takes every object with its id.
+- Upload integrity: a final key only ever holds an object whose size and checksum were
+  verified, so a killed run can never leave a partial upload that counts as a backup.
+- `aws s3 ls` exiting 1 on an empty prefix read as a failure on a first backup.
+- Cron's minimal PATH hid an `aws` or `age` in `/usr/local/bin` from scheduled runs.
+- `backup run` volume archives failed on GNU tar's "file changed" from a live app; the
+  artifact is already labelled crash-consistent.
+
 ## [0.1.51] - 2026-11-05
 
 ### Added

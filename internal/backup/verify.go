@@ -26,8 +26,10 @@ type VerifyResult struct {
 	Kind      string `json:"kind"` // postgres|mysql|mongo|redis|valkey|dragonfly|nucleus|volume
 	// Engine is the detected engine (mariadb is Kind "mysql"; generic is
 	// Kind "volume") and Detection the evidence it came from.
-	Engine     string `json:"engine"`
-	Detection  string `json:"detection"`
+	Engine    string `json:"engine"`
+	Detection string `json:"detection"`
+	// Database is the database verified, when it has its own series.
+	Database   string `json:"database,omitempty"`
 	Date       string `json:"date"`
 	S3Key      string `json:"s3_key"`
 	SizeBytes  int64  `json:"size_bytes"`
@@ -35,6 +37,13 @@ type VerifyResult struct {
 	DurationMs int64  `json:"duration_ms"`
 	OK         bool   `json:"ok"`
 	Detail     string `json:"detail,omitempty"`
+	// Encrypted says the verified object was age-encrypted, and was decrypted
+	// with this server's own identity.
+	Encrypted bool `json:"encrypted"`
+	// series is the bucket-relative prefix of the backup's object.
+	series string
+	// loc is where the object was found (current or a previous prefix).
+	loc S3Config
 }
 
 // InspectAccessory reads the image and environment of the RUNNING accessory
@@ -44,7 +53,7 @@ type VerifyResult struct {
 // gives auth parity with the backup commands (same POSTGRES_USER, same
 // passwordless-root mysql, etc.).
 func (c *Client) InspectAccessory(ctx context.Context, app, name string) (image string, env map[string]string, err error) {
-	containerName := app + "-" + name
+	containerName := ContainerName(app, name)
 	img, err := c.exec.Run(ctx, fmt.Sprintf(
 		"docker inspect -f '{{.Config.Image}}' %s", ssh.ShellQuote(containerName)))
 	if err != nil {
@@ -73,41 +82,55 @@ func (c *Client) InspectAccessory(ctx context.Context, app, name string) (image 
 // by listing the S3 prefix. Returns the bare timestamp (the <date> restore
 // arg) and the object's size in bytes.
 func (c *Client) LatestBackupDate(ctx context.Context, app, name string, s3 S3Config) (date string, size int64, err error) {
-	date, size, _, err = c.latestBackup(ctx, app, name, s3)
+	date, size, _, _, err = c.latestBackup(ctx, app, name, "", s3)
 	return date, size, err
 }
 
-// latestBackup is LatestBackupDate plus the object's file name (its
-// extension says which artifact format the backup is).
-func (c *Client) latestBackup(ctx context.Context, app, name string, s3 S3Config) (date string, size int64, file string, err error) {
-	prefix := fmt.Sprintf("s3://%s/%s/accessories/%s/", s3.Base(), app, name)
-	out, err := c.exec.Run(ctx, s3.AWS(fmt.Sprintf("s3 ls %s", ssh.ShellQuote(prefix))))
-	if err != nil {
-		return "", 0, "", fmt.Errorf("listing backups at %s: %w", prefix, err)
-	}
-	// Lines look like: 2026-07-10 04:00:01   52428800 20260710-040000.sql.gz
-	// The teploy timestamp format sorts lexically, so track the max.
-	var best, bestFile string
+// latestBackup is LatestBackupDate for one series (the primary, or one
+// database's) across the current and previous prefixes, plus the object's file
+// name and where it was found. Objects below the engine's plausibility floor are
+// not backups, and pending uploads never appear (they sit one level down).
+func (c *Client) latestBackup(ctx context.Context, app, name, db string, s3 S3Config) (date string, size int64, file string, found S3Config, err error) {
+	var listed bool
+	var lastErr error
 	var bestSize int64
-	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) < 4 {
+	var best, bestFile string
+	for _, loc := range s3.locations() {
+		prefix := seriesPrefix(loc, app, name, db)
+		out, lsErr := c.exec.Run(ctx, loc.AWS(fmt.Sprintf("s3 ls %s", ssh.ShellQuote(prefix))))
+		if lsErr != nil {
+			lastErr = fmt.Errorf("listing backups at %s: %w", prefix, lsErr)
 			continue
 		}
-		fname := fields[len(fields)-1]
-		ts, _, ok := strings.Cut(fname, ".")
-		if !ok || ValidateDate(ts) != nil {
-			continue
-		}
-		if ts > best {
-			best, bestFile = ts, fname
-			bestSize, _ = strconv.ParseInt(fields[len(fields)-2], 10, 64)
+		listed = true
+		// Lines look like: 2026-07-10 04:00:01   52428800 20260710-040000.sql.gz
+		// The teploy timestamp format sorts lexically, so track the max.
+		for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+			fields := strings.Fields(line)
+			if len(fields) < 4 {
+				continue
+			}
+			fname := fields[len(fields)-1]
+			ts, _, ok := strings.Cut(fname, ".")
+			if !ok || ValidateDate(ts) != nil {
+				continue
+			}
+			sz, _ := strconv.ParseInt(fields[len(fields)-2], 10, 64)
+			if sz < artifactFloor(fname) {
+				continue
+			}
+			if ts > best {
+				best, bestFile, bestSize, found = ts, fname, sz, loc
+			}
 		}
 	}
 	if best == "" {
-		return "", 0, "", fmt.Errorf("no backups found at %s", prefix)
+		if !listed && lastErr != nil {
+			return "", 0, "", s3, lastErr
+		}
+		return "", 0, "", s3, fmt.Errorf("no backups found at %s", seriesPrefix(s3, app, name, db))
 	}
-	return best, bestSize, bestFile, nil
+	return best, bestSize, bestFile, found, nil
 }
 
 // VerifyBackup downloads a backup (latest when date is empty), restores it
@@ -128,7 +151,15 @@ func verifyTmpDir() string {
 	return "/var/tmp"
 }
 
-func (c *Client) VerifyBackup(ctx context.Context, app, name, date string, s3 S3Config) (retResult *VerifyResult, retErr error) {
+func (c *Client) VerifyBackup(ctx context.Context, app, name, date string, s3 S3Config) (*VerifyResult, error) {
+	return c.VerifyBackupDatabase(ctx, app, name, date, "", s3)
+}
+
+// VerifyBackupDatabase is VerifyBackup for one database with its own series
+// (database empty: the accessory's primary).
+func (c *Client) VerifyBackupDatabase(ctx context.Context, app, name, date, database string, s3 S3Config) (retResult *VerifyResult, retErr error) {
+	ctx, cancel := context.WithTimeout(ctx, c.backupDeadline())
+	defer cancel()
 	if err := c.ensureAWSCLI(ctx); err != nil {
 		return nil, err
 	}
@@ -143,11 +174,32 @@ func (c *Client) VerifyBackup(ctx context.Context, app, name, date string, s3 S3
 	if err != nil {
 		return nil, err
 	}
+	series := det.Engine == EnginePostgres || det.Engine == EngineMySQL || det.Engine == EngineMariaDB
+	if database != "" && !series {
+		return nil, fmt.Errorf("--database applies to postgres and mysql/mariadb accessories; %s is %s", name, det.Engine)
+	}
+	if database != "" && !addressableDB(database) {
+		return nil, fmt.Errorf("invalid database name %q", database)
+	}
+	if app == AdoptedApp && series && database == "" {
+		return nil, fmt.Errorf("%s holds several databases, each with its own backups: name one with --database", name)
+	}
+	seriesDB := database
+	if database != "" && app != AdoptedApp {
+		primary, _ := postgresDBAndUser(app, env)
+		if det.Engine != EnginePostgres {
+			primary = mysqlDB(app, env)
+		}
+		if database == primary {
+			seriesDB = ""
+		}
+	}
 
 	var size int64
 	var latestFile string
+	loc := s3
 	if date == "" {
-		date, size, latestFile, err = c.latestBackup(ctx, app, name, s3)
+		date, size, latestFile, loc, err = c.latestBackup(ctx, app, name, seriesDB, s3)
 		if err != nil {
 			return nil, err
 		}
@@ -157,7 +209,8 @@ func (c *Client) VerifyBackup(ctx context.Context, app, name, date string, s3 S3
 
 	res := &VerifyResult{
 		App: app, Accessory: name, Image: image, Date: date, SizeBytes: size,
-		Engine: det.Engine, Detection: det.Source,
+		Engine: det.Engine, Detection: det.Source, Database: database,
+		series: strings.TrimPrefix(seriesPrefix(S3Config{Bucket: "b"}, app, name, seriesDB), "s3://b/"), loc: loc,
 	}
 
 	var nonce [16]byte
@@ -197,18 +250,22 @@ func (c *Client) VerifyBackup(ctx context.Context, app, name, date string, s3 S3
 	if det.IsDB() && det.Engine != EngineNucleus {
 		ext := ""
 		for _, e := range artifactExts(det.Engine) {
-			if strings.HasSuffix(latestFile, e) {
+			if strings.HasSuffix(strings.TrimSuffix(latestFile, ageSuffix), e) {
 				ext = e
 			}
 		}
+		key := ""
 		if ext == "" && latestFile == "" {
-			if _, e, rerr := c.resolveAccessoryKey(ctx, s3, fmt.Sprintf("s3://%s/%s/accessories/%s/", s3.Base(), app, name), date, artifactExts(det.Engine)...); rerr == nil {
-				ext = e
+			if k, e, l, rerr := c.findObject(ctx, s3, res.series, date, artifactExts(det.Engine)...); rerr == nil {
+				ext, key, res.loc = e, k, l
 			}
 		}
 		if ext == ".tar.gz" {
 			res.Kind = det.Engine
-			res.S3Key = fmt.Sprintf("s3://%s/%s/accessories/%s/%s.tar.gz", s3.Base(), app, name, date)
+			if key == "" {
+				key = seriesPrefix(loc, app, name, seriesDB) + latestFile
+			}
+			res.S3Key = key
 			res.DurationMs = time.Since(start).Milliseconds()
 			res.Detail = "this " + det.Engine + " backup is a raw file copy of the live data directory (taken before teploy detected the engine) — it can be restored as files but not verified as a database; take a new backup"
 			return res, nil
@@ -221,7 +278,7 @@ func (c *Client) VerifyBackup(ctx context.Context, app, name, date string, s3 S3
 	switch det.Engine {
 	case EnginePostgres:
 		res.Kind = "postgres"
-		err = c.verifyPostgres(ctx, res, app, name, image, env, s3, scratch, tmpBase, latestFile)
+		err = c.verifyPostgres(ctx, res, app, name, image, env, s3, scratch, tmpBase)
 	case EngineMySQL, EngineMariaDB:
 		res.Kind = "mysql"
 		err = c.verifyMySQL(ctx, res, app, name, det.Engine, image, env, s3, scratch, tmpBase)
@@ -246,6 +303,11 @@ func (c *Client) VerifyBackup(ctx context.Context, app, name, date string, s3 S3
 	}
 
 	res.DurationMs = time.Since(start).Milliseconds()
+	if res.SizeBytes == 0 && res.S3Key != "" {
+		if h, herr := c.head(ctx, res.loc, res.S3Key); herr == nil {
+			res.SizeBytes = h.Size
+		}
+	}
 	if err != nil {
 		res.OK = false
 		res.Detail = err.Error()
@@ -283,14 +345,20 @@ func (c *Client) verifyEnv(ctx context.Context, env map[string]string, tmpBase s
 	return "--label teploy.verify.owner=" + ssh.ShellQuote(env["TEPLOY_VERIFY_OWNER"]) + " --env-file " + ssh.ShellQuote(path), nil
 }
 
-func (c *Client) download(ctx context.Context, s3Key, dest string, s3 S3Config) error {
-	fmt.Fprintf(c.out, "Downloading %s...\n", s3Key)
-	_, err := c.exec.Run(ctx, s3.AWS(fmt.Sprintf("s3 cp %s %s",
-		ssh.ShellQuote(s3Key), ssh.ShellQuote(dest))))
+// fetchVerifyObject downloads (and decrypts) the backup under verification,
+// trying exts in order, recording its key and encryption on res.
+func (c *Client) fetchVerifyObject(ctx context.Context, res *VerifyResult, s3 S3Config, dest func(ext string) string, exts ...string) (string, error) {
+	key, ext, loc, err := c.findObject(ctx, s3, res.series, res.Date, exts...)
 	if err != nil {
-		return fmt.Errorf("downloading backup: %w", err)
+		return "", err
 	}
-	return nil
+	res.S3Key, res.loc = key, loc
+	res.Encrypted = strings.HasSuffix(key, ageSuffix)
+	fmt.Fprintf(c.out, "Downloading %s...\n", key)
+	if err := c.fetch(ctx, loc, key, dest(ext)); err != nil {
+		return "", fmt.Errorf("downloading backup: %w", err)
+	}
+	return ext, nil
 }
 
 // waitReady polls a readiness probe inside the scratch container.
@@ -304,31 +372,25 @@ func (c *Client) waitReady(ctx context.Context, scratch, probe string, attempts 
 	return nil
 }
 
-func (c *Client) verifyPostgres(ctx context.Context, res *VerifyResult, app, name, image string, env map[string]string, s3 S3Config, scratch, tmpBase, latestFile string) error {
+func (c *Client) verifyPostgres(ctx context.Context, res *VerifyResult, app, name, image string, env map[string]string, s3 S3Config, scratch, tmpBase string) error {
 	db, user := postgresDBAndUser(app, env)
-	prefix := fmt.Sprintf("s3://%s/%s/accessories/%s/", s3.Base(), app, name)
-	var s3Key, ext string
-	switch {
-	case strings.HasSuffix(latestFile, ".pgdump"):
-		s3Key, ext = prefix+latestFile, ".pgdump"
-	case strings.HasSuffix(latestFile, ".sql.gz"):
-		s3Key, ext = prefix+latestFile, ".sql.gz"
-	default:
-		var err error
-		if s3Key, ext, err = c.resolveAccessoryKey(ctx, s3, prefix, res.Date, ".pgdump", ".sql.gz"); err != nil {
-			return err
+	seriesDB := ""
+	if res.Database != "" {
+		if res.Database != db || app == AdoptedApp {
+			seriesDB = res.Database
 		}
+		db = res.Database
 	}
-	res.S3Key = s3Key
-	dump := tmpBase + ext
-	if err := c.download(ctx, s3Key, dump, s3); err != nil {
+	ext, err := c.fetchVerifyObject(ctx, res, s3, func(e string) string { return tmpBase + e }, ".pgdump", ".sql.gz")
+	if err != nil {
 		return err
 	}
+	dump := tmpBase + ext
 	// The cluster's roles (pg_dumpall --globals-only, stored beside the
 	// dump) let the scratch restore keep real ownership. Older backups
 	// have none.
 	globals := tmpBase + ".globals.sql.gz"
-	haveGlobals := c.download(ctx, prefix+"globals/"+res.Date+".sql.gz", globals, s3) == nil
+	haveGlobals := c.fetchSidecar(ctx, res.loc, postgresGlobalsKey(res.loc, app, name, res.Date), globals)
 
 	flags, err := c.verifyEnv(ctx, env, tmpBase, "POSTGRES_", "POSTGRESQL_", "ALLOW_EMPTY_PASSWORD")
 	if err != nil {
@@ -371,7 +433,7 @@ func (c *Client) verifyPostgres(ctx context.Context, res *VerifyResult, app, nam
 		return fmt.Errorf("preparing the scratch database: %w", err)
 	}
 	fmt.Fprintf(c.out, "Restoring into scratch as %s...\n", user)
-	if _, err := c.restorePostgres(ctx, newPGTarget(scratch, db, user, env), dump, ext, path.Dir(tmpBase), pgRestoreOpts{logicalBytes: c.pgRecordedSize(ctx, s3, app, name, res.Date, path.Dir(tmpBase))}); err != nil {
+	if _, err := c.restorePostgres(ctx, newPGTarget(scratch, db, user, env), dump, ext, path.Dir(tmpBase), pgRestoreOpts{logicalBytes: c.pgRecordedSize(ctx, res.loc, app, name, seriesDB, res.Date, path.Dir(tmpBase))}); err != nil {
 		return fmt.Errorf("restore into scratch failed: %w", err)
 	}
 
@@ -389,10 +451,11 @@ func (c *Client) verifyPostgres(ctx context.Context, res *VerifyResult, app, nam
 
 func (c *Client) verifyMySQL(ctx context.Context, res *VerifyResult, app, name, engine, image string, env map[string]string, s3 S3Config, scratch, tmpBase string) error {
 	db := mysqlDB(app, env)
-	s3Key := fmt.Sprintf("s3://%s/%s/accessories/%s/%s.sql.gz", s3.Base(), app, name, res.Date)
-	res.S3Key = s3Key
+	if res.Database != "" {
+		db = res.Database
+	}
 	dump := tmpBase + ".sql.gz"
-	if err := c.download(ctx, s3Key, dump, s3); err != nil {
+	if _, err := c.fetchVerifyObject(ctx, res, s3, func(string) string { return dump }, ".sql.gz"); err != nil {
 		return err
 	}
 
@@ -415,6 +478,12 @@ func (c *Client) verifyMySQL(ctx context.Context, res *VerifyResult, app, name, 
 	if err := c.waitReady(ctx, scratch, "sh -c "+ssh.ShellQuote(prelude+"exec "+client+" --protocol=TCP -h 127.0.0.1 -u root -e 'SELECT 1'"), 40); err != nil {
 		return err
 	}
+	// The scratch server only made MYSQL_DATABASE: a dump of one schema has no
+	// CREATE DATABASE of its own.
+	createDB := prelude + "exec " + client + " -u root -e " + ssh.ShellQuote("CREATE DATABASE IF NOT EXISTS "+mysqlIdent(db))
+	if _, err := c.exec.Run(ctx, "docker exec "+ssh.ShellQuote(scratch)+" sh -c "+ssh.ShellQuote(createDB)); err != nil {
+		return fmt.Errorf("preparing the scratch database: %w", err)
+	}
 	restore := prelude + "exec " + client + " -u root " + ssh.ShellQuote(db)
 	if _, err := c.exec.Run(ctx, "gunzip -c "+ssh.ShellQuote(dump)+" > "+ssh.ShellQuote(tmpBase+".sql")+" && docker exec -i "+ssh.ShellQuote(scratch)+" sh -c "+ssh.ShellQuote(restore)+" < "+ssh.ShellQuote(tmpBase+".sql")); err != nil {
 		return fmt.Errorf("restore into scratch failed: %w", err)
@@ -435,10 +504,8 @@ func (c *Client) verifyMySQL(ctx context.Context, res *VerifyResult, app, name, 
 
 func (c *Client) verifyRedis(ctx context.Context, res *VerifyResult, app, name, engine, image string, env map[string]string, s3 S3Config, scratch, tmpBase string) error {
 	cli := redisCLI(engine)
-	s3Key := fmt.Sprintf("s3://%s/%s/accessories/%s/%s.rdb.gz", s3.Base(), app, name, res.Date)
-	res.S3Key = s3Key
 	dump := tmpBase + ".rdb.gz"
-	if err := c.download(ctx, s3Key, dump, s3); err != nil {
+	if _, err := c.fetchVerifyObject(ctx, res, s3, func(string) string { return dump }, ".rdb.gz"); err != nil {
 		return err
 	}
 
@@ -467,10 +534,8 @@ func (c *Client) verifyRedis(ctx context.Context, res *VerifyResult, app, name, 
 // verifyDragonfly boots a scratch dragonfly and loads the snapshot with
 // DFLY LOAD (the same mechanism the in-place restore uses).
 func (c *Client) verifyDragonfly(ctx context.Context, res *VerifyResult, app, name, image string, env map[string]string, s3 S3Config, scratch, tmpBase string) error {
-	s3Key := fmt.Sprintf("s3://%s/%s/accessories/%s/%s.rdb.gz", s3.Base(), app, name, res.Date)
-	res.S3Key = s3Key
 	dump := tmpBase + ".rdb.gz"
-	if err := c.download(ctx, s3Key, dump, s3); err != nil {
+	if _, err := c.fetchVerifyObject(ctx, res, s3, func(string) string { return dump }, ".rdb.gz"); err != nil {
 		return err
 	}
 	if _, err := c.exec.Run(ctx, "gunzip -c "+ssh.ShellQuote(dump)+" > "+ssh.ShellQuote(tmpBase+".rdb")); err != nil {
@@ -490,10 +555,8 @@ func (c *Client) verifyDragonfly(ctx context.Context, res *VerifyResult, app, na
 }
 
 func (c *Client) verifyMongo(ctx context.Context, res *VerifyResult, app, name, image string, env map[string]string, s3 S3Config, scratch, tmpBase string) error {
-	s3Key := fmt.Sprintf("s3://%s/%s/accessories/%s/%s.archive.gz", s3.Base(), app, name, res.Date)
-	res.S3Key = s3Key
 	dump := tmpBase + ".archive.gz"
-	if err := c.download(ctx, s3Key, dump, s3); err != nil {
+	if _, err := c.fetchVerifyObject(ctx, res, s3, func(string) string { return dump }, ".archive.gz"); err != nil {
 		return err
 	}
 
@@ -536,10 +599,8 @@ func (c *Client) verifyMongo(ctx context.Context, res *VerifyResult, app, name, 
 // tables, and stay running. The "Restored N table(s)" boot line is the
 // verification metric.
 func (c *Client) verifyNucleus(ctx context.Context, res *VerifyResult, app, name, image string, env map[string]string, s3 S3Config, scratch, tmpBase string) error {
-	s3Key := fmt.Sprintf("s3://%s/%s/accessories/%s/%s.tar.gz", s3.Base(), app, name, res.Date)
-	res.S3Key = s3Key
 	dump := tmpBase + ".tar.gz"
-	if err := c.download(ctx, s3Key, dump, s3); err != nil {
+	if _, err := c.fetchVerifyObject(ctx, res, s3, func(string) string { return dump }, ".tar.gz"); err != nil {
 		return err
 	}
 
@@ -582,10 +643,8 @@ func (c *Client) verifyNucleus(ctx context.Context, res *VerifyResult, app, name
 // verifyVolume checks a generic volume archive: integrity (a truncated or
 // corrupt tar fails extraction) and non-emptiness.
 func (c *Client) verifyVolume(ctx context.Context, res *VerifyResult, app, name string, s3 S3Config, tmpBase string) error {
-	s3Key := fmt.Sprintf("s3://%s/%s/accessories/%s/%s.tar.gz", s3.Base(), app, name, res.Date)
-	res.S3Key = s3Key
 	dump := tmpBase + ".tar.gz"
-	if err := c.download(ctx, s3Key, dump, s3); err != nil {
+	if _, err := c.fetchVerifyObject(ctx, res, s3, func(string) string { return dump }, ".tar.gz"); err != nil {
 		return err
 	}
 	extractDir := tmpBase + ".d"
