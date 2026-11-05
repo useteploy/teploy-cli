@@ -1,5 +1,68 @@
 # Open audit items
 
+## 2026-11-05 — Dash auto-config Slice 6 CLI: cleanup / audit (P5)
+
+Plan: `../_internal/DASH_AUTOCONFIG_PLAN_2026-11-03.md` (section 9). Branch
+`slice6-cleanup`. `teploy server audit` (read-only findings + remedy argv),
+`route remove` (exact-block CAS), `releases prune --keep N`,
+`server prune --build-cache --dangling`, keep_versions D3 (unset → 5 after a
+recorded 7-day notice, `init` writes 3, 0 keeps everything), contracts rev 19.
+
+Deliberately report-only (design principle 4: hand-written config and other
+people's containers are never edited by teploy):
+- Hand-written Caddy blocks: dead upstream, non-local address. Evidence only.
+- Large container writable layers (managed ≥ 5 GB) and large unmanaged
+  containers (≥ 1 GB): a layer's data belongs to whoever wrote it; the
+  evidence names the move-to-volume fix.
+- Dangling volumes: may hold the only copy; there is never a remedy argv.
+- Unmanaged containers (portainer et al.): not teploy's to remove.
+- A managed block that still serves files (a `root` that exists), carries the
+  autodeploy webhook, or whose app is live: `route remove` refuses; the audit
+  reports the finding with the refusal as its evidence and a null remedy.
+- An upstream that is not this app's (a `caddy_extra` proxy to another app's
+  dead container): this app's redeploy cannot fix it, so no redeploy remedy.
+
+Deferred surface:
+- **Backup output sizes in the audit** (plan lesson: "backup jobs whose
+  outputs are implausibly small"): covered at write time by the engine's
+  minimum-size refusal (Slice 2, `internal/backup/engine.go`) and
+  `backup status`'s per-target last success/failure; the audit does not
+  re-walk buckets, which would need target credentials it must not use.
+- **`server audit` on a server with no caddyfile at all** reports no route
+  findings by construction; a Caddyfile with no Caddy container is flagged
+  (`caddyfile_without_caddy`, compute-2's case).
+- **Disk attribution beyond docker + /deployments**: `du` of other trees
+  (logs, /var) is not attempted; the pressure finding attributes what teploy
+  can name and links the reclaimable findings.
+- **Audit does not pin the notice file's mtime against clock skew**: the
+  notice is a RFC 3339 server-side timestamp written by the deploy that
+  starts it, same trust domain as state.json.
+
+Decisions worth reviewing:
+- `route remove` protects running-container versions of an app's name even
+  without state (`ownedContainers`, unlabelled `<app>-*` names included):
+  an older deploy's container keeps the name alive, so the route is not
+  proven dead until it is gone.
+- `releases prune --keep 0` (and the audit never emits it) prunes everything
+  the protections do not name — deliberately the opposite reading of
+  `keep_versions: 0`, documented in the command's help, because "retain none
+  beyond the protected set" is a coherent manual operation.
+- Automatic pruning under the default keep_versions runs only inside a
+  deploy of that app (never from the audit, never fleet-wide), so the notice
+  is always written by an operation that already holds the app lock.
+- `retentionProtected` includes any version with a running container, beyond
+  the plan's pins/current/previous: `docker rm -f` of a running stranger is
+  not something a cleanup command should do even inside the keep window.
+
+Verified: unit/hermetic only (mock SSH executors, the same discipline as
+`domains check`); every audit finding kind, all `route remove` refusal
+paths, the CAS refusal on a concurrent rewrite, prune selections (pins/
+current/previous/running survive, `--keep 0`, unreadable pins refuse),
+the notice-period state machine, and the read-only pin (no mutating verb,
+docker subcommand or upload in any command `server audit` issues). Not yet
+exercised live: the four fleet servers' first real audit run and the Dash
+cleanup page (Dash side, next slice).
+
 ## 2026-11-05 — Dash auto-config Slice 4 CLI: fleet backup engine (G1, G3, G4, G5)
 
 Plan: `../_internal/DASH_AUTOCONFIG_PLAN_2026-11-03.md` (sections 2.1-2.3, 5). Branch
