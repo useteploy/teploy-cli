@@ -29,7 +29,7 @@ func (f itFixture) dropKeptTmp(err error) {
 	}
 	if _, after, ok := strings.Cut(err.Error(), "restore files kept in "); ok {
 		dir := strings.Fields(after)[0]
-		if strings.HasPrefix(dir, "/tmp/teploy-restore.") {
+		if strings.HasPrefix(dir, "/var/tmp/teploy-restore.") {
 			f.base.Run(context.Background(), "rm -rf "+ssh.ShellQuote(dir))
 		}
 	}
