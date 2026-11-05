@@ -16,7 +16,8 @@ import (
 // live directory (via a promote step) once that succeeds.
 
 func TestRestoreVolumes_StagesBeforePromoting(t *testing.T) {
-	mock := ssh.NewMockExecutor("1.2.3.4",
+	mock := newStoreMock("1.2.3.4",
+		ssh.MockCommand{Match: "aws s3 ls", Output: "2026-01-01 00:00:00 4096 20260101-000000.tar.gz\n"},
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
 		ssh.MockCommand{Match: "aws s3 cp", Output: "download: done\n"},
 		ssh.MockCommand{Match: "umask 077", Output: "/tmp/teploy-volume-restore.abc123\n"},
@@ -127,7 +128,8 @@ func TestRestoreVolumes_StagesBeforePromoting(t *testing.T) {
 }
 
 func TestRestoreVolumes_ExtractionFailureLeavesLiveDirUntouched(t *testing.T) {
-	mock := ssh.NewMockExecutor("1.2.3.4",
+	mock := newStoreMock("1.2.3.4",
+		ssh.MockCommand{Match: "aws s3 ls", Output: "2026-01-01 00:00:00 4096 20260101-000000.tar.gz\n"},
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
 		ssh.MockCommand{Match: "aws s3 cp", Output: "download: done\n"},
 		ssh.MockCommand{Match: "umask 077", Output: "/tmp/teploy-volume-restore.abc123\n"},
@@ -155,7 +157,8 @@ func TestRestoreVolumes_ExtractionFailureLeavesLiveDirUntouched(t *testing.T) {
 // old recovery unconditionally ran `find live -mindepth 1 -delete` first,
 // destroying the only copy of the unmoved originals.
 func TestRestoreVolumes_PartialMoveAsideNeverDeletesLiveEntries(t *testing.T) {
-	mock := ssh.NewMockExecutor("1.2.3.4",
+	mock := newStoreMock("1.2.3.4",
+		ssh.MockCommand{Match: "aws s3 ls", Output: "2026-01-01 00:00:00 4096 20260101-000000.tar.gz\n"},
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
 		ssh.MockCommand{Match: "aws s3 cp", Output: "download: done\n"},
 		ssh.MockCommand{Match: "umask 077", Output: "/tmp/teploy-volume-restore.abc123\n"},
@@ -204,11 +207,11 @@ func TestRestoreVolumes_PartialMoveAsideNeverDeletesLiveEntries(t *testing.T) {
 // restorePath, so the download and restore operated on empty arguments —
 // every MySQL restore was deterministically broken.
 func TestAccessoryRestore_MySQL_DownloadsAndRestoresRealPaths(t *testing.T) {
-	mock := ssh.NewMockExecutor("1.2.3.4",
+	mock := newStoreMock("1.2.3.4",
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
 		ssh.MockCommand{Match: "aws s3 ls", Output: "2026-01-01 00:00:00 99 20260101-000000.sql.gz\n"},
 		ssh.MockCommand{Match: "aws s3 cp", Output: "download: done\n"},
-		ssh.MockCommand{Match: "mktemp -d '/tmp/teploy-restore.XXXXXX'", Output: "/tmp/teploy-restore.abc123\n"},
+		ssh.MockCommand{Match: "mktemp -d '/var/tmp/teploy-restore.XXXXXX'", Output: "/tmp/teploy-restore.abc123\n"},
 		ssh.MockCommand{Match: "umask 077; gunzip -c", Output: ""},
 		ssh.MockCommand{Match: "docker exec", Output: ""},
 		ssh.MockCommand{Match: "rm -f ", Output: ""},
@@ -244,13 +247,13 @@ func TestAccessoryRestore_MySQL_DownloadsAndRestoresRealPaths(t *testing.T) {
 }
 
 func TestAccessoryRestore_GenericStagesBeforePromoting(t *testing.T) {
-	mock := ssh.NewMockExecutor("1.2.3.4",
+	mock := newStoreMock("1.2.3.4",
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
 		ssh.MockCommand{Match: "aws s3 ls", Output: "2026-01-01 00:00:00 99 20260101-000000.tar.gz\n"},
 		ssh.MockCommand{Match: "aws s3 cp", Output: "download: done\n"},
 		ssh.MockCommand{Match: "rm -rf", Output: ""},
 		ssh.MockCommand{Match: "mkdir -p", Output: ""},
-		ssh.MockCommand{Match: "mktemp -d '/tmp/teploy-restore.XXXXXX'", Output: "/tmp/teploy-restore.abc123\n"},
+		ssh.MockCommand{Match: "mktemp -d '/var/tmp/teploy-restore.XXXXXX'", Output: "/tmp/teploy-restore.abc123\n"},
 		ssh.MockCommand{Match: "mktemp -d", Output: "/deployments/myapp/accessories/cache.restore-old.abc123\n"},
 		ssh.MockCommand{Match: "find ", Output: ""},
 		ssh.MockCommand{Match: "cp -a ", Output: ""},
@@ -294,11 +297,11 @@ func TestAccessoryRestore_GenericStagesBeforePromoting(t *testing.T) {
 // the current dump, and restore + restart the original when the replacement
 // copy fails.
 func TestAccessoryRestore_RedisRestartsAfterCopyFailure(t *testing.T) {
-	mock := ssh.NewMockExecutor("1.2.3.4",
+	mock := newStoreMock("1.2.3.4",
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
 		ssh.MockCommand{Match: "aws s3 ls", Output: "2026-01-01 00:00:00 99 20260101-000000.rdb.gz\n"},
 		ssh.MockCommand{Match: "aws s3 cp", Output: "download: done\n"},
-		ssh.MockCommand{Match: "mktemp -d '/tmp/teploy-restore.XXXXXX'", Output: "/tmp/teploy-restore.abc123\n"},
+		ssh.MockCommand{Match: "mktemp -d '/var/tmp/teploy-restore.XXXXXX'", Output: "/tmp/teploy-restore.abc123\n"},
 		// A40's preflight must prove appendonly=no before the script runs.
 		ssh.MockCommand{Match: "docker exec 'myapp-redis' redis-cli --raw config get appendonly", Output: "appendonly no"},
 		ssh.MockCommand{Match: "set -eu", Err: fmt.Errorf("exit status 1: docker cp failed")},

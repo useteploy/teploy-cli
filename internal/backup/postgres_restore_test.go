@@ -45,7 +45,7 @@ func pgRestoreMock(overrides ...ssh.MockCommand) *ssh.MockExecutor {
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
 		ssh.MockCommand{Match: "aws s3 ls", Output: "2026-01-01 00:00:00 2048 20260101-000000.pgdump\n"},
 		ssh.MockCommand{Match: "aws s3 cp", Output: "download: done\n"},
-		ssh.MockCommand{Match: "mktemp -d '/tmp/teploy-restore.XXXXXX'", Output: "/tmp/teploy-restore.abc123\n"},
+		ssh.MockCommand{Match: "mktemp -d '/var/tmp/teploy-restore.XXXXXX'", Output: "/tmp/teploy-restore.abc123\n"},
 		ssh.MockCommand{Match: "gzip -t", Output: ""},
 		ssh.MockCommand{Match: "docker exec -i 'myapp-postgres' pg_restore -C -l", Output: pgTOC},
 		ssh.MockCommand{Match: "docker exec 'myapp-postgres' psql -X -qtA -v ON_ERROR_STOP=1 -U 'postgres' -d 'postgres' -c 'SELECT current_setting", Output: "170004|t|t|appowner|UTF8|en_US.utf8|en_US.utf8|1000000\n"},
@@ -59,7 +59,7 @@ func pgRestoreMock(overrides ...ssh.MockCommand) *ssh.MockExecutor {
 		ssh.MockCommand{Match: "gunzip -c", Output: ""},
 		ssh.MockCommand{Match: "rm -rf", Output: ""},
 	)
-	return ssh.NewMockExecutor("1.2.3.4", cmds...)
+	return newStoreMock("1.2.3.4", cmds...)
 }
 
 func pgClient(mock *ssh.MockExecutor) *Client {
@@ -265,26 +265,26 @@ func TestLegacyTarOfReclassifiedEngineIsAFileRestore(t *testing.T) {
 	env := map[string]string{"PG_MAJOR": "17"}
 	listing := ssh.MockCommand{Match: "aws s3 ls", Output: "2026-01-01 00:00:00 4096 20260101-000000.tar.gz\n"}
 
-	art, err := NewClient(ssh.NewMockExecutor("h", listing), io.Discard).ResolveAccessoryArtifact(ctx, "myapp", "db", "pgvector/pgvector:pg17", "20260101-000000", env, s3)
+	art, err := NewClient(newStoreMock("h", listing), io.Discard).ResolveAccessoryArtifact(ctx, "myapp", "db", "pgvector/pgvector:pg17", "20260101-000000", env, s3)
 	if err != nil || !art.FileRestore || art.Engine.Engine != EnginePostgres || art.Ext != ".tar.gz" {
 		t.Fatalf("artifact = %+v, %v", art, err)
 	}
-	native, err := NewClient(ssh.NewMockExecutor("h", ssh.MockCommand{Match: "aws s3 ls", Output: "2026-01-01 00:00:00 4096 20260101-000000.pgdump\n"}), io.Discard).ResolveAccessoryArtifact(ctx, "myapp", "db", "pgvector/pgvector:pg17", "20260101-000000", env, s3)
+	native, err := NewClient(newStoreMock("h", ssh.MockCommand{Match: "aws s3 ls", Output: "2026-01-01 00:00:00 4096 20260101-000000.pgdump\n"}), io.Discard).ResolveAccessoryArtifact(ctx, "myapp", "db", "pgvector/pgvector:pg17", "20260101-000000", env, s3)
 	if err != nil || native.FileRestore {
 		t.Fatalf("a .pgdump is an engine restore: %+v %v", native, err)
 	}
 
-	running := ssh.NewMockExecutor("h", listing,
+	running := newStoreMock("h", listing,
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
 		ssh.MockCommand{Match: "docker inspect -f '{{.State.Running}}'", Output: "true\n"})
 	if _, err := NewClient(running, io.Discard).AccessoryRestoreKeep(ctx, "myapp", "db", "pgvector/pgvector:pg17", "20260101-000000", env, s3); err == nil || !strings.Contains(err.Error(), "must be stopped") {
 		t.Fatalf("a file restore into a running accessory must be refused, got %v", err)
 	}
 
-	stopped := ssh.NewMockExecutor("h", listing,
+	stopped := newStoreMock("h", listing,
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
 		ssh.MockCommand{Match: "docker inspect -f '{{.State.Running}}'", Output: "false\n"},
-		ssh.MockCommand{Match: "mktemp -d '/tmp/teploy-restore.XXXXXX'", Output: "/tmp/teploy-restore.abc123\n"},
+		ssh.MockCommand{Match: "mktemp -d '/var/tmp/teploy-restore.XXXXXX'", Output: "/tmp/teploy-restore.abc123\n"},
 		ssh.MockCommand{Match: "aws s3 cp", Output: ""},
 		ssh.MockCommand{Match: "rm -rf", Output: ""},
 		ssh.MockCommand{Match: "mkdir -p", Output: ""},
@@ -318,7 +318,7 @@ func mysqlRestoreMock(overrides ...ssh.MockCommand) *ssh.MockExecutor {
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
 		ssh.MockCommand{Match: "aws s3 ls", Output: "2026-01-01 00:00:00 2048 20260101-000000.sql.gz\n"},
 		ssh.MockCommand{Match: "aws s3 cp", Output: ""},
-		ssh.MockCommand{Match: "mktemp -d '/tmp/teploy-restore.XXXXXX'", Output: "/tmp/teploy-restore.abc123\n"},
+		ssh.MockCommand{Match: "mktemp -d '/var/tmp/teploy-restore.XXXXXX'", Output: "/tmp/teploy-restore.abc123\n"},
 		ssh.MockCommand{Match: "umask 077; gunzip -c", Output: ""},
 		ssh.MockCommand{Match: "docker exec -i 'myapp-db' sh -c 'IFS= read -r teploy_credential || exit 1; MYSQL_PWD=${teploy_credential#MYSQL_PWD=}; export MYSQL_PWD; exec mysql -u root -N -B", Output: "utf8mb4|utf8mb4_0900_ai_ci|16384|0|0\n"},
 		ssh.MockCommand{Match: "df -Pk '/var/tmp'", Output: "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/vda1 100000 10 90000 1% /\n"},
@@ -328,7 +328,7 @@ func mysqlRestoreMock(overrides ...ssh.MockCommand) *ssh.MockExecutor {
 		ssh.MockCommand{Match: "rm -f ", Output: ""},
 		ssh.MockCommand{Match: "rm -rf", Output: ""},
 	)
-	return ssh.NewMockExecutor("1.2.3.4", cmds...)
+	return newStoreMock("1.2.3.4", cmds...)
 }
 
 func mysqlRestore(mock *ssh.MockExecutor) (RestoreRecovery, error) {
@@ -404,7 +404,7 @@ func TestMongoRestore_FailureClassification(t *testing.T) {
 			ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
 			ssh.MockCommand{Match: "aws s3 ls", Output: "2026-01-01 00:00:00 2048 20260101-000000.archive.gz\n"},
 			ssh.MockCommand{Match: "aws s3 cp", Output: ""},
-			ssh.MockCommand{Match: "mktemp -d '/tmp/teploy-restore.XXXXXX'", Output: "/tmp/teploy-restore.abc123\n"},
+			ssh.MockCommand{Match: "mktemp -d '/var/tmp/teploy-restore.XXXXXX'", Output: "/tmp/teploy-restore.abc123\n"},
 			ssh.MockCommand{Match: "gzip -t", Output: ""},
 			ssh.MockCommand{Match: "umask 077; mktemp -d '/var/tmp/teploy-pre-restore.myapp@db@XXXXXX'", Output: "/var/tmp/teploy-pre-restore.g\n"},
 			ssh.MockCommand{Match: "docker exec 'myapp-db' mongodump", Output: ""},
@@ -412,7 +412,7 @@ func TestMongoRestore_FailureClassification(t *testing.T) {
 			ssh.MockCommand{Match: "docker exec -i 'myapp-db' mongorestore", Output: ""},
 			ssh.MockCommand{Match: "rm -", Output: ""},
 		)
-		return ssh.NewMockExecutor("h", cmds...)
+		return newStoreMock("h", cmds...)
 	}
 	run := func(m *ssh.MockExecutor) (RestoreRecovery, error) {
 		return NewClient(m, io.Discard).AccessoryRestoreKeep(context.Background(), "myapp", "db", "mongo:7", "20260101-000000", map[string]string{"MONGO_VERSION": "7.0"}, S3Config{Bucket: "b", Region: "us-east-1"})
@@ -433,11 +433,11 @@ func TestMongoRestore_FailureClassification(t *testing.T) {
 // Dragonfly: when DFLY LOAD and the pre-restore reload both fail the
 // script's marker makes the error recovery-incomplete.
 func TestDragonflyDoubleFailureIsRecoveryIncomplete(t *testing.T) {
-	mock := ssh.NewMockExecutor("h",
+	mock := newStoreMock("h",
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
 		ssh.MockCommand{Match: "aws s3 ls", Output: "2026-01-01 00:00:00 2048 20260101-000000.rdb.gz\n"},
 		ssh.MockCommand{Match: "aws s3 cp", Output: ""},
-		ssh.MockCommand{Match: "mktemp -d '/tmp/teploy-restore.XXXXXX'", Output: "/tmp/teploy-restore.abc123\n"},
+		ssh.MockCommand{Match: "mktemp -d '/var/tmp/teploy-restore.XXXXXX'", Output: "/tmp/teploy-restore.abc123\n"},
 		ssh.MockCommand{Match: "umask 077; mktemp -d '/var/tmp/teploy-pre-restore.myapp@cache@XXXXXX'", Output: "/var/tmp/teploy-pre-restore.d\n"},
 		ssh.MockCommand{Match: "set -eu", Err: errors.New("Process exited with status 3: " + recoveryIncompleteMarker + ": DFLY LOAD of the backup failed")},
 		ssh.MockCommand{Match: "rm -", Output: ""},
@@ -740,7 +740,7 @@ func coverageMock(databases string, overrides ...ssh.MockCommand) *ssh.MockExecu
 		ssh.MockCommand{Match: "{ docker exec", Output: ""},
 		ssh.MockCommand{Match: "rm -rf", Output: ""},
 	)
-	return ssh.NewMockExecutor("h", cmds...)
+	return newStoreMock("h", cmds...)
 }
 
 func coverageBackup(mock *ssh.MockExecutor) (BackupResult, error) {
@@ -845,7 +845,7 @@ func copiesMock(databases string, overrides ...ssh.MockCommand) *ssh.MockExecuto
 		ssh.MockCommand{Match: "for d in '/var/tmp/teploy-pre-restore.myapp@postgres@'*", Output: "done /var/tmp/teploy-pre-restore.myapp@postgres@abc\n"},
 		ssh.MockCommand{Match: "rm -rf", Output: ""},
 	)
-	return ssh.NewMockExecutor("h", cmds...)
+	return newStoreMock("h", cmds...)
 }
 
 func TestReleaseRecoveryCopies(t *testing.T) {
@@ -896,7 +896,7 @@ func TestReleaseRefusedWhileTheLiveDatabaseIsMissing(t *testing.T) {
 // copy in /var/tmp. Its restore never wrote the marker: refused without --force.
 func TestReleaseRefusesUnconfirmedSafetyCopyWithoutForce(t *testing.T) {
 	path := "/var/tmp/teploy-pre-restore.myapp@db@abc"
-	mock := ssh.NewMockExecutor("h",
+	mock := newStoreMock("h",
 		ssh.MockCommand{Match: "docker exec 'myapp-db' sh -c", Output: ""},
 		ssh.MockCommand{Match: "for d in '/var/tmp/teploy-pre-restore.myapp@db@'*", Output: "open " + path + "\n"},
 		ssh.MockCommand{Match: "rm -rf", Output: ""},
@@ -964,7 +964,7 @@ func TestRollbackRestore(t *testing.T) {
 		t.Fatalf("plan = %+v, %v", plan, err)
 	}
 
-	e := &pgRollbackExec{MockExecutor: ssh.NewMockExecutor("h"), present: map[string]bool{"myapp": true, old: true}}
+	e := &pgRollbackExec{MockExecutor: newStoreMock("h"), present: map[string]bool{"myapp": true, old: true}}
 	displaced, err := NewClient(e, io.Discard).RollbackRestore(ctx, plan)
 	if err != nil || !strings.HasPrefix(displaced, "myapp_teploy_new_") {
 		t.Fatalf("rollback = %s %v", displaced, err)
@@ -974,7 +974,7 @@ func TestRollbackRestore(t *testing.T) {
 	}
 
 	// After a recovery-incomplete restore the live name may be gone.
-	e = &pgRollbackExec{MockExecutor: ssh.NewMockExecutor("h"), present: map[string]bool{old: true}}
+	e = &pgRollbackExec{MockExecutor: newStoreMock("h"), present: map[string]bool{old: true}}
 	displaced, err = NewClient(e, io.Discard).RollbackRestore(ctx, plan)
 	if err != nil || displaced != "" || pgCalled(e.Calls, `ALTER DATABASE "myapp" RENAME TO`) {
 		t.Fatalf("rollback with no live database = %q %v: %v", displaced, err, e.Calls)
@@ -1002,7 +1002,7 @@ func TestRollbackRestore(t *testing.T) {
 
 // A name with a space must not read as an unknown state after a committed swap.
 func TestPgSwapStateHandlesSpacesInNames(t *testing.T) {
-	mock := ssh.NewMockExecutor("h", ssh.MockCommand{Match: "docker exec 'c' psql", Output: "my db\nmy db_old\n"})
+	mock := newStoreMock("h", ssh.MockCommand{Match: "docker exec 'c' psql", Output: "my db\nmy db_old\n"})
 	st, err := NewClient(mock, io.Discard).pgSwapState(context.Background(), pgTarget{container: "c", user: "u", db: "my db"}, "my db_new", "my db_old")
 	if err != nil || !st.live || !st.previous || st.replacement {
 		t.Fatalf("state = %+v, %v", st, err)
@@ -1167,7 +1167,7 @@ func TestMySQLRestore_MarksTheSafetyCopyCompleted(t *testing.T) {
 func TestMySQLBackup_SecondSchemaWarns(t *testing.T) {
 	q := mysqlEnvClient(EngineMariaDB, "myapp-db", "X", "-N", "-B")
 	prefix := q[:strings.Index(q, "-e ")]
-	mock := ssh.NewMockExecutor("h",
+	mock := newStoreMock("h",
 		ssh.MockCommand{Match: prefix, Output: "appdb\t0\nreports\t0\nappdb_teploy_check\t1\n"},
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
 		ssh.MockCommand{Match: "umask 077", Output: "/tmp/teploy-backup.abc123\n"},
@@ -1192,11 +1192,11 @@ func TestMySQLBackup_SecondSchemaWarns(t *testing.T) {
 // that kills mongod is recovery-incomplete, not "untouched".
 func TestMongoRestore_SpaceAndLiveness(t *testing.T) {
 	base := func(o ...ssh.MockCommand) *ssh.MockExecutor {
-		return ssh.NewMockExecutor("h", append(o,
+		return newStoreMock("h", append(o,
 			ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
 			ssh.MockCommand{Match: "aws s3 ls", Output: "2026-01-01 00:00:00 2048 20260101-000000.archive.gz\n"},
 			ssh.MockCommand{Match: "aws s3 cp", Output: ""},
-			ssh.MockCommand{Match: "mktemp -d '/tmp/teploy-restore.XXXXXX'", Output: "/tmp/teploy-restore.abc123\n"},
+			ssh.MockCommand{Match: "mktemp -d '/var/tmp/teploy-restore.XXXXXX'", Output: "/tmp/teploy-restore.abc123\n"},
 			ssh.MockCommand{Match: "gzip -t", Output: ""},
 			ssh.MockCommand{Match: "wc -c", Output: "62000000\n"},
 			ssh.MockCommand{Match: "docker exec 'myapp-db' df -Pk", Output: "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/x 1000000 10 25000 1% /data/db\n"},
@@ -1236,7 +1236,7 @@ func TestMongoRestore_SpaceAndLiveness(t *testing.T) {
 // One throwaway database with a short random name fits any database name in
 // 63 bytes; leftovers are excluded from every real restore and dropped.
 func TestMongoRestore_ThrowawayNameAndExclusions(t *testing.T) {
-	mock := ssh.NewMockExecutor("h",
+	mock := newStoreMock("h",
 		ssh.MockCommand{Match: "gzip -t", Output: ""},
 		ssh.MockCommand{Match: "wc -c", Output: "100\n"},
 		ssh.MockCommand{Match: "docker exec 'c' df -Pk", Err: errors.New("exit status 1")},
@@ -1271,7 +1271,7 @@ func TestMongoRestore_ThrowawayNameAndExclusions(t *testing.T) {
 // whole server, so it would land in this backup silently.
 func TestMongoBackup_ClearsThrowawaysFirst(t *testing.T) {
 	var order []string
-	mock := ssh.NewMockExecutor("h",
+	mock := newStoreMock("h",
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
 		ssh.MockCommand{Match: "umask 077", Output: "/tmp/teploy-backup.abc123\n"},
 		ssh.MockCommand{Match: "docker exec 'myapp-db' sh -c", Output: "teploy_check_0123abcd\n"},
@@ -1302,7 +1302,7 @@ func TestMongoBackup_ClearsThrowawaysFirst(t *testing.T) {
 
 // A missing --database dump is found before anything stops.
 func TestResolveRestoreArtifact_ExtraDatabaseMustExist(t *testing.T) {
-	mock := ssh.NewMockExecutor("h", ssh.MockCommand{Match: "aws s3 ls", Err: errors.New("exit status 1")})
+	mock := newStoreMock("h", ssh.MockCommand{Match: "aws s3 ls", Err: errors.New("exit status 1")})
 	_, err := NewClient(mock, io.Discard).ResolveRestoreArtifact(context.Background(), "myapp", "db", "postgres:17", "20260101-000000", map[string]string{"PG_MAJOR": "17", "POSTGRES_DB": "appdb"}, S3Config{Bucket: "b", Region: "r"}, RestoreOptions{Database: "reports"})
 	if err == nil || !strings.Contains(err.Error(), "no backup") {
 		t.Fatalf("got %v", err)
@@ -1329,12 +1329,12 @@ func TestMySQLRestore_DryRunRefusesBeforeDrop(t *testing.T) {
 
 // Mongo: the archive is loaded into throwaway namespaces first.
 func TestMongoRestore_DryRunRefusesBeforeTouching(t *testing.T) {
-	mock := ssh.NewMockExecutor("h",
+	mock := newStoreMock("h",
 		ssh.MockCommand{Match: "docker exec -i 'myapp-db' mongorestore --archive --gzip --drop --nsExclude", Err: errors.New("exit status 1: Failed: corruption")},
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
 		ssh.MockCommand{Match: "aws s3 ls", Output: "2026-01-01 00:00:00 2048 20260101-000000.archive.gz\n"},
 		ssh.MockCommand{Match: "aws s3 cp", Output: ""},
-		ssh.MockCommand{Match: "mktemp -d '/tmp/teploy-restore.XXXXXX'", Output: "/tmp/teploy-restore.abc123\n"},
+		ssh.MockCommand{Match: "mktemp -d '/var/tmp/teploy-restore.XXXXXX'", Output: "/tmp/teploy-restore.abc123\n"},
 		ssh.MockCommand{Match: "gzip -t", Output: ""},
 		ssh.MockCommand{Match: "docker exec 'myapp-db' sh -c", Output: ""},
 		ssh.MockCommand{Match: "rm -", Output: ""},

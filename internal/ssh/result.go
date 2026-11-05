@@ -93,6 +93,13 @@ func RunInputDetailed(ctx context.Context, ex Executor, cmd string, stdin io.Rea
 	return runDetailedWithLimit(ctx, ex, cmd, stdin, DefaultResultLimit)
 }
 
+// RunDetailedLimit is RunDetailed with a caller-chosen capture limit, for the
+// few callers whose stdout is legitimately large (a bucket listing). Callers
+// must treat Truncated as a failure.
+func RunDetailedLimit(ctx context.Context, ex Executor, cmd string, limit int64) Result {
+	return runDetailedWithLimit(ctx, ex, cmd, nil, limit)
+}
+
 func runDetailedWithLimit(ctx context.Context, ex Executor, cmd string, stdin io.Reader, limit int64) Result {
 	switch v := ex.(type) {
 	case *RemoteExecutor:

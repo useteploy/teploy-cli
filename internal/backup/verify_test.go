@@ -11,7 +11,7 @@ import (
 )
 
 func TestLatestBackupDate_PicksNewest(t *testing.T) {
-	mock := ssh.NewMockExecutor("1.2.3.4",
+	mock := newStoreMock("1.2.3.4",
 		ssh.MockCommand{Match: "umask 077; mktemp -d", Output: "/var/tmp/teploy-verify.test\n"},
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
 		ssh.MockCommand{Match: "aws s3 ls", Output: "" +
@@ -33,7 +33,7 @@ func TestLatestBackupDate_PicksNewest(t *testing.T) {
 }
 
 func TestLatestBackupDate_NoBackups(t *testing.T) {
-	mock := ssh.NewMockExecutor("1.2.3.4",
+	mock := newStoreMock("1.2.3.4",
 		ssh.MockCommand{Match: "umask 077; mktemp -d", Output: "/var/tmp/teploy-verify.test\n"},
 		ssh.MockCommand{Match: "aws s3 ls", Output: "\n"},
 	)
@@ -49,7 +49,7 @@ func TestLatestBackupDate_NoBackups(t *testing.T) {
 // inspect (not config), the restore targets a SCRATCH container (never the
 // real accessory), the verify query runs, and teardown removes the scratch.
 func TestVerifyBackup_Postgres(t *testing.T) {
-	mock := ssh.NewMockExecutor("1.2.3.4",
+	mock := newStoreMock("1.2.3.4",
 		ssh.MockCommand{Match: "umask 077; mktemp -d", Output: "/var/tmp/teploy-verify.test\n"},
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
 		ssh.MockCommand{Match: "docker inspect -f '{{.Config.Image}}'", Output: "postgres:16\n"},
@@ -112,7 +112,7 @@ func TestVerifyBackup_Postgres(t *testing.T) {
 // TestVerifyBackup_FailureIsResultAndTearsDown asserts a failed restore
 // yields ok=false (not an operational error) and STILL removes the scratch.
 func TestVerifyBackup_FailureIsResultAndTearsDown(t *testing.T) {
-	mock := ssh.NewMockExecutor("1.2.3.4",
+	mock := newStoreMock("1.2.3.4",
 		ssh.MockCommand{Match: "umask 077; mktemp -d", Output: "/var/tmp/teploy-verify.test\n"},
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
 		ssh.MockCommand{Match: "docker inspect -f '{{.Config.Image}}'", Output: "postgres:16\n"},
@@ -151,7 +151,7 @@ func TestVerifyBackup_FailureIsResultAndTearsDown(t *testing.T) {
 // TestVerifyBackup_NucleusBootVerify covers the engine-boot verification for
 // nucleus accessories (generic tar + scratch engine on the restored data dir).
 func TestVerifyBackup_NucleusBootVerify(t *testing.T) {
-	mock := ssh.NewMockExecutor("1.2.3.4",
+	mock := newStoreMock("1.2.3.4",
 		ssh.MockCommand{Match: "umask 077; mktemp -d", Output: "/var/tmp/teploy-verify.test\n"},
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
 		ssh.MockCommand{Match: "docker inspect -f '{{.Config.Image}}'", Output: "ghcr.io/neutron-build/nucleus:latest\n"},
@@ -184,7 +184,8 @@ func TestVerifyBackup_NucleusBootVerify(t *testing.T) {
 // TestVerifyBackup_VolumeArchive covers the generic path: extraction is the
 // integrity check, and an empty archive fails.
 func TestVerifyBackup_VolumeArchive(t *testing.T) {
-	mock := ssh.NewMockExecutor("1.2.3.4",
+	mock := newStoreMock("1.2.3.4",
+		ssh.MockCommand{Match: "aws s3 ls", Output: "2026-07-10 04:00:01 4096 20260710-040000.tar.gz\n"},
 		ssh.MockCommand{Match: "umask 077; mktemp -d", Output: "/var/tmp/teploy-verify.test\n"},
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
 		ssh.MockCommand{Match: "docker inspect -f '{{.Config.Image}}'", Output: "some/custom-thing:1\n"},

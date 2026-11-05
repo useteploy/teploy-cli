@@ -62,6 +62,9 @@ func (c *Client) ReleaseRecovery(ctx context.Context, r RestoreRecovery) error {
 type AccessoryArtifact struct {
 	Key, Ext string
 	Engine   EngineDetection
+	// Loc is the location the object was found in (the current prefix or a
+	// previous one); its sidecars live beside it.
+	Loc S3Config
 	// FileRestore is true when the artifact is a file archive (.tar.gz):
 	// restoring it replaces files on disk, so the accessory container
 	// must be stopped first. Every backup a pre-G6 CLI took of a
@@ -97,12 +100,11 @@ func (c *Client) ResolveAccessoryArtifact(ctx context.Context, app, name, image,
 	if err != nil {
 		return AccessoryArtifact{}, err
 	}
-	prefix := fmt.Sprintf("s3://%s/%s/accessories/%s/", s3.Base(), app, name)
-	key, ext, err := c.resolveAccessoryKey(ctx, s3, prefix, date, artifactExts(det.Engine)...)
+	key, ext, loc, err := c.findObject(ctx, s3, app+"/accessories/"+name+"/", date, artifactExts(det.Engine)...)
 	if err != nil {
 		return AccessoryArtifact{}, err
 	}
-	return AccessoryArtifact{Key: key, Ext: ext, Engine: det, FileRestore: ext == ".tar.gz"}, nil
+	return AccessoryArtifact{Key: key, Ext: ext, Engine: det, Loc: loc, FileRestore: ext == ".tar.gz"}, nil
 }
 
 // AccessoryRestore restores an accessory backup and releases the recovery
@@ -134,14 +136,20 @@ type RestoreOptions struct {
 	// IgnoreSpaceCheck skips the free-space preflights: when the estimate
 	// is known to be wrong, or the disk is being recovered by this restore.
 	IgnoreSpaceCheck bool
-	// Database restores one extra database stored by backup_databases:
-	// instead of the accessory's primary (postgres only).
+	// Database restores one database with its own series (backup_databases:,
+	// policy-managed runs, adopted containers) instead of the primary.
 	Database string
+	// NoPreBackup skips the automatic backup the CLI takes before a restore.
+	NoPreBackup bool
 }
 
 // AccessoryRestoreWith is AccessoryRestoreKeep with options.
 func (c *Client) AccessoryRestoreWith(ctx context.Context, app, name, image, date string, env map[string]string, s3 S3Config, opts RestoreOptions) (RestoreRecovery, error) {
 	var none RestoreRecovery
+	// A wedged download or load must not keep the app down indefinitely; each
+	// engine's restore already says, on cancel, what state it left.
+	ctx, cancel := context.WithTimeout(ctx, c.backupDeadline())
+	defer cancel()
 	if err := c.ensureAWSCLI(ctx); err != nil {
 		return none, err
 	}
@@ -149,7 +157,7 @@ func (c *Client) AccessoryRestoreWith(ctx context.Context, app, name, image, dat
 	if err != nil {
 		return none, err
 	}
-	container := app + "-" + name
+	container := ContainerName(app, name)
 	if art.FileRestore {
 		out, _ := c.exec.Run(ctx, "docker inspect -f '{{.State.Running}}' "+ssh.ShellQuote(container)+" 2>/dev/null")
 		if strings.TrimSpace(out) == "true" {
@@ -160,7 +168,7 @@ func (c *Client) AccessoryRestoreWith(ctx context.Context, app, name, image, dat
 	// All restore scratch files live under one per-invocation temp dir
 	// (shared fixed names let concurrent or retried restores read each
 	// other's files). On failure it is kept and named; on success removed.
-	tmpOut, err := c.exec.Run(ctx, "mktemp -d "+ssh.ShellQuote("/tmp/teploy-restore.XXXXXX"))
+	tmpOut, err := c.exec.Run(ctx, "mktemp -d "+ssh.ShellQuote(backupTmpDir()+"/teploy-restore.XXXXXX"))
 	if err != nil {
 		return none, fmt.Errorf("creating restore temp dir: %w", err)
 	}
@@ -173,7 +181,7 @@ func (c *Client) AccessoryRestoreWith(ctx context.Context, app, name, image, dat
 	}
 	artifact := tmpdir + "/restore" + art.Ext
 	fmt.Fprintf(c.out, "Downloading %s...\n", art.Key)
-	if _, err := c.exec.Run(ctx, s3.AWS(fmt.Sprintf("s3 cp %s %s", ssh.ShellQuote(art.Key), ssh.ShellQuote(artifact)))); err != nil {
+	if err := c.fetch(ctx, art.Loc, art.Key, artifact); err != nil {
 		return fail(none, fmt.Errorf("downloading backup: %w", err))
 	}
 
@@ -193,8 +201,9 @@ func (c *Client) AccessoryRestoreWith(ctx context.Context, app, name, image, dat
 		pgOpts := pgRestoreOpts{ignoreSpace: opts.IgnoreSpaceCheck}
 		if opts.Database != "" && opts.Database != db {
 			db = opts.Database
+			pgOpts.logicalBytes = c.pgRecordedSize(ctx, art.Loc, app, name, db, date, tmpdir)
 		} else {
-			pgOpts.logicalBytes = c.pgRecordedSize(ctx, s3, app, name, date, tmpdir)
+			pgOpts.logicalBytes = c.pgRecordedSize(ctx, art.Loc, app, name, "", date, tmpdir)
 		}
 		rec, err = c.restorePostgres(ctx, newPGTarget(container, db, user, env), artifact, art.Ext, tmpdir, pgOpts)
 		if err != nil {
@@ -203,6 +212,9 @@ func (c *Client) AccessoryRestoreWith(ctx context.Context, app, name, image, dat
 
 	case art.Engine.Engine == EngineMySQL || art.Engine.Engine == EngineMariaDB:
 		m := mysqlTarget{engine: art.Engine.Engine, container: container, db: mysqlDB(app, env)}
+		if opts.Database != "" {
+			m.db = opts.Database
+		}
 		if pwd := mysqlRootPassword(env); pwd != "" {
 			if err := c.exec.Upload(ctx, strings.NewReader("MYSQL_PWD="+pwd+"\n"), credFile, "0600"); err != nil {
 				return fail(none, err)
@@ -277,29 +289,41 @@ func (c *Client) markRestoreCompleted(ctx context.Context, rec *RestoreRecovery)
 	}
 }
 
-// resolveExtraDatabase is the stored dump of a backup_databases: entry.
+// resolveExtraDatabase finds one database's object: its own series, or the
+// accessory's primary series when it is the primary database.
 func (c *Client) resolveExtraDatabase(ctx context.Context, app, name, image, date string, env map[string]string, s3 S3Config, db string) (AccessoryArtifact, error) {
 	if err := ValidateDate(date); err != nil {
 		return AccessoryArtifact{}, err
 	}
-	if !pgSafeDBName.MatchString(db) {
+	if !addressableDB(db) {
 		return AccessoryArtifact{}, fmt.Errorf("invalid database name %q", db)
 	}
 	det, err := c.ResolveEngine(ctx, app, name, image, env)
 	if err != nil {
 		return AccessoryArtifact{}, err
 	}
-	if det.Engine != EnginePostgres {
-		return AccessoryArtifact{}, fmt.Errorf("--database applies to postgres accessories; %s is %s", name, det.Engine)
+	var primary string
+	var exts []string
+	switch det.Engine {
+	case EnginePostgres:
+		primary, _ = postgresDBAndUser(app, env)
+		exts = []string{".pgdump"}
+	case EngineMySQL, EngineMariaDB:
+		primary = mysqlDB(app, env)
+		exts = []string{".sql.gz"}
+	default:
+		return AccessoryArtifact{}, fmt.Errorf("--database applies to postgres and mysql/mariadb accessories; %s is %s", name, det.Engine)
 	}
-	if primary, _ := postgresDBAndUser(app, env); db == primary {
-		return c.ResolveAccessoryArtifact(ctx, app, name, image, date, env, s3)
+	if db == primary && app != AdoptedApp {
+		if art, err := c.ResolveAccessoryArtifact(ctx, app, name, image, date, env, s3); err == nil {
+			return art, nil
+		}
 	}
-	key := pgExtraKey(s3, app, name, db, date)
-	if _, _, err := c.resolveAccessoryKey(ctx, s3, strings.TrimSuffix(key, date+".pgdump"), date, ".pgdump"); err != nil {
+	key, ext, loc, err := c.findObject(ctx, s3, app+"/accessories/"+name+"/databases/"+dbSegment(db)+"/", date, exts...)
+	if err != nil {
 		return AccessoryArtifact{}, err
 	}
-	return AccessoryArtifact{Key: key, Ext: ".pgdump", Engine: det}, nil
+	return AccessoryArtifact{Key: key, Ext: ext, Engine: det, Loc: loc}, nil
 }
 
 // ResolveRestoreArtifact is the artifact a restore with opts would use.
@@ -308,6 +332,11 @@ func (c *Client) resolveExtraDatabase(ctx context.Context, app, name, image, dat
 func (c *Client) ResolveRestoreArtifact(ctx context.Context, app, name, image, date string, env map[string]string, s3 S3Config, opts RestoreOptions) (AccessoryArtifact, error) {
 	if opts.Database != "" {
 		return c.resolveExtraDatabase(ctx, app, name, image, date, env, s3, opts.Database)
+	}
+	if app == AdoptedApp {
+		if det, err := c.ResolveEngine(ctx, app, name, image, env); err == nil && (det.Engine == EnginePostgres || det.Engine == EngineMySQL || det.Engine == EngineMariaDB) {
+			return AccessoryArtifact{}, fmt.Errorf("%s holds several databases, each with its own backups: name one with --database", name)
+		}
 	}
 	return c.ResolveAccessoryArtifact(ctx, app, name, image, date, env, s3)
 }
@@ -786,7 +815,7 @@ func (rc RecoveryCopies) All() []string {
 // scopes postgres copies to one database ("" means every database in the
 // cluster, as a `--database` restore keeps copies of its own).
 func (c *Client) FindRecoveryCopies(ctx context.Context, app, name, image, database string, env map[string]string) (RecoveryCopies, error) {
-	rc := RecoveryCopies{container: app + "-" + name}
+	rc := RecoveryCopies{container: ContainerName(app, name)}
 	det, err := c.ResolveEngine(ctx, app, name, image, env)
 	if err != nil {
 		return rc, err
@@ -993,6 +1022,62 @@ func (c *Client) RollbackRestore(ctx context.Context, plan RollbackPlan) (displa
 func mysqlEnvClient(engine, container, sql string, flags ...string) string {
 	client, _ := mysqlTools(engine)
 	return "docker exec " + ssh.ShellQuote(container) + " sh -c " + ssh.ShellQuote("MYSQL_PWD=${MARIADB_ROOT_PASSWORD:-${MYSQL_ROOT_PASSWORD:-${MYSQL_PASSWORD:-}}}; export MYSQL_PWD; exec "+client+" -u root "+strings.Join(flags, " ")+" -e "+ssh.ShellQuote(sql))
+}
+
+// mysqlDumpableDB is addressableDB minus what mysqldump itself mangles: it
+// backslash-escapes a quote in the schema name inside its own USE statement and
+// then fails with "Unknown database" (seen on mysql 8 and mariadb-dump). Such a
+// schema is reported as not backed up, loudly.
+func mysqlDumpableDB(db string) bool {
+	return addressableDB(db) && !strings.ContainsAny(db, `'\`)
+}
+
+// mysqlCoverage decides which of the server's schemas a backup with this listing
+// stores, the shape pgReadCoverage gives postgres. A schema it cannot hand to
+// the tools literally stays uncovered, whatever the listing says.
+func (c *Client) mysqlCoverage(ctx context.Context, engine, container, db string, listed []string) (pgCoverage, error) {
+	var cov pgCoverage
+	others, leftovers, err := c.mysqlReadCoverage(ctx, engine, container, db)
+	if err != nil {
+		return cov, err
+	}
+	cov.Throwaway = leftovers
+	all := false
+	want := map[string]bool{}
+	for _, l := range listed {
+		if l == "all" {
+			all = true
+		}
+		want[l] = true
+	}
+	for _, name := range others {
+		if (all || want[name]) && mysqlDumpableDB(name) {
+			cov.Extra = append(cov.Extra, name)
+		} else {
+			cov.Uncovered = append(cov.Uncovered, name)
+		}
+	}
+	if db != "" {
+		exists, err := c.mysqlSchemaExists(ctx, engine, container, db)
+		if err != nil {
+			return cov, err
+		}
+		cov.PrimaryMissing = !exists
+	}
+	for _, l := range listed {
+		if l != "all" && l != db && !slices.Contains(others, l) {
+			cov.Missing = append(cov.Missing, l)
+		}
+	}
+	return cov, nil
+}
+
+func (c *Client) mysqlSchemaExists(ctx context.Context, engine, container, db string) (bool, error) {
+	out, err := c.exec.Run(ctx, mysqlEnvClient(engine, container, "SELECT COUNT(*) FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = '"+strings.ReplaceAll(db, "'", "''")+"'", "-N", "-B"))
+	if err != nil {
+		return false, err
+	}
+	return strings.TrimSpace(out) != "0", nil
 }
 
 // mysqlReadCoverage lists the server's other schemas: the dump holds one, so
