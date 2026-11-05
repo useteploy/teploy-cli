@@ -4,6 +4,8 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [0.1.52] - 2026-11-05
+
 ### Added
 
 - Server backup policy: `teploy server backup-policy set/show/unset`, one cron
