@@ -157,13 +157,13 @@ func inspectSite(owner string, b SiteBlock) RouteSite {
 			continue
 		}
 		fields := strings.Fields(code)
-		net := braceNet(code)
+		delta := braceNet(code)
 		if len(fields) > 0 && !inWebhook {
 			switch {
 			case fields[0] == "reverse_proxy":
 				site.Upstreams = append(site.Upstreams, dialTokens(fields[1:])...)
-				if net > 0 {
-					inProxy, proxyDepth = true, depth+net
+				if delta > 0 {
+					inProxy, proxyDepth = true, depth+delta
 				}
 			case fields[0] == "to" && inProxy && depth == proxyDepth:
 				site.Upstreams = append(site.Upstreams, dialTokens(fields[1:])...)
@@ -175,7 +175,7 @@ func inspectSite(owner string, b SiteBlock) RouteSite {
 				}
 			}
 		}
-		depth += net
+		depth += delta
 		if inProxy && depth < proxyDepth {
 			inProxy = false
 		}

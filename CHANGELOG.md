@@ -4,6 +4,38 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+### Added
+
+- `teploy domains check [--server X] [--app A] [--log-window D] [--json]`: DNS
+  from fixed public resolvers, Caddy certificate failures and route health per
+  (server, app, host). Read-only; advertised as `domains-check-v1`. What cannot
+  be established reads `unknown`, never healthy.
+
+### Changed
+
+- Reserved names (RFC 2606/6761: example.com/.net/.org, *.example, .test,
+  .invalid, .localhost, localhost) are refused under caddy ingress unless
+  `tls.internal` or `tls.http_only` is set, and warned as label-only under host
+  and external ingress. **A `teploy.yml` with such a domain under caddy ingress
+  stops loading.**
+- Compose import no longer fabricates `<app>.example.com`; it asks for a domain.
+
+### Fixed
+
+- A deploy or rollback that leaves caddy ingress removes the managed Caddy block
+  the earlier release left, after the state commit, under the fence and a CAS on
+  the block's hash, and `teploy plan` shows it. Those blocks kept Caddy retrying
+  certificates for names nothing served. A failed deploy leaves the block alone.
+- Rollback from a host or external release to a caddy release works: it resolved
+  its route expectation against the wrong ingress and rendered an empty CAS.
+- A release record keeps `tls.http_only`, so a folderless rollback or a route
+  restore no longer re-renders an HTTP-only site with HTTPS.
+- State after a rollback names the target release's domain.
+- Multi-host domains pass the first-deploy DNS check (the comma list went to the
+  resolver as one name), `validate` no longer DNS-checks host-ingress apps that
+  `deploy` skips, addresses compare by value, and a Cloudflare answer is a note
+  rather than a mismatch.
+
 ## [0.1.50] - 2026-11-04
 
 ### Fixed
