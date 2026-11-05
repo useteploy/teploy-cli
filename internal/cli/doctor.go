@@ -22,6 +22,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/useteploy/teploy/internal/backup"
@@ -203,7 +204,7 @@ func doctorRun(ctx context.Context, deps doctorDeps, flags *Flags, serverName st
 
 	if executor == nil {
 		const sshDown = "restore SSH connectivity (see the ssh check above), then re-run teploy doctor"
-		for _, name := range []string{"docker", "disk", "registry", "caddy", "compatibility", "repair-debt", "secret-exposure", "server-tools", "config-home", "backup-cron", "age-identity", "git-trigger", "scheduler", "restore-leftovers", "backup-coverage"} {
+		for _, name := range []string{"docker", "disk", "registry", "caddy", "compatibility", "repair-debt", "secret-exposure", "server-tools", "config-home", "backup-cron", "age-identity", "git-trigger", "scheduler", "restore-leftovers", "backup-coverage", "backup-policy"} {
 			skipFail(name, "SSH unreachable", sshDown)
 		}
 	} else {
@@ -229,6 +230,7 @@ func doctorRun(ctx context.Context, deps doctorDeps, flags *Flags, serverName st
 		pgReports, pgErr := backup.NewClient(executor, io.Discard).AccessoryReports(ctx)
 		report.Checks = append(report.Checks, doctorRestoreLeftoversCheck(ctx, executor, pgReports))
 		report.Checks = append(report.Checks, doctorBackupCoverageCheck(pgReports, pgErr))
+		report.Checks = append(report.Checks, doctorBackupPolicyCheck(ctx, executor, time.Now().UTC()))
 	}
 
 	report.summarize()
@@ -972,9 +974,89 @@ func doctorBackupCoverageCheck(pg []backup.AccessoryReport, err error) doctorChe
 	if len(gaps) > 0 {
 		return doctorCheck{Name: "backup-coverage", Result: doctorWarn,
 			Detail:      "databases not covered by the accessory's backups: " + strings.Join(gaps, "; "),
-			Remediation: "postgres: list them in the accessory's backup_databases: in teploy.yml (\"all\" for every one) and recreate the accessory. mysql/mariadb: back each schema up as its own accessory until G5"}
+			Remediation: "postgres: list them in the accessory's backup_databases: in teploy.yml (\"all\" for every one) and recreate the accessory. mysql/mariadb: the same list, or \"all\". A server backup policy (teploy server backup-policy set) covers every database on its own"}
 	}
 	return doctorCheck{Name: "backup-coverage", Result: doctorOK, Detail: fmt.Sprintf("%d database accessory(ies): every database is covered", len(pg))}
+}
+
+// doctorBackupPolicyCheck reports what would make a server's backups fail or go
+// quiet: a policy with no target or no running job, no recovery key, stale runs,
+// no aws CLI (three production servers had none), no age, a killed run's
+// leftovers, and databases nothing backs up. It reads the same facts Dash does.
+func doctorBackupPolicyCheck(ctx context.Context, exec ssh.Executor, now time.Time) doctorCheck {
+	sctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancel()
+	st, err := backup.ReadFleetStatus(sctx, exec, now)
+	if err != nil {
+		return doctorCheck{Name: "backup-policy", Result: doctorWarn, Detail: "could not read the backup status: " + err.Error()}
+	}
+	cronBased := st.Policy.Configured
+	for _, e := range st.Entries {
+		cronBased = cronBased || e.Schedule == "own"
+	}
+	var fails, warns, remedies []string
+	if (cronBased || st.Target.Configured) && !st.AWSCLI {
+		fails = append(fails, "the aws CLI is missing, so every backup here fails")
+		remedies = append(remedies, backup.AWSCLIRemedy)
+	}
+	if st.Policy.Configured {
+		if !st.Target.Configured {
+			fails = append(fails, "the backup policy has no target, so every run fails")
+			remedies = append(remedies, "teploy server backup-target set --host <server> --bucket <bucket> --prefix <server>")
+		}
+		if st.Policy.Interval != "" && !st.Policy.CronInstalled {
+			fails = append(fails, "the backup policy's cron line is not installed, so no run happens")
+			remedies = append(remedies, "teploy server backup-policy set --host <server> --interval "+st.Policy.Interval)
+		}
+		if st.Policy.Recipient == "" {
+			warns = append(warns, "no recovery key is set, so backups are stored unencrypted and app .env files are left out of them")
+			remedies = append(remedies, "teploy backup keygen, then teploy server backup-policy set --host <server> --recipient <age1...>")
+		} else if !st.AgeCLI {
+			fails = append(fails, "the policy encrypts backups but age is not installed, so every backup is refused")
+			remedies = append(remedies, "teploy setup, or on the server: apt-get install age")
+		}
+		switch {
+		case st.Policy.Interval == "":
+		case st.LastRun == nil:
+			warns = append(warns, "the policy has never run")
+			remedies = append(remedies, "wait for its cron line, or run teploy backup run --all on the server")
+		case st.LastRun.Stale:
+			fails = append(fails, fmt.Sprintf("the last backup run was at %s, past twice the %s interval: cron is not running it", st.LastRun.At.Format(time.RFC3339), st.Policy.Interval))
+			remedies = append(remedies, "check the cron daemon and run teploy backup run --all on the server")
+		case st.LastRun.Status != backup.RunOK:
+			warns = append(warns, fmt.Sprintf("the last backup run ended %s (%d failed)", st.LastRun.Status, st.LastRun.TargetsFailed))
+			remedies = append(remedies, "teploy backup status --host <server> shows which target and why")
+		}
+		if st.Policy.HeartbeatCount == 0 {
+			warns = append(warns, "no heartbeat URL is set, so a job that stops running raises no alert")
+			remedies = append(remedies, "printf '<url>\\n' | teploy server backup-policy set --host <server> --heartbeat-stdin")
+		}
+	}
+	if st.Target.Configured && st.AWSCLI && !st.Target.Reachable {
+		fails = append(fails, "the backup target did not answer: "+st.Target.Error)
+		remedies = append(remedies, "check the bucket, endpoint and credentials (teploy server backup-target set)")
+	}
+	if len(st.LeftoverWorkspaces) > 0 {
+		warns = append(warns, "killed or kept backup operations left "+strings.Join(st.LeftoverWorkspaces, ", ")+" (dumps and possibly a credential file)")
+		remedies = append(remedies, "the next teploy backup run --all removes workspaces and identities; check a kept restore's files before removing them by hand, and docker rm -fv a verify scratch")
+	}
+	if len(st.LeftoverUploads) > 0 {
+		warns = append(warns, fmt.Sprintf("%d upload(s) a killed run never published are still in the bucket", len(st.LeftoverUploads)))
+		remedies = append(remedies, "the next teploy backup run --all removes them")
+	}
+	if st.Policy.Configured && len(st.UncoveredDatabases) > 0 {
+		warns = append(warns, "not backed up: "+strings.Join(st.UncoveredDatabases, ", "))
+		remedies = append(remedies, "teploy server backup-policy set --host <server> --adopt <container>[:<engine>[:all]], or --exclude it")
+	}
+	switch {
+	case len(fails) > 0:
+		return doctorCheck{Name: "backup-policy", Result: doctorFail, Detail: strings.Join(append(fails, warns...), "; "), Remediation: strings.Join(remedies, "; ")}
+	case len(warns) > 0:
+		return doctorCheck{Name: "backup-policy", Result: doctorWarn, Detail: strings.Join(warns, "; "), Remediation: strings.Join(remedies, "; ")}
+	case !st.Policy.Configured:
+		return doctorCheck{Name: "backup-policy", Result: doctorOK, Detail: "no backup policy on this server (teploy server backup-policy set covers every database with one cron line)"}
+	}
+	return doctorCheck{Name: "backup-policy", Result: doctorOK, Detail: fmt.Sprintf("%d target(s), %s, encrypted", len(st.Entries), st.LastRun.Status)}
 }
 
 // doctorAgeIdentityScript prints three facts about the age identity's

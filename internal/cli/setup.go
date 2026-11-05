@@ -696,6 +696,31 @@ func setupStages() []setupStage {
 			},
 		},
 		{
+			name:    "backup tools",
+			affects: "aws CLI (apt, else AWS's own bundle) and age (apt, if missing) — the backup transport and payload encryption; a failure here warns, since nothing but backups needs them",
+			run: func(ctx context.Context, exec ssh.Executor, w io.Writer, env *setupEnv) error {
+				fmt.Fprintln(w, "Checking aws CLI and age...")
+				if _, err := exec.Run(ctx, "command -v aws"); err == nil {
+					fmt.Fprintln(w, "  aws CLI already installed")
+				} else {
+					fmt.Fprintln(w, "  Installing the aws CLI...")
+					if out, err := exec.Run(ctx, env.sudo+"sh -c "+ssh.ShellQuote(backup.AWSCLIInstallScript)); err != nil {
+						// Three production servers had none and every backup failed
+						// at run time: say what backups will do and how to fix it.
+						fmt.Fprintf(w, "  Warning: installing the aws CLI failed (%v %s) — backups will fail until it is present: %s\n", err, strings.TrimSpace(out), backup.AWSCLIRemedy)
+					} else {
+						fmt.Fprintln(w, "  aws CLI installed")
+					}
+				}
+				if err := secret.NewManager(exec).EnsureAge(ctx); err != nil {
+					fmt.Fprintf(w, "  Warning: installing age failed (%v) — encrypted backups will be refused until it is present\n", err)
+				} else {
+					fmt.Fprintln(w, "  age present")
+				}
+				return nil
+			},
+		},
+		{
 			name:    "age identity location",
 			affects: "/etc/teploy (created 0700) — the age identity moves there from /deployments/.age-key when one exists; the move is verified by decrypting one secret before the old file is replaced by a public-key marker",
 			run: func(ctx context.Context, exec ssh.Executor, w io.Writer, env *setupEnv) error {

@@ -721,6 +721,8 @@ func TestSetupServer_InterruptedRunIsResumable(t *testing.T) {
 	// rsync, the teploy network, the directories, the Caddyfile, and a
 	// running modern caddy — everything the interrupted run got to.
 	phase2 := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "command -v aws", Output: "/usr/bin/aws"},
+		ssh.MockCommand{Match: "which age", Output: "/usr/bin/age"},
 		ssh.MockCommand{Match: "whoami", Output: "root"},
 		ssh.MockCommand{Match: "docker --version", Output: "Docker version 24.0.0"},
 		ssh.MockCommand{Match: "rsync --version", Output: "rsync  version 3.2.7"},
@@ -783,6 +785,8 @@ func TestSetupServer_ConnectionLossRecoversMidStage(t *testing.T) {
 		ssh.MockCommand{Match: "docker --version", Output: "Docker version 24.0.0"},
 		ssh.MockCommand{Match: "rsync --version", Output: "rsync  version 3.2.7"},
 		ssh.MockCommand{Match: "for t in git python3", Output: ""},
+		ssh.MockCommand{Match: "command -v aws", Output: "/usr/bin/aws"},
+		ssh.MockCommand{Match: "which age", Output: "/usr/bin/age"},
 		ssh.MockCommand{Match: "sched_daemon=no", Output: "daemon=yes\nenabled=enabled\ncrontab=yes\nteploy_entries=0\n"},
 		ssh.MockCommand{Match: "ufw status", Err: fmt.Errorf("exit status 1: ufw: command not found")},
 		ssh.MockCommand{Match: "systemctl is-active firewalld", Err: fmt.Errorf("exit status 3: inactive")},
@@ -886,9 +890,13 @@ func TestSetupCronDaemonStage(t *testing.T) {
 	}
 	t.Run("stopped and disabled gets enabled", func(t *testing.T) {
 		mock := ssh.NewMockExecutor("h",
+			ssh.MockCommand{Match: "command -v aws", Output: "/usr/bin/aws"},
+			ssh.MockCommand{Match: "which age", Output: "/usr/bin/age"},
 			ssh.MockCommand{Match: "sched_daemon=no", Output: "daemon=no\nenabled=disabled\ncrontab=yes\nteploy_entries=1\n", Once: true},
 			ssh.MockCommand{Match: "command -v systemctl", Output: "/usr/bin/systemctl"},
 			ssh.MockCommand{Match: "sudo sh -c 'systemctl enable --now cron", Output: ""},
+			ssh.MockCommand{Match: "command -v aws", Output: "/usr/bin/aws"},
+			ssh.MockCommand{Match: "which age", Output: "/usr/bin/age"},
 			ssh.MockCommand{Match: "sched_daemon=no", Output: "daemon=yes\nenabled=enabled\ncrontab=yes\nteploy_entries=1\n"},
 		)
 		var buf bytes.Buffer
@@ -900,7 +908,9 @@ func TestSetupCronDaemonStage(t *testing.T) {
 		}
 	})
 	t.Run("running is left alone", func(t *testing.T) {
-		mock := ssh.NewMockExecutor("h", ssh.MockCommand{Match: "sched_daemon=no", Output: "daemon=yes\nenabled=enabled\ncrontab=yes\nteploy_entries=0\n"})
+		mock := ssh.NewMockExecutor("h", ssh.MockCommand{Match: "command -v aws", Output: "/usr/bin/aws"},
+			ssh.MockCommand{Match: "which age", Output: "/usr/bin/age"},
+			ssh.MockCommand{Match: "sched_daemon=no", Output: "daemon=yes\nenabled=enabled\ncrontab=yes\nteploy_entries=0\n"})
 		var buf bytes.Buffer
 		if err := stage.run(context.Background(), mock, &buf, &setupEnv{}); err != nil {
 			t.Fatal(err)
@@ -910,7 +920,9 @@ func TestSetupCronDaemonStage(t *testing.T) {
 		}
 	})
 	t.Run("masked is reported, not unmasked", func(t *testing.T) {
-		mock := ssh.NewMockExecutor("h", ssh.MockCommand{Match: "sched_daemon=no", Output: "daemon=no\nenabled=masked\ncrontab=yes\nteploy_entries=0\n"})
+		mock := ssh.NewMockExecutor("h", ssh.MockCommand{Match: "command -v aws", Output: "/usr/bin/aws"},
+			ssh.MockCommand{Match: "which age", Output: "/usr/bin/age"},
+			ssh.MockCommand{Match: "sched_daemon=no", Output: "daemon=no\nenabled=masked\ncrontab=yes\nteploy_entries=0\n"})
 		var buf bytes.Buffer
 		if err := stage.run(context.Background(), mock, &buf, &setupEnv{}); err != nil {
 			t.Fatal(err)
