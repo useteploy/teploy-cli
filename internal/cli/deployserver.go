@@ -175,12 +175,15 @@ func deployServerConfigLocked(ctx context.Context, executor ssh.Executor, host, 
 	} else if err := ensureImage(ctx, docker.NewClient(executor), image, os.Stdout); err != nil {
 		return err
 	}
-	if !skipDNSCheck && appCfg.Domain != "" &&
-		appCfg.Ingress != config.IngressHost && appCfg.Ingress != config.IngressExternal {
+	if !skipDNSCheck && dnsCheckApplies(appCfg) {
 		if current, _ := state.Read(ctx, executor, app); current == nil {
 			fmt.Println("Validating DNS...")
-			if err := validateDomainDNS(ctx, executor, appCfg.Domain, host); err != nil {
+			notes, err := validateDomainDNS(ctx, executor, appCfg.Domain, host)
+			if err != nil {
 				return err
+			}
+			for _, note := range notes {
+				fmt.Printf("  Note: %s\n", note)
 			}
 			fmt.Println("  DNS validated")
 		}

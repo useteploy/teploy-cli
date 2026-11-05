@@ -136,6 +136,10 @@ func runAdHocDeploy(flags *Flags, serverName, appName, image, domain string, por
 		if err := config.ValidateDomain(domain, false); err != nil {
 			return refuseAdmission(err)
 		}
+		// Ad-hoc deploys are always caddy-routed and have no tls: settings.
+		if err := config.ValidateRoutableDomain(domain, false, false); err != nil {
+			return refuseAdmission(err)
+		}
 	}
 	if serverName == "" {
 		serverName = flags.Host
@@ -624,13 +628,16 @@ func deployAppConfig(flags *Flags, appCfg *config.AppConfig, serverName, image, 
 	// Skipped for host ingress (publishes a raw port, no domain) and for
 	// external ingress (the user's own front — Cloudflare Tunnel / nginx /
 	// ALB — serves the domain, so it resolves there, not to the server IP).
-	if !skipDNSCheck && appCfg.Domain != "" &&
-		appCfg.Ingress != config.IngressHost && appCfg.Ingress != config.IngressExternal {
+	if !skipDNSCheck && dnsCheckApplies(appCfg) {
 		current, _ := state.Read(ctx, executor, appCfg.App)
 		if current == nil {
 			fmt.Println("Validating DNS...")
-			if err := validateDomainDNS(ctx, executor, appCfg.Domain, host); err != nil {
+			notes, err := validateDomainDNS(ctx, executor, appCfg.Domain, host)
+			if err != nil {
 				return err
+			}
+			for _, note := range notes {
+				fmt.Printf("  Note: %s\n", note)
 			}
 			fmt.Println("  DNS validated")
 		}

@@ -1,12 +1,14 @@
 package cli
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/useteploy/teploy/internal/config"
+	"github.com/useteploy/teploy/internal/ssh"
 )
 
 // TestNonPublicDomainWarnings_PlainDomainNoWarning confirms the
@@ -143,5 +145,32 @@ func TestBuildPrereqCheck_ImageSkipsBuildCheck(t *testing.T) {
 	warns, errs := buildPrereqCheck(&config.AppConfig{Image: "registry.example.com/app:latest"})
 	if len(warns) != 0 || len(errs) != 0 {
 		t.Errorf("a pre-built image needs no build check, got warns=%v errs=%v", warns, errs)
+	}
+}
+
+func TestDNSCheckAppliesOnlyToCaddyRoutedDomains(t *testing.T) {
+	for _, tc := range []struct {
+		cfg  config.AppConfig
+		want bool
+	}{
+		{config.AppConfig{Domain: "a.dev"}, true},
+		{config.AppConfig{Domain: "a.dev", Ingress: config.IngressCaddy}, true},
+		{config.AppConfig{Domain: "a.dev", Ingress: config.IngressHost}, false},
+		{config.AppConfig{Domain: "a.dev", Ingress: config.IngressExternal}, false},
+		{config.AppConfig{}, false},
+	} {
+		if got := dnsCheckApplies(&tc.cfg); got != tc.want {
+			t.Errorf("dnsCheckApplies(%+v) = %v", tc.cfg, got)
+		}
+	}
+}
+
+// Every multi-host first deploy used to fail: the whole comma list went to the
+// resolver as one name.
+func TestValidateDomainDNS_ChecksEachHost(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4", ssh.MockCommand{Match: "hostname -I", Output: "127.0.0.1"})
+	_, err := validateDomainDNS(context.Background(), mock, "localhost, localhost", "127.0.0.1")
+	if err != nil {
+		t.Fatalf("both hosts resolve to the server: %v", err)
 	}
 }

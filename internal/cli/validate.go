@@ -65,6 +65,9 @@ func runValidate(flags *Flags) error {
 	// it here explicitly so that's a documented, expected outcome instead
 	// of a surprise discovered mid-deploy.
 	result.Warns = append(result.Warns, nonPublicDomainWarnings(appCfg)...)
+	if !appCfg.UsesCaddy() {
+		result.Warns = append(result.Warns, config.ReservedDomainLabelWarnings(appCfg.Domain, appCfg.Ingress)...)
+	}
 
 	// 3. Check server connectivity.
 	if appCfg.Server == "" && flags.Host == "" {
@@ -100,13 +103,13 @@ func runValidate(flags *Flags) error {
 					result.Errors = append(result.Errors, "Docker is not installed or not running on server")
 				}
 
-				// Check DNS. Skipped for ingress: external — the user's own
-				// front (Cloudflare Tunnel / nginx / ALB) serves the domain, so
-				// it legitimately resolves there, not to the server IP.
-				if appCfg.Domain != "" && appCfg.Ingress != config.IngressExternal {
-					if err := validateDomainDNS(ctx, executor, appCfg.Domain, host); err != nil {
+				// Check DNS with the rule deploy applies.
+				if dnsCheckApplies(appCfg) {
+					notes, err := validateDomainDNS(ctx, executor, appCfg.Domain, host)
+					if err != nil {
 						result.Warns = append(result.Warns, fmt.Sprintf("DNS: %v", err))
 					}
+					result.Warns = append(result.Warns, notes...)
 				}
 			}
 		}
