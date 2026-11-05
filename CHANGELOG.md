@@ -4,6 +4,8 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [0.1.50] - 2026-11-04
+
 ### Fixed
 
 - Accessory backups detect the database engine from the container (a
