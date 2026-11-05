@@ -23,7 +23,7 @@ untouched; the previous database is the recovery copy), database-level
 settings/ACLs re-applied, restore preflight (superuser or owner+CREATEDB,
 free space), verify restores as the accessory's own role, legacy .tar.gz
 of reclassified engines restore as files (artifact decides the stop),
-multi-database clusters refused, globals stored beside postgres dumps,
+globals stored beside postgres dumps,
 MySQL/Mongo safety dumps + recovery-incomplete classification, mysqldump
 --events, dragonfly rollback classification + trap cleanup, live-DB guard
 on generic tars, `engine:` accessory config, sidecar detection, scheduler
@@ -33,26 +33,43 @@ probe systemd fallback + severity split, restore-leftovers doctor check,
 extension, refused swap, database settings/ACL preserved with an open
 connection, legacy pgvector tarball, MySQL table created after backup.
 
+Second independent review (2026-11-04) kept the swap design and found the
+rest; fixed on the branch: MySQL/MariaDB and Mongo dry-run load before any
+DROP (MariaDB error 1118 repro), space preflight sizes the backup (recorded
+logical size, else artifact x 4 and at least live) with --ignore-space-check,
+a load or checkpoint that kills the server is recovery-incomplete, swap is one
+transaction and pg_database is re-read on any error, legacy .sql.gz keeps live
+database settings, multi-database clusters warn instead of refusing (backup.run
+detail, doctor backup-coverage, backup_databases: option, --database restore),
+leftovers excluded from coverage and listed by doctor, --release / --rollback,
+docker rm -fv on verify and DR scratches, the shell message that ran hostile
+POSTGRES_DB names removed, ICU provider/locale carried, DR bundles carry roles,
+real Bitnami images work (password from the container's env), warnings and
+recovery_database in the restore DTO, names truncated on rune boundaries.
+Integration matrix now includes mariadb:11 and mongo:7 against real containers.
+
 Open / deferred:
-- G5 (adopt unmanaged containers, multi-database clusters) and MySQL
-  one-object-per-database: not in this slice. A postgres cluster with
-  other databases now FAILS its backup (loudly) rather than omitting them.
-- Mongo restore (`--drop`) still leaves collections created after the
-  backup; Mongo is not in the integration matrix (unit tests only).
-- Bitnami images are detected but not integration tested; redis/valkey
-  restore and verify assume /data/dump.rdb.
-- DR bundles do not carry postgres globals; database-level settings are
-  re-applied at cutover from the archive.
+- G5 adoption of unmanaged containers and MySQL one-object-per-database: not
+  in this slice.
+- Mongo with auth (MONGO_INITDB_ROOT_USERNAME): mongodump/mongorestore run
+  without credentials, so backup fails loudly (Unauthorized). Pre-existing;
+  needs credentials via --config inside the container, not argv.
+- Mongo restore (--drop) leaves collections created after the backup.
+- verify-backup covers the primary database only, not backup_databases: dumps;
+  DR bundles carry the primary only (their manifest notes what is missing).
+- `backup list` shows one row per id; backup_databases: dumps have no rows of
+  their own.
+- Role password hashes are in the postgres globals sidecar and DR member,
+  unencrypted until G1 (the dump beside them is too).
+- Redis/valkey restore and verify assume /data/dump.rdb (Bitnami redis differs).
 - Dragonfly's pre-restore snapshot in /var/tmp has no free-space preflight
   (its size is the in-memory dataset).
-- A killed postgres restore can leave <db>_teploy_new_* / _teploy_old_*
-  databases; doctor cannot see inside engines, so only the /var/tmp
-  copies are reported.
+- A fenced lock on an app with no /deployments/<app> directory reports
+  "deploy is already in progress" (mkdir of .lock fails). Real accessories
+  have the directory; the message is misleading for anything else.
 - Trigger/autodeploy poll scheduling writes crontab without the scheduler
   refusal; doctor's scheduler check reports those lines.
-- Pre-existing, unrelated: `TestDRIntegration_BundleRoundTrip` expects the
-  restored state.json generation 2 and gets 3 (same on 666491f). The DR
-  fixture also needs a 022 umask and a tyler-owned /deployments on colima.
+- The DR fixture needs a 022 umask and a tyler-owned /deployments on colima.
 
 ## 2026-09-25 — local image identity
 

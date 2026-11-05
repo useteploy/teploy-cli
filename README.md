@@ -681,19 +681,28 @@ files:
 
 | Engine | Backup | In-place restore |
 |---|---|---|
-| postgres (incl. pgvector, timescale, postgis) | `pg_dump -Fc` (`.pgdump`) of the accessory's database, plus the cluster's roles (`pg_dumpall --globals-only`) beside it; a cluster holding other databases is refused rather than half backed up | loaded into a new database first; only a complete load is swapped in by rename, and the previous database is kept renamed until the app is healthy, then dropped. Database-level settings, ACLs and comments are re-applied. A failed load or a refused swap leaves the live database untouched. Needs a superuser, or the database owner with CREATEDB |
-| mysql / mariadb | `mysqldump --single-transaction --routines --triggers --events` | safety dump, `DROP`/`CREATE` the database (same charset), load; a failed load reloads the safety dump |
+| postgres (incl. pgvector, timescale, postgis) | `pg_dump -Fc` (`.pgdump`) of the accessory's database, with the cluster's roles (`pg_dumpall --globals-only`) and its size stored beside it. Other databases are covered by `backup_databases:` (names, or `all`); those not covered are warned about in the output, the `backup.run` event and `teploy doctor`, and the backup still runs | loaded into a new database first; only a complete load is swapped in, both renames in one transaction, and the previous database is kept renamed until the app is healthy, then dropped. Database-level settings, ACLs and comments are re-applied (from the live database for a legacy plain dump); collation provider and locale are kept. A failed load or a refused swap leaves the live database untouched. Needs a superuser, or the owner with CREATEDB, and room on the data volume for what the backup holds (`--ignore-space-check` overrides). `--database` restores one `backup_databases:` database |
+| mysql / mariadb | `mysqldump --single-transaction --routines --triggers --events` | the dump must first load into a throwaway `<db>_teploy_check` (a dump the server refuses is refused with the database untouched); then a safety dump, `DROP`/`CREATE` the database (same charset), load; a failed load reloads the safety dump |
 | redis / valkey | `BGSAVE`, wait for `LASTSAVE` to move, copy `dump.rdb` (refused when AOF is on) | stop, swap `dump.rdb`, start |
 | dragonfly | `SAVE RDB` (its `BGSAVE` writes `.dfs` files, not `dump.rdb`) | online: pre-restore `SAVE RDB`, `DFLY LOAD`, `SAVE` |
-| mongo | `mongodump --archive --gzip` | safety dump, `mongorestore --drop`; a failed restore reloads the safety dump |
+| mongo | `mongodump --archive --gzip` | the archive must first load into throwaway `teploy_check_*` databases; then a safety dump, `mongorestore --drop` (collections created after the backup survive); a failed restore reloads the safety dump |
 | nucleus, generic | tar of the accessory directory (crash-consistent); refused while the container runs when its files look like a database data directory | staged two-phase file promotion with the container stopped |
 
 Backups an older CLI took of an engine it did not recognise (pgvector,
 TimescaleDB, Valkey, Dragonfly, ...) are `.tar.gz` file copies: they still
 restore, as files with the accessory stopped, but `verify-backup` reports
 them as not verifiable as a database. A restore that cannot finish and
-cannot roll back stops with the app down and names what it kept;
-`teploy doctor` reports pre-restore copies left in `/var/tmp`.
+cannot roll back stops with the app down and names what it kept. A restore
+whose health check failed, or that was killed, leaves its recovery copies:
+
+```
+teploy backup restore --accessory db --app myapp --host prod --rollback --yes  # swap the kept previous postgres database back
+teploy backup restore --accessory db --app myapp --host prod --release --yes   # confirm: discard the kept copies
+```
+
+`teploy doctor` reports them (`restore-leftovers`: safety copies in `/var/tmp`
+and `<db>_teploy_old_*` / `_teploy_new_*` databases) and any database the
+backups do not cover (`backup-coverage`).
 
 A backup whose artifact is implausibly small (an empty dump from a wrong
 password) or structurally wrong fails instead of being stored.
