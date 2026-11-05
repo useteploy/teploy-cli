@@ -17,8 +17,9 @@ import (
 // The server backup policy (G4): /etc/teploy/backup-policy.json, read at run
 // time by the one cron line `teploy backup run --all`, so a database deployed
 // tomorrow is covered with no command. Mode 0600: heartbeat URLs carry tokens.
-// A non-root user that cannot write /etc/teploy falls back to
-// ~/.config/teploy/backup-policy.json, like the backup target.
+// A non-root user with passwordless sudo reads, writes and removes it through sudo,
+// so there is one policy; one with neither keeps its own in
+// ~/.config/teploy/backup-policy.json, and is refused if that would be shadowed.
 
 // Policy paths.
 const (
@@ -142,8 +143,12 @@ func (p FleetPolicy) Validate() error {
 		return fmt.Errorf("tmp_dir must be an absolute path of letters, digits and . _ - /")
 	}
 	if p.TargetDeadline != "" {
-		if d, err := time.ParseDuration(p.TargetDeadline); err != nil || d <= 0 {
+		d, err := time.ParseDuration(p.TargetDeadline)
+		if err != nil || d <= 0 {
 			return fmt.Errorf("target_deadline must be a positive duration such as 12h")
+		}
+		if d > MaxDeadline {
+			return fmt.Errorf("target_deadline %s is over the %s a whole run may last, so it would be capped silently", p.TargetDeadline, MaxDeadline)
 		}
 	}
 	for _, e := range p.Excludes {
@@ -265,25 +270,27 @@ func IntervalCron(interval, seed string) (string, error) {
 }
 
 // policyReadMarker starts readPolicyScript.
-const policyReadMarker = `if [ -d /etc/teploy ] && [ ! -x /etc/teploy ]; then`
+const policyReadMarker = `if [ -d /etc/teploy ] && { [ ! -x /etc/teploy ] || { [ -e /etc/teploy/backup-policy.json ] && [ ! -r /etc/teploy/backup-policy.json ]; }; }; then`
 
 // readPolicyScript prints "absent" or "path <p>\n<contents>", or exits 3 when it
 // cannot tell. Root keeps /etc/teploy 0700, and to a non-root user a file in there
 // does not even exist (`[ -e ]` is false): it read as "no policy", which cleared
-// the recipient and uploaded plaintext on a server configured to encrypt. So an
-// untraversable /etc/teploy is asked through passwordless sudo when that works
-// (deploy users usually have it, cron included); a user with its own policy in
-// ~/.config has made its choice; anyone else gets a refusal, never a guess.
+// the recipient and uploaded plaintext on a server configured to encrypt. So a
+// policy this user cannot see or read is asked through passwordless sudo when that
+// works (deploy users usually have it, cron included); a user with its own policy in
+// ~/.config has made its choice; anyone else gets a refusal, never a guess. A
+// file that is there and unreadable (/etc/teploy opened to 711: the file stays 0600)
+// is refused even then, by the loop below.
 const readPolicyScript = policyReadMarker + `
   if command -v sudo >/dev/null 2>&1 && s=$(sudo -n sh -c 'if [ -e /etc/teploy/backup-policy.json ]; then echo present; cat /etc/teploy/backup-policy.json; else echo absent; fi' 2>/dev/null); then
     case "$s" in present*) printf 'path /etc/teploy/backup-policy.json\n%s\n' "${s#present}"; exit 0;; esac
   elif [ ! -e "$HOME"/.config/teploy/backup-policy.json ]; then
-    echo "cannot tell whether this server's backups must be encrypted: /etc/teploy is not readable by $(id -un). Connect as root, give this user passwordless sudo, run on the server: chmod 711 /etc/teploy, or set this user's own policy (teploy server backup-policy set)" >&2
+    echo "cannot tell whether this server's backups must be encrypted: /etc/teploy is not readable by $(id -un). Connect as root, give this user passwordless sudo, or set this user's own policy (teploy server backup-policy set)" >&2
     exit 3
   fi
 fi
 for p in /etc/teploy/backup-policy.json "$HOME"/.config/teploy/backup-policy.json; do
-if [ -e "$p" ] && [ ! -r "$p" ]; then echo "cannot read $p: run as its owner" >&2; exit 3; fi
+if [ -e "$p" ] && [ ! -r "$p" ]; then echo "cannot read $p: connect as root, or give this user passwordless sudo" >&2; exit 3; fi
 if [ -r "$p" ]; then printf 'path %s\n' "$p"; cat "$p"; exit 0; fi
 done
 echo absent`
@@ -323,27 +330,43 @@ func ReadFleetPolicy(ctx context.Context, exec ssh.Executor) (FleetPolicy, error
 	return p, nil
 }
 
-const writeFleetPolicyScript = `d=
-if [ "$(id -u)" = 0 ]; then
-  mkdir -p /etc/teploy && chmod 700 /etc/teploy || exit 1
-  d=/etc/teploy/backup-policy.json
-elif [ -w /etc/teploy ] 2>/dev/null; then
-  d=/etc/teploy/backup-policy.json
-else
-  dir=${XDG_CONFIG_HOME:-$HOME/.config}/teploy
-  mkdir -p "$dir" && chmod 700 "$dir" || exit 1
-  d=$dir/backup-policy.json
-  echo fallback >&2
-fi
-umask 077
+// policyStoreScript stores stdin as the file $d, atomically at 0600. No single
+// quotes: it also runs inside `sudo sh -c '...'`.
+const policyStoreScript = `umask 077
 t=$(mktemp "$(dirname "$d")/.backup-policy.XXXXXXXX") || exit 1
 cat > "$t" || { rm -f -- "$t"; exit 1; }
 chmod 600 "$t" || { rm -f -- "$t"; exit 1; }
 mv -f -- "$t" "$d" || { rm -f -- "$t"; exit 1; }
-printf 'written %s\n' "$d"`
+printf "written %s\n" "$d"`
+
+// writeFleetPolicyScript writes where readPolicyScript will look first, so what set
+// stored is what show, the run and rotation see: /etc/teploy directly when this user
+// can, through passwordless sudo when it cannot. ~/.config is only for a user with
+// neither, and only when no policy in /etc would shadow it. A policy this user can
+// see and cannot replace is a refusal: a copy it never reads would look stored.
+const writeFleetPolicyScript = `e=/etc/teploy/backup-policy.json
+if [ "$(id -u)" = 0 ]; then
+  mkdir -p /etc/teploy && chmod 700 /etc/teploy || exit 1
+  d=$e
+elif [ -w /etc/teploy ] && [ -x /etc/teploy ]; then
+  d=$e
+elif [ -d /etc/teploy ] && command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+  exec sudo -n sh -c 'd=/etc/teploy/backup-policy.json
+` + policyStoreScript + `'
+elif [ -e "$e" ]; then
+  echo "$e exists and $(id -un) cannot replace it, so a policy stored anywhere else would never be read. Connect as root, or give this user passwordless sudo" >&2
+  exit 3
+else
+  dir=$HOME/.config/teploy
+  mkdir -p "$dir" && chmod 700 "$dir" || exit 1
+  d=$dir/backup-policy.json
+  echo fallback >&2
+fi
+` + policyStoreScript
 
 // WriteFleetPolicy stores the policy atomically at 0600 and returns the path and
-// whether the non-root fallback was used.
+// whether the non-root fallback was used. It reads the policy back through the path
+// every reader uses: a stored policy that is not the one in force is an error.
 func WriteFleetPolicy(ctx context.Context, exec ssh.Executor, p FleetPolicy) (string, bool, error) {
 	if err := p.Validate(); err != nil {
 		return "", false, err
@@ -364,12 +387,32 @@ func WriteFleetPolicy(ctx context.Context, exec ssh.Executor, p FleetPolicy) (st
 	if len(f) != 2 || f[0] != "written" {
 		return "", false, fmt.Errorf("writing the backup policy: unrecognized output framing")
 	}
+	back, err := ReadFleetPolicy(ctx, exec)
+	if err != nil {
+		return "", false, fmt.Errorf("the backup policy was written to %s but cannot be read back: %w", f[1], err)
+	}
+	if back.Path != f[1] {
+		return "", false, fmt.Errorf("the backup policy was written to %s but this server reads %s, so it is not in force", f[1], back.Path)
+	}
 	return f[1], strings.Contains(string(res.Stderr), "fallback"), nil
 }
 
-const unsetFleetPolicyScript = `for p in /etc/teploy/backup-policy.json "$HOME"/.config/teploy/backup-policy.json; do
-if [ -e "$p" ]; then rm -f -- "$p" || exit 1; echo "removed $p"; fi
-done`
+// unsetFleetPolicyScript removes what readPolicyScript would read. Exit 3: a policy
+// is, or may be, still in force and this user cannot remove it.
+const unsetFleetPolicyScript = `e=/etc/teploy/backup-policy.json
+h=$HOME/.config/teploy/backup-policy.json
+if [ "$(id -u)" != 0 ] && [ -d /etc/teploy ] && { [ ! -x /etc/teploy ] || { [ -e "$e" ] && [ ! -w /etc/teploy ]; }; }; then
+  if command -v sudo >/dev/null 2>&1 && r=$(sudo -n sh -c 'if [ -e /etc/teploy/backup-policy.json ]; then rm -f -- /etc/teploy/backup-policy.json && echo removed; else echo absent; fi' 2>/dev/null); then
+    if [ "$r" = removed ]; then echo "removed $e"; fi
+  elif [ -e "$e" ] || [ ! -e "$h" ]; then
+    echo "cannot remove the backup policy: $(id -un) cannot change /etc/teploy, so a policy there stays in force. Connect as root, or give this user passwordless sudo" >&2
+    exit 3
+  fi
+elif [ -e "$e" ]; then
+  rm -f -- "$e" || exit 1
+  echo "removed $e"
+fi
+if [ -e "$h" ]; then rm -f -- "$h" || exit 1; echo "removed $h"; fi`
 
 // UnsetFleetPolicy removes the policy file(s), returning what it removed.
 func UnsetFleetPolicy(ctx context.Context, exec ssh.Executor) ([]string, error) {

@@ -988,7 +988,7 @@ func doctorBackupPolicyCheck(ctx context.Context, exec ssh.Executor, now time.Ti
 	defer cancel()
 	st, err := backup.ReadFleetStatus(sctx, exec, now)
 	if errors.Is(err, backup.ErrPolicyHidden) {
-		return doctorCheck{Name: "backup-policy", Result: doctorFail, Detail: err.Error(), Remediation: "connect as root, give this user passwordless sudo, or run on the server: chmod 711 /etc/teploy. Until then every backup through this user is refused rather than risk plaintext"}
+		return doctorCheck{Name: "backup-policy", Result: doctorFail, Detail: err.Error(), Remediation: "connect as root, give this user passwordless sudo, or set this user's own policy (teploy server backup-policy set). Until then every backup through this user is refused rather than risk plaintext"}
 	}
 	if err != nil {
 		return doctorCheck{Name: "backup-policy", Result: doctorWarn, Detail: "could not read the backup status: " + err.Error()}
@@ -1000,6 +1000,10 @@ func doctorBackupPolicyCheck(ctx context.Context, exec ssh.Executor, now time.Ti
 	var fails, warns, remedies []string
 	if (cronBased || st.Target.Configured) && !st.AWSCLI {
 		fails = append(fails, "the aws CLI is missing, so every backup here fails")
+		remedies = append(remedies, backup.AWSCLIRemedy)
+	}
+	if (cronBased || st.Target.Configured) && st.AWSCLIProblem != "" {
+		fails = append(fails, st.AWSCLIProblem+", so every backup here fails")
 		remedies = append(remedies, backup.AWSCLIRemedy)
 	}
 	if st.Policy.Configured {
@@ -1051,6 +1055,18 @@ func doctorBackupPolicyCheck(ctx context.Context, exec ssh.Executor, now time.Ti
 	if st.Target.Configured && st.AWSCLI && !st.Target.Reachable {
 		fails = append(fails, "the backup target did not answer: "+st.Target.Error)
 		remedies = append(remedies, "check the bucket, endpoint and credentials (teploy server backup-target set)")
+	}
+	incoming := ".incoming/"
+	if st.Target.Prefix != "" {
+		incoming = st.Target.Prefix + "/.incoming/"
+	}
+	switch st.Target.IncomingLifecycle {
+	case backup.LifecycleAbsent:
+		warns = append(warns, "no lifecycle rule expires "+incoming+": on a store that keeps versions (B2 only hides on delete) every pending upload stays billed, about one extra copy of every backup")
+		remedies = append(remedies, "add a rule expiring "+incoming+" after 1 day, old versions included (README, backup target)")
+	case backup.LifecycleUnknown:
+		warns = append(warns, "could not read the bucket's lifecycle rules, so whether "+incoming+" expires is unknown")
+		remedies = append(remedies, "give the key s3:GetLifecycleConfiguration, or check by hand that a rule expires "+incoming+" after 1 day, old versions included (README, backup target)")
 	}
 	if len(st.LeftoverWorkspaces) > 0 {
 		warns = append(warns, "killed or kept backup operations left "+strings.Join(st.LeftoverWorkspaces, ", ")+" (dumps and possibly a credential file)")

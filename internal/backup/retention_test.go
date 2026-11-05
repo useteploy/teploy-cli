@@ -108,10 +108,10 @@ func TestPruneBackups(t *testing.T) {
 
 	var rmCalls int
 	for _, c := range mock.Calls {
-		if strings.HasPrefix(c, "aws s3 rm") {
+		if strings.HasPrefix(c, "aws s3 rm") && !strings.Contains(c, "/.clock-") {
 			rmCalls++
 		}
-		if strings.Contains(c, "20240103-000000") && strings.HasPrefix(c, "aws s3 rm") {
+		if strings.Contains(c, "20240103-000000") && strings.HasPrefix(c, "aws s3 rm") && !strings.Contains(c, "/.clock-") {
 			t.Errorf("newest backup must not be deleted: %s", c)
 		}
 	}

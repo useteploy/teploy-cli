@@ -268,6 +268,9 @@ func runBackupCreate(flags *Flags, appName, accessory, database string, adopted 
 	}
 
 	client := backup.NewClient(executor, backupProgressOut(flags))
+	if err := backup.ValidateDeadline(deadline); err != nil {
+		return err
+	}
 	client.SetDeadline(deadline)
 
 	var res backup.BackupResult
@@ -760,6 +763,9 @@ func runBackupRestoreWith(flags *Flags, appName, accessory string, adopted bool,
 
 	progress := backupProgressOut(flags)
 	client := backup.NewClient(executor, progress)
+	if err := backup.ValidateDeadline(restoreOpts.Deadline); err != nil {
+		return err
+	}
 	client.SetDeadline(restoreOpts.Deadline)
 	if err := applyAdoptedEngine(ctx, client, executor, appCfg.App, accessory); err != nil {
 		return err
@@ -1114,6 +1120,7 @@ func newBackupPruneCmd(flags *Flags) *cobra.Command {
 		maxAgeDays  int
 		gfs         backup.FleetRetention
 		ignoreClock bool
+		massDelete  bool
 	)
 
 	cmd := &cobra.Command{
@@ -1128,7 +1135,7 @@ func newBackupPruneCmd(flags *Flags) *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			gfs.KeepLast, gfs.MaxAgeDays = keepLast, maxAgeDays
 			policy := gfs.Policy()
-			policy.IgnoreClock = ignoreClock
+			policy.IgnoreClock, policy.AllowMassDelete = ignoreClock, massDelete
 			return runBackupPrune(flags, appName, adopted, &tf, accessory, policy)
 		},
 	}
@@ -1138,7 +1145,8 @@ func newBackupPruneCmd(flags *Flags) *cobra.Command {
 	cmd.Flags().IntVar(&gfs.KeepDaily, "keep-daily", 0, "keep the newest backup of the last N days that have one")
 	cmd.Flags().IntVar(&gfs.KeepWeekly, "keep-weekly", 0, "keep the newest backup of the last N ISO weeks that have one")
 	cmd.Flags().IntVar(&gfs.KeepMonthly, "keep-monthly", 0, "keep the newest backup of the last N months that have one")
-	cmd.Flags().BoolVar(&ignoreClock, "ignore-clock", false, "prune even though this machine's clock disagrees with the store's, or a backup is dated in the future")
+	cmd.Flags().BoolVar(&ignoreClock, "ignore-clock", false, "prune even though this machine's clock disagrees with the store's, or the store's cannot be read")
+	cmd.Flags().BoolVar(&massDelete, "allow-mass-delete", false, "let this one run delete most of a series, which is otherwise refused (after tightening retention on purpose)")
 	addBackupTargetFlags(cmd, &tf)
 	cmd.Flags().StringVar(&accessory, "accessory", "", "Prune an accessory's backups instead of volumes (accessory name)")
 	addRetentionFlags(cmd, &keepLast, &maxAgeDays)

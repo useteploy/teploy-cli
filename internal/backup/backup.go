@@ -801,7 +801,40 @@ func (c *Client) SetSchedule(ctx context.Context, schedule, command, marker stri
 
 // AWSCLIRemedy is the exact way to give a server the aws CLI. `teploy setup`
 // runs AWSCLIInstallScript; Ubuntu 24.04+ has no apt package for it.
-const AWSCLIRemedy = "run `teploy setup` against the server (it installs the distribution's package, else AWS's bundle with its signature checked), or on the server: apt-get install -y awscli, else AWS's installer as documented at https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html"
+const AWSCLIRemedy = "run `teploy setup` against the server (it installs the distribution's package if that is new enough, else AWS's bundle with its signature checked), or on the server: AWS's installer as documented at https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html"
+
+// The oldest aws CLIs teploy runs on: the first to send a checksum header on every
+// upload by default. A store with Object Lock (B2's included) refuses an upload with
+// neither that nor Content-MD5. --checksum-algorithm came earlier (2.18, 1.35); aws
+// CLI's own changelog, "default integrity protections".
+const (
+	awsCLIMinV2Minor = 23
+	awsCLIMinV1Minor = 37
+)
+
+var awsCLIMinimum = fmt.Sprintf("2.%d.0 (or 1.%d.0)", awsCLIMinV2Minor, awsCLIMinV1Minor)
+
+var awsVersionRE = regexp.MustCompile(`aws-cli/(\d+)\.(\d+)\.(\d+)`)
+
+// AWSCLIVersionProblem reads `aws --version` output and says what is wrong with it,
+// "" when nothing is, or when it is not a version (a wrapper): the first upload would
+// answer for that.
+func AWSCLIVersionProblem(versionOutput string) string {
+	m := awsVersionRE.FindStringSubmatch(versionOutput)
+	if m == nil {
+		return ""
+	}
+	major, _ := strconv.Atoi(m[1])
+	minor, _ := strconv.Atoi(m[2])
+	if (major == 2 && minor < awsCLIMinV2Minor) || (major == 1 && minor < awsCLIMinV1Minor) || major < 1 {
+		return fmt.Sprintf("aws CLI %s.%s.%s is older than %s, the first to send a checksum on every upload, which a bucket with Object Lock requires", m[1], m[2], m[3], awsCLIMinimum)
+	}
+	return ""
+}
+
+// awsCLIShellOK is a shell function: is the installed aws new enough. Same numbers
+// as above (a test holds them together).
+const awsCLIShellOK = `aws_ok() { v=$(aws --version 2>&1) || return 1; v=${v#aws-cli/}; v=${v%% *}; a=${v%%.*}; r=${v#*.}; b=${r%%.*}; case "$a" in 1) [ "$b" -ge 37 ];; 2) [ "$b" -ge 23 ];; *) [ "$a" -gt 2 ];; esac; }`
 
 // awsCLIKeyFingerprint and awsCLIPublicKey pin AWS's bundle signer, from
 // docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html (key
@@ -845,11 +878,16 @@ E91G7bb0hOb/cA==
 // against the pinned key first (TLS alone is not enough for that). python3 unpacks
 // it (unzip may be absent), which drops the file modes, so they are restored for
 // every user before installing: with u+x alone the installed aws runs for root and
-// "Permission denied"s for cron. Success is `aws --version` running, not `command
-// -v aws`: the glibc bundle on a musl host is present and cannot start.
+// "Permission denied"s for cron. Success is `aws --version` running at the minimum
+// version, not `command -v aws`: the glibc bundle on a musl host is present and cannot
+// start. A distribution package too old to use is removed, because cron's PATH would
+// find it before the bundle in /usr/local/bin.
 const AWSCLIInstallScript = `set -e
 export DEBIAN_FRONTEND=noninteractive
-if apt-get install -y -qq awscli >/dev/null 2>&1 && aws --version >/dev/null 2>&1; then exit 0; fi
+` + awsCLIShellOK + `
+if aws_ok; then exit 0; fi
+if apt-get install -y -qq awscli >/dev/null 2>&1 && aws_ok; then exit 0; fi
+apt-get remove -y -qq awscli >/dev/null 2>&1 || true
 command -v gpg >/dev/null 2>&1 || apt-get install -y -qq gnupg >/dev/null 2>&1 || { echo "gpg is needed to verify AWS's bundle" >&2; exit 1; }
 d=$(mktemp -d /tmp/teploy-awscli.XXXXXXXX)
 trap 'rm -rf "$d"' EXIT
@@ -864,12 +902,16 @@ gpg --batch --status-fd 1 --verify "$d/a.sig" "$d/a.zip" 2>/dev/null | grep -q "
 python3 -m zipfile -e "$d/a.zip" "$d/x"
 chmod -R 755 "$d/x/aws"
 "$d/x/aws/install" --update
-aws --version >/dev/null 2>&1 || { echo "AWS's bundle installed but does not run here (a musl libc?): install your distribution's aws-cli package" >&2; exit 1; }`
+aws_ok || { echo "AWS's bundle installed but does not run here (a musl libc?): install your distribution's aws-cli package, at least 2.23.0" >&2; exit 1; }`
 
 func (c *Client) ensureAWSCLI(ctx context.Context) error {
 	// That it runs, not only that it is there: a glibc bundle on a musl host is.
-	if _, err := c.exec.Run(ctx, "which aws >/dev/null && aws --version >/dev/null 2>&1"); err != nil {
+	out, err := c.exec.Run(ctx, "which aws >/dev/null && aws --version 2>&1")
+	if err != nil {
 		return fmt.Errorf("aws CLI not found or not runnable on server — %s", AWSCLIRemedy)
+	}
+	if problem := AWSCLIVersionProblem(out); problem != "" {
+		return fmt.Errorf("%s — %s", problem, AWSCLIRemedy)
 	}
 	return nil
 }

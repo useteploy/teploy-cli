@@ -45,33 +45,36 @@ var listedIDRE = regexp.MustCompile(`^([0-9]{8}-[0-9]{6}(?:-[0-9a-f]{16})?)\.(ta
 // ListBackupsRecursive lists every object under s3://<base>/<app>/ in one
 // recursive call per location (current prefix, then any previous one) and
 // classifies each by its key layout. Objects whose name does not match the
-// CLI's naming (strays, pending uploads) are skipped, and so are objects below
-// their engine's plausibility floor: neither is a backup anyone should choose.
+// CLI's naming (strays) are skipped, and so are objects below their engine's
+// plausibility floor: neither is a backup anyone should choose. A previous location
+// that does not answer is a warning: it must not make the current one unreadable.
 func (c *Client) ListBackupsRecursive(ctx context.Context, app string, s3 S3Config) ([]ListedBackup, error) {
-	rows, _, err := c.listBackupsAndPending(ctx, app, s3)
+	rows, warnings, err := c.listBackups(ctx, app, s3)
+	for _, w := range warnings {
+		fmt.Fprintf(c.out, "Warning: %s\n", w)
+	}
 	return rows, err
 }
 
-// listBackupsAndPending is ListBackupsRecursive plus the bucket-relative keys of
-// verification-pending uploads, which status and doctor report.
-func (c *Client) listBackupsAndPending(ctx context.Context, app string, s3 S3Config) ([]ListedBackup, []string, error) {
+// listBackups is ListBackupsRecursive, handing the warnings back.
+func (c *Client) listBackups(ctx context.Context, app string, s3 S3Config) ([]ListedBackup, []string, error) {
 	if err := c.ensureAWSCLI(ctx); err != nil {
 		return nil, nil, err
 	}
 	var rows []ListedBackup
-	var pending []string
+	var warnings []string
 	for _, loc := range s3.locations() {
 		keys, err := c.listTree(ctx, loc, app+"/")
 		if err != nil {
-			return nil, nil, fmt.Errorf("listing backups: %w", err)
+			if loc.isPrevious {
+				warnings = append(warnings, fmt.Sprintf("previous prefix %s did not answer, so its backups are not listed: %s", loc.Prefix, oneLine(err.Error())))
+				continue
+			}
+			return nil, warnings, fmt.Errorf("listing backups: %w", err)
 		}
 		for _, k := range keys {
 			rel, ok := loc.relToBase(k.Key)
 			if !ok {
-				continue
-			}
-			if strings.Contains(rel, "/"+incomingDir+"/") {
-				pending = append(pending, k.Key)
 				continue
 			}
 			row, ok := classifyListedKey(app, rel)
@@ -95,7 +98,7 @@ func (c *Client) listBackupsAndPending(ctx context.Context, app string, s3 S3Con
 		}
 		return rows[i].Key < rows[j].Key
 	})
-	return rows, pending, nil
+	return rows, warnings, nil
 }
 
 // classifyListedKey maps one key relative to the base (the bucket root, or the

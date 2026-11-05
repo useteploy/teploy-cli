@@ -29,7 +29,7 @@ import (
 
 // fleetRunDeadline bounds a whole `backup run --all`; each target has its own
 // backup.BackupDeadline inside it. A holder older than this plus an hour is stuck.
-const fleetRunDeadline = 23 * time.Hour
+const fleetRunDeadline = backup.MaxDeadline
 
 // serverToolPaths are directories cron's minimal PATH leaves out, where aws
 // (the AWS installer's symlink) and age may live.
@@ -169,6 +169,9 @@ func runFleet(ctx context.Context, exec ssh.Executor, out io.Writer, ignoreSpace
 	// nothing yet says so.
 	if len(targets) == 0 && !policy.AllowEmpty {
 		return finishFleet(ctx, exec, out, res, policy, started, fmt.Errorf("the policy found nothing to back up on this server: no accessory, app volume or adopted container. If that is right, set allow_empty (teploy server backup-policy set --allow-empty)"), hc)
+	}
+	if len(targets) > 0 && policy.AllowEmpty {
+		res.Warnings = append(res.Warnings, fmt.Sprintf("allow_empty is set and this server has %d target(s): if they all disappear, a run reports ok instead of failing (teploy server backup-policy set --allow-empty=false)", len(targets)))
 	}
 
 	// A killed run's leftovers, now that this run owns the lock. Bounded: a wedged
@@ -356,7 +359,8 @@ func newServerBackupPolicyCmd(flags *Flags) *cobra.Command {
 		Use:   "backup-policy",
 		Short: "Manage the server's backup policy (the fleet engine's one cron line)",
 		Long: "One policy per server, at /etc/teploy/backup-policy.json (0600; a non-root\n" +
-			"user who cannot write /etc/teploy gets ~/.config/teploy/backup-policy.json).\n" +
+			"user goes through passwordless sudo, and one with neither write access nor sudo\n" +
+			"keeps ~/.config/teploy/backup-policy.json unless a policy in /etc would shadow it).\n" +
 			"A single cron line runs `teploy backup run --all`, which works out at run\n" +
 			"time what to back up: every labelled accessory (each of its databases), app\n" +
 			"volumes when enabled, and adopted containers. A per-app schedule stays as an\n" +
@@ -826,12 +830,14 @@ func newServerBackupPolicyUnsetCmd(flags *Flags) *cobra.Command {
 				return err
 			}
 			defer executor.Close()
-			// Cron first: a line with no policy behind it would fail every interval.
-			if err := backup.NewClient(executor, io.Discard).RemoveSchedule(ctx, backup.FleetCronMarker); err != nil {
-				return err
-			}
+			// The policy first: it can refuse (a policy this user cannot remove stays in
+			// force), and that must not leave it in force with no line running it. A line
+			// left behind by a failure below fails loudly every interval instead.
 			removed, err := backup.UnsetFleetPolicy(ctx, executor)
 			if err != nil {
+				return err
+			}
+			if err := backup.NewClient(executor, io.Discard).RemoveSchedule(ctx, backup.FleetCronMarker); err != nil {
 				return err
 			}
 			if len(removed) == 0 {

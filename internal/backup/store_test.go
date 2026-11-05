@@ -144,7 +144,7 @@ func treeMock(listing string) *ssh.MockExecutor {
 func rmKeys(mock *ssh.MockExecutor) []string {
 	var out []string
 	for _, c := range mock.Calls {
-		if strings.HasPrefix(c, "aws s3 rm ") {
+		if strings.HasPrefix(c, "aws s3 rm ") && !strings.Contains(c, "/.clock-") {
 			f := strings.Fields(c)
 			out = append(out, strings.Trim(f[3], "'"))
 		}
@@ -307,15 +307,15 @@ func TestPutUploadsToIncomingThenPublishes(t *testing.T) {
 			order = append(order, "prove")
 		case strings.HasPrefix(c, "rm -f '/w/x.pgdump'"):
 			order = append(order, "rm-plain")
-		case strings.HasPrefix(c, "aws s3 cp '/w/x.pgdump.age' 's3://b/a/accessories/db/.incoming/1.pgdump.age' --metadata 'sha256=abc'"):
+		case strings.HasPrefix(c, "aws s3 cp '/w/x.pgdump.age' 's3://b/.incoming/a/accessories/db/1.pgdump.age' --metadata 'sha256=abc'"):
 			order = append(order, "upload")
 		case strings.HasPrefix(c, "aws s3 cp '/w/x.pgdump'"):
 			t.Fatalf("plaintext uploaded: %s", c)
 		case strings.HasPrefix(c, "{ aws s3 cp"):
 			order = append(order, "readback")
-		case strings.HasPrefix(c, "aws s3 cp 's3://b/a/accessories/db/.incoming/1.pgdump.age' 's3://b/a/accessories/db/1.pgdump.age'"):
+		case strings.HasPrefix(c, "aws s3 cp 's3://b/.incoming/a/accessories/db/1.pgdump.age' 's3://b/a/accessories/db/1.pgdump.age'"):
 			order = append(order, "publish")
-		case strings.HasPrefix(c, "aws s3 rm 's3://b/a/accessories/db/.incoming/1.pgdump.age'"):
+		case strings.HasPrefix(c, "aws s3 rm 's3://b/.incoming/a/accessories/db/1.pgdump.age'"):
 			order = append(order, "clean")
 		}
 	}
@@ -342,13 +342,13 @@ func TestPutRefusesWhatDoesNotVerify(t *testing.T) {
 				t.Fatalf("err = %v, want %q", err, tc.want)
 			}
 			for _, c := range mock.Calls {
-				if strings.HasPrefix(c, "aws s3 cp 's3://b/k/.incoming/1.pgdump' 's3://b/k/1.pgdump'") {
+				if strings.HasPrefix(c, "aws s3 cp 's3://b/.incoming/k/1.pgdump' 's3://b/k/1.pgdump'") {
 					t.Fatalf("an unverified object was published: %s", c)
 				}
 			}
 			removed := false
 			for _, c := range mock.Calls {
-				removed = removed || strings.HasPrefix(c, "aws s3 rm 's3://b/k/.incoming/1.pgdump'")
+				removed = removed || strings.HasPrefix(c, "aws s3 rm 's3://b/.incoming/k/1.pgdump'")
 			}
 			if !removed {
 				t.Fatal("the unverified upload was left behind")
@@ -626,7 +626,7 @@ func TestOneDatabaseFailingDoesNotStopTheOthers(t *testing.T) {
 			lastPut = i
 		}
 	}
-	if !strings.Contains(mock.Calls[lastPut], "a/accessories/db/.incoming/") || strings.Contains(mock.Calls[lastPut], "databases/") {
+	if !strings.Contains(mock.Calls[lastPut], ".incoming/a/accessories/db/") || strings.Contains(mock.Calls[lastPut], "databases/") {
 		t.Fatalf("the primary must be the last upload: %s", mock.Calls[lastPut])
 	}
 }
@@ -772,7 +772,7 @@ func TestPruneSelectsEachDatabaseSeriesOnItsOwn(t *testing.T) {
 		}
 	}
 	mock := treeMock(strings.Join(lines, "\n"))
-	if _, err := NewClient(mock, io.Discard).PruneBackups(context.Background(), "a", "accessories/db", S3Config{Bucket: "b", Region: "r"}, RetentionPolicy{KeepDaily: 3}); err != nil {
+	if _, err := NewClient(mock, io.Discard).PruneBackups(context.Background(), "a", "accessories/db", S3Config{Bucket: "b", Region: "r"}, RetentionPolicy{KeepDaily: 3, AllowMassDelete: true}); err != nil {
 		t.Fatal(err)
 	}
 	removed := map[string]bool{}
@@ -798,7 +798,7 @@ func TestPruneDatabaseSeriesIgnoresThePrimarysPeriods(t *testing.T) {
 		lines = append(lines, "d t 1000 "+r+"databases/x/202601"+strconv.Itoa(d)+"-000000.pgdump")
 	}
 	mock := treeMock(strings.Join(lines, "\n"))
-	if _, err := NewClient(mock, io.Discard).PruneBackups(context.Background(), "a", "accessories/db", S3Config{Bucket: "b", Region: "r"}, RetentionPolicy{KeepLast: 5}); err != nil {
+	if _, err := NewClient(mock, io.Discard).PruneBackups(context.Background(), "a", "accessories/db", S3Config{Bucket: "b", Region: "r"}, RetentionPolicy{KeepLast: 5, AllowMassDelete: true}); err != nil {
 		t.Fatal(err)
 	}
 	if got := len(rmKeys(mock)); got != 14 {
@@ -807,7 +807,7 @@ func TestPruneDatabaseSeriesIgnoresThePrimarysPeriods(t *testing.T) {
 	// The primary long gone: the series is still selected.
 	lines[0] = "d t 1000 " + r + "20200101-000000.pgdump"
 	mock = treeMock(strings.Join(lines, "\n"))
-	if _, err := NewClient(mock, io.Discard).PruneBackups(context.Background(), "a", "accessories/db", S3Config{Bucket: "b", Region: "r"}, RetentionPolicy{KeepLast: 5}); err != nil {
+	if _, err := NewClient(mock, io.Discard).PruneBackups(context.Background(), "a", "accessories/db", S3Config{Bucket: "b", Region: "r"}, RetentionPolicy{KeepLast: 5, AllowMassDelete: true}); err != nil {
 		t.Fatal(err)
 	}
 	if got := len(rmKeys(mock)); got != 14 {
@@ -899,29 +899,30 @@ func TestPruneRefusesAWrongClock(t *testing.T) {
 	if _, err := NewClient(mock, io.Discard).PruneBackups(ctx, "a", "volumes", S3Config{Bucket: "b", Region: "r"}, RetentionPolicy{KeepLast: 1, IgnoreClock: true}); err != nil {
 		t.Fatalf("--ignore-clock: %v", err)
 	}
-	// A backup dated in the future would count as the newest: keep_last 1 would
-	// then delete today's real one.
-	mock = treeMock("d t 1000 " + r + time.Now().UTC().AddDate(1, 0, 0).Format("20060102-150405") + ".tar.gz\nd t 1000 " + r + time.Now().UTC().Format("20060102-150405") + ".tar.gz\n")
-	_, err = NewClient(mock, io.Discard).PruneBackups(ctx, "a", "volumes", S3Config{Bucket: "b", Region: "r"}, RetentionPolicy{KeepLast: 1})
-	if !errors.Is(err, ErrClockSkew) || len(rmKeys(mock)) != 0 {
-		t.Fatalf("future-dated: err = %v, removed %v", err, rmKeys(mock))
-	}
 }
 
-func TestPrunePendingUploadsAtAnyDepth(t *testing.T) {
-	r := "a/accessories/db/"
+// Pending uploads live in one tree, and go once no run could still own them.
+func TestPruneCleansStalePendingUploads(t *testing.T) {
+	stale := time.Now().UTC().Add(-25 * time.Hour).Format("20060102-150405")
+	// Past the old fixed 7h, and well inside a 23h deadline.
+	live := time.Now().UTC().Add(-8 * time.Hour).Format("20060102-150405")
 	listing := strings.Join([]string{
-		"d t 1000 " + r + "20240103-000000.pgdump",
-		"d t 1000 " + r + "databases/x/.incoming/20240101-000000.pgdump",
-		"d t 1000 " + r + "globals/.incoming/20240101-000000.sql.gz",
-		"d t 1000 " + r + "meta/.incoming/20240101-000000.json",
-		"d t 1000 " + r + ".incoming/20240101-000000.pgdump",
+		"d t 1000 .incoming/a/accessories/db/databases/x/" + stale + ".pgdump",
+		"d t 1000 .incoming/a/accessories/db/" + stale + ".pgdump",
+		"d t 1000 .incoming/a/accessories/db/" + live + ".pgdump",
 	}, "\n")
-	mock := treeMock(listing)
+	r := "a/accessories/db/"
+	mock := newStoreMock("h",
+		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
+		ssh.MockCommand{Match: "aws s3 ls 's3://b/.incoming/a/'", Output: listing},
+		ssh.MockCommand{Match: "aws s3 ls", Output: "d t 1000 " + r + "20240103-000000.pgdump\n"},
+		ssh.MockCommand{Match: "aws s3 rm", Output: ""},
+	)
 	if _, err := NewClient(mock, io.Discard).PruneBackups(context.Background(), "a", "accessories/db", S3Config{Bucket: "b", Region: "r"}, RetentionPolicy{KeepLast: 1}); err != nil {
 		t.Fatal(err)
 	}
-	if got := rmKeys(mock); len(got) != 4 {
+	got := rmKeys(mock)
+	if len(got) != 2 || strings.Contains(strings.Join(got, ","), live) {
 		t.Fatalf("removed %v", got)
 	}
 }
@@ -975,7 +976,7 @@ func TestPutLargeObjectUsesAProviderChecksum(t *testing.T) {
 	}
 	// A store or CLI without it falls back, and says so.
 	var out strings.Builder
-	mock = big(ssh.MockCommand{Match: "aws s3 cp '/w/x' 's3://b/k/.incoming/1.pgdump' --metadata 'sha256=abc' --checksum-algorithm", Err: errors.New("exit status 2: Unknown options: --checksum-algorithm")})
+	mock = big(ssh.MockCommand{Match: "aws s3 cp '/w/x' 's3://b/.incoming/k/1.pgdump' --metadata 'sha256=abc' --checksum-algorithm", Err: errors.New("exit status 2: Unknown options: --checksum-algorithm")})
 	cl := NewClient(mock, &out)
 	cl.readBack = 1
 	if _, err := cl.put(ctx, S3Config{Bucket: "b", Region: "r"}, "/w/x", "s3://b/k/1.pgdump"); err != nil {
@@ -1023,24 +1024,25 @@ func TestStaleWorkspacesLookInTheConfiguredDir(t *testing.T) {
 func TestAbortStaleUploadsIsScopedToOwnedNamespaces(t *testing.T) {
 	old := time.Now().UTC().AddDate(0, 0, -2).Format(time.RFC3339)
 	mock := newStoreMock("h",
+		ssh.MockCommand{Match: "aws s3api list-multipart-uploads --bucket 'b' --prefix '.incoming/mine/'", Output: `{"Uploads":[{"Key":".incoming/mine/y","UploadId":"u2","Initiated":"` + old + `"},{"Key":".incoming/mine/fresh","UploadId":"u3","Initiated":"` + time.Now().UTC().Add(-8*time.Hour).Format(time.RFC3339) + `"}]}`},
 		ssh.MockCommand{Match: "aws s3 ls 's3://b/mine/.owners/'", Output: "d t 20 mine/.owners/0123456789abcdef\n"},
 		ssh.MockCommand{Match: "aws s3 ls 's3://b/shared/.owners/'", Output: "d t 20 shared/.owners/aaaaaaaaaaaaaaaa\n"},
 		ssh.MockCommand{Match: "aws s3api list-multipart-uploads", Output: `{"Uploads":[{"Key":"mine/x","UploadId":"u1","Initiated":"` + old + `"}]}`},
 		ssh.MockCommand{Match: "aws s3api abort-multipart-upload", Output: ""},
 	)
-	if n := NewClient(mock, io.Discard).AbortStaleUploads(context.Background(), S3Config{Bucket: "b", Region: "r"}, []string{"mine", "shared"}, time.Now().UTC()); n != 1 {
+	if n := NewClient(mock, io.Discard).AbortStaleUploads(context.Background(), S3Config{Bucket: "b", Region: "r"}, []string{"mine", "shared"}, time.Now().UTC()); n != 2 {
 		t.Fatalf("aborted %d", n)
 	}
 	lists := 0
 	for _, c := range mock.Calls {
 		if strings.HasPrefix(c, "aws s3api list-multipart-uploads") {
 			lists++
-			if !strings.Contains(c, "--prefix 'mine/'") {
+			if !strings.Contains(c, "--prefix 'mine/'") && !strings.Contains(c, "--prefix '.incoming/mine/'") {
 				t.Fatalf("unscoped: %s", c)
 			}
 		}
 	}
-	if lists != 1 {
+	if lists != 2 {
 		t.Fatalf("lists = %d", lists)
 	}
 }

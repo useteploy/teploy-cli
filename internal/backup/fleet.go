@@ -450,15 +450,15 @@ func (c *Client) RunFleetTarget(ctx context.Context, t FleetTarget, s3 S3Config,
 		default:
 			for _, row := range rows {
 				if row.Accessory == t.Name && row.Restorable {
-					r.Status, r.Reason = TargetFailed, "this target has earlier backups and now holds nothing to back up: its databases are gone. Nothing was pruned"
+					r.Status, r.Reason = TargetFailed, "this target has earlier backups and now holds nothing to back up: its databases are gone. Nothing was pruned. If it is meant to be empty: teploy server backup-policy set --exclude "+excludeName(t)
 					break
 				}
 			}
 		}
 		return r
 	}
-	c.CleanStaleIncoming(ctx, t.App, s3)
 	if t.Retention.IsZero() {
+		c.CleanStaleIncoming(ctx, t.App, s3)
 		return r
 	}
 	deleted, perr := c.PruneBackups(ctx, t.App, prefix, s3, t.Retention)
@@ -599,13 +599,34 @@ func (c *Client) ProbeTarget(ctx context.Context, s3 S3Config) error {
 	return err
 }
 
-// RunLockPath is where the overlap lock lives: beside the policy.
+// excludeName is how `--exclude` names a target.
+func excludeName(t FleetTarget) string {
+	switch {
+	case t.Kind == TargetVolumes:
+		return t.App + "/volumes"
+	case t.App == AdoptedApp || t.App == "":
+		return t.Container
+	}
+	return t.App + "/" + t.Name
+}
+
+// RunLockPath is where the overlap lock lives: beside the policy when this user can
+// write there, else in its own config. A policy read through sudo sits in a
+// directory the run itself cannot touch, and a cron line failing on its lock is
+// every backup failing.
 func RunLockPath(policyPath string) string {
 	if policyPath != "" {
-		return path.Dir(policyPath) + "/backup-run.lock"
+		p := path.Dir(policyPath) + "/backup-run.lock"
+		if f, err := os.OpenFile(p, os.O_CREATE|os.O_RDWR, 0o600); err == nil {
+			f.Close()
+			return p
+		}
 	}
 	if d := os.Getenv("HOME"); d != "" {
-		return d + "/.config/teploy/backup-run.lock"
+		dir := d + "/.config/teploy"
+		if os.MkdirAll(dir, 0o700) == nil {
+			return dir + "/backup-run.lock"
+		}
 	}
 	return "/tmp/teploy-backup-run.lock"
 }

@@ -52,14 +52,8 @@ func AcquireRunLock(path string, now time.Time, staleAfter time.Duration) (*RunL
 			f.Close()
 			return nil, holder, ErrRunLocked
 		}
-		// Alive, stuck and past every deadline it had: it will never let go. Its
-		// dumps and uploads run in process groups of their own, which would
-		// outlive it into the next run.
-		children := childPIDs(holder.PID)
-		for _, child := range children {
-			_ = syscall.Kill(-child, syscall.SIGKILL)
-		}
-		if killErr := syscall.Kill(holder.PID, syscall.SIGKILL); killErr != nil {
+		// Alive, stuck and past every deadline it had: it will never let go.
+		if killErr := killHolder(holder.PID, childPIDs(holder.PID), syscall.Kill); killErr != nil {
 			f.Close()
 			return nil, holder, fmt.Errorf("%w (pid %d has held it since %s and could not be stopped: %v)", ErrRunLocked, holder.PID, holder.StartedAt.Format(time.RFC3339), killErr)
 		}
@@ -80,6 +74,20 @@ func AcquireRunLock(path string, now time.Time, staleAfter time.Duration) (*RunL
 		f.Sync()
 	}
 	return &RunLock{f: f}, RunLockHolder{}, nil
+}
+
+// killHolder stops a stuck holder and the process groups of its dumps and uploads,
+// which would outlive it into the next run. The parent goes first, on a list taken
+// before: alive, it would see a child die and start the next step, and a child
+// killed first leaves a parent that can no longer be asked anything about it.
+func killHolder(pid int, children []int, kill func(int, syscall.Signal) error) error {
+	if err := kill(pid, syscall.SIGKILL); err != nil {
+		return err
+	}
+	for _, child := range children {
+		_ = kill(-child, syscall.SIGKILL)
+	}
+	return nil
 }
 
 // Release drops the lock (and exiting does too).

@@ -635,7 +635,7 @@ func TestContractsBackupFleetGolden(t *testing.T) {
 	writeFixture(t, "backup-policy-envelope/valid/unconfigured.json", policyDTO("192.0.2.10", backup.FleetPolicy{}, ""))
 
 	status := backupStatusDTO{MachineInterface: MachineInterface, Host: "192.0.2.10", ObservedAt: at, FleetStatus: backup.FleetStatus{
-		Target: backup.StatusTarget{Configured: true, Bucket: "teploy-backups", Region: "us-east-1", Prefix: "prod", HasCredentials: true, Reachable: true,
+		Target: backup.StatusTarget{Configured: true, Bucket: "teploy-backups", Region: "us-east-1", Prefix: "prod", HasCredentials: true, Reachable: true, IncomingLifecycle: backup.LifecycleCovered,
 			PreviousPrefixes: []backup.PreviousPrefix{{Prefix: ""}}},
 		Policy: backup.StatusPolicy{Configured: true, Path: policy.Path, Interval: "1h", CronInstalled: true, Retention: policy.Retention, Excludes: policy.Excludes, Adopted: policy.Adopted,
 			Volumes: true, VolumeMaxGB: 20, HeartbeatCount: 1, HeartbeatHosts: []string{"https://dash.example.internal"}, Recipient: policy.Recipient},

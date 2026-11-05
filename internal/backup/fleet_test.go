@@ -351,7 +351,7 @@ func TestFleetStatusCoverage(t *testing.T) {
 	evA := `{"v":1,"id":"1","seq":1,"ts":"2026-02-01T11:00:00Z","app":"a","kind":"backup.run","outcome":"succeeded","detail":{"accessory":"db","kind":"accessory","policy_managed":true}}`
 	evAd := `{"v":1,"id":"2","seq":1,"ts":"2026-01-01T11:00:00Z","app":"_adopted","kind":"backup.run","outcome":"failed","detail":{"accessory":"b_mysql","kind":"accessory","error":"boom","policy_managed":true}}`
 	mock := ssh.NewMockExecutor("h",
-		ssh.MockCommand{Match: "if [ -d /etc/teploy ] && [ ! -x /etc/teploy ]", Output: "path /etc/teploy/backup-policy.json\n" + `{"v":"1","interval":"1h","recipient":"` + testOwnerRecipient + `","heartbeat_urls":["https://d/api/push/SECRETTOKEN"],"adopted":[{"container":"b_mysql","databases":"all"},{"container":"gone","databases":"all"}]}`},
+		ssh.MockCommand{Match: "if [ -d /etc/teploy ]", Output: "path /etc/teploy/backup-policy.json\n" + `{"v":"1","interval":"1h","recipient":"` + testOwnerRecipient + `","heartbeat_urls":["https://d/api/push/SECRETTOKEN"],"adopted":[{"container":"b_mysql","databases":"all"},{"container":"gone","databases":"all"}]}`},
 		ssh.MockCommand{Match: "for p in /etc/teploy/backup-target.json", Output: "path /etc/teploy/backup-target.json\n" + `{"v":"1","bucket":"bk","region":"r","prefix":"p","credentials":"SECRETARMOR"}`},
 		ssh.MockCommand{Match: "command -v aws >/dev/null", Output: "aws\nage\n"},
 		ssh.MockCommand{Match: "crontab -l", Output: "5 * * * * /usr/local/bin/teploy backup run --all # [teploy-backup-all]\n"},
@@ -474,7 +474,7 @@ func TestRunFleetTargetStoredNothing(t *testing.T) {
 	target := FleetTarget{Kind: TargetAccessory, App: "a", Name: "db", Container: "a-db", Fact: &ContainerFact{Image: "postgres:17", Env: map[string]string{"PG_MAJOR": "17", "POSTGRES_DB": "app"}}, Retention: RetentionPolicy{KeepLast: 1}}
 	mock := mk("2026-01-01 00:00:00 1000 a/accessories/db/20260101-000000.pgdump\n")
 	r := NewClient(mock, io.Discard).RunFleetTarget(context.Background(), target, S3Config{Bucket: "b", Region: "r"}, BackupOptions{})
-	if r.Status != TargetFailed || !strings.Contains(r.Reason, "earlier backups") {
+	if r.Status != TargetFailed || !strings.Contains(r.Reason, "earlier backups") || !strings.Contains(r.Reason, "--exclude a/db") {
 		t.Fatalf("%+v", r)
 	}
 	for _, c := range mock.Calls {

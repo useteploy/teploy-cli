@@ -77,6 +77,10 @@
         "error": {
           "type": "string"
         },
+        "incoming_lifecycle": {
+          "type": "string",
+          "enum": ["covered", "absent", "unknown"]
+        },
         "other_servers": {
           "type": "array",
           "items": {
@@ -201,6 +205,9 @@
     "encrypted": {
       "type": "boolean",
       "description": "New objects will be encrypted. false: Dash should warn."
+    },
+    "aws_cli_problem": {
+      "type": "string"
     },
     "aws_cli": {
       "type": "boolean"

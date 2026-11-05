@@ -139,7 +139,7 @@ func TestPreOperationBackupAllCoversEveryDatabase(t *testing.T) {
 		t.Fatalf("%q %v", id, err)
 	}
 	joined := strings.Join(mock.Calls, "\n")
-	if !strings.Contains(joined, "databases/analytics/.incoming/") {
+	if !strings.Contains(joined, ".incoming/a/accessories/db/databases/analytics/") {
 		t.Fatalf("analytics was not stored: %s", joined)
 	}
 	if !strings.Contains(joined, "/safety/"+id+".safety") {

@@ -700,7 +700,8 @@ func setupStages() []setupStage {
 			affects: "aws CLI (apt, else AWS's own bundle) and age (apt, if missing) — the backup transport and payload encryption; a failure here warns, since nothing but backups needs them",
 			run: func(ctx context.Context, exec ssh.Executor, w io.Writer, env *setupEnv) error {
 				fmt.Fprintln(w, "Checking aws CLI and age...")
-				if _, err := exec.Run(ctx, "command -v aws >/dev/null && aws --version >/dev/null 2>&1"); err == nil {
+				out, err := exec.Run(ctx, "command -v aws >/dev/null && aws --version 2>&1")
+				if err == nil && backup.AWSCLIVersionProblem(out) == "" {
 					fmt.Fprintln(w, "  aws CLI already installed")
 				} else {
 					fmt.Fprintln(w, "  Installing the aws CLI...")

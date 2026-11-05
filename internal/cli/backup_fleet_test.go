@@ -276,7 +276,7 @@ func TestRunFleetNoTargetHeartbeatsDown(t *testing.T) {
 	defer srv.Close()
 	dir := t.TempDir()
 	mock := ssh.NewMockExecutor("h",
-		ssh.MockCommand{Match: "if [ -d /etc/teploy ] && [ ! -x /etc/teploy ]", Output: "path " + dir + "/backup-policy.json\n" + `{"v":"1","interval":"1h","heartbeat_urls":["` + srv.URL + `/api/push/SECRET"]}`},
+		ssh.MockCommand{Match: "if [ -d /etc/teploy ]", Output: "path " + dir + "/backup-policy.json\n" + `{"v":"1","interval":"1h","heartbeat_urls":["` + srv.URL + `/api/push/SECRET"]}`},
 		ssh.MockCommand{Match: "for p in /etc/teploy/backup-target.json", Output: "absent\n"},
 		ssh.MockCommand{Match: "python3 -c", Output: `{"seq":1,"ts":"2026-01-01T00:00:00Z"}`},
 	)
@@ -299,7 +299,7 @@ func TestRunFleetNoTargetHeartbeatsDown(t *testing.T) {
 }
 
 func TestRunFleetWithNoPolicyFails(t *testing.T) {
-	mock := ssh.NewMockExecutor("h", ssh.MockCommand{Match: "if [ -d /etc/teploy ] && [ ! -x /etc/teploy ]", Output: "absent\n"})
+	mock := ssh.NewMockExecutor("h", ssh.MockCommand{Match: "if [ -d /etc/teploy ]", Output: "absent\n"})
 	res, err := runFleet(context.Background(), mock, io.Discard, false, nil)
 	if err == nil || res.Status != backup.RunFailed || !strings.Contains(res.Error, "backup-policy set") {
 		t.Fatalf("%v %+v", err, res)
@@ -318,7 +318,7 @@ func TestRunFleetStandsDownOnOverlap(t *testing.T) {
 	}
 	defer lock.Release()
 	mock := ssh.NewMockExecutor("h",
-		ssh.MockCommand{Match: "if [ -d /etc/teploy ] && [ ! -x /etc/teploy ]", Output: "path " + dir + "/backup-policy.json\n" + `{"v":"1","heartbeat_urls":["` + srv.URL + `/hb"]}`},
+		ssh.MockCommand{Match: "if [ -d /etc/teploy ]", Output: "path " + dir + "/backup-policy.json\n" + `{"v":"1","heartbeat_urls":["` + srv.URL + `/hb"]}`},
 	)
 	res, err := runFleet(context.Background(), mock, io.Discard, false, nil)
 	if err != nil || res.Status != "skipped" {
@@ -342,7 +342,7 @@ func TestRunFleetPartialFailure(t *testing.T) {
 		return string(b)
 	}
 	mock := ssh.NewMockExecutor("h",
-		ssh.MockCommand{Match: "if [ -d /etc/teploy ] && [ ! -x /etc/teploy ]", Output: "path " + dir + "/backup-policy.json\n" + `{"v":"1","interval":"1h","retention":{"keep_last":1},"heartbeat_urls":["` + srv.URL + `/hb"]}`},
+		ssh.MockCommand{Match: "if [ -d /etc/teploy ]", Output: "path " + dir + "/backup-policy.json\n" + `{"v":"1","interval":"1h","retention":{"keep_last":1},"heartbeat_urls":["` + srv.URL + `/hb"]}`},
 		ssh.MockCommand{Match: "for p in /etc/teploy/backup-target.json", Output: "path /etc/teploy/backup-target.json\n" + `{"v":"1","bucket":"b","region":"r"}`},
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
 		ssh.MockCommand{Match: "for d in", Output: ""},
@@ -458,12 +458,12 @@ func TestEnsureServerPathCompletesCronPath(t *testing.T) {
 func TestSetBackupPolicyFromStdin(t *testing.T) {
 	t.Setenv("TEPLOY_SERVER_BINARY", "/opt/teploy")
 	mock := ssh.NewMockExecutor("srv",
-		ssh.MockCommand{Match: "if [ -d /etc/teploy ] && [ ! -x /etc/teploy ]", Output: "absent\n"},
+		ssh.MockCommand{Match: "if [ -d /etc/teploy ]", Output: "path /etc/teploy/backup-policy.json\n" + `{"v":"1"}`},
 		ssh.MockCommand{Match: "for p in /etc/teploy/backup-target.json", Output: "path /etc/teploy/backup-target.json\n" + `{"v":"1","bucket":"b","region":"r"}`},
 		ssh.MockCommand{Match: "sched_daemon=no", Output: "daemon=yes\nenabled=enabled\ncrontab=yes\nteploy_entries=0\n"},
 		ssh.MockCommand{Match: "which age", Output: "/usr/bin/age"},
 		ssh.MockCommand{Match: "'/opt/teploy' backup run --help", Output: ""},
-		ssh.MockCommand{Match: "d=\nif [ \"$(id -u)\" = 0 ]", Output: "written /etc/teploy/backup-policy.json\n"},
+		ssh.MockCommand{Match: "e=/etc/teploy/backup-policy.json", Output: "written /etc/teploy/backup-policy.json\n"},
 		ssh.MockCommand{Match: "raw=$(crontab -l", Output: ""},
 		ssh.MockCommand{Match: "python3 -c", Output: `{"seq":1,"ts":"2026-01-01T00:00:00Z"}`},
 	)
@@ -502,7 +502,7 @@ func TestSetBackupPolicyFromStdin(t *testing.T) {
 
 	// Refused before anything is stored.
 	bad := backup.FleetPolicy{Adopted: []backup.AdoptedEntry{{Container: "x'; rm -rf /", Databases: backup.DatabaseSelector{All: true}}}}
-	refused := ssh.NewMockExecutor("srv", ssh.MockCommand{Match: "if [ -d /etc/teploy ] && [ ! -x /etc/teploy ]", Output: "absent\n"})
+	refused := ssh.NewMockExecutor("srv", ssh.MockCommand{Match: "if [ -d /etc/teploy ]", Output: "absent\n"})
 	if err := setBackupPolicyOn(context.Background(), &cobra.Command{}, refused, &Flags{}, &policySetFlags{stdin: true}, &bad, nil); err == nil {
 		t.Fatal("a hostile container name must be refused")
 	}
@@ -546,7 +546,7 @@ func TestRunFleetZeroTargets(t *testing.T) {
 	dir := t.TempDir()
 	mk := func(extra string) *ssh.MockExecutor {
 		return ssh.NewMockExecutor("h",
-			ssh.MockCommand{Match: "if [ -d /etc/teploy ] && [ ! -x /etc/teploy ]", Output: "path " + dir + "/backup-policy.json\n" + `{"v":"1","interval":"1h"` + extra + `,"heartbeat_urls":["` + srv.URL + `/hb"]}`},
+			ssh.MockCommand{Match: "if [ -d /etc/teploy ]", Output: "path " + dir + "/backup-policy.json\n" + `{"v":"1","interval":"1h"` + extra + `,"heartbeat_urls":["` + srv.URL + `/hb"]}`},
 			ssh.MockCommand{Match: "for p in /etc/teploy/backup-target.json", Output: "path /etc/teploy/backup-target.json\n" + `{"v":"1","bucket":"b","region":"r"}`},
 			ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
 			ssh.MockCommand{Match: "for d in", Output: ""},
@@ -565,5 +565,27 @@ func TestRunFleetZeroTargets(t *testing.T) {
 	res, err = runFleet(context.Background(), mk(`,"allow_empty":true`), io.Discard, false, nil)
 	if err != nil || res.Status != backup.RunOK {
 		t.Fatalf("%v %+v", err, res)
+	}
+}
+
+// A server set up with nothing on it keeps allow_empty after it stops being true, and
+// then losing every target reports ok.
+func TestRunFleetWarnsAboutAllowEmptyWithTargets(t *testing.T) {
+	dir := t.TempDir()
+	line, _ := json.Marshal(map[string]any{"name": "/a-db", "image": "postgres:17", "state": "running",
+		"labels": map[string]string{"teploy.role": "accessory", "teploy.app": "a", "teploy.accessory": "db"},
+		"env":    []string{"PG_MAJOR=17"}, "entrypoint": []string{}, "cmd": []string{}})
+	mock := ssh.NewMockExecutor("h",
+		ssh.MockCommand{Match: "if [ -d /etc/teploy ]", Output: "path " + dir + "/backup-policy.json\n" + `{"v":"1","interval":"1h","allow_empty":true,"excludes":["a/db"]}`},
+		ssh.MockCommand{Match: "for p in /etc/teploy/backup-target.json", Output: "path /etc/teploy/backup-target.json\n" + `{"v":"1","bucket":"b","region":"r"}`},
+		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
+		ssh.MockCommand{Match: "for d in", Output: ""},
+		ssh.MockCommand{Match: "ids=$(docker ps -aq", Output: string(line) + "\n"},
+		ssh.MockCommand{Match: "crontab -l", Output: ""},
+		ssh.MockCommand{Match: "python3 -c", Output: `{"seq":1,"ts":"2026-01-01T00:00:00Z"}`},
+	)
+	res, _ := runFleet(context.Background(), mock, io.Discard, false, nil)
+	if !strings.Contains(strings.Join(res.Warnings, "\n"), "allow_empty is set") {
+		t.Fatalf("%+v", res)
 	}
 }

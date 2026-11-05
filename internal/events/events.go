@@ -114,6 +114,7 @@ const (
 	KindBackupRestore  = "backup.restore"
 	KindBackupVerify   = "backup.verify"
 	KindBackupTarget   = "backup_target.set"
+	KindBackupOwners   = "backup_target.owners_clear"
 	KindBackupAll      = "backup.all"
 	KindBackupPolicy   = "backup_policy.set"
 )
@@ -150,6 +151,7 @@ var detailAllow = map[string][]string{
 	KindBackupVerify:   {"accessory", "database", "date", "ok", "engine", "kind", "metric", "key", "size_bytes", "duration_ms", "encrypted", "error"},
 	KindBackupRestore:  {"id", "kind", "accessory", "action", "database", "released", "pre_backup_id", "error"},
 	KindBackupTarget:   {"id", "kind", "accessory", "error"},
+	KindBackupOwners:   {"fingerprint", "force", "removed", "error"},
 	KindBackupAll:      {"status", "targets_ok", "targets_failed", "omissions", "encrypted", "duration_ms", "heartbeats_ok", "heartbeats_failed", "warnings", "error"},
 	KindBackupPolicy:   {"interval", "encrypted", "volumes", "adopted", "error"},
 }

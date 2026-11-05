@@ -1,6 +1,10 @@
 package backup
 
-import "github.com/useteploy/teploy/internal/ssh"
+import (
+	"time"
+
+	"github.com/useteploy/teploy/internal/ssh"
+)
 
 // newStoreMock is ssh.NewMockExecutor with the verified-upload path answered:
 // the local measurement and the stored object agree, so a test about something
@@ -16,7 +20,7 @@ var storeStubs = []ssh.MockCommand{
 	{Match: "{ ", Output: "abc  -\n"},
 	{Match: "printf '%s\\n'", Output: ""},
 	{Match: "for p in /etc/teploy/age-key", Output: ""},
-	{Match: "aws s3api head-object", Output: `{"ContentLength":4096,"Metadata":{"sha256":"abc"}}`},
+	{Match: "aws s3api head-object", Output: `{"ContentLength":4096,"Metadata":{"sha256":"abc"},"LastModified":"` + time.Now().UTC().Format(time.RFC3339) + `"}`},
 }
 
 // Valid X25519 age recipients (fixed values: public keys, no matching identity is kept).

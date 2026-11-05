@@ -43,7 +43,7 @@ if [ "$1" = s3api ]; then
   shift 2; b=""; k=""
   while [ $# -gt 0 ]; do case "$1" in --bucket) b=$2; shift 2;; --key) k=$2; shift 2;; *) shift;; esac; done
   f="$root/$b/$k"; [ -f "$f" ] || { echo "An error occurred (404) when calling the HeadObject operation" >&2; exit 254; }
-  printf '{"ContentLength":%s,"Metadata":{"sha256":"%s"}}\n' "$(wc -c < "$f" | tr -d ' ')" "$(sha256sum "$f" | cut -d' ' -f1)"
+  printf '{"ContentLength":%s,"LastModified":"%s","Metadata":{"sha256":"%s"}}\n' "$(wc -c < "$f" | tr -d ' ')" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$(sha256sum "$f" | cut -d' ' -f1)"
   exit 0
 fi
 [ "$1" = s3 ] || { echo "fake aws: only s3 is supported" >&2; exit 2; }
@@ -52,7 +52,7 @@ args=""
 recursive=no
 while [ $# -gt 0 ]; do
   case "$1" in
-    --region|--endpoint-url|--metadata) shift 2 ;;
+    --region|--endpoint-url|--metadata|--copy-props) shift 2 ;;
     --recursive) recursive=yes; shift ;;
     --only-show-errors) shift ;;
     *) args="$args $1"; shift ;;

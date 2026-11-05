@@ -8,7 +8,7 @@
 //
 //	TEPLOY_FAULT_HOST=127.0.0.1:<colima ssh port> TEPLOY_FAULT_USER=tyler \
 //	TEPLOY_FAULT_KEY=~/.colima/_lima/_config/user \
-//	go test -tags integration -p 2 -run TestFleetIntegration -v -timeout 40m ./internal/cli
+//	go test -tags integration -p 2 -run TestFleetIntegration -v -timeout 80m ./internal/cli
 //
 // Containers are capped and removed on exit.
 package cli
@@ -16,6 +16,7 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -163,7 +164,7 @@ func TestFleetIntegration(t *testing.T) {
 	if host == "" || user == "" || keyPath == "" {
 		t.Skip("needs TEPLOY_FAULT_HOST, TEPLOY_FAULT_USER, TEPLOY_FAULT_KEY")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 35*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 70*time.Minute)
 	defer cancel()
 	cctx, ccancel := context.WithTimeout(ctx, 10*time.Second)
 	defer ccancel()
@@ -174,11 +175,11 @@ func TestFleetIntegration(t *testing.T) {
 	t.Cleanup(func() { vm.Close() })
 	f := &fleetIT{t: t, exec: vm, ctx: ctx, host: host, user: user, key: keyPath}
 
-	containers := []string{"teploy-it-minio", "teployit-db", "teployit-cache", "teployit2-db", "teployit3-db", "wordpress-shared-mysql", "omni_postgres", "teploy-it-hook", "teploy-it-scratch"}
+	containers := []string{"teploy-it-minio", "teploy-it-minio2", "teployit-db", "teployit-cache", "teployit2-db", "teployit3-db", "wordpress-shared-mysql", "omni_postgres", "teploy-it-hook", "teploy-it-scratch"}
 	cleanup := func() {
 		c := context.Background()
 		vm.Run(c, "docker rm -fv "+strings.Join(containers, " ")+" >/dev/null 2>&1; docker ps -aq --filter name=teploy-backup-verify- | xargs -r docker rm -fv >/dev/null 2>&1; pkill -f teploy-it-hook.py; pkill -9 -f '[s]leep 600'; true")
-		vm.Run(c, "rm -rf "+itDir+" /deployments/teployit /deployments/teployit2 /deployments/teployit3 /deployments/_adopted /deployments/.teploy/apps/teployit /deployments/.teploy/apps/teployit2 /deployments/.teploy/apps/teployit3 /deployments/.teploy/apps/_adopted /deployments/.teploy/apps/_fleet /var/tmp/teploy-backup.* /var/tmp/teploy-pre-restore.* /var/tmp/teploy-verify.* /var/tmp/teploy-restore.* /var/tmp/teploy-dr /tmp/teploy-pwned; crontab -r 2>/dev/null; sudo -n rm -rf /etc/teploy/backup-policy.json; sudo -n chmod 755 /etc/teploy 2>/dev/null; sudo -n userdel -rf teployit 2>/dev/null; rm -f \"$HOME\"/.config/teploy/backup-policy.json \"$HOME\"/.config/teploy/backup-target.json \"$HOME\"/.config/teploy/backup-run.lock; true")
+		vm.Run(c, "rm -rf "+itDir+" /deployments/teployit /deployments/teployit2 /deployments/teployit3 /deployments/_adopted /deployments/.teploy/apps/teployit /deployments/.teploy/apps/teployit2 /deployments/.teploy/apps/teployit3 /deployments/.teploy/apps/_adopted /deployments/.teploy/apps/_fleet /var/tmp/teploy-backup.* /var/tmp/teploy-pre-restore.* /var/tmp/teploy-verify.* /var/tmp/teploy-restore.* /var/tmp/teploy-dr /tmp/teploy-pwned; crontab -r 2>/dev/null; sudo -n rm -rf /etc/teploy/backup-policy.json; sudo -n chmod 755 /etc/teploy 2>/dev/null; sudo -n rmdir /etc/teploy 2>/dev/null; sudo -n userdel -rf teployit 2>/dev/null; rm -f \"$HOME\"/.config/teploy/backup-policy.json \"$HOME\"/.config/teploy/backup-target.json \"$HOME\"/.config/teploy/backup-run.lock; true")
 	}
 	cleanup()
 	t.Cleanup(cleanup)
@@ -588,7 +589,7 @@ http.server.HTTPServer(("127.0.0.1",` + itHookPort + `),H).serve_forever()
 		}
 		// A partial object left at the verification-pending key, as a provider
 		// with weaker semantics or a future bug might: never a backup.
-		partial := "teployit/accessories/db/.incoming/29991231-235959-0123456789abcdef.pgdump.age"
+		partial := ".incoming/teployit/accessories/db/29991231-235959-0123456789abcdef.pgdump.age"
 		f.sh("printf partial > " + itDir + "/partial")
 		f.awsIT("s3 cp " + itDir + "/partial s3://itfleet/" + partial + " --only-show-errors")
 		// A truncated object at a FINAL key is also refused by the floor.
@@ -708,6 +709,15 @@ http.server.HTTPServer(("127.0.0.1",` + itHookPort + `),H).serve_forever()
 		f.sh(seedScript)
 		client := backup.NewClient(vm, os.Stderr)
 		policy := backup.RetentionPolicy{KeepLast: 2, KeepDaily: 3, KeepWeekly: 4, KeepMonthly: 2}
+		// Most of a series going at once is refused, and nothing goes.
+		beforeBrake := f.keys("gfsapp/accessories/db/")
+		if _, err := client.PruneBackups(ctx, "gfsapp", "accessories/db", f.s3, policy); !errors.Is(err, backup.ErrPruneBrake) {
+			t.Fatalf("brake: %v", err)
+		}
+		if got := f.keys("gfsapp/accessories/db/"); len(got) != len(beforeBrake) {
+			t.Fatalf("the brake deleted something: %d of %d left", len(got), len(beforeBrake))
+		}
+		policy.AllowMassDelete = true
 		deleted, err := client.PruneBackups(ctx, "gfsapp", "accessories/db", f.s3, policy)
 		if err != nil {
 			t.Fatalf("prune: %v (deleted %v)", err, deleted)
@@ -745,7 +755,7 @@ http.server.HTTPServer(("127.0.0.1",` + itHookPort + `),H).serve_forever()
 			seed2 += "s " + early + ".pgdump.age; s " + late + ".pgdump.age; s databases/reports/" + early + ".pgdump.age; "
 		}
 		f.sh(seed2)
-		daily := backup.RetentionPolicy{KeepDaily: 4}
+		daily := backup.RetentionPolicy{KeepDaily: 4, AllowMassDelete: true}
 		if _, err := client.PruneBackups(ctx, "seriesapp", "accessories/db", f.s3, daily); err != nil {
 			t.Fatalf("prune: %v", err)
 		}
@@ -830,8 +840,117 @@ http.server.HTTPServer(("127.0.0.1",` + itHookPort + `),H).serve_forever()
 		if !strings.Contains(head, "sha256") {
 			t.Fatalf("no recorded sha256: %s", head)
 		}
-		if left := f.keys("teployit/volumes/.incoming/"); len(left) != 0 {
+		if left := f.keys(".incoming/teployit/volumes/"); len(left) != 0 {
 			t.Fatalf("pending upload left: %v", left)
+		}
+	})
+
+	t.Run("8 MB and up: multipart copy keeps its checksum, a refused copy re-uploads, one pending tree", func(t *testing.T) {
+		f.t = t
+		bucketKey := func(uri string) (string, string) {
+			b, k, _ := strings.Cut(strings.TrimPrefix(uri, "s3://"), "/")
+			return b, k
+		}
+		f.sh("dd if=/dev/urandom of=/deployments/teployit/volumes/data/mid bs=1M count=20 2>/dev/null")
+		defer f.sh("rm -f /deployments/teployit/volumes/data/mid " + itShims + "/aws")
+		res, code, out := f.runAll("")
+		if code != 0 {
+			t.Fatalf("exit %d: %s", code, out)
+		}
+		vol := f.target(res, "teployit/volumes")
+		if vol.SizeBytes < 8<<20 {
+			t.Fatalf("not multipart: %+v", vol)
+		}
+		b, k := bucketKey(vol.Objects[0].Key)
+		if head := f.awsIT("s3api head-object --bucket " + b + " --key " + k); !strings.Contains(head, `"sha256"`) {
+			t.Fatalf("the multipart copy lost the recorded checksum: %s", head)
+		}
+		// A store that refuses the copy, as B2 is documented to: the object still
+		// arrives, verified, with its checksum, and restores.
+		realAWS := strings.TrimSpace(f.sh("command -v aws"))
+		shim := "#!/bin/sh\ncase \"$*\" in *'s3 cp s3://'*.incoming*s3://*) echo 'copy failed: An error occurred (InvalidRequest) when calling the UploadPartCopy operation: checksum algorithm cannot be changed' >&2; exit 1;; esac\nexec " + realAWS + " \"$@\"\n"
+		if err := vm.Upload(ctx, strings.NewReader(shim), itShims+"/aws", "0755"); err != nil {
+			t.Fatal(err)
+		}
+		res, code, out = f.runAll("PATH=" + itShims + ":$PATH")
+		if code != 0 || !strings.Contains(out, "uploaded straight to its final name") {
+			t.Fatalf("exit %d: %s", code, out)
+		}
+		vol = f.target(res, "teployit/volumes")
+		b, k = bucketKey(vol.Objects[0].Key)
+		if head := f.awsIT("s3api head-object --bucket " + b + " --key " + k); !strings.Contains(head, `"sha256"`) {
+			t.Fatalf("the re-upload lost the recorded checksum: %s", head)
+		}
+		f.sh("rm -f " + itShims + "/aws")
+		if left := f.keys(".incoming/teployit/volumes/"); len(left) != 0 {
+			t.Fatalf("pending uploads left: %v", left)
+		}
+		// Doctor reads the lifecycle rule the pending tree is meant for.
+		if st, err := backup.ReadFleetStatus(ctx, vm, time.Now().UTC()); err != nil || st.Target.IncomingLifecycle != backup.LifecycleAbsent {
+			t.Fatalf("no rule yet: %q %v", st.Target.IncomingLifecycle, err)
+		}
+		if c := doctorBackupPolicyCheck(ctx, vm, time.Now().UTC()); !strings.Contains(c.Detail, "no lifecycle rule expires .incoming/") {
+			t.Fatalf("doctor: %+v", c)
+		}
+		f.sh("printf '%s' " + ssh.ShellQuote(`{"Rules":[{"ID":"incoming","Status":"Enabled","Filter":{"Prefix":".incoming/"},"Expiration":{"Days":1}}]}`) + " > " + itDir + "/rules.json")
+		f.awsIT("s3api put-bucket-lifecycle-configuration --bucket itfleet --lifecycle-configuration file://" + itDir + "/rules.json")
+		defer f.awsIT("s3api delete-bucket-lifecycle --bucket itfleet")
+		if st, err := backup.ReadFleetStatus(ctx, vm, time.Now().UTC()); err != nil || st.Target.IncomingLifecycle != backup.LifecycleCovered {
+			t.Fatalf("with the rule: %q %v", st.Target.IncomingLifecycle, err)
+		}
+	})
+
+	t.Run("on a versioned store the pending bytes sit in one tree and markers are not rewritten", func(t *testing.T) {
+		f.t = t
+		// Versioning needs erasure coding: a second MinIO on four directories.
+		const port = "19101"
+		endpoint := "http://127.0.0.1:" + port
+		f.sh("docker rm -fv teploy-it-minio2 >/dev/null 2>&1; docker run -d --name teploy-it-minio2 --memory 512m -p 127.0.0.1:" + port + ":9000 -e MINIO_ROOT_USER=" + itAK + " -e MINIO_ROOT_PASSWORD=" + itSK + " cgr.dev/chainguard/minio:latest server /tmp/d{1...4} >/dev/null")
+		defer f.sh("docker rm -fv teploy-it-minio2 >/dev/null 2>&1; true")
+		aws := "AWS_ACCESS_KEY_ID=" + itAK + " AWS_SECRET_ACCESS_KEY=" + itSK + " aws --region us-east-1 --endpoint-url " + endpoint + " "
+		f.waitFor("the second minio", aws+"s3 mb s3://itv")
+		f.sh(aws + "s3api put-bucket-versioning --bucket itv --versioning-configuration Status=Enabled")
+		cfg := backup.S3Config{Bucket: "itv", Region: "us-east-1", Endpoint: endpoint, AccessKey: itAK, SecretKey: itSK, Prefix: "srv1"}
+		client := backup.NewClient(vm, os.Stderr)
+		retention := backup.RetentionPolicy{KeepLast: 1}
+		for i := 0; i < 3; i++ {
+			if _, err := client.AccessoryBackup(ctx, "teployit", "cache", "redis:7-alpine", nil, cfg); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := client.PruneBackups(ctx, "teployit", "accessories/cache", cfg, retention); err != nil {
+				t.Fatal(err)
+			}
+			time.Sleep(1100 * time.Millisecond)
+		}
+		var versions struct {
+			Versions []struct {
+				Key string `json:"Key"`
+			} `json:"Versions"`
+		}
+		if err := json.Unmarshal([]byte(f.sh(aws+"s3api list-object-versions --bucket itv --output json")), &versions); err != nil {
+			t.Fatal(err)
+		}
+		counts := map[string]int{}
+		for _, v := range versions.Versions {
+			counts[v.Key]++
+			if strings.Contains(strings.TrimPrefix(v.Key, "srv1/.incoming/"), ".incoming") {
+				t.Fatalf("a pending upload outside the one tree: %s", v.Key)
+			}
+		}
+		pending, marker := 0, 0
+		for k, n := range counts {
+			switch {
+			case strings.HasPrefix(k, "srv1/.incoming/"):
+				pending += n
+			case strings.Contains(k, "/.owners/"):
+				marker += n
+			}
+		}
+		if pending == 0 {
+			t.Fatalf("no pending versions at all, so this proved nothing: %v", counts)
+		}
+		if marker != 1 {
+			t.Fatalf("the marker was rewritten: %d versions: %v", marker, counts)
 		}
 	})
 
@@ -854,10 +973,17 @@ http.server.HTTPServer(("127.0.0.1",` + itHookPort + `),H).serve_forever()
 		if err != nil || !strings.Contains(out, "aaaaaaaaaaaaaaaa") {
 			t.Fatalf("owners: %v\n%s", err, out)
 		}
-		if out, err := f.cli("", "server", "backup-target", "owners", "--clear", "aaaaaaaaaaaaaaaa"); err != nil || !strings.Contains(out, "Removed 1 marker") {
+		// A marker written minutes ago may be a live server: refused without --force.
+		if out, err := f.cli("", "server", "backup-target", "owners", "--clear", "aaaaaaaaaaaaaaaa"); err == nil || !strings.Contains(out, "--force") {
+			t.Fatalf("clear of a recent marker: %v\n%s", err, out)
+		}
+		if out, err := f.cli("", "server", "backup-target", "owners", "--clear", "aaaaaaaaaaaaaaaa", "--force"); err != nil || !strings.Contains(out, "Removed 1 marker") {
 			t.Fatalf("clear: %v\n%s", err, out)
 		}
-		if _, err := client.PruneBackups(ctx, "gfsapp", "accessories/db", f.s3, backup.RetentionPolicy{KeepLast: 1}); err != nil {
+		if log := f.sh("grep backup_target.owners_clear /deployments/.teploy/apps/_fleet/events.jsonl"); !strings.Contains(log, `"outcome":"refused"`) || !strings.Contains(log, `"force":true`) {
+			t.Fatalf("the clears are not on record: %s", log)
+		}
+		if _, err := client.PruneBackups(ctx, "gfsapp", "accessories/db", f.s3, backup.RetentionPolicy{KeepLast: 1, AllowMassDelete: true}); err != nil {
 			t.Fatalf("prune after clearing: %v", err)
 		}
 		// Per-server prefixes: a sibling prefix is invisible to this one's prune.
@@ -868,7 +994,7 @@ http.server.HTTPServer(("127.0.0.1",` + itHookPort + `),H).serve_forever()
 		f.awsIT("s3 cp " + itDir + "/blob s3://itfleet/server-a/shared/accessories/db/20200102-000000.pgdump --only-show-errors")
 		a := f.s3
 		a.Prefix = "server-a"
-		if _, err := client.PruneBackups(ctx, "shared", "accessories/db", a, backup.RetentionPolicy{KeepLast: 1}); err != nil {
+		if _, err := client.PruneBackups(ctx, "shared", "accessories/db", a, backup.RetentionPolicy{KeepLast: 1, AllowMassDelete: true}); err != nil {
 			t.Fatal(err)
 		}
 		if got := f.keys("server-a/shared/accessories/"); len(got) != 1 {
@@ -939,7 +1065,7 @@ http.server.HTTPServer(("127.0.0.1",` + itHookPort + `),H).serve_forever()
 		}
 		// Prune never touches the unowned old prefix.
 		before := f.keys("teployit/accessories/db/")
-		if _, err := client.PruneBackups(ctx, "teployit", "accessories/db", cfg, backup.RetentionPolicy{KeepLast: 1}); err != nil {
+		if _, err := client.PruneBackups(ctx, "teployit", "accessories/db", cfg, backup.RetentionPolicy{KeepLast: 1, AllowMassDelete: true}); err != nil {
 			t.Fatal(err)
 		}
 		if got := f.keys("teployit/accessories/db/"); len(got) != len(before) {
@@ -965,7 +1091,7 @@ http.server.HTTPServer(("127.0.0.1",` + itHookPort + `),H).serve_forever()
 				t.Fatalf("%q owned=%v: %+v", pp.Prefix, pp.Owned, moved.PreviousPrefixes)
 			}
 		}
-		if _, err := client.PruneBackups(ctx, "teployit", "accessories/db", TargetS3(moved), backup.RetentionPolicy{KeepLast: 1}); err != nil {
+		if _, err := client.PruneBackups(ctx, "teployit", "accessories/db", TargetS3(moved), backup.RetentionPolicy{KeepLast: 1, AllowMassDelete: true}); err != nil {
 			t.Fatal(err)
 		}
 		if got := len(f.keys("teployit/accessories/db/")); got != rootBefore {
@@ -991,7 +1117,7 @@ http.server.HTTPServer(("127.0.0.1",` + itHookPort + `),H).serve_forever()
 		// Owned: it ages out under retention, and the newest of all survives.
 		owned := cfg
 		owned.PreviousPrefixes = []backup.PreviousPrefix{{Prefix: "", Owned: true}}
-		if _, err := client.PruneBackups(ctx, "teployit", "accessories/db", owned, backup.RetentionPolicy{KeepLast: 1}); err != nil {
+		if _, err := client.PruneBackups(ctx, "teployit", "accessories/db", owned, backup.RetentionPolicy{KeepLast: 1, AllowMassDelete: true}); err != nil {
 			t.Fatal(err)
 		}
 		if got := f.keys("teployit/accessories/db/"); len(got) >= len(before) {
@@ -1434,7 +1560,7 @@ http.server.HTTPServer(("127.0.0.1",` + itHookPort + `),H).serve_forever()
 		f.t = t
 		policy := `{"v":"1","interval":"1h","recipient":"` + f.pub + `"}`
 		f.sh("sudo -n mkdir -p /etc/teploy && printf '%s' " + ssh.ShellQuote(policy) + " | sudo -n tee /etc/teploy/backup-policy.json >/dev/null && sudo -n chmod 600 /etc/teploy/backup-policy.json && sudo -n chmod 700 /etc/teploy")
-		defer f.sh("sudo -n rm -f /etc/teploy/backup-policy.json; sudo -n chmod 755 /etc/teploy; sudo -n userdel -rf teployit 2>/dev/null; true")
+		defer f.sh("sudo -n rm -f /etc/teploy/backup-policy.json; sudo -n chmod 755 /etc/teploy; sudo -n rmdir /etc/teploy 2>/dev/null; sudo -n userdel -rf teployit 2>/dev/null; true")
 		// This user has passwordless sudo, as deploy users do: the policy is read.
 		got, err := backup.ReadFleetPolicy(ctx, vm)
 		if err != nil || got.Recipient != f.pub {
@@ -1454,6 +1580,41 @@ http.server.HTTPServer(("127.0.0.1",` + itHookPort + `),H).serve_forever()
 		res = ssh.RunDetailed(ctx, vm, "sudo -n -u teployit -H "+itBin+" backup run --all")
 		if !res.Failed() || !strings.Contains(string(res.Stdout)+string(res.Stderr), "cannot tell whether") {
 			t.Fatalf("--all: exit %d\n%s%s", res.ExitCode, res.Stdout, res.Stderr)
+		}
+		// Back to the user with sudo: rotation lands where reads look, no second copy.
+		rotated := strings.TrimSpace(strings.Split(strings.SplitN(func() string {
+			c := exec.Command(f.local, "backup", "keygen")
+			b, err := c.Output()
+			if err != nil {
+				t.Fatal(err)
+			}
+			return string(b)
+		}(), "# public key: ", 2)[1], "\n")[0])
+		path, fallback, err := backup.WriteFleetPolicy(ctx, vm, backup.FleetPolicy{Interval: "1h", Recipient: rotated})
+		if err != nil || path != backup.PolicyFileEtc || fallback {
+			t.Fatalf("write through sudo: %s %v %v", path, fallback, err)
+		}
+		if got, err = backup.ReadFleetPolicy(ctx, vm); err != nil || got.Recipient != rotated {
+			t.Fatalf("show after set: %+v %v", got, err)
+		}
+		if !strings.Contains(f.sh("sudo -n cat "+backup.PolicyFileEtc), rotated) {
+			t.Fatal("the file in /etc was not rotated")
+		}
+		if left := ssh.RunDetailed(ctx, vm, `test -e "$HOME"/.config/teploy/backup-policy.json`); !left.Failed() {
+			t.Fatal("a second policy was written under ~/.config")
+		}
+		// The run this user's cron would make: its lock cannot live in /etc/teploy.
+		_, _, out := f.runAll("")
+		if strings.Contains(out, "backup-run.lock") || strings.Contains(out, "permission denied") {
+			t.Fatalf("the run failed on its lock: %s", out)
+		}
+		// Unset through the same path, and it says so.
+		removed, err := backup.UnsetFleetPolicy(ctx, vm)
+		if err != nil || strings.Join(removed, ",") != backup.PolicyFileEtc {
+			t.Fatalf("unset: %v %v", removed, err)
+		}
+		if got, err = backup.ReadFleetPolicy(ctx, vm); err != nil || got.Configured() {
+			t.Fatalf("after unset: %+v %v", got, err)
 		}
 	})
 

@@ -78,6 +78,9 @@ func (c *Client) newBackupWorkspace(ctx context.Context) (string, func(), error)
 		return "", nil, fmt.Errorf("creating backup workspace: %w", err)
 	}
 	workDir := strings.TrimSpace(runOut)
+	// Says how long this run may live, for a janitor that does not know its deadline.
+	// Best effort: without it the fixed leftover age applies.
+	c.exec.Run(ctx, fmt.Sprintf(`printf '%%s\n' "$(( $(date +%%s) + %d ))" > %s`, int64((c.backupDeadline()+time.Hour).Seconds()), ssh.ShellQuote(workDir+"/"+workspaceExpiry)))
 	return workDir, func() {
 		rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
 		defer cancel()

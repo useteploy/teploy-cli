@@ -2,6 +2,7 @@ package backup
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"slices"
@@ -25,6 +26,13 @@ const (
 	CoverageUncovered = "uncovered"
 	CoverageExcluded  = "excluded"
 	CoverageAdopted   = "adopted"
+)
+
+// What a target's lifecycle rules say about its .incoming/ tree.
+const (
+	LifecycleCovered = "covered"
+	LifecycleAbsent  = "absent"
+	LifecycleUnknown = "unknown"
 )
 
 // StatusObject is the newest good object of a series.
@@ -103,6 +111,10 @@ type StatusTarget struct {
 	// OtherServers are fingerprints of servers that also write at this target's
 	// base. Only looked for with no prefix, where same-named apps would collide.
 	OtherServers []string `json:"other_servers,omitempty"`
+	// IncomingLifecycle says whether a lifecycle rule expires <base>/.incoming/, which
+	// on a store that keeps versions is what stops pending uploads billing forever:
+	// covered, absent, or unknown (the store would not say).
+	IncomingLifecycle string `json:"incoming_lifecycle,omitempty"`
 }
 
 // StatusPolicy summarizes the policy (no heartbeat tokens).
@@ -144,7 +156,9 @@ type FleetStatus struct {
 	// Encrypted says new objects will be encrypted (a recovery key is set).
 	Encrypted bool `json:"encrypted"`
 	AWSCLI    bool `json:"aws_cli"`
-	AgeCLI    bool `json:"age_cli"`
+	// AWSCLIProblem is set when the aws CLI runs but is too old to back up with.
+	AWSCLIProblem string `json:"aws_cli_problem,omitempty"`
+	AgeCLI        bool   `json:"age_cli"`
 	// RunLock names a run in progress.
 	LastRun *StatusLastRun `json:"last_run,omitempty"`
 	Entries []StatusEntry  `json:"entries"`
@@ -186,9 +200,12 @@ func ReadFleetStatus(ctx context.Context, exec ssh.Executor, now time.Time) (Fle
 		Configured: target.Bucket != "", Bucket: target.Bucket, Region: target.Region, Endpoint: target.Endpoint,
 		Prefix: target.Prefix, HasCredentials: target.HasCredentials, PreviousPrefixes: target.PreviousPrefixes,
 	}
-	if out, err := exec.Run(ctx, "command -v aws >/dev/null 2>&1 && aws --version >/dev/null 2>&1 && echo aws; command -v age >/dev/null 2>&1 && echo age; true"); err == nil {
+	if out, err := exec.Run(ctx, `command -v aws >/dev/null 2>&1 && v=$(aws --version 2>&1) && echo "aws $v"; command -v age >/dev/null 2>&1 && echo age; true`); err == nil {
 		for _, t := range splitLines(out) {
-			st.AWSCLI = st.AWSCLI || t == "aws"
+			if t == "aws" || strings.HasPrefix(t, "aws ") {
+				st.AWSCLI = true
+				st.AWSCLIProblem = AWSCLIVersionProblem(t)
+			}
 			st.AgeCLI = st.AgeCLI || t == "age"
 		}
 	}
@@ -235,6 +252,24 @@ func ReadFleetStatus(ctx context.Context, exec ssh.Executor, now time.Time) (Fle
 			st.Target.Reachable = true
 		}
 	}
+	if st.Target.Reachable {
+		st.Target.IncomingLifecycle = c.incomingLifecycle(ctx, cfg)
+		// One tree per base, reported whatever namespace it belongs to.
+		lctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+		if keys, err := c.listTree(lctx, cfg, incomingDir+"/"); err == nil {
+			for _, k := range keys {
+				rel, ok := cfg.relToBase(k.Key)
+				if !ok || !strings.HasPrefix(rel, incomingDir+"/") {
+					continue
+				}
+				segs := strings.Split(k.Key, "/")
+				if e, ok := newBackupEntry(segs[len(segs)-1]); ok && now.Sub(e.time) > incomingStaleAfter {
+					st.LeftoverUploads = append(st.LeftoverUploads, k.Key)
+				}
+			}
+		}
+		cancel()
+	}
 	if st.Target.Reachable && target.Prefix == "" && policy.Configured() && c.fingerprint(ctx) != "" {
 		mctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 		if markers, err := c.ListNamespaceMarkers(mctx, cfg); err == nil {
@@ -255,16 +290,15 @@ func ReadFleetStatus(ctx context.Context, exec ssh.Executor, now time.Time) (Fle
 		if st.Target.Reachable {
 			lctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 			defer cancel()
-			r, pending, err := c.listBackupsAndPending(lctx, app, cfg)
+			r, warnings, err := c.listBackups(lctx, app, cfg)
 			if err != nil {
 				st.Target.Reachable = false
 				st.Target.Error = oneLine(err.Error())
 			}
 			rows = r
-			for _, k := range pending {
-				segs := strings.Split(k, "/")
-				if e, ok := newBackupEntry(segs[len(segs)-1]); ok && now.Sub(e.time) > tmpLeftoverMinutes*time.Minute {
-					st.LeftoverUploads = append(st.LeftoverUploads, k)
+			for _, w := range warnings {
+				if !slices.Contains(st.Warnings, w) {
+					st.Warnings = append(st.Warnings, w)
 				}
 			}
 		}
@@ -446,6 +480,60 @@ func ReadFleetStatus(ctx context.Context, exec ssh.Executor, now time.Time) (Fle
 	}
 	sort.Strings(st.UncoveredDatabases)
 	return st, nil
+}
+
+// incomingLifecycle reads the bucket's lifecycle rules for one that expires
+// <base>/.incoming/. Read-only.
+func (c *Client) incomingLifecycle(ctx context.Context, s3 S3Config) string {
+	lctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	res := ssh.RunDetailed(lctx, c.exec, s3.AWS("s3api get-bucket-lifecycle-configuration --bucket "+ssh.ShellQuote(s3.Bucket)+" --output json"))
+	if res.Failed() {
+		if strings.Contains(res.ExitErrorText(), "NoSuchLifecycleConfiguration") {
+			return LifecycleAbsent
+		}
+		return LifecycleUnknown
+	}
+	return lifecycleCovers(res.Stdout, s3)
+}
+
+// lifecycleCovers reads a GetBucketLifecycleConfiguration reply.
+func lifecycleCovers(reply []byte, s3 S3Config) string {
+	var cfg struct {
+		Rules []struct {
+			Status string `json:"Status"`
+			Prefix string `json:"Prefix"`
+			Filter struct {
+				Prefix string `json:"Prefix"`
+			} `json:"Filter"`
+			Expiration struct {
+				Days int `json:"Days"`
+			} `json:"Expiration"`
+			NoncurrentVersionExpiration struct {
+				NoncurrentDays int `json:"NoncurrentDays"`
+			} `json:"NoncurrentVersionExpiration"`
+		} `json:"Rules"`
+	}
+	if json.Unmarshal(reply, &cfg) != nil {
+		return LifecycleUnknown
+	}
+	want := incomingDir + "/"
+	if s3.Prefix != "" {
+		want = s3.Prefix + "/" + want
+	}
+	for _, r := range cfg.Rules {
+		prefix := r.Filter.Prefix
+		if prefix == "" {
+			prefix = r.Prefix
+		}
+		// A rule on the whole bucket would expire the backups too, and is someone
+		// else's decision: this one is about the pending tree.
+		if r.Status == "Enabled" && prefix != "" && strings.HasPrefix(want, prefix) && strings.Contains(prefix, incomingDir) &&
+			(r.Expiration.Days > 0 || r.NoncurrentVersionExpiration.NoncurrentDays > 0) {
+			return LifecycleCovered
+		}
+	}
+	return LifecycleAbsent
 }
 
 // statusUncovered reads what a running database server holds beyond this

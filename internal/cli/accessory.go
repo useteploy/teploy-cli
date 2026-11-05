@@ -777,6 +777,9 @@ func runAccessoryVerifyBackup(flags *Flags, appName, name, bucket, region, date,
 		// Keep stdout clean for the JSON result; progress goes to stderr.
 		out = os.Stderr
 	}
+	if err := backup.ValidateDeadline(deadline); err != nil {
+		return err
+	}
 	client := backup.NewClient(executor, out)
 	client.SetDeadline(deadline)
 	if err := applyAdoptedEngine(ctx, client, executor, appCfg.App, name); err != nil {

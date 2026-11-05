@@ -13,7 +13,8 @@
         "prefix": ""
       }
     ],
-    "reachable": true
+    "reachable": true,
+    "incoming_lifecycle": "covered"
   },
   "policy": {
     "configured": true,

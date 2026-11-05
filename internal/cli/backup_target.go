@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/useteploy/teploy/internal/config"
 
@@ -51,7 +53,10 @@ func newServerBackupTargetCmd(flags *Flags) *cobra.Command {
 // refuses a namespace holding another server's, so a rebuilt server's old self
 // would stop retention there forever, and growth is the only symptom.
 func newServerBackupTargetOwnersCmd(flags *Flags) *cobra.Command {
-	var clear string
+	var (
+		clear string
+		force bool
+	)
 	cmd := &cobra.Command{
 		Use:   "owners",
 		Short: "List which servers have written under this target; --clear removes one's markers",
@@ -59,7 +64,9 @@ func newServerBackupTargetOwnersCmd(flags *Flags) *cobra.Command {
 			"refuses a namespace holding another server's. --clear <fingerprint> removes a\n" +
 			"server's markers, under the current and previous prefixes: for a server that\n" +
 			"no longer exists, or this one before a rebuild. Backups are not touched. Do not\n" +
-			"clear a server that still writes here: give it its own --prefix.",
+			"clear a server that still writes here: give it its own --prefix. A namespace\n" +
+			"written to in the last week is refused without --force, and every clear is\n" +
+			"recorded in the server's event log.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
@@ -89,13 +96,9 @@ func newServerBackupTargetOwnersCmd(flags *Flags) *cobra.Command {
 				locs = append(locs, l)
 			}
 			if clear != "" {
-				total := 0
-				for _, l := range locs {
-					removed, err := client.ClearNamespaceMarkers(ctx, l, clear)
-					total += len(removed)
-					if err != nil {
-						return err
-					}
+				total, err := clearOwnerMarkers(ctx, executor, client, locs, clear, force, time.Now())
+				if err != nil {
+					return err
 				}
 				fmt.Printf("Removed %d marker(s) of %s\n", total, clear)
 				return nil
@@ -121,8 +124,39 @@ func newServerBackupTargetOwnersCmd(flags *Flags) *cobra.Command {
 			return nil
 		},
 	}
-	cmd.Flags().StringVar(&clear, "clear", "", "remove this fingerprint's markers")
+	cmd.Flags().StringVar(&clear, "clear", "", "remove this fingerprint's markers (a namespace written to in the last week needs --force)")
+	cmd.Flags().BoolVar(&force, "force", false, "with --clear: remove them even though the namespace is in use, which lets a prune here delete that server's backups")
 	return cmd
+}
+
+// clearOwnerMarkers removes a fingerprint's markers from every location, and records
+// it: the marker is all that stops a prune deleting that server's objects, so its
+// removal is an event whether it went through or was refused.
+func clearOwnerMarkers(ctx context.Context, exec ssh.Executor, client *backup.Client, locs []backup.S3Config, fingerprint string, force bool, now time.Time) (int, error) {
+	total := 0
+	var err error
+	for _, l := range locs {
+		removed, cerr := client.ClearNamespaceMarkers(ctx, l, fingerprint, force, now)
+		total += len(removed)
+		if cerr != nil {
+			err = cerr
+			break
+		}
+	}
+	events.Record(ctx, exec, ownerClearEvent(fingerprint, force, total, err))
+	return total, err
+}
+
+func ownerClearEvent(fingerprint string, force bool, removed int, err error) events.Event {
+	ev := events.Event{App: backup.FleetApp, Kind: events.KindBackupOwners, Outcome: events.Succeeded, Detail: map[string]any{"fingerprint": fingerprint, "force": force, "removed": removed}}
+	if err != nil {
+		ev.Outcome = events.Failed
+		if errors.Is(err, backup.ErrMarkerRecent) {
+			ev.Outcome = events.Refused
+		}
+		ev.Detail = events.ErrDetail(ev.Detail, err)
+	}
+	return ev
 }
 
 // backupTargetDTO is the `server backup-target show --json` envelope
