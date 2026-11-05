@@ -118,6 +118,13 @@ func deployServerConfigLocked(ctx context.Context, executor ssh.Executor, host, 
 	if err != nil {
 		return refuseAdmission(err)
 	}
+	// A redeploy is recovery: it re-runs what is already running and must not
+	// refuse mid-incident over a domain rule that arrived after that release.
+	if !isRedeployTrigger(ctx) {
+		if err := config.ValidateDeployDomain(appCfg); err != nil {
+			return refuseAdmission(err)
+		}
+	}
 	if appCfg.IsStatic() {
 		return refuseAdmission(fmt.Errorf("static sites in Teploy home need a code source, which this teploy version does not support yet — keep %s in folder home (`teploy config home folder`)", app))
 	}
@@ -175,12 +182,15 @@ func deployServerConfigLocked(ctx context.Context, executor ssh.Executor, host, 
 	} else if err := ensureImage(ctx, docker.NewClient(executor), image, os.Stdout); err != nil {
 		return err
 	}
-	if !skipDNSCheck && appCfg.Domain != "" &&
-		appCfg.Ingress != config.IngressHost && appCfg.Ingress != config.IngressExternal {
+	if !skipDNSCheck && dnsCheckApplies(appCfg) {
 		if current, _ := state.Read(ctx, executor, app); current == nil {
 			fmt.Println("Validating DNS...")
-			if err := validateDomainDNS(ctx, executor, appCfg.Domain, host); err != nil {
+			notes, err := validateDomainDNS(ctx, executor, appCfg.Domain, host)
+			if err != nil {
 				return err
+			}
+			for _, note := range notes {
+				fmt.Printf("  Note: %s\n", note)
 			}
 			fmt.Println("  DNS validated")
 		}

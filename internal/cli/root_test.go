@@ -32,7 +32,7 @@ func TestProjectDirEstablishesRelativeProjectSemantics(t *testing.T) {
 		}
 	}
 	writeProjectFile(t, filepath.Join(projectDir, "teploy.yml"), `app: dash-contract
-domain: dash-contract.example.com
+domain: dash-contract.teploy-fixture.dev
 server: prod
 context: build
 dockerfile: Dockerfile

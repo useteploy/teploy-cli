@@ -8,7 +8,7 @@ import (
 )
 
 func TestLoadAcceptsPortableConfig(t *testing.T) {
-	cfg, err := Load([]byte("app: blog\ndomain: blog.example.com\nimage: nginx:1.27\nenv:\n  LOG_LEVEL: info\n  PRICE: \"$$5\"\n  DB_PASSWORD: secret:DB_PASSWORD\n"), "blog")
+	cfg, err := Load([]byte("app: blog\ndomain: blog.teploy-fixture.dev\nimage: nginx:1.27\nenv:\n  LOG_LEVEL: info\n  PRICE: \"$$5\"\n  DB_PASSWORD: secret:DB_PASSWORD\n"), "blog")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -20,7 +20,7 @@ func TestLoadAcceptsPortableConfig(t *testing.T) {
 
 func TestLoadRefusesNonPortableConfig(t *testing.T) {
 	raw := `app: blog
-domain: blog.example.com
+domain: blog.teploy-fixture.dev
 server: prod
 env_files: [.env.prod]
 env:
@@ -42,7 +42,7 @@ tls:
 }
 
 func TestLoadRefusesLocalStaticBuildAndWrongApp(t *testing.T) {
-	_, err := Load([]byte("app: site\ntype: static\ndomain: s.example.com\nsource: dist\nbuild: [\"npm run build\"]\n"), "other")
+	_, err := Load([]byte("app: site\ntype: static\ndomain: s.teploy-fixture.dev\nsource: dist\nbuild: [\"npm run build\"]\n"), "other")
 	if err == nil || !strings.Contains(err.Error(), "build_remote") || !strings.Contains(err.Error(), "source:") || !strings.Contains(err.Error(), `belongs to "other"`) {
 		t.Fatalf("got %v", err)
 	}
@@ -73,7 +73,7 @@ func TestPrivilegedChange(t *testing.T) {
 }
 
 func TestLoadKeepsShellVarsOutsideEnv(t *testing.T) {
-	raw := "app: blog\ndomain: blog.example.com\nimage: nginx:1\nprocesses:\n  web: sh -c 'exec server --root $HOME'\nhooks:\n  pre_deploy: echo $APP_VERSION\n"
+	raw := "app: blog\ndomain: blog.teploy-fixture.dev\nimage: nginx:1\nprocesses:\n  web: sh -c 'exec server --root $HOME'\nhooks:\n  pre_deploy: echo $APP_VERSION\n"
 	if _, err := Load([]byte(raw), "blog"); err != nil {
 		t.Fatalf("$VAR outside env: is never expanded and must be accepted: %v", err)
 	}

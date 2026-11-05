@@ -234,7 +234,7 @@ func TestDoctorHumanTable(t *testing.T) {
 func TestDoctorConfigCheck(t *testing.T) {
 	t.Run("ok", func(t *testing.T) {
 		dir := t.TempDir()
-		if err := os.WriteFile(filepath.Join(dir, "teploy.yml"), []byte("app: blog\nserver: prod\ndomain: blog.example.com\n"), 0600); err != nil {
+		if err := os.WriteFile(filepath.Join(dir, "teploy.yml"), []byte("app: blog\nserver: prod\ndomain: blog.teploy-fixture.dev\n"), 0600); err != nil {
 			t.Fatal(err)
 		}
 		cfg, err := config.LoadApp(dir)
@@ -252,7 +252,7 @@ func TestDoctorConfigCheck(t *testing.T) {
 
 	t.Run("grammar error surfaced", func(t *testing.T) {
 		dir := t.TempDir()
-		source := "app: blog\nserver: prod\ndomain: blog.example.com\ningress: bogus-mode\n"
+		source := "app: blog\nserver: prod\ndomain: blog.teploy-fixture.dev\ningress: bogus-mode\n"
 		if err := os.WriteFile(filepath.Join(dir, "teploy.yml"), []byte(source), 0600); err != nil {
 			t.Fatal(err)
 		}
@@ -687,7 +687,7 @@ func TestDoctorExitCode(t *testing.T) {
 func TestDoctorEndToEndAllOK(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "teploy.yml"), []byte("app: blog\nserver: 192.0.2.10\ndomain: blog.example.com\nimage: example/blog:v1\n"), 0600); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "teploy.yml"), []byte("app: blog\nserver: 192.0.2.10\ndomain: blog.teploy-fixture.dev\nimage: example/blog:v1\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
 	t.Chdir(dir)

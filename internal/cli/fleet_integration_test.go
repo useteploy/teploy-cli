@@ -1200,7 +1200,7 @@ http.server.HTTPServer(("127.0.0.1",` + itHookPort + `),H).serve_forever()
 		f.psql("teployit2-db", "analytics", "CREATE TABLE a(id int); INSERT INTO a VALUES (41),(42)")
 		// Upgrade, from a folder with teploy.yml.
 		dir := t.TempDir()
-		yml := "app: teployit2\nserver: " + f.host + "\ndomain: teployit2.example.test\nimage: alpine:3\naccessories:\n  db:\n    image: postgres:17-alpine\n    env:\n      POSTGRES_DB: two\n      POSTGRES_USER: appuser\n      POSTGRES_PASSWORD: " + itDBPW + "\n"
+		yml := "app: teployit2\nserver: " + f.host + "\ndomain: teployit2.teploy-fixture.dev\nimage: alpine:3\naccessories:\n  db:\n    image: postgres:17-alpine\n    env:\n      POSTGRES_DB: two\n      POSTGRES_USER: appuser\n      POSTGRES_PASSWORD: " + itDBPW + "\n"
 		if err := os.WriteFile(filepath.Join(dir, "teploy.yml"), []byte(yml), 0o600); err != nil {
 			t.Fatal(err)
 		}
@@ -1347,7 +1347,7 @@ http.server.HTTPServer(("127.0.0.1",` + itHookPort + `),H).serve_forever()
 		f.sh(cleanHost)
 		defer f.sh(restoreHost)
 		dir := t.TempDir()
-		yml := "app: teployit\nserver: " + f.host + "\ndomain: teployit.example.test\nimage: alpine:3\nvolumes:\n  data: /app/data\naccessories:\n  db:\n    image: postgres:17-alpine\n    env:\n      POSTGRES_DB: appdb\n      POSTGRES_USER: appuser\n      POSTGRES_PASSWORD: " + itDBPW + "\n"
+		yml := "app: teployit\nserver: " + f.host + "\ndomain: teployit.teploy-fixture.dev\nimage: alpine:3\nvolumes:\n  data: /app/data\naccessories:\n  db:\n    image: postgres:17-alpine\n    env:\n      POSTGRES_DB: appdb\n      POSTGRES_USER: appuser\n      POSTGRES_PASSWORD: " + itDBPW + "\n"
 		if err := os.WriteFile(filepath.Join(dir, "teploy.yml"), []byte(yml), 0o600); err != nil {
 			t.Fatal(err)
 		}

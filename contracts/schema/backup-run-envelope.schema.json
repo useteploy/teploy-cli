@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://teploy.github.io/contracts/schema/backup-run-envelope.schema.json",
-  "title": "`teploy backup run --all --json` (backup-fleet-v1, rev 17). Exit status is nonzero unless status is ok or skipped. omissions lists everything not backed up: a status of ok with omissions is not a complete backup.",
+  "title": "`teploy backup run --all --json` (backup-fleet-v1, rev 18). Exit status is nonzero unless status is ok or skipped. omissions lists everything not backed up: a status of ok with omissions is not a complete backup.",
   "type": "object",
   "required": [
     "machine_interface",

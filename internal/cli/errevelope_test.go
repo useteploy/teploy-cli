@@ -24,7 +24,7 @@ func driveRoot(t *testing.T, args ...string) error {
 	return root.Execute()
 }
 
-const invalidModeConfig = "app: demo\ndomain: demo.example.com\nserver: prod\nhealth:\n  mode: bogus\n"
+const invalidModeConfig = "app: demo\ndomain: demo.teploy-fixture.dev\nserver: prod\nhealth:\n  mode: bogus\n"
 
 // TestMachineErrorEnvelopeConfigLoad drives a real failing deploy (an
 // invalid teploy.yml) and asserts the machine error envelope: emitted on

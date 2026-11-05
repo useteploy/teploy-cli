@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://teploy.github.io/contracts/schema/backup-status-envelope.schema.json",
-  "title": "`teploy backup status --host S --json`: one read-only report per server (backup-fleet-v1, rev 17). Never carries credentials, env values or heartbeat tokens.",
+  "title": "`teploy backup status --host S --json`: one read-only report per server (backup-fleet-v1, rev 18). Never carries credentials, env values or heartbeat tokens.",
   "type": "object",
   "required": [
     "machine_interface",
@@ -76,6 +76,13 @@
         },
         "error": {
           "type": "string"
+        },
+        "other_servers": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Fingerprints of servers that also write at this target's base; only looked for with no prefix."
         }
       }
     },

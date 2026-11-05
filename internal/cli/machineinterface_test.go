@@ -86,6 +86,7 @@ func TestCapabilityTokenRegistry(t *testing.T) {
 		"app-list-machine",
 		"autodeploy-redeploy",
 		"doctor-diagnostics",
+		"domains-check-v1",
 		"env-set-stdin",
 		"error-envelope",
 		"health-modes",

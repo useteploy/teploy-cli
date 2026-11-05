@@ -458,6 +458,13 @@ func (d *Deployer) deployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 		}
 		resolvedRouteHash = caddy.ManagedRegionHash(region)
 	}
+	// A non-caddy release retires any managed block a caddy release left
+	// behind (TCL-10's stale half, U5). Resolved here, removed after the state
+	// commit: a deploy that fails never touches the route.
+	var staleRoute staleRouteBlock
+	if !cfg.usesCaddy() {
+		staleRoute = resolveStaleRoute(ctx, d.caddy, d.out, cfg.App)
+	}
 	// switchedRouteHash is re-resolved after a SUCCESSFUL switch (below):
 	// the block this deploy wrote but has not yet committed — the restore
 	// path's CAS accepts exactly {resolved, switched} and refuses anything
@@ -1099,6 +1106,12 @@ func (d *Deployer) deployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 		return d.abortStateCommit(ctx, cfg, current, started, startedIDs, displacedHostWeb, assetAttempt, restoreRouteCAS(resolvedRouteHash, switchedRouteHash), start, err)
 	}
 
+	// 13a. The non-caddy release is authoritative: retire the stale route.
+	var staleRouteErr error
+	if !cfg.usesCaddy() {
+		staleRouteErr = retireStaleRoute(ctx, d.caddy, d.out, cfg.App, cfg.Ingress, staleRoute, fromGeneration, guardPrefix)
+	}
+
 	// 13b. Record the release metadata (F14). The containers are live and
 	// the route/state are committed — a record failure is a degraded
 	// rollback window, not a failed deploy, and it converges on the next
@@ -1305,10 +1318,14 @@ func (d *Deployer) deployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 	// 16. Log the real outcome (C01-5): clean success only when
 	// retirement completed; a partial retirement is a degraded success.
 	degradedReason := strings.Join(retireIncomplete, "; ")
-	d.logDeploy(ctx, cfg, true, degradedReason, start)
 	if degradedReason != "" {
 		fmt.Fprintf(d.out, "Warning: deployed, but predecessor retirement is incomplete — %s\n", degradedReason)
 	}
+	if staleRouteErr != nil {
+		retireIncomplete = append(retireIncomplete, fmt.Sprintf("stale Caddy route not removed: %v", staleRouteErr))
+		degradedReason = strings.Join(retireIncomplete, "; ")
+	}
+	d.logDeploy(ctx, cfg, true, degradedReason, start)
 
 	duration := time.Since(start)
 
@@ -1641,7 +1658,7 @@ func (d *Deployer) restoreRouteFromReceipt(ctx context.Context, cfg Config, curr
 	fw := cfg.Firewall
 	access := cfg.Access
 	if rec.Caddy != nil {
-		tls = caddy.TLS{Cert: rec.Caddy.TLSCert, Key: rec.Caddy.TLSKey, Internal: rec.Caddy.TLSInternal}
+		tls = caddy.TLS{Cert: rec.Caddy.TLSCert, Key: rec.Caddy.TLSKey, Internal: rec.Caddy.TLSInternal, HTTPOnly: rec.Caddy.HTTPOnlyOr(cfg.TLSHTTPOnly)}
 		caddyExtra = rec.Caddy.CaddyExtra
 		cache = rec.Caddy.Cache
 		if rec.Caddy.Firewall != nil {
@@ -1789,10 +1806,12 @@ func (d *Deployer) recordRelease(ctx context.Context, cfg Config, att releasemet
 		}
 	}
 	if cfg.usesCaddy() {
+		httpOnly := cfg.TLSHTTPOnly
 		rec.Caddy = &releasemeta.CaddyRoute{
 			TLSCert:     cfg.TLSCert,
 			TLSKey:      cfg.TLSKey,
 			TLSInternal: cfg.TLSInternal,
+			TLSHTTPOnly: &httpOnly,
 			CaddyExtra:  cfg.CaddyExtra,
 			Cache:       maps.Clone(cfg.Cache),
 		}

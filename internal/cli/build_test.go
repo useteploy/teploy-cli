@@ -58,7 +58,7 @@ func captureStdout(t *testing.T, fn func()) string {
 // connection and possibly an rsync.
 func TestBuildRefusesWhatItCannotBuild(t *testing.T) {
 	t.Run("static app has no image", func(t *testing.T) {
-		chdirTemp(t, "app: brochure\ntype: static\nsource: dist\ndomain: example.com\nserver: web1\n")
+		chdirTemp(t, "app: brochure\ntype: static\nsource: dist\ndomain: teploy-fixture.dev\nserver: web1\n")
 		err := runBuild(&Flags{}, "", "")
 		if err == nil || !strings.Contains(err.Error(), "static app") {
 			t.Fatalf("expected a static-app refusal, got %v", err)
@@ -66,7 +66,7 @@ func TestBuildRefusesWhatItCannotBuild(t *testing.T) {
 	})
 
 	t.Run("no server to build on", func(t *testing.T) {
-		chdirTemp(t, "app: api\ndomain: example.com\n")
+		chdirTemp(t, "app: api\ndomain: teploy-fixture.dev\n")
 		err := runBuild(&Flags{}, "", "")
 		if err == nil || !strings.Contains(err.Error(), "no server specified") {
 			t.Fatalf("expected a missing-server refusal, got %v", err)

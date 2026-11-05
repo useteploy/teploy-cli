@@ -72,7 +72,7 @@
     },
     "pre_backup_id": {
       "type": "string",
-      "description": "The automatic backup taken just before this restore (rev 17)."
+      "description": "The automatic backup taken just before this restore (rev 18)."
     }
   }
 }

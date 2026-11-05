@@ -64,11 +64,11 @@
     },
     "encrypted": {
       "type": "boolean",
-      "description": "age-encrypted (rev 17)."
+      "description": "age-encrypted (rev 18)."
     },
     "objects": {
       "type": "array",
-      "description": "Every primary and per-database object stored (rev 17).",
+      "description": "Every primary and per-database object stored (rev 18).",
       "items": {
         "type": "object",
         "required": [

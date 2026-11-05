@@ -634,6 +634,9 @@ func triggerAutoDeploy(ctx context.Context, executor ssh.Executor, app, branch, 
 	if appCfg.App != app {
 		return fmt.Errorf("teploy.yml in %s declares app %q, expected %q — refusing to deploy the wrong app", buildDir, appCfg.App, app)
 	}
+	if err := config.ValidateDeployDomain(appCfg); err != nil {
+		return err
+	}
 
 	// Local file references resolve against the CHECKOUT, not the resident
 	// process's working directory (audit T31): the systemd unit has no

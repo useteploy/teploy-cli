@@ -91,10 +91,22 @@ type CaddyRoute struct {
 	TLSCert     string            `json:"tls_cert,omitempty"`
 	TLSKey      string            `json:"tls_key,omitempty"`
 	TLSInternal bool              `json:"tls_internal,omitempty"`
+	// TLSHTTPOnly is nil on records written before this field existed; every
+	// caddy release since records it, so the record can turn the flag off too.
+	TLSHTTPOnly *bool             `json:"tls_http_only,omitempty"`
 	CaddyExtra  string            `json:"caddy_extra,omitempty"`
 	Cache       map[string]string `json:"cache,omitempty"`
 	Firewall    *caddy.Firewall   `json:"firewall,omitempty"`
 	Access      *caddy.Access     `json:"access,omitempty"`
+}
+
+// HTTPOnlyOr is the recorded plain-HTTP setting, or fallback on a record too old
+// to carry one.
+func (r *CaddyRoute) HTTPOnlyOr(fallback bool) bool {
+	if r == nil || r.TLSHTTPOnly == nil {
+		return fallback
+	}
+	return *r.TLSHTTPOnly
 }
 
 // Static records a type:static release's serving configuration — the piece

@@ -47,7 +47,7 @@
     },
     "previous_prefixes": {
       "type": "array",
-      "description": "Old prefixes of this bucket list and restore still search; only owned ones are pruned (rev 17).",
+      "description": "Old prefixes of this bucket list and restore still search; only owned ones are pruned (rev 18).",
       "items": {
         "type": "object",
         "required": [

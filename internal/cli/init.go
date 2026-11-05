@@ -80,11 +80,7 @@ func initFlow(reader *bufio.Reader, dir string, useTOML, force bool) (string, er
 	// Domain. No fabricated default — an example.com placeholder that then
 	// deploys is worse than a question. Empty switches to ingress:host
 	// (publish a raw port), which validate() requires a port for.
-	defaultDomain := cfg.Domain
-	if strings.HasSuffix(defaultDomain, ".example.com") {
-		defaultDomain = ""
-	}
-	cfg.Domain = prompt(reader, "Domain (empty = publish a raw port, no HTTPS routing)", defaultDomain)
+	cfg.Domain = prompt(reader, "Domain (empty = publish a raw port, no HTTPS routing)", cfg.Domain)
 	if cfg.Domain == "" {
 		cfg.Ingress = config.IngressHost
 		defaultPort := cfg.Port

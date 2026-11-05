@@ -106,7 +106,7 @@ func TestLoadApp_InvalidDomain(t *testing.T) {
 
 func TestLoadApp_ValidDomains(t *testing.T) {
 	dir := t.TempDir()
-	domains := []string{"myapp.com", "sub.myapp.com", "192.168.1.1.nip.io", "my-app.example.com"}
+	domains := []string{"myapp.com", "sub.myapp.com", "192.168.1.1.nip.io", "my-app.teploy-fixture.dev"}
 
 	for _, domain := range domains {
 		content := fmt.Sprintf("app: myapp\ndomain: %s\n", domain)

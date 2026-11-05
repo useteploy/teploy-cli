@@ -53,9 +53,10 @@ The Engine matrix's other Slice 2 engines were not re-run. The DR fixture still 
 Open / deferred:
 - Legacy objects from a server that has not upgraded yet carry no marker. A first prune in
   a shared root by an upgraded server cannot tell them from its own: only markers from the
-  moment each server upgrades protect it. Per-server prefixes close this; the set command
-  warns when there is none. Attributing unmarked objects would stop a single server's own
-  legacy history ever ageing out.
+  moment each server upgrades protect it. Per-server prefixes close this (decided: Dash always
+  sets one): the set command warns when there is none, and doctor flags a policy with no prefix
+  once another server's marker is at the bucket root. Attributing unmarked objects would stop a
+  single server's own legacy history ever ageing out.
 - A dropped database in an accessory whose other databases are fine keeps its series (its
   newest good object forever) and raises nothing. It reads as history, not as a problem.
 - An external kill -9 of a run leaves its children (own process groups) running until they
@@ -96,6 +97,46 @@ Open / deferred:
   invisible to its listing. Release order: CLI on servers first (plan section 4).
 - `TEPLOY_SERVER_BINARY` was used in the live test; on real servers `ensureFleetBinary`
   upgrades via the release pipeline, so the policy cannot be set until this ships.
+
+## 2026-11-05 — Dash auto-config Slice 5: domain health (CLI side)
+
+Plan: `../_internal/DASH_AUTOCONFIG_PLAN_2026-11-03.md` section 8. Branch
+`slice5-domain-health`.
+
+Closed: U5 root cause and TCL-10's stale half (a release leaving caddy ingress
+retires the block after the state commit, CAS + fence; rollback both directions);
+reserved names under caddy ingress; compose placeholder; the three DNS bugs
+(multi-host, validate/deploy disagreement, equality-only); `domains check`.
+Found along the way and fixed: host-to-caddy rollback rendered an empty CAS list;
+the release record dropped `tls.http_only`; rollback state kept the old domain.
+
+Review fixes (same branch): the reserved-name rule moved out of `validate()` to
+deploy admission (`ValidateDeployDomain`: deploy, multi-server, server-config,
+autodeploy, plan, validate), after overlays merge, so rollback, logs and other
+read and recovery commands never refuse, and Compose-only folders load; redeploy
+skips it. Custom certificates and localhost names are exempt. Public address is
+known per family. A wildcard's failing obtain covers its hosts. `tls_http_only` is
+a `*bool`, so the record can turn the flag off. Log parsing: an empty log is
+short, and a matched line that cannot be attributed makes logs `partial`.
+
+Open:
+- teploy-observe's `teploy.yml` still carries `domain:` and `server:
+  observe.example.com` under `ingress: host`. Legal (label-only warning); remove
+  it there.
+- A crash between the state commit and the block removal leaves the block until
+  the next deploy; `domains check` reports it as `stale_managed` meanwhile.
+- A managed block whose owner is not deployed is reported (`orphan_managed`), not
+  removed. Removal is plan P5 (`route remove`).
+- The DNS lookup uses Go's resolver with a fixed dial target, which still honors
+  the local /etc/hosts before asking. A hosts entry for a public name would hide
+  the public answer.
+- `tls.obtain`/`tls.renew` parsing assumes Caddy's default JSON log; another log
+  format reads `unknown` for the whole server (`unavailable`), never zero.
+- `teploy scale` builds its deploy config without deploy admission: it resizes
+  what is already running, the same reasoning as redeploy.
+- Public address detection: interface addresses plus a best-effort probe of
+  1.1.1.1's trace endpoint from the server. Without either a foreign answer reads
+  `unknown`. Explicit `public_ips` server fields remain plan v2.
 
 ## 2026-11-03 — Dash auto-config Slice 2: backup correctness (G6, G7)
 

@@ -97,15 +97,15 @@
           },
           "database": {
             "type": "string",
-            "description": "Present on one database's own object, only with `backup list --databases` or --adopted (rev 17): a caller must pass it as `restore --database`, or it would replace the primary."
+            "description": "Present on one database's own object, only with `backup list --databases` or --adopted (rev 18): a caller must pass it as `restore --database`, or it would replace the primary."
           },
           "encrypted": {
             "type": "boolean",
-            "description": "age-encrypted (.age, rev 17)."
+            "description": "age-encrypted (.age, rev 18)."
           },
           "previous_prefix": {
             "type": "boolean",
-            "description": "Found under an old prefix of the bucket (rev 17)."
+            "description": "Found under an old prefix of the bucket (rev 18)."
           }
         }
       }

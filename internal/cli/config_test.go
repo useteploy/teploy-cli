@@ -33,7 +33,7 @@ func localConfigTarget(t *testing.T) *configTarget {
 	return &configTarget{app: "blog", server: "prod", exec: ssh.NewLocalExecutor()}
 }
 
-const blogConfig = "app: blog\ndomain: blog.example.com\nimage: nginx:1.27\nenv:\n  LOG_LEVEL: info\n"
+const blogConfig = "app: blog\ndomain: blog.teploy-fixture.dev\nimage: nginx:1.27\nenv:\n  LOG_LEVEL: info\n"
 
 func TestCommitConfigValidatesAndRecordsEvent(t *testing.T) {
 	tg := localConfigTarget(t)

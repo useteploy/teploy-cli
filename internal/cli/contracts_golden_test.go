@@ -612,7 +612,7 @@ func TestContractsGitSourceGolden(t *testing.T) {
 	})
 }
 
-// TestContractsBackupFleetGolden pins the fleet engine's envelopes (rev 17,
+// TestContractsBackupFleetGolden pins the fleet engine's envelopes (rev 18,
 // backup-fleet-v1). Dash's backups page builds on backup-status-envelope.
 func TestContractsBackupFleetGolden(t *testing.T) {
 	at := time.Date(2026, 11, 4, 3, 17, 4, 0, time.UTC)

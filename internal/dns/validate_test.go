@@ -1,6 +1,7 @@
 package dns
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -146,5 +147,39 @@ func TestValidate_ServerResolvesToNoAddresses(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "no addresses returned") {
 		t.Errorf("expected no addresses returned message, got: %v", err)
+	}
+}
+
+func TestValidate_CloudflareAnswerIsProxiedNotMismatch(t *testing.T) {
+	resolve := func(host string) ([]string, error) {
+		if host == "site.test" {
+			return []string{"104.16.1.1", "2606:4700::1"}, nil
+		}
+		return []string{"192.0.2.10"}, nil
+	}
+	err := Validate("site.test", "192.0.2.10", resolve)
+	if !errors.Is(err, ErrProxied) {
+		t.Fatalf("Validate = %v, want ErrProxied", err)
+	}
+	mixed := func(host string) ([]string, error) {
+		if host == "site.test" {
+			return []string{"104.16.1.1", "198.51.100.7"}, nil
+		}
+		return []string{"192.0.2.10"}, nil
+	}
+	if err := Validate("site.test", "192.0.2.10", mixed); err == nil || errors.Is(err, ErrProxied) {
+		t.Fatalf("a mixed answer is a mismatch, got %v", err)
+	}
+}
+
+func TestValidate_ComparesAddressesByValue(t *testing.T) {
+	resolve := func(host string) ([]string, error) {
+		if host == "site.test" {
+			return []string{"2001:0db8:0000:0000:0000:0000:0000:0001"}, nil
+		}
+		return []string{"2001:db8::1"}, nil
+	}
+	if err := Validate("site.test", "server", resolve); err != nil {
+		t.Fatalf("two spellings of one address must match: %v", err)
 	}
 }

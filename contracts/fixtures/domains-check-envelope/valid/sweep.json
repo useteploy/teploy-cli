@@ -1,0 +1,186 @@
+{
+  "machine_interface": 2,
+  "checked_at": "2026-11-04T12:00:00Z",
+  "log_window_seconds": 1209600,
+  "resolvers": [
+    "1.1.1.1:53",
+    "8.8.8.8:53"
+  ],
+  "cloudflare_ranges_as_of": "2026-11-04",
+  "servers": [
+    {
+      "server": "down",
+      "host": "198.51.100.1",
+      "state": "unreachable",
+      "checked_at": "2026-11-04T12:00:00Z",
+      "error": "dial tcp 198.51.100.1:22: i/o timeout",
+      "addresses": [],
+      "public_address_known": false,
+      "public_ipv4_known": false,
+      "public_ipv6_known": false,
+      "caddy": {
+        "container": "unknown",
+        "caddyfile": "unreadable",
+        "logs": "unavailable",
+        "log_coverage_seconds": 0
+      },
+      "issues": []
+    },
+    {
+      "server": "edge",
+      "host": "192.0.2.10",
+      "state": "ok",
+      "checked_at": "2026-11-04T12:00:00Z",
+      "addresses": [
+        "172.17.0.1",
+        "192.0.2.10"
+      ],
+      "public_address_known": true,
+      "public_ipv4_known": true,
+      "public_ipv6_known": false,
+      "caddy": {
+        "container": "present",
+        "caddyfile": "present",
+        "logs": "ok",
+        "log_coverage_seconds": 1209600
+      },
+      "issues": []
+    }
+  ],
+  "domains": [
+    {
+      "server": "edge",
+      "app": "blog",
+      "host": "blog.dev",
+      "ingress": "caddy",
+      "dns": {
+        "status": "ok",
+        "answers": [
+          "192.0.2.10"
+        ]
+      },
+      "tls": {
+        "status": "ok",
+        "failures": 0
+      },
+      "route": {
+        "kind": "managed",
+        "owner": "blog",
+        "tls": "acme",
+        "upstreams": [
+          {
+            "dial": "blog-web-v1:3000",
+            "resolves": "yes"
+          }
+        ],
+        "upstream_resolves": "yes"
+      }
+    },
+    {
+      "server": "edge",
+      "app": "dash",
+      "host": "dash.example.com",
+      "ingress": "host",
+      "skip": "reserved_name",
+      "dns": {
+        "status": "skipped",
+        "answers": [],
+        "detail": "reserved name: never publicly resolvable"
+      },
+      "tls": {
+        "status": "failing",
+        "failures": 1,
+        "failing_since": "2026-10-25T11:00:00Z",
+        "last_failure_at": "2026-11-04T11:00:00Z",
+        "last_error": "[dash.example.com] Obtain: no solvers"
+      },
+      "route": {
+        "kind": "stale_managed",
+        "owner": "dash",
+        "tls": "acme",
+        "upstreams": [
+          {
+            "dial": "dash-web-old:3456",
+            "resolves": "no"
+          }
+        ],
+        "upstream_resolves": "no"
+      }
+    },
+    {
+      "server": "edge",
+      "app": "front",
+      "host": "front.dev",
+      "ingress": "external",
+      "skip": "external_label",
+      "dns": {
+        "status": "skipped",
+        "answers": []
+      },
+      "tls": {
+        "status": "not_applicable",
+        "failures": null
+      },
+      "route": {
+        "kind": "none",
+        "upstreams": [],
+        "upstream_resolves": "not_applicable"
+      }
+    },
+    {
+      "server": "edge",
+      "app": "",
+      "host": "hand.dev",
+      "ingress": "",
+      "dns": {
+        "status": "nxdomain",
+        "answers": [],
+        "detail": "no address record at the public resolvers"
+      },
+      "tls": {
+        "status": "ok",
+        "failures": 0
+      },
+      "route": {
+        "kind": "manual",
+        "tls": "acme",
+        "upstreams": [
+          {
+            "dial": "127.0.0.1:9000",
+            "resolves": "not_applicable"
+          }
+        ],
+        "upstream_resolves": "yes"
+      }
+    },
+    {
+      "server": "edge",
+      "app": "blog",
+      "host": "www.blog.dev",
+      "ingress": "caddy",
+      "dns": {
+        "status": "proxied",
+        "answers": [
+          "104.16.0.1"
+        ],
+        "detail": "answers from Cloudflare: origin cannot be read from DNS"
+      },
+      "tls": {
+        "status": "ok",
+        "failures": 0
+      },
+      "route": {
+        "kind": "managed",
+        "owner": "blog",
+        "tls": "acme",
+        "upstreams": [
+          {
+            "dial": "blog-web-v1:3000",
+            "resolves": "yes"
+          }
+        ],
+        "upstream_resolves": "yes"
+      }
+    }
+  ]
+}

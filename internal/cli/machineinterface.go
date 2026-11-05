@@ -188,6 +188,11 @@ const (
 	// under env:/env_literal: by the app's Teploy-home config, pointing
 	// at `teploy config set` / dash Settings.
 	CapEnvConfigGuardV1 = "env-config-guard-v1"
+	// CapDomainsCheckV1: `teploy domains check [--server X] [--app A]
+	// [--log-window D] --json` reports DNS (public resolvers), Caddy certificate
+	// failures and the route per (server, app, host); read-only, runs from the
+	// caller over SSH with nothing new on the server.
+	CapDomainsCheckV1 = "domains-check-v1"
 )
 
 // MachineCapabilities returns every capability token this build
@@ -231,7 +236,8 @@ func MachineCapabilities() []string {
 		CapReleasesJsonV1,
 		CapRollbackJsonV1,
 		CapRedeployV1,
-		CapEnvConfigGuardV1}
+		CapEnvConfigGuardV1,
+		CapDomainsCheckV1}
 	sort.Strings(tokens)
 	return tokens
 }

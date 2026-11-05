@@ -78,7 +78,7 @@ func TestLoadAppRefusesGitInFolder(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	write("app: demo\ndomain: demo.invalid\ngit:\n  repository: git@github.com:org/repo\n  branch: main\n")
+	write("app: demo\ndomain: demo.teploy-fixture.dev\ngit:\n  repository: git@github.com:org/repo\n  branch: main\n")
 	_, err := LoadApp(dir)
 	if err == nil || !strings.Contains(err.Error(), "Teploy-home") {
 		t.Fatalf("folder LoadApp with git: = %v, want Teploy-home refusal", err)
@@ -91,25 +91,25 @@ func TestLoadAppBytesGitValidation(t *testing.T) {
 		_, err := LoadAppBytes([]byte(body))
 		return err
 	}
-	if err := load("app: demo\ndomain: demo.invalid\ngit:\n  repository: git@github.com:org/repo\n  branch: main\n"); err != nil {
+	if err := load("app: demo\ndomain: demo.teploy-fixture.dev\ngit:\n  repository: git@github.com:org/repo\n  branch: main\n"); err != nil {
 		t.Fatalf("valid git: rejected: %v", err)
 	}
-	if err := load("app: demo\ndomain: demo.invalid\nimage: nginx:1\ngit:\n  repository: git@github.com:org/repo\n  branch: main\n"); err == nil || !strings.Contains(err.Error(), "image") {
+	if err := load("app: demo\ndomain: demo.teploy-fixture.dev\nimage: nginx:1\ngit:\n  repository: git@github.com:org/repo\n  branch: main\n"); err == nil || !strings.Contains(err.Error(), "image") {
 		t.Fatalf("image+git = %v, want refusal", err)
 	}
-	if err := load("app: demo\ndomain: demo.invalid\ngit:\n  branch: main\n"); err == nil || !strings.Contains(err.Error(), "repository") {
+	if err := load("app: demo\ndomain: demo.teploy-fixture.dev\ngit:\n  branch: main\n"); err == nil || !strings.Contains(err.Error(), "repository") {
 		t.Fatalf("missing repository = %v", err)
 	}
-	if err := load("app: demo\ndomain: demo.invalid\ngit:\n  repository: git@github.com:org/repo\n  branch: main\n  submodules: true\n"); err == nil || !strings.Contains(err.Error(), "submodules") {
+	if err := load("app: demo\ndomain: demo.teploy-fixture.dev\ngit:\n  repository: git@github.com:org/repo\n  branch: main\n  submodules: true\n"); err == nil || !strings.Contains(err.Error(), "submodules") {
 		t.Fatalf("submodules: true = %v, want refusal", err)
 	}
-	if err := load("app: demo\ndomain: demo.invalid\ngit:\n  repository: git@github.com:org/repo\n  branch: main\n  poll: 30s\n"); err == nil || !strings.Contains(err.Error(), "poll") {
+	if err := load("app: demo\ndomain: demo.teploy-fixture.dev\ngit:\n  repository: git@github.com:org/repo\n  branch: main\n  poll: 30s\n"); err == nil || !strings.Contains(err.Error(), "poll") {
 		t.Fatalf("poll: 30s = %v, want refusal", err)
 	}
-	if err := load("app: demo\ndomain: demo.invalid\nbuild_secrets: [TOKEN]\n"); err == nil || !strings.Contains(err.Error(), "build_secrets") {
+	if err := load("app: demo\ndomain: demo.teploy-fixture.dev\nbuild_secrets: [TOKEN]\n"); err == nil || !strings.Contains(err.Error(), "build_secrets") {
 		t.Fatalf("build_secrets without git = %v, want refusal", err)
 	}
-	if err := load("app: demo\ndomain: demo.invalid\ngit:\n  repository: git@github.com:org/repo\n  branch: main\n  paths: [\"../escape\"]\n"); err == nil || !strings.Contains(err.Error(), "paths") {
+	if err := load("app: demo\ndomain: demo.teploy-fixture.dev\ngit:\n  repository: git@github.com:org/repo\n  branch: main\n  paths: [\"../escape\"]\n"); err == nil || !strings.Contains(err.Error(), "paths") {
 		t.Fatalf("escaping path = %v, want refusal", err)
 	}
 }

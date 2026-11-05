@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://teploy.github.io/contracts/schema/backup-policy-envelope.schema.json",
-  "title": "`teploy server backup-policy show|set --json` (backup-fleet-v1, rev 17). Heartbeat URLs appear only as hosts.",
+  "title": "`teploy server backup-policy show|set --json` (backup-fleet-v1, rev 18). Heartbeat URLs appear only as hosts.",
   "type": "object",
   "required": [
     "machine_interface",
