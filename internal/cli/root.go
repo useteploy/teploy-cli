@@ -220,6 +220,12 @@ func backupRunDetail(res backup.BackupResult, kind, accessory string) map[string
 	if accessory != "" {
 		detail["accessory"] = accessory
 	}
+	if len(res.UncoveredDatabases) > 0 {
+		detail["uncovered_databases"] = res.UncoveredDatabases
+	}
+	if len(res.Warnings) > 0 {
+		detail["warnings"] = res.Warnings
+	}
 	return detail
 }
 

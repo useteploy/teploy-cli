@@ -187,6 +187,10 @@ type backupCreateDTO struct {
 	Key              string `json:"key"`
 	TeployKey        string `json:"teploy_key,omitempty"`
 	Pruned           int    `json:"pruned"`
+	// Warnings are coverage problems the backup met; UncoveredDatabases are
+	// databases in the cluster this backup does not contain.
+	Warnings           []string `json:"warnings,omitempty"`
+	UncoveredDatabases []string `json:"uncovered_databases,omitempty"`
 }
 
 func newBackupCreateCmd(flags *Flags) *cobra.Command {
@@ -298,17 +302,19 @@ func runBackupCreate(flags *Flags, appName, accessory string, tf *backupTargetFl
 
 	if flags.JSON {
 		return json.NewEncoder(os.Stdout).Encode(backupCreateDTO{
-			MachineInterface: MachineInterface,
-			Host:             executor.Host(),
-			App:              appCfg.App,
-			ID:               res.ID,
-			Kind:             kind,
-			Accessory:        accessory,
-			SizeBytes:        res.SizeBytes,
-			CreatedAt:        backupCreatedAt(res.ID),
-			Key:              res.Key,
-			TeployKey:        res.TeployKey,
-			Pruned:           pruned,
+			MachineInterface:   MachineInterface,
+			Host:               executor.Host(),
+			App:                appCfg.App,
+			ID:                 res.ID,
+			Kind:               kind,
+			Accessory:          accessory,
+			SizeBytes:          res.SizeBytes,
+			CreatedAt:          backupCreatedAt(res.ID),
+			Key:                res.Key,
+			TeployKey:          res.TeployKey,
+			Pruned:             pruned,
+			Warnings:           res.Warnings,
+			UncoveredDatabases: res.UncoveredDatabases,
 		})
 	}
 	fmt.Printf("Backup %s created (%s, %d bytes)\n", res.ID, kind, res.SizeBytes)
@@ -497,7 +503,14 @@ type backupRestoreDTO struct {
 	Started          []string `json:"started"`
 	Health           string   `json:"health"`
 	RecoveryDir      string   `json:"recovery_dir,omitempty"`
-	Error            string   `json:"error,omitempty"`
+	// RecoveryDatabase is the previous postgres database, kept renamed until
+	// the restore is confirmed (--release) or undone (--rollback).
+	RecoveryDatabase string   `json:"recovery_database,omitempty"`
+	Warnings         []string `json:"warnings,omitempty"`
+	// Action and Released report --release / --rollback.
+	Action   string   `json:"action,omitempty"`
+	Released []string `json:"released,omitempty"`
+	Error    string   `json:"error,omitempty"`
 }
 
 func newBackupRestoreCmd(flags *Flags) *cobra.Command {
@@ -506,20 +519,34 @@ func newBackupRestoreCmd(flags *Flags) *cobra.Command {
 		accessory string
 		tf        backupTargetFlags
 		yes       bool
+		opts      restoreFlags
 	)
 
 	cmd := &cobra.Command{
-		Use:   "restore <date>",
+		Use:   "restore [<date>]",
 		Short: "Restore a volume or accessory backup (quiesced)",
 		Long: "Restores a backup under the app's fenced lock: the app's containers\n" +
 			"are stopped (and a generic accessory's container, for an accessory\n" +
 			"restore), the backup is promoted with the two-phase recovery\n" +
 			"discipline, the containers are started again and health-checked. On\n" +
 			"failure the recovery copy of the previous data is kept and named.\n" +
-			"Non-interactive runs must pass --yes.",
-		Args: cobra.ExactArgs(1),
+			"Non-interactive runs must pass --yes.\n\n" +
+			"A restore whose health check failed, or one that was killed, leaves its\n" +
+			"recovery copies: --release confirms the restore and discards them, and\n" +
+			"--rollback swaps a kept previous postgres database back (no <date>).",
+		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runBackupRestore(flags, appName, accessory, args[0], &tf, yes)
+			date := ""
+			if len(args) == 1 {
+				date = args[0]
+			}
+			if err := opts.validate(date, accessory); err != nil {
+				return err
+			}
+			if opts.release || opts.rollback {
+				return runBackupRecoveryAction(flags, appName, accessory, &opts, yes)
+			}
+			return runBackupRestoreWith(flags, appName, accessory, date, &tf, yes, opts.restoreOptions())
 		},
 	}
 
@@ -527,11 +554,50 @@ func newBackupRestoreCmd(flags *Flags) *cobra.Command {
 	cmd.Flags().StringVar(&accessory, "accessory", "", "restore this accessory's backup instead of the app's volumes")
 	addBackupTargetFlags(cmd, &tf)
 	cmd.Flags().BoolVar(&yes, "yes", false, "proceed without interactive confirmation")
+	cmd.Flags().BoolVar(&opts.release, "release", false, "discard this accessory's kept recovery copies (needs --accessory, no <date>)")
+	cmd.Flags().BoolVar(&opts.rollback, "rollback", false, "swap a kept previous postgres database back into place (needs --accessory, no <date>)")
+	cmd.Flags().StringVar(&opts.recoveryDatabase, "recovery-database", "", "with --rollback: which kept database, when several are")
+	cmd.Flags().StringVar(&opts.database, "database", "", "restore this database from a backup_databases: dump instead of the accessory's primary")
+	cmd.Flags().BoolVar(&opts.ignoreSpace, "ignore-space-check", false, "skip the free-space preflight")
 
 	return cmd
 }
 
-func runBackupRestore(flags *Flags, appName, accessory, date string, tf *backupTargetFlags, yes bool) error {
+// restoreFlags are the accessory-restore options of `backup restore`.
+type restoreFlags struct {
+	release, rollback, ignoreSpace bool
+	recoveryDatabase, database     string
+}
+
+func (o *restoreFlags) restoreOptions() backup.RestoreOptions {
+	return backup.RestoreOptions{IgnoreSpaceCheck: o.ignoreSpace, Database: o.database}
+}
+
+func (o *restoreFlags) validate(date, accessory string) error {
+	if o.release && o.rollback {
+		return fmt.Errorf("--release and --rollback are mutually exclusive")
+	}
+	action := o.release || o.rollback
+	switch {
+	case action && accessory == "":
+		return fmt.Errorf("--release and --rollback need --accessory")
+	case action && date != "":
+		return fmt.Errorf("--release and --rollback act on kept copies, not on a backup id")
+	case action && (o.database != "" || o.ignoreSpace):
+		return fmt.Errorf("--database and --ignore-space-check apply to a restore, not to --release/--rollback")
+	case !action && date == "":
+		return fmt.Errorf("a backup id is required (or --release / --rollback)")
+	case !action && o.recoveryDatabase != "":
+		return fmt.Errorf("--recovery-database applies to --rollback")
+	case o.release && o.recoveryDatabase != "":
+		return fmt.Errorf("--recovery-database applies to --rollback")
+	case !action && o.database != "" && accessory == "":
+		return fmt.Errorf("--database needs --accessory")
+	}
+	return nil
+}
+
+func runBackupRestoreWith(flags *Flags, appName, accessory, date string, tf *backupTargetFlags, yes bool, restoreOpts backup.RestoreOptions) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
@@ -608,7 +674,11 @@ func runBackupRestore(flags *Flags, appName, accessory, date string, tf *backupT
 		// an older CLI took of a pgvector/timescale/valkey/... accessory),
 		// an engine dump restores through the running engine.
 		accessoryImage, accessoryEnv := inspectAccessoryForRestore(ctx, client, appCfg.App, accessory, appCfg)
-		art, aErr := client.ResolveAccessoryArtifact(ctx, appCfg.App, accessory, accessoryImage, date, accessoryEnv, cfg)
+		var art backup.AccessoryArtifact
+		var aErr error
+		if restoreOpts.Database == "" {
+			art, aErr = client.ResolveAccessoryArtifact(ctx, appCfg.App, accessory, accessoryImage, date, accessoryEnv, cfg)
+		}
 		if aErr != nil {
 			qErr = aErr
 		} else if art.FileRestore {
@@ -633,14 +703,15 @@ func runBackupRestore(flags *Flags, appName, accessory, date string, tf *backupT
 	quiescedNote := strings.Join(dto.Stopped, ", ")
 	if accessory != "" {
 		accessoryImage, env := inspectAccessoryForRestore(ctx, client, appCfg.App, accessory, appCfg)
-		recovery, err = client.AccessoryRestoreKeep(ctx, appCfg.App, accessory, accessoryImage, date, env, cfg)
+		recovery, err = client.AccessoryRestoreWith(ctx, appCfg.App, accessory, accessoryImage, date, env, cfg, restoreOpts)
 	} else {
 		var dir string
 		dir, err = client.RestoreVolumesKeep(ctx, appCfg.App, date, cfg, quiescedNote)
 		recovery = backup.RestoreRecovery{Path: dir}
 	}
-	if err != nil && !recovery.IsZero() {
-		dto.RecoveryDir = recovery.String()
+	dto.Warnings = recovery.Warnings
+	if err != nil {
+		dto.RecoveryDir, dto.RecoveryDatabase = recovery.Path, recovery.PGDatabase
 	}
 	if err != nil {
 		return finishRestoreFailure(flags, ctx, executor, lc, lk, dto, accessoryStopped, stopped, err)
@@ -665,7 +736,7 @@ func runBackupRestore(flags *Flags, appName, accessory, date string, tf *backupT
 		// The restored data is in place but did not come up healthy: keep
 		// the recovery copy so the operator can fall back.
 		dto.Health = "unhealthy"
-		dto.RecoveryDir = recovery.String()
+		dto.RecoveryDir, dto.RecoveryDatabase = recovery.Path, recovery.PGDatabase
 		dto.Error = fmt.Sprintf("health check after restore failed: %v — pre-restore data kept in %s", resume.HealthErr, recovery)
 		recordAppEvent(ctx, executor, appCfg.App, events.KindBackupRestore, resume.HealthErr, restoreEventDetail(dto))
 		if flags.JSON {
@@ -677,7 +748,11 @@ func runBackupRestore(flags *Flags, appName, accessory, date string, tf *backupT
 
 	if !recovery.IsZero() {
 		if relErr := client.ReleaseRecovery(context.WithoutCancel(ctx), recovery); relErr != nil {
-			fmt.Fprintf(os.Stderr, "Warning: the restore succeeded but its recovery copy was not released: %v\n", relErr)
+			// The restore worked; say what is still kept and how to clear it.
+			dto.RecoveryDir, dto.RecoveryDatabase = recovery.Path, recovery.PGDatabase
+			w := fmt.Sprintf("the restore succeeded but its recovery copy was not released: %v (teploy backup restore --accessory %s --release)", relErr, accessory)
+			dto.Warnings = append(dto.Warnings, w)
+			fmt.Fprintf(os.Stderr, "Warning: %s\n", w)
 		}
 	}
 	dto.OK = true
@@ -686,6 +761,120 @@ func runBackupRestore(flags *Flags, appName, accessory, date string, tf *backupT
 		return json.NewEncoder(os.Stdout).Encode(dto)
 	}
 	fmt.Printf("Restore complete: %s (started %s)\n", date, strings.Join(dto.Started, ", "))
+	return nil
+}
+
+// runBackupRecoveryAction is `backup restore --accessory X --release|--rollback`:
+// the way out of a restore that was kept (failed health check) or left behind
+// (killed). --release drops the copies with the app running. --rollback stops
+// the app, swaps the previous database back and resumes.
+func runBackupRecoveryAction(flags *Flags, appName, accessory string, opts *restoreFlags, yes bool) error {
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer cancel()
+
+	appCfg, executor, err := resolveApp(ctx, flags, appName)
+	if err != nil {
+		return err
+	}
+	defer executor.Close()
+	if err := backup.ValidateBucket(accessory); err != nil {
+		return fmt.Errorf("invalid accessory name %q: %w", accessory, err)
+	}
+	action := "release"
+	if opts.rollback {
+		action = "rollback"
+	}
+	if !yes {
+		if !stdinIsTerminal() {
+			return fmt.Errorf("--yes is required to %s without an interactive terminal", action)
+		}
+		prompt := fmt.Sprintf("Discard the kept recovery copies of %s/%s?", appCfg.App, accessory)
+		if opts.rollback {
+			prompt = fmt.Sprintf("Swap the previous database of %s/%s back (stops the app while it runs)?", appCfg.App, accessory)
+		}
+		if !confirm(os.Stdout, prompt) {
+			return fmt.Errorf("aborted")
+		}
+	}
+
+	lk, err := state.AcquireLockFenced(ctx, executor, appCfg.App)
+	if err != nil {
+		return err
+	}
+	lk.StartRenewal(executor)
+	defer state.ReleaseLockFenced(executor, lk, appCfg.App)
+
+	progress := backupProgressOut(flags)
+	client := backup.NewClient(executor, progress)
+	dto := backupRestoreDTO{
+		MachineInterface: MachineInterface, Host: executor.Host(), App: appCfg.App,
+		Kind: backup.KindAccessory, Accessory: accessory, Action: action,
+		Stopped: []string{}, Started: []string{},
+	}
+	image, env := inspectAccessoryForRestore(ctx, client, appCfg.App, accessory, appCfg)
+	rc, err := client.FindRecoveryCopies(ctx, appCfg.App, accessory, image, env)
+	if err != nil {
+		return err
+	}
+
+	var actionErr error
+	if opts.release {
+		dto.Released, actionErr = client.ReleaseRecoveryCopies(ctx, rc)
+		if actionErr == nil && len(dto.Released) == 0 {
+			actionErr = fmt.Errorf("%s/%s has no kept recovery copies", appCfg.App, accessory)
+		}
+	} else {
+		lc := deploy.NewLifecycle(executor, progress)
+		stopTimeout := appCfg.StopTimeout
+		if stopTimeout == 0 {
+			stopTimeout = 10
+		}
+		stopped, qErr := lc.QuiesceApp(ctx, lk, appCfg.App, stopTimeout)
+		for _, c := range stopped {
+			dto.Stopped = append(dto.Stopped, c.Name)
+		}
+		if qErr != nil {
+			actionErr = qErr
+		} else {
+			var restored, displaced string
+			restored, displaced, actionErr = client.RollbackRestore(ctx, rc, opts.recoveryDatabase)
+			if actionErr == nil {
+				fmt.Fprintf(progress, "%s swapped back into place\n", restored)
+				dto.RecoveryDatabase = displaced
+			}
+		}
+		if !backup.IsRecoveryIncomplete(actionErr) {
+			resume := lc.ResumeApp(ctx, lk, appCfg.App, stopped)
+			dto.Started = resume.Started
+			if dto.Started == nil {
+				dto.Started = []string{}
+			}
+			dto.Health = resume.HealthStatus()
+			if actionErr == nil {
+				actionErr = resume.HealthErr
+			}
+		}
+	}
+	dto.OK = actionErr == nil
+	if actionErr != nil {
+		dto.Error = actionErr.Error()
+	}
+	recordAppEvent(ctx, executor, appCfg.App, events.KindBackupRestore, actionErr, map[string]any{
+		"kind": backup.KindAccessory, "accessory": accessory, "action": action, "released": dto.Released,
+	})
+	if flags.JSON {
+		return errors.Join(actionErr, json.NewEncoder(os.Stdout).Encode(dto))
+	}
+	if actionErr != nil {
+		return actionErr
+	}
+	if opts.release {
+		fmt.Printf("Released: %s\n", strings.Join(dto.Released, ", "))
+	} else if dto.RecoveryDatabase != "" {
+		fmt.Printf("Rolled back. The restored copy is kept as %s until --release\n", dto.RecoveryDatabase)
+	} else {
+		fmt.Println("Rolled back.")
+	}
 	return nil
 }
 

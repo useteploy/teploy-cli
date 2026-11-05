@@ -203,7 +203,7 @@ func doctorRun(ctx context.Context, deps doctorDeps, flags *Flags, serverName st
 
 	if executor == nil {
 		const sshDown = "restore SSH connectivity (see the ssh check above), then re-run teploy doctor"
-		for _, name := range []string{"docker", "disk", "registry", "caddy", "compatibility", "repair-debt", "secret-exposure", "server-tools", "config-home", "backup-cron", "age-identity", "git-trigger", "scheduler", "restore-leftovers"} {
+		for _, name := range []string{"docker", "disk", "registry", "caddy", "compatibility", "repair-debt", "secret-exposure", "server-tools", "config-home", "backup-cron", "age-identity", "git-trigger", "scheduler", "restore-leftovers", "backup-coverage"} {
 			skipFail(name, "SSH unreachable", sshDown)
 		}
 	} else {
@@ -226,7 +226,9 @@ func doctorRun(ctx context.Context, deps doctorDeps, flags *Flags, serverName st
 		report.Checks = append(report.Checks, doctorAgeIdentityCheck(ctx, executor))
 		report.Checks = append(report.Checks, doctorGitTriggerCheck(ctx, executor, deps))
 		report.Checks = append(report.Checks, doctorSchedulerCheck(ctx, executor))
-		report.Checks = append(report.Checks, doctorRestoreLeftoversCheck(ctx, executor))
+		pgReports, pgErr := backup.NewClient(executor, io.Discard).PostgresAccessories(ctx)
+		report.Checks = append(report.Checks, doctorRestoreLeftoversCheck(ctx, executor, pgReports))
+		report.Checks = append(report.Checks, doctorBackupCoverageCheck(pgReports, pgErr))
 	}
 
 	report.summarize()
@@ -912,19 +914,50 @@ func doctorSchedulerCheck(ctx context.Context, exec ssh.Executor) doctorCheck {
 // is holding disk.
 const restoreLeftoversProbe = "find /var/tmp -maxdepth 1 -name 'teploy-pre-restore.*' -mmin +1440 -print 2>/dev/null; true"
 
-// doctorRestoreLeftoversCheck reports stale pre-restore safety copies.
-func doctorRestoreLeftoversCheck(ctx context.Context, exec ssh.Executor) doctorCheck {
+// doctorRestoreLeftoversCheck reports what restores left behind: stale
+// safety copies in /var/tmp, and renamed databases inside postgres accessories
+// (a previous database kept by a restore, a partial replacement from a killed
+// one). Each still holds disk, and a kept previous database is a decision
+// waiting: --release or --rollback.
+func doctorRestoreLeftoversCheck(ctx context.Context, exec ssh.Executor, pg []backup.PostgresAccessoryReport) doctorCheck {
 	out, err := exec.Run(ctx, restoreLeftoversProbe)
 	if err != nil {
 		return doctorCheck{Name: "restore-leftovers", Result: doctorWarn, Detail: "could not list /var/tmp: " + err.Error()}
 	}
-	paths := strings.Fields(out)
-	if len(paths) == 0 {
-		return doctorCheck{Name: "restore-leftovers", Result: doctorOK, Detail: "no stale pre-restore safety copies"}
+	items := strings.Fields(out)
+	for _, r := range pg {
+		for _, db := range r.Leftovers() {
+			items = append(items, fmt.Sprintf("%s/%s: database %s", r.App, r.Accessory, db))
+		}
+	}
+	if len(items) == 0 {
+		return doctorCheck{Name: "restore-leftovers", Result: doctorOK, Detail: "no stale pre-restore copies or kept databases"}
 	}
 	return doctorCheck{Name: "restore-leftovers", Result: doctorWarn,
-		Detail:      fmt.Sprintf("%d pre-restore safety copy(ies) older than a day: %s", len(paths), strings.Join(paths, ", ")),
-		Remediation: "each is the data as it was before a restore that did not finish cleanly; once the restored data is confirmed, remove them (rm -rf). A killed postgres restore can also leave <db>_teploy_old_* / _teploy_new_* databases"}
+		Detail:      fmt.Sprintf("%d restore leftover(s): %s", len(items), strings.Join(items, "; ")),
+		Remediation: "each is the data as it was before a restore that did not finish cleanly: teploy backup restore --accessory <name> --release confirms the restore and discards them, --rollback swaps a kept previous postgres database back"}
+}
+
+// doctorBackupCoverageCheck warns when a postgres cluster holds databases
+// its accessory's backups do not contain.
+func doctorBackupCoverageCheck(pg []backup.PostgresAccessoryReport, err error) doctorCheck {
+	if err != nil {
+		return doctorCheck{Name: "backup-coverage", Result: doctorWarn, Detail: "could not list the postgres accessories: " + err.Error()}
+	}
+	var gaps []string
+	for _, r := range pg {
+		if r.Err != nil {
+			gaps = append(gaps, fmt.Sprintf("%s/%s: could not list databases (%v)", r.App, r.Accessory, r.Err))
+		} else if u := r.Uncovered(); len(u) > 0 {
+			gaps = append(gaps, fmt.Sprintf("%s/%s: %s", r.App, r.Accessory, strings.Join(u, ", ")))
+		}
+	}
+	if len(gaps) > 0 {
+		return doctorCheck{Name: "backup-coverage", Result: doctorWarn,
+			Detail:      "databases not covered by the accessory's backups: " + strings.Join(gaps, "; "),
+			Remediation: "list them in the accessory's backup_databases: in teploy.yml (\"all\" for every one) and recreate the accessory"}
+	}
+	return doctorCheck{Name: "backup-coverage", Result: doctorOK, Detail: fmt.Sprintf("%d postgres accessory(ies): every database is covered", len(pg))}
 }
 
 // doctorAgeIdentityScript prints three facts about the age identity's

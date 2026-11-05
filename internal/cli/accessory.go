@@ -558,6 +558,7 @@ func newAccessoryRestoreCmd(flags *Flags) *cobra.Command {
 		endpoint string
 		prefix   string
 		yes      bool
+		ignore   bool
 	)
 
 	cmd := &cobra.Command{
@@ -565,7 +566,7 @@ func newAccessoryRestoreCmd(flags *Flags) *cobra.Command {
 		Short: "Restore an accessory from backup (stops the app while it runs)",
 		Args:  cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runAccessoryRestore(flags, args[0], args[1], bucket, region, endpoint, prefix, yes)
+			return runAccessoryRestore(flags, args[0], args[1], bucket, region, endpoint, prefix, yes, ignore)
 		},
 	}
 
@@ -574,11 +575,12 @@ func newAccessoryRestoreCmd(flags *Flags) *cobra.Command {
 	cmd.Flags().StringVar(&endpoint, "endpoint", "", "S3-compatible endpoint URL (MinIO/B2/R2); creds from TEPLOY_S3_ACCESS_KEY/SECRET_KEY or AWS_* env")
 	cmd.Flags().StringVar(&prefix, "prefix", "", "key prefix under the bucket (default: the stored target's prefix)")
 	cmd.Flags().BoolVar(&yes, "yes", false, "proceed without interactive confirmation (the app is stopped while the restore runs)")
+	cmd.Flags().BoolVar(&ignore, "ignore-space-check", false, "skip the free-space preflight")
 
 	return cmd
 }
 
-func runAccessoryRestore(flags *Flags, name, date, bucket, region, endpoint, prefix string, yes bool) error {
+func runAccessoryRestore(flags *Flags, name, date, bucket, region, endpoint, prefix string, yes, ignoreSpace bool) error {
 	appCfg, err := loadAppCfgForAccessory()
 	if err != nil {
 		return err
@@ -592,7 +594,7 @@ func runAccessoryRestore(flags *Flags, name, date, bucket, region, endpoint, pre
 	// the live database with the app still writing). Stopping the app is
 	// an effect it never had, so it now asks first (--yes skips it, and is
 	// required without a terminal) — the same contract as backup restore.
-	return runBackupRestore(flags, "", name, date, &backupTargetFlags{bucket: bucket, region: region, endpoint: endpoint, prefix: prefix}, yes)
+	return runBackupRestoreWith(flags, "", name, date, &backupTargetFlags{bucket: bucket, region: region, endpoint: endpoint, prefix: prefix}, yes, backup.RestoreOptions{IgnoreSpaceCheck: ignoreSpace})
 }
 
 // verifyEventErr is the backup.verify outcome: an operational error, or a

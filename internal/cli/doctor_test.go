@@ -6,11 +6,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/useteploy/teploy/internal/backup"
 	"github.com/useteploy/teploy/internal/config"
 	"github.com/useteploy/teploy/internal/ssh"
 )
@@ -19,7 +21,7 @@ import (
 // against (adding checks is additive at the end; renaming/removing is a
 // machine-interface bump).
 var doctorCheckOrder = []string{
-	"git", "config", "ssh", "docker", "disk", "registry", "caddy", "compatibility", "repair-debt", "secret-exposure", "server-tools", "config-home", "backup-cron", "age-identity", "git-trigger", "scheduler", "restore-leftovers"}
+	"git", "config", "ssh", "docker", "disk", "registry", "caddy", "compatibility", "repair-debt", "secret-exposure", "server-tools", "config-home", "backup-cron", "age-identity", "git-trigger", "scheduler", "restore-leftovers", "backup-coverage"}
 
 // doctorHappyMock registers every remote read a fully healthy target
 // answers, for the app config returned by doctorTestApp.
@@ -38,6 +40,7 @@ func doctorHappyMock() *ssh.MockExecutor {
 		ssh.MockCommand{Match: "if [ -r /etc/teploy/age-key ]", Output: "present labsent movable"},
 		ssh.MockCommand{Match: "sched_daemon=no", Output: "daemon=yes\nenabled=enabled\ncrontab=yes\nteploy_entries=0\n"},
 		ssh.MockCommand{Match: "find /var/tmp -maxdepth 1 -name 'teploy-pre-restore.*'", Output: ""},
+		ssh.MockCommand{Match: "docker ps --filter label=teploy.role=accessory", Output: ""},
 	)
 }
 
@@ -86,8 +89,8 @@ func TestDoctorAllChecksPass(t *testing.T) {
 	if ex == nil {
 		t.Fatal("expected an executor back")
 	}
-	if report.Summary != (doctorSummary{OK: 17, Warn: 0, Fail: 0}) {
-		t.Fatalf("summary = %+v, want 17 ok", report.Summary)
+	if report.Summary != (doctorSummary{OK: 18, Warn: 0, Fail: 0}) {
+		t.Fatalf("summary = %+v, want 18 ok", report.Summary)
 	}
 	if len(report.Checks) != len(doctorCheckOrder) {
 		t.Fatalf("got %d checks, want %d", len(report.Checks), len(doctorCheckOrder))
@@ -134,8 +137,8 @@ func TestDoctorJSONStableShape(t *testing.T) {
 		t.Fatalf("machine_interface = %v, want %d", doc["machine_interface"], MachineInterface)
 	}
 	checks, ok := doc["checks"].([]any)
-	if !ok || len(checks) != 17 {
-		t.Fatalf("checks = %#v, want 17 entries", doc["checks"])
+	if !ok || len(checks) != 18 {
+		t.Fatalf("checks = %#v, want 18 entries", doc["checks"])
 	}
 	for i, raw := range checks {
 		check, ok := raw.(map[string]any)
@@ -194,6 +197,7 @@ func TestDoctorHumanTable(t *testing.T) {
 		ssh.MockCommand{Match: "if [ -r /etc/teploy/age-key ]", Output: "present labsent movable"},
 		ssh.MockCommand{Match: "sched_daemon=no", Output: "daemon=yes\nenabled=enabled\ncrontab=yes\nteploy_entries=0\n"},
 		ssh.MockCommand{Match: "find /var/tmp -maxdepth 1 -name 'teploy-pre-restore.*'", Output: ""},
+		ssh.MockCommand{Match: "docker ps --filter label=teploy.role=accessory", Output: ""},
 	)
 	report, _ := doctorRun(context.Background(), doctorTestDeps(mock), &Flags{}, "", doctorTestApp(), nil)
 	var out bytes.Buffer
@@ -207,7 +211,7 @@ func TestDoctorHumanTable(t *testing.T) {
 	if !strings.Contains(rendered, "fix:") {
 		t.Fatalf("table missing the remediation line:\n%s", rendered)
 	}
-	if !strings.Contains(rendered, "Summary: 16 ok, 0 warn, 1 fail") {
+	if !strings.Contains(rendered, "Summary: 17 ok, 0 warn, 1 fail") {
 		t.Fatalf("table summary line wrong:\n%s", rendered)
 	}
 	assertDoctorReadOnlyCalls(t, mock.Calls)
@@ -680,7 +684,7 @@ func TestDoctorEndToEndAllOK(t *testing.T) {
 	if err := runDoctor(doctorTestDeps(mock), &Flags{}, "", &out); err != nil {
 		t.Fatalf("runDoctor: %v", err)
 	}
-	if !strings.Contains(out.String(), "Summary: 17 ok, 0 warn, 0 fail") {
+	if !strings.Contains(out.String(), "Summary: 18 ok, 0 warn, 0 fail") {
 		t.Fatalf("human report wrong:\n%s", out.String())
 	}
 	assertDoctorReadOnlyCalls(t, mock.Calls)
@@ -707,6 +711,7 @@ func assertDoctorReadOnlyCalls(t *testing.T, calls []string) {
 		"crontab -l",
 		"sched_daemon=no; for f in /proc/",
 		"find /var/tmp -maxdepth 1 -name 'teploy-pre-restore.*'",
+		"docker ps --filter label=teploy.role=accessory",
 	}
 	for _, call := range calls {
 		allowed := false
@@ -870,11 +875,43 @@ func TestDoctorSchedulerSeverity(t *testing.T) {
 func TestDoctorRestoreLeftoversCheck(t *testing.T) {
 	ctx := context.Background()
 	clean := ssh.NewMockExecutor("h", ssh.MockCommand{Match: "find /var/tmp -maxdepth 1", Output: ""})
-	if c := doctorRestoreLeftoversCheck(ctx, clean); c.Result != doctorOK {
+	if c := doctorRestoreLeftoversCheck(ctx, clean, nil); c.Result != doctorOK {
 		t.Errorf("clean = %+v", c)
 	}
 	stale := ssh.NewMockExecutor("h", ssh.MockCommand{Match: "find /var/tmp -maxdepth 1", Output: "/var/tmp/teploy-pre-restore.AbC123\n"})
-	if c := doctorRestoreLeftoversCheck(ctx, stale); c.Result != doctorWarn || !strings.Contains(c.Detail, "teploy-pre-restore.AbC123") {
+	if c := doctorRestoreLeftoversCheck(ctx, stale, nil); c.Result != doctorWarn || !strings.Contains(c.Detail, "teploy-pre-restore.AbC123") {
 		t.Errorf("stale = %+v", c)
+	}
+}
+
+func TestDoctorPostgresLeftoversAndCoverage(t *testing.T) {
+	ctx := context.Background()
+	mock := ssh.NewMockExecutor("h",
+		ssh.MockCommand{Match: "find /var/tmp -maxdepth 1", Output: ""},
+		ssh.MockCommand{Match: "docker ps --filter label=teploy.role=accessory", Output: "myapp|db\nmyapp|cache\n"},
+		ssh.MockCommand{Match: "docker inspect -f '{{.Config.Image}}' 'myapp-db'", Output: "postgres:17\n"},
+		ssh.MockCommand{Match: "docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' 'myapp-db'", Output: "PG_MAJOR=17\nPOSTGRES_DB=appdb\n"},
+		ssh.MockCommand{Match: "docker inspect -f '{{.Config.Image}}' 'myapp-cache'", Output: "redis:7\n"},
+		ssh.MockCommand{Match: "docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' 'myapp-cache'", Output: "REDIS_VERSION=7\n"},
+		ssh.MockCommand{Match: "docker exec 'myapp-db' psql -X -qtA -v ON_ERROR_STOP=1 -U 'postgres' -d 'postgres' -c 'SELECT datname", Output: "appdb\nother\nappdb_teploy_old_0123abcd\npostgres\n"},
+		ssh.MockCommand{Match: "docker exec 'myapp-db' psql", Output: "0\n"},
+	)
+	reports, err := backup.NewClient(mock, io.Discard).PostgresAccessories(ctx)
+	if err != nil || len(reports) != 1 {
+		t.Fatalf("reports = %+v, %v (redis is not reported)", reports, err)
+	}
+	left := doctorRestoreLeftoversCheck(ctx, mock, reports)
+	if left.Result != doctorWarn || !strings.Contains(left.Detail, "myapp/db: database appdb_teploy_old_0123abcd") || !strings.Contains(left.Remediation, "--release") {
+		t.Errorf("leftovers = %+v", left)
+	}
+	cov := doctorBackupCoverageCheck(reports, nil)
+	if cov.Result != doctorWarn || !strings.Contains(cov.Detail, "myapp/db: other") || strings.Contains(cov.Detail, "teploy_old") || !strings.Contains(cov.Remediation, "backup_databases") {
+		t.Errorf("coverage = %+v", cov)
+	}
+	if c := doctorBackupCoverageCheck(nil, nil); c.Result != doctorOK {
+		t.Errorf("no postgres accessories = %+v", c)
+	}
+	if c := doctorBackupCoverageCheck(nil, errors.New("docker down")); c.Result != doctorWarn {
+		t.Errorf("unlistable = %+v", c)
 	}
 }

@@ -144,9 +144,9 @@ var detailAllow = map[string][]string{
 	KindMaintenanceOff: {"error"},
 	KindGateRepair:     {"case", "message"},
 	KindWatermarkReset: {"ref"},
-	KindBackupRun:      {"id", "kind", "accessory", "size_bytes", "key", "duration_ms", "engine", "consistency", "encrypted", "error"},
+	KindBackupRun:      {"id", "kind", "accessory", "size_bytes", "key", "duration_ms", "engine", "consistency", "encrypted", "uncovered_databases", "warnings", "error"},
 	KindBackupVerify:   {"accessory", "date", "ok", "engine", "kind", "metric", "key", "size_bytes", "duration_ms", "error"},
-	KindBackupRestore:  {"id", "kind", "accessory", "error"},
+	KindBackupRestore:  {"id", "kind", "accessory", "action", "database", "released", "error"},
 	KindBackupTarget:   {"id", "kind", "accessory", "error"},
 }
 
