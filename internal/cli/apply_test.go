@@ -72,11 +72,11 @@ func planFromConfig(t *testing.T, dir, image, destination string) *PlanRecord {
 // drift — never execute the stale plan.
 func TestApplyDrift_ConfigChangedBetweenPlanAndApply(t *testing.T) {
 	dir := t.TempDir()
-	writeAppConfig(t, dir, "app: blog\nimage: registry/blog:v1\ndomain: blog.example.com\nport: 3000\n")
+	writeAppConfig(t, dir, "app: blog\nimage: registry/blog:v1\ndomain: blog.teploy-fixture.dev\nport: 3000\n")
 	rec := planFromConfig(t, dir, "registry/blog:v1", "")
 
 	// The world moves: port edited after the plan was reviewed.
-	writeAppConfig(t, dir, "app: blog\nimage: registry/blog:v1\ndomain: blog.example.com\nport: 8080\n")
+	writeAppConfig(t, dir, "app: blog\nimage: registry/blog:v1\ndomain: blog.teploy-fixture.dev\nport: 8080\n")
 
 	appCfg, image, digest, version, err := applyResolveCurrent(context.Background(), &Flags{}, rec)
 	if err != nil {
@@ -104,7 +104,7 @@ func TestApplyDrift_ConfigChangedBetweenPlanAndApply(t *testing.T) {
 // the config digest).
 func TestApplyDrift_OverlayFlipInvalidates(t *testing.T) {
 	dir := t.TempDir()
-	writeAppConfig(t, dir, "app: blog\nimage: registry/blog:v1\ndomain: blog.example.com\nport: 3000\nenv:\n  BASE: kept\n")
+	writeAppConfig(t, dir, "app: blog\nimage: registry/blog:v1\ndomain: blog.teploy-fixture.dev\nport: 3000\nenv:\n  BASE: kept\n")
 	if err := os.WriteFile(filepath.Join(dir, "teploy.staging.yml"), []byte("env:\n  STAGED: \"1\"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -130,7 +130,7 @@ func TestApplyDrift_OverlayFlipInvalidates(t *testing.T) {
 // — the same resolution verifies clean.
 func TestApplyStable_ConfigUnchanged(t *testing.T) {
 	dir := t.TempDir()
-	writeAppConfig(t, dir, "app: blog\nimage: registry/blog:v1\ndomain: blog.example.com\nport: 3000\n")
+	writeAppConfig(t, dir, "app: blog\nimage: registry/blog:v1\ndomain: blog.teploy-fixture.dev\nport: 3000\n")
 	rec := planFromConfig(t, dir, "registry/blog:v1", "")
 
 	appCfg, _, digest, version, err := applyResolveCurrent(context.Background(), &Flags{}, rec)
@@ -157,7 +157,7 @@ func TestApplyStable_ConfigUnchanged(t *testing.T) {
 // apply moves the state generation — the stale plan refuses.
 func TestApplyDrift_DeployHappenedInBetween(t *testing.T) {
 	dir := t.TempDir()
-	writeAppConfig(t, dir, "app: blog\nimage: registry/blog:v1\ndomain: blog.example.com\nport: 3000\n")
+	writeAppConfig(t, dir, "app: blog\nimage: registry/blog:v1\ndomain: blog.teploy-fixture.dev\nport: 3000\n")
 	rec := planFromConfig(t, dir, "registry/blog:v1", "")
 	rec.TargetState = PlanTargetState{Deployed: true, Generation: 7, CurrentHash: "old99"}
 	rec.PlanID = computePlanID(rec)

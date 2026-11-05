@@ -7,7 +7,7 @@ import (
 
 func TestExtractSecretsKeepsValuesOutOfTheConfig(t *testing.T) {
 	rendered := []byte(`app: wiki
-domain: wiki.example.com
+domain: wiki.teploy-fixture.dev
 image: wiki:2
 env:
   DATABASE_URL: postgres://wiki:Gen3ratedPw@wiki-db:5432/wiki
@@ -38,7 +38,7 @@ accessories:
 }
 
 func TestExtractSecretsRefusesSecretsOutsideEnv(t *testing.T) {
-	_, _, err := ExtractSecrets([]byte("app: wiki\ndomain: w.example.com\nimage: wiki:2\nprocesses:\n  web: serve --password Gen3ratedPw\n"), []string{"Gen3ratedPw"})
+	_, _, err := ExtractSecrets([]byte("app: wiki\ndomain: w.teploy-fixture.dev\nimage: wiki:2\nprocesses:\n  web: serve --password Gen3ratedPw\n"), []string{"Gen3ratedPw"})
 	if err == nil || !strings.Contains(err.Error(), "outside env:") {
 		t.Fatalf("got %v", err)
 	}
@@ -47,7 +47,7 @@ func TestExtractSecretsRefusesSecretsOutsideEnv(t *testing.T) {
 // Rendered templates carry their literal values as env_literal (never
 // expanded); a generated secret there must leave the config too.
 func TestExtractSecretsFromRenderedLiteralEnv(t *testing.T) {
-	rendered := []byte("app: pa\ndomain: pa.example.com\nimage: adminer:4\nenv_literal:\n  ADMINER_DEFAULT_SERVER: pa-db\naccessories:\n  db:\n    image: postgres:16\n    env_literal:\n      POSTGRES_PASSWORD: Gen3ratedPw\n      POSTGRES_DB: pa\n")
+	rendered := []byte("app: pa\ndomain: pa.teploy-fixture.dev\nimage: adminer:4\nenv_literal:\n  ADMINER_DEFAULT_SERVER: pa-db\naccessories:\n  db:\n    image: postgres:16\n    env_literal:\n      POSTGRES_PASSWORD: Gen3ratedPw\n      POSTGRES_DB: pa\n")
 	out, moved, err := ExtractSecrets(rendered, []string{"Gen3ratedPw"})
 	if err != nil {
 		t.Fatal(err)

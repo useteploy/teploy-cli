@@ -1,6 +1,9 @@
 package config
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // TestValidateName_RejectsShellMetacharacters guards the ad-hoc --app
 // deploy path (internal/cli/deploy.go's runAdHocDeploy) and the --app flag
@@ -84,5 +87,73 @@ func TestValidateDomain(t *testing.T) {
 		if (err != nil) != c.wantErr {
 			t.Errorf("ValidateDomain(%q, %v) error = %v, wantErr %v", c.domain, c.allowZero, err, c.wantErr)
 		}
+	}
+}
+
+func TestIsReservedDomain(t *testing.T) {
+	for host, want := range map[string]bool{
+		"example.com":        true,
+		"dash.example.com":   true,
+		"DASH.EXAMPLE.COM.":  true,
+		"example.net":        true,
+		"a.example.org":      true,
+		"foo.example":        true,
+		"example":            true,
+		"app.test":           true,
+		"app.invalid":        true,
+		"app.localhost":      true,
+		"localhost":          true,
+		"*.example.com":      true,
+		"example.com.au":     false,
+		"notexample.com":     false,
+		"my-example.org":     false,
+		"contest":            false,
+		"thelocalhost":       false,
+		"latest.dev":         false,
+		"teploy-fixture.dev": false,
+	} {
+		if got := IsReservedDomain(host); got != want {
+			t.Errorf("IsReservedDomain(%q) = %v, want %v", host, got, want)
+		}
+	}
+}
+
+func TestValidate_ReservedDomainRule(t *testing.T) {
+	load := func(t *testing.T, yaml string) error {
+		t.Helper()
+		_, err := LoadAppBytes([]byte(yaml))
+		return err
+	}
+	refused := map[string]string{
+		"caddy default":   "app: a\ndomain: a.example.com\n",
+		"explicit caddy":  "app: a\ningress: caddy\ndomain: a.test\n",
+		"one of several":  "app: a\ndomain: real.dev, a.invalid\n",
+		"localhost":       "app: a\ndomain: localhost\n",
+		"static is caddy": "app: a\ntype: static\nsource: dist\ndomain: a.example.org\n",
+	}
+	for name, cfg := range refused {
+		t.Run(name, func(t *testing.T) {
+			err := load(t, cfg)
+			if err == nil || !strings.Contains(err.Error(), "reserved") {
+				t.Fatalf("expected the reserved-name refusal, got %v", err)
+			}
+		})
+	}
+	allowed := map[string]string{
+		"tls internal":  "app: a\ndomain: a.test\ntls:\n  internal: true\n",
+		"tls http only": "app: a\ndomain: a.example.com\ntls:\n  http_only: true\n",
+		"host label":    "app: a\ningress: host\nport: 3000\ndomain: a.example.com\n",
+		"external":      "app: a\ningress: external\ndomain: a.example.com\n",
+		"real name":     "app: a\ndomain: a.teploy-fixture.dev\n",
+	}
+	for name, cfg := range allowed {
+		t.Run(name, func(t *testing.T) {
+			if err := load(t, cfg); err != nil {
+				t.Fatalf("should load: %v", err)
+			}
+		})
+	}
+	if warns := ReservedDomainLabelWarnings("a.example.com, real.dev", IngressHost); len(warns) != 1 || !strings.Contains(warns[0], "label") {
+		t.Errorf("host ingress must warn label-only once: %v", warns)
 	}
 }

@@ -22,7 +22,7 @@ func TestEventTrigger(t *testing.T) {
 
 func TestRedeployRefusesStaticFolder(t *testing.T) {
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "teploy.yml"), []byte("app: site\ntype: static\ndomain: site.example.com\nserver: prod\nsource: ./dist\n"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "teploy.yml"), []byte("app: site\ntype: static\ndomain: site.teploy-fixture.dev\nserver: prod\nsource: ./dist\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	cwd, _ := os.Getwd()
@@ -36,7 +36,7 @@ func TestRedeployRefusesStaticFolder(t *testing.T) {
 
 func TestRedeployNeedsServer(t *testing.T) {
 	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "teploy.yml"), []byte("app: blog\nimage: nginx:1\ndomain: blog.example.com\n"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "teploy.yml"), []byte("app: blog\nimage: nginx:1\ndomain: blog.teploy-fixture.dev\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	cwd, _ := os.Getwd()

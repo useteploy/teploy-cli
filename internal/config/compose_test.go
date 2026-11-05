@@ -1628,3 +1628,23 @@ services:
 		t.Errorf("bind classification broken for the imported keys")
 	}
 }
+
+// Compose carries no domain, and none is invented: a fabricated
+// <app>.example.com is what sent Caddy after certificates it could never get.
+func TestLoadApp_ComposeRequiresADomain(t *testing.T) {
+	dir := t.TempDir()
+	content := "services:\n  web:\n    image: nginx:1\n    ports:\n      - \"80:80\"\n"
+	if err := os.WriteFile(filepath.Join(dir, "docker-compose.yml"), []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := LoadCompose(dir)
+	if err != nil {
+		t.Fatalf("LoadCompose: %v", err)
+	}
+	if cfg.Domain != "" {
+		t.Fatalf("Compose import fabricated a domain: %q", cfg.Domain)
+	}
+	if _, err := LoadApp(dir); err == nil || !strings.Contains(err.Error(), "no domain") {
+		t.Fatalf("LoadApp should ask for a domain, got %v", err)
+	}
+}

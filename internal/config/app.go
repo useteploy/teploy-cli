@@ -1156,6 +1156,56 @@ func validVolumeDestination(dest string) error {
 	return nil
 }
 
+// ReservedDomainHosts lists the hosts of a domain field that can never get a public
+// certificate because RFC 2606 / RFC 6761 reserve them: example.com/.net/.org
+// and their subdomains, *.example, .test, .invalid, .localhost and localhost.
+func ReservedDomainHosts(domain string) []string {
+	var out []string
+	for _, h := range strings.Split(domain, ",") {
+		if h = strings.TrimSpace(h); h != "" && IsReservedDomain(h) {
+			out = append(out, h)
+		}
+	}
+	return out
+}
+
+// IsReservedDomain reports whether one host name is reserved (see
+// ReservedDomainHosts). Matching is case-insensitive and ignores a trailing
+// dot and a leading wildcard label.
+func IsReservedDomain(host string) bool {
+	h := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
+	h = strings.TrimPrefix(h, "*.")
+	for _, name := range []string{"example.com", "example.net", "example.org", "example", "test", "invalid", "localhost"} {
+		if h == name || strings.HasSuffix(h, "."+name) {
+			return true
+		}
+	}
+	return false
+}
+
+// ValidateRoutableDomain refuses a reserved name on a Caddy-routed app unless
+// the certificate is not public anyway: Caddy would otherwise retry ACME for a
+// name no CA will issue, burning rate limits for as long as the block lives.
+func ValidateRoutableDomain(domain string, tlsInternal, httpOnly bool) error {
+	if tlsInternal || httpOnly {
+		return nil
+	}
+	if hosts := ReservedDomainHosts(domain); len(hosts) > 0 {
+		return fmt.Errorf("'domain' %s is reserved (RFC 2606/6761) and can never get a public certificate — use a real domain, or set 'tls: {internal: true}' or 'tls: {http_only: true}' for a private name", strings.Join(hosts, ", "))
+	}
+	return nil
+}
+
+// ReservedDomainLabelWarnings words the same names as a warning for ingress
+// modes where teploy serves no route: the domain is only a label there.
+func ReservedDomainLabelWarnings(domain, ingress string) []string {
+	var warns []string
+	for _, h := range ReservedDomainHosts(domain) {
+		warns = append(warns, fmt.Sprintf("domain %q is a reserved name and is only a label under 'ingress: %s': nothing routes it, and it will never resolve publicly", h, ingress))
+	}
+	return warns
+}
+
 func (c *AppConfig) validate() error {
 	if err := ValidateName(c.App); err != nil {
 		return err
@@ -1164,6 +1214,11 @@ func (c *AppConfig) validate() error {
 	// routes by hostname and requires one.
 	if err := ValidateDomain(c.Domain, c.Ingress == IngressHost); err != nil {
 		return err
+	}
+	if c.UsesCaddy() {
+		if err := ValidateRoutableDomain(c.Domain, c.TLS != nil && c.TLS.Internal, c.TLS != nil && c.TLS.HTTPOnly); err != nil {
+			return err
+		}
 	}
 	if c.Platform != "" && !validPlatform.MatchString(c.Platform) {
 		return fmt.Errorf("'platform' must be os/arch (e.g. linux/amd64, linux/arm64), got %q", c.Platform)
@@ -1567,6 +1622,9 @@ func LoadApp(dir string) (*AppConfig, error) {
 		return nil, invalidConfig(err)
 	}
 	if composeCfg != nil {
+		if composeCfg.Domain == "" {
+			return nil, invalidConfig(fmt.Errorf("invalid Compose config: Compose files carry no domain — run `teploy init` to generate a teploy.yml with one, or add a teploy.yml with `domain:` (or `ingress: host` and `port:` to publish a raw port)"))
+		}
 		if err := composeCfg.validate(); err != nil {
 			return nil, fmt.Errorf("invalid Compose config: %w", err)
 		}
