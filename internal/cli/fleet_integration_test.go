@@ -45,16 +45,17 @@ const (
 )
 
 type fleetIT struct {
-	t     *testing.T
-	exec  ssh.Executor
-	ctx   context.Context
-	s3    backup.S3Config
-	owner string // owner identity file on the VM
-	pub   string // owner recipient
-	local string // darwin/linux binary for the --host commands
-	host  string
-	user  string
-	key   string
+	t          *testing.T
+	exec       ssh.Executor
+	ctx        context.Context
+	s3         backup.S3Config
+	owner      string // owner identity file on the VM
+	ownerLocal string // the same key on this machine, for --identity
+	pub        string // owner recipient
+	local      string // darwin/linux binary for the --host commands
+	host       string
+	user       string
+	key        string
 }
 
 func (f *fleetIT) sh(cmd string) string {
@@ -173,11 +174,11 @@ func TestFleetIntegration(t *testing.T) {
 	t.Cleanup(func() { vm.Close() })
 	f := &fleetIT{t: t, exec: vm, ctx: ctx, host: host, user: user, key: keyPath}
 
-	containers := []string{"teploy-it-minio", "teployit-db", "teployit-cache", "teployit2-db", "wordpress-shared-mysql", "omni_postgres", "teploy-it-hook", "teploy-it-scratch"}
+	containers := []string{"teploy-it-minio", "teployit-db", "teployit-cache", "teployit2-db", "teployit3-db", "wordpress-shared-mysql", "omni_postgres", "teploy-it-hook", "teploy-it-scratch"}
 	cleanup := func() {
 		c := context.Background()
-		vm.Run(c, "docker rm -fv "+strings.Join(containers, " ")+" >/dev/null 2>&1; docker ps -aq --filter name=teploy-backup-verify- | xargs -r docker rm -fv >/dev/null 2>&1; pkill -f teploy-it-hook.py; true")
-		vm.Run(c, "rm -rf "+itDir+" /deployments/teployit /deployments/teployit2 /deployments/_adopted /deployments/.teploy/apps/teployit /deployments/.teploy/apps/teployit2 /deployments/.teploy/apps/_adopted /deployments/.teploy/apps/_fleet /var/tmp/teploy-backup.* /var/tmp/teploy-pre-restore.* /var/tmp/teploy-verify.* /var/tmp/teploy-restore.* /var/tmp/teploy-dr /tmp/teploy-pwned; crontab -r 2>/dev/null; rm -f \"$HOME\"/.config/teploy/backup-policy.json \"$HOME\"/.config/teploy/backup-target.json \"$HOME\"/.config/teploy/backup-run.lock; true")
+		vm.Run(c, "docker rm -fv "+strings.Join(containers, " ")+" >/dev/null 2>&1; docker ps -aq --filter name=teploy-backup-verify- | xargs -r docker rm -fv >/dev/null 2>&1; pkill -f teploy-it-hook.py; pkill -9 -f '[s]leep 600'; true")
+		vm.Run(c, "rm -rf "+itDir+" /deployments/teployit /deployments/teployit2 /deployments/teployit3 /deployments/_adopted /deployments/.teploy/apps/teployit /deployments/.teploy/apps/teployit2 /deployments/.teploy/apps/teployit3 /deployments/.teploy/apps/_adopted /deployments/.teploy/apps/_fleet /var/tmp/teploy-backup.* /var/tmp/teploy-pre-restore.* /var/tmp/teploy-verify.* /var/tmp/teploy-restore.* /var/tmp/teploy-dr /tmp/teploy-pwned; crontab -r 2>/dev/null; sudo -n rm -rf /etc/teploy/backup-policy.json; sudo -n chmod 755 /etc/teploy 2>/dev/null; sudo -n userdel -rf teployit 2>/dev/null; rm -f \"$HOME\"/.config/teploy/backup-policy.json \"$HOME\"/.config/teploy/backup-target.json \"$HOME\"/.config/teploy/backup-run.lock; true")
 	}
 	cleanup()
 	t.Cleanup(cleanup)
@@ -221,6 +222,10 @@ func TestFleetIntegration(t *testing.T) {
 			t.Fatalf("keygen: %v", err)
 		}
 		if err := vm.Upload(ctx, strings.NewReader(string(b)), file, "0600"); err != nil {
+			t.Fatal(err)
+		}
+		f.ownerLocal = filepath.Join(tmp, "owner.txt")
+		if err := os.WriteFile(f.ownerLocal, b, 0o600); err != nil {
 			t.Fatal(err)
 		}
 		for _, line := range strings.Split(string(b), "\n") {
@@ -622,6 +627,9 @@ http.server.HTTPServer(("127.0.0.1",` + itHookPort + `),H).serve_forever()
 		}
 		f.awsIT("s3 rm s3://itfleet/" + bad + " --only-show-errors")
 		f.awsIT("s3 rm s3://itfleet/" + partial + " --only-show-errors")
+		// An external kill -9 cannot reach the runs' own process groups: clear what
+		// those two left, so what follows measures the stale-holder path alone.
+		f.sh("pkill -9 -f '[s]leep 600'; true")
 		// A holder alive and stuck past every deadline it had: the next run ends it.
 		startKilled(itDir + "/publishing")
 		holderPID := strings.TrimSpace(f.sh("cat " + itDir + "/pid"))
@@ -632,6 +640,11 @@ http.server.HTTPServer(("127.0.0.1",` + itHookPort + `),H).serve_forever()
 		}
 		if alive := ssh.RunDetailed(ctx, vm, "kill -0 "+holderPID); !alive.Failed() {
 			t.Fatalf("the stuck holder %s is still alive", holderPID)
+		}
+		// Its upload ran in a process group of its own: that must not survive
+		// into the next run either.
+		if left := strings.TrimSpace(f.sh("pgrep -fa '[s]leep 600' || true")); left != "" {
+			t.Fatalf("the stuck holder's children survived: %s", left)
 		}
 		f.sh("kill -9 -- -" + holderPID + " 2>/dev/null; rm -rf /var/tmp/teploy-backup.* " + itShims + "/aws")
 	})
@@ -719,6 +732,107 @@ http.server.HTTPServer(("127.0.0.1",` + itHookPort + `),H).serve_forever()
 		if len(rest) != 4*len(want) {
 			t.Fatalf("%d objects left for %d backups: %v", len(rest), len(want), rest)
 		}
+
+		// A database whose last run of each day fails: it has its own history, and
+		// keep_daily holds for it, not only for the primary's ids.
+		var primary, reports []string
+		seed2 := "export AWS_ACCESS_KEY_ID=" + itAK + " AWS_SECRET_ACCESS_KEY=" + itSK + " AWS_DEFAULT_REGION=us-east-1; s() { aws --endpoint-url " + itEndpoint + " s3 cp --only-show-errors " + itDir + "/blob \"s3://itfleet/seriesapp/accessories/db/$1\"; }; "
+		for d := 0; d < 12; d++ {
+			day := time.Date(2026, 10, 10+d, 0, 0, 0, 0, time.UTC)
+			early, late := day.Add(2*time.Hour).Format("20060102-150405"), day.Add(20*time.Hour).Format("20060102-150405")
+			primary = append(primary, early, late)
+			reports = append(reports, early)
+			seed2 += "s " + early + ".pgdump.age; s " + late + ".pgdump.age; s databases/reports/" + early + ".pgdump.age; "
+		}
+		f.sh(seed2)
+		daily := backup.RetentionPolicy{KeepDaily: 4}
+		if _, err := client.PruneBackups(ctx, "seriesapp", "accessories/db", f.s3, daily); err != nil {
+			t.Fatalf("prune: %v", err)
+		}
+		gotReports := map[string]bool{}
+		for _, k := range f.keys("seriesapp/accessories/db/databases/reports/") {
+			parts := strings.Split(k, "/")
+			gotReports[strings.Split(parts[len(parts)-1], ".")[0]] = true
+		}
+		wantReports := map[string]bool{}
+		for _, id := range resticForget(reports, daily) {
+			wantReports[id] = true
+		}
+		if fmt.Sprint(sortedKeysOf(gotReports)) != fmt.Sprint(sortedKeysOf(wantReports)) {
+			t.Fatalf("reports kept %v, want %v: a database must get its own keep_daily", sortedKeysOf(gotReports), sortedKeysOf(wantReports))
+		}
+		_ = primary
+	})
+
+	t.Run("a leftover schedule store does not decide retention", func(t *testing.T) {
+		f.t = t
+		before := len(f.keys("teployit/accessories/db/"))
+		if err := backup.WritePolicy(ctx, vm, "teployit", backup.AppPolicy{Accessories: map[string]*backup.KindPolicy{"db": {KeepLast: 1}}}); err != nil {
+			t.Fatal(err)
+		}
+		res, code, out := f.runAll("")
+		f.sh("rm -f " + backup.PolicyPath("teployit"))
+		if code != 0 {
+			t.Fatalf("exit %d: %s", code, out)
+		}
+		if !strings.Contains(strings.Join(res.Warnings, "\n"), "no cron line runs it") {
+			t.Fatalf("no warning about the leftover: %v", res.Warnings)
+		}
+		var primaries int
+		for _, k := range f.keys("teployit/accessories/db/") {
+			if strings.Count(strings.TrimPrefix(k, "teployit/accessories/db/"), "/") == 0 {
+				primaries++
+			}
+		}
+		if primaries < 3 {
+			t.Fatalf("keep_last 1 from a stale store pruned the history: %d primaries left (of %d keys before)", primaries, before)
+		}
+	})
+
+	t.Run("every database dropped: failure and heartbeat down, nothing pruned", func(t *testing.T) {
+		f.t = t
+		f.sh("docker run -d --name teployit3-db --memory 128m --label teploy.role=accessory --label teploy.app=teployit3 --label teploy.accessory=db -e POSTGRES_DB=three -e POSTGRES_USER=appuser -e POSTGRES_PASSWORD=" + itDBPW + " postgres:17-alpine >/dev/null")
+		f.waitFor("postgres", "docker exec teployit3-db pg_isready -h 127.0.0.1 -U appuser")
+		f.psql("teployit3-db", "three", "CREATE TABLE t(id int)")
+		defer f.sh("docker rm -fv teployit3-db >/dev/null 2>&1; true")
+		res, code, out := f.runAll("")
+		if code != 0 || f.target(res, "teployit3-db").Status != backup.TargetOK {
+			t.Fatalf("first run: %d %s", code, out)
+		}
+		before := f.keys("teployit3/accessories/db/")
+		f.sh("docker exec teployit3-db psql -X -q -U appuser -d postgres -c 'DROP DATABASE three'")
+		res, code, out = f.runAll("")
+		if code == 0 || f.target(res, "teployit3-db").Status != backup.TargetFailed {
+			t.Fatalf("a target that had backups and now holds nothing must fail: exit %d %+v\n%s", code, f.target(res, "teployit3-db"), out)
+		}
+		if got := f.keys("teployit3/accessories/db/"); strings.Join(got, ",") != strings.Join(before, ",") {
+			t.Fatalf("pruned on a run that stored nothing:\n%v\n%v", before, got)
+		}
+		if log := f.sh("cat " + itDir + "/hook.log"); !strings.Contains(lastLine(log), "status=down") {
+			t.Fatalf("heartbeat must be down: %s", lastLine(log))
+		}
+	})
+
+	t.Run("a target over 256 MiB gets a checksum the store verified", func(t *testing.T) {
+		f.t = t
+		f.sh("dd if=/dev/urandom of=/deployments/teployit/volumes/data/big bs=1M count=258 2>/dev/null")
+		res, code, out := f.runAll("")
+		f.sh("rm -f /deployments/teployit/volumes/data/big")
+		if code != 0 {
+			t.Fatalf("exit %d: %s", code, out)
+		}
+		vol := f.target(res, "teployit/volumes")
+		if vol.SizeBytes < 256<<20 {
+			t.Fatalf("not over the read-back limit: %+v", vol)
+		}
+		bucket, key, _ := strings.Cut(strings.TrimPrefix(vol.Objects[0].Key, "s3://"), "/")
+		head := f.awsIT("s3api head-object --checksum-mode ENABLED --bucket " + bucket + " --key " + key)
+		if !strings.Contains(head, "sha256") {
+			t.Fatalf("no recorded sha256: %s", head)
+		}
+		if left := f.keys("teployit/volumes/.incoming/"); len(left) != 0 {
+			t.Fatalf("pending upload left: %v", left)
+		}
 	})
 
 	t.Run("never prunes across servers", func(t *testing.T) {
@@ -735,6 +849,17 @@ http.server.HTTPServer(("127.0.0.1",` + itHookPort + `),H).serve_forever()
 		if got := f.keys("gfsapp/accessories/db/"); len(got) != len(before) {
 			t.Fatalf("pruned across servers: %v", got)
 		}
+		// A rebuilt server's old marker: visible, and clearable by name.
+		out, err := f.cli("", "--json", "server", "backup-target", "owners")
+		if err != nil || !strings.Contains(out, "aaaaaaaaaaaaaaaa") {
+			t.Fatalf("owners: %v\n%s", err, out)
+		}
+		if out, err := f.cli("", "server", "backup-target", "owners", "--clear", "aaaaaaaaaaaaaaaa"); err != nil || !strings.Contains(out, "Removed 1 marker") {
+			t.Fatalf("clear: %v\n%s", err, out)
+		}
+		if _, err := client.PruneBackups(ctx, "gfsapp", "accessories/db", f.s3, backup.RetentionPolicy{KeepLast: 1}); err != nil {
+			t.Fatalf("prune after clearing: %v", err)
+		}
 		// Per-server prefixes: a sibling prefix is invisible to this one's prune.
 		f.sh("head -c 2000 /dev/urandom > " + itDir + "/blob")
 		f.awsIT("s3 cp " + itDir + "/blob s3://itfleet/server-b/shared/accessories/db/20200101-000000.pgdump --only-show-errors")
@@ -746,10 +871,10 @@ http.server.HTTPServer(("127.0.0.1",` + itHookPort + `),H).serve_forever()
 		if _, err := client.PruneBackups(ctx, "shared", "accessories/db", a, backup.RetentionPolicy{KeepLast: 1}); err != nil {
 			t.Fatal(err)
 		}
-		if got := f.keys("server-a/"); len(got) != 1 {
+		if got := f.keys("server-a/shared/accessories/"); len(got) != 1 {
 			t.Fatalf("server-a kept %v", got)
 		}
-		if got := f.keys("server-b/"); len(got) != 2 {
+		if got := f.keys("server-b/shared/accessories/"); len(got) != 2 {
 			t.Fatalf("server-a's prune reached server-b: %v", got)
 		}
 	})
@@ -819,6 +944,49 @@ http.server.HTTPServer(("127.0.0.1",` + itHookPort + `),H).serve_forever()
 		}
 		if got := f.keys("teployit/accessories/db/"); len(got) != len(before) {
 			t.Fatalf("pruned an unowned previous prefix: %d -> %d", len(before), len(got))
+		}
+		// The real flag: owned applies only to the prefix being left. A second run
+		// first, so the prefix being left has history to age out.
+		if _, code, runOut := f.runAll(""); code != 0 {
+			t.Fatalf("second run: %s", runOut)
+		}
+		srv1Before := len(f.keys("srv1/teployit/accessories/db/"))
+		rootBefore := len(f.keys("teployit/accessories/db/"))
+		out, err = f.cli(cred, "server", "backup-target", "set", "--bucket", "itfleet", "--endpoint", itEndpoint, "--prefix", "srv2", "--previous-prefix-owned")
+		if err != nil {
+			t.Fatalf("target set --previous-prefix-owned: %v\n%s", err, out)
+		}
+		moved, err := backup.ReadTarget(ctx, vm)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, pp := range moved.PreviousPrefixes {
+			if want := pp.Prefix == "srv1"; pp.Owned != want {
+				t.Fatalf("%q owned=%v: %+v", pp.Prefix, pp.Owned, moved.PreviousPrefixes)
+			}
+		}
+		if _, err := client.PruneBackups(ctx, "teployit", "accessories/db", TargetS3(moved), backup.RetentionPolicy{KeepLast: 1}); err != nil {
+			t.Fatal(err)
+		}
+		if got := len(f.keys("teployit/accessories/db/")); got != rootBefore {
+			t.Fatalf("--previous-prefix-owned pruned the shared root: %d -> %d", rootBefore, got)
+		}
+		if got := len(f.keys("srv1/teployit/accessories/db/")); got >= srv1Before {
+			t.Fatalf("the owned prefix did not age out: %d -> %d", srv1Before, got)
+		}
+		// A marker from another server in the owned prefix overrides the word.
+		f.sh("printf x > " + itDir + "/o")
+		f.awsIT("s3 cp " + itDir + "/o s3://itfleet/srv1/teployit/.owners/bbbbbbbbbbbbbbbb --only-show-errors")
+		srv1Now := len(f.keys("srv1/teployit/accessories/db/"))
+		if _, err := client.PruneBackups(ctx, "teployit", "accessories/db", TargetS3(moved), backup.RetentionPolicy{KeepLast: 1}); err == nil || !strings.Contains(err.Error(), "shared backup namespace") {
+			t.Fatalf("a foreign marker in an owned prefix: %v", err)
+		}
+		if got := len(f.keys("srv1/teployit/accessories/db/")); got != srv1Now {
+			t.Fatalf("pruned a prefix with a foreign marker: %d -> %d", srv1Now, got)
+		}
+		f.awsIT("s3 rm s3://itfleet/srv1/teployit/.owners/bbbbbbbbbbbbbbbb --only-show-errors")
+		if out, err := f.cli(cred, "server", "backup-target", "set", "--bucket", "itfleet", "--endpoint", itEndpoint, "--prefix", "srv1"); err != nil {
+			t.Fatalf("moving back: %v\n%s", err, out)
 		}
 		// Owned: it ages out under retention, and the newest of all survives.
 		owned := cfg
@@ -894,13 +1062,58 @@ http.server.HTTPServer(("127.0.0.1",` + itHookPort + `),H).serve_forever()
 		if !sawUncovered {
 			t.Fatalf("uncovered_databases: %v", st.UncoveredDatabases)
 		}
+
+		// Dash restores a row by id and accessory alone: per-database rows only on
+		// request, or restoring one would replace the primary.
+		listOut, err := f.cli("", "--json", "backup", "list", "--app", "teployit")
+		if err != nil {
+			t.Fatalf("list: %v\n%s", err, listOut)
+		}
+		if strings.Contains(listOut, `"database"`) {
+			t.Fatalf("per-database rows without --databases: %s", listOut)
+		}
+		listOut, err = f.cli("", "--json", "backup", "list", "--app", "teployit", "--databases")
+		if err != nil || !strings.Contains(listOut, `"database":"reports"`) {
+			t.Fatalf("--databases: %v\n%s", err, listOut)
+		}
+
+		// A wiped namespace is not covered, whatever the last run said.
+		f.awsIT("s3 rm --recursive --only-show-errors s3://itfleet/srv1/_adopted/accessories/wordpress-shared-mysql/")
+		f.awsIT("s3 rm --recursive --only-show-errors s3://itfleet/_adopted/accessories/wordpress-shared-mysql/")
+		out, err = f.cli("", "--json", "backup", "status")
+		if err != nil {
+			t.Fatalf("status: %v\n%s", err, out)
+		}
+		st = backupStatusDTO{}
+		if err := json.Unmarshal(lastJSONLine([]byte(out)), &st); err != nil {
+			t.Fatal(err)
+		}
+		if e := entry("wordpress-shared-mysql"); e.Coverage != backup.CoverageStale || e.Newest != nil {
+			t.Fatalf("a wiped namespace: %+v", e)
+		}
+		res, code, runOut := f.runAll("")
+		if code != 0 {
+			t.Fatalf("run: %d %s", code, runOut)
+		}
+		_ = res
 	})
 
 	t.Run("adopting by name: an underscore, no labels", func(t *testing.T) {
 		f.t = t
 		f.psql("omni_postgres", "postgres", "CREATE DATABASE omni")
 		f.psql("omni_postgres", "omni", "CREATE TABLE o(id int); INSERT INTO o VALUES (1)")
-		out, err := f.cli("", "server", "backup-policy", "set", "--adopt", "omni_postgres:postgres:all", "--volume-max-gb", "0.000001")
+		// The machine path, end to end. --host must not count as a policy flag.
+		policyJSON, _ := json.Marshal(backup.FleetPolicy{Interval: "1h", Retention: retention, Volumes: true, Recipient: f.pub, Adopted: base.Adopted, HeartbeatURLs: base.HeartbeatURLs})
+		out, err := f.cli(string(policyJSON), "--json", "server", "backup-policy", "set", "--stdin")
+		if err != nil || strings.Contains(out, itToken) {
+			t.Fatalf("policy set --stdin: %v\n%s", err, out)
+		}
+		// A machine-written policy that drops the key does not silently stop encrypting.
+		noKey, _ := json.Marshal(backup.FleetPolicy{Interval: "1h", Retention: retention, Volumes: true})
+		if out, err := f.cli(string(noKey), "server", "backup-policy", "set", "--stdin"); err == nil || !strings.Contains(out, "--no-recipient") {
+			t.Fatalf("dropping the recipient on stdin: %v\n%s", err, out)
+		}
+		out, err = f.cli("", "server", "backup-policy", "set", "--adopt", "omni_postgres:postgres:all", "--volume-max-gb", "0.000001")
 		if err != nil {
 			t.Fatalf("policy set: %v\n%s", err, out)
 		}
@@ -983,6 +1196,8 @@ http.server.HTTPServer(("127.0.0.1",` + itHookPort + `),H).serve_forever()
 		f.sh("docker run -d --name teployit2-db --memory 128m --label teploy.role=accessory --label teploy.app=teployit2 --label teploy.accessory=db -e POSTGRES_DB=two -e POSTGRES_USER=appuser -e POSTGRES_PASSWORD=" + itDBPW + " postgres:17-alpine >/dev/null")
 		f.waitFor("postgres", "docker exec teployit2-db pg_isready -h 127.0.0.1 -U appuser")
 		f.psql("teployit2-db", "two", "CREATE TABLE z(id int)")
+		f.sh("docker exec teployit2-db psql -X -q -U appuser -d postgres -c 'CREATE DATABASE analytics'")
+		f.psql("teployit2-db", "analytics", "CREATE TABLE a(id int); INSERT INTO a VALUES (41),(42)")
 		// Upgrade, from a folder with teploy.yml.
 		dir := t.TempDir()
 		yml := "app: teployit2\nserver: " + f.host + "\ndomain: teployit2.example.test\nimage: alpine:3\naccessories:\n  db:\n    image: postgres:17-alpine\n    env:\n      POSTGRES_DB: two\n      POSTGRES_USER: appuser\n      POSTGRES_PASSWORD: " + itDBPW + "\n"
@@ -1024,8 +1239,16 @@ http.server.HTTPServer(("127.0.0.1",` + itHookPort + `),H).serve_forever()
 		if len(f.keys(base+"teployit2/accessories/db/")) <= keysBefore {
 			t.Fatal("no backup object from the upgrade")
 		}
+		if len(f.keys(base+"teployit2/accessories/db/databases/analytics/")) == 0 {
+			t.Fatalf("the upgrade's backup left out a database: %v", f.keys(base+"teployit2/accessories/db/"))
+		}
 		f.waitFor("postgres", "docker exec teployit2-db pg_isready -h 127.0.0.1 -U appuser")
 		f.psql("teployit2-db", "two", "CREATE TABLE IF NOT EXISTS z(id int)")
+		// The accessory has no volume in this fixture, so the data did not survive
+		// the recreate: seed the second database again for the purge.
+		f.sh("docker exec teployit2-db psql -X -q -U appuser -d postgres -c 'CREATE DATABASE analytics'")
+		f.psql("teployit2-db", "analytics", "CREATE TABLE a(id int); INSERT INTO a VALUES (41),(42)")
+		analyticsBefore := len(f.keys(base + "teployit2/accessories/db/databases/analytics/"))
 		// Healthy: the purge backs up the accessory and the volumes, then deletes.
 		keysBefore = len(f.keys(base + "teployit2/accessories/db/"))
 		out, err = f.cli("", "remove", "--app", "teployit2", "--purge", "--yes")
@@ -1034,6 +1257,17 @@ http.server.HTTPServer(("127.0.0.1",` + itHookPort + `),H).serve_forever()
 		}
 		if len(f.keys(base+"teployit2/accessories/db/")) <= keysBefore || len(f.keys(base+"teployit2/volumes/")) == 0 {
 			t.Fatalf("no backups from the purge: %v", f.keys(base+"teployit2/"))
+		}
+		if !strings.Contains(out, "Backed up every database") {
+			t.Fatalf("purge output: %s", out)
+		}
+		// What the purge destroyed is in the bucket: every database, not the primary alone.
+		if got := len(f.keys(base + "teployit2/accessories/db/databases/analytics/")); got <= analyticsBefore {
+			t.Fatalf("the purge's backup left out a database: %d -> %d", analyticsBefore, got)
+		}
+		// Safety copies are marked: retention leaves them for a week.
+		if len(f.keys(base+"teployit2/accessories/db/safety/")) == 0 {
+			t.Fatalf("no safety markers: %v", f.keys(base+"teployit2/accessories/db/"))
 		}
 		if res := ssh.RunDetailed(ctx, vm, "docker inspect teployit2-db >/dev/null 2>&1"); !res.Failed() {
 			t.Fatal("the purge left the accessory")
@@ -1105,6 +1339,142 @@ http.server.HTTPServer(("127.0.0.1",` + itHookPort + `),H).serve_forever()
 			t.Fatalf("receipt: %+v", receipt)
 		}
 		vm.Run(ctx, "docker ps -aq --filter name=teploy-dr- | xargs -r docker rm -fv >/dev/null 2>&1; rm -rf /var/tmp/teploy-dr/teployit")
+
+		// Clean-host recovery through the normal commands: no server identity, no
+		// policy, no stored target; only the bucket credentials and the owner's key.
+		cleanHost := "mkdir -p " + itDir + "/hidden && mv /deployments/.age-key " + itDir + "/hidden/age-key && for f in backup-policy.json backup-target.json; do [ -e \"$HOME\"/.config/teploy/$f ] && mv \"$HOME\"/.config/teploy/$f " + itDir + "/hidden/$f; done; true"
+		restoreHost := "mv " + itDir + "/hidden/age-key /deployments/.age-key; for f in backup-policy.json backup-target.json; do [ -e " + itDir + "/hidden/$f ] && mv " + itDir + "/hidden/$f \"$HOME\"/.config/teploy/$f; done; true"
+		f.sh(cleanHost)
+		defer f.sh(restoreHost)
+		dir := t.TempDir()
+		yml := "app: teployit\nserver: " + f.host + "\ndomain: teployit.example.test\nimage: alpine:3\nvolumes:\n  data: /app/data\naccessories:\n  db:\n    image: postgres:17-alpine\n    env:\n      POSTGRES_DB: appdb\n      POSTGRES_USER: appuser\n      POSTGRES_PASSWORD: " + itDBPW + "\n"
+		if err := os.WriteFile(filepath.Join(dir, "teploy.yml"), []byte(yml), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		creds := []string{"TEPLOY_S3_ACCESS_KEY=" + itAK, "TEPLOY_S3_SECRET_KEY=" + itSK}
+		run := func(args ...string) (string, error) {
+			c := exec.CommandContext(ctx, f.local, append([]string{"--host", f.host, "--user", f.user, "--key", f.key}, args...)...)
+			c.Dir = dir
+			c.Env = append(os.Environ(), creds...)
+			o, e := c.CombinedOutput()
+			return string(o), e
+		}
+		s3Flags := []string{"--bucket", "itfleet", "--endpoint", itEndpoint, "--prefix", "srv1"}
+		// Without the key: refused, naming the flag.
+		out, err := run(append([]string{"dr", "restore", m.ID}, s3Flags...)...)
+		if err == nil || !strings.Contains(out, "--identity") {
+			t.Fatalf("dr restore with no key on a clean host: %v\n%s", err, out)
+		}
+		f.sh("rm -rf /var/tmp/teploy-dr/teployit")
+		out, err = run(append(append([]string{"dr", "restore", m.ID}, s3Flags...), "--identity", f.ownerLocal)...)
+		if err != nil {
+			t.Fatalf("dr restore --identity --bucket --prefix on a clean host: %v\n%s", err, out)
+		}
+		vm.Run(ctx, "docker ps -aq --filter name=teploy-dr- | xargs -r docker rm -fv >/dev/null 2>&1; rm -rf /var/tmp/teploy-dr/teployit")
+		if left := strings.TrimSpace(f.sh("ls -d /var/tmp/teploy-dr-identity.* 2>/dev/null; true")); left != "" {
+			t.Fatalf("the owner key was left on the server: %s", left)
+		}
+		// A database and one schema, encrypted, restored with only the owner's key.
+		rows := f.keys("srv1/teployit/accessories/db/")
+		id := ""
+		for _, k := range rows {
+			if rel := strings.TrimPrefix(k, "srv1/teployit/accessories/db/"); !strings.Contains(rel, "/") && strings.HasSuffix(rel, ".pgdump.age") {
+				id = strings.Split(rel, ".")[0]
+			}
+		}
+		if id == "" {
+			t.Fatalf("no encrypted primary: %v", rows)
+		}
+		f.psql("teployit-db", "appdb", "INSERT INTO t VALUES (777)")
+		// The server identity alone is absent: without --identity it says what to do.
+		out, err = run(append([]string{"backup", "restore", id, "--app", "teployit", "--accessory", "db", "--yes", "--no-backup"}, s3Flags...)...)
+		if err == nil || !strings.Contains(out, "--identity") {
+			t.Fatalf("restore with no key on a clean host: %v\n%s", err, out)
+		}
+		out, err = run(append(append([]string{"backup", "restore", id, "--app", "teployit", "--accessory", "db", "--yes", "--no-backup"}, s3Flags...), "--identity", f.ownerLocal)...)
+		if err != nil {
+			t.Fatalf("backup restore --identity on a clean host: %v\n%s", err, out)
+		}
+		if got := f.psql("teployit-db", "appdb", "SELECT COUNT(*) FROM t WHERE id = 777"); got != "0" {
+			t.Fatalf("the restore did not replace the data: %s", got)
+		}
+		if left := strings.TrimSpace(f.sh("ls -d /var/tmp/teploy-dr-identity.* 2>/dev/null; true")); left != "" {
+			t.Fatalf("the owner key was left on the server: %s", left)
+		}
+	})
+
+	t.Run("a real cron firing, with cron's own PATH", func(t *testing.T) {
+		f.t = t
+		seq := f.sh("wc -l < /deployments/.teploy/apps/_fleet/events.jsonl")
+		f.sh(`crontab -l | sed -E 's|^([^ ]+ +){5}|* * * * * |' | crontab -`)
+		line := f.sh("crontab -l")
+		if !strings.HasPrefix(line, "* * * * * ") {
+			t.Fatalf("crontab: %s", line)
+		}
+		fired := false
+		for i := 0; i < 240 && !fired; i++ {
+			if strings.TrimSpace(f.sh("wc -l < /deployments/.teploy/apps/_fleet/events.jsonl")) != strings.TrimSpace(seq) {
+				fired = true
+				break
+			}
+			time.Sleep(time.Second)
+		}
+		f.sh(`crontab -l | sed -E 's|^([^ ]+ +){5}|7 3 * * * |' | crontab -`)
+		f.waitFor("the cron run to finish", "! pgrep -f '[b]ackup run --all' >/dev/null")
+		if !fired {
+			t.Fatal("cron never ran it")
+		}
+		last := f.sh("tail -n 1 /deployments/.teploy/apps/_fleet/events.jsonl")
+		if !strings.Contains(last, `"kind":"backup.all"`) || strings.Contains(last, "aws CLI not found") {
+			t.Fatalf("cron's run: %s", last)
+		}
+	})
+
+	t.Run("a non-root user who cannot read /etc/teploy never uploads plaintext", func(t *testing.T) {
+		f.t = t
+		policy := `{"v":"1","interval":"1h","recipient":"` + f.pub + `"}`
+		f.sh("sudo -n mkdir -p /etc/teploy && printf '%s' " + ssh.ShellQuote(policy) + " | sudo -n tee /etc/teploy/backup-policy.json >/dev/null && sudo -n chmod 600 /etc/teploy/backup-policy.json && sudo -n chmod 700 /etc/teploy")
+		defer f.sh("sudo -n rm -f /etc/teploy/backup-policy.json; sudo -n chmod 755 /etc/teploy; sudo -n userdel -rf teployit 2>/dev/null; true")
+		// This user has passwordless sudo, as deploy users do: the policy is read.
+		got, err := backup.ReadFleetPolicy(ctx, vm)
+		if err != nil || got.Recipient != f.pub {
+			t.Fatalf("through sudo: %+v %v", got, err)
+		}
+		// One without sudo: refused, not "no policy". A target of its own, so the
+		// policy read is what stands between it and a plaintext upload.
+		f.sh("sudo -n useradd -m teployit 2>/dev/null; printf '%s' " + ssh.ShellQuote(`{"v":"1","bucket":"itfleet","region":"us-east-1","endpoint":"`+itEndpoint+`"}`) + " | sudo -n -u teployit -H sh -c 'mkdir -p ~/.config/teploy && cat > ~/.config/teploy/backup-target.json'; sudo -n chmod 755 " + itDir + " " + itBin)
+		before := strings.Join(f.keys("srv1/teployit/volumes/"), ",")
+		res := ssh.RunDetailed(ctx, vm, "sudo -n -u teployit -H env AWS_ACCESS_KEY_ID="+itAK+" AWS_SECRET_ACCESS_KEY="+itSK+" "+itBin+" backup run --app teployit")
+		if !res.Failed() || !strings.Contains(string(res.Stdout)+string(res.Stderr), "cannot tell whether") {
+			t.Fatalf("a hidden policy must refuse: exit %d\n%s%s", res.ExitCode, res.Stdout, res.Stderr)
+		}
+		if strings.Join(f.keys("srv1/teployit/volumes/"), ",") != before {
+			t.Fatal("something was uploaded")
+		}
+		res = ssh.RunDetailed(ctx, vm, "sudo -n -u teployit -H "+itBin+" backup run --all")
+		if !res.Failed() || !strings.Contains(string(res.Stdout)+string(res.Stderr), "cannot tell whether") {
+			t.Fatalf("--all: exit %d\n%s%s", res.ExitCode, res.Stdout, res.Stderr)
+		}
+	})
+
+	t.Run("zero targets is a failure unless the policy allows it", func(t *testing.T) {
+		f.t = t
+		f.sh("docker rm -fv teployit-db teployit-cache wordpress-shared-mysql omni_postgres >/dev/null 2>&1; true")
+		p := backup.FleetPolicy{V: "1", Interval: "1h", Retention: retention, Recipient: f.pub, HeartbeatURLs: base.HeartbeatURLs}
+		f.setPolicy(p)
+		res, code, out := f.runAll("")
+		if code == 0 || res.Status != backup.RunFailed || !strings.Contains(res.Error, "allow_empty") {
+			t.Fatalf("exit %d %s %s\n%s", code, res.Status, res.Error, out)
+		}
+		if log := f.sh("cat " + itDir + "/hook.log"); !strings.Contains(lastLine(log), "status=down") {
+			t.Fatalf("heartbeat: %s", lastLine(log))
+		}
+		p.AllowEmpty = true
+		f.setPolicy(p)
+		res, code, out = f.runAll("")
+		if code != 0 || res.Status != backup.RunOK {
+			t.Fatalf("allowed: exit %d %s\n%s", code, res.Status, out)
+		}
 	})
 
 	t.Run("doctor flags a policy with no target and no recipient", func(t *testing.T) {

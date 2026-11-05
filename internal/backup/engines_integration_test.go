@@ -36,6 +36,7 @@ import (
 const fakeAWS = `#!/bin/sh
 set -eu
 root=__ROOT__
+[ "${1:-}" = --version ] && { echo "fake aws"; exit 0; }
 if [ "$1" = s3api ]; then
   # head-object --bucket B --key K [--region R] [--endpoint-url E]
   [ "$2" = head-object ] || exit 1
