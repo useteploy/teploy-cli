@@ -51,7 +51,33 @@ Regressions: `go test -tags integration ./internal/backup`, the full engine matr
 v0.1.51 (postgres, pgvector, timescale, mysql, mariadb, mongo, redis, valkey, dragonfly). The DR
 fixture still needs a 022 umask.
 
+Re-review (2026-11-05, 16 items), all on the branch. Blocker and highs: a publish copy of 8 MB
+or more becomes UploadPartCopy, which B2 documents cannot change a checksum algorithm, and R2
+cannot do with its default tag read (`--copy-props metadata-directive`, then a re-upload of the
+verified local file on any refusal); pending uploads at every depth billed forever on a store
+that keeps versions (one `.incoming/` tree, doctor reads the lifecycle rule, the marker is not
+rewritten); a sudoer read /etc and wrote ~/.config, so rotation did nothing (one path, a read-back
+in `WriteFleetPolicy`, and the lock falls back). Medium and low: `owners --clear` on a live marker,
+a prune trusting a same-host clock and skipping an unreadable one, a janitor fixed at 7h, uncapped
+safety copies, an unreachable previous prefix staling everything, the wrong chmod 711 remedy,
+future-dated objects, the checksum head with no fallback, `--exclude` unnamed, no minimum aws
+version, the kill order on a stuck holder. Decisions: the clone and renamed-host limits of the
+fingerprint are documented, not papered over (an id file is copied by a clone too); marker recency
+is the namespace's newest write, since a marker that is not rewritten says nothing about liveness;
+the minimum aws is 2.23.0/1.37.0 from aws-cli's own changelog (first default checksum on upload).
+
+Proven only against MinIO, not real B2 or R2: every publish path. The refusal is simulated by a
+shim, with an assumed error text, and a re-upload follows anything shaped like a store's error
+reply rather than one exact string for that reason. Also unverified on B2: whether its S3 API
+answers `GetBucketLifecycleConfiguration` (if not, doctor warns "unknown", which is true and
+permanent there), whether `--copy-props metadata-directive` carries metadata through its multipart
+copy, and Object Lock with aws 2.23+. The real-B2 smoke test is the coordinator's.
+
 Open / deferred:
+- The run lock falls back per user when the policy's directory is not writable, so a root run
+  and a sudoer's run do not exclude each other. Only one of them has the cron line.
+- `backup status` can still read a future-dated object as the newest good one, so one stray
+  object can show a target covered. Prune no longer trusts it; status has not been changed.
 - Legacy objects from a server that has not upgraded yet carry no marker. A first prune in
   a shared root by an upgraded server cannot tell them from its own: only markers from the
   moment each server upgrades protect it. Per-server prefixes close this (decided: Dash always

@@ -725,32 +725,66 @@ and `backup.all` (under the pseudo-app `_fleet`) and `--json` both report `ok`,
 hits, a DB-like container nothing adopts, including engines teploy has no method for
 such as ClickHouse or Qdrant, a schema the tools cannot address). A clean status with
 omissions is not a complete backup. Zero targets is a failure unless the policy says
-`--allow-empty`: a lost accessory and an empty docker daemon look the same. A target
-that has earlier backups and now holds nothing to back up (its databases dropped) is
-a failure too. `--tmp-dir` builds on another disk and `--target-deadline` replaces the
-6h per-target deadline; manual commands take `--deadline`. A run that finds another
-running stands down; the lock is an `flock`, so a killed run cannot block the next,
-and a holder alive past the 23h run deadline is killed. Each target has a 6h deadline.
+`--allow-empty`: a lost accessory and an empty docker daemon look the same (and a run
+warns while `allow_empty` is set on a server that has targets, since losing them all
+would then report ok). A target that has earlier backups and now holds nothing to back
+up (its databases dropped) is a failure too, whose message names the `--exclude` that
+ends it. `--tmp-dir` builds on another disk and `--target-deadline` replaces the 6h
+per-target deadline; manual commands take `--deadline`. Neither may exceed the 23h a run
+may last: that is refused, not capped. A run that finds another running stands down; the
+lock is an `flock`, so a killed run cannot block the next, and a holder alive past the
+23h run deadline is killed. The lock sits beside the policy, or in `~/.config/teploy`
+when this user cannot write there.
 
 A killed run's leftovers are invisible to later runs and visible to doctor: a final
-key only ever holds a verified object (the upload goes to a `.incoming/` key, its
-size and SHA-256 are checked, up to 256 MiB its bytes are read back, above that the
-store's own `--checksum-algorithm SHA256` is used, and only then is it copied into place), sidecars are stored before the primary object that commits
-a backup, and objects below their engine's plausibility floor are never a good copy.
+key only ever holds a verified object (the upload goes to one `<prefix>/.incoming/`
+tree, its size and SHA-256 are checked, up to 256 MiB its bytes are read back, above that
+the store's own `--checksum-algorithm SHA256` is used, and only then is it copied into
+place), sidecars are stored before the primary object that commits a backup, and objects
+below their engine's plausibility floor are never a good copy. A store that refuses the
+server-side copy gets the verified file uploaded straight to its final name instead, and
+verified there. A workspace records its own deadline, so a janitor never cleans a live
+long run; a pending upload is a leftover after 24h.
+
+**Give `.incoming/` a 1-day lifecycle rule.** Every backup passes through it, and on a
+store that keeps versions (B2 only hides on delete; a versioned bucket) what was deleted
+there stays billed: about one extra copy of every backup, forever. `teploy doctor` reads
+the rule through `GetBucketLifecycleConfiguration` and warns when there is none, or when
+the store will not say. Scope the rule to `.incoming/` under the server's prefix: a rule
+on the whole bucket deletes the backups.
+
+```sh
+aws s3api put-bucket-lifecycle-configuration --bucket B --lifecycle-configuration '{"Rules":[{
+  "ID":"teploy-incoming","Status":"Enabled","Filter":{"Prefix":"PREFIX/.incoming/"},
+  "Expiration":{"Days":1},"NoncurrentVersionExpiration":{"NoncurrentDays":1},
+  "AbortIncompleteMultipartUpload":{"DaysAfterInitiation":1}}]}'
+```
+
+On B2 the same thing in its own terms is a lifecycle rule with `fileNamePrefix`
+`PREFIX/.incoming/`, `daysFromUploadingToHiding` 1 and `daysFromHidingToDeleting` 1.
+
+The aws CLI must be at least 2.23.0 (or 1.37.0), the first to send a checksum on every
+upload, which a bucket with Object Lock requires. An older one is refused with the remedy,
+and doctor fails on it; `teploy setup` replaces it.
 
 **Retention** is a union of rules over the good backups, restic `forget` style:
 `--keep-last N`; `--keep-daily/-weekly/-monthly N` keep the newest backup of the last
 N UTC days, ISO weeks and months that have one (an empty period does not use one up);
 `--max-age-days D` keeps everything younger than D days (restic's `keep-within`), and
 anything older goes unless another rule keeps it. The newest good backup is never
-deleted, and a safety copy a destructive operation took outlasts every rule for 7 days.
+deleted, and the newest 5 safety copies a destructive operation took, per target, outlast
+every rule for 7 days.
 The primary and each database's series are selected on their own, so a database that
 fails in the last run of each day still gets its `keep_daily`; ids the primary keeps
 are also kept for the databases. A pruned backup takes its sidecars with it. The same
 flags work on `teploy backup prune`. A run that stored nothing prunes nothing. A prune
 refuses (a warning in the run's output, event and doctor: the backup is stored, retention
-has stopped) when this machine's clock is over an hour from the store's or a backup is
-dated in the future (`backup prune --ignore-clock`).
+has stopped) when this machine's clock is over an hour from the store's, when the store's
+clock cannot be read (`backup prune --ignore-clock` for both), and when one run would
+delete most of a series, at least 3 backups and over half of it: a store on the same host
+shares a wrong clock, and a mistaken policy looks the same. Tighten retention on purpose
+with one `backup prune --allow-mass-delete`. A backup dated in the future is left out of
+selection: never deleted, never counted as the newest, and warned about on every run.
 
 **Heartbeats**: after every run the server GETs each URL, adding `?status=down` on
 anything but `ok` (`/fail` for healthchecks.io). A failing receiver is reported and
@@ -799,10 +833,13 @@ verify-backup`, and `teploy dr restore <id> --identity recovery.txt --bucket B -
 E --prefix P`.
 
 A non-root SSH user usually cannot see into `/etc/teploy` (0700 once root has used it),
-where a policy would be invisible rather than absent. Teploy asks through passwordless
-sudo when it can; a user with its own `~/.config/teploy/backup-policy.json` follows that;
-anyone else is refused rather than risk uploading plaintext on a server configured to
-encrypt (`chmod 711 /etc/teploy` lets the refusal go away, and leaves the files 0600).
+where a policy would be invisible rather than absent. Teploy reads, writes and removes the
+policy there through passwordless sudo when it can, so there is one policy and rotating a
+key rotates it. A user with neither sudo nor write access keeps its own
+`~/.config/teploy/backup-policy.json` when nothing in `/etc` would shadow it; if it can see
+one there, `set` and `unset` refuse rather than store a copy nothing reads. A user that
+cannot tell is refused rather than risk uploading plaintext on a server configured to
+encrypt: connect as root, give it passwordless sudo, or set its own policy.
 
 #### Shared buckets
 
@@ -815,8 +852,18 @@ policy's retention. As a second guard every server leaves a marker at
 `<base>/<app>/.owners/<fingerprint>` before its first prune, and a namespace holding
 another server's marker, or one whose owners cannot be listed, is never pruned. `teploy
 server backup-target owners` lists the markers; `--clear <fingerprint>` removes those of
-a server that is gone, or this one before a rebuild. A policy with no prefix in a bucket another server
-writes to is flagged by `teploy doctor`.
+a server that is gone, or this one before a rebuild. Without its marker a prune here deletes
+that server's backups, so a namespace written to in the last week needs `--force`, and every
+clear or refusal is an event in the `_fleet` log. A policy with no prefix in a bucket another
+server writes to is flagged by `teploy doctor`.
+
+The fingerprint is a hash of `/etc/machine-id` and the hostname, plus the server's age public
+key in the marker. Two things follow, on purpose rather than papered over with an id file a
+clone would copy too. Renaming a host gives it a new fingerprint: it sees its old marker as
+another server's and refuses to prune, which is safe, and `owners --clear <old> --force` ends
+it. A clone that keeps the machine-id and hostname and has no age identity is the same server
+to this check, so clones need their own `--prefix` (Dash always sets one) or a fresh
+`/etc/machine-id`.
 
 #### Before anything destructive
 

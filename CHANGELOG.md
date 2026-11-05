@@ -62,6 +62,25 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
   newest good backup is never pruned even with only `--max-age-days` set.
 - `backup list` shows per-database rows only with `--databases`: a caller restoring a
   row by id and accessory alone would replace the primary with another database's dump.
+- Pending uploads live in one `<prefix>/.incoming/` tree, so a 1-day lifecycle rule can
+  expire them on a store that keeps versions; doctor reads the rule and warns without one.
+  Owner markers are written once, not on every prune.
+- A publish copy names `--copy-props metadata-directive`. A store that refuses the copy
+  gets the verified file uploaded straight to its final name.
+- The policy is written and removed through passwordless sudo when that is how it is
+  read, and `set`/`unset` refuse when a policy would stay in force. The run lock falls
+  back to `~/.config/teploy` when the policy's directory is not writable.
+- `owners --clear` refuses a namespace written to in the last week without `--force`,
+  and records every clear or refusal (`backup_target.owners_clear`).
+- A prune refuses when it would delete most of a series (`--allow-mass-delete`) and when
+  the store's clock cannot be read. A future-dated object no longer stops retention: it
+  is left out of selection, never deleted, and warned about.
+- `target_deadline` and `--deadline` over 23h are refused rather than capped. A workspace
+  records its own deadline for the janitor; a pending upload is a leftover after 24h.
+- Safety copies are capped at the newest 5 per target. An unreachable previous prefix is
+  a warning, not a failed listing and a stale status.
+- The aws CLI must be at least 2.23.0 (or 1.37.0), the first to send a checksum on every
+  upload, which Object Lock requires. `teploy setup` replaces an older one.
 
 ### Fixed
 
