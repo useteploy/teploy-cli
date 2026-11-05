@@ -206,10 +206,12 @@ func TestRestoreVolumes_PartialMoveAsideNeverDeletesLiveEntries(t *testing.T) {
 func TestAccessoryRestore_MySQL_DownloadsAndRestoresRealPaths(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
+		ssh.MockCommand{Match: "aws s3 ls", Output: "2026-01-01 00:00:00 99 20260101-000000.sql.gz\n"},
 		ssh.MockCommand{Match: "aws s3 cp", Output: "download: done\n"},
 		ssh.MockCommand{Match: "mktemp -d '/tmp/teploy-restore.XXXXXX'", Output: "/tmp/teploy-restore.abc123\n"},
-		ssh.MockCommand{Match: "gunzip -c", Output: ""},
+		ssh.MockCommand{Match: "umask 077; gunzip -c", Output: ""},
 		ssh.MockCommand{Match: "docker exec", Output: ""},
+		ssh.MockCommand{Match: "rm -f ", Output: ""},
 		ssh.MockCommand{Match: "rm -rf", Output: ""},
 	)
 
@@ -226,7 +228,7 @@ func TestAccessoryRestore_MySQL_DownloadsAndRestoresRealPaths(t *testing.T) {
 		if strings.HasPrefix(call, "aws s3 cp") {
 			download = call
 		}
-		if strings.Contains(call, "mysql -u root") {
+		if strings.Contains(call, "gunzip -c") {
 			restore = call
 		}
 	}
@@ -244,6 +246,7 @@ func TestAccessoryRestore_MySQL_DownloadsAndRestoresRealPaths(t *testing.T) {
 func TestAccessoryRestore_GenericStagesBeforePromoting(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
+		ssh.MockCommand{Match: "aws s3 ls", Output: "2026-01-01 00:00:00 99 20260101-000000.tar.gz\n"},
 		ssh.MockCommand{Match: "aws s3 cp", Output: "download: done\n"},
 		ssh.MockCommand{Match: "rm -rf", Output: ""},
 		ssh.MockCommand{Match: "mkdir -p", Output: ""},
@@ -293,6 +296,7 @@ func TestAccessoryRestore_GenericStagesBeforePromoting(t *testing.T) {
 func TestAccessoryRestore_RedisRestartsAfterCopyFailure(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
+		ssh.MockCommand{Match: "aws s3 ls", Output: "2026-01-01 00:00:00 99 20260101-000000.rdb.gz\n"},
 		ssh.MockCommand{Match: "aws s3 cp", Output: "download: done\n"},
 		ssh.MockCommand{Match: "mktemp -d '/tmp/teploy-restore.XXXXXX'", Output: "/tmp/teploy-restore.abc123\n"},
 		// A40's preflight must prove appendonly=no before the script runs.
@@ -334,68 +338,3 @@ func TestAccessoryRestore_RedisRestartsAfterCopyFailure(t *testing.T) {
 // etc.), shared by every restore — concurrent restores or a crash followed by
 // a retry could pick up the previous run's files. Each restore must allocate
 // its own temp dir, remove it on success, and keep (and name) it on failure.
-func TestAccessoryRestore_UsesPerInvocationTempDir(t *testing.T) {
-	mock := ssh.NewMockExecutor("1.2.3.4",
-		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
-		ssh.MockCommand{Match: "aws s3 cp", Output: "download: done\n"},
-		ssh.MockCommand{Match: "mktemp -d '/tmp/teploy-restore.XXXXXX'", Output: "/tmp/teploy-restore.abc123\n"},
-		ssh.MockCommand{Match: "gunzip -c", Output: ""},
-		ssh.MockCommand{Match: "docker exec", Output: ""},
-		ssh.MockCommand{Match: "rm -rf", Output: ""},
-	)
-
-	var buf bytes.Buffer
-	client := NewClient(mock, &buf)
-	err := client.AccessoryRestore(context.Background(), "myapp", "postgres", "postgres:16",
-		"20260101-000000", nil, S3Config{Bucket: "my-bucket", Region: "us-east-1"})
-	if err != nil {
-		t.Fatalf("AccessoryRestore: %v", err)
-	}
-
-	var restoreCmd, cleanup string
-	for _, call := range mock.Calls {
-		if strings.Contains(call, "psql") {
-			restoreCmd = call
-		}
-		if strings.HasPrefix(call, "rm -rf '/tmp/teploy-restore.") {
-			cleanup = call
-		}
-	}
-	if restoreCmd == "" {
-		t.Fatal("expected a psql restore command")
-	}
-	if !strings.Contains(restoreCmd, "/tmp/teploy-restore.abc123/restore.sql") {
-		t.Errorf("restore must use a per-invocation temp path, got: %s", restoreCmd)
-	}
-	if strings.Contains(restoreCmd, "'/tmp/restore.sql'") {
-		t.Errorf("restore must not use the shared fixed path /tmp/restore.sql: %s", restoreCmd)
-	}
-	if cleanup == "" {
-		t.Errorf("success must remove the temp dir, got calls: %v", mock.Calls)
-	}
-}
-
-func TestAccessoryRestore_FailureKeepsTempDir(t *testing.T) {
-	mock := ssh.NewMockExecutor("1.2.3.4",
-		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
-		ssh.MockCommand{Match: "aws s3 cp", Output: "download: done\n"},
-		ssh.MockCommand{Match: "mktemp -d '/tmp/teploy-restore.XXXXXX'", Output: "/tmp/teploy-restore.abc123\n"},
-		ssh.MockCommand{Match: "gunzip -c", Err: fmt.Errorf("exit status 1: gzip: stdin: not in gzip format")},
-	)
-
-	var buf bytes.Buffer
-	client := NewClient(mock, &buf)
-	err := client.AccessoryRestore(context.Background(), "myapp", "postgres", "postgres:16",
-		"20260101-000000", nil, S3Config{Bucket: "my-bucket", Region: "us-east-1"})
-	if err == nil {
-		t.Fatal("expected AccessoryRestore to fail when gunzip fails")
-	}
-	if !strings.Contains(err.Error(), "/tmp/teploy-restore.abc123") {
-		t.Errorf("error must name the kept temp dir for inspection, got: %v", err)
-	}
-	for _, call := range mock.Calls {
-		if strings.HasPrefix(call, "rm -rf '/tmp/teploy-restore.") {
-			t.Errorf("failure must keep the temp dir, got cleanup: %s", call)
-		}
-	}
-}

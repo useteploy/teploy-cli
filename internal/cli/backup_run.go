@@ -115,11 +115,7 @@ func runBackupRunOn(ctx context.Context, executor ssh.Executor, appName, accesso
 		}
 	}
 
-	detail := map[string]any{"id": res.ID, "kind": kind}
-	if accessory != "" {
-		detail["accessory"] = accessory
-	}
-	events.Record(ctx, executor, events.Event{App: appName, Kind: events.KindBackupRun, Outcome: events.Outcome(err), Detail: detail})
+	events.Record(ctx, executor, events.Event{App: appName, Kind: events.KindBackupRun, Outcome: events.Outcome(err), Detail: events.ErrDetail(backupRunDetail(res, kind, accessory), err)})
 
 	if err != nil {
 		// The failure alert (uploaded by `backup schedule` when the app's
@@ -127,6 +123,12 @@ func runBackupRunOn(ctx context.Context, executor ssh.Executor, appName, accesso
 		// single argument-free command.
 		runBackupAlertIfPresent(ctx, appName)
 		return err
+	}
+	if len(res.UncoveredDatabases) > 0 {
+		// Succeeded, but something on the server is not backed up. Nobody
+		// reads events unprompted; until Dash alerts on this (Slice 4) the
+		// failure channel carries it, as a warning.
+		runBackupWarningIfPresent(ctx, appName)
 	}
 	fmt.Printf("Backup %s complete (%s, %d bytes", res.ID, kind, res.SizeBytes)
 	if pruned > 0 {
@@ -144,6 +146,23 @@ func runBackupAlertIfPresent(ctx context.Context, app string) {
 	exec := ssh.NewLocalExecutor()
 	defer exec.Close()
 	res := ssh.RunDetailed(ctx, exec, "if [ -x "+ssh.ShellQuote(script)+" ]; then "+ssh.ShellQuote(script)+"; fi")
+	if res.Failed() {
+		fmt.Fprintf(os.Stderr, "Warning: the backup alert script failed: %s\n", res.ExitErrorText())
+	}
+}
+
+// backupWarningCmd runs the alert script as a warning, only if it is one that
+// understands the argument: an older script ignores it and would report this
+// successful backup as failed. `backup schedule` rewrites it.
+func backupWarningCmd(app string) string {
+	script := ssh.ShellQuote(backupAlertScriptPath(app))
+	return "if [ -x " + script + " ] && grep -qF " + ssh.ShellQuote(backupAlertWarningMarker) + " " + script + "; then " + script + " warning; fi"
+}
+
+func runBackupWarningIfPresent(ctx context.Context, app string) {
+	exec := ssh.NewLocalExecutor()
+	defer exec.Close()
+	res := ssh.RunDetailed(ctx, exec, backupWarningCmd(app))
 	if res.Failed() {
 		fmt.Fprintf(os.Stderr, "Warning: the backup alert script failed: %s\n", res.ExitErrorText())
 	}

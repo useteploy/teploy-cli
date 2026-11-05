@@ -1,5 +1,96 @@
 # Open audit items
 
+## 2026-11-03 — Dash auto-config Slice 2: backup correctness (G6, G7)
+
+Plan: `../_internal/DASH_AUTOCONFIG_PLAN_2026-11-03.md` (U3, U4, P1 G6/G7,
+backup.verify, Slice 0 cron lesson). Branch `slice2-backup-correctness`.
+
+Closed: U3 (engine detection from label/env/entrypoint/image; detected
+databases never tarred; verify classifies by engine), U4 (postgres in-place
+restore: safety dump, DROP ... WITH (FORCE), CREATE, pg_restore; legacy
+.sql.gz still restores), mysql consistency flags, dragonfly snapshot path
+(SAVE RDB / DFLY LOAD), artifact size floors, POSIX pipefail on the mysql
+restore pipes, backup.verify event and enriched backup.run detail, cron
+daemon presence (setup / doctor / schedule refusal), plain ntfy tags.
+Integration matrix (`-tags integration`, colima fixture):
+postgres:17, pgvector:pg17, timescaledb latest-pg17, mysql:8, redis:7,
+valkey:8, dragonfly — all pass.
+
+Independent review (2026-11-03, same day) found the first cut unsafe;
+fixed on the branch: postgres restore now loads into a new database and
+swaps by rename (a failed load or refused swap leaves the live database
+untouched; the previous database is the recovery copy), database-level
+settings/ACLs re-applied, restore preflight (superuser or owner+CREATEDB,
+free space), verify restores as the accessory's own role, legacy .tar.gz
+of reclassified engines restore as files (artifact decides the stop),
+globals stored beside postgres dumps,
+MySQL/Mongo safety dumps + recovery-incomplete classification, mysqldump
+--events, dragonfly rollback classification + trap cleanup, live-DB guard
+on generic tars, `engine:` accessory config, sidecar detection, scheduler
+probe systemd fallback + severity split, restore-leftovers doctor check,
+`accessory restore --yes`. Regression tests (unit + real postgres):
+250 tables at max_locks_per_transaction=10, non-superuser owner + superuser
+extension, refused swap, database settings/ACL preserved with an open
+connection, legacy pgvector tarball, MySQL table created after backup.
+
+Second independent review (2026-11-04) kept the swap design and found the
+rest; fixed on the branch: MySQL/MariaDB and Mongo dry-run load before any
+DROP (MariaDB error 1118 repro), space preflight sizes the backup (recorded
+logical size, else artifact x 4 and at least live) with --ignore-space-check,
+a load or checkpoint that kills the server is recovery-incomplete, swap is one
+transaction and pg_database is re-read on any error, legacy .sql.gz keeps live
+database settings, multi-database clusters warn instead of refusing (backup.run
+detail, doctor backup-coverage, backup_databases: option, --database restore),
+leftovers excluded from coverage and listed by doctor, --release / --rollback,
+docker rm -fv on verify and DR scratches, the shell message that ran hostile
+POSTGRES_DB names removed, ICU provider/locale carried, DR bundles carry roles,
+real Bitnami images work (password from the container's env), warnings and
+recovery_database in the restore DTO, names truncated on rune boundaries.
+Integration matrix now includes mariadb:11 and mongo:7 against real containers.
+
+Third independent review (2026-11-05) kept the swap, backup_databases:, the
+size sidecar and .sql.gz settings, and found the new code's holes; fixed on the
+branch: --release refused when the live postgres database is missing and,
+without --force, for a safety copy with no restore-completed marker, listing
+what it discards; doctor no longer calls it a confirmation and flags unfinished
+copies; MySQL dry run skips the binlog (SET sql_log_bin=0), counts it when it
+cannot, deadlines on loads and cleanup; Mongo dry run has a space preflight and
+liveness check; Postgres sizing adds min(size, max_wal_size); --database copies
+findable, releasable and rollback-able; scheduled backups warn the alert channel
+on uncovered databases (script marker; older scripts are not invoked); MySQL and
+MariaDB warn about other schemas; teploy_check_* excluded from restores, dropped
+before a mongodump, listed by doctor; one short-named Mongo throwaway database;
+safety-copy prefix unambiguous (app@name@); <db>_teploy_check only dropped with
+its marker table; checks run before the app stops; `database` in the restore
+event; `backup list` works without cron.
+
+Open / deferred:
+- G5 adoption of unmanaged containers and MySQL one-object-per-database: not
+  in this slice. MySQL/MariaDB backups cover one schema and warn about the rest.
+- A scheduled backup alerts on coverage only where `backup schedule` has
+  uploaded the current script (rescheduling updates it). Dash alerting: Slice 4.
+- Safety copies are not rolled back automatically for mysql/mongo/dragonfly:
+  --rollback names them and they are loaded by hand.
+- Mongo with auth (MONGO_INITDB_ROOT_USERNAME): mongodump/mongorestore run
+  without credentials, so backup fails loudly (Unauthorized). Pre-existing;
+  needs credentials via --config inside the container, not argv.
+- Mongo restore (--drop) leaves collections created after the backup.
+- verify-backup covers the primary database only, not backup_databases: dumps;
+  DR bundles carry the primary only (their manifest notes what is missing).
+- `backup list` shows one row per id; backup_databases: dumps have no rows of
+  their own.
+- Role password hashes are in the postgres globals sidecar and DR member,
+  unencrypted until G1 (the dump beside them is too).
+- Redis/valkey restore and verify assume /data/dump.rdb (Bitnami redis differs).
+- Dragonfly's pre-restore snapshot in /var/tmp has no free-space preflight
+  (its size is the in-memory dataset).
+- A fenced lock on an app with no /deployments/<app> directory reports
+  "deploy is already in progress" (mkdir of .lock fails). Real accessories
+  have the directory; the message is misleading for anything else.
+- Trigger/autodeploy poll scheduling writes crontab without the scheduler
+  refusal; doctor's scheduler check reports those lines.
+- The DR fixture needs a 022 umask and a tyler-owned /deployments on colima.
+
 ## 2026-09-25 — local image identity
 
 Full local `sha256:<64hex>` image IDs now count as immutable in deployment

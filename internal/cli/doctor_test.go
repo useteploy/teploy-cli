@@ -6,11 +6,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/useteploy/teploy/internal/backup"
 	"github.com/useteploy/teploy/internal/config"
 	"github.com/useteploy/teploy/internal/ssh"
 )
@@ -19,7 +21,7 @@ import (
 // against (adding checks is additive at the end; renaming/removing is a
 // machine-interface bump).
 var doctorCheckOrder = []string{
-	"git", "config", "ssh", "docker", "disk", "registry", "caddy", "compatibility", "repair-debt", "secret-exposure", "server-tools", "config-home", "backup-cron", "age-identity", "git-trigger"}
+	"git", "config", "ssh", "docker", "disk", "registry", "caddy", "compatibility", "repair-debt", "secret-exposure", "server-tools", "config-home", "backup-cron", "age-identity", "git-trigger", "scheduler", "restore-leftovers", "backup-coverage"}
 
 // doctorHappyMock registers every remote read a fully healthy target
 // answers, for the app config returned by doctorTestApp.
@@ -36,6 +38,9 @@ func doctorHappyMock() *ssh.MockExecutor {
 		ssh.MockCommand{Match: "ls -1 '/deployments/.teploy/apps'", Output: ""},
 		ssh.MockCommand{Match: "crontab -l", Output: ""},
 		ssh.MockCommand{Match: "if [ -r /etc/teploy/age-key ]", Output: "present labsent movable"},
+		ssh.MockCommand{Match: "sched_daemon=no", Output: "daemon=yes\nenabled=enabled\ncrontab=yes\nteploy_entries=0\n"},
+		ssh.MockCommand{Match: "for d in /var/tmp/teploy-pre-restore.*", Output: ""},
+		ssh.MockCommand{Match: "docker ps --filter label=teploy.role=accessory", Output: ""},
 	)
 }
 
@@ -84,8 +89,8 @@ func TestDoctorAllChecksPass(t *testing.T) {
 	if ex == nil {
 		t.Fatal("expected an executor back")
 	}
-	if report.Summary != (doctorSummary{OK: 15, Warn: 0, Fail: 0}) {
-		t.Fatalf("summary = %+v, want 15 ok", report.Summary)
+	if report.Summary != (doctorSummary{OK: 18, Warn: 0, Fail: 0}) {
+		t.Fatalf("summary = %+v, want 18 ok", report.Summary)
 	}
 	if len(report.Checks) != len(doctorCheckOrder) {
 		t.Fatalf("got %d checks, want %d", len(report.Checks), len(doctorCheckOrder))
@@ -132,8 +137,8 @@ func TestDoctorJSONStableShape(t *testing.T) {
 		t.Fatalf("machine_interface = %v, want %d", doc["machine_interface"], MachineInterface)
 	}
 	checks, ok := doc["checks"].([]any)
-	if !ok || len(checks) != 15 {
-		t.Fatalf("checks = %#v, want 15 entries", doc["checks"])
+	if !ok || len(checks) != 18 {
+		t.Fatalf("checks = %#v, want 18 entries", doc["checks"])
 	}
 	for i, raw := range checks {
 		check, ok := raw.(map[string]any)
@@ -190,6 +195,9 @@ func TestDoctorHumanTable(t *testing.T) {
 		ssh.MockCommand{Match: "ls -1 '/deployments/.teploy/apps'", Output: ""},
 		ssh.MockCommand{Match: "crontab -l", Output: ""},
 		ssh.MockCommand{Match: "if [ -r /etc/teploy/age-key ]", Output: "present labsent movable"},
+		ssh.MockCommand{Match: "sched_daemon=no", Output: "daemon=yes\nenabled=enabled\ncrontab=yes\nteploy_entries=0\n"},
+		ssh.MockCommand{Match: "for d in /var/tmp/teploy-pre-restore.*", Output: ""},
+		ssh.MockCommand{Match: "docker ps --filter label=teploy.role=accessory", Output: ""},
 	)
 	report, _ := doctorRun(context.Background(), doctorTestDeps(mock), &Flags{}, "", doctorTestApp(), nil)
 	var out bytes.Buffer
@@ -203,7 +211,7 @@ func TestDoctorHumanTable(t *testing.T) {
 	if !strings.Contains(rendered, "fix:") {
 		t.Fatalf("table missing the remediation line:\n%s", rendered)
 	}
-	if !strings.Contains(rendered, "Summary: 14 ok, 0 warn, 1 fail") {
+	if !strings.Contains(rendered, "Summary: 17 ok, 0 warn, 1 fail") {
 		t.Fatalf("table summary line wrong:\n%s", rendered)
 	}
 	assertDoctorReadOnlyCalls(t, mock.Calls)
@@ -676,7 +684,7 @@ func TestDoctorEndToEndAllOK(t *testing.T) {
 	if err := runDoctor(doctorTestDeps(mock), &Flags{}, "", &out); err != nil {
 		t.Fatalf("runDoctor: %v", err)
 	}
-	if !strings.Contains(out.String(), "Summary: 15 ok, 0 warn, 0 fail") {
+	if !strings.Contains(out.String(), "Summary: 18 ok, 0 warn, 0 fail") {
 		t.Fatalf("human report wrong:\n%s", out.String())
 	}
 	assertDoctorReadOnlyCalls(t, mock.Calls)
@@ -701,6 +709,9 @@ func assertDoctorReadOnlyCalls(t *testing.T, calls []string) {
 		"for f in /deployments/*/state.json",
 		"ls -1 '/deployments/.teploy/apps'",
 		"crontab -l",
+		"sched_daemon=no; for f in /proc/",
+		"for d in /var/tmp/teploy-pre-restore.*",
+		"docker ps --filter label=teploy.role=accessory",
 	}
 	for _, call := range calls {
 		allowed := false
@@ -815,5 +826,103 @@ func TestDoctorConfigHomeCheck(t *testing.T) {
 		if check.Result != tc.result || !strings.Contains(check.Detail, tc.want) {
 			t.Errorf("%q: %+v, want %s containing %q", tc.out, check, tc.result, tc.want)
 		}
+	}
+}
+
+// The deploy-ovh lesson: scheduled jobs on a host with no cron daemon are a
+// FAIL (they never run), naming the jobs; a running daemon with jobs is ok;
+// no daemon and nothing scheduled is a warn.
+func TestDoctorSchedulerCheck(t *testing.T) {
+	ctx := context.Background()
+	probe := func(out string) doctorCheck {
+		return doctorSchedulerCheck(ctx, ssh.NewMockExecutor("h", ssh.MockCommand{Match: "sched_daemon=no", Output: out}))
+	}
+	if c := probe("daemon=no\nenabled=unknown\ncrontab=no\nteploy_entries=0\ncrond_teploy=teploy-wp-backup\ncrond_other=replicate\n"); c.Result != doctorFail ||
+		!strings.Contains(c.Detail, "/etc/cron.d/teploy-wp-backup") || !strings.Contains(c.Detail, "/etc/cron.d/replicate") || !strings.Contains(c.Remediation, "teploy setup") {
+		t.Errorf("cron.d jobs without a daemon = %+v, want fail naming them", c)
+	}
+	if c := probe("daemon=no\nenabled=disabled\ncrontab=yes\ncrontab_entries=3\nteploy_entries=2\n"); c.Result != doctorFail || !strings.Contains(c.Detail, "2 teploy crontab line(s)") || !strings.Contains(c.Detail, "1 other crontab line(s)") {
+		t.Errorf("teploy crontab lines without a daemon = %+v, want fail", c)
+	}
+	if c := probe("daemon=no\nenabled=unknown\ncrontab=no\nteploy_entries=0\n"); c.Result != doctorWarn {
+		t.Errorf("no daemon, nothing scheduled = %+v, want warn", c)
+	}
+	if c := probe("daemon=yes\nenabled=enabled\ncrontab=yes\nteploy_entries=1\n"); c.Result != doctorOK {
+		t.Errorf("running daemon = %+v, want ok", c)
+	}
+	if c := probe("daemon=yes\nenabled=disabled\ncrontab=yes\nteploy_entries=1\n"); c.Result != doctorWarn || !strings.Contains(c.Detail, "reboot") {
+		t.Errorf("running but disabled = %+v, want a reboot warning", c)
+	}
+}
+
+// Package-only jobs (certbot, anacron in /etc/cron.d, a non-teploy crontab
+// line) without a daemon are a warning, not a failure; teploy's are a fail.
+func TestDoctorSchedulerSeverity(t *testing.T) {
+	probe := func(out string) doctorCheck {
+		return doctorSchedulerCheck(context.Background(), ssh.NewMockExecutor("h", ssh.MockCommand{Match: "sched_daemon=no", Output: out}))
+	}
+	if c := probe("daemon=no\nenabled=unknown\ncrontab=yes\ncrontab_entries=1\nteploy_entries=1\n"); c.Result != doctorFail {
+		t.Errorf("a teploy crontab job without a daemon = %+v, want fail", c)
+	}
+	if c := probe("daemon=no\nenabled=unknown\ncrontab=no\ncrond_other=certbot\ncrond_other=anacron\n"); c.Result != doctorWarn || !strings.Contains(c.Detail, "/etc/cron.d/certbot") {
+		t.Errorf("package-only cron.d jobs without a daemon = %+v, want warn", c)
+	}
+	if c := probe("daemon=no\nenabled=unknown\ncrontab=yes\ncrontab_entries=2\nteploy_entries=0\n"); c.Result != doctorWarn {
+		t.Errorf("non-teploy crontab lines without a daemon = %+v, want warn", c)
+	}
+}
+
+func TestDoctorRestoreLeftoversCheck(t *testing.T) {
+	ctx := context.Background()
+	clean := ssh.NewMockExecutor("h", ssh.MockCommand{Match: "for d in /var/tmp", Output: ""})
+	if c := doctorRestoreLeftoversCheck(ctx, clean, nil); c.Result != doctorOK {
+		t.Errorf("clean = %+v", c)
+	}
+	stale := ssh.NewMockExecutor("h", ssh.MockCommand{Match: "for d in /var/tmp", Output: "done /var/tmp/teploy-pre-restore.AbC123\n"})
+	c := doctorRestoreLeftoversCheck(ctx, stale, nil)
+	if c.Result != doctorWarn || !strings.Contains(c.Detail, "teploy-pre-restore.AbC123") || strings.Contains(c.Remediation, "only copy of the data") {
+		t.Errorf("stale = %+v", c)
+	}
+	// The reproduced trap: doctor told the operator --release "confirms the
+	// restore" for a copy that was the only data left.
+	open := ssh.NewMockExecutor("h", ssh.MockCommand{Match: "for d in /var/tmp", Output: "open /var/tmp/teploy-pre-restore.a@b@1\n"})
+	c = doctorRestoreLeftoversCheck(ctx, open, nil)
+	if c.Result != doctorWarn || !strings.Contains(c.Detail, "only copy of the data") || !strings.Contains(c.Remediation, "do NOT discard") {
+		t.Errorf("unconfirmed = %+v", c)
+	}
+	if strings.Contains(c.Remediation, "confirms the restore") {
+		t.Errorf("must not call --release a confirmation: %s", c.Remediation)
+	}
+}
+
+func TestDoctorPostgresLeftoversAndCoverage(t *testing.T) {
+	ctx := context.Background()
+	mock := ssh.NewMockExecutor("h",
+		ssh.MockCommand{Match: "for d in /var/tmp", Output: ""},
+		ssh.MockCommand{Match: "docker ps --filter label=teploy.role=accessory", Output: "myapp|db\nmyapp|cache\n"},
+		ssh.MockCommand{Match: "docker inspect -f '{{.Config.Image}}' 'myapp-db'", Output: "postgres:17\n"},
+		ssh.MockCommand{Match: "docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' 'myapp-db'", Output: "PG_MAJOR=17\nPOSTGRES_DB=appdb\n"},
+		ssh.MockCommand{Match: "docker inspect -f '{{.Config.Image}}' 'myapp-cache'", Output: "redis:7\n"},
+		ssh.MockCommand{Match: "docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' 'myapp-cache'", Output: "REDIS_VERSION=7\n"},
+		ssh.MockCommand{Match: "docker exec 'myapp-db' psql -X -qtA -v ON_ERROR_STOP=1 -U 'postgres' -d 'postgres' -c 'SELECT datname", Output: "appdb\nother\nappdb_teploy_old_0123abcd\npostgres\n"},
+		ssh.MockCommand{Match: "docker exec 'myapp-db' psql", Output: "0\n"},
+	)
+	reports, err := backup.NewClient(mock, io.Discard).AccessoryReports(ctx)
+	if err != nil || len(reports) != 1 {
+		t.Fatalf("reports = %+v, %v (redis is not reported)", reports, err)
+	}
+	left := doctorRestoreLeftoversCheck(ctx, mock, reports)
+	if left.Result != doctorWarn || !strings.Contains(left.Detail, "myapp/db: database appdb_teploy_old_0123abcd") || !strings.Contains(left.Remediation, "--release") {
+		t.Errorf("leftovers = %+v", left)
+	}
+	cov := doctorBackupCoverageCheck(reports, nil)
+	if cov.Result != doctorWarn || !strings.Contains(cov.Detail, "myapp/db: other") || strings.Contains(cov.Detail, "teploy_old") || !strings.Contains(cov.Remediation, "backup_databases") {
+		t.Errorf("coverage = %+v", cov)
+	}
+	if c := doctorBackupCoverageCheck(nil, nil); c.Result != doctorOK {
+		t.Errorf("no postgres accessories = %+v", c)
+	}
+	if c := doctorBackupCoverageCheck(nil, errors.New("docker down")); c.Result != doctorWarn {
+		t.Errorf("unlistable = %+v", c)
 	}
 }

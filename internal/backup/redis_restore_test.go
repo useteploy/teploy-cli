@@ -36,6 +36,8 @@ func (e *redisRestoreExec) Run(ctx context.Context, cmd string) (string, error) 
 	switch {
 	case strings.HasPrefix(cmd, "which aws"):
 		return "", nil
+	case strings.Contains(cmd, "aws s3 ls "):
+		return "2026-09-19 00:00:00 99 20260919-000000.rdb.gz\n", nil
 	case strings.HasPrefix(cmd, "mktemp -d "):
 		dir, err := os.MkdirTemp("", "teploy-restore-test-")
 		if err != nil {
@@ -55,7 +57,7 @@ func (e *redisRestoreExec) Run(ctx context.Context, cmd string) (string, error) 
 		}
 		var buf bytes.Buffer
 		zw := gzip.NewWriter(&buf)
-		zw.Write([]byte("new-dump"))
+		zw.Write([]byte("REDIS0011new-dump"))
 		zw.Close()
 		if err := os.WriteFile(out, buf.Bytes(), 0644); err != nil {
 			return "", err
@@ -140,7 +142,7 @@ func runRedisRestore(t *testing.T, env ...string) (error, string) {
 	dockerLog := filepath.Join(stubDir, "docker.log")
 	ex := &redisRestoreExec{stubDir: stubDir, env: append([]string{"DOCKER_LOG=" + dockerLog}, env...)}
 	c := NewClient(ex, os.Stdout)
-	err := c.AccessoryRestore(context.Background(), "myapp", "cache", "redis:7", "20260919", nil, S3Config{Bucket: "b", Region: "us-east-1"})
+	err := c.AccessoryRestore(context.Background(), "myapp", "cache", "redis:7", "20260919-000000", nil, S3Config{Bucket: "b", Region: "us-east-1"})
 	logBytes, _ := os.ReadFile(dockerLog)
 	return err, string(logBytes)
 }

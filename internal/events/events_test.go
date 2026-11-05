@@ -122,3 +122,31 @@ func TestReadMissingIsEmpty(t *testing.T) {
 		t.Fatalf("got %v, %v", got, err)
 	}
 }
+
+// The backup.run and backup.verify details carry what a watcher needs to
+// judge a backup (size, key, engine, consistency, duration) through the
+// allowlist; anything else is still dropped.
+func TestSanitizeBackupDetails(t *testing.T) {
+	run := Event{Kind: KindBackupRun, Detail: map[string]any{
+		"id": "20261103-040000", "kind": "accessory", "accessory": "db", "size_bytes": int64(1616),
+		"key": "s3://b/app/accessories/db/20261103-040000.pgdump", "duration_ms": int64(143),
+		"engine": "postgres", "consistency": "engine-consistent", "encrypted": false, "password": "x",
+	}}
+	Sanitize(&run)
+	for _, k := range []string{"id", "kind", "accessory", "size_bytes", "key", "duration_ms", "engine", "consistency", "encrypted"} {
+		if _, ok := run.Detail[k]; !ok {
+			t.Errorf("backup.run detail %q dropped", k)
+		}
+	}
+	if _, ok := run.Detail["password"]; ok {
+		t.Error("a key outside the allowlist survived")
+	}
+	verify := Event{Kind: KindBackupVerify, Detail: map[string]any{
+		"accessory": "db", "date": "20261103-040000", "ok": true, "engine": "postgres", "kind": "postgres",
+		"metric": "tables=3", "key": "s3://b/k", "size_bytes": int64(1616), "duration_ms": int64(9000), "error": "boom",
+	}}
+	Sanitize(&verify)
+	if len(verify.Detail) != 10 {
+		t.Errorf("backup.verify detail = %v, want all ten keys", verify.Detail)
+	}
+}

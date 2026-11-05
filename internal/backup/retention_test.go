@@ -3,6 +3,7 @@ package backup
 import (
 	"bytes"
 	"context"
+	"io"
 	"strings"
 	"testing"
 	"time"
@@ -130,5 +131,27 @@ func TestPruneBackupsZeroPolicyNoop(t *testing.T) {
 	}
 	if len(deleted) != 0 || len(mock.Calls) != 0 {
 		t.Errorf("zero policy must not touch the server: deleted=%v calls=%v", deleted, mock.Calls)
+	}
+}
+
+// Pruning an accessory backup also removes its postgres globals sidecar.
+func TestPruneRemovesGlobalsSidecar(t *testing.T) {
+	mock := ssh.NewMockExecutor("h",
+		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
+		ssh.MockCommand{Match: "aws s3 ls", Output: "2024-01-01 00:00:00 100 20240101-000000.pgdump\n2024-01-02 00:00:00 100 20240102-000000.pgdump\n"},
+		ssh.MockCommand{Match: "aws s3 rm", Output: ""},
+	)
+	deleted, err := NewClient(mock, io.Discard).PruneBackups(context.Background(), "myapp", "accessories/db", S3Config{Bucket: "b", Region: "r"}, RetentionPolicy{KeepLast: 1})
+	if err != nil || len(deleted) != 1 {
+		t.Fatalf("deleted %v, %v", deleted, err)
+	}
+	sidecar := false
+	for _, c := range mock.Calls {
+		if strings.Contains(c, "s3://b/myapp/accessories/db/globals/20240101-000000.sql.gz") {
+			sidecar = true
+		}
+	}
+	if !sidecar {
+		t.Fatalf("globals sidecar not pruned: %v", mock.Calls)
 	}
 }

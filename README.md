@@ -348,7 +348,7 @@ teploy log                                # deploy history
 teploy exec <server> <cmd>                # run a command on the server (SSH)
 teploy app exec -- <cmd>                  # run a command in the app container (migrations, etc.)
 teploy validate                           # check config and server readiness
-teploy doctor [--server <name>]           # read-only diagnostics: toolchain, SSH, Docker, registry, Caddy, disk, compatibility, repair debt (--json for machines; exit 1 if any check fails, never 2)
+teploy doctor [--server <name>]           # read-only diagnostics: toolchain, SSH, Docker, registry, Caddy, disk, compatibility, repair debt, cron scheduler (--json for machines; exit 1 if any check fails, never 2)
 teploy plan                               # preview what a deploy would change (containers, routing, env, storage, resources; read-only)
 teploy plan --out plan.json               # write a bound plan record (config digest + target identity + generation)
 teploy apply plan.json                    # execute a reviewed plan; refuses naming what drifted since it was made
@@ -664,9 +664,61 @@ never rewrites cron. `teploy server backup-target set` rewrites existing
 teploy-generated backup cron lines to that form (hand-written commands
 under a teploy marker are left alone and reported), and `teploy doctor`
 flags any cron line that still embeds credentials or bucket flags.
+Schedules need a running cron daemon: `teploy setup` installs, enables and
+starts cron, `backup schedule` (and `accessory backup --schedule`) refuse on
+a server without one, and `teploy doctor` fails when teploy crontab lines or
+`/etc/cron.d` jobs exist but no cron daemon runs them (other jobs warn).
 
-Restore quiesces: the app's containers (and a generic accessory's) are
-stopped under the app's fenced lock, the backup is promoted with the
+Accessory backups are engine-aware. The engine is detected from the
+container — the accessory's `engine:` in `teploy.yml` (set on the container
+as the `teploy.engine` label: postgres, mysql, mariadb, redis, valkey,
+dragonfly, mongo, nucleus, or generic/none for plain files), else the
+version env the upstream images set (so pgvector, TimescaleDB, PostGIS and
+Bitnami images are postgres) as long as the container runs that engine's
+server (a backup sidecar built FROM postgres is not postgres), else the
+entrypoint or image name. A detected database is never copied as raw
+files:
+
+| Engine | Backup | In-place restore |
+|---|---|---|
+| postgres (incl. pgvector, timescale, postgis) | `pg_dump -Fc` (`.pgdump`) of the accessory's database, with the cluster's roles (`pg_dumpall --globals-only`) and its size stored beside it. Other databases are covered by `backup_databases:` (names, or `all`); those not covered are warned about in the output, the `backup.run` event and `teploy doctor`, and the backup still runs | loaded into a new database first; only a complete load is swapped in, both renames in one transaction, and the previous database is kept renamed until the app is healthy, then dropped. Database-level settings, ACLs and comments are re-applied (from the live database for a legacy plain dump); collation provider and locale are kept. A failed load or a refused swap leaves the live database untouched. Needs a superuser, or the owner with CREATEDB, and room on the data volume for what the backup holds plus its WAL (`--ignore-space-check` overrides). `--database` restores one `backup_databases:` database |
+| mysql / mariadb | `mysqldump --single-transaction --routines --triggers --events` of one schema; others on the server are warned about the same way | the dump must first load into a throwaway `<db>_teploy_check`, kept out of the binlog (a dump the server refuses is refused with the database untouched); then a safety dump, `DROP`/`CREATE` the database (same charset), load; a failed load reloads the safety dump. Free space counts the binlog; loads have deadlines, as a full disk makes mysqld wait forever |
+| redis / valkey | `BGSAVE`, wait for `LASTSAVE` to move, copy `dump.rdb` (refused when AOF is on) | stop, swap `dump.rdb`, start |
+| dragonfly | `SAVE RDB` (its `BGSAVE` writes `.dfs` files, not `dump.rdb`) | online: pre-restore `SAVE RDB`, `DFLY LOAD`, `SAVE` |
+| mongo | `mongodump --archive --gzip` (a killed restore's `teploy_check_*` is dropped first) | free space is checked, and the archive must first load into a throwaway `teploy_check_*` database; a dry run that takes mongod down is reported as that. Then a safety dump, `mongorestore --drop` (collections created after the backup survive); a failed restore reloads the safety dump |
+| nucleus, generic | tar of the accessory directory (crash-consistent); refused while the container runs when its files look like a database data directory | staged two-phase file promotion with the container stopped |
+
+Backups an older CLI took of an engine it did not recognise (pgvector,
+TimescaleDB, Valkey, Dragonfly, ...) are `.tar.gz` file copies: they still
+restore, as files with the accessory stopped, but `verify-backup` reports
+them as not verifiable as a database. A restore that cannot finish and
+cannot roll back stops with the app down and names what it kept. A restore
+whose health check failed, or that was killed, leaves its recovery copies:
+
+```
+teploy backup restore --accessory db --app myapp --host prod --rollback --yes  # swap the kept previous postgres database back
+teploy backup restore --accessory db --app myapp --host prod --release --yes   # discard the kept copies, after checking the restored data
+```
+
+`--database` scopes either to one database's copies. `--release` lists what it
+will discard, and refuses while one may be the only copy of the data: when the
+live postgres database is missing (use `--rollback`), and, without `--force`,
+when a safety copy has no record that its restore finished (a restore killed
+after it dropped the database). `teploy doctor` reports them
+(`restore-leftovers`: safety copies in `/var/tmp`, flagged when unfinished, and
+databases left in accessories) and any database the backups do not cover
+(`backup-coverage`). A scheduled backup with uncovered databases also sends its
+failure-alert channel a warning.
+
+A backup whose artifact is implausibly small (an empty dump from a wrong
+password) or structurally wrong fails instead of being stored.
+`accessory verify-backup` restores into a scratch container as the
+accessory's own role, through the same path, and records a `backup.verify`
+event.
+
+Restore quiesces: the app's containers (and a file-restored accessory's) are
+stopped under the app's fenced lock (`accessory restore` takes the same path
+and, like `backup restore`, needs `--yes` without a terminal), the backup is promoted with the
 two-phase recovery discipline, the containers are started again and
 health-checked. On failure — or an unhealthy app afterwards — the
 pre-restore recovery copy is kept and named. Non-interactive restores

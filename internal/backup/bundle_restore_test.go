@@ -57,7 +57,7 @@ func drRestoreMock(manifest *BundleManifest, extra ...ssh.MockCommand) *ssh.Mock
 		{Match: "gunzip -c", Output: ""},
 		{Match: "docker exec '" + strings.Repeat("a", 64) + "' psql -tA", Output: "3\n"},
 		// r2-03 private stdin import: SQL + credential header piped to exec -i.
-		{Match: "{ cat; cat ", Output: ""},
+		{Match: "rm -f ", Output: ""},
 	}...)...)
 	// The store's manifest, readable through the framed auto-answer.
 	mock.Files["/var/drstore/myapp/dr/"+manifest.ID+"/manifest.json"] = manifestJSON
@@ -180,7 +180,7 @@ func TestRestoreBundleIsolated_ReceiptRPORTO(t *testing.T) {
 	// Scratch teardown happened.
 	var sawTeardown bool
 	for _, call := range executor.commands {
-		if strings.HasPrefix(call, "docker rm -f '") {
+		if strings.HasPrefix(call, "docker rm -fv '") {
 			sawTeardown = true
 		}
 		if strings.Contains(call, "/deployments/myapp") {
@@ -249,7 +249,7 @@ func drCutoverMock(receipt *RestoreReceipt, manifest *BundleManifest, extra ...s
 		{Match: "umask 077; gunzip -c", Output: ""},
 		{Match: "gunzip -c", Output: ""},
 		// r2-03 private stdin import: SQL + credential header piped to exec -i.
-		{Match: "{ cat; cat ", Output: ""},
+		{Match: "rm -f ", Output: ""},
 		{Match: "mkdir -p '/deployments/myapp/volumes/data'", Output: ""},
 		{Match: "mktemp -d '/deployments", Output: "/deployments/myapp/recovery123\n"},
 		{Match: "find ", Output: ""},

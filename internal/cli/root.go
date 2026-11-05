@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/useteploy/teploy/internal/backup"
 	"github.com/useteploy/teploy/internal/events"
 	"github.com/useteploy/teploy/internal/ssh"
 	"github.com/useteploy/teploy/internal/state"
@@ -205,6 +206,27 @@ func cleanActorPart(s string, max int) string {
 // app's server history (warns, never fails the command).
 func recordAppEvent(ctx context.Context, exec ssh.Executor, app, kind string, err error, detail map[string]any) {
 	events.Record(ctx, exec, events.Event{App: app, Kind: kind, Outcome: events.Outcome(err), Detail: events.ErrDetail(detail, err)})
+}
+
+// backupRunDetail is the backup.run event detail: what was written, where,
+// how big, how long it took, and the consistency the artifact can claim.
+// Payload encryption (G1) is not implemented yet, so encrypted is false.
+func backupRunDetail(res backup.BackupResult, kind, accessory string) map[string]any {
+	detail := map[string]any{
+		"id": res.ID, "kind": kind, "size_bytes": res.SizeBytes, "key": res.Key,
+		"duration_ms": res.DurationMs, "engine": res.Engine, "consistency": res.Consistency,
+		"encrypted": false,
+	}
+	if accessory != "" {
+		detail["accessory"] = accessory
+	}
+	if len(res.UncoveredDatabases) > 0 {
+		detail["uncovered_databases"] = res.UncoveredDatabases
+	}
+	if len(res.Warnings) > 0 {
+		detail["warnings"] = res.Warnings
+	}
+	return detail
 }
 
 func sortedKeys(m map[string]string) []string {

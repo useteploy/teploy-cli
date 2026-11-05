@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/useteploy/teploy/internal/accessories"
@@ -463,6 +464,9 @@ func runAccessoryBackup(flags *Flags, appName, name, bucket, region, endpoint, p
 	tf := backupTargetFlags{bucket: bucket, region: region, endpoint: endpoint, prefix: prefix}
 	var target backup.Target
 	if schedule != "" {
+		if err := backup.RequireScheduler(ctx, executor); err != nil {
+			return err
+		}
 		var err error
 		target, err = resolveScheduleTarget(ctx, executor, &tf)
 		if err != nil {
@@ -519,8 +523,7 @@ func runAccessoryBackup(flags *Flags, appName, name, bucket, region, endpoint, p
 	}
 
 	res, err := client.AccessoryBackup(ctx, app, name, accImage, accEnv, s3Cfg)
-	detail := map[string]any{"id": res.ID, "kind": backup.KindAccessory, "accessory": name}
-	recordAppEvent(ctx, executor, app, events.KindBackupRun, err, detail)
+	recordAppEvent(ctx, executor, app, events.KindBackupRun, err, backupRunDetail(res, backup.KindAccessory, name))
 	if err != nil {
 		return err
 	}
@@ -554,14 +557,16 @@ func newAccessoryRestoreCmd(flags *Flags) *cobra.Command {
 		region   string
 		endpoint string
 		prefix   string
+		yes      bool
+		ignore   bool
 	)
 
 	cmd := &cobra.Command{
 		Use:   "restore <name> <date>",
-		Short: "Restore an accessory from backup",
+		Short: "Restore an accessory from backup (stops the app while it runs)",
 		Args:  cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runAccessoryRestore(flags, args[0], args[1], bucket, region, endpoint, prefix)
+			return runAccessoryRestore(flags, args[0], args[1], bucket, region, endpoint, prefix, yes, ignore)
 		},
 	}
 
@@ -569,50 +574,55 @@ func newAccessoryRestoreCmd(flags *Flags) *cobra.Command {
 	cmd.Flags().StringVar(&region, "region", "", "AWS region (default: the stored target's region, else us-east-1)")
 	cmd.Flags().StringVar(&endpoint, "endpoint", "", "S3-compatible endpoint URL (MinIO/B2/R2); creds from TEPLOY_S3_ACCESS_KEY/SECRET_KEY or AWS_* env")
 	cmd.Flags().StringVar(&prefix, "prefix", "", "key prefix under the bucket (default: the stored target's prefix)")
+	cmd.Flags().BoolVar(&yes, "yes", false, "proceed without interactive confirmation (the app is stopped while the restore runs)")
+	cmd.Flags().BoolVar(&ignore, "ignore-space-check", false, "skip the free-space preflight")
 
 	return cmd
 }
 
-func runAccessoryRestore(flags *Flags, name, date, bucket, region, endpoint, prefix string) error {
+func runAccessoryRestore(flags *Flags, name, date, bucket, region, endpoint, prefix string, yes, ignoreSpace bool) error {
 	appCfg, err := loadAppCfgForAccessory()
 	if err != nil {
 		return err
 	}
-
-	accCfg, ok := appCfg.Accessories[name]
-	if !ok {
+	if _, ok := appCfg.Accessories[name]; !ok {
 		return fmt.Errorf("accessory %q not found in teploy.yml", name)
 	}
+	// One restore path: the quiesced, fenced `backup restore --accessory`
+	// flow. An engine restore now drops and recreates the database, so the
+	// app must be stopped while it runs (this command used to restore into
+	// the live database with the app still writing). Stopping the app is
+	// an effect it never had, so it now asks first (--yes skips it, and is
+	// required without a terminal) — the same contract as backup restore.
+	return runBackupRestoreWith(flags, "", name, date, &backupTargetFlags{bucket: bucket, region: region, endpoint: endpoint, prefix: prefix}, yes, backup.RestoreOptions{IgnoreSpaceCheck: ignoreSpace})
+}
 
-	if err := backup.ValidateDate(date); err != nil {
-		return err
-	}
-
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
-	defer cancel()
-
-	executor, err := connectForApp(ctx, flags, appCfg)
+// verifyEventErr is the backup.verify outcome: an operational error, or a
+// verification that ran and failed (which VerifyBackup reports as a result).
+func verifyEventErr(res *backup.VerifyResult, err error) error {
 	if err != nil {
 		return err
 	}
-	defer executor.Close()
+	if res != nil && !res.OK {
+		return fmt.Errorf("%s", res.Detail)
+	}
+	return nil
+}
 
-	s3Cfg, err := resolveBackupS3(ctx, executor, &backupTargetFlags{bucket: bucket, region: region, endpoint: endpoint, prefix: prefix})
-	if err != nil {
-		return err
+// verifyEventDetail is the backup.verify event detail.
+func verifyEventDetail(name, date string, res *backup.VerifyResult, elapsed time.Duration) map[string]any {
+	detail := map[string]any{"accessory": name, "date": date, "ok": false, "duration_ms": elapsed.Milliseconds()}
+	if res != nil {
+		detail["date"] = res.Date
+		detail["ok"] = res.OK
+		detail["engine"] = res.Engine
+		detail["kind"] = res.Kind
+		detail["metric"] = res.Metric
+		detail["key"] = res.S3Key
+		detail["size_bytes"] = res.SizeBytes
+		detail["duration_ms"] = res.DurationMs
 	}
-	client := backup.NewClient(executor, os.Stdout)
-	// Same credential rule as manual backup: prefer the RUNNING accessory's
-	// env (the config's `auto`/`secret:` references are never what the
-	// database actually runs with) — audit F68.
-	if image, env, inspErr := client.InspectAccessory(ctx, appCfg.App, name); inspErr == nil {
-		accCfg.Image, accCfg.Env = image, env
-	} else {
-		if err := requireResolvedAccessoryEnv(name, accCfg.Env); err != nil {
-			return fmt.Errorf("accessory %s is not inspectable (%v) and its teploy.yml env cannot be used directly: %w", name, inspErr, err)
-		}
-	}
-	return client.AccessoryRestore(ctx, appCfg.App, name, accCfg.Image, date, accCfg.Env, s3Cfg)
+	return detail
 }
 
 // requireResolvedAccessoryEnv rejects config env maps that still contain
@@ -712,7 +722,9 @@ func runAccessoryVerifyBackup(flags *Flags, appName, name, bucket, region, date,
 		out = os.Stderr
 	}
 	client := backup.NewClient(executor, out)
+	start := time.Now()
 	res, err := client.VerifyBackup(ctx, appCfg.App, name, date, s3Cfg)
+	recordAppEvent(ctx, executor, appCfg.App, events.KindBackupVerify, verifyEventErr(res, err), verifyEventDetail(name, date, res, time.Since(start)))
 	if err != nil {
 		return err
 	}

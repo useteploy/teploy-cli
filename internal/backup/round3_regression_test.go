@@ -45,7 +45,7 @@ func (e *round3DRExecutor) Run(ctx context.Context, command string) (string, err
 		}
 		return "", errors.New("unknown scratch ID")
 	}
-	if strings.HasPrefix(command, "docker rm -f ") {
+	if strings.HasPrefix(command, "docker rm -fv ") {
 		for id := range e.owners {
 			if strings.HasSuffix(command, "'"+id+"'") {
 				return "", nil
@@ -77,7 +77,7 @@ func TestRound3DRNativeMariaDBAndPasswordStdinAtCutover(t *testing.T) {
 		if strings.Contains(command, "DUMMY-r3-secret") {
 			t.Fatalf("password in argv: %s", command)
 		}
-		if strings.Contains(command, "exec mariadb-admin ") {
+		if strings.Contains(command, "exec mariadb --protocol=TCP ") {
 			nativeAdmin = true
 		}
 		if strings.Contains(command, "exec mariadb -u root") {

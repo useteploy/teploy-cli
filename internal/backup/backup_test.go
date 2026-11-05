@@ -20,6 +20,7 @@ func TestBackupVolumes(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
 		ssh.MockCommand{Match: "umask 077", Output: "/tmp/teploy-backup.abc123\n"},
+		ssh.MockCommand{Match: "wc -c", Output: "4096\n"},
 		ssh.MockCommand{Match: "if [ -f", Output: ""},
 		ssh.MockCommand{Match: "aws s3 cp", Output: "upload: done\n"},
 		ssh.MockCommand{Match: "rm -f", Output: ""},
@@ -79,6 +80,7 @@ func TestAccessoryBackup_Postgres(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
 		ssh.MockCommand{Match: "umask 077", Output: "/tmp/teploy-backup.abc123\n"},
+		ssh.MockCommand{Match: "wc -c", Output: "4096\n"},
 		ssh.MockCommand{Match: "docker exec", Output: ""},
 		ssh.MockCommand{Match: "aws s3 cp", Output: "done\n"},
 		ssh.MockCommand{Match: "rm -f", Output: ""},
@@ -98,7 +100,7 @@ func TestAccessoryBackup_Postgres(t *testing.T) {
 	// matches connectionEnvVars' own app-name fallback).
 	foundPgDump := false
 	for _, call := range mock.Calls {
-		if strings.Contains(call, "pg_dump") {
+		if strings.Contains(call, "pg_dump -Fc") {
 			foundPgDump = true
 			if !strings.Contains(call, "-U 'postgres' 'myapp'") && !strings.Contains(call, "-U postgres myapp") {
 				t.Errorf("expected pg_dump to target db 'myapp' (app-name fallback), got: %s", call)
@@ -124,6 +126,7 @@ func TestAccessoryBackup_Postgres_CustomDBName(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
 		ssh.MockCommand{Match: "umask 077", Output: "/tmp/teploy-backup.abc123\n"},
+		ssh.MockCommand{Match: "wc -c", Output: "4096\n"},
 		ssh.MockCommand{Match: "docker exec", Output: ""},
 		ssh.MockCommand{Match: "aws s3 cp", Output: "done\n"},
 		ssh.MockCommand{Match: "rm -f", Output: ""},
@@ -142,7 +145,7 @@ func TestAccessoryBackup_Postgres_CustomDBName(t *testing.T) {
 
 	var pgDumpCall string
 	for _, call := range mock.Calls {
-		if strings.Contains(call, "pg_dump") {
+		if strings.Contains(call, "pg_dump -Fc") {
 			pgDumpCall = call
 		}
 	}
@@ -153,7 +156,7 @@ func TestAccessoryBackup_Postgres_CustomDBName(t *testing.T) {
 	// (the app name) — check the actual pg_dump invocation (-U <user>
 	// <db>) targets the configured POSTGRES_DB/POSTGRES_USER specifically,
 	// not that "myapp" is absent from the whole command line.
-	if !strings.Contains(pgDumpCall, "pg_dump -U 'customuser' 'realdbname'") {
+	if !strings.Contains(pgDumpCall, "pg_dump -Fc -U 'customuser' 'realdbname'") {
 		t.Errorf("expected pg_dump invocation to be `-U 'customuser' 'realdbname'`, got: %s", pgDumpCall)
 	}
 }
@@ -169,6 +172,7 @@ func TestAccessoryBackup_Postgres_DumpFailureIsNotSwallowed(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
 		ssh.MockCommand{Match: "umask 077", Output: "/tmp/teploy-backup.abc123\n"},
+		ssh.MockCommand{Match: "wc -c", Output: "4096\n"},
 		ssh.MockCommand{Match: "docker exec", Err: errors.New(`exit status 1: pg_dump: error: connection to database "myapp" failed: FATAL:  database "myapp" does not exist`)},
 	)
 
@@ -193,6 +197,7 @@ func TestAccessoryBackup_MySQL(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
 		ssh.MockCommand{Match: "umask 077", Output: "/tmp/teploy-backup.abc123\n"},
+		ssh.MockCommand{Match: "wc -c", Output: "4096\n"},
 		ssh.MockCommand{Match: "docker exec", Output: ""},
 		ssh.MockCommand{Match: "aws s3 cp", Output: "done\n"},
 		ssh.MockCommand{Match: "rm -f", Output: ""},
@@ -226,6 +231,7 @@ func TestAccessoryBackup_RedisWaitsForBgsave(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
 		ssh.MockCommand{Match: "umask 077", Output: "/tmp/teploy-backup.abc123\n"},
+		ssh.MockCommand{Match: "wc -c", Output: "4096\n"},
 		ssh.MockCommand{Match: "set -eu", Output: ""},
 		ssh.MockCommand{Match: "aws s3 cp", Output: "done\n"},
 		ssh.MockCommand{Match: "rm -f", Output: ""},
@@ -276,6 +282,7 @@ func TestAccessoryBackup_MySQL_UsesRootPasswordEnv(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
 		ssh.MockCommand{Match: "umask 077", Output: "/tmp/teploy-backup.abc123\n"},
+		ssh.MockCommand{Match: "wc -c", Output: "4096\n"},
 		ssh.MockCommand{Match: "docker exec", Output: ""},
 		ssh.MockCommand{Match: "aws s3 cp", Output: "done\n"},
 		ssh.MockCommand{Match: "rm -f", Output: ""},
@@ -324,6 +331,7 @@ func TestAccessoryBackup_MySQL_PasswordFallbackAndAbsence(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
 		ssh.MockCommand{Match: "umask 077", Output: "/tmp/teploy-backup.abc123\n"},
+		ssh.MockCommand{Match: "wc -c", Output: "4096\n"},
 		ssh.MockCommand{Match: "docker exec", Output: ""},
 		ssh.MockCommand{Match: "aws s3 cp", Output: "done\n"},
 		ssh.MockCommand{Match: "rm -f", Output: ""},
@@ -354,6 +362,7 @@ func TestAccessoryBackup_MySQL_PasswordFallbackAndAbsence(t *testing.T) {
 	mock = ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
 		ssh.MockCommand{Match: "umask 077", Output: "/tmp/teploy-backup.abc123\n"},
+		ssh.MockCommand{Match: "wc -c", Output: "4096\n"},
 		ssh.MockCommand{Match: "docker exec", Output: ""},
 		ssh.MockCommand{Match: "aws s3 cp", Output: "done\n"},
 		ssh.MockCommand{Match: "rm -f", Output: ""},
@@ -365,7 +374,9 @@ func TestAccessoryBackup_MySQL_PasswordFallbackAndAbsence(t *testing.T) {
 		t.Fatalf("AccessoryBackup: %v", err)
 	}
 	for _, call := range mock.Calls {
-		if strings.Contains(call, "MYSQL_PWD") {
+		// The read-only coverage query reads whatever the container's env
+		// holds, in the container; the dump is what must not expect one.
+		if strings.Contains(call, "MYSQL_PWD") && !strings.Contains(call, "information_schema.SCHEMATA") {
 			t.Errorf("no password configured, so no MYSQL_PWD expected: %s", call)
 		}
 	}
@@ -378,6 +389,7 @@ func TestAccessoryBackup_MySQL_QuotesHostilePassword(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
 		ssh.MockCommand{Match: "umask 077", Output: "/tmp/teploy-backup.abc123\n"},
+		ssh.MockCommand{Match: "wc -c", Output: "4096\n"},
 		ssh.MockCommand{Match: "docker exec", Output: ""},
 		ssh.MockCommand{Match: "aws s3 cp", Output: "done\n"},
 		ssh.MockCommand{Match: "rm -f", Output: ""},
@@ -407,9 +419,12 @@ func TestAccessoryBackup_MySQL_QuotesHostilePassword(t *testing.T) {
 func TestAccessoryRestore_MySQL_UsesRootPasswordEnv(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
+		ssh.MockCommand{Match: "aws s3 ls", Output: "2026-01-01 00:00:00 99 20260101-000000.sql.gz\n"},
 		ssh.MockCommand{Match: "aws s3 cp", Output: "download: done\n"},
 		ssh.MockCommand{Match: "mktemp -d '/tmp/teploy-restore.XXXXXX'", Output: "/tmp/teploy-restore.abc123\n"},
-		ssh.MockCommand{Match: "gunzip -c", Output: ""},
+		ssh.MockCommand{Match: "umask 077; gunzip -c", Output: ""},
+		ssh.MockCommand{Match: "docker exec", Output: ""},
+		ssh.MockCommand{Match: "rm -f", Output: ""},
 		ssh.MockCommand{Match: "rm -rf", Output: ""},
 	)
 
@@ -450,9 +465,10 @@ func TestAccessoryRestore_MySQL_FailureKeepsSQLNotSecret(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
 		ssh.MockCommand{Match: "aws s3 cp", Output: "download: done\n"},
+		ssh.MockCommand{Match: "aws s3 ls", Output: "2026-01-01 00:00:00 99 20260101-000000.sql.gz\n"},
 		ssh.MockCommand{Match: "mktemp -d '/tmp/teploy-restore.XXXXXX'", Output: "/tmp/teploy-restore.abc123\n"},
-		// The restore command fails so keepTmp runs.
-		ssh.MockCommand{Match: "gunzip -c", Err: errors.New("exit status 1: gzip: invalid")},
+		// The restore command fails so the failure path runs.
+		ssh.MockCommand{Match: "umask 077; gunzip -c", Err: errors.New("exit status 1: gzip: invalid")},
 		ssh.MockCommand{Match: "rm -f", Output: ""},
 	)
 
@@ -479,71 +495,12 @@ func TestAccessoryRestore_MySQL_FailureKeepsSQLNotSecret(t *testing.T) {
 	}
 }
 
-// teploy-cli-04: the restore pipelines (`gunzip -c X | docker exec -i ...
-// psql ...`) only reported the LAST command's exit status — psql without
-// ON_ERROR_STOP exits 0 on SQL errors, and a failed gunzip alone fed the
-// container an empty stdin and still "succeeded". The restore command must
-// check gunzip's exit code itself and make psql stop on SQL errors.
-func TestAccessoryRestore_PostgresFailsOnErrors(t *testing.T) {
-	mock := ssh.NewMockExecutor("1.2.3.4",
-		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
-		ssh.MockCommand{Match: "aws s3 cp", Output: "download: done\n"},
-		ssh.MockCommand{Match: "mktemp -d '/tmp/teploy-restore.XXXXXX'", Output: "/tmp/teploy-restore.abc123\n"},
-		ssh.MockCommand{Match: "gunzip -c", Output: ""},
-		ssh.MockCommand{Match: "docker exec", Output: ""},
-		ssh.MockCommand{Match: "rm -rf", Output: ""},
-	)
-
-	var buf bytes.Buffer
-	client := NewClient(mock, &buf)
-	err := client.AccessoryRestore(context.Background(), "myapp", "postgres", "postgres:16",
-		"20260101-000000", nil, S3Config{Bucket: "my-bucket", Region: "us-east-1"})
-	if err != nil {
-		t.Fatalf("AccessoryRestore: %v", err)
-	}
-
-	var restoreCmd string
-	for _, call := range mock.Calls {
-		if strings.Contains(call, "psql") {
-			restoreCmd = call
-		}
-	}
-	if restoreCmd == "" {
-		t.Fatal("expected a psql restore command")
-	}
-	if !strings.Contains(restoreCmd, "-v ON_ERROR_STOP=1") {
-		t.Errorf("psql must run with ON_ERROR_STOP so SQL errors fail the restore:\n%s", restoreCmd)
-	}
-	if strings.Contains(restoreCmd, "|") {
-		t.Errorf("restore must not be a pipeline (last-command exit status masks gunzip failures):\n%s", restoreCmd)
-	}
-}
-
-func TestAccessoryRestore_CorruptArchiveFails(t *testing.T) {
-	mock := ssh.NewMockExecutor("1.2.3.4",
-		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
-		ssh.MockCommand{Match: "aws s3 cp", Output: "download: done\n"},
-		ssh.MockCommand{Match: "mktemp -d '/tmp/teploy-restore.XXXXXX'", Output: "/tmp/teploy-restore.abc123\n"},
-		ssh.MockCommand{Match: "gunzip -c", Err: errors.New("exit status 1: gzip: stdin: not in gzip format")},
-	)
-
-	var buf bytes.Buffer
-	client := NewClient(mock, &buf)
-	err := client.AccessoryRestore(context.Background(), "myapp", "postgres", "postgres:16",
-		"20260101-000000", nil, S3Config{Bucket: "my-bucket", Region: "us-east-1"})
-	if err == nil {
-		t.Fatal("expected AccessoryRestore to fail when gunzip fails, not report success")
-	}
-	if !strings.Contains(err.Error(), "not in gzip format") {
-		t.Errorf("expected the underlying gunzip error to surface, got: %v", err)
-	}
-}
-
 func TestAccessoryBackup_Generic(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
 		ssh.MockCommand{Match: "umask 077", Output: "/tmp/teploy-backup.abc123\n"},
-		ssh.MockCommand{Match: "tar -czf", Output: ""},
+		ssh.MockCommand{Match: "wc -c", Output: "4096\n"},
+		ssh.MockCommand{Match: "m=$(find", Output: ""},
 		ssh.MockCommand{Match: "aws s3 cp", Output: "done\n"},
 		ssh.MockCommand{Match: "rm -f", Output: ""},
 	)
@@ -561,7 +518,7 @@ func TestAccessoryBackup_Generic(t *testing.T) {
 	// Generic type should use tar.
 	foundTar := false
 	for _, call := range mock.Calls {
-		if strings.HasPrefix(call, "tar") {
+		if strings.Contains(call, "tar -czf") {
 			foundTar = true
 		}
 	}
@@ -900,6 +857,7 @@ func TestRedisRestore_AOFRequiresProvenNo(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			mock := ssh.NewMockExecutor("1.2.3.4",
 				ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
+				ssh.MockCommand{Match: "aws s3 ls", Output: "2026-01-01 00:00:00 99 20260101-000000.rdb.gz\n"},
 				ssh.MockCommand{Match: "aws s3 cp", Output: "ok"},
 				ssh.MockCommand{Match: "mktemp -d", Output: "/tmp/teploy-restore.abc\n"},
 				ssh.MockCommand{Match: "gunzip -c", Output: ""},
@@ -929,6 +887,7 @@ func TestRedisRestore_AOFRequiresProvenNo(t *testing.T) {
 func TestRedisRestore_SnapshotsAfterStopAndCompensatesStartFailure(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
+		ssh.MockCommand{Match: "aws s3 ls", Output: "2026-01-01 00:00:00 99 20260101-000000.rdb.gz\n"},
 		ssh.MockCommand{Match: "aws s3 cp", Output: "ok"},
 		ssh.MockCommand{Match: "mktemp -d", Output: "/tmp/teploy-restore.abc\n"},
 		ssh.MockCommand{Match: "docker exec 'myapp-cache' redis-cli --raw config get appendonly", Output: "appendonly no"},
@@ -973,6 +932,7 @@ func TestBackupVolumesIncludesTeployServerData(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
 		ssh.MockCommand{Match: "umask 077", Output: "/tmp/teploy-backup.abc123\n"},
+		ssh.MockCommand{Match: "wc -c", Output: "4096\n"},
 		ssh.MockCommand{Match: "if [ -f", Output: ""},
 		ssh.MockCommand{Match: "aws s3 cp", Output: "upload: done\n"},
 		ssh.MockCommand{Match: "rm -f", Output: ""},

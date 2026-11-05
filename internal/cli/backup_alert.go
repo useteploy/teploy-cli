@@ -34,6 +34,9 @@ func backupAlertScriptPath(app string) string {
 	return "/deployments/" + app + "/backup-alert.sh"
 }
 
+// backupAlertWarningMarker marks an alert script that accepts "warning".
+const backupAlertWarningMarker = "# teploy-alert: warning"
+
 // buildBackupAlertScript renders the failure-alert script.
 //
 // secret may be empty, in which case the delivery goes out unsigned exactly as
@@ -48,6 +51,11 @@ func buildBackupAlertScript(app, server, webhookURL, secret string) string {
 		app, server,
 	)
 
+	warning := fmt.Sprintf(
+		`{"app":%q,"server":%q,"type":"backup","success":false,"warning":true,"message":"Scheduled backup succeeded but does not cover every database on the server (see: teploy events)","duration_ms":0,"timestamp":""}`,
+		app, server,
+	)
+
 	var b strings.Builder
 	b.WriteString("#!/bin/sh\n")
 	b.WriteString("# Written by `teploy backup schedule`. Invoked by cron when a scheduled\n")
@@ -56,6 +64,10 @@ func buildBackupAlertScript(app, server, webhookURL, secret string) string {
 	// early on a non-zero step would swallow the report it exists to send.
 	b.WriteString("\n")
 	b.WriteString("BODY=" + ssh.ShellQuote(payload) + "\n")
+	// The marker tells `backup run` this script understands "warning"; a
+	// script from an older CLI would report a successful backup as failed.
+	b.WriteString(backupAlertWarningMarker + "\n")
+	b.WriteString(`if [ "${1:-}" = warning ]; then BODY=` + ssh.ShellQuote(warning) + "; fi\n")
 	b.WriteString("URL=" + ssh.ShellQuote(webhookURL) + "\n")
 	b.WriteString("SECRET=" + ssh.ShellQuote(secret) + "\n")
 	b.WriteString("\n")

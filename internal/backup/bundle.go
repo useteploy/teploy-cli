@@ -195,6 +195,10 @@ type SnapshotRecord struct {
 	Consistency string `json:"consistency"` // engine-consistent | engine-snapshot | crash-consistent | quiesced
 	Detection   string `json:"detection"`   // image-pattern | volume-pattern | operator-override | teploy-stop
 	Artifact    string `json:"artifact"`    // member path inside the bundle
+	// Globals is the member holding a postgres cluster's roles
+	// (pg_dumpall --globals-only), applied before the dump at validation and
+	// cutover: a dump owned by extra roles cannot load without them.
+	Globals string `json:"globals,omitempty"`
 	// Image is the accessory image the snapshot was taken from (empty for
 	// app volumes) — what an isolated restore boots to validate the dump.
 	Image string `json:"image,omitempty"`
@@ -688,11 +692,25 @@ func (c *Client) CreateBundle(ctx context.Context, opts BundleOptions, store Bun
 			return nil, fmt.Errorf("preparing accessory workspace: %w", err)
 		}
 		fmt.Fprintf(c.out, "Snapshotting accessory %s (%s)...\n", accName, image)
-		plan := planAccessoryDump(opts.App, accName, image, env, accWS)
+		det, err := c.ResolveEngine(ctx, opts.App, accName, image, env)
+		if err != nil {
+			cleanup()
+			return nil, err
+		}
+		plan, err := planAccessoryDump(opts.App, accName, det, env, accWS)
+		if err != nil {
+			cleanup()
+			return nil, err
+		}
 		if err := plan.stage(ctx, c.exec); err != nil {
+			cleanup()
 			return nil, fmt.Errorf("staging credential for accessory %s (no dump was run): %w", accName, err)
 		}
 		if _, err := c.exec.Run(ctx, plan.cmd); err != nil {
+			cleanup()
+			return nil, fmt.Errorf("dumping accessory %s: %w", accName, err)
+		}
+		if _, err := c.checkArtifactSize(ctx, plan.artifactPath, plan.minBytes); err != nil {
 			cleanup()
 			return nil, fmt.Errorf("dumping accessory %s: %w", accName, err)
 		}
@@ -707,7 +725,7 @@ func (c *Client) CreateBundle(ctx context.Context, opts BundleOptions, store Bun
 			Engine:      plan.engine,
 			Method:      plan.method,
 			Consistency: plan.consistency,
-			Detection:   "image-pattern",
+			Detection:   plan.detection,
 			Artifact:    member,
 			Image:       image,
 		}
@@ -715,14 +733,39 @@ func (c *Client) CreateBundle(ctx context.Context, opts BundleOptions, store Bun
 		case "postgres":
 			db, user := postgresDBAndUser(opts.App, env)
 			rec.EngineParams = map[string]string{"db": db, "user": user}
+			t := newPGTarget(opts.App+"-"+accName, db, user, env)
+			gz := "accessories/" + accName + ".globals.sql.gz"
+			if err := c.dumpPostgresGlobals(ctx, t, accWS, ws+"/"+gz); err != nil {
+				fmt.Fprintf(c.out, "Warning: the cluster roles of %s were not saved in this bundle: %v\n", accName, err)
+			} else {
+				rec.Globals = gz
+			}
+			// A partial bundle beats none; the manifest says what is missing.
+			_, _, warnings := c.backupCoverage(ctx, opts.App, accName, EngineDetection{Engine: EnginePostgres}, t, env)
+			rec.Notes = strings.Join(warnings, "; ")
+			for _, w := range warnings {
+				fmt.Fprintf(c.out, "Warning: %s: %s\n", accName, w)
+			}
 		case "mysql", "mariadb":
 			rec.EngineParams = map[string]string{"db": mysqlDB(opts.App, env)}
+			_, _, warnings := c.backupCoverage(ctx, opts.App, accName, EngineDetection{Engine: plan.engine}, pgTarget{}, env)
+			rec.Notes = strings.Join(warnings, "; ")
+			for _, w := range warnings {
+				fmt.Fprintf(c.out, "Warning: %s: %s\n", accName, w)
+			}
+		case EngineMongo:
+			_, _, warnings := c.backupCoverage(ctx, opts.App, accName, EngineDetection{Engine: EngineMongo}, pgTarget{}, env)
+			rec.Notes = strings.Join(warnings, "; ")
 		}
-		if plan.engine == "generic" {
-			rec.Notes = "generic accessory: raw tar of the bind-mounted directory while the engine ran; engine-native dump tooling for this image is not known to teploy — the isolated restore validates it by booting a scratch engine"
-		}
-		if plan.engine == "redis" {
-			rec.Notes = "redis BGSAVE-acknowledged dump.rdb copy (appendonly=no proven at snapshot time)"
+		switch plan.engine {
+		case EngineGeneric:
+			rec.Notes = "generic accessory: raw tar of the bind-mounted directory; no database engine was detected for this container (env markers, labels, entrypoint, image name)"
+		case EngineNucleus:
+			rec.Notes = "nucleus: raw tar of the live data directory (crash-consistent; Nucleus recovers torn tails) — the isolated restore validates it by booting a scratch engine"
+		case EngineRedis, EngineValkey:
+			rec.Notes = plan.engine + " BGSAVE-acknowledged dump.rdb copy (appendonly=no proven at snapshot time)"
+		case EngineDragonfly:
+			rec.Notes = "dragonfly SAVE RDB snapshot (Redis-compatible RDB written synchronously by the engine)"
 		}
 		m.Snapshots = append(m.Snapshots, rec)
 	}
@@ -768,6 +811,12 @@ func (c *Client) CreateBundle(ctx context.Context, opts BundleOptions, store Bun
 		return nil
 	}
 	for _, snap := range m.Snapshots {
+		if snap.Globals != "" {
+			if err := uploadMember(snap.Globals, ws+"/"+snap.Globals); err != nil {
+				cleanup()
+				return nil, err
+			}
+		}
 		if err := uploadMember(snap.Artifact, ws+"/"+snap.Artifact); err != nil {
 			cleanup()
 			return nil, err
@@ -1049,13 +1098,16 @@ func validateBundlePaths(m *BundleManifest) error {
 			return fmt.Errorf("invalid snapshot role %q", snap.Role)
 		}
 		valid := false
-		for _, ext := range []string{".tar.gz", ".sql.gz", ".archive.gz", ".rdb.gz"} {
+		for _, ext := range []string{".tar.gz", ".pgdump", ".sql.gz", ".archive.gz", ".rdb.gz"} {
 			if snap.Artifact == prefix+snap.Name+ext {
 				valid = true
 			}
 		}
 		if !valid || seen[snap.Artifact] {
 			return fmt.Errorf("invalid or duplicate snapshot artifact %q", snap.Artifact)
+		}
+		if snap.Globals != "" && snap.Globals != prefix+snap.Name+".globals.sql.gz" {
+			return fmt.Errorf("invalid snapshot globals member %q", snap.Globals)
 		}
 		seen[snap.Artifact] = true
 	}

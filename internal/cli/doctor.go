@@ -203,7 +203,7 @@ func doctorRun(ctx context.Context, deps doctorDeps, flags *Flags, serverName st
 
 	if executor == nil {
 		const sshDown = "restore SSH connectivity (see the ssh check above), then re-run teploy doctor"
-		for _, name := range []string{"docker", "disk", "registry", "caddy", "compatibility", "repair-debt", "secret-exposure", "server-tools", "config-home", "backup-cron", "age-identity", "git-trigger"} {
+		for _, name := range []string{"docker", "disk", "registry", "caddy", "compatibility", "repair-debt", "secret-exposure", "server-tools", "config-home", "backup-cron", "age-identity", "git-trigger", "scheduler", "restore-leftovers", "backup-coverage"} {
 			skipFail(name, "SSH unreachable", sshDown)
 		}
 	} else {
@@ -225,6 +225,10 @@ func doctorRun(ctx context.Context, deps doctorDeps, flags *Flags, serverName st
 		report.Checks = append(report.Checks, doctorBackupCronCheck(ctx, executor))
 		report.Checks = append(report.Checks, doctorAgeIdentityCheck(ctx, executor))
 		report.Checks = append(report.Checks, doctorGitTriggerCheck(ctx, executor, deps))
+		report.Checks = append(report.Checks, doctorSchedulerCheck(ctx, executor))
+		pgReports, pgErr := backup.NewClient(executor, io.Discard).AccessoryReports(ctx)
+		report.Checks = append(report.Checks, doctorRestoreLeftoversCheck(ctx, executor, pgReports))
+		report.Checks = append(report.Checks, doctorBackupCoverageCheck(pgReports, pgErr))
 	}
 
 	report.summarize()
@@ -852,6 +856,125 @@ func doctorBackupCronCheck(ctx context.Context, exec ssh.Executor) doctorCheck {
 		return doctorCheck{Name: "backup-cron", Result: doctorOK,
 			Detail: fmt.Sprintf("%d scheduled line(s) use `backup run`; no embedded credentials or buckets", runForm)}
 	}
+}
+
+// doctorSchedulerCheck fails when jobs are scheduled that nothing will
+// run: crontab entries or /etc/cron.d files on a server with no
+// cron daemon (deploy-ovh ran none of its backup jobs for 6.5 months
+// because cron was never installed). File names and counts only — a cron
+// line can carry credentials.
+func doctorSchedulerCheck(ctx context.Context, exec ssh.Executor) doctorCheck {
+	st, err := backup.ProbeScheduler(ctx, exec)
+	if err != nil {
+		return doctorCheck{Name: "scheduler", Result: doctorWarn, Detail: err.Error(),
+			Remediation: "check the shell on the server — the scheduler probe failed"}
+	}
+	var jobs, teployJobs []string
+	if st.TeployEntries > 0 {
+		teployJobs = append(teployJobs, fmt.Sprintf("%d teploy crontab line(s)", st.TeployEntries))
+	}
+	if other := st.CrontabEntries - st.TeployEntries; other > 0 {
+		jobs = append(jobs, fmt.Sprintf("%d other crontab line(s)", other))
+	}
+	for _, f := range st.CronDTeploy {
+		teployJobs = append(teployJobs, "/etc/cron.d/"+f)
+	}
+	for _, f := range st.CronDOther {
+		jobs = append(jobs, "/etc/cron.d/"+f)
+	}
+	all := append(append([]string{}, teployJobs...), jobs...)
+	switch {
+	case !st.Daemon && st.HasTeployJobs():
+		return doctorCheck{Name: "scheduler", Result: doctorFail,
+			Detail:      "no cron daemon is running, so none of these scheduled jobs run: " + strings.Join(all, ", "),
+			Remediation: backup.SchedulerRemedy()}
+	case !st.Daemon && st.HasJobs():
+		return doctorCheck{Name: "scheduler", Result: doctorWarn,
+			Detail:      "no cron daemon is running; these non-teploy jobs never run: " + strings.Join(all, ", "),
+			Remediation: backup.SchedulerRemedy()}
+	case !st.Daemon:
+		return doctorCheck{Name: "scheduler", Result: doctorWarn,
+			Detail:      "no cron daemon is running (nothing is scheduled yet; `backup schedule` will refuse until one is)",
+			Remediation: backup.SchedulerRemedy()}
+	case st.Enabled == "disabled" || st.Enabled == "masked":
+		return doctorCheck{Name: "scheduler", Result: doctorWarn,
+			Detail:      "the cron daemon is running but its unit is " + st.Enabled + " — scheduled jobs stop after the next reboot",
+			Remediation: "on the server: systemctl enable cron (or crond)"}
+	}
+	detail := "cron daemon running"
+	if len(all) > 0 {
+		detail += "; scheduled: " + strings.Join(all, ", ")
+	}
+	return doctorCheck{Name: "scheduler", Result: doctorOK, Detail: detail}
+}
+
+// restoreLeftoversProbe lists pre-restore safety copies: any whose restore
+// never recorded finishing (it may be the only copy of the data, and could
+// also be a restore running now), and finished ones older than a day (a
+// restore normally removes its copy once the app is healthy).
+const restoreLeftoversProbe = `for d in /var/tmp/teploy-pre-restore.*; do [ -d "$d" ] || continue; if [ -e "$d/restore-completed" ]; then [ -n "$(find "$d" -maxdepth 0 -mmin +1440 2>/dev/null)" ] && printf 'done %s\n' "$d"; else printf 'open %s\n' "$d"; fi; done; true`
+
+// doctorRestoreLeftoversCheck reports what restores left behind: safety copies
+// in /var/tmp, and databases inside accessories (a previous postgres database
+// kept by a restore, a partial replacement or dry run from a killed one). A
+// copy that may be the only copy of the data is said to be, so `--release`
+// is never suggested as a routine cleanup of it.
+func doctorRestoreLeftoversCheck(ctx context.Context, exec ssh.Executor, reports []backup.AccessoryReport) doctorCheck {
+	out, err := exec.Run(ctx, restoreLeftoversProbe)
+	if err != nil {
+		return doctorCheck{Name: "restore-leftovers", Result: doctorWarn, Detail: "could not list /var/tmp: " + err.Error()}
+	}
+	var items []string
+	unconfirmed := false
+	for _, line := range strings.Split(out, "\n") {
+		state, path, ok := strings.Cut(strings.TrimSpace(line), " ")
+		if !ok {
+			continue
+		}
+		if state == "open" {
+			unconfirmed = true
+			items = append(items, path+" (its restore never recorded finishing: this may be the only copy of the data, or a restore running now)")
+		} else {
+			items = append(items, path)
+		}
+	}
+	for _, r := range reports {
+		for _, db := range r.Leftovers {
+			items = append(items, fmt.Sprintf("%s/%s: database %s", r.App, r.Accessory, db))
+		}
+	}
+	if len(items) == 0 {
+		return doctorCheck{Name: "restore-leftovers", Result: doctorOK, Detail: "no pre-restore copies or kept databases"}
+	}
+	remedy := "check the restored data first. teploy backup restore --accessory <name> --rollback swaps a kept previous postgres database back; --release discards kept copies once the restored data is confirmed good, and refuses while one may be the only copy"
+	if unconfirmed {
+		remedy = "do NOT discard a copy whose restore never finished before checking the live database: it may hold the only copy of the data. Load it with the engine's client if the live database is empty or partial. " + remedy
+	}
+	return doctorCheck{Name: "restore-leftovers", Result: doctorWarn,
+		Detail:      fmt.Sprintf("%d restore leftover(s): %s", len(items), strings.Join(items, "; ")),
+		Remediation: remedy}
+}
+
+// doctorBackupCoverageCheck warns when a database server holds databases its
+// accessory's backups do not contain.
+func doctorBackupCoverageCheck(pg []backup.AccessoryReport, err error) doctorCheck {
+	if err != nil {
+		return doctorCheck{Name: "backup-coverage", Result: doctorWarn, Detail: "could not list the database accessories: " + err.Error()}
+	}
+	var gaps []string
+	for _, r := range pg {
+		if r.Err != nil {
+			gaps = append(gaps, fmt.Sprintf("%s/%s: could not list databases (%v)", r.App, r.Accessory, r.Err))
+		} else if len(r.Uncovered) > 0 {
+			gaps = append(gaps, fmt.Sprintf("%s/%s: %s", r.App, r.Accessory, strings.Join(r.Uncovered, ", ")))
+		}
+	}
+	if len(gaps) > 0 {
+		return doctorCheck{Name: "backup-coverage", Result: doctorWarn,
+			Detail:      "databases not covered by the accessory's backups: " + strings.Join(gaps, "; "),
+			Remediation: "postgres: list them in the accessory's backup_databases: in teploy.yml (\"all\" for every one) and recreate the accessory. mysql/mariadb: back each schema up as its own accessory until G5"}
+	}
+	return doctorCheck{Name: "backup-coverage", Result: doctorOK, Detail: fmt.Sprintf("%d database accessory(ies): every database is covered", len(pg))}
 }
 
 // doctorAgeIdentityScript prints three facts about the age identity's
