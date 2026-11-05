@@ -685,6 +685,14 @@ func (c *Client) Remove(ctx context.Context, name string) error {
 	return nil
 }
 
+// RemoveWithVolumes removes a container and its anonymous volumes.
+func (c *Client) RemoveWithVolumes(ctx context.Context, name string) error {
+	if _, err := c.exec.Run(ctx, "docker rm -v "+ssh.ShellQuote(name)); err != nil {
+		return fmt.Errorf("removing container %s: %w", name, err)
+	}
+	return nil
+}
+
 // HostPort returns the container's host-mapped port — the port a health
 // check on this machine connects to at http://localhost:<port>, as opposed
 // to InternalPort (the container-internal port Caddy dials over the

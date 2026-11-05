@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
+	"github.com/useteploy/teploy/internal/backup"
 	"github.com/useteploy/teploy/internal/build"
 	"github.com/useteploy/teploy/internal/caddy"
 	"github.com/useteploy/teploy/internal/confighome"
@@ -23,7 +24,7 @@ import (
 
 func newRemoveCmd(flags *Flags) *cobra.Command {
 	var appName string
-	var yes, purge bool
+	var yes, purge, noBackup bool
 	var redirect string
 	cmd := &cobra.Command{
 		Use:     "remove",
@@ -40,7 +41,9 @@ so the server history can still answer what happened to the app.
 
 Data is preserved by default: volumes/, accessory data, and running accessory
 containers are left in place so a removal is never silently destructive.
-Pass --purge to delete those too (irreversible).
+Pass --purge to delete those too (irreversible). A fresh backup of every
+accessory and of the volumes is stored first; if that fails, or the server has
+no backup target, the purge is refused unless --no-backup.
 
 Pass --redirect <url> to leave a permanent redirect behind for the app's
 domains. The redirect is written as a plain, unmanaged Caddy block (no TEPLOY
@@ -49,13 +52,14 @@ markers), so later teploy operations never touch it.
 Every step is idempotent — re-running after a partial failure is safe.`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runRemove(flags, appName, yes, purge, redirect)
+			return runRemove(flags, appName, yes, purge, noBackup, redirect)
 		},
 	}
 	cmd.Flags().StringVar(&appName, "app", "", "app name — act on server state instead of teploy.yml (requires --host)")
 	cmd.Flags().BoolVarP(&yes, "yes", "y", false, "skip the confirmation prompt")
 	cmd.Flags().BoolVar(&purge, "purge", false, "also delete volumes, accessory data, and accessory containers (irreversible)")
 	cmd.Flags().StringVar(&redirect, "redirect", "", "leave a permanent redirect to this URL for the app's domains")
+	cmd.Flags().BoolVar(&noBackup, "no-backup", false, "with --purge: skip the automatic backup taken first")
 	return cmd
 }
 
@@ -76,7 +80,59 @@ type removeSummary struct {
 	KeptConfig        bool     `json:"kept_config,omitempty"`
 }
 
-func runRemove(flags *Flags, appName string, yes, purge bool, redirect string) error {
+// purgeInventory names what a purge would destroy, for the prompt and the backup.
+func purgeInventory(ctx context.Context, exec ssh.Executor, app string) (accessoriesNames []string, hasVolumes bool, err error) {
+	containers, err := docker.NewClient(exec).ListContainers(ctx, app)
+	if err != nil {
+		return nil, false, fmt.Errorf("listing containers: %w", err)
+	}
+	for _, c := range containers {
+		if c.Labels["teploy.role"] == "accessory" {
+			// Older accessories carry no teploy.accessory label: the name still
+			// says which, and one left out here would be destroyed unprotected.
+			name := c.Labels["teploy.accessory"]
+			if name == "" {
+				name = strings.TrimPrefix(c.Name, app+"-")
+			}
+			accessoriesNames = append(accessoriesNames, name)
+		}
+	}
+	slices.Sort(accessoriesNames)
+	out, err := exec.Run(ctx, "d="+ssh.ShellQuote("/deployments/"+app+"/volumes")+`; if [ -d "$d" ] && [ -n "$(ls -A "$d" 2>/dev/null)" ]; then echo yes; fi; true`)
+	if err != nil {
+		return nil, false, fmt.Errorf("checking volumes: %w", err)
+	}
+	return accessoriesNames, strings.TrimSpace(out) == "yes", nil
+}
+
+// backupBeforePurge stores a copy of everything a purge is about to destroy.
+func backupBeforePurge(ctx context.Context, exec ssh.Executor, app string, accs []string, volumes bool, out io.Writer) error {
+	if len(accs) == 0 && !volumes {
+		return nil
+	}
+	cfg, err := resolvePreBackupTarget(ctx, exec, "remove --purge")
+	if err != nil {
+		return err
+	}
+	client := backup.NewClient(exec, out)
+	for _, acc := range accs {
+		id, err := preOperationBackup(ctx, client, exec, app, acc, "", cfg, "remove --purge")
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(out, "Backed up %s first: %s\n", backup.ContainerName(app, acc), id)
+	}
+	if volumes {
+		id, err := preOperationBackup(ctx, client, exec, app, "", "", cfg, "remove --purge")
+		if err != nil {
+			return err
+		}
+		fmt.Fprintf(out, "Backed up %s's volumes first: %s\n", app, id)
+	}
+	return nil
+}
+
+func runRemove(flags *Flags, appName string, yes, purge, noBackup bool, redirect string) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
@@ -95,6 +151,15 @@ func runRemove(flags *Flags, appName string, yes, purge bool, redirect string) e
 		return fmt.Errorf("app %q has no domains recorded in its state — cannot write a redirect", appCfg.App)
 	}
 
+	var purgeAccessories []string
+	var purgeVolumes bool
+	if purge {
+		purgeAccessories, purgeVolumes, err = purgeInventory(ctx, executor, appCfg.App)
+		if err != nil {
+			return err
+		}
+	}
+
 	if !yes {
 		fmt.Printf("Remove %s from %s:\n", appCfg.App, executor.Host())
 		fmt.Println("  - stop and remove its containers")
@@ -104,7 +169,18 @@ func runRemove(flags *Flags, appName string, yes, purge bool, redirect string) e
 			fmt.Println("  - remove its Caddy route")
 		}
 		if purge {
-			fmt.Println("  - DELETE volumes, accessory data, and accessory containers (--purge)")
+			fmt.Println("  - DELETE, irreversibly (--purge):")
+			if purgeVolumes {
+				fmt.Printf("      volumes: /deployments/%s/volumes\n", appCfg.App)
+			}
+			for _, acc := range purgeAccessories {
+				fmt.Printf("      accessory: %s, with its data in /deployments/%s/accessories/%s\n", backup.ContainerName(appCfg.App, acc), appCfg.App, acc)
+			}
+			if noBackup {
+				fmt.Println("      NO backup is taken first (--no-backup)")
+			} else {
+				fmt.Println("      a fresh backup of each is stored first")
+			}
 		} else {
 			fmt.Println("  - delete deploy state (volumes and accessories are preserved)")
 		}
@@ -116,6 +192,12 @@ func runRemove(flags *Flags, appName string, yes, purge bool, redirect string) e
 	out := io.Writer(os.Stdout)
 	if flags.JSON {
 		out = io.Discard
+	}
+	if purge && !noBackup {
+		if err := backupBeforePurge(ctx, executor, appCfg.App, purgeAccessories, purgeVolumes, backupProgressOut(flags)); err != nil {
+			recordAppEvent(ctx, executor, appCfg.App, events.KindRemove, err, map[string]any{"purge": purge, "redirect": redirect})
+			return err
+		}
 	}
 	summary, err := executeRemove(ctx, executor, appCfg.App, domains, removeOptions{Purge: purge, Redirect: redirect}, out)
 	recordAppEvent(ctx, executor, appCfg.App, events.KindRemove, err, map[string]any{"purge": purge, "redirect": redirect})
@@ -200,7 +282,13 @@ func executeRemove(ctx context.Context, exec ssh.Executor, app string, domains [
 				return nil, err
 			}
 		}
-		if err := dk.Remove(ctx, c.Name); err != nil {
+		// A purge takes the container's anonymous volumes with it: nothing else
+		// can ever reach them, and leaving them is disk nobody can see.
+		remove := dk.Remove
+		if opts.Purge {
+			remove = dk.RemoveWithVolumes
+		}
+		if err := remove(ctx, c.Name); err != nil {
 			return nil, err
 		}
 		summary.RemovedContainers = append(summary.RemovedContainers, c.Name)

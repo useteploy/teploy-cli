@@ -690,11 +690,15 @@ type AppConfig struct {
 	// everything — historical behavior. Set to 2 or 3 to enable auto-prune
 	// with a rollback window. Container-deploy only; static deploy uses
 	// KeepReleases instead.
-	KeepVersions    int                        `yaml:"keep_versions,omitempty" toml:"keep_versions"`
-	Hooks           HooksConfig                `yaml:"hooks,omitempty" toml:"hooks"`
-	Volumes         map[string]string          `yaml:"volumes,omitempty" toml:"volumes"`
-	VolumeOwnership map[string]VolumeOwnership `yaml:"volume_ownership,omitempty" toml:"volume_ownership"`
-	Processes       map[string]string          `yaml:"processes,omitempty" toml:"processes"`
+	KeepVersions int         `yaml:"keep_versions,omitempty" toml:"keep_versions"`
+	Hooks        HooksConfig `yaml:"hooks,omitempty" toml:"hooks"`
+	// BackupBeforeHooks backs every database accessory up before a deploy whose
+	// pre_deploy hook is about to run (migrations rewrite data with no way down).
+	// A failed backup aborts the deploy; `--no-backup` overrides. Default off.
+	BackupBeforeHooks bool                       `yaml:"backup_before_hooks,omitempty" toml:"backup_before_hooks"`
+	Volumes           map[string]string          `yaml:"volumes,omitempty" toml:"volumes"`
+	VolumeOwnership   map[string]VolumeOwnership `yaml:"volume_ownership,omitempty" toml:"volume_ownership"`
+	Processes         map[string]string          `yaml:"processes,omitempty" toml:"processes"`
 	// Env are plain environment variables passed to the app container. Values
 	// may reference ${VAR} from the local environment (expanded at deploy
 	// time). Secrets set via `teploy secret` override these key-for-key.
@@ -1799,6 +1803,9 @@ func mergeConfigs(base, overlay *AppConfig) {
 	}
 	if len(overlay.Publish) > 0 {
 		base.Publish = overlay.Publish
+	}
+	if overlay.BackupBeforeHooks {
+		base.BackupBeforeHooks = true
 	}
 	if overlay.Hooks.PreDeploy != "" {
 		base.Hooks.PreDeploy = overlay.Hooks.PreDeploy
