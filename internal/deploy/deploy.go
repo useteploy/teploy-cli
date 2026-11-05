@@ -1658,7 +1658,7 @@ func (d *Deployer) restoreRouteFromReceipt(ctx context.Context, cfg Config, curr
 	fw := cfg.Firewall
 	access := cfg.Access
 	if rec.Caddy != nil {
-		tls = caddy.TLS{Cert: rec.Caddy.TLSCert, Key: rec.Caddy.TLSKey, Internal: rec.Caddy.TLSInternal, HTTPOnly: rec.Caddy.TLSHTTPOnly}
+		tls = caddy.TLS{Cert: rec.Caddy.TLSCert, Key: rec.Caddy.TLSKey, Internal: rec.Caddy.TLSInternal, HTTPOnly: rec.Caddy.HTTPOnlyOr(cfg.TLSHTTPOnly)}
 		caddyExtra = rec.Caddy.CaddyExtra
 		cache = rec.Caddy.Cache
 		if rec.Caddy.Firewall != nil {
@@ -1806,11 +1806,12 @@ func (d *Deployer) recordRelease(ctx context.Context, cfg Config, att releasemet
 		}
 	}
 	if cfg.usesCaddy() {
+		httpOnly := cfg.TLSHTTPOnly
 		rec.Caddy = &releasemeta.CaddyRoute{
 			TLSCert:     cfg.TLSCert,
 			TLSKey:      cfg.TLSKey,
 			TLSInternal: cfg.TLSInternal,
-			TLSHTTPOnly: cfg.TLSHTTPOnly,
+			TLSHTTPOnly: &httpOnly,
 			CaddyExtra:  cfg.CaddyExtra,
 			Cache:       maps.Clone(cfg.Cache),
 		}

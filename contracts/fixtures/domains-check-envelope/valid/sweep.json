@@ -16,6 +16,8 @@
       "error": "dial tcp 198.51.100.1:22: i/o timeout",
       "addresses": [],
       "public_address_known": false,
+      "public_ipv4_known": false,
+      "public_ipv6_known": false,
       "caddy": {
         "container": "unknown",
         "caddyfile": "unreadable",
@@ -34,6 +36,8 @@
         "192.0.2.10"
       ],
       "public_address_known": true,
+      "public_ipv4_known": true,
+      "public_ipv6_known": false,
       "caddy": {
         "container": "present",
         "caddyfile": "present",

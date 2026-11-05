@@ -296,6 +296,9 @@ func runPlan(flags *Flags, version, image, destination, outFile string) error {
 	if err != nil {
 		return err
 	}
+	if err := config.ValidateDeployDomain(appCfg); err != nil {
+		return refuseAdmission(err)
+	}
 	serverName := resolvePlanServerName(appCfg)
 	executor, err := connectForApp(ctx, flags, appCfg)
 	if err != nil {

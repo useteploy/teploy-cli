@@ -13,6 +13,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -125,11 +126,27 @@ func staleRouteEffects(ctx context.Context, exec ssh.Executor, out io.Writer, ap
 	if !present {
 		return nil
 	}
+	detail := "left by an earlier caddy-ingress release; removed after the state commit, kept if this deploy fails"
+	if strings.Contains(region, "# TEPLOY WEBHOOK BEGIN") {
+		detail += "; WARNING: it carries the autodeploy webhook route, which stops working"
+	}
+	// An upstream that is not one of this app's own containers outlives the
+	// release, so the block may be serving traffic that removal would cut.
+	var foreign []string
+	for _, u := range caddy.RegionUpstreams(region) {
+		if !strings.HasPrefix(u, appCfg.App+"-") {
+			foreign = append(foreign, u)
+		}
+	}
+	if len(foreign) > 0 {
+		sort.Strings(foreign)
+		detail += "; WARNING: it also proxies to " + strings.Join(slices.Compact(foreign), ", ") + ", not this app's containers, and removal cuts that traffic"
+	}
 	return []planEffect{{
 		Action: "remove",
 		Name:   "stale caddy route",
 		From:   strings.Join(caddy.RegionHosts(region), ","),
-		Detail: "left by an earlier caddy-ingress release; removed after the state commit, kept if this deploy fails",
+		Detail: detail,
 	}}
 }
 

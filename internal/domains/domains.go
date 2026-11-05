@@ -69,6 +69,7 @@ const (
 const (
 	LogsOK          = "ok"
 	LogsShort       = "short"       // under a day: not enough to call zero failures
+	LogsPartial     = "partial"     // a matched line could not be parsed: same
 	LogsUnavailable = "unavailable" // could not be read
 	LogsNoCaddy     = "no_caddy"    // no caddy container here
 )
@@ -119,11 +120,14 @@ type Server struct {
 	State     string    `json:"state"`
 	CheckedAt time.Time `json:"checked_at"`
 	Error     string    `json:"error,omitempty"`
-	// Addresses are every address counted as this server; PublicAddressKnown is
-	// false when none of them is public, so a non-matching DNS answer proves
-	// nothing and reads unknown.
+	// Addresses are every address counted as this server. PublicAddressKnown is
+	// false when none of them is public; the per-family flags decide DNS: an
+	// answer in a family with no known public address proves nothing and reads
+	// unknown.
 	Addresses          []string    `json:"addresses"`
 	PublicAddressKnown bool        `json:"public_address_known"`
+	PublicIPv4Known    bool        `json:"public_ipv4_known"`
+	PublicIPv6Known    bool        `json:"public_ipv6_known"`
 	Caddy              CaddyStatus `json:"caddy"`
 	Issues             []Issue     `json:"issues"`
 }
@@ -282,7 +286,8 @@ func CheckServer(ctx context.Context, exec ssh.Executor, name string, opts Optio
 	apps, stateKnown := readApps(ctx, exec, &srv, issue)
 
 	sites, routesKnown := readSites(ctx, exec, &srv, issue)
-	srv.Addresses, srv.PublicAddressKnown = readAddresses(ctx, exec)
+	srv.Addresses, srv.PublicIPv4Known, srv.PublicIPv6Known = readAddresses(ctx, exec)
+	srv.PublicAddressKnown = srv.PublicIPv4Known || srv.PublicIPv6Known
 
 	obtain := readObtainLog(ctx, exec, &srv, opts.LogWindow, now(), issue)
 
@@ -293,7 +298,7 @@ func CheckServer(ctx context.Context, exec ssh.Executor, name string, opts Optio
 
 	dnsCtx, cancel := context.WithTimeout(ctx, opts.DNSBudget)
 	defer cancel()
-	applyDNS(dnsCtx, rows, srv.Addresses, srv.PublicAddressKnown, cache)
+	applyDNS(dnsCtx, rows, srv, cache)
 
 	if len(srv.Issues) > 0 {
 		srv.State = ServerPartial
@@ -365,7 +370,7 @@ func readSites(ctx context.Context, exec ssh.Executor, srv *Server, issue func(s
 // no interface). The probe goes to the same operator as the first resolver, and
 // is best effort: without it, and with no public interface, a non-matching DNS
 // answer reads unknown rather than wrong_target.
-func readAddresses(ctx context.Context, exec ssh.Executor) (addrs []string, publicKnown bool) {
+func readAddresses(ctx context.Context, exec ssh.Executor) (addrs []string, publicV4, publicV6 bool) {
 	seen := map[string]bool{}
 	add := func(raw string) {
 		ip := net.ParseIP(strings.TrimSpace(raw))
@@ -378,7 +383,11 @@ func readAddresses(ctx context.Context, exec ssh.Executor) (addrs []string, publ
 			addrs = append(addrs, s)
 		}
 		if isPublicIP(ip) {
-			publicKnown = true
+			if ip.To4() != nil {
+				publicV4 = true
+			} else {
+				publicV6 = true
+			}
 		}
 	}
 	add(exec.Host())
@@ -396,7 +405,7 @@ func readAddresses(ctx context.Context, exec ssh.Executor) (addrs []string, publ
 		}
 	}
 	sort.Strings(addrs)
-	return addrs, publicKnown
+	return addrs, publicV4, publicV6
 }
 
 var cgnat = func() *net.IPNet { _, n, _ := net.ParseCIDR("100.64.0.0/10"); return n }()
@@ -413,7 +422,7 @@ func logCommand(window time.Duration) string {
 	return `o=$(docker container inspect -f '{{.State.Running}}' caddy 2>&1) || { case "$o" in *"No such"*) echo TEPLOY_CADDY_ABSENT;; *) echo TEPLOY_CADDY_UNKNOWN;; esac; exit 0; }; ` +
 		`echo "TEPLOY_CADDY_RUNNING=$o"; ` +
 		`t=; command -v timeout >/dev/null 2>&1 && t='timeout 30'; ` +
-		`printf 'TEPLOY_LOG_FIRST '; docker logs caddy 2>&1 | head -n 1 | cut -c1-300; ` +
+		`printf 'TEPLOY_LOG_FIRST %s\n' "$(docker logs caddy 2>&1 | head -n 1 | cut -c1-300)"; ` +
 		`{ $t docker logs --since ` + since + ` caddy 2>&1; echo "TEPLOY_LOG_RC=$?"; } | ` +
 		`grep -E '"logger":"tls\.(obtain|renew)"|^TEPLOY_LOG_RC=' | ` +
 		`grep -E '"level":"error"|obtained successfully|renewed successfully|^TEPLOY_LOG_RC=' | ` +
@@ -487,6 +496,7 @@ func parseObtainOutput(out string, now time.Time, window time.Duration) obtainOu
 
 	rc := -1
 	logLines := 0
+	unparsed := 0
 	haveFirst := false
 	for _, line := range lines[1:] {
 		line = strings.TrimSpace(line)
@@ -519,7 +529,9 @@ func parseObtainOutput(out string, now time.Time, window time.Duration) obtainOu
 			rc, _ = strconv.Atoi(strings.TrimPrefix(line, "TEPLOY_LOG_RC="))
 		case line != "":
 			logLines++
-			recordObtainLine(res.stats, line)
+			if !recordObtainLine(res.stats, line) {
+				unparsed++
+			}
 		}
 	}
 	if rc != 0 {
@@ -531,6 +543,14 @@ func parseObtainOutput(out string, now time.Time, window time.Duration) obtainOu
 		res.logs = LogsOK
 	} else {
 		res.logs = LogsShort
+	}
+	// A failure line that cannot be attributed could be anyone's: zero failures
+	// is not believable for any name.
+	if unparsed > 0 {
+		if res.logs == LogsOK {
+			res.logs = LogsPartial
+		}
+		res.problem = fmt.Sprintf("%d certificate log line(s) could not be read", unparsed)
 	}
 	return res
 }
@@ -547,7 +567,8 @@ func unixFloat(ts float64) time.Time {
 	return time.Unix(sec, int64((ts-float64(sec))*1e9)).UTC()
 }
 
-func recordObtainLine(stats map[string]*ObtainStats, line string) {
+// recordObtainLine reports false for a matched line it could not attribute.
+func recordObtainLine(stats map[string]*ObtainStats, line string) bool {
 	var rec struct {
 		Level      string  `json:"level"`
 		TS         float64 `json:"ts"`
@@ -557,7 +578,7 @@ func recordObtainLine(stats map[string]*ObtainStats, line string) {
 		Elapsed    float64 `json:"elapsed"`
 	}
 	if json.Unmarshal([]byte(line), &rec) != nil || rec.TS == 0 {
-		return
+		return false
 	}
 	id := rec.Identifier
 	if id == "" {
@@ -567,7 +588,7 @@ func recordObtainLine(stats map[string]*ObtainStats, line string) {
 	}
 	id = strings.ToLower(strings.TrimSpace(id))
 	if id == "" {
-		return
+		return false
 	}
 	s := stats[id]
 	if s == nil {
@@ -581,7 +602,7 @@ func recordObtainLine(stats map[string]*ObtainStats, line string) {
 			s.FailingSince = time.Time{}
 			s.LastSuccessAt = at
 		}
-		return
+		return true
 	}
 	// Each attempt logs one line per issuer plus one "will retry"; the retry
 	// line is the attempt count and carries how long the obtain has been failing.
@@ -600,6 +621,19 @@ func recordObtainLine(stats map[string]*ObtainStats, line string) {
 	if rec.Error != "" {
 		s.LastError = cleanText(rec.Error, maxErrorChars)
 	}
+	return true
+}
+
+// statsFor finds a host's certificate history: its own, or the wildcard
+// certificate that covers it.
+func statsFor(stats map[string]*ObtainStats, host string) *ObtainStats {
+	if s := stats[host]; s != nil {
+		return s
+	}
+	if i := strings.IndexByte(host, '.'); i >= 0 {
+		return stats["*"+host[i:]]
+	}
+	return nil
 }
 
 // credentialURL strips userinfo from anything URL-shaped in a stored error.
@@ -902,7 +936,7 @@ func applyTLS(rows []Domain, stats map[string]*ObtainStats, status CaddyStatus) 
 		if row.Route.TLS != caddy.SiteTLSACME || row.Skip == SkipIPLiteral || row.Skip == SkipPrivateName {
 			continue
 		}
-		s := stats[row.Host]
+		s := statsFor(stats, row.Host)
 		if s == nil {
 			if status.Logs == LogsOK {
 				zero := 0
@@ -937,7 +971,7 @@ func applyTLS(rows []Domain, stats map[string]*ObtainStats, status CaddyStatus) 
 
 // applyDNS runs the public lookups concurrently, each row bounded by the DNS
 // budget and the shared limiter.
-func applyDNS(ctx context.Context, rows []Domain, addrs []string, publicKnown bool, cache *DNSCache) {
+func applyDNS(ctx context.Context, rows []Domain, srv Server, cache *DNSCache) {
 	var wg sync.WaitGroup
 	for i := range rows {
 		row := &rows[i]
@@ -961,7 +995,7 @@ func applyDNS(ctx context.Context, rows []Domain, addrs []string, publicKnown bo
 			defer wg.Done()
 			ans := cache.get(ctx, row.Host)
 			row.DNS.Answers = append([]string{}, ans.Answers...)
-			row.DNS.Status = dns.Classify(ans, addrs, publicKnown)
+			row.DNS.Status = dns.Classify(ans, srv.Addresses, srv.PublicIPv4Known, srv.PublicIPv6Known)
 			switch row.DNS.Status {
 			case dns.StatusNXDomain:
 				row.DNS.Detail = "no address record at the public resolvers"
@@ -971,7 +1005,7 @@ func applyDNS(ctx context.Context, rows []Domain, addrs []string, publicKnown bo
 				if ans.Err != nil {
 					row.DNS.Detail = "public resolvers did not answer"
 				} else {
-					row.DNS.Detail = "this server's public address could not be determined"
+					row.DNS.Detail = "this server's public address for that record type could not be determined"
 				}
 			}
 		}(row)

@@ -117,9 +117,11 @@ func lookupVia(ctx context.Context, lookup lookupFunc, resolvers []string, host 
 }
 
 // Classify turns an answer into a status. serverIPs are the addresses that
-// count as this server; targetKnown is false when no public address could be
-// determined for it, in which case a non-matching answer proves nothing.
-func Classify(ans PublicAnswer, serverIPs []string, targetKnown bool) string {
+// count as this server. publicV4 and publicV6 say whether a public address of
+// that family is known for it: a public IPv6 on an interface says nothing about
+// the IPv4 a NAT'd box answers on, so a non-matching answer in a family with no
+// known address proves nothing.
+func Classify(ans PublicAnswer, serverIPs []string, publicV4, publicV6 bool) string {
 	switch {
 	case ans.Err != nil:
 		return StatusUnknown
@@ -129,11 +131,17 @@ func Classify(ans PublicAnswer, serverIPs []string, targetKnown bool) string {
 		return StatusOK
 	case AllCloudflare(ans.Answers):
 		return StatusProxied
-	case !targetKnown:
-		return StatusUnknown
-	default:
-		return StatusWrongTarget
 	}
+	for _, a := range ans.Answers {
+		ip := net.ParseIP(a)
+		if ip == nil {
+			continue
+		}
+		if known := map[bool]bool{true: publicV4, false: publicV6}[ip.To4() != nil]; !known {
+			return StatusUnknown
+		}
+	}
+	return StatusWrongTarget
 }
 
 // cloudflareRangesAsOf dates the list below (https://www.cloudflare.com/ips/).

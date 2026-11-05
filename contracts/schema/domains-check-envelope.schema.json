@@ -14,7 +14,7 @@
       "type": "array",
       "items": {
         "type": "object",
-        "required": ["server", "host", "state", "checked_at", "addresses", "public_address_known", "caddy", "issues"],
+        "required": ["server", "host", "state", "checked_at", "addresses", "public_address_known", "public_ipv4_known", "public_ipv6_known", "caddy", "issues"],
         "properties": {
           "server": {"type": "string", "minLength": 1},
           "host": {"type": "string"},
@@ -23,13 +23,15 @@
           "error": {"type": "string"},
           "addresses": {"type": "array", "items": {"type": "string"}},
           "public_address_known": {"type": "boolean"},
+          "public_ipv4_known": {"type": "boolean"},
+          "public_ipv6_known": {"type": "boolean"},
           "caddy": {
             "type": "object",
             "required": ["container", "caddyfile", "logs", "log_coverage_seconds"],
             "properties": {
               "container": {"enum": ["present", "absent", "stopped", "unknown"]},
               "caddyfile": {"enum": ["present", "absent", "unparseable", "unreadable"]},
-              "logs": {"enum": ["ok", "short", "unavailable", "no_caddy"]},
+              "logs": {"enum": ["ok", "short", "partial", "unavailable", "no_caddy"]},
               "log_coverage_seconds": {"type": "integer", "minimum": 0},
               "logs_truncated": {"type": "boolean"}
             }

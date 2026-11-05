@@ -285,9 +285,10 @@ func TestRollback_HostToCaddyCommitFailureRemovesWhatItWrote(t *testing.T) {
 }
 
 func TestRollback_RestoreKeepsHTTPOnly(t *testing.T) {
+	httpOnly := true
 	rec := marshalRecord(t, &releasemeta.Record{DeploymentType: "container", IngressMode: "caddy", Domain: "myapp.com",
 		Health: &releasemeta.Health{Path: "/health", TimeoutSeconds: 30, IntervalSeconds: 1},
-		Caddy:  &releasemeta.CaddyRoute{TLSHTTPOnly: true},
+		Caddy:  &releasemeta.CaddyRoute{TLSHTTPOnly: &httpOnly},
 		Ports:  []releasemeta.Port{{HostPort: 49152, ContainerPort: 3000, Primary: true}}})
 	m := ssh.NewMockExecutor("1.2.3.4", rollbackFixtureCommands(rec)...)
 	m.Files["/deployments/caddy/Caddyfile"] = []byte(rollbackCaddyBlock + "\n")
@@ -297,5 +298,96 @@ func TestRollback_RestoreKeepsHTTPOnly(t *testing.T) {
 	}
 	if caddyfile := string(m.Files["/deployments/caddy/Caddyfile"]); !strings.Contains(caddyfile, "http://myapp.com") {
 		t.Errorf("the recorded http_only setting was lost:\n%s", caddyfile)
+	}
+}
+
+// The record wins both ways: a folder that is http_only now, rolling back to a
+// release recorded as HTTPS, must not drop HTTPS. A record too old to carry the
+// field keeps what the caller resolved.
+func TestRollback_RecordCanTurnHTTPOnlyOff(t *testing.T) {
+	off := false
+	for _, tc := range []struct {
+		name     string
+		recorded *bool
+		want     string
+	}{
+		{"recorded off", &off, "myapp.com {"},
+		{"old record", nil, "http://myapp.com"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rec := marshalRecord(t, &releasemeta.Record{DeploymentType: "container", IngressMode: "caddy", Domain: "myapp.com",
+				Health: &releasemeta.Health{Path: "/health", TimeoutSeconds: 30, IntervalSeconds: 1},
+				Caddy:  &releasemeta.CaddyRoute{TLSHTTPOnly: tc.recorded},
+				Ports:  []releasemeta.Port{{HostPort: 49152, ContainerPort: 3000, Primary: true}}})
+			m := ssh.NewMockExecutor("1.2.3.4", rollbackFixtureCommands(rec)...)
+			m.Files["/deployments/caddy/Caddyfile"] = []byte(rollbackCaddyBlock + "\n")
+			cfg := rollbackCfg()
+			cfg.TLSHTTPOnly = true
+			var out bytes.Buffer
+			if err := Rollback(context.Background(), m, &out, cfg); err != nil {
+				t.Fatalf("Rollback: %v\n%s", err, out.String())
+			}
+			caddyfile := string(m.Files["/deployments/caddy/Caddyfile"])
+			if !strings.Contains(caddyfile, tc.want) {
+				t.Errorf("want %q in:\n%s", tc.want, caddyfile)
+			}
+		})
+	}
+}
+
+// A refused removal after a committed rollback is degraded, on the record.
+func TestRollback_RetireFailureRecordedAsDegraded(t *testing.T) {
+	m := ssh.NewMockExecutor("1.2.3.4",
+		append([]ssh.MockCommand{{Match: "docker exec caddy caddy reload", Err: errors.New("reload refused")}}, rollbackFixtureCommands(hostRecord(t))...)...)
+	m.Files["/deployments/caddy/Caddyfile"] = []byte(rollbackCaddyBlock + "\n")
+	var out bytes.Buffer
+	if err := Rollback(context.Background(), m, &out, rollbackCfg()); err != nil {
+		t.Fatalf("the rollback itself stands: %v\n%s", err, out.String())
+	}
+	raw, ok := logEntryFromCalls(m)
+	if !ok {
+		t.Fatalf("no log entry\n%s", out.String())
+	}
+	var entry state.LogEntry
+	if err := json.Unmarshal(raw, &entry); err != nil {
+		t.Fatal(err)
+	}
+	if !entry.Success || !entry.Degraded || !strings.Contains(entry.DegradedReason, "stale Caddy route") {
+		t.Errorf("log entry = %+v", entry)
+	}
+}
+
+// Deploy's twin of the rollback guard: a caddy deploy over a host release whose
+// commit fails takes out the block it wrote rather than rendering a route for a
+// release that had none.
+func TestDeploy_CaddyOverHostCommitFailureRemovesBlock(t *testing.T) {
+	st := fmt.Sprintf(`{"schema_version":2,"deployment_type":"container","ingress_mode":"host","updated_at":"2026-07-22T10:00:00Z","current_port":3000,"current_hash":"old123"}`)
+	m := ssh.NewMockExecutor("1.2.3.4",
+		ssh.MockCommand{Match: "UPLOAD:/deployments/web/state.json.tmp-", Err: errors.New("disk full")},
+		ssh.MockCommand{Match: "mkdir -p /deployments/web", Output: ""},
+		ssh.MockCommand{Match: "mkdir /deployments/web/.lock", Output: ""},
+		ssh.MockCommand{Match: "if [ ! -e '/deployments/web/state.json' ]", Output: "present\n" + st},
+		ssh.MockCommand{Match: "docker ps", Output: ""},
+		ssh.MockCommand{Match: "ss -tln", Output: ""},
+		ssh.MockCommand{Match: "docker run", Output: "container-id"},
+		ssh.MockCommand{Match: "docker inspect -f '{{.State.Status}}'", Output: "running"},
+		ssh.MockCommand{Match: "docker stop", Output: ""},
+		ssh.MockCommand{Match: "docker rm", Output: ""},
+		ssh.MockCommand{Match: "curl -s -o /dev/null", Output: "200"},
+		ssh.MockCommand{Match: "docker exec caddy caddy reload", Output: ""},
+		ssh.MockCommand{Match: "a=$(docker exec caddy md5sum", Output: "TEPLOY_CADDY_OK"},
+		ssh.MockCommand{Match: "mkdir /deployments/caddy/.lock", Output: ""},
+		ssh.MockCommand{Match: "printf %s", Output: ""},
+		ssh.MockCommand{Match: "rm -rf /deployments/web/.lock", Output: ""},
+	)
+	m.Files["/deployments/caddy/Caddyfile"] = []byte(otherBlock + "\n")
+	var out bytes.Buffer
+	cfg := Config{App: "web", Image: "web:new", Version: "new456", Domain: "web.teploy-fixture.dev", ContainerPort: 3000,
+		Health: HealthConfig{Timeout: 5 * time.Second, Interval: 10 * time.Millisecond}}
+	if err := NewDeployer(m, &out).Deploy(context.Background(), cfg); err == nil {
+		t.Fatalf("expected the commit to fail\n%s", out.String())
+	}
+	if caddyfile := string(m.Files["/deployments/caddy/Caddyfile"]); strings.Contains(caddyfile, "TEPLOY BEGIN web") {
+		t.Errorf("the block must go:\n%s", caddyfile)
 	}
 }

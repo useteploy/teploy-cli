@@ -320,6 +320,14 @@ func TestStaleRouteEffects(t *testing.T) {
 	if got := staleRouteEffects(context.Background(), withFile("# nothing\n"), &out, host); got != nil {
 		t.Errorf("no block, no effect: %+v", got)
 	}
+	if d := effects[0].Detail; strings.Contains(d, "WARNING") {
+		t.Errorf("an ordinary block warns about nothing: %s", d)
+	}
+	risky := "# TEPLOY BEGIN blog\nblog.dev {\n\t# TEPLOY WEBHOOK BEGIN blog\n\t@h {\n\t\tpath /x\n\t}\n\t# TEPLOY WEBHOOK END blog\n\treverse_proxy other-box:8080\n}\n# TEPLOY END blog\n"
+	got := staleRouteEffects(context.Background(), withFile(risky), &out, host)
+	if len(got) != 1 || !strings.Contains(got[0].Detail, "webhook") || !strings.Contains(got[0].Detail, "other-box:8080") {
+		t.Errorf("the plan must warn about what removal cuts: %+v", got)
+	}
 	caddy := &config.AppConfig{App: "blog", Domain: "blog.dev"}
 	if got := staleRouteEffects(context.Background(), withFile(block), &out, caddy); got != nil {
 		t.Errorf("a caddy plan keeps its route: %+v", got)

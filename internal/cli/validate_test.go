@@ -158,6 +158,9 @@ func TestDNSCheckAppliesOnlyToCaddyRoutedDomains(t *testing.T) {
 		{config.AppConfig{Domain: "a.dev", Ingress: config.IngressHost}, false},
 		{config.AppConfig{Domain: "a.dev", Ingress: config.IngressExternal}, false},
 		{config.AppConfig{}, false},
+		{config.AppConfig{Domain: "app.test", TLS: &config.TLSConfig{Internal: true}}, false},
+		{config.AppConfig{Domain: "a.dev", TLS: &config.TLSConfig{HTTPOnly: true}}, false},
+		{config.AppConfig{Domain: "a.dev", TLS: &config.TLSConfig{Cert: "c", Key: "k"}}, true},
 	} {
 		if got := dnsCheckApplies(&tc.cfg); got != tc.want {
 			t.Errorf("dnsCheckApplies(%+v) = %v", tc.cfg, got)
@@ -172,5 +175,41 @@ func TestValidateDomainDNS_ChecksEachHost(t *testing.T) {
 	_, err := validateDomainDNS(context.Background(), mock, "localhost, localhost", "127.0.0.1")
 	if err != nil {
 		t.Fatalf("both hosts resolve to the server: %v", err)
+	}
+}
+
+// A placeholder stops a deploy and a plan before any connection, and never a
+// load: the refusal is deploy admission's.
+func TestDeployAdmission_RefusesBeforeAnyEffect(t *testing.T) {
+	cfg := &config.AppConfig{App: "a", Domain: "a.example.com", Image: "nginx:1", Server: "192.0.2.1"}
+	err := deployAppConfig(&Flags{}, cfg, "192.0.2.1", "", "", false, false, "")
+	if err == nil || !strings.Contains(err.Error(), "reserved") {
+		t.Fatalf("deploy: %v", err)
+	}
+	if err := runMultiDeploy(&Flags{}, cfg, "", "", false, 1, false); err == nil || !strings.Contains(err.Error(), "reserved") {
+		t.Fatalf("multi deploy: %v", err)
+	}
+
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "teploy.yml"), []byte("app: a\ndomain: a.example.com\nimage: nginx:1\nserver: 192.0.2.1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := config.LoadApp(dir); err != nil {
+		t.Fatalf("rollback and logs load this file: %v", err)
+	}
+	t.Chdir(dir)
+	if err := runPlan(&Flags{}, "", "", "", ""); err == nil || !strings.Contains(err.Error(), "reserved") {
+		t.Fatalf("plan: %v", err)
+	}
+	flags := &Flags{JSON: true}
+	if err := runValidate(flags); err == nil {
+		t.Fatal("validate must report it invalid")
+	}
+}
+
+func TestValidateDomainDNS_SkipsLocalhostNames(t *testing.T) {
+	notes, err := validateDomainDNS(context.Background(), nil, "foo.localhost", "192.0.2.1")
+	if err != nil || len(notes) != 0 {
+		t.Fatalf("notes=%v err=%v", notes, err)
 	}
 }

@@ -584,8 +584,9 @@ serves. Read-only, run from your machine over SSH, nothing new on the server:
   failure), `unknown` (no resolver answered, or the server's public address
   could not be determined), `skipped`.
 - **tls**: certificate failures per name from Caddy's logs (`--log-window`,
-  default 14 days), with how long the name has been failing. Logs under a day
-  old or unreadable give `unknown`, never 0.
+  default 14 days), with how long the name has been failing; a wildcard's failure
+  covers the names under it. Logs under a day old, unreadable, or with a line
+  that cannot be attributed give `unknown`, never 0.
 - **route**: `managed`, `manual`, `stale_managed` (the app is no longer
   caddy-routed), `orphan_managed` (no such app here), `none`, and whether each
   upstream resolves in Caddy's network.

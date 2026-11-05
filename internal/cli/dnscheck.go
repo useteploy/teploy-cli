@@ -15,7 +15,13 @@ import (
 // Caddy-routed domain must point at this server. Host ingress publishes a raw
 // port and external ingress is served by the user's own front, so neither
 // domain resolves here by design.
+//
+// tls.internal and tls.http_only never ask a public CA, and are typically private
+// names or origins behind a proxy, so public DNS proves nothing about them.
 func dnsCheckApplies(appCfg *config.AppConfig) bool {
+	if appCfg.TLS != nil && (appCfg.TLS.Internal || appCfg.TLS.HTTPOnly) {
+		return false
+	}
 	return appCfg.Domain != "" && appCfg.UsesCaddy()
 }
 
@@ -34,7 +40,7 @@ func validateDomainDNS(ctx context.Context, executor ssh.Executor, domain, host 
 	interfacesRead := false
 	for _, d := range strings.Split(domain, ",") {
 		d = strings.TrimSpace(d)
-		if d == "" {
+		if d == "" || config.IsLocalhostName(d) {
 			continue
 		}
 		verr := dns.Validate(d, host, nil)

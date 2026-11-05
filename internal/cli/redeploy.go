@@ -47,6 +47,11 @@ func withRedeployTrigger(ctx context.Context) context.Context {
 	return context.WithValue(ctx, redeployKey{}, true)
 }
 
+func isRedeployTrigger(ctx context.Context) bool {
+	_, ok := ctx.Value(redeployKey{}).(bool)
+	return ok
+}
+
 func eventTrigger(ctx context.Context) string {
 	if _, ok := ctx.Value(redeployKey{}).(bool); ok {
 		return "redeploy"

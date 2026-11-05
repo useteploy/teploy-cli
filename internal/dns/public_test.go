@@ -16,6 +16,8 @@ func TestClassify(t *testing.T) {
 		targetKnown bool
 		want        string
 	}{
+		// A public IPv6 on an interface says nothing about the box's IPv4.
+		{"v4 answer, only v6 known", PublicAnswer{Answers: []string{"198.51.100.1"}}, false, StatusUnknown},
 		{"answer is the server", PublicAnswer{Answers: []string{"192.0.2.10"}}, true, StatusOK},
 		{"one of several is the server", PublicAnswer{Answers: []string{"192.0.2.10", "198.51.100.1"}}, true, StatusOK},
 		{"no record", PublicAnswer{NotFound: true}, true, StatusNXDomain},
@@ -28,8 +30,32 @@ func TestClassify(t *testing.T) {
 		{"cloudflare even with unknown server", PublicAnswer{Answers: []string{"104.16.0.1"}}, false, StatusProxied},
 	}
 	for _, c := range cases {
-		if got := Classify(c.ans, server, c.targetKnown); got != c.want {
+		if got := Classify(c.ans, server, c.targetKnown, c.targetKnown); got != c.want {
 			t.Errorf("%s: Classify = %q, want %q", c.name, got, c.want)
+		}
+	}
+}
+
+func TestClassify_PerFamily(t *testing.T) {
+	server := []string{"192.0.2.10", "2001:db8::1"}
+	v4 := PublicAnswer{Answers: []string{"198.51.100.1"}}
+	v6 := PublicAnswer{Answers: []string{"2001:db8::99"}}
+	both := PublicAnswer{Answers: []string{"198.51.100.1", "2001:db8::99"}}
+	for _, c := range []struct {
+		name         string
+		ans          PublicAnswer
+		v4Known, v6K bool
+		want         string
+	}{
+		{"A answer, public IPv6 only", v4, false, true, StatusUnknown},
+		{"A answer, public IPv4 known", v4, true, false, StatusWrongTarget},
+		{"AAAA answer, public IPv4 only", v6, true, false, StatusUnknown},
+		{"AAAA answer, public IPv6 known", v6, false, true, StatusWrongTarget},
+		{"both families, one unknown", both, true, false, StatusUnknown},
+		{"both families, both known", both, true, true, StatusWrongTarget},
+	} {
+		if got := Classify(c.ans, server, c.v4Known, c.v6K); got != c.want {
+			t.Errorf("%s: %q, want %q", c.name, got, c.want)
 		}
 	}
 }

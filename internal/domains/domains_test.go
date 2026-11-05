@@ -5,6 +5,9 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -465,5 +468,86 @@ func TestCheckServer_PreviewRoutes(t *testing.T) {
 	}
 	if r := rows["dead.dev"]; r.Route.Kind != RouteOrphanManaged || r.Route.UpstreamResolves != ResolvesNo {
 		t.Errorf("dead preview = %+v", r.Route)
+	}
+}
+
+// A failing wildcard certificate is the certificate of every name under it.
+func TestCheckServer_WildcardObtainCoversItsHosts(t *testing.T) {
+	failing := fmt.Sprintf(`{"level":"error","ts":%s,"logger":"tls.obtain","msg":"will retry","error":"[*.foo.dev] Obtain: dns challenge failed","elapsed":200000}`, ts(checkNow.Add(-time.Hour)))
+	caddyfile := "*.foo.dev {\n\treverse_proxy a:1\n}\n\nown.foo.dev {\n\treverse_proxy a:1\n}\n"
+	good := fmt.Sprintf(`{"level":"info","ts":%s,"logger":"tls.obtain","msg":"certificate obtained successfully","identifier":"own.foo.dev"}`, ts(checkNow.Add(-time.Hour)))
+	m := fleetMock(caddyfile, logsOK(failing, good), map[string]string{"x": appState("caddy", "x.foo.dev, own.foo.dev")}, "0 a\n")
+	_, rows := runCheck(t, m, staticDNS(nil), Options{})
+	if r := rows["x.foo.dev"]; r.TLS.Status != TLSFailing || r.TLS.FailingSince == nil {
+		t.Errorf("a host under a failing wildcard read %+v", r.TLS)
+	}
+	if r := rows["*.foo.dev"]; r.TLS.Status != TLSFailing || r.Skip != SkipWildcard {
+		t.Errorf("wildcard row = %+v", r)
+	}
+	if r := rows["own.foo.dev"]; r.TLS.Status != TLSOK {
+		t.Errorf("its own certificate wins: %+v", r.TLS)
+	}
+}
+
+func TestCheckServer_AddressFamiliesAreKnownSeparately(t *testing.T) {
+	// A NAT'd home box: public IPv6 on an interface, and the IPv4 probe failed.
+	natted := func() *ssh.MockExecutor {
+		return ssh.NewMockExecutor("100.64.0.5",
+			ssh.MockCommand{Match: "for f in /deployments/*/state.json", Output: "blog"},
+			ssh.MockCommand{Match: "for app in", Output: snapshotOutput(map[string]string{"blog": appState("caddy", "blog.dev")})},
+			ssh.MockCommand{Match: "hostname -I", Output: "192.168.1.5 2001:569:7dba:a00::1"},
+			ssh.MockCommand{Match: "curl -4", Output: ""},
+			ssh.MockCommand{Match: "o=$(docker container inspect", Output: logsOK()},
+		)
+	}
+	srv, rows := runCheck(t, natted(), staticDNS(map[string]dns.PublicAnswer{"blog.dev": {Answers: []string{"207.6.43.143"}}}), Options{})
+	if srv.PublicIPv4Known || !srv.PublicIPv6Known || !srv.PublicAddressKnown {
+		t.Fatalf("server = %+v", srv)
+	}
+	if r := rows["blog.dev"]; r.DNS.Status != dns.StatusUnknown {
+		t.Errorf("a correct A answer must not read wrong_target when the IPv4 is unknown: %+v", r.DNS)
+	}
+	_, rows = runCheck(t, natted(), staticDNS(map[string]dns.PublicAnswer{"blog.dev": {Answers: []string{"2001:db8::9"}}}), Options{})
+	if r := rows["blog.dev"]; r.DNS.Status != dns.StatusWrongTarget {
+		t.Errorf("an AAAA answer in a known family is evidence: %+v", r.DNS)
+	}
+}
+
+// Runs the real command in a real shell against a fake docker: an empty log used
+// to glue the status marker onto the first-line marker.
+func TestLogCommand_EmptyLogInARealShell(t *testing.T) {
+	dir := t.TempDir()
+	fake := `#!/bin/sh
+case "$1" in
+container) echo true ;;
+logs) ;;
+esac
+`
+	if err := os.WriteFile(filepath.Join(dir, "docker"), []byte(fake), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("/bin/sh", "-c", logCommand(14*24*time.Hour))
+	cmd.Env = append(os.Environ(), "PATH="+dir+":"+os.Getenv("PATH"))
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	res := parseObtainOutput(string(out), checkNow, 14*24*time.Hour)
+	if res.logs != LogsShort || res.problem != "" {
+		t.Errorf("an empty log is short, not unreadable: %+v\noutput: %q", res, out)
+	}
+}
+
+// A long error cut by the size bound cannot be attributed, so no name can claim
+// zero failures; a name with its own evidence still reports it.
+func TestParseObtainOutput_UnparseableLineMeansUnknown(t *testing.T) {
+	cut := fmt.Sprintf(`{"level":"error","ts":%s,"logger":"tls.obtain","msg":"will retry","error":"[other.dev] Obtain: %s`, ts(checkNow), strings.Repeat("x", 50))
+	caddyfile := "blog.dev {\n\treverse_proxy a:1\n}\n"
+	srv, rows := runCheck(t, fleetMock(caddyfile, logsOK(cut), map[string]string{}, "0 a\n"), staticDNS(nil), Options{})
+	if srv.Caddy.Logs != LogsPartial || srv.State != ServerPartial {
+		t.Errorf("server = %+v", srv)
+	}
+	if r := rows["blog.dev"]; r.TLS.Status != TLSUnknown || r.TLS.Failures != nil {
+		t.Errorf("zero is not believable with an unread failure line: %+v", r.TLS)
 	}
 }

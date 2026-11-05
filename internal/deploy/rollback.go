@@ -670,8 +670,11 @@ func rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg Rollbac
 	// The non-caddy target is authoritative: retire the route the rolled-back-
 	// from caddy release left. Degraded, never a failed rollback: the next
 	// deploy retries it and `teploy domains check` reports it until then.
+	degradedReason := ""
 	if !cfg.usesCaddy() {
-		_ = retireStaleRoute(ctx, cd, out, cfg.App, cfg.Ingress, staleRoute, fromGeneration, lk.GuardPrefix())
+		if err := retireStaleRoute(ctx, cd, out, cfg.App, cfg.Ingress, staleRoute, fromGeneration, lk.GuardPrefix()); err != nil {
+			degradedReason = fmt.Sprintf("stale Caddy route not removed: %v", err)
+		}
 	}
 
 	// 6. The authoritative commit succeeded; the prior current workload can
@@ -723,12 +726,14 @@ func rollback(ctx context.Context, exec ssh.Executor, out io.Writer, cfg Rollbac
 
 	// 7. Log.
 	state.AppendLog(ctx, exec, state.LogEntry{
-		Timestamp:  time.Now().UTC(),
-		App:        cfg.App,
-		Type:       "rollback",
-		Hash:       target,
-		Success:    true,
-		DurationMs: time.Since(start).Milliseconds(),
+		Timestamp:      time.Now().UTC(),
+		App:            cfg.App,
+		Type:           "rollback",
+		Hash:           target,
+		Success:        true,
+		Degraded:       degradedReason != "",
+		DegradedReason: degradedReason,
+		DurationMs:     time.Since(start).Milliseconds(),
 	})
 
 	duration := time.Since(start)
@@ -823,7 +828,7 @@ func restoreRollbackRouteFromReceipt(ctx context.Context, cd *caddy.Client, cfg 
 	fw := cfg.Firewall
 	access := cfg.Access
 	if rec.Caddy != nil {
-		tls = caddy.TLS{Cert: rec.Caddy.TLSCert, Key: rec.Caddy.TLSKey, Internal: rec.Caddy.TLSInternal, HTTPOnly: rec.Caddy.TLSHTTPOnly}
+		tls = caddy.TLS{Cert: rec.Caddy.TLSCert, Key: rec.Caddy.TLSKey, Internal: rec.Caddy.TLSInternal, HTTPOnly: rec.Caddy.HTTPOnlyOr(cfg.TLSHTTPOnly)}
 		caddyExtra = rec.Caddy.CaddyExtra
 		cache = rec.Caddy.Cache
 		if rec.Caddy.Firewall != nil {
@@ -935,7 +940,7 @@ func applyRecordToRollback(cfg *RollbackConfig, rec *releasemeta.Record, healthC
 		cfg.TLSKey = rec.Caddy.TLSKey
 		cfg.TLSInternal = rec.Caddy.TLSInternal
 		// Records written before this field keep what the caller resolved.
-		cfg.TLSHTTPOnly = cfg.TLSHTTPOnly || rec.Caddy.TLSHTTPOnly
+		cfg.TLSHTTPOnly = rec.Caddy.HTTPOnlyOr(cfg.TLSHTTPOnly)
 		cfg.CaddyExtra = rec.Caddy.CaddyExtra
 		cfg.Cache = rec.Caddy.Cache
 		if rec.Caddy.Firewall != nil {

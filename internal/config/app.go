@@ -581,6 +581,9 @@ const (
 
 // AppConfig represents the teploy configuration (yml, yaml, or toml).
 type AppConfig struct {
+	// composeImport marks a config read from a Compose file, which has no domain.
+	composeImport bool
+
 	App    string `yaml:"app" toml:"app"`
 	Domain string `yaml:"domain" toml:"domain"`
 	Type   string `yaml:"type,omitempty" toml:"type"`
@@ -1183,17 +1186,47 @@ func IsReservedDomain(host string) bool {
 	return false
 }
 
-// ValidateRoutableDomain refuses a reserved name on a Caddy-routed app unless
-// the certificate is not public anyway: Caddy would otherwise retry ACME for a
-// name no CA will issue, burning rate limits for as long as the block lives.
-func ValidateRoutableDomain(domain string, tlsInternal, httpOnly bool) error {
-	if tlsInternal || httpOnly {
+// IsLocalhostName reports localhost and *.localhost, which Caddy serves from its
+// local CA without any public certificate.
+func IsLocalhostName(host string) bool {
+	h := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
+	return h == "localhost" || strings.HasSuffix(h, ".localhost")
+}
+
+// ValidateRoutableDomain refuses a reserved name on a Caddy-routed app when the
+// certificate would have to be a public one: Caddy would retry ACME for a name
+// no CA will issue, burning rate limits for as long as the block lives. A local
+// CA, plain HTTP or the operator's own certificate never go to ACME, and neither
+// does a localhost name.
+func ValidateRoutableDomain(domain string, tls *TLSConfig) error {
+	if tls != nil && (tls.Internal || tls.HTTPOnly || tls.Cert != "") {
 		return nil
 	}
-	if hosts := ReservedDomainHosts(domain); len(hosts) > 0 {
-		return fmt.Errorf("'domain' %s is reserved (RFC 2606/6761) and can never get a public certificate — use a real domain, or set 'tls: {internal: true}' or 'tls: {http_only: true}' for a private name", strings.Join(hosts, ", "))
+	var refused []string
+	for _, h := range ReservedDomainHosts(domain) {
+		if !IsLocalhostName(h) {
+			refused = append(refused, h)
+		}
+	}
+	if len(refused) > 0 {
+		return fmt.Errorf("'domain' %s is reserved (RFC 2606/6761) and can never get a public certificate — use a real domain, or set 'tls: {internal: true}', 'tls: {http_only: true}' or your own 'tls: {cert, key}' for a private name", strings.Join(refused, ", "))
 	}
 	return nil
+}
+
+// ValidateDeployDomain is deploy admission's domain rule, for the config after
+// every overlay has merged. It is deliberately not part of validate(): a base
+// file whose placeholder an overlay replaces is correct, and rollback, logs and
+// the rest of the read and recovery commands load the same file mid-incident and
+// must never refuse over a domain.
+func ValidateDeployDomain(c *AppConfig) error {
+	if !c.UsesCaddy() {
+		return nil
+	}
+	if c.Domain == "" {
+		return fmt.Errorf("'domain' is required to deploy with Caddy ingress: Compose files carry no domain — run `teploy init` to generate a teploy.yml with one, or add a teploy.yml with `domain:` (or `ingress: host` and `port:` to publish a raw port)")
+	}
+	return ValidateRoutableDomain(c.Domain, c.TLS)
 }
 
 // ReservedDomainLabelWarnings words the same names as a warning for ingress
@@ -1211,14 +1244,11 @@ func (c *AppConfig) validate() error {
 		return err
 	}
 	// Host ingress publishes a raw port and needs no domain; every other mode
-	// routes by hostname and requires one.
-	if err := ValidateDomain(c.Domain, c.Ingress == IngressHost); err != nil {
+	// routes by hostname and requires one. A Compose import has none to give:
+	// it loads for read and recovery commands, and deploy admission asks for it
+	// (ValidateDeployDomain).
+	if err := ValidateDomain(c.Domain, c.Ingress == IngressHost || c.composeImport); err != nil {
 		return err
-	}
-	if c.UsesCaddy() {
-		if err := ValidateRoutableDomain(c.Domain, c.TLS != nil && c.TLS.Internal, c.TLS != nil && c.TLS.HTTPOnly); err != nil {
-			return err
-		}
 	}
 	if c.Platform != "" && !validPlatform.MatchString(c.Platform) {
 		return fmt.Errorf("'platform' must be os/arch (e.g. linux/amd64, linux/arm64), got %q", c.Platform)
@@ -1622,9 +1652,7 @@ func LoadApp(dir string) (*AppConfig, error) {
 		return nil, invalidConfig(err)
 	}
 	if composeCfg != nil {
-		if composeCfg.Domain == "" {
-			return nil, invalidConfig(fmt.Errorf("invalid Compose config: Compose files carry no domain — run `teploy init` to generate a teploy.yml with one, or add a teploy.yml with `domain:` (or `ingress: host` and `port:` to publish a raw port)"))
-		}
+		composeCfg.composeImport = true
 		if err := composeCfg.validate(); err != nil {
 			return nil, fmt.Errorf("invalid Compose config: %w", err)
 		}

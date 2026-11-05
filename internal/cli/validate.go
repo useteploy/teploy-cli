@@ -49,6 +49,13 @@ func runValidate(flags *Flags) error {
 		return outputResult(flags, result)
 	}
 
+	// 1b. The domain rule deploy admission applies.
+	if err := config.ValidateDeployDomain(appCfg); err != nil {
+		result.Valid = false
+		result.Errors = append(result.Errors, fmt.Sprintf("config: %v", err))
+		return outputResult(flags, result)
+	}
+
 	// 2. Check build prerequisites.
 	warns, errs := buildPrereqCheck(appCfg)
 	result.Warns = append(result.Warns, warns...)
