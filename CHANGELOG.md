@@ -4,6 +4,22 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+### Added
+
+- `teploy server siblings <server> --json`: read-only sibling discovery
+  (Programme B) — teploy products (dash, observe, ship) by the
+  `dev.teploy.product` label (the container's own, else its image's) and the
+  forgejo family by the OCI labels on its image, each row with version hints,
+  the teploy app name when managed, and published-port hints where the
+  product's `/.well-known/teploy.json` may live. An unrecognised
+  `dev.teploy.product` value passes through verbatim under `unknown_labeled`
+  (a product newer than the CLI stays visible; the consumer decides).
+  Observes only — no probing, no DNS, no env or credentials — in at most two
+  remote commands, both pinned read-only by test. An unobserved server
+  reports `state: partial|unreachable`, never a clean "no siblings".
+- Contracts: `siblings-envelope` (schema + generated fixtures, corpus rev
+  20); version-handshake advertises `siblings-v1`.
+
 ## [0.1.53] - 2026-11-05
 
 ### Added

@@ -1,5 +1,57 @@
 # Open audit items
 
+## 2026-11-05 — Dash auto-config Programme B CLI: server siblings
+
+Plan: `../_internal/DASH_AUTOCONFIG_PLAN_2026-11-03.md` section 10. Branch
+`programme-b-siblings`. `teploy server siblings <server> --json` (read-only
+discovery: dev.teploy.product container/image label, forgejo via OCI labels,
+version hints, published-port hints, unknown values passed through),
+capability `siblings-v1`, contracts rev 20.
+
+Deliberately out of scope (the plan puts them on the consumer):
+- Probing, DNS, and anything URL-shaped: the command only observes labels
+  and port binds. Dash probes `/.well-known/teploy.json` and forgejo's
+  `/api/v1/version`; credential minting and env writes need a confirmed
+  `instance_id` + admin consent, neither of which exists here.
+- Grouping a product's containers: one teploy app with web + worker
+  containers yields two rows (both carry the product label). The consumer
+  groups by its own probe; a CLI-side dedupe would guess which container
+  is "the" instance — exactly the substring guessing the plan forbids.
+
+Open / deferred:
+- Forgejo detection is substring-based by design (`forgejo/forgejo` or
+  `gitea` in the image's OCI title/source labels): upstream forgejo/gitea
+  images carry no teploy label, so their OCI labels are the only signal. A
+  third-party image that merely mentions gitea in its source label becomes
+  a candidate — it costs the consumer one failed probe, never a wrong
+  connection. `teploy.engine=`-style override (a manual label pinning the
+  product) is the escape hatch and is already honoured: dev.teploy.product
+  on the container wins over everything the image says.
+- Image facts come from the image as the host knows it: a container run
+  from an image that was since re-tagged reports the CURRENT tag's labels.
+  Same trust domain as `docker ps`; not solvable without a registry read
+  this read-only command will not do.
+- A stopped sibling is listed with its docker state (`state: exited`): a
+  candidate that is down is information, not noise. Consumers should read
+  `state` before probing.
+- The port-hint read includes every container's binds (one batched inspect
+  for the whole host) rather than only the candidates': image-label
+  detection lands in the same round trip, and a third trip to re-inspect
+  just-discovered candidates would double the command's cost for no
+  privacy or safety gain. Both reads are inspects.
+- Version gates: Dash must read `siblings-v1` from `teploy version --json`
+  before relying on the envelope (plan: version-gated). Not yet exercised
+  live against the fleet: first real run happens with the Dash slice.
+
+Verified: unit/hermetic only (mock SSH executors, the same discipline as
+`server audit`): every detection source and fallback, version priority,
+port-hint extraction (dual-stack, loopback, tailnet, udp,
+exposed-but-unpublished), pass-through of unknown products, partial vs ok
+states (unlistable server, wholesale inspect failure), determinism,
+JSON round-trip, ID-created image tag resolution, and the read-only pin
+(no mutating verb or docker subcommand, no stdin, no uploads, ≤2 remote
+commands). Schemas validated against the generated fixtures.
+
 ## 2026-11-05 — Dash auto-config Slice 6 CLI: cleanup / audit (P5)
 
 Plan: `../_internal/DASH_AUTOCONFIG_PLAN_2026-11-03.md` (section 9). Branch
