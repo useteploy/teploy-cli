@@ -624,6 +624,27 @@ func TestContractsServerAuditGolden(t *testing.T) {
 	writeFixture(t, "server-audit-envelope/valid/findings.json", auditKitchenSink().audit(t))
 }
 
+// TestContractsSiblingsGolden pins `teploy server siblings <server> --json`
+// (rev 20, siblings-v1): one server carrying each detection class — a teploy
+// product by its container label (a two-container app), one by its IMAGE's
+// label, forgejo by its OCI labels, an unrecognised product passed through
+// verbatim — and one with nothing on it. Generated from the real
+// `collectServerSiblings` over a mock executor.
+func TestContractsSiblingsGolden(t *testing.T) {
+	writeFixture(t, "siblings-envelope/valid/mixed.json", siblingsKitchenSink().collect(t))
+
+	none := siblingsFixture{
+		containers: strings.Join([]string{
+			auditContainer("caddy", "caddy:2", "running", "2026-05-01 00:00:00 +0000 UTC", nil),
+			auditContainer("blog-web-v3", "blog:v3", "running", "2026-11-04 10:00:00 +0000 UTC",
+				map[string]string{"teploy.app": "blog", "teploy.version": "v3"}),
+		}, "\n"),
+		inspectPorts: "/blog-web-v3\t{}\n/caddy\t{}",
+		inspectImgs:  siblingsImageID("blog") + "\t" + `["blog:v3"]` + "\t" + `{}`,
+	}
+	writeFixture(t, "siblings-envelope/valid/none.json", none.collect(t))
+}
+
 func TestContractsBackupFleetGolden(t *testing.T) {
 	at := time.Date(2026, 11, 4, 3, 17, 4, 0, time.UTC)
 	failedAt := at.Add(-time.Hour)

@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://teploy.github.io/contracts/schema/siblings-envelope.schema.json",
+  "title": "`teploy server siblings <server> --json` envelope: sibling product candidates on a server, as the containers and their images report them (rev 20). Observation only — no probing, no DNS, no credentials; the consumer confirms via each product's own discovery endpoint.",
+  "type": "object",
+  "required": ["machine_interface", "server", "host", "observed_at", "state", "siblings", "unknown_labeled"],
+  "properties": {
+    "machine_interface": {"type": "integer", "minimum": 1},
+    "server": {"type": "string", "minLength": 1},
+    "host": {"type": "string"},
+    "observed_at": {"type": "string", "format": "date-time"},
+    "state": {"enum": ["ok", "partial", "unreachable"], "description": "partial means the container listing or the batched inspect failed: empty arrays are 'unobserved', never 'no siblings'"},
+    "error": {"type": "string"},
+    "siblings": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/sibling"},
+      "description": "recognised candidates: teploy products (dash, observe, ship) and the forgejo family, one row per container (a multi-container product app yields several rows; the consumer groups them by its own probe)"
+    },
+    "unknown_labeled": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/sibling"},
+      "description": "containers carrying a dev.teploy.product value this CLI does not recognise, passed through verbatim — a product newer than the CLI stays visible; the consumer decides what it knows"
+    }
+  },
+  "$defs": {
+    "sibling": {
+      "type": "object",
+      "required": ["container", "product", "state", "image", "port_hints", "source"],
+      "properties": {
+        "container": {"type": "string", "minLength": 1},
+        "product": {"type": "string", "minLength": 1},
+        "version": {"type": "string", "description": "hint, in priority order: the container's dev.teploy.version label, the teploy release label when the container belongs to a teploy app, the image's org.opencontainers.image.version; absent when nothing says"},
+        "app": {"type": "string", "description": "the teploy app name when the container is teploy-managed; absent otherwise"},
+        "state": {"type": "string", "description": "docker's container state (running, exited, …)"},
+        "image": {"type": "string", "description": "the image ref docker reports, with a 12-hex image ID resolved to its first repo tag when the facts hold one"},
+        "port_hints": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["host_ip", "host_port", "container_port", "proto"],
+            "properties": {
+              "host_ip": {"type": "string", "description": "as docker reports the bind: 0.0.0.0 (every interface), :: (v6), 127.0.0.1 (loopback only), or a mesh/tailnet address"},
+              "host_port": {"type": "integer", "minimum": 1, "maximum": 65535},
+              "container_port": {"type": "integer", "minimum": 1, "maximum": 65535},
+              "proto": {"enum": ["tcp", "udp"]}
+            }
+          },
+          "description": "published host binds where the product's discovery endpoint may live; hints, not endpoints"
+        },
+        "source": {"enum": ["label", "image_label", "oci_label"], "description": "label: the container's own dev.teploy.product; image_label: the image's; oci_label: the image's org.opencontainers.image.title/source names the forgejo family"}
+      }
+    }
+  }
+}

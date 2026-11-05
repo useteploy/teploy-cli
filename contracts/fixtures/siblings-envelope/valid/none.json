@@ -1,0 +1,9 @@
+{
+  "machine_interface": 2,
+  "server": "infra-home",
+  "host": "192.0.2.10",
+  "observed_at": "2026-11-05T12:00:00Z",
+  "state": "ok",
+  "siblings": [],
+  "unknown_labeled": []
+}
