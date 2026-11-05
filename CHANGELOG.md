@@ -4,6 +4,8 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [0.1.51] - 2026-11-05
+
 ### Added
 
 - `teploy domains check [--server X] [--app A] [--log-window D] [--json]`: DNS
