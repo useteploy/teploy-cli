@@ -21,14 +21,50 @@ Decisions worth reviewing:
 - `.owners/<fingerprint>` markers refuse a prune in a namespace another server wrote to,
   because a reused prefix or a same-named app is the failure a prefix alone cannot catch.
 
+Independent review (2026-11-05, same day) reproduced real holes and all are fixed on the
+branch: purge and upgrade backed up only the primary (now every database, refusing what
+it cannot cover); a leftover backup-schedule.json decided a policy run's retention; a run
+that stored nothing still pruned and reported ok; a database's objects followed the
+primary's ids (each series is selected on its own now); the .owners guard failed open on
+a listing error, an empty machine-id and a late marker; status never looked at the
+bucket; owner-key recovery could not work through normal commands; a non-root user reading
+a 0700 /etc/teploy saw "no policy" and uploaded plaintext; per-database rows reached Dash,
+whose restore by id would have replaced the primary. Medium/low: refused prunes invisible,
+pre-restore not forwarding --ignore-space-check, zero targets reading as ok, .incoming only
+at one depth, a docker blip reading as no container, a wrong clock deleting real backups,
+--previous-prefix-owned marking every earlier prefix, AWS's bundle unverified, a 6h deadline
+with no override, legacy lines reported encrypted, ClickHouse and friends in no report, a
+--no-credentials target never working, --stdin dropping the recipient silently, bucket-wide
+multipart abort, TEPLOY_BACKUP_TMPDIR workspaces invisible, postgresql:// names, a stale
+holder's children, self-referential checksums above 256 MiB, safety copies prunable.
+
 Verified live (colima, MinIO via the real aws CLI, real age, the real linux binary):
-`go test -tags integration -run TestFleetIntegration ./internal/cli`, 17 scenarios. Only
-unit-tested: the deploy hook, healthchecks.io's /fail form, the janitors' age thresholds and
-multipart abort, setup's aws install, the space preflights' refusal, a bucket refusing deletes.
+`go test -tags integration -run TestFleetIntegration ./internal/cli`, 22 scenarios, on real
+multi-database accessories; `TEPLOY_IT_INSTALL_AWS=1 go test -tags integration -run
+TestAWSCLIInstallScriptLive ./internal/backup` installs AWS's bundle for real and refuses a wrong
+pin. Only unit-tested: the deploy hook, healthchecks.io's /fail form, the janitors' age thresholds
+and multipart abort, the space preflights' refusal, a bucket refusing deletes, a store without
+upload checksums, a musl host, the clock checks and an empty machine-id, setup's stage itself
+(the script it runs is the live one), the /etc/teploy root path (the fixture is non-root; the
+non-root paths, both with sudo and without, ran live).
 Regressions: `TEPLOY_IT_ENGINES=postgres,mysql,redis go test -tags integration ./internal/backup`.
-The other Slice 2 engines were not re-run. The DR fixture still needs a 022 umask (open below).
+The Engine matrix's other Slice 2 engines were not re-run. The DR fixture still needs a 022 umask.
 
 Open / deferred:
+- Legacy objects from a server that has not upgraded yet carry no marker. A first prune in
+  a shared root by an upgraded server cannot tell them from its own: only markers from the
+  moment each server upgrades protect it. Per-server prefixes close this; the set command
+  warns when there is none. Attributing unmarked objects would stop a single server's own
+  legacy history ever ageing out.
+- A dropped database in an accessory whose other databases are fine keeps its series (its
+  newest good object forever) and raises nothing. It reads as history, not as a problem.
+- An external kill -9 of a run leaves its children (own process groups) running until they
+  finish; they cannot block the next run, and a stale holder's are killed. A Pdeathsig
+  would reach only the shell.
+- AWS's signing key is pinned (expires 2027-07-01; old signatures stay valid). A rotated
+  key makes setup refuse the bundle until the pin is updated: the safe way to fail.
+- Unsupported databases are recognised by image name only; a renamed image reads as generic
+  (and a labelled accessory still hits the live-data guard).
 - A schema name holding `'` or `\`: `mysqldump` mangles it in its own `USE` (seen live on
   mysql:8), so it is reported as not backed up in omissions and status, never silently.
   A Postgres or MySQL name with `=`, a leading `-`, a control character or over 64 bytes

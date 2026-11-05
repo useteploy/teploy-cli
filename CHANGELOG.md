@@ -38,7 +38,13 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
   before a deploy with a `pre_deploy` hook (`backup_before_hooks: true`).
 - Volume size guard: `volume_max_gb` warns and excludes, visible in status and events.
 - `teploy doctor` check `backup-policy`; `teploy setup` installs the aws CLI (AWS's
-  bundle where the distribution has none, as on Ubuntu 24.04) and age.
+  bundle with its PGP signature checked, where the distribution has none, as on Ubuntu
+  24.04) and age.
+- `backup restore`, `accessory restore` and `accessory verify-backup` take `--identity`,
+  `dr` commands take `--prefix`: a rebuilt host recovers with only the owner key and the
+  bucket credentials, through the normal commands. `--deadline` on manual backups,
+  restores and verifies; `--tmp-dir`, `--target-deadline`, `--allow-empty` on the policy.
+- `teploy server backup-target owners [--clear <fingerprint>]`.
 
 ### Changed
 
@@ -54,6 +60,8 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
   and a reserve, measured against what the backup will occupy.
 - `backup list` and status no longer treat below-floor objects as restorable, and a
   newest good backup is never pruned even with only `--max-age-days` set.
+- `backup list` shows per-database rows only with `--databases`: a caller restoring a
+  row by id and accessory alone would replace the primary with another database's dump.
 
 ### Fixed
 
