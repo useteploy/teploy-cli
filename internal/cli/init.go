@@ -43,6 +43,11 @@ func newInitCmd(flags *Flags) *cobra.Command {
 	return cmd
 }
 
+// initKeepVersions is the keep_versions a generated config starts with
+// (decision D3): a deliberate, small rollback window rather than the
+// unset default.
+const initKeepVersions = 3
+
 // initFlow prompts for the minimal config and writes it to dir. Shared by
 // `teploy init` and the zero-config first run inside `teploy deploy`.
 // Returns the path of the file written.
@@ -108,6 +113,12 @@ func initFlow(reader *bufio.Reader, dir string, useTOML, force bool) (string, er
 		}
 	}
 	cfg.Server = prompt(reader, "Server (name from servers.yml or IP)", defaultServer)
+
+	// New apps start with a small rollback window rather than the default.
+	if cfg.KeepVersions == nil && !cfg.IsStatic() {
+		keep := initKeepVersions
+		cfg.KeepVersions = &keep
+	}
 
 	// Write config.
 	var out []byte

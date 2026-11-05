@@ -40,6 +40,22 @@ func TestInitFlowWritesValidConfigWithDomain(t *testing.T) {
 	}
 }
 
+// D3: a generated container config starts with keep_versions 3 — a small
+// rollback window rather than the unset default.
+func TestInitFlowWritesKeepVersionsThree(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := initFlow(scripted("myapp", "myapp.com", "1.2.3.4"), dir, false, false); err != nil {
+		t.Fatalf("initFlow: %v", err)
+	}
+	cfg, err := config.LoadApp(dir)
+	if err != nil {
+		t.Fatalf("generated config does not load: %v", err)
+	}
+	if cfg.KeepVersions == nil || *cfg.KeepVersions != initKeepVersions {
+		t.Errorf("keep_versions = %v, want %d", cfg.KeepVersions, initKeepVersions)
+	}
+}
+
 func TestInitFlowEmptyDomainBecomesHostIngress(t *testing.T) {
 	dir := t.TempDir()
 

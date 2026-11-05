@@ -66,6 +66,9 @@ func Seed(rec *releasemeta.Record, manifest json.RawMessage) ([]byte, []string, 
 	} {
 		copyKey(from, to)
 	}
+	if all, _ := c["keep_all_versions"].(bool); all {
+		seed["keep_versions"] = 0
+	}
 	if m.Ingress == config.IngressHost {
 		copyKey("bind", "bind")
 	}

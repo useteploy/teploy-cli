@@ -117,6 +117,7 @@ const (
 	KindBackupOwners   = "backup_target.owners_clear"
 	KindBackupAll      = "backup.all"
 	KindBackupPolicy   = "backup_policy.set"
+	KindReleasesPrune  = "releases.prune"
 )
 
 // detailAllow is the per-kind allowlist of detail keys. Env and secret
@@ -154,6 +155,7 @@ var detailAllow = map[string][]string{
 	KindBackupOwners:   {"fingerprint", "force", "removed", "error"},
 	KindBackupAll:      {"status", "targets_ok", "targets_failed", "omissions", "encrypted", "duration_ms", "heartbeats_ok", "heartbeats_failed", "warnings", "error"},
 	KindBackupPolicy:   {"interval", "encrypted", "volumes", "adopted", "error"},
+	KindReleasesPrune:  {"keep", "pruned", "protected", "trigger", "error"},
 }
 
 // maxErrorDetail bounds the "error" detail so a command's full stderr

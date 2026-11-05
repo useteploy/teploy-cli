@@ -689,11 +689,12 @@ type AppConfig struct {
 	// never plaintext on disk). Later files and explicit env: keys win.
 	EnvFiles []string `yaml:"env_files,omitempty" toml:"env_files"`
 	// KeepVersions caps the number of past app versions retained after a
-	// successful deploy (containers + images). Zero (default) keeps
-	// everything — historical behavior. Set to 2 or 3 to enable auto-prune
-	// with a rollback window. Container-deploy only; static deploy uses
-	// KeepReleases instead.
-	KeepVersions int         `yaml:"keep_versions,omitempty" toml:"keep_versions"`
+	// successful deploy (containers + images). Unset means DefaultKeepVersions,
+	// and automatic pruning under that default starts only after a notice
+	// period; 0 keeps everything; `teploy init` writes 3. Pinned, current and
+	// previous versions are never pruned. Container-deploy only; static deploy
+	// uses KeepReleases instead.
+	KeepVersions *int        `yaml:"keep_versions,omitempty" toml:"keep_versions,omitempty"`
 	Hooks        HooksConfig `yaml:"hooks,omitempty" toml:"hooks"`
 	// BackupBeforeHooks backs every database accessory up before a deploy whose
 	// pre_deploy hook is about to run (migrations rewrite data with no way down).
@@ -1369,7 +1370,7 @@ func (c *AppConfig) validate() error {
 			// rather than silently ignore.
 			return fmt.Errorf("'tls' is not yet supported for type:static")
 		}
-		if c.KeepVersions != 0 {
+		if c.KeepVersions != nil && *c.KeepVersions != 0 {
 			return fmt.Errorf("'keep_versions' is container-deploy only; static deploys use 'keep_releases'")
 		}
 	default:
@@ -1489,8 +1490,8 @@ func (c *AppConfig) validate() error {
 			return fmt.Errorf("healthcheck refers to unknown process %q (must match a key in processes)", name)
 		}
 	}
-	if c.KeepVersions < 0 {
-		return fmt.Errorf("'keep_versions' must be >= 0 (got %d)", c.KeepVersions)
+	if c.KeepVersions != nil && *c.KeepVersions < 0 {
+		return fmt.Errorf("'keep_versions' must be >= 0 (got %d)", *c.KeepVersions)
 	}
 	if c.DrainSeconds < 0 || c.DrainSeconds > 600 {
 		return fmt.Errorf("'drain_seconds' must be in 0..600 (got %d)", c.DrainSeconds)
@@ -1881,7 +1882,7 @@ func mergeConfigs(base, overlay *AppConfig) {
 	if overlay.Scan {
 		base.Scan = true
 	}
-	if overlay.KeepVersions != 0 {
+	if overlay.KeepVersions != nil {
 		base.KeepVersions = overlay.KeepVersions
 	}
 	if overlay.Replicas != 0 {

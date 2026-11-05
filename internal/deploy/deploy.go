@@ -53,15 +53,12 @@ type Config struct {
 	// HTTP listener for the image's curl probe to hit).
 	NoHealthcheck map[string]bool
 	// KeepVersions caps the number of past app versions retained on the
-	// server after a successful deploy. Zero (default) keeps every version
-	// — the historical behavior, in which Teploy stopped but never removed
-	// old containers, letting disk usage climb across deploys. Set this to
-	// 2 or 3 to keep the current version + a small rollback window and
-	// have superseded versions auto-pruned (containers + images).
-	// Versions are scored by newest container creation timestamp; the
-	// current and immediately-previous versions are always protected even
-	// if older than other versions on disk.
-	KeepVersions int
+	// server after a successful deploy (containers + images). Nil means
+	// config.DefaultKeepVersions, pruned only after a notice period (see
+	// defaultPruneDue); zero keeps every version. Versions are scored by
+	// newest container creation timestamp; the current, immediately-previous
+	// and pinned versions are always protected.
+	KeepVersions *int
 	// Ingress selects the routing layer; see config.IngressCaddy /
 	// IngressExternal. Empty defaults to caddy. When external, the
 	// deployer skips every Caddy interaction (route update, reload) —
@@ -1268,11 +1265,11 @@ func (d *Deployer) deployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 		}
 	}
 
-	// 15b. Prune superseded app versions (containers + images) if the
-	// operator opted in via keep_versions. Always protects the current
-	// version and the immediately-previous version so a rollback target
-	// is preserved regardless of timestamp ordering.
-	if cfg.KeepVersions > 0 {
+	// 15b. Prune superseded app versions (containers + images) per
+	// keep_versions. Always protects the current version and the
+	// immediately-previous version so a rollback target is preserved
+	// regardless of timestamp ordering.
+	if keep, explicit := config.EffectiveKeepVersions(cfg.KeepVersions); keep > 0 {
 		// Fence (F16): pruning removes other versions' containers; a
 		// stale holder must not delete under a new owner's feet.
 		fenceOK := true
@@ -1298,18 +1295,24 @@ func (d *Deployer) deployFenced(ctx context.Context, cfg Config, lk *state.Lock)
 				fmt.Fprintf(d.out, "Warning: version prune skipped — pin state could not be read: %v\n", pinsErr)
 			} else {
 				protected = append(protected, pins...)
-				pruned, err := d.docker.PruneVersions(ctx, cfg.App, cfg.KeepVersions, protected...)
-				switch {
-				case err != nil:
-					// Partial cleanup (A25): report what was left behind —
-					// the old path printed nothing when any removal failed,
-					// or reported failed removals as pruned.
-					fmt.Fprintf(d.out, "Warning: version prune incomplete: %v\n", err)
+				if explicit || d.defaultPruneDue(ctx, cfg.App, keep, protected) {
+					pruned, err := d.docker.PruneVersions(ctx, cfg.App, keep, protected...)
 					if len(pruned) > 0 {
+						events.Record(ctx, d.exec, events.Event{App: cfg.App, Kind: events.KindReleasesPrune, Outcome: events.Outcome(err), Release: cfg.Version,
+							Detail: events.ErrDetail(map[string]any{"keep": keep, "pruned": pruned, "trigger": "deploy"}, err)})
+					}
+					switch {
+					case err != nil:
+						// Partial cleanup (A25): report what was left behind —
+						// the old path printed nothing when any removal failed,
+						// or reported failed removals as pruned.
+						fmt.Fprintf(d.out, "Warning: version prune incomplete: %v\n", err)
+						if len(pruned) > 0 {
+							fmt.Fprintf(d.out, "Pruned %d superseded version(s): %s\n", len(pruned), strings.Join(pruned, ", "))
+						}
+					case len(pruned) > 0:
 						fmt.Fprintf(d.out, "Pruned %d superseded version(s): %s\n", len(pruned), strings.Join(pruned, ", "))
 					}
-				case len(pruned) > 0:
-					fmt.Fprintf(d.out, "Pruned %d superseded version(s): %s\n", len(pruned), strings.Join(pruned, ", "))
 				}
 			}
 		}
