@@ -98,6 +98,62 @@ func (e *unterminatedRegionError) Error() string {
 	return "the managed block for " + e.app + " has no end marker"
 }
 
+// ManagedRegion is one app's marker-delimited region of a Caddyfile.
+type ManagedRegion struct {
+	App string
+	// Text is the region including its markers, as ManagedRegionHash expects.
+	Text string
+	// Sites is empty for a region that holds no site block.
+	Sites []RouteSite
+}
+
+// ManagedRegions lists a Caddyfile's managed regions in file order. An
+// unparseable file is an error, as for InspectRoutes.
+func ManagedRegions(content string) ([]ManagedRegion, error) {
+	sites, err := InspectRoutes(content)
+	if err != nil {
+		return nil, err
+	}
+	var regions []ManagedRegion
+	seen := map[string]bool{}
+	for _, line := range strings.Split(content, "\n") {
+		app, ok := beginMarkerApp(line)
+		if !ok || seen[app] {
+			continue
+		}
+		seen[app] = true
+		region := ManagedRegion{App: app, Text: extractManagedRegion(content, app)}
+		for _, site := range sites {
+			if site.Owner == app {
+				region.Sites = append(region.Sites, site)
+			}
+		}
+		regions = append(regions, region)
+	}
+	return regions, nil
+}
+
+// RegionHasWebhook reports whether a region carries the autodeploy webhook route.
+func RegionHasWebhook(region string) bool {
+	return strings.Contains(region, "# TEPLOY WEBHOOK BEGIN")
+}
+
+// RegionRoots lists the paths a region's root directives serve files from.
+func RegionRoots(region string) []string {
+	var roots []string
+	for _, line := range strings.Split(region, "\n") {
+		f := strings.Fields(line)
+		if len(f) < 2 || f[0] != "root" {
+			continue
+		}
+		path := f[len(f)-1]
+		if !slices.Contains(roots, path) {
+			roots = append(roots, path)
+		}
+	}
+	return roots
+}
+
 // RegionHosts lists the hosts a managed region serves.
 func RegionHosts(region string) []string {
 	body := make([]string, 0)

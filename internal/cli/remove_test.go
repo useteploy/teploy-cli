@@ -110,6 +110,8 @@ func TestExecuteRemovePurgeFallsBackToContainerForForeignOwnedData(t *testing.T)
 func TestExecuteRemoveDefaultPreservesData(t *testing.T) {
 	cmds := append([]ssh.MockCommand{
 		removeTestContainers(),
+		{Match: "[ -d '/deployments/scratch' ]", Output: ""},
+		{Match: "mkdir /deployments/scratch/.lock", Output: ""},
 		{Match: "docker stop -t 10 'scratch-web-aaa'", Output: ""},
 		{Match: "docker rm 'scratch-web-aaa'", Output: ""},
 		{Match: "find '/deployments/scratch'", Output: ""},

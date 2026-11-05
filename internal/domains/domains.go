@@ -306,10 +306,13 @@ func CheckServer(ctx context.Context, exec ssh.Executor, name string, opts Optio
 	return srv, rows
 }
 
+// AppListCommand prints the name of every app with state on a server.
+const AppListCommand = `for f in /deployments/*/state.json /deployments/*/state; do [ -f "$f" ] && basename "$(dirname "$f")"; done | sort -u`
+
 // readApps lists the deployed apps with their ingress and domain. known=false
 // means the app list itself could not be read, so ownership cannot be judged.
 func readApps(ctx context.Context, exec ssh.Executor, srv *Server, issue func(string, error)) (apps []AppInfo, known bool) {
-	out, err := exec.Run(ctx, `for f in /deployments/*/state.json /deployments/*/state; do [ -f "$f" ] && basename "$(dirname "$f")"; done | sort -u`)
+	out, err := exec.Run(ctx, AppListCommand)
 	if err != nil {
 		issue("apps", err)
 		return nil, false
@@ -834,10 +837,10 @@ func skipFor(row Domain, host string) string {
 
 var upstreamHostRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
 
-// upstreamHost returns the name to resolve for a dial, or why not: an IP literal
+// UpstreamHost returns the name to resolve for a dial, or why not: an IP literal
 // has nothing to resolve; a placeholder or odd token cannot be checked. Names
 // are validated before they reach a shell, and quoted there.
-func upstreamHost(dial string) (name, verdict string) {
+func UpstreamHost(dial string) (name, verdict string) {
 	host := dial
 	if h, _, err := net.SplitHostPort(dial); err == nil {
 		host = h
@@ -859,7 +862,7 @@ func resolveUpstreams(ctx context.Context, exec ssh.Executor, rows []Domain, srv
 	wanted := map[string]bool{}
 	for i := range rows {
 		for _, u := range rows[i].Route.Upstreams {
-			if name, _ := upstreamHost(u.Dial); name != "" {
+			if name, _ := UpstreamHost(u.Dial); name != "" {
 				wanted[name] = true
 			}
 		}
@@ -868,32 +871,18 @@ func resolveUpstreams(ctx context.Context, exec ssh.Executor, rows []Domain, srv
 	if len(wanted) > 0 && srv.Caddy.Container == "present" {
 		names := make([]string, 0, len(wanted))
 		for n := range wanted {
-			names = append(names, ssh.ShellQuote(n))
+			names = append(names, n)
 		}
-		sort.Strings(names)
-		cmd := "printf '%s\\n' " + strings.Join(names, " ") + ` | docker exec -i caddy sh -c 'while read -r h; do getent hosts "$h" >/dev/null 2>&1; echo "$? $h"; done'`
-		out, err := exec.Run(ctx, cmd)
-		if err != nil {
+		var err error
+		if answers, err = ResolveNames(ctx, exec, names); err != nil {
 			issue("upstreams", err)
-		}
-		for _, line := range strings.Split(out, "\n") {
-			rc, name, ok := strings.Cut(strings.TrimSpace(line), " ")
-			if !ok || !wanted[name] {
-				continue
-			}
-			switch rc {
-			case "0":
-				answers[name] = ResolvesYes
-			case "2":
-				answers[name] = ResolvesNo
-			}
 		}
 	}
 	for i := range rows {
 		r := &rows[i].Route
 		yes, no, unknown := 0, 0, 0
 		for j := range r.Upstreams {
-			name, verdict := upstreamHost(r.Upstreams[j].Dial)
+			name, verdict := UpstreamHost(r.Upstreams[j].Dial)
 			if name != "" {
 				if verdict = answers[name]; verdict == "" {
 					verdict = ResolvesUnknown
@@ -926,6 +915,36 @@ func resolveUpstreams(ctx context.Context, exec ssh.Executor, rows []Domain, srv
 			r.UpstreamResolves = ResolvesYes
 		}
 	}
+}
+
+// ResolveNames asks the running caddy container, in one docker exec, whether
+// each name resolves: yes or no. A name missing from the result is unknown,
+// and so is everything when the error is set. Names must pass UpstreamHost.
+func ResolveNames(ctx context.Context, exec ssh.Executor, names []string) (map[string]string, error) {
+	answers := map[string]string{}
+	if len(names) == 0 {
+		return answers, nil
+	}
+	quoted := make([]string, 0, len(names))
+	for _, n := range names {
+		quoted = append(quoted, ssh.ShellQuote(n))
+	}
+	sort.Strings(quoted)
+	cmd := "printf '%s\\n' " + strings.Join(quoted, " ") + ` | docker exec -i caddy sh -c 'while read -r h; do getent hosts "$h" >/dev/null 2>&1; echo "$? $h"; done'`
+	out, err := exec.Run(ctx, cmd)
+	for _, line := range strings.Split(out, "\n") {
+		rc, name, ok := strings.Cut(strings.TrimSpace(line), " ")
+		if !ok {
+			continue
+		}
+		switch rc {
+		case "0":
+			answers[name] = ResolvesYes
+		case "2":
+			answers[name] = ResolvesNo
+		}
+	}
+	return answers, err
 }
 
 // applyTLS fills certificate evidence on rows Caddy would obtain for. Unknown

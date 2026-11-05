@@ -4,6 +4,46 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+### Added
+
+- `teploy server audit <server> --json`: what is left over on a server, each
+  finding with its evidence and — only where a CLI command fixes it safely —
+  the remedy argv. Stale and empty managed routes, managed routes with dead
+  upstreams, app state with no containers, versions beyond `keep_versions`,
+  reclaimable build cache and dangling images, large container writable
+  layers, large containers teploy does not manage, dangling volumes, a
+  Caddyfile with no Caddy container, scheduled jobs with no cron daemon, and
+  disk pressure with attribution. Read-only: every command the audit runs on
+  the server only reads (a test pins that). A source that could not be read
+  is an `unknown` check and yields no finding — never a clean bill.
+- `teploy route remove --app X`: removes a managed Caddy block proven dead
+  (no app state, no containers carrying the name, no upstream that still
+  resolves, no files it still serves, nothing unreadable), under the app's
+  lock and an exact-block compare-and-swap, so a concurrent rewrite is
+  refused rather than undone. Recorded as a `route.remove` event.
+- `teploy releases prune --app X --keep N`: removes old versions' containers
+  and images beyond `--keep`. Pinned, current, previous and running versions
+  are never removed whatever `--keep` says; an unreadable pin set, state or
+  container list refuses the prune. Recorded as a `releases.prune` event.
+- `teploy server prune --host S --build-cache --dangling`: reclaims docker's
+  unused build cache and dangling images — nothing else (no tagged image, no
+  container, no volume). Recorded as a `server.prune` event under `_fleet`.
+- Contracts: `server-audit-envelope` (schema + generated fixture, corpus rev
+  19); version-handshake advertises `server-audit-v1`.
+
+### Changed
+
+- `keep_versions` is now optional (decision D3): unset means 5, pruned by
+  deploys only after a 7-day notice recorded on the server (the deploy
+  output and `server audit` warn first); `teploy init` writes 3; `0` keeps
+  everything. Applied manifests record unset and N as before, so existing
+  digests hold; an explicit 0 records `keep_all_versions`.
+- `teploy remove` on an app whose directory is already gone (an earlier
+  removal finished) succeeds instead of failing its state deletion.
+- `teploy doctor` disk remediations point at `teploy server audit`, which
+  attributes the space; one named a `releases prune` command that did not
+  exist.
+
 ## [0.1.52] - 2026-11-05
 
 ### Added

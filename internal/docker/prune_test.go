@@ -151,3 +151,53 @@ func mkPS(id, name, image, createdAt, version, process string) string {
 		id, name, image, createdAt, process, version,
 	)
 }
+
+// TestPrunableVersions_Selection pins the selection PruneVersions and
+// `releases prune`/`server audit` share: the `keep` most recent by newest
+// container creation time, minus the protected set, accessories never counted.
+func TestPrunableVersions_Selection(t *testing.T) {
+	ct := func(name, version, createdAt string) Container {
+		return Container{Name: name, Image: "myapp:" + version, CreatedAt: createdAt,
+			Labels: map[string]string{"teploy.app": "myapp", "teploy.version": version}}
+	}
+	containers := []Container{
+		ct("myapp-web-v3", "v3", "2026-05-28 21:30:00 -0700 PDT"),
+		ct("myapp-web-v2", "v2", "2026-05-28 21:00:00 -0700 PDT"),
+		ct("myapp-web-v1", "v1", "2026-05-28 20:00:00 -0700 PDT"),
+		// An accessory carrying a version label must never be a candidate.
+		{Name: "myapp-db", Image: "postgres:16", CreatedAt: "2026-05-20 20:00:00 -0700 PDT",
+			Labels: map[string]string{"teploy.app": "myapp", "teploy.role": "accessory", "teploy.version": "v0"}},
+	}
+	got := PrunableVersions(containers, 2)
+	if fmt.Sprint(got) != fmt.Sprint([]string{"v1"}) {
+		t.Errorf("keep 2 = %v, want [v1]", got)
+	}
+	got = PrunableVersions(containers, 0)
+	if fmt.Sprint(got) != fmt.Sprint([]string{"v3", "v2", "v1"}) {
+		t.Errorf("keep 0 = %v, want everything but accessories, newest first", got)
+	}
+	got = PrunableVersions(containers, 1, "v3")
+	if fmt.Sprint(got) != fmt.Sprint([]string{"v2", "v1"}) {
+		t.Errorf("keep 1 with v3 protected = %v, want [v2 v1]", got)
+	}
+	// Everything protected: nothing prunable whatever keep says.
+	if got = PrunableVersions(containers, 0, "v1", "v2", "v3"); len(got) != 0 {
+		t.Errorf("fully protected = %v, want nothing", got)
+	}
+}
+
+// TestPrunableVersions_UnparseableDatesAreNewest pins the fail-safe ordering:
+// a version whose creation time cannot be parsed is treated as newest, so
+// cleanup never deletes something it cannot date.
+func TestPrunableVersions_UnparseableDatesAreNewest(t *testing.T) {
+	containers := []Container{
+		{Name: "myapp-web-v1", Image: "myapp:v1", CreatedAt: "not a date",
+			Labels: map[string]string{"teploy.app": "myapp", "teploy.version": "v1"}},
+		{Name: "myapp-web-v2", Image: "myapp:v2", CreatedAt: "2026-05-28 21:00:00 -0700 PDT",
+			Labels: map[string]string{"teploy.app": "myapp", "teploy.version": "v2"}},
+	}
+	got := PrunableVersions(containers, 1)
+	if fmt.Sprint(got) != fmt.Sprint([]string{"v2"}) {
+		t.Errorf("keep 1 = %v, want [v2]: the undatable v1 sorts newest and is kept", got)
+	}
+}

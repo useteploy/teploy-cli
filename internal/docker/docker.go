@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -879,89 +880,14 @@ func ContainersByApp(containers []Container, app string) []Container {
 // a joined error describing every failed removal. Per-version image
 // removal stays best-effort (a shared image legitimately refuses).
 func (c *Client) PruneVersions(ctx context.Context, app string, keep int, protectedVersions ...string) ([]string, error) {
-	if keep < 0 {
-		keep = 0
-	}
 	containers, err := c.ListContainers(ctx, app)
 	if err != nil {
 		return nil, fmt.Errorf("listing containers for prune: %w", err)
 	}
-
-	// Group containers by teploy.version label. Track newest creation
-	// timestamp + container names + image names per version. Containers
-	// without the label (e.g. caddy, postgres accessory) are ignored.
-	type vinfo struct {
-		newestCreated  time.Time
-		containerNames []string
-		images         map[string]struct{}
-	}
-	versions := map[string]*vinfo{}
-	for _, ct := range containers {
-		v := ct.Labels["teploy.version"]
-		if v == "" {
-			continue
-		}
-		info, ok := versions[v]
-		if !ok {
-			info = &vinfo{images: map[string]struct{}{}}
-			versions[v] = info
-		}
-		// Compare as instants, not strings. docker's CreatedAt is a localized
-		// timestamp ("2006-01-02 15:04:05 -0700 MST"), so lexicographic ordering
-		// is wrong across timezones / DST. On a parse failure, treat the version
-		// as newest so cleanup never prunes something it can't date.
-		created := parseDockerTime(ct.CreatedAt)
-		if created.After(info.newestCreated) {
-			info.newestCreated = created
-		}
-		info.containerNames = append(info.containerNames, ct.Name)
-		if ct.Image != "" {
-			info.images[ct.Image] = struct{}{}
-		}
-	}
-
-	if len(versions) == 0 {
-		return nil, nil
-	}
-
-	// Sort versions by recency (newest first).
-	type entry struct {
-		version string
-		info    *vinfo
-	}
-	sorted := make([]entry, 0, len(versions))
-	for v, info := range versions {
-		sorted = append(sorted, entry{v, info})
-	}
-	sort.Slice(sorted, func(i, j int) bool {
-		if !sorted[i].info.newestCreated.Equal(sorted[j].info.newestCreated) {
-			return sorted[i].info.newestCreated.After(sorted[j].info.newestCreated)
-		}
-		// Deterministic tie-break when timestamps match (or both unparseable).
-		return sorted[i].version > sorted[j].version
-	})
-
-	// Build the protected set: explicit names + top-`keep` by recency.
-	protect := map[string]bool{}
-	for _, v := range protectedVersions {
-		if v != "" {
-			protect[v] = true
-		}
-	}
-	kept := 0
-	for _, e := range sorted {
-		if kept < keep {
-			protect[e.version] = true
-			kept++
-		}
-	}
-
 	var pruned []string
 	var failures []error
-	for _, e := range sorted {
-		if protect[e.version] {
-			continue
-		}
+	for _, version := range PrunableVersions(containers, keep, protectedVersions...) {
+		names, images := versionArtifacts(containers, version)
 		// Force-remove containers in case any are still running. We
 		// already took ownership of cleanup; refusing to nuke a stray
 		// running container from an older version defeats the point.
@@ -970,23 +896,84 @@ func (c *Client) PruneVersions(ctx context.Context, app string, keep int, protec
 		// "Pruned N" could report versions whose containers were still
 		// running, hiding disk exhaustion and failed cleanup.
 		complete := true
-		for _, name := range e.info.containerNames {
+		for _, name := range names {
 			if _, err := c.exec.Run(ctx, "docker rm -f "+ssh.ShellQuote(name)); err != nil {
 				complete = false
-				failures = append(failures, fmt.Errorf("removing container %s (version %s): %w", name, e.version, err))
+				failures = append(failures, fmt.Errorf("removing container %s (version %s): %w", name, version, err))
 			}
 		}
 		// Best-effort image removal. Fails (silently) if another
 		// container or tag still references the image, which is the
 		// safe behavior.
-		for img := range e.info.images {
+		for _, img := range images {
 			_, _ = c.exec.Run(ctx, "docker rmi "+ssh.ShellQuote(img))
 		}
 		if complete {
-			pruned = append(pruned, e.version)
+			pruned = append(pruned, version)
 		}
 	}
 	return pruned, errors.Join(failures...)
+}
+
+// PrunableVersions lists the versions PruneVersions would remove from one app's
+// containers, newest first: everything outside the `keep` most recent and the
+// protected set. Containers without a version label (accessories) never count.
+func PrunableVersions(containers []Container, keep int, protectedVersions ...string) []string {
+	if keep < 0 {
+		keep = 0
+	}
+	newest := map[string]time.Time{}
+	for _, ct := range containers {
+		v := ct.Labels["teploy.version"]
+		if v == "" || ct.Labels["teploy.role"] == "accessory" {
+			continue
+		}
+		// Compare as instants, not strings. docker's CreatedAt is a localized
+		// timestamp ("2006-01-02 15:04:05 -0700 MST"), so lexicographic ordering
+		// is wrong across timezones / DST. On a parse failure, treat the version
+		// as newest so cleanup never prunes something it can't date.
+		created := parseDockerTime(ct.CreatedAt)
+		if cur, ok := newest[v]; !ok || created.After(cur) {
+			newest[v] = created
+		}
+	}
+	sorted := make([]string, 0, len(newest))
+	for v := range newest {
+		sorted = append(sorted, v)
+	}
+	sort.Slice(sorted, func(i, j int) bool {
+		if !newest[sorted[i]].Equal(newest[sorted[j]]) {
+			return newest[sorted[i]].After(newest[sorted[j]])
+		}
+		// Deterministic tie-break when timestamps match (or both unparseable).
+		return sorted[i] > sorted[j]
+	})
+	protect := map[string]bool{}
+	for _, v := range protectedVersions {
+		if v != "" {
+			protect[v] = true
+		}
+	}
+	var prunable []string
+	for i, v := range sorted {
+		if i >= keep && !protect[v] {
+			prunable = append(prunable, v)
+		}
+	}
+	return prunable
+}
+
+func versionArtifacts(containers []Container, version string) (names, images []string) {
+	for _, ct := range containers {
+		if ct.Labels["teploy.version"] != version || ct.Labels["teploy.role"] == "accessory" {
+			continue
+		}
+		names = append(names, ct.Name)
+		if ct.Image != "" && !slices.Contains(images, ct.Image) {
+			images = append(images, ct.Image)
+		}
+	}
+	return names, images
 }
 
 // EnsureNetwork creates the "teploy" Docker network if it doesn't already exist.

@@ -41,7 +41,7 @@ func NormalizeAndDigest(cfg *AppConfig, appliedImage string) (json.RawMessage, s
 		"ingress_mode":    ingress,
 	}
 	if deploymentType == TypeContainer {
-		manifest["container"] = map[string]any{
+		container := map[string]any{
 			"image":            appliedImage,
 			"port":             port,
 			"replicas":         replicas,
@@ -52,7 +52,7 @@ func NormalizeAndDigest(cfg *AppConfig, appliedImage string) (json.RawMessage, s
 			"build_local":      cfg.BuildLocal,
 			"context":          cleanOptionalPath(cfg.Context),
 			"dockerfile":       cleanOptionalPath(cfg.Dockerfile),
-			"keep_versions":    cfg.KeepVersions,
+			"keep_versions":    keepVersionsRecorded(cfg.KeepVersions),
 			"processes":        sortedMapKeys(cfg.Processes),
 			"env_keys":         bindingCombinedEnvKeys(cfg.Env, cfg.EnvLiteral),
 			"env_files":        append([]string(nil), cfg.EnvFiles...),
@@ -68,6 +68,12 @@ func NormalizeAndDigest(cfg *AppConfig, appliedImage string) (json.RawMessage, s
 			"asset_path":       cfg.Assets.Path,
 			"asset_keep_days":  cfg.Assets.KeepDays,
 		}
+		// Unset and N record what they always did, so existing digests hold;
+		// an explicit 0 needs its own key because unset also records 0.
+		if cfg.KeepVersions != nil && *cfg.KeepVersions == 0 {
+			container["keep_all_versions"] = true
+		}
+		manifest["container"] = container
 	} else {
 		keepReleases := cfg.KeepReleases
 		if keepReleases == 0 {
@@ -102,6 +108,25 @@ func NormalizeAndDigest(cfg *AppConfig, appliedImage string) (json.RawMessage, s
 	}
 	digest := sha256.Sum256(data)
 	return json.RawMessage(data), hex.EncodeToString(digest[:]), nil
+}
+
+// DefaultKeepVersions is the retention of an app that does not set keep_versions.
+const DefaultKeepVersions = 5
+
+// EffectiveKeepVersions resolves keep_versions: the count (0 keeps everything)
+// and whether the operator chose it.
+func EffectiveKeepVersions(v *int) (keep int, explicit bool) {
+	if v == nil {
+		return DefaultKeepVersions, false
+	}
+	return *v, true
+}
+
+func keepVersionsRecorded(v *int) int {
+	if v == nil {
+		return 0
+	}
+	return *v
 }
 
 func normalizeDomains(domain string) string {

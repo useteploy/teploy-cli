@@ -614,6 +614,16 @@ func TestContractsGitSourceGolden(t *testing.T) {
 
 // TestContractsBackupFleetGolden pins the fleet engine's envelopes (rev 18,
 // backup-fleet-v1). Dash's backups page builds on backup-status-envelope.
+// TestContractsServerAuditGolden pins `teploy server audit <server> --json`
+// (rev 19, server-audit-v1): one server carrying one of each finding class —
+// including report-only findings whose remedy argv is null — plus one unknown
+// check (an app whose state could not be read), so a consumer can never
+// mistake unreadable for clean. Generated from the real `auditServer` over a
+// mock executor.
+func TestContractsServerAuditGolden(t *testing.T) {
+	writeFixture(t, "server-audit-envelope/valid/findings.json", auditKitchenSink().audit(t))
+}
+
 func TestContractsBackupFleetGolden(t *testing.T) {
 	at := time.Date(2026, 11, 4, 3, 17, 4, 0, time.UTC)
 	failedAt := at.Add(-time.Hour)

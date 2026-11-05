@@ -1,0 +1,352 @@
+{
+  "machine_interface": 2,
+  "server": "edge",
+  "host": "192.0.2.10",
+  "audited_at": "2026-11-05T12:00:00Z",
+  "state": "partial",
+  "checks": [
+    {
+      "name": "apps",
+      "status": "unknown",
+      "detail": "could not read the state of broken"
+    },
+    {
+      "name": "caddyfile",
+      "status": "ok"
+    },
+    {
+      "name": "containers",
+      "status": "ok"
+    },
+    {
+      "name": "container_sizes",
+      "status": "ok"
+    },
+    {
+      "name": "upstreams",
+      "status": "ok"
+    },
+    {
+      "name": "static_roots",
+      "status": "ok"
+    },
+    {
+      "name": "addresses",
+      "status": "ok"
+    },
+    {
+      "name": "docker_usage",
+      "status": "ok"
+    },
+    {
+      "name": "dangling_images",
+      "status": "ok"
+    },
+    {
+      "name": "dangling_volumes",
+      "status": "ok"
+    },
+    {
+      "name": "disk",
+      "status": "ok"
+    },
+    {
+      "name": "scheduler",
+      "status": "ok"
+    },
+    {
+      "name": "retention",
+      "status": "ok"
+    }
+  ],
+  "disk": {
+    "path": "/",
+    "available_bytes": 800000000,
+    "used_percent": 96,
+    "attribution": [
+      {
+        "name": "images",
+        "size_bytes": 20000000000
+      },
+      {
+        "name": "container_layers",
+        "size_bytes": 5000000000
+      },
+      {
+        "name": "volumes",
+        "size_bytes": 4000000000
+      },
+      {
+        "name": "build_cache",
+        "size_bytes": 2000000000
+      },
+      {
+        "name": "deployments",
+        "size_bytes": 53687091200
+      }
+    ]
+  },
+  "findings": [
+    {
+      "id": "disk_pressure:/",
+      "kind": "disk_pressure",
+      "severity": "critical",
+      "subject": "/",
+      "evidence": "800.0 MB available on / (96% used); deployments 53.7 GB, images 20.0 GB, container_layers 5.0 GB, volumes 4.0 GB, build_cache 2.0 GB",
+      "related": [
+        "dangling_volumes:docker",
+        "large_writable_layer:reacher-web-1f2e3d",
+        "reclaimable_build_artifacts:docker",
+        "unmanaged_container:portainer",
+        "versions_beyond_policy:many",
+        "versions_beyond_policy:unset"
+      ],
+      "remedy": {
+        "argv": null,
+        "destructive": false,
+        "confirm": false
+      }
+    },
+    {
+      "id": "managed_route_dead_upstream:blog",
+      "kind": "managed_route_dead_upstream",
+      "severity": "critical",
+      "subject": "blog",
+      "app": "blog",
+      "evidence": "blog.example.com routes to blog-web-v3:3000, which does not resolve in Caddy's network",
+      "remedy": {
+        "argv": [
+          "teploy",
+          "redeploy",
+          "--app",
+          "blog",
+          "--host",
+          "edge"
+        ],
+        "destructive": false,
+        "confirm": true
+      }
+    },
+    {
+      "id": "scheduler_missing:cron",
+      "kind": "scheduler_missing",
+      "severity": "critical",
+      "subject": "cron",
+      "evidence": "jobs are scheduled but no cron daemon is running, so none of them run: run `teploy setup` against the server (it installs and enables cron), or on the server: apt-get install cron \u0026\u0026 systemctl enable --now cron",
+      "remedy": {
+        "argv": null,
+        "destructive": false,
+        "confirm": false
+      }
+    },
+    {
+      "id": "large_writable_layer:reacher-web-1f2e3d",
+      "kind": "large_writable_layer",
+      "severity": "warning",
+      "subject": "reacher-web-1f2e3d",
+      "app": "reacher",
+      "evidence": "reacher-web-1f2e3d (running) has written 35.7 GB to its container layer, which a redeploy discards: move that data to a volume",
+      "size_bytes": 35700000000,
+      "remedy": {
+        "argv": null,
+        "destructive": false,
+        "confirm": false
+      }
+    },
+    {
+      "id": "manual_route_dead_upstream:hand.example.com",
+      "kind": "manual_route_dead_upstream",
+      "severity": "warning",
+      "subject": "hand.example.com",
+      "evidence": "hand-written block for hand.example.com routes to gone-svc:80, which does not resolve",
+      "remedy": {
+        "argv": null,
+        "destructive": false,
+        "confirm": false
+      }
+    },
+    {
+      "id": "orphan_state:orphan",
+      "kind": "orphan_state",
+      "severity": "warning",
+      "subject": "orphan",
+      "app": "orphan",
+      "evidence": "orphan has deploy state (release o1) but no containers; removing keeps its volumes, accessory data and credentials",
+      "remedy": {
+        "argv": [
+          "teploy",
+          "remove",
+          "--app",
+          "orphan",
+          "--host",
+          "edge",
+          "-y"
+        ],
+        "destructive": true,
+        "confirm": true
+      }
+    },
+    {
+      "id": "stale_route:files",
+      "kind": "stale_route",
+      "severity": "warning",
+      "subject": "files",
+      "app": "files",
+      "evidence": "no app files on this server, but its managed block serves files.example.com; not removable: it serves files from /deployments/files/site, which exists",
+      "remedy": {
+        "argv": null,
+        "destructive": false,
+        "confirm": false
+      }
+    },
+    {
+      "id": "stale_route:ghost",
+      "kind": "stale_route",
+      "severity": "warning",
+      "subject": "ghost",
+      "app": "ghost",
+      "evidence": "no app ghost on this server, but its managed block serves ghost.example.com and routes to ghost-web-v1:3000, which does not resolve",
+      "remedy": {
+        "argv": [
+          "teploy",
+          "route",
+          "remove",
+          "--app",
+          "ghost",
+          "--host",
+          "edge"
+        ],
+        "destructive": false,
+        "confirm": false
+      }
+    },
+    {
+      "id": "unmanaged_container:portainer",
+      "kind": "unmanaged_container",
+      "severity": "warning",
+      "subject": "portainer",
+      "evidence": "portainer (running) is not managed by teploy and holds 2.0 GB in its container layer",
+      "size_bytes": 2000000000,
+      "remedy": {
+        "argv": null,
+        "destructive": false,
+        "confirm": false
+      }
+    },
+    {
+      "id": "versions_beyond_policy:unset",
+      "kind": "versions_beyond_policy",
+      "severity": "warning",
+      "subject": "unset",
+      "app": "unset",
+      "evidence": "2 version(s) beyond keep_versions 5: u2, u1; keep_versions is not set, so deploys after 2026-11-08 remove them automatically; set keep_versions (0 keeps everything) or pin what you need",
+      "size_bytes": 20000000,
+      "remedy": {
+        "argv": [
+          "teploy",
+          "releases",
+          "prune",
+          "--app",
+          "unset",
+          "--host",
+          "edge",
+          "--keep",
+          "5"
+        ],
+        "destructive": true,
+        "confirm": true
+      }
+    },
+    {
+      "id": "dangling_volumes:docker",
+      "kind": "dangling_volumes",
+      "severity": "info",
+      "subject": "docker",
+      "evidence": "21 volume(s) attached to no container, 3.1 GB reclaimable: 0000000000000000000000000000000xxxxxxxdeadbeef, 0000000000000000000000000000001xxxxxxxdeadbeef, 0000000000000000000000000000002xxxxxxxdeadbeef, 0000000000000000000000000000003xxxxxxxdeadbeef, 0000000000000000000000000000004xxxxxxxdeadbeef (+16 more)",
+      "size_bytes": 3150000000,
+      "remedy": {
+        "argv": null,
+        "destructive": false,
+        "confirm": false
+      }
+    },
+    {
+      "id": "empty_managed_region:hollow",
+      "kind": "empty_managed_region",
+      "severity": "info",
+      "subject": "hollow",
+      "app": "hollow",
+      "evidence": "the managed region holds no site block",
+      "remedy": {
+        "argv": [
+          "teploy",
+          "route",
+          "remove",
+          "--app",
+          "hollow",
+          "--host",
+          "edge"
+        ],
+        "destructive": false,
+        "confirm": false
+      }
+    },
+    {
+      "id": "manual_route_nonlocal_address:203.0.113.9",
+      "kind": "manual_route_nonlocal_address",
+      "severity": "info",
+      "subject": "203.0.113.9",
+      "evidence": "hand-written block is addressed to 203.0.113.9, which is not an address of this server",
+      "remedy": {
+        "argv": null,
+        "destructive": false,
+        "confirm": false
+      }
+    },
+    {
+      "id": "reclaimable_build_artifacts:docker",
+      "kind": "reclaimable_build_artifacts",
+      "severity": "info",
+      "subject": "docker",
+      "evidence": "2.0 GB of unused build cache and 3 dangling image(s)",
+      "size_bytes": 2000000000,
+      "remedy": {
+        "argv": [
+          "teploy",
+          "server",
+          "prune",
+          "--host",
+          "edge",
+          "--build-cache",
+          "--dangling"
+        ],
+        "destructive": false,
+        "confirm": false
+      }
+    },
+    {
+      "id": "versions_beyond_policy:many",
+      "kind": "versions_beyond_policy",
+      "severity": "info",
+      "subject": "many",
+      "app": "many",
+      "evidence": "1 version(s) beyond keep_versions 2: v2; the next deploy removes them",
+      "size_bytes": 10000000,
+      "remedy": {
+        "argv": [
+          "teploy",
+          "releases",
+          "prune",
+          "--app",
+          "many",
+          "--host",
+          "edge",
+          "--keep",
+          "2"
+        ],
+        "destructive": true,
+        "confirm": true
+      }
+    }
+  ]
+}

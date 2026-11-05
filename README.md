@@ -134,7 +134,9 @@ drain_seconds: 10             # request drain: keep the old container serving in
                               # the drain policy — size it to your longest normal request.
 memory: 2g                    # cgroup RAM cap (docker units: 512m, 2g). Unset = unlimited.
 cpu: "1.5"                    # CPU cap in cores. Unset = unlimited.
-keep_versions: 3              # auto-prune older versions after deploy (0 = keep all, default)
+keep_versions: 3              # versions retained after a deploy. Unset = 5, pruned only after a
+                              # 7-day notice (teploy init writes 3); 0 keeps everything.
+                              # The current, previous and pinned versions are never pruned.
 backup_before_hooks: true     # back up running databases before a deploy whose pre_deploy hook will run (default off)
                               # `teploy pin <version>` protects a version from this prune
 
@@ -354,6 +356,7 @@ teploy plan                               # preview what a deploy would change (
 teploy plan --out plan.json               # write a bound plan record (config digest + target identity + generation)
 teploy apply plan.json                    # execute a reviewed plan; refuses naming what drifted since it was made
 teploy scale <count>                      # multi-server deploy + LB update
+teploy server audit <server>              # read-only: what is left over and what fixes it
 teploy version / update                   # version info and self-update
 ```
 
@@ -594,6 +597,40 @@ serves. Read-only, run from your machine over SSH, nothing new on the server:
 
 `ingress: external` and an unfronted `ingress: host` domain are labels: they
 carry a `skip` reason. A server that cannot be reached is reported as such.
+
+### Fleet cleanup & audit
+
+```bash
+teploy server audit <server>              # what is left over, with evidence and the fix
+teploy server audit <server> --json       # contracts/schema/server-audit-envelope.schema.json
+teploy route remove --app X --host S      # remove a managed Caddy block proven dead (CAS)
+teploy releases prune --app X --host S --keep N   # remove versions beyond N (pins/current/previous survive)
+teploy server prune --host S --build-cache --dangling   # reclaim unused build cache and dangling images
+```
+
+`server audit` changes nothing: every command it runs on the server only
+reads (a test pins that). Each finding says what it is, the evidence for it,
+and — only where a CLI command can fix it safely — the remedy:
+
+| Finding | Remedy |
+|---|---|
+| stale/empty managed route | `teploy route remove --app X` |
+| managed route, dead upstream | `teploy redeploy` (confirm) |
+| app state, no containers | `teploy remove --app X -y` (keeps volumes; confirm) |
+| versions beyond `keep_versions` | `teploy releases prune --keep N` (confirm) |
+| build cache / dangling images | `teploy server prune --build-cache --dangling` |
+| hand-written blocks, big writable layers, dangling volumes, unmanaged containers, disk pressure, a Caddyfile with no Caddy, scheduled jobs with no cron daemon | report only |
+
+A source that could not be read shows as `unknown` in `checks[]` and the
+findings depending on it are missing — a server is never reported clean
+because it could not be inspected. With `--json` the exit code is 0 whenever
+the envelope was produced; read `state` (`ok` / `partial` / `unreachable`).
+
+`route remove` only takes a block proven dead — no app state, no containers
+carrying the name, no upstream that still resolves (asked inside Caddy's
+network), no files it still serves, nothing unreadable — and commits under
+an exact-block compare-and-swap, so a deploy that rewrites the block in
+between is never undone.
 
 ### Accessories
 ```
