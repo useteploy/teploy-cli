@@ -78,8 +78,6 @@ copy, and Object Lock with aws 2.23+. The real-B2 smoke test is the coordinator'
 Open / deferred:
 - The run lock falls back per user when the policy's directory is not writable, so a root run
   and a sudoer's run do not exclude each other. Only one of them has the cron line.
-- `backup status` can still read a future-dated object as the newest good one, so one stray
-  object can show a target covered. Prune no longer trusts it; status has not been changed.
 - Legacy objects from a server that has not upgraded yet carry no marker. A first prune in
   a shared root by an upgraded server cannot tell them from its own: only markers from the
   moment each server upgrades protect it. Per-server prefixes close this (decided: Dash always

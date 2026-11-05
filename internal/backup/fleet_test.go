@@ -513,6 +513,24 @@ func TestUnsupportedDatabasesAreReported(t *testing.T) {
 }
 
 // Covered needs a restorable object now, from what covers the entry.
+func TestStatusIgnoresFutureDatedObjects(t *testing.T) {
+	var e StatusEntry
+	future := time.Now().Add(365 * 24 * time.Hour).UTC().Format(time.RFC3339)
+	past := time.Now().Add(-time.Hour).UTC().Format(time.RFC3339)
+	fillEntryObjects(&e, []ListedBackup{
+		{Kind: KindAccessory, Accessory: "db", Restorable: true, ID: "stray", CreatedAt: future},
+		{Kind: KindAccessory, Accessory: "db", Restorable: true, ID: "real", CreatedAt: past},
+	}, "db")
+	if e.Newest == nil || e.Newest.ID != "real" {
+		t.Fatalf("newest = %+v, want the real backup", e.Newest)
+	}
+	var only StatusEntry
+	fillEntryObjects(&only, []ListedBackup{{Kind: KindAccessory, Accessory: "db", Restorable: true, ID: "stray", CreatedAt: future}}, "db")
+	if only.Newest != nil {
+		t.Fatalf("a future-dated object alone counted as coverage: %+v", only.Newest)
+	}
+}
+
 func TestStatusCoverageNeedsAnObject(t *testing.T) {
 	labels := map[string]string{"teploy.role": "accessory", "teploy.app": "a", "teploy.accessory": "db"}
 	now := mustTime(t, "20260201-120000")

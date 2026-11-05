@@ -598,9 +598,11 @@ func fillEntryEvents(e *StatusEntry, evs []events.Event, name string) {
 }
 
 // fillEntryObjects sets the newest object of each series from a listing (newest
-// first). Below-floor objects are not Restorable and never count.
+// first). Below-floor objects are not Restorable and never count, and neither do
+// future-dated ones: as in prune, one stray object must not show a target covered.
 func fillEntryObjects(e *StatusEntry, rows []ListedBackup, name string) {
 	seen := map[string]bool{}
+	now := time.Now()
 	for _, r := range rows {
 		switch {
 		case name == "" && r.Kind != KindVolumes:
@@ -608,6 +610,9 @@ func fillEntryObjects(e *StatusEntry, rows []ListedBackup, name string) {
 		case name != "" && (r.Kind != KindAccessory || r.Accessory != name):
 			continue
 		case !r.Restorable:
+			continue
+		}
+		if t, err := time.Parse(time.RFC3339, r.CreatedAt); err == nil && t.Sub(now) > maxClockSkew {
 			continue
 		}
 		if seen[r.Database] {
