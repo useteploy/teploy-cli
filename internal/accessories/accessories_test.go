@@ -1053,3 +1053,25 @@ func TestEnsureRunning_EngineLabel(t *testing.T) {
 		}
 	}
 }
+
+// backup_databases: reaches a server-side backup run through a label, the
+// only thing it can read without teploy.yml.
+func TestEnsureRunning_BackupDatabasesLabel(t *testing.T) {
+	mock := ssh.NewMockExecutor("1.2.3.4", append(admissionStubs("myapp"),
+		ssh.MockCommand{Match: "docker inspect", Err: fmt.Errorf("not found")},
+		ssh.MockCommand{Match: "mkdir -p", Output: ""},
+		ssh.MockCommand{Match: "docker run", Output: "abc123"},
+	)...)
+	if _, err := NewManager(mock, &bytes.Buffer{}).EnsureRunning(context.Background(), "myapp", "db", config.AccessoryConfig{Image: "postgres:17", BackupDatabases: []string{"one", "two"}}); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, c := range mock.Calls {
+		if strings.HasPrefix(c, "docker run") && strings.Contains(c, "--label 'teploy.backup-databases=one,two'") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("label missing: %v", mock.Calls)
+	}
+}

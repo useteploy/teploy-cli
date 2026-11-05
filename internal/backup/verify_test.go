@@ -98,7 +98,9 @@ func TestVerifyBackup_Postgres(t *testing.T) {
 				t.Errorf("restore must load a replacement for POSTGRES_DB from inspected env: %s", call)
 			}
 		}
-		if strings.Contains(call, "docker rm -f") && strings.Contains(call, "teploy-backup-verify-") {
+		// -v: the scratch's anonymous volume is an unencrypted copy of the
+		// customer database; it must not outlive the verification.
+		if strings.Contains(call, "docker rm -fv") && strings.Contains(call, "teploy-backup-verify-") {
 			sawTeardown = true
 		}
 	}
@@ -137,7 +139,7 @@ func TestVerifyBackup_FailureIsResultAndTearsDown(t *testing.T) {
 	}
 	teardown := false
 	for _, call := range mock.Calls {
-		if strings.Contains(call, "docker rm -f") && strings.Contains(call, "teploy-backup-verify-") {
+		if strings.Contains(call, "docker rm -fv") && strings.Contains(call, "teploy-backup-verify-") {
 			teardown = true
 		}
 	}

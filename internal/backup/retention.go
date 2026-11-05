@@ -119,6 +119,7 @@ func (c *Client) PruneBackups(ctx context.Context, app, prefix string, s3 S3Conf
 	toDelete := selectForDeletion(entries, p, time.Now().UTC())
 
 	var deleted []string
+	var extras *[]string
 	for _, name := range toDelete {
 		key := fmt.Sprintf("s3://%s/%s/%s/%s", s3.Base(), app, prefix, name)
 		if _, err := c.exec.Run(ctx, s3.AWS("s3 rm "+ssh.ShellQuote(key))); err != nil {
@@ -127,12 +128,34 @@ func (c *Client) PruneBackups(ctx context.Context, app, prefix string, s3 S3Conf
 		fmt.Fprintf(c.out, "Pruned %s\n", key)
 		deleted = append(deleted, name)
 		if strings.HasPrefix(prefix, "accessories/") {
-			// A postgres backup's globals sidecar goes with it (absent
-			// for every other engine; deleting a missing key succeeds).
-			id, _, _ := strings.Cut(name, ".")
-			sidecar := fmt.Sprintf("s3://%s/%s/%s/globals/%s.sql.gz", s3.Base(), app, prefix, id)
-			c.exec.Run(ctx, s3.AWS("s3 rm "+ssh.ShellQuote(sidecar)))
+			c.pruneAccessorySidecars(ctx, app, prefix, name, s3, &extras)
 		}
 	}
 	return deleted, nil
+}
+
+// pruneAccessorySidecars removes what a pruned accessory backup keeps
+// beside itself: postgres globals and size record, and any backup_databases
+// dumps. Absent for other engines; deleting a missing key succeeds.
+func (c *Client) pruneAccessorySidecars(ctx context.Context, app, prefix, file string, s3 S3Config, extras **[]string) {
+	id, _, _ := strings.Cut(file, ".")
+	base := fmt.Sprintf("s3://%s/%s/%s/", s3.Base(), app, prefix)
+	if *extras == nil {
+		names := []string{}
+		if out, err := c.exec.Run(ctx, s3.AWS("s3 ls "+ssh.ShellQuote(base+"databases/"))); err == nil {
+			for _, line := range strings.Split(out, "\n") {
+				if f := strings.Fields(line); len(f) == 2 && f[0] == "PRE" {
+					names = append(names, strings.TrimSuffix(f[1], "/"))
+				}
+			}
+		}
+		*extras = &names
+	}
+	keys := []string{base + "globals/" + id + ".sql.gz", base + "meta/" + id + ".json"}
+	for _, db := range **extras {
+		keys = append(keys, base+"databases/"+db+"/"+id+".pgdump")
+	}
+	for _, key := range keys {
+		c.exec.Run(ctx, s3.AWS("s3 rm "+ssh.ShellQuote(key)))
+	}
 }

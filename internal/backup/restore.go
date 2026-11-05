@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -20,6 +21,9 @@ type RestoreRecovery struct {
 	PGDatabase string
 	pg         pgTarget
 	pgVersion  int
+	// Warnings are non-fatal problems the restore met (database-level
+	// settings it could not re-apply, a lost swap status).
+	Warnings []string
 }
 
 // IsZero reports whether the restore kept nothing.
@@ -121,11 +125,32 @@ func (c *Client) AccessoryRestore(ctx context.Context, app, name, image, date st
 // leaves the data in an indeterminate state is recovery-incomplete
 // (IsRecoveryIncomplete), which tells the caller not to restart the app.
 func (c *Client) AccessoryRestoreKeep(ctx context.Context, app, name, image, date string, env map[string]string, s3 S3Config) (RestoreRecovery, error) {
+	return c.AccessoryRestoreWith(ctx, app, name, image, date, env, s3, RestoreOptions{})
+}
+
+// RestoreOptions tune an accessory restore.
+type RestoreOptions struct {
+	// IgnoreSpaceCheck skips the free-space preflights: when the estimate
+	// is known to be wrong, or the disk is being recovered by this restore.
+	IgnoreSpaceCheck bool
+	// Database restores one extra database stored by backup_databases:
+	// instead of the accessory's primary (postgres only).
+	Database string
+}
+
+// AccessoryRestoreWith is AccessoryRestoreKeep with options.
+func (c *Client) AccessoryRestoreWith(ctx context.Context, app, name, image, date string, env map[string]string, s3 S3Config, opts RestoreOptions) (RestoreRecovery, error) {
 	var none RestoreRecovery
 	if err := c.ensureAWSCLI(ctx); err != nil {
 		return none, err
 	}
-	art, err := c.ResolveAccessoryArtifact(ctx, app, name, image, date, env, s3)
+	var art AccessoryArtifact
+	var err error
+	if opts.Database != "" {
+		art, err = c.resolveExtraDatabase(ctx, app, name, image, date, env, s3, opts.Database)
+	} else {
+		art, err = c.ResolveAccessoryArtifact(ctx, app, name, image, date, env, s3)
+	}
 	if err != nil {
 		return none, err
 	}
@@ -170,7 +195,13 @@ func (c *Client) AccessoryRestoreKeep(ctx context.Context, app, name, image, dat
 
 	case art.Engine.Engine == EnginePostgres:
 		db, user := postgresDBAndUser(app, env)
-		rec, err = c.restorePostgres(ctx, pgTarget{container: container, user: user, db: db}, artifact, art.Ext, tmpdir)
+		pgOpts := pgRestoreOpts{ignoreSpace: opts.IgnoreSpaceCheck}
+		if opts.Database != "" && opts.Database != db {
+			db = opts.Database
+		} else {
+			pgOpts.logicalBytes = c.pgRecordedSize(ctx, s3, app, name, date, tmpdir)
+		}
+		rec, err = c.restorePostgres(ctx, newPGTarget(container, db, user, env), artifact, art.Ext, tmpdir, pgOpts)
 		if err != nil {
 			return fail(rec, err)
 		}
@@ -183,13 +214,13 @@ func (c *Client) AccessoryRestoreKeep(ctx context.Context, app, name, image, dat
 			}
 			m.credFile = credFile
 		}
-		rec, err = c.restoreMySQLInPlace(ctx, m, artifact, tmpdir)
+		rec, err = c.restoreMySQLInPlace(ctx, m, artifact, tmpdir, opts.IgnoreSpaceCheck, recoveryPrefix(app, name))
 		if err != nil {
 			return fail(rec, err)
 		}
 
 	case art.Engine.Engine == EngineMongo:
-		rec, err = c.restoreMongoInPlace(ctx, container, artifact)
+		rec, err = c.restoreMongoInPlace(ctx, container, artifact, recoveryPrefix(app, name))
 		if err != nil {
 			return fail(rec, err)
 		}
@@ -205,7 +236,7 @@ func (c *Client) AccessoryRestoreKeep(ctx context.Context, app, name, image, dat
 		}
 
 	case art.Engine.Engine == EngineDragonfly:
-		recOut, err := c.exec.Run(ctx, "umask 077; mktemp -d /var/tmp/teploy-pre-restore.XXXXXX")
+		recOut, err := c.exec.Run(ctx, "umask 077; mktemp -d "+ssh.ShellQuote(recoveryPrefix(app, name)+".XXXXXX"))
 		if err != nil {
 			return fail(none, fmt.Errorf("creating the pre-restore snapshot directory (dataset untouched): %w", err))
 		}
@@ -224,6 +255,33 @@ func (c *Client) AccessoryRestoreKeep(ctx context.Context, app, name, image, dat
 	c.exec.Run(ctx, "rm -rf "+ssh.ShellQuote(tmpdir))
 	fmt.Fprintln(c.out, "Restore complete")
 	return rec, nil
+}
+
+// recoveryPrefix names an accessory's pre-restore safety copies, so doctor
+// and `backup restore --release` can attribute them.
+func recoveryPrefix(app, name string) string {
+	return "/var/tmp/teploy-pre-restore." + app + "-" + name
+}
+
+// resolveExtraDatabase is the stored dump of a backup_databases: entry.
+func (c *Client) resolveExtraDatabase(ctx context.Context, app, name, image, date string, env map[string]string, s3 S3Config, db string) (AccessoryArtifact, error) {
+	if err := ValidateDate(date); err != nil {
+		return AccessoryArtifact{}, err
+	}
+	if !pgSafeDBName.MatchString(db) {
+		return AccessoryArtifact{}, fmt.Errorf("invalid database name %q", db)
+	}
+	det, err := c.ResolveEngine(ctx, app, name, image, env)
+	if err != nil {
+		return AccessoryArtifact{}, err
+	}
+	if det.Engine != EnginePostgres {
+		return AccessoryArtifact{}, fmt.Errorf("--database applies to postgres accessories; %s is %s", name, det.Engine)
+	}
+	if primary, _ := postgresDBAndUser(app, env); db == primary {
+		return c.ResolveAccessoryArtifact(ctx, app, name, image, date, env, s3)
+	}
+	return AccessoryArtifact{Key: pgExtraKey(s3, app, name, db, date), Ext: ".pgdump", Engine: det}, nil
 }
 
 // recoveryIncompleteMarker is what a restore script prints when both the
@@ -302,12 +360,19 @@ func mysqlIdent(s string) string { return "`" + strings.ReplaceAll(s, "`", "``")
 // routines, triggers and events a plain dump omits.
 const mysqlDumpArgs = "--single-transaction --routines --triggers --events"
 
-// restoreMySQLInPlace replaces the database with the dump: validate the
-// dump, take a safety dump of the current database, DROP + CREATE it with
-// its charset/collation (so tables created after the backup do not
-// survive), load. A failed load reloads the safety dump; if that fails too
-// the error is recovery-incomplete.
-func (c *Client) restoreMySQLInPlace(ctx context.Context, m mysqlTarget, artifact, workDir string) (RestoreRecovery, error) {
+// restoreMySQLInPlace replaces the database with the dump. MySQL has no
+// RENAME DATABASE, and RENAME TABLE across schemas does not carry views,
+// routines, events or triggers, so a Postgres-style swap is not available.
+// Instead the dump must first prove it loads: into a throwaway
+// <db>_teploy_check on this server, under this server's settings. A dump the
+// server refuses (a table created under innodb_strict_mode=0 hits error 1118
+// on reload) is refused here with the database untouched; DROPping first
+// left only the tables before the bad one, and the safety dump of the same
+// table failed the same way. Then: safety dump, DROP + CREATE with the
+// database's charset (so tables created after the backup do not survive),
+// load. A failed load reloads the safety dump; if that fails too the error is
+// recovery-incomplete.
+func (c *Client) restoreMySQLInPlace(ctx context.Context, m mysqlTarget, artifact, workDir string, ignoreSpace bool, recPrefix string) (RestoreRecovery, error) {
 	var none RestoreRecovery
 	client, _ := mysqlTools(m.engine)
 	dumpTool := "mysqldump"
@@ -326,35 +391,79 @@ func (c *Client) restoreMySQLInPlace(ctx context.Context, m mysqlTarget, artifac
 	}
 	props := strings.Split(strings.TrimSpace(out), "|")
 	exists := len(props) == 3
-	create := "CREATE DATABASE " + mysqlIdent(m.db)
+	charset := ""
 	if exists {
-		create += " CHARACTER SET " + props[0] + " COLLATE " + props[1]
+		charset = " CHARACTER SET " + props[0] + " COLLATE " + props[1]
 	}
-	recreate := m.client(client, "-e "+q("DROP DATABASE IF EXISTS "+mysqlIdent(m.db)+"; "+create))
+	recreate := func(db string) string {
+		return m.client(client, "-e "+q("DROP DATABASE IF EXISTS "+mysqlIdent(db)+"; CREATE DATABASE "+mysqlIdent(db)+charset))
+	}
+
+	if !ignoreSpace {
+		// The dry run and the real load each need about the dump's size on
+		// the data volume; the dry run's copy is dropped before the load.
+		var sqlBytes int64
+		if out, err := c.exec.Run(ctx, "wc -c < "+q(sqlPath)); err == nil {
+			sqlBytes, _ = strconv.ParseInt(strings.TrimSpace(out), 10, 64)
+		}
+		free, known := c.freeBytes(ctx, "docker exec "+q(m.container)+" ", "/var/lib/mysql")
+		if err := requireSpace("loading the dump on the data volume (--ignore-space-check overrides)", free, known, sqlBytes); err != nil {
+			return none, err
+		}
+	}
+
+	// The dry run: nothing of the live database is touched until the server
+	// has accepted the whole dump.
+	check := truncBytes(m.db, 40) + "_teploy_check"
+	checkT := m
+	checkT.db = check
+	wctx := context.WithoutCancel(ctx)
+	dropCheck := func() error {
+		_, err := c.exec.Run(wctx, m.client(client, "-e "+q("DROP DATABASE IF EXISTS "+mysqlIdent(check))))
+		return err
+	}
+	fmt.Fprintf(c.out, "Checking that the dump loads (into %s)...\n", check)
+	_, dryErr := c.exec.Run(ctx, recreate(check))
+	if dryErr == nil {
+		_, dryErr = c.exec.Run(ctx, checkT.load(sqlPath, workDir+"/check.failed"))
+	}
+	dropErr := dropCheck()
+	if dryErr != nil {
+		// A dry run that takes the server down is not "untouched".
+		if _, pingErr := c.exec.Run(wctx, m.client(client, "-e "+q("SELECT 1"))); pingErr != nil {
+			return none, fmt.Errorf("%w: the dry run failed (%v) and the server no longer answers (%v)", errRecoveryIncomplete, dryErr, pingErr)
+		}
+		return none, fmt.Errorf("this server cannot load the dump, so nothing was changed (database untouched): %w", dryErr)
+	}
+	if dropErr != nil {
+		fmt.Fprintf(c.out, "Warning: could not drop the dry-run database %s: %v\n", check, dropErr)
+	}
 
 	var rec RestoreRecovery
 	safety := ""
 	if exists {
-		size, _ := strconv.ParseInt(props[2], 10, 64)
-		free, known := c.freeBytes(ctx, "", "/var/tmp")
-		if err := requireSpace("the pre-restore safety dump in /var/tmp", free, known, size); err != nil {
-			return none, err
+		if !ignoreSpace {
+			size, _ := strconv.ParseInt(props[2], 10, 64)
+			free, known := c.freeBytes(ctx, "", "/var/tmp")
+			if err := requireSpace("the pre-restore safety dump in /var/tmp (--ignore-space-check overrides)", free, known, size); err != nil {
+				return none, err
+			}
 		}
-		dir, err := c.exec.Run(ctx, "umask 077; mktemp -d /var/tmp/teploy-pre-restore.XXXXXX")
+		dir, err := c.exec.Run(ctx, "umask 077; mktemp -d "+q(recPrefix+".XXXXXX"))
 		if err != nil {
 			return none, fmt.Errorf("creating the safety-dump directory (database untouched): %w", err)
 		}
 		rec.Path = strings.TrimSpace(dir)
 		safety = rec.Path + "/pre-restore.sql"
 		if _, err := c.exec.Run(ctx, m.client(dumpTool, mysqlDumpArgs+" "+q(m.db))+" > "+q(safety)+" && tail -c 512 "+q(safety)+" | grep -q 'Dump completed'"); err != nil {
-			c.exec.Run(context.WithoutCancel(ctx), "rm -rf "+q(rec.Path))
+			c.exec.Run(wctx, "rm -rf "+q(rec.Path))
 			return none, fmt.Errorf("safety dump of the current database failed (database untouched): %w", err)
 		}
 		fmt.Fprintf(c.out, "Safety dump of the current %s database: %s\n", m.db, safety)
 	}
 
 	loadErr := func() error {
-		if _, err := c.exec.Run(ctx, recreate); err != nil {
+		if _, err := c.exec.Run(ctx, recreate(m.db)); err != nil {
 			return fmt.Errorf("recreating database %s: %w", m.db, err)
 		}
 		if _, err := c.exec.Run(ctx, m.load(sqlPath, workDir+"/load.failed")); err != nil {
@@ -369,8 +478,7 @@ func (c *Client) restoreMySQLInPlace(ctx context.Context, m mysqlTarget, artifac
 		return none, loadErr
 	}
 	fmt.Fprintf(c.out, "Restore failed (%v); reloading the safety dump...\n", loadErr)
-	wctx := context.WithoutCancel(ctx)
-	if _, err := c.exec.Run(wctx, recreate); err == nil {
+	if _, err := c.exec.Run(wctx, recreate(m.db)); err == nil {
 		_, err = c.exec.Run(wctx, m.load(safety, workDir+"/reload.failed"))
 		if err == nil {
 			c.exec.Run(wctx, "rm -rf "+q(rec.Path))
@@ -385,34 +493,179 @@ func (c *Client) restoreMySQLInPlace(ctx context.Context, m mysqlTarget, artifac
 
 // ---- mongo ----
 
-// restoreMongoInPlace takes a safety mongodump, then mongorestore --drop;
-// a failed restore reloads the safety archive (recovery-incomplete when
-// that fails too). --drop replaces the collections in the archive;
-// collections created after the backup survive.
-func (c *Client) restoreMongoInPlace(ctx context.Context, container, artifact string) (RestoreRecovery, error) {
+// mongoCheckPrefix names the throwaway databases of a restore's dry run.
+const mongoCheckPrefix = "teploy_check_"
+
+// mongoShell runs a script in the container's shell (mongosh on 5.x+, the
+// legacy mongo shell before that).
+func mongoShell(container, script string) string {
+	return "docker exec " + ssh.ShellQuote(container) + " sh -c " + ssh.ShellQuote("mongosh --quiet --eval "+ssh.ShellQuote(script)+" || mongo --quiet --eval "+ssh.ShellQuote(script))
+}
+
+// restoreMongoInPlace first proves the archive loads, into throwaway
+// teploy_check_* databases (mongorestore --nsFrom/--nsTo; admin and config
+// are left out, as they cannot be renamed), so an archive the server refuses
+// leaves the data untouched. Then a safety mongodump and mongorestore --drop;
+// a failed restore reloads the safety archive (recovery-incomplete when that
+// fails too). --drop replaces the collections in the archive; collections
+// created after the backup survive.
+func (c *Client) restoreMongoInPlace(ctx context.Context, container, artifact, recPrefix string) (RestoreRecovery, error) {
 	var none RestoreRecovery
 	q := ssh.ShellQuote
 	if _, err := c.exec.Run(ctx, "gzip -t "+q(artifact)); err != nil {
 		return none, fmt.Errorf("the archive is corrupt (database untouched): %w", err)
 	}
-	dir, err := c.exec.Run(ctx, "umask 077; mktemp -d /var/tmp/teploy-pre-restore.XXXXXX")
+	wctx := context.WithoutCancel(ctx)
+	dropCheck := func() {
+		script := "db.getMongo().getDBNames().filter(function(n){return n.indexOf(" + "'" + mongoCheckPrefix + "'" + ")===0}).forEach(function(n){db.getSiblingDB(n).dropDatabase()})"
+		if _, err := c.exec.Run(wctx, mongoShell(container, script)); err != nil {
+			fmt.Fprintf(c.out, "Warning: could not drop the dry-run databases (%s*): %v\n", mongoCheckPrefix, err)
+		}
+	}
+	fmt.Fprintln(c.out, "Checking that the archive loads...")
+	dry := "docker exec -i " + q(container) + " mongorestore --archive --gzip --drop --nsExclude=" + q("admin.*") + " --nsExclude=" + q("config.*") +
+		" --nsFrom=" + q("$db$.$coll$") + " --nsTo=" + q(mongoCheckPrefix+"$db$.$coll$") + " < " + q(artifact)
+	_, dryErr := c.exec.Run(ctx, dry)
+	dropCheck()
+	if dryErr != nil {
+		return none, fmt.Errorf("this server cannot load the archive, so nothing was changed (database untouched): %w", dryErr)
+	}
+	dir, err := c.exec.Run(ctx, "umask 077; mktemp -d "+q(recPrefix+".XXXXXX"))
 	if err != nil {
 		return none, fmt.Errorf("creating the safety-dump directory (database untouched): %w", err)
 	}
 	rec := RestoreRecovery{Path: strings.TrimSpace(dir)}
 	safety := rec.Path + "/pre-restore.archive.gz"
 	if _, err := c.exec.Run(ctx, "docker exec "+q(container)+" mongodump --archive --gzip > "+q(safety)); err != nil {
-		c.exec.Run(context.WithoutCancel(ctx), "rm -rf "+q(rec.Path))
+		c.exec.Run(wctx, "rm -rf "+q(rec.Path))
 		return none, fmt.Errorf("safety dump of the current data failed (database untouched): %w", err)
 	}
 	if _, err := c.exec.Run(ctx, mongoRestoreCmd(container, artifact)); err == nil {
 		return rec, nil
 	} else {
-		wctx := context.WithoutCancel(ctx)
 		if _, rbErr := c.exec.Run(wctx, mongoRestoreCmd(container, safety)); rbErr != nil {
 			return rec, fmt.Errorf("%w: mongorestore: %v — reloading the safety dump also failed: %v; the pre-restore data is saved at %s", errRecoveryIncomplete, err, rbErr, safety)
 		}
 		c.exec.Run(wctx, "rm -rf "+q(rec.Path))
 		return none, fmt.Errorf("mongorestore: %w — the previous data was reloaded from the safety dump", err)
 	}
+}
+
+// ---- kept recovery copies ----
+
+// RecoveryCopies is what earlier restores of an accessory left behind.
+type RecoveryCopies struct {
+	Previous []string // postgres databases renamed aside (<db>_teploy_old_*)
+	Partial  []string // replacements a killed restore left (<db>_teploy_new_*)
+	Paths    []string // pre-restore safety copies in /var/tmp
+	pg       pgTarget
+	version  int
+}
+
+// FindRecoveryCopies lists an accessory's kept recovery copies.
+func (c *Client) FindRecoveryCopies(ctx context.Context, app, name, image string, env map[string]string) (RecoveryCopies, error) {
+	var rc RecoveryCopies
+	det, err := c.ResolveEngine(ctx, app, name, image, env)
+	if err != nil {
+		return rc, err
+	}
+	if det.Engine == EnginePostgres {
+		db, user := postgresDBAndUser(app, env)
+		rc.pg = newPGTarget(app+"-"+name, db, user, env)
+		cl, err := c.pgClusterState(ctx, rc.pg)
+		if err != nil {
+			return rc, err
+		}
+		rc.version = cl.version
+		cov, err := c.pgReadCoverage(ctx, rc.pg, nil)
+		if err != nil {
+			return rc, err
+		}
+		// Only this database's copies (a truncated name is still its prefix).
+		prefix := truncBytes(db, 40) + "_teploy_"
+		for _, n := range cov.KeptOld {
+			if strings.HasPrefix(n, prefix) {
+				rc.Previous = append(rc.Previous, n)
+			}
+		}
+		for _, n := range cov.PartialNew {
+			if strings.HasPrefix(n, prefix) {
+				rc.Partial = append(rc.Partial, n)
+			}
+		}
+	}
+	out, err := c.exec.Run(ctx, "for d in "+ssh.ShellQuote(recoveryPrefix(app, name))+".*; do [ -d \"$d\" ] && printf '%s\\n' \"$d\"; done; true")
+	if err == nil {
+		rc.Paths = strings.Fields(out)
+	}
+	return rc, nil
+}
+
+// ReleaseRecoveryCopies confirms a restore: it discards every kept copy.
+func (c *Client) ReleaseRecoveryCopies(ctx context.Context, rc RecoveryCopies) ([]string, error) {
+	var released []string
+	var errs []error
+	for _, db := range append(append([]string{}, rc.Previous...), rc.Partial...) {
+		if err := c.pgDropDB(ctx, rc.pg, db, rc.version); err != nil {
+			errs = append(errs, fmt.Errorf("dropping %s: %w", db, err))
+			continue
+		}
+		released = append(released, db)
+	}
+	for _, p := range rc.Paths {
+		if _, err := c.exec.Run(ctx, "rm -rf "+ssh.ShellQuote(p)); err != nil {
+			errs = append(errs, fmt.Errorf("removing %s: %w", p, err))
+			continue
+		}
+		released = append(released, p)
+	}
+	return released, errors.Join(errs...)
+}
+
+// RollbackRestore undoes a restore by swapping the kept previous postgres
+// database back into place. The database it displaces stays, renamed as a
+// partial copy, until --release. pick selects one when several are kept. The
+// caller has quiesced the app. Safety-dump copies of other engines are not
+// rolled back automatically; the error names them.
+func (c *Client) RollbackRestore(ctx context.Context, rc RecoveryCopies, pick string) (restored, displaced string, err error) {
+	switch {
+	case pick != "":
+		if !slices.Contains(rc.Previous, pick) {
+			return "", "", fmt.Errorf("%s is not a kept previous database (kept: %s)", pick, strings.Join(rc.Previous, ", "))
+		}
+		restored = pick
+	case len(rc.Previous) == 1:
+		restored = rc.Previous[0]
+	case len(rc.Previous) == 0:
+		if len(rc.Paths) > 0 {
+			return "", "", fmt.Errorf("no previous database is kept; the pre-restore safety copies are %s (load one with the engine's client)", strings.Join(rc.Paths, ", "))
+		}
+		return "", "", fmt.Errorf("no previous database is kept for this accessory")
+	default:
+		return "", "", fmt.Errorf("several previous databases are kept (%s): pick one with --recovery-database", strings.Join(rc.Previous, ", "))
+	}
+	t := rc.pg
+	displaced = truncBytes(t.db, 40) + "_teploy_new_" + randSuffix()
+	st, err := c.pgSwapState(ctx, t, restored, displaced)
+	if err != nil {
+		return "", "", fmt.Errorf("reading the databases: %w", err)
+	}
+	// pgSwap's roles reversed: previous -> live, live -> displaced. A live
+	// database may be missing after a recovery-incomplete restore.
+	if err := c.pgSwap(ctx, t, restored, displaced, st.live); err != nil {
+		wctx := context.WithoutCancel(ctx)
+		after, stErr := c.pgSwapState(wctx, t, restored, displaced)
+		switch {
+		case stErr != nil:
+			return "", "", fmt.Errorf("%w: the rollback failed (%v) and the server no longer answers (%v)", errRecoveryIncomplete, err, stErr)
+		case after.live && !after.replacement && (after.previous || !st.live):
+			// Committed: only the reply was lost.
+		default:
+			return "", "", fmt.Errorf("the rollback did not happen, nothing changed: %w", err)
+		}
+	}
+	if !st.live {
+		displaced = ""
+	}
+	return restored, displaced, nil
 }

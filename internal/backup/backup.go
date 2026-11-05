@@ -257,6 +257,10 @@ type BackupResult struct {
 	Engine      string
 	Consistency string
 	DurationMs  int64
+	// UncoveredDatabases are databases in the postgres cluster this backup
+	// does not contain; Warnings are non-fatal coverage problems.
+	UncoveredDatabases []string
+	Warnings           []string
 }
 
 // BackupVolumes archives the app's volumes (and .env) to S3, reporting the

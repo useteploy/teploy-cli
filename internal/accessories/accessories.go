@@ -166,6 +166,11 @@ func (m *Manager) EnsureRunning(ctx context.Context, app, name string, cfg confi
 		// Read back by backup engine detection (backup.EngineLabel).
 		args = append(args, "--label", "teploy.engine="+cfg.Engine)
 	}
+	if len(cfg.BackupDatabases) > 0 {
+		// Read back by a server-side `backup run`, which has no teploy.yml
+		// (backup.BackupDatabasesLabel).
+		args = append(args, "--label", ssh.ShellQuote("teploy.backup-databases="+strings.Join(cfg.BackupDatabases, ",")))
+	}
 
 	// Env rides a 0600 env-file under the accessory's own directory rather
 	// than `-e KEY=value` argv: resolved credentials (generated passwords,

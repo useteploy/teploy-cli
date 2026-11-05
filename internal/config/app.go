@@ -386,7 +386,15 @@ type AccessoryConfig struct {
 	// detectors misread: a sidecar built FROM postgres that is not a
 	// server, or a database image that dropped the upstream env markers.
 	Engine string `yaml:"engine,omitempty" toml:"engine"`
+	// BackupDatabases names the other databases of a postgres cluster that
+	// its backups also dump, one object each ("all" means every one). Others
+	// are not backed up, and each backup warns about them. Set on the
+	// container as the teploy.backup-databases label, so it takes effect when
+	// the accessory is (re)created.
+	BackupDatabases []string `yaml:"backup_databases,omitempty" toml:"backup_databases"`
 }
+
+var validBackupDatabase = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_.-]*$`)
 
 // AccessoryEngines are the accepted values of an accessory's engine:.
 var AccessoryEngines = []string{"postgres", "mysql", "mariadb", "redis", "valkey", "dragonfly", "mongo", "nucleus", "generic", "none"}
@@ -1355,6 +1363,11 @@ func (c *AppConfig) validate() error {
 		if acc.Engine != "" && !slices.Contains(AccessoryEngines, acc.Engine) {
 			return fmt.Errorf("accessory %s: engine %q is not one of %s", name, acc.Engine, strings.Join(AccessoryEngines, ", "))
 		}
+		for _, db := range acc.BackupDatabases {
+			if !validBackupDatabase.MatchString(db) {
+				return fmt.Errorf("accessory %s: backup_databases entry %q must be alphanumeric with _ . - (or \"all\")", name, db)
+			}
+		}
 		// Accessory volume keys become path segments under the accessory's
 		// data directory (and reach mkdir/chown sites); the same grammar as
 		// top-level volume names applies, and container destinations must
@@ -1978,6 +1991,9 @@ func mergeAccessory(base, overlay AccessoryConfig) AccessoryConfig {
 	}
 	if overlay.Engine != "" {
 		out.Engine = overlay.Engine
+	}
+	if len(overlay.BackupDatabases) > 0 {
+		out.BackupDatabases = overlay.BackupDatabases
 	}
 	if len(overlay.Env) > 0 {
 		if out.Env == nil {

@@ -81,7 +81,6 @@ func TestAccessoryBackup_Postgres(t *testing.T) {
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
 		ssh.MockCommand{Match: "umask 077", Output: "/tmp/teploy-backup.abc123\n"},
 		ssh.MockCommand{Match: "wc -c", Output: "4096\n"},
-		ssh.MockCommand{Match: "others=", Output: ""},
 		ssh.MockCommand{Match: "docker exec", Output: ""},
 		ssh.MockCommand{Match: "aws s3 cp", Output: "done\n"},
 		ssh.MockCommand{Match: "rm -f", Output: ""},
@@ -128,7 +127,6 @@ func TestAccessoryBackup_Postgres_CustomDBName(t *testing.T) {
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
 		ssh.MockCommand{Match: "umask 077", Output: "/tmp/teploy-backup.abc123\n"},
 		ssh.MockCommand{Match: "wc -c", Output: "4096\n"},
-		ssh.MockCommand{Match: "others=", Output: ""},
 		ssh.MockCommand{Match: "docker exec", Output: ""},
 		ssh.MockCommand{Match: "aws s3 cp", Output: "done\n"},
 		ssh.MockCommand{Match: "rm -f", Output: ""},
@@ -175,7 +173,7 @@ func TestAccessoryBackup_Postgres_DumpFailureIsNotSwallowed(t *testing.T) {
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
 		ssh.MockCommand{Match: "umask 077", Output: "/tmp/teploy-backup.abc123\n"},
 		ssh.MockCommand{Match: "wc -c", Output: "4096\n"},
-		ssh.MockCommand{Match: "others=", Err: errors.New(`exit status 1: pg_dump: error: connection to database "myapp" failed: FATAL:  database "myapp" does not exist`)},
+		ssh.MockCommand{Match: "docker exec", Err: errors.New(`exit status 1: pg_dump: error: connection to database "myapp" failed: FATAL:  database "myapp" does not exist`)},
 	)
 
 	var buf bytes.Buffer

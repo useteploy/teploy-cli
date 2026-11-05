@@ -153,3 +153,18 @@ func TestAccessoryEngineValidated(t *testing.T) {
 		t.Errorf("unknown engine accepted: %v", err)
 	}
 }
+
+func TestAccessoryBackupDatabasesValidated(t *testing.T) {
+	cfg := func(dbs ...string) *AppConfig {
+		return &AppConfig{App: "myapp", Domain: "myapp.com",
+			Accessories: map[string]AccessoryConfig{"db": {Image: "postgres:16", BackupDatabases: dbs}}}
+	}
+	if err := cfg("other", "all", "a_b.c-d").validate(); err != nil {
+		t.Errorf("valid names rejected: %v", err)
+	}
+	for _, bad := range []string{"x$(id)", "a,b", "", "a b"} {
+		if err := cfg(bad).validate(); err == nil {
+			t.Errorf("accepted %q", bad)
+		}
+	}
+}

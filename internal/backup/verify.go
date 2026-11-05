@@ -178,7 +178,7 @@ func (c *Client) VerifyBackup(ctx context.Context, app, name, date string, s3 S3
 	defer func() {
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 		defer cancel()
-		_, cleanupErr := c.exec.Run(cleanupCtx, fmt.Sprintf("if [ \"$(docker inspect -f '{{index .Config.Labels \"teploy.verify.owner\"}}' %s 2>/dev/null)\" = %s ]; then docker rm -f %s >/dev/null; fi; rm -rf -- %s", ssh.ShellQuote(scratch), ssh.ShellQuote(owner), ssh.ShellQuote(scratch), ssh.ShellQuote(workspace)))
+		_, cleanupErr := c.exec.Run(cleanupCtx, fmt.Sprintf("if [ \"$(docker inspect -f '{{index .Config.Labels \"teploy.verify.owner\"}}' %s 2>/dev/null)\" = %s ]; then docker rm -fv %s >/dev/null; fi; rm -rf -- %s", ssh.ShellQuote(scratch), ssh.ShellQuote(owner), ssh.ShellQuote(scratch), ssh.ShellQuote(workspace)))
 		if cleanupErr != nil {
 			retErr = errors.Join(retErr, fmt.Errorf("cleaning verification scratch: %w", cleanupErr))
 			if retResult != nil {
@@ -330,21 +330,27 @@ func (c *Client) verifyPostgres(ctx context.Context, res *VerifyResult, app, nam
 	globals := tmpBase + ".globals.sql.gz"
 	haveGlobals := c.download(ctx, prefix+"globals/"+res.Date+".sql.gz", globals, s3) == nil
 
-	flags, err := c.verifyEnv(ctx, env, tmpBase, "POSTGRES_")
+	flags, err := c.verifyEnv(ctx, env, tmpBase, "POSTGRES_", "POSTGRESQL_", "ALLOW_EMPTY_PASSWORD")
 	if err != nil {
 		return err
 	}
-	if _, ok := env["POSTGRES_PASSWORD"]; !ok {
+	sup := pgTarget{container: scratch, user: postgresBootstrapUser(env), db: db}
+	if _, ok := env["POSTGRES_PASSWORD"]; !ok && env["BITNAMI_APP_NAME"] == "" {
 		// Source ran without auth config (trust); scratch images require one.
 		flags += " -e POSTGRES_HOST_AUTH_METHOD=trust"
+	}
+	if env["BITNAMI_APP_NAME"] != "" {
+		// Bitnami's superuser has no password unless given one, and its
+		// local socket is not trust: give the throwaway scratch one.
+		sup.pwEnv = "POSTGRESQL_POSTGRES_PASSWORD"
+		flags += " -e POSTGRESQL_POSTGRES_PASSWORD=teploy-scratch"
 	}
 	fmt.Fprintf(c.out, "Starting scratch %s...\n", scratch)
 	if _, err := c.exec.Run(ctx, fmt.Sprintf(
 		"docker run -d --name %s %s %s >/dev/null", ssh.ShellQuote(scratch), flags, ssh.ShellQuote(image))); err != nil {
 		return fmt.Errorf("starting scratch container: %w", err)
 	}
-	super := postgresBootstrapUser(env)
-	if err := c.waitReady(ctx, scratch, postgresReadyProbe(super), 30); err != nil {
+	if err := c.waitReady(ctx, scratch, postgresReadyProbe(sup.user), 30); err != nil {
 		return err
 	}
 
@@ -352,12 +358,10 @@ func (c *Client) verifyPostgres(ctx context.Context, res *VerifyResult, app, nam
 	// accessory's OWN role through the same swap restore an in-place
 	// restore runs. A gentler scratch restore (superuser, --no-owner)
 	// passed backups the real restore could not load.
-	sup := pgTarget{container: scratch, user: super, db: db}
-	q := ssh.ShellQuote
 	if haveGlobals {
-		c.exec.Run(ctx, "gunzip -c "+q(globals)+" > "+q(tmpBase+".globals.sql")+" && docker exec -i "+q(scratch)+" psql -X -q -U "+q(super)+" -d postgres < "+q(tmpBase+".globals.sql")+" >/dev/null 2>&1; true")
+		c.applyPostgresGlobals(ctx, sup, globals)
 	}
-	if user != super {
+	if user != sup.user {
 		ensure := "DO $$BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = " + pgLiteral(user) + ") THEN CREATE ROLE " + pgIdent(user) + " LOGIN CREATEDB; END IF; END$$"
 		if _, err := c.exec.Run(ctx, sup.psql("postgres", ensure)); err != nil {
 			return fmt.Errorf("preparing the scratch role %s: %w", user, err)
@@ -367,7 +371,7 @@ func (c *Client) verifyPostgres(ctx context.Context, res *VerifyResult, app, nam
 		return fmt.Errorf("preparing the scratch database: %w", err)
 	}
 	fmt.Fprintf(c.out, "Restoring into scratch as %s...\n", user)
-	if _, err := c.restorePostgres(ctx, pgTarget{container: scratch, user: user, db: db}, dump, ext, path.Dir(tmpBase)); err != nil {
+	if _, err := c.restorePostgres(ctx, newPGTarget(scratch, db, user, env), dump, ext, path.Dir(tmpBase), pgRestoreOpts{logicalBytes: c.pgRecordedSize(ctx, s3, app, name, res.Date, path.Dir(tmpBase))}); err != nil {
 		return fmt.Errorf("restore into scratch failed: %w", err)
 	}
 

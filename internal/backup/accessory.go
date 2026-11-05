@@ -1,7 +1,9 @@
 package backup
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"path"
 	"strconv"
@@ -60,6 +62,25 @@ func (c *Client) AccessoryBackup(ctx context.Context, app, name, image string, e
 		cleanup()
 		return res, fmt.Errorf("staging the mysql credential file for %s (no dump was run): %w", name, err)
 	}
+	// A cluster with more databases than this backup covers is still backed
+	// up: a partial backup and a loud warning beat none. The coverage
+	// reaches the backup.run event and doctor, and the fleet watchdog alerts.
+	var pgT pgTarget
+	var coverage pgCoverage
+	if det.Engine == EnginePostgres {
+		db, user := postgresDBAndUser(app, env)
+		pgT = newPGTarget(containerName, db, user, env)
+		labels, _ := c.inspectEngineHints(ctx, containerName)
+		var covErr error
+		if coverage, covErr = c.pgReadCoverage(ctx, pgT, listedDatabases(labels)); covErr != nil {
+			res.Warnings = append(res.Warnings, fmt.Sprintf("could not list the cluster's databases, so coverage is unknown: %v", covErr))
+		}
+		res.UncoveredDatabases = coverage.Uncovered
+		res.Warnings = append(res.Warnings, coverage.warnings(db)...)
+		for _, w := range res.Warnings {
+			fmt.Fprintf(c.out, "Warning: %s\n", w)
+		}
+	}
 	fmt.Fprintf(c.out, "Backing up %s (%s, detected from %s)...\n", containerName, det.Engine, det.Source)
 	if _, err := c.exec.Run(ctx, plan.cmd); err != nil {
 		// Never leave partial backups around: they're disk-fillers at best,
@@ -82,6 +103,14 @@ func (c *Client) AccessoryBackup(ctx context.Context, app, name, image string, e
 
 	if det.Engine == EnginePostgres {
 		c.backupPostgresGlobals(ctx, app, name, timestamp, env, workDir, s3)
+		c.recordPostgresSize(ctx, pgT, s3, app, name, timestamp, workDir)
+		for _, extra := range coverage.Extra {
+			if err := c.backupPostgresExtra(ctx, pgT, extra, s3, app, name, timestamp, workDir); err != nil {
+				cleanup()
+				return res, fmt.Errorf("backing up database %s (backup_databases): %w", extra, err)
+			}
+			fmt.Fprintf(c.out, "Backed up database %s\n", extra)
+		}
 	}
 
 	cleanup()
@@ -99,22 +128,79 @@ func postgresGlobalsKey(s3 S3Config, app, name, id string) string {
 
 // backupPostgresGlobals stores the cluster's roles beside the dump so a
 // restore into a fresh cluster (and verify-backup's scratch) can recreate
-// object ownership. Best effort: the database dump is the backup; a role
-// that may not read pg_authid gets the dump without role passwords.
+// object ownership. Best effort: the database dump is the backup.
 func (c *Client) backupPostgresGlobals(ctx context.Context, app, name, id string, env map[string]string, workDir string, s3 S3Config) {
 	_, user := postgresDBAndUser(app, env)
-	q := ssh.ShellQuote
-	container := q(app + "-" + name)
-	sql, gz := workDir+"/globals.sql", workDir+"/globals.sql.gz"
-	cmd := "{ docker exec " + container + " pg_dumpall --globals-only -U " + q(user) + " > " + q(sql) + " 2>/dev/null || docker exec " + container + " pg_dumpall --globals-only --no-role-passwords -U " + q(user) + " > " + q(sql) + "; } && grep -q 'CREATE ROLE' " + q(sql) + " && gzip -c " + q(sql) + " > " + q(gz)
-	key := postgresGlobalsKey(s3, app, name, id)
-	if _, err := c.exec.Run(ctx, cmd); err != nil {
+	gz := workDir + "/globals.sql.gz"
+	if err := c.dumpPostgresGlobals(ctx, newPGTarget(app+"-"+name, "", user, env), workDir, gz); err != nil {
 		fmt.Fprintf(c.out, "Warning: the cluster roles (pg_dumpall --globals-only) were not saved: %v\n", err)
 		return
 	}
-	if _, err := c.exec.Run(ctx, s3.AWS(fmt.Sprintf("s3 cp %s %s", q(gz), q(key)))); err != nil {
+	key := postgresGlobalsKey(s3, app, name, id)
+	if _, err := c.exec.Run(ctx, s3.AWS(fmt.Sprintf("s3 cp %s %s", ssh.ShellQuote(gz), ssh.ShellQuote(key)))); err != nil {
 		fmt.Fprintf(c.out, "Warning: uploading the cluster roles failed: %v\n", err)
 	}
+}
+
+// dumpPostgresGlobals writes pg_dumpall --globals-only, gzipped, to gz. A
+// role that may not read pg_authid gets it without role passwords.
+func (c *Client) dumpPostgresGlobals(ctx context.Context, t pgTarget, workDir, gz string) error {
+	q := ssh.ShellQuote
+	sql := workDir + "/globals.sql"
+	dumpall := t.tool("pg_dumpall", false) + " --globals-only"
+	cmd := "{ " + dumpall + " -U " + q(t.user) + " > " + q(sql) + " 2>/dev/null || " + dumpall + " --no-role-passwords -U " + q(t.user) + " > " + q(sql) + "; } && grep -q 'CREATE ROLE' " + q(sql) + " && gzip -c " + q(sql) + " > " + q(gz)
+	_, err := c.exec.Run(ctx, cmd)
+	return err
+}
+
+// applyPostgresGlobals loads a gzipped globals file as super. Errors for
+// roles that already exist are expected, so it never stops on them; a dump
+// that needs a missing role still fails, loudly, when it loads.
+func (c *Client) applyPostgresGlobals(ctx context.Context, super pgTarget, gz string) {
+	q := ssh.ShellQuote
+	sql := strings.TrimSuffix(gz, ".gz")
+	c.exec.Run(ctx, "gunzip -c "+q(gz)+" > "+q(sql)+" && "+super.tool("psql", true)+" -X -q -U "+q(super.user)+" -d postgres < "+q(sql)+" >/dev/null 2>&1; true")
+}
+
+// recordPostgresSize stores the database's logical size beside the dump: a
+// restore's free-space check needs what the BACKUP will occupy, which
+// neither the compressed artifact nor the live database says. Best effort.
+func (c *Client) recordPostgresSize(ctx context.Context, t pgTarget, s3 S3Config, app, name, id, workDir string) {
+	out, err := c.exec.Run(ctx, t.psql(t.db, "SELECT pg_database_size(current_database())"))
+	if err != nil {
+		return
+	}
+	size, err := strconv.ParseInt(strings.TrimSpace(out), 10, 64)
+	if err != nil || size <= 0 {
+		return
+	}
+	local := workDir + "/meta.json"
+	body, _ := json.Marshal(pgBackupMeta{LogicalBytes: size})
+	if err := c.exec.Upload(ctx, bytes.NewReader(body), local, "0600"); err != nil {
+		return
+	}
+	c.exec.Run(ctx, s3.AWS(fmt.Sprintf("s3 cp %s %s", ssh.ShellQuote(local), ssh.ShellQuote(pgSidecarKey(s3, app, name, "meta", id, ".json")))))
+}
+
+// backupPostgresExtra dumps one more database of the cluster. Extras sit
+// below the accessory's backups, so retention counting and listings see one
+// backup per id; `backup restore --database` restores one.
+func (c *Client) backupPostgresExtra(ctx context.Context, t pgTarget, db string, s3 S3Config, app, name, id, workDir string) error {
+	q := ssh.ShellQuote
+	local := workDir + "/extra.pgdump"
+	cmd := fmt.Sprintf("%s -Fc -U %s %s > %s && [ \"$(head -c 5 %s)\" = PGDMP ]", t.tool("pg_dump", false), q(t.user), q(db), q(local), q(local))
+	if _, err := c.exec.Run(ctx, cmd); err != nil {
+		return err
+	}
+	if _, err := c.checkArtifactSize(ctx, local, minPostgresDump); err != nil {
+		return err
+	}
+	_, err := c.exec.Run(ctx, s3.AWS(fmt.Sprintf("s3 cp %s %s", q(local), q(pgExtraKey(s3, app, name, db, id)))))
+	return err
+}
+
+func pgExtraKey(s3 S3Config, app, name, db, id string) string {
+	return fmt.Sprintf("s3://%s/%s/accessories/%s/databases/%s/%s.pgdump", s3.Base(), app, name, db, id)
 }
 
 // checkArtifactSize measures a freshly written artifact and refuses one
@@ -254,25 +340,12 @@ func planAccessoryDump(app, name string, det EngineDetection, env map[string]str
 	switch det.Engine {
 	case EnginePostgres:
 		db, user := postgresDBAndUser(app, env)
+		t := newPGTarget(containerName, db, user, env)
 		p := ssh.ShellQuote(workDir + "/dump.pgdump")
 		base.method, base.consistency, base.ext, base.minBytes = "pg_dump", consistencyEngineDump, ".pgdump", minPostgresDump
 		base.artifactPath = workDir + "/dump.pgdump"
-		// One database is dumped. A cluster holding others would be backed
-		// up incompletely while reporting success — the raw tar this
-		// replaces at least copied them all — so that is refused, loudly.
-		// (A "postgres" maintenance database counts only when it holds
-		// tables of its own — an extension's catalog tables, such as the
-		// ones TimescaleDB installs there, do not count.) Multi-database clusters are G5 adoption's job.
-		psql := fmt.Sprintf("docker exec %s psql -X -qtA -U %s -d ", qContainer, ssh.ShellQuote(user))
-		others := "SELECT string_agg(datname, ', ' ORDER BY datname) FROM pg_database WHERE NOT datistemplate AND datallowconn AND datname NOT IN (" + pgLiteral(db) + ", 'postgres')"
-		tables := "SELECT count(*) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE c.relkind IN ('r','p') AND n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname NOT LIKE 'pg\\_%' AND NOT EXISTS (SELECT 1 FROM pg_depend d WHERE d.classid = 'pg_class'::regclass AND d.objid = c.oid AND d.deptype = 'e')"
-		check := "others=$(" + psql + ssh.ShellQuote(db) + " -c " + ssh.ShellQuote(others) + ")"
-		if db != "postgres" {
-			check += "; pt=$(" + psql + "postgres -c " + ssh.ShellQuote(tables) + " 2>/dev/null) || pt=0; [ \"${pt:-0}\" = 0 ] || others=\"${others:+$others, }postgres\""
-		}
-		check += "; if [ -n \"$others\" ]; then echo \"this postgres cluster holds other databases teploy would not back up: $others (only " + strings.ReplaceAll(db, "'", "") + " is dumped) — refusing a backup that silently omits them\" >&2; exit 1; fi"
-		base.cmd = check + fmt.Sprintf(" && docker exec %s pg_dump -Fc -U %s %s > %s && { [ \"$(head -c 5 %s)\" = PGDMP ] || { echo 'pg_dump did not produce a custom-format archive' >&2; exit 1; }; }",
-			qContainer, ssh.ShellQuote(user), ssh.ShellQuote(db), p, p)
+		base.cmd = fmt.Sprintf("%s -Fc -U %s %s > %s && { [ \"$(head -c 5 %s)\" = PGDMP ] || { echo 'pg_dump did not produce a custom-format archive' >&2; exit 1; }; }",
+			t.tool("pg_dump", false), ssh.ShellQuote(user), ssh.ShellQuote(db), p, p)
 		return base, nil
 
 	case EngineMySQL, EngineMariaDB:
@@ -351,7 +424,8 @@ func planAccessoryDump(app, name string, det EngineDetection, env map[string]str
 			dragonflyDirPrelude(qContainer),
 			// The in-container snapshot never outlives the script, on any
 			// exit path (a failed copy, a dropped SSH session).
-			fmt.Sprintf(`trap 'docker exec -u 0 %s rm -f "$dir"/%s.rdb >/dev/null 2>&1 || true' EXIT HUP INT TERM`, qContainer, snap),
+			fmt.Sprintf(`cleanup_snapshot() { docker exec -u 0 %s rm -f "$dir"/%s.rdb >/dev/null 2>&1 || true; }`, qContainer, snap),
+			`trap cleanup_snapshot EXIT HUP INT TERM`,
 			fmt.Sprintf("out=$(docker exec %s redis-cli save rdb %s 2>&1) || true", qContainer, snap),
 			`if [ "$out" != OK ]; then printf 'dragonfly SAVE RDB failed: %s\n' "$out" >&2; exit 1; fi`,
 			fmt.Sprintf(`docker cp %s:"$dir"/%s.rdb %s`, qContainer, snap, ssh.ShellQuote(rdb)),
@@ -452,7 +526,8 @@ func dragonflyLoadScript(container, artifactGz, workDir, preRestore string) stri
 		rdbMagicCheck(rdb),
 		dragonflyDirPrelude(q),
 		// Neither in-container snapshot outlives the script, on any exit.
-		fmt.Sprintf(`trap 'docker exec -u 0 %s rm -f "$dir"/%s "$dir"/%s >/dev/null 2>&1 || true' EXIT HUP INT TERM`, q, in, pre),
+		fmt.Sprintf(`cleanup_snapshots() { docker exec -u 0 %s rm -f "$dir"/%s "$dir"/%s >/dev/null 2>&1 || true; }`, q, in, pre),
+		`trap cleanup_snapshots EXIT HUP INT TERM`,
 		fmt.Sprintf(`out=$(docker exec %s redis-cli save rdb %s 2>&1) || true`, q, strings.TrimSuffix(pre, ".rdb")),
 		`if [ "$out" != OK ]; then printf 'pre-restore snapshot failed (dataset untouched): %s\n' "$out" >&2; exit 1; fi`,
 		fmt.Sprintf(`docker cp %s:"$dir"/%s %s`, q, pre, ssh.ShellQuote(preRestore)),

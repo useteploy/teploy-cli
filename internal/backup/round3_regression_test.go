@@ -45,7 +45,7 @@ func (e *round3DRExecutor) Run(ctx context.Context, command string) (string, err
 		}
 		return "", errors.New("unknown scratch ID")
 	}
-	if strings.HasPrefix(command, "docker rm -f ") {
+	if strings.HasPrefix(command, "docker rm -fv ") {
 		for id := range e.owners {
 			if strings.HasSuffix(command, "'"+id+"'") {
 				return "", nil

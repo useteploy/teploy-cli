@@ -195,6 +195,10 @@ type SnapshotRecord struct {
 	Consistency string `json:"consistency"` // engine-consistent | engine-snapshot | crash-consistent | quiesced
 	Detection   string `json:"detection"`   // image-pattern | volume-pattern | operator-override | teploy-stop
 	Artifact    string `json:"artifact"`    // member path inside the bundle
+	// Globals is the member holding a postgres cluster's roles
+	// (pg_dumpall --globals-only), applied before the dump at validation and
+	// cutover: a dump owned by extra roles cannot load without them.
+	Globals string `json:"globals,omitempty"`
 	// Image is the accessory image the snapshot was taken from (empty for
 	// app volumes) — what an isolated restore boots to validate the dump.
 	Image string `json:"image,omitempty"`
@@ -729,6 +733,22 @@ func (c *Client) CreateBundle(ctx context.Context, opts BundleOptions, store Bun
 		case "postgres":
 			db, user := postgresDBAndUser(opts.App, env)
 			rec.EngineParams = map[string]string{"db": db, "user": user}
+			t := newPGTarget(opts.App+"-"+accName, db, user, env)
+			gz := "accessories/" + accName + ".globals.sql.gz"
+			if err := c.dumpPostgresGlobals(ctx, t, accWS, ws+"/"+gz); err != nil {
+				fmt.Fprintf(c.out, "Warning: the cluster roles of %s were not saved in this bundle: %v\n", accName, err)
+			} else {
+				rec.Globals = gz
+			}
+			// A partial bundle beats none; the manifest says what is missing.
+			if cov, err := c.pgReadCoverage(ctx, t, nil); err == nil {
+				rec.Notes = strings.Join(cov.warnings(db), "; ")
+				for _, w := range cov.warnings(db) {
+					fmt.Fprintf(c.out, "Warning: %s: %s\n", accName, w)
+				}
+			} else {
+				rec.Notes = fmt.Sprintf("could not list the cluster's databases, so coverage is unknown: %v", err)
+			}
 		case "mysql", "mariadb":
 			rec.EngineParams = map[string]string{"db": mysqlDB(opts.App, env)}
 		}
@@ -786,6 +806,12 @@ func (c *Client) CreateBundle(ctx context.Context, opts BundleOptions, store Bun
 		return nil
 	}
 	for _, snap := range m.Snapshots {
+		if snap.Globals != "" {
+			if err := uploadMember(snap.Globals, ws+"/"+snap.Globals); err != nil {
+				cleanup()
+				return nil, err
+			}
+		}
 		if err := uploadMember(snap.Artifact, ws+"/"+snap.Artifact); err != nil {
 			cleanup()
 			return nil, err
@@ -1074,6 +1100,9 @@ func validateBundlePaths(m *BundleManifest) error {
 		}
 		if !valid || seen[snap.Artifact] {
 			return fmt.Errorf("invalid or duplicate snapshot artifact %q", snap.Artifact)
+		}
+		if snap.Globals != "" && snap.Globals != prefix+snap.Name+".globals.sql.gz" {
+			return fmt.Errorf("invalid snapshot globals member %q", snap.Globals)
 		}
 		seen[snap.Artifact] = true
 	}

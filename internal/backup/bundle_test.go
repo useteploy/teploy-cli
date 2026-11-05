@@ -23,7 +23,7 @@ func drBaseMock(extra ...ssh.MockCommand) *ssh.MockExecutor {
 		{Match: "mkdir -p /deployments/myapp/accessories/db", Output: ""},
 		{Match: "find '/deployments/myapp/meta'", Output: ""},
 		{Match: "tar -czf", Output: ""},
-		{Match: "others=", Output: ""},
+		{Match: "docker exec 'myapp-db' pg_dump", Output: ""},
 		{Match: "wc -c", Output: "4096\n"},
 		{Match: "docker inspect -f '{{.Config.Image}}' 'myapp-db'", Output: "postgres:16\n"},
 		{Match: "docker inspect -f '{{range .Config.Env}}{{println .}}{{end}}' 'myapp-db'", Output: "POSTGRES_DB=appdb\nPOSTGRES_USER=appuser\n"},
@@ -349,5 +349,42 @@ func TestDirStore_ListIDs(t *testing.T) {
 	}
 	if len(ids) != 1 || ids[0] != "20260923-101500-0123456789abcdef" {
 		t.Errorf("ids: %v", ids)
+	}
+}
+
+// A DR bundle must not abort over a cluster's other databases: it says what
+// is missing, and carries the cluster's roles for validation and cutover.
+func TestCreateBundle_CoverageNoteAndGlobals(t *testing.T) {
+	mock := drBaseMock(
+		ssh.MockCommand{Match: "docker exec 'myapp-db' psql -X -qtA -v ON_ERROR_STOP=1 -U 'appuser' -d 'postgres' -c 'SELECT datname", Output: "appdb\nother\n"},
+		ssh.MockCommand{Match: "{ docker exec 'myapp-db' pg_dumpall --globals-only", Output: ""},
+	)
+	m, err := NewClient(mock, &bytes.Buffer{}).CreateBundle(context.Background(), BundleOptions{
+		App: "myapp", Config: drTestConfig(),
+		Now: func() time.Time { return time.Date(2026, 9, 23, 10, 15, 0, 0, time.UTC) },
+	}, DirBundleStore{Root: "/var/drstore"})
+	if err != nil {
+		t.Fatalf("a bundle must not abort over coverage: %v", err)
+	}
+	var db SnapshotRecord
+	for _, s := range m.Snapshots {
+		if s.Name == "db" {
+			db = s
+		}
+	}
+	if !strings.Contains(db.Notes, "also holds other") {
+		t.Errorf("notes = %q", db.Notes)
+	}
+	if db.Globals != "accessories/db.globals.sql.gz" {
+		t.Errorf("globals = %q", db.Globals)
+	}
+	uploaded := false
+	for _, c := range mock.Calls {
+		if strings.Contains(c, "/accessories/db.globals.sql.gz") && strings.Contains(c, "/var/drstore") {
+			uploaded = true
+		}
+	}
+	if !uploaded {
+		t.Errorf("the globals member was not published: %v", mock.Calls)
 	}
 }

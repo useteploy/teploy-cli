@@ -180,7 +180,7 @@ func TestRestoreBundleIsolated_ReceiptRPORTO(t *testing.T) {
 	// Scratch teardown happened.
 	var sawTeardown bool
 	for _, call := range executor.commands {
-		if strings.HasPrefix(call, "docker rm -f '") {
+		if strings.HasPrefix(call, "docker rm -fv '") {
 			sawTeardown = true
 		}
 		if strings.Contains(call, "/deployments/myapp") {

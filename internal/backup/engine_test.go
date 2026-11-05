@@ -151,7 +151,7 @@ func TestAccessoryBackup_PgvectorIsDumpedNotTarred(t *testing.T) {
 	mock := ssh.NewMockExecutor("1.2.3.4",
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
 		ssh.MockCommand{Match: "umask 077", Output: "/tmp/teploy-backup.abc123\n"},
-		ssh.MockCommand{Match: "others=", Output: ""},
+		ssh.MockCommand{Match: "docker exec 'myapp-db' pg_dump -Fc", Output: ""},
 		ssh.MockCommand{Match: "wc -c", Output: "2123\n"},
 		ssh.MockCommand{Match: "aws s3 cp", Output: "done\n"},
 		ssh.MockCommand{Match: "rm -rf", Output: ""},
@@ -349,16 +349,5 @@ func TestPlanAccessoryDump_GenericRefusesLiveDatabaseFiles(t *testing.T) {
 		if state == "false" && err != nil {
 			t.Errorf("a stopped container's files are quiescent: %v %s", err, out)
 		}
-	}
-}
-
-// A postgres dump refuses a cluster holding databases it would omit.
-func TestPlanAccessoryDump_PostgresRefusesOmittedDatabases(t *testing.T) {
-	plan, _ := planAccessoryDump("app", "db", EngineDetection{Engine: EnginePostgres}, map[string]string{"POSTGRES_DB": "appdb"}, "/tmp/w")
-	if !strings.HasPrefix(plan.cmd, "others=$(") || !strings.Contains(plan.cmd, "NOT datistemplate") || !strings.Contains(plan.cmd, "silently omits") {
-		t.Fatalf("postgres plan must check for other databases first:\n%s", plan.cmd)
-	}
-	if i, j := strings.Index(plan.cmd, "others=$("), strings.Index(plan.cmd, "pg_dump -Fc"); i > j {
-		t.Fatal("the check must run before the dump")
 	}
 }

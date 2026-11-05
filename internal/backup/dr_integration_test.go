@@ -58,7 +58,7 @@ func drFixtureCleanup(t *testing.T, exec ssh.Executor) {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 	for _, c := range []string{drFixtureApp + "-db", drFixtureApp + "-db-drcheck", drFixtureApp + "-dr-appcheck"} {
-		exec.Run(ctx, "docker rm -f "+ssh.ShellQuote(c)+" >/dev/null 2>&1 || true")
+		exec.Run(ctx, "docker rm -fv "+ssh.ShellQuote(c)+" >/dev/null 2>&1 || true")
 	}
 	// Engine data dirs are chowned to the image's uid with mode 700 (the
 	// same reality reconcileDataOwnership exists for), so removal needs
@@ -143,6 +143,9 @@ func TestDRIntegration_BundleRoundTrip(t *testing.T) {
 		drFixtureApp+"-db", drFixtureApp, drFixtureApp))
 	run(fmt.Sprintf("for i in $(seq 1 30); do docker exec %s pg_isready -U appuser >/dev/null 2>&1 && break; sleep 2; done", drFixtureApp+"-db"))
 	run(fmt.Sprintf("docker exec %s psql -U appuser -d appdb -c 'CREATE TABLE probe(id int); INSERT INTO probe VALUES (1),(2),(3);'", drFixtureApp+"-db"))
+	// A table owned by an extra role: validation and cutover need the
+	// cluster's roles the bundle carries.
+	run(fmt.Sprintf("docker exec %s psql -U appuser -d appdb -c 'CREATE ROLE extra_owner; CREATE TABLE owned(id int); ALTER TABLE owned OWNER TO extra_owner;'", drFixtureApp+"-db"))
 
 	client := NewClient(exec, os.Stdout)
 	store := DirBundleStore{Root: "/tmp/teploy-dr-fixture"}
@@ -243,7 +246,9 @@ func TestDRIntegration_BundleRoundTrip(t *testing.T) {
 	if err := json.Unmarshal([]byte(run("cat /deployments/"+drFixtureApp+"/state.json")), &stateCheck); err != nil {
 		t.Fatalf("restored state.json unparseable: %v", err)
 	}
-	if stateCheck.Generation != 2 || stateCheck.ImageRef != "alpine:3" {
+	// Cutover publishes a generation above the bundle's 2 (fresh-target
+	// fencing, TestDRCutoverPublishesFreshTargetGeneration).
+	if stateCheck.Generation <= 2 || stateCheck.ImageRef != "alpine:3" {
 		t.Errorf("restored state.json wrong: %+v", stateCheck)
 	}
 }

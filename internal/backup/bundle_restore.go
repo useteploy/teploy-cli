@@ -152,6 +152,11 @@ func (c *Client) RestoreBundleIsolated(ctx context.Context, opts BundleRestoreOp
 		if err := store.Download(ctx, c.exec, opts.App, manifest.ID, snap.Artifact, staging+"/"+snap.Artifact); err != nil {
 			return nil, err
 		}
+		if snap.Globals != "" {
+			if err := store.Download(ctx, c.exec, opts.App, manifest.ID, snap.Globals, staging+"/"+snap.Globals); err != nil {
+				return nil, err
+			}
+		}
 	}
 	for _, member := range manifest.Secrets.Included {
 		if err := store.Download(ctx, c.exec, opts.App, manifest.ID, member, staging+"/"+member); err != nil {
@@ -412,6 +417,9 @@ func (c *Client) validateEngineSnapshot(ctx context.Context, manifest *BundleMan
 		}
 		if err := c.waitReady(ctx, scratchID, postgresReadyProbe(user), 30); err != nil {
 			return checkFailed(check, err)
+		}
+		if snap.Globals != "" {
+			c.applyPostgresGlobals(ctx, pgTarget{container: scratchID, user: user}, staging+"/"+snap.Globals)
 		}
 		if err := c.pgLoadArtifact(ctx, pgTarget{container: scratchID, user: user, db: db}, dump, staging); err != nil {
 			return checkFailed(check, fmt.Errorf("restoring dump into scratch: %w", err))
@@ -887,6 +895,9 @@ func (c *Client) CutoverBundle(ctx context.Context, opts BundleRestoreOptions) (
 			if err := c.waitReady(ctx, container, postgresReadyProbe(user), 30); err != nil {
 				restoreErr = err
 			} else {
+				if snap.Globals != "" {
+					c.applyPostgresGlobals(ctx, pgTarget{container: container, user: user}, staging+"/"+snap.Globals)
+				}
 				restoreErr = c.pgLoadArtifact(ctx, pgTarget{container: container, user: user, db: db}, dump, staging)
 			}
 		case "mysql", "mariadb":
@@ -1240,7 +1251,7 @@ func (c *Client) cleanupDRScratch(ctx context.Context, id, owner string) error {
 	if err != nil || strings.TrimSpace(actual) != owner {
 		return fmt.Errorf("scratch ownership unproven for %s; cleanup withheld: %v", id, err)
 	}
-	_, err = c.exec.Run(cleanup, "docker rm -f "+ssh.ShellQuote(id))
+	_, err = c.exec.Run(cleanup, "docker rm -fv "+ssh.ShellQuote(id))
 	return err
 }
 

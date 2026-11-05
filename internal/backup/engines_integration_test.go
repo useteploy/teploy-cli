@@ -66,6 +66,7 @@ case "$op" in
     [ -d "$dir" ] || exit 1
     found=no
     for f in "$dir"/"$pre"*; do
+      [ -d "$f" ] && { found=yes; printf '                           PRE %s/\n' "$(basename "$f")"; continue; }
       [ -f "$f" ] || continue
       found=yes
       printf '2026-11-03 00:00:00 %s %s\n' "$(wc -c < "$f" | tr -d ' ')" "$(basename "$f")"
@@ -132,8 +133,8 @@ func newITFixture(t *testing.T, ctx context.Context) itFixture {
 func (f itFixture) container(t *testing.T, ctx context.Context, name, runArgs, probe string) func(string) string {
 	t.Helper()
 	rm := func() {
-		f.base.Run(context.Background(), "docker rm -f "+ssh.ShellQuote(name)+" >/dev/null 2>&1 || true")
-		f.base.Run(context.Background(), "docker ps -aq --filter name=teploy-backup-verify- | xargs -r docker rm -f >/dev/null 2>&1 || true")
+		f.base.Run(context.Background(), "docker rm -fv "+ssh.ShellQuote(name)+" >/dev/null 2>&1 || true")
+		f.base.Run(context.Background(), "docker ps -aq --filter name=teploy-backup-verify- | xargs -r docker rm -fv >/dev/null 2>&1 || true")
 	}
 	rm()
 	t.Cleanup(rm)
@@ -188,6 +189,11 @@ func engineCases() []engineCase {
 	}
 	redisCLI := func(_, args string) string { return args }
 
+	mariadb := func(sql string) string {
+		return "sh -c " + ssh.ShellQuote("MYSQL_PWD=rootpw mariadb -u root -N appdb -e "+ssh.ShellQuote(sql))
+	}
+	mongo := func(js string) string { return "mongosh --quiet appdb --eval " + ssh.ShellQuote(js) }
+
 	cases := []engineCase{
 		{key: "postgres", image: "postgres:17-alpine", env: pgEnv, ready: pgReady, seed: pgSeed, mutate: pgMutate, check: pgCheck, want: "1:one,2:two,3:three\n0", wantKind: "postgres"},
 		{key: "pgvector", image: "pgvector/pgvector:pg17", env: pgEnv, ready: pgReady,
@@ -208,6 +214,17 @@ func engineCases() []engineCase {
 			mutate: mysql("UPDATE items SET name='changed' WHERE id=1; DELETE FROM items WHERE id=2; INSERT INTO items VALUES (4,'four'); DROP PROCEDURE p1; CREATE TABLE later(x int);"),
 			check:  mysql("SELECT GROUP_CONCAT(CONCAT(id,':',name) ORDER BY id) FROM items; SELECT COUNT(*) FROM information_schema.triggers WHERE trigger_schema='appdb'; SELECT COUNT(*) FROM information_schema.routines WHERE routine_schema='appdb'; SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='appdb' AND table_name='later';"),
 			want:   "1:one,2:two,3:three\n1\n1\n0", wantKind: "mysql"},
+		{key: "mariadb", image: "mariadb:11", env: []string{"MARIADB_ROOT_PASSWORD=rootpw", "MARIADB_DATABASE=appdb"},
+			ready:  "sh -c 'MYSQL_PWD=rootpw mariadb --protocol=TCP -h 127.0.0.1 -u root -e \"select 1\" appdb'",
+			seed:   mariadb("CREATE TABLE items(id int primary key, name varchar(20)); INSERT INTO items VALUES (1,'one'),(2,'two'),(3,'three'); CREATE TRIGGER items_bi BEFORE INSERT ON items FOR EACH ROW SET NEW.name=NEW.name; CREATE PROCEDURE p1() SELECT 1;"),
+			mutate: mariadb("UPDATE items SET name='changed' WHERE id=1; DELETE FROM items WHERE id=2; INSERT INTO items VALUES (4,'four'); DROP PROCEDURE p1; CREATE TABLE later(x int);"),
+			check:  mariadb("SELECT GROUP_CONCAT(CONCAT(id,':',name) ORDER BY id) FROM items; SELECT COUNT(*) FROM information_schema.triggers WHERE trigger_schema='appdb'; SELECT COUNT(*) FROM information_schema.routines WHERE routine_schema='appdb'; SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='appdb' AND table_name='later';"),
+			want:   "1:one,2:two,3:three\n1\n1\n0", wantKind: "mysql"},
+		{key: "mongo", image: "mongo:7", ready: "mongosh --quiet --eval 'db.runCommand({ping:1}).ok'",
+			seed:   mongo("db.items.insertMany([{_id:1,name:'one'},{_id:2,name:'two'},{_id:3,name:'three'}])"),
+			mutate: mongo("db.items.updateOne({_id:1},{$set:{name:'changed'}}); db.items.deleteOne({_id:2}); db.items.insertOne({_id:4,name:'four'})"),
+			check:  mongo("print(db.items.find().sort({_id:1}).toArray().map(function(d){return d._id+':'+d.name}).join(','))"),
+			want:   "1:one,2:two,3:three", wantKind: "mongo"},
 		{key: "redis", image: "redis:7-alpine", ready: "redis-cli ping",
 			seed:   redisCLI("", ("redis-cli set a one && redis-cli set b two && redis-cli rpush l x y z")),
 			mutate: redisCLI("", ("redis-cli set a changed && redis-cli del b && redis-cli set c new")),
@@ -251,13 +268,13 @@ func TestEngineIntegration(t *testing.T) {
 			app := "teployit" + tc.key
 			container := app + "-db"
 			rm := func() {
-				base.Run(context.Background(), "docker rm -f "+ssh.ShellQuote(container)+" >/dev/null 2>&1 || true")
+				base.Run(context.Background(), "docker rm -fv "+ssh.ShellQuote(container)+" >/dev/null 2>&1 || true")
 			}
 			rm()
 			t.Cleanup(rm)
 			// Belt and braces: no verify scratch may outlive the subtest.
 			t.Cleanup(func() {
-				base.Run(context.Background(), "docker ps -aq --filter name=teploy-backup-verify- | xargs -r docker rm -f >/dev/null 2>&1 || true")
+				base.Run(context.Background(), "docker ps -aq --filter name=teploy-backup-verify- | xargs -r docker rm -fv >/dev/null 2>&1 || true")
 			})
 			run := func(cmd string) string {
 				t.Helper()
@@ -311,9 +328,13 @@ func TestEngineIntegration(t *testing.T) {
 			// verify-backup into a scratch container while the accessory is
 			// stopped (one running container at a time).
 			run("docker stop " + ssh.ShellQuote(container) + " >/dev/null")
+			volumesBefore := strings.TrimSpace(run("docker volume ls -q | wc -l"))
 			vr, err := client.VerifyBackup(ctx, app, "db", "", s3)
 			if err != nil {
 				t.Fatalf("VerifyBackup: %v", err)
+			}
+			if after := strings.TrimSpace(run("docker volume ls -q | wc -l")); after != volumesBefore {
+				t.Fatalf("verify left a volume behind (%s -> %s): an unencrypted copy of the database on the host", volumesBefore, after)
 			}
 			t.Logf("verify: kind=%s metric=%s ok=%v detail=%s", vr.Kind, vr.Metric, vr.OK, vr.Detail)
 			if !vr.OK || vr.Kind != tc.wantKind {
