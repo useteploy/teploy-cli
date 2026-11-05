@@ -451,12 +451,12 @@ func doctorDiskCheck(ctx context.Context, exec ssh.Executor) doctorCheck {
 	case avail < doctorDiskFailAvailable:
 		return doctorCheck{
 			Name: "disk", Result: doctorFail, Detail: detail,
-			Remediation: "free disk space on / (docker system prune, teploy releases/preview prune, old backups) — deploys fail mid-flight below 2 GiB",
+			Remediation: "free disk space on / — deploys fail mid-flight below 2 GiB. `teploy server audit <server>` names what takes the space and what removes it",
 		}
 	case avail < doctorDiskWarnAvailable || pct >= doctorDiskWarnUsedPct:
 		return doctorCheck{
 			Name: "disk", Result: doctorWarn, Detail: detail,
-			Remediation: "free disk space on / before the next deploy (docker system prune, teploy releases prune)",
+			Remediation: "free disk space on / before the next deploy. `teploy server audit <server>` names what takes the space and what removes it",
 		}
 	}
 	return doctorCheck{Name: "disk", Result: doctorOK, Detail: detail}
