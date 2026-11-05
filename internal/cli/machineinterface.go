@@ -159,6 +159,13 @@ const (
 	// size_bytes, created_at, key; schedules discovered from teploy cron
 	// markers) and restore quiesces the app under its fenced lock.
 	CapBackupJSONV1 = "backup-json-v1"
+	// CapBackupFleetV1 is the fleet engine (Slice 4): `server backup-policy`
+	// (one cron line, `backup run --all`, adopted containers, GFS, heartbeats),
+	// `backup status --json`, `backup fetch`, `backup keygen`, payload encryption
+	// (.age objects), per-database series (`--database`, `--adopted`) and
+	// previous-prefix lookup. backup-status-envelope, backup-run-envelope and
+	// backup-policy-envelope pin the JSON.
+	CapBackupFleetV1 = "backup-fleet-v1"
 	// CapSecretStdinV1: `secret set KEY --stdin` reads the value verbatim
 	// from stdin (never argv), and secret set/get/list/rm/rotate accept
 	// folderless `--app X --host S` (provider from the app's Teploy
@@ -219,6 +226,7 @@ func MachineCapabilities() []string {
 		CapTriggerPollV1,
 		CapBackupTargetV1,
 		CapBackupJSONV1,
+		CapBackupFleetV1,
 		CapSecretStdinV1,
 		CapReleasesJsonV1,
 		CapRollbackJsonV1,

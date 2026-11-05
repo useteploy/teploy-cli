@@ -611,3 +611,63 @@ func TestContractsGitSourceGolden(t *testing.T) {
 		MachineInterface: MachineInterface, App: "blog", Host: "", Ref: "refs/heads/main", Admitted: false, Reason: "not-due",
 	})
 }
+
+// TestContractsBackupFleetGolden pins the fleet engine's envelopes (rev 17,
+// backup-fleet-v1). Dash's backups page builds on backup-status-envelope.
+func TestContractsBackupFleetGolden(t *testing.T) {
+	at := time.Date(2026, 11, 4, 3, 17, 4, 0, time.UTC)
+	failedAt := at.Add(-time.Hour)
+	key := "s3://teploy-backups/prod/_adopted/accessories/wordpress-shared-mysql/databases/wp_blog/20261104-031704-1f2e3d4c5b6a7988.sql.gz.age"
+	newest := &backup.StatusObject{ID: "20261104-031704-1f2e3d4c5b6a7988", Key: key, SizeBytes: 2097152, CreatedAt: "2026-11-04T03:17:04Z", Encrypted: true}
+	policy := backup.FleetPolicy{
+		V: "1", Interval: "1h", Path: "/etc/teploy/backup-policy.json",
+		Retention: backup.FleetRetention{KeepLast: 3, KeepDaily: 7, KeepWeekly: 4, KeepMonthly: 12, MaxAgeDays: 2},
+		Excludes:  []string{"blog/volumes"},
+		Adopted: []backup.AdoptedEntry{
+			{Container: "wordpress-shared-mysql", Engine: "mysql", Databases: backup.DatabaseSelector{All: true}},
+			{Container: "omni_postgres", Databases: backup.DatabaseSelector{Names: []string{"omni"}}},
+		},
+		Volumes: true, VolumeMaxGB: 20,
+		HeartbeatURLs: []string{"https://dash.example.internal/api/push/secret-token"},
+		Recipient:     "age1lggyhqrw2nlhcxprm67z43rta597azn8gknawjehu9d9dl0jq3yqqvfafg",
+	}
+	writeFixture(t, "backup-policy-envelope/valid/configured.json", policyDTO("192.0.2.10", policy, "37 * * * *"))
+	writeFixture(t, "backup-policy-envelope/valid/unconfigured.json", policyDTO("192.0.2.10", backup.FleetPolicy{}, ""))
+
+	status := backupStatusDTO{MachineInterface: MachineInterface, Host: "192.0.2.10", ObservedAt: at, FleetStatus: backup.FleetStatus{
+		Target: backup.StatusTarget{Configured: true, Bucket: "teploy-backups", Region: "us-east-1", Prefix: "prod", HasCredentials: true, Reachable: true,
+			PreviousPrefixes: []backup.PreviousPrefix{{Prefix: ""}}},
+		Policy: backup.StatusPolicy{Configured: true, Path: policy.Path, Interval: "1h", CronInstalled: true, Retention: policy.Retention, Excludes: policy.Excludes, Adopted: policy.Adopted,
+			Volumes: true, VolumeMaxGB: 20, HeartbeatCount: 1, HeartbeatHosts: []string{"https://dash.example.internal"}, Recipient: policy.Recipient},
+		Encrypted: true, AWSCLI: true, AgeCLI: true,
+		LastRun: &backup.StatusLastRun{At: at, Status: backup.RunPartial, TargetsOK: 3, TargetsFailed: 1, Omissions: []string{"redis-cache: a database container no policy entry covers (adopt or exclude it)"}},
+		Entries: []backup.StatusEntry{
+			{Name: "blog-db", Kind: backup.TargetAccessory, App: "blog", Accessory: "db", Engine: "postgres", Detection: "env", State: "running", Coverage: backup.CoverageCovered, Schedule: "policy", LastSuccess: &at, Newest: &backup.StatusObject{ID: "20261104-031704-1f2e3d4c5b6a7988", Key: "s3://teploy-backups/prod/blog/accessories/db/20261104-031704-1f2e3d4c5b6a7988.pgdump.age", SizeBytes: 1048576, CreatedAt: "2026-11-04T03:17:04Z", Encrypted: true}, LastVerify: &backup.StatusVerify{At: at, OK: true, ID: "20261104-031704-1f2e3d4c5b6a7988", Metric: "tables=42"}},
+			{Name: "wordpress-shared-mysql", Kind: backup.TargetAdopted, Accessory: "wordpress-shared-mysql", Engine: "mysql", Detection: "policy", State: "running", Unmanaged: true, Adopted: true, Coverage: backup.CoverageAdopted, Schedule: "policy", LastSuccess: &at, Newest: newest, Databases: []backup.StatusDatabase{{Name: "wp_blog", Newest: newest}}},
+			{Name: "omni_postgres", Kind: backup.TargetAdopted, Accessory: "omni_postgres", Engine: "postgres", Detection: "env", State: "running", Unmanaged: true, Adopted: true, Coverage: backup.CoverageFailing, Schedule: "policy", LastFailure: &failedAt, LastError: "dumping omni: exit status 1", UncoveredDatabases: []string{"reports"}},
+			{Name: "redis-cache", Kind: "unmanaged", Engine: "redis", Detection: "env", State: "running", Unmanaged: true, Coverage: backup.CoverageUncovered, Reason: "no policy entry covers this container (adopt or exclude it)", Schedule: "none"},
+			{Name: "blog/volumes", Kind: backup.TargetVolumes, App: "blog", Coverage: backup.CoverageExcluded, Schedule: "policy", SizeBytes: 53687091200, Reason: "50.00 GB is over the policy's volume_max_gb 20.00"},
+		},
+		UncoveredDatabases: []string{"omni_postgres/reports", "redis-cache"},
+	}}
+	writeFixture(t, "backup-status-envelope/valid/fleet.json", status)
+	writeFixture(t, "backup-status-envelope/valid/unconfigured.json", backupStatusDTO{MachineInterface: MachineInterface, Host: "192.0.2.10", ObservedAt: at, FleetStatus: backup.FleetStatus{
+		Entries: []backup.StatusEntry{}, UncoveredDatabases: []string{},
+	}})
+
+	writeFixture(t, "backup-run-envelope/valid/partial.json", backupRunEnvelope{MachineInterface: MachineInterface, FleetRunResult: backup.FleetRunResult{
+		Status: backup.RunPartial, StartedAt: at, DurationMs: 8123, Encrypted: true,
+		Targets: []backup.FleetTargetResult{
+			{Kind: backup.TargetAccessory, App: "blog", Accessory: "db", Container: "blog-db", Engine: "postgres", Status: backup.TargetOK, ID: "20261104-031704-1f2e3d4c5b6a7988", SizeBytes: 1048576, DurationMs: 900, Encrypted: true, Pruned: 2,
+				Objects: []backup.BackupObject{{Key: "s3://teploy-backups/prod/blog/accessories/db/20261104-031704-1f2e3d4c5b6a7988.pgdump.age", Size: 1048576, Encrypted: true}}},
+			{Kind: backup.TargetAdopted, App: backup.AdoptedApp, Accessory: "omni_postgres", Container: "omni_postgres", Engine: "postgres", Status: backup.TargetFailed, Reason: "dumping omni: exit status 1", Encrypted: true, FailedDatabases: map[string]string{"omni": "exit status 1"}},
+			{Kind: backup.TargetVolumes, App: "blog", Status: backup.TargetExcluded, Reason: "volumes are 50.00 GB, over the policy's volume_max_gb 20.00; not backed up", SizeBytes: 53687091200, Encrypted: true, SizeGuard: true},
+		},
+		UncoveredContainers: []string{"redis-cache"},
+		Omissions:           []string{"blog/volumes: volumes are 50.00 GB, over the policy's volume_max_gb 20.00; not backed up", "redis-cache: a database container no policy entry covers (adopt or exclude it)"},
+		Heartbeats:          []backup.HeartbeatResult{{Host: "dash.example.internal", OK: true, Status: 200}},
+	}})
+	writeFixture(t, "backup-run-envelope/valid/skipped.json", backupRunEnvelope{MachineInterface: MachineInterface, FleetRunResult: backup.FleetRunResult{
+		Status: "skipped", StartedAt: at, Targets: []backup.FleetTargetResult{}, Error: "another run holds the lock",
+	}})
+}

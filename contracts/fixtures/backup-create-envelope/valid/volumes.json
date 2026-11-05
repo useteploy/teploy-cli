@@ -8,5 +8,6 @@
   "created_at": "2026-10-20T03:17:04Z",
   "key": "s3://teploy-backups/blog/volumes/20261020-031704-1f2e3d4c5b6a7988.tar.gz",
   "teploy_key": "s3://teploy-backups/blog/teploy/20261020-031704-1f2e3d4c5b6a7988.tar.gz",
-  "pruned": 1
+  "pruned": 1,
+  "encrypted": false
 }

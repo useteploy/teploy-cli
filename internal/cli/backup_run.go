@@ -21,19 +21,36 @@ import (
 
 func newBackupRunCmd(flags *Flags) *cobra.Command {
 	var (
-		appName   string
-		accessory string
+		appName     string
+		accessory   string
+		all         bool
+		ignoreSpace bool
 	)
 	cmd := &cobra.Command{
 		Use:   "run",
 		Short: "Run a scheduled backup on the server (the cron entrypoint)",
-		Args:  cobra.NoArgs,
+		Long: "Runs ON the server. --app backs up one app's volumes or one accessory (a\n" +
+			"per-app schedule). --all is the policy line: it reads the server's backup\n" +
+			"policy and works out at run time what to back up (every labelled accessory\n" +
+			"and each of its databases, app volumes when enabled, adopted containers), one\n" +
+			"target at a time. One target failing does not stop the others; the exit status\n" +
+			"is nonzero for anything but a clean run, and nothing of a failed target is\n" +
+			"pruned. A run that finds another one running stands down.",
+		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if all {
+				if appName != "" || accessory != "" {
+					return fmt.Errorf("--all takes no --app or --accessory: it works out its own targets")
+				}
+				return runBackupRunAll(flags, ignoreSpace)
+			}
 			return runBackupRun(flags, appName, accessory)
 		},
 	}
-	cmd.Flags().StringVar(&appName, "app", "", "app name (required)")
+	cmd.Flags().StringVar(&appName, "app", "", "app name (required without --all)")
 	cmd.Flags().StringVar(&accessory, "accessory", "", "back up this accessory instead of the app's volumes")
+	cmd.Flags().BoolVar(&all, "all", false, "back up everything the server's backup policy covers")
+	cmd.Flags().BoolVar(&ignoreSpace, "ignore-space-check", false, "with --all: skip the free-space preflights")
 	return cmd
 }
 
@@ -48,6 +65,7 @@ func runBackupRun(flags *Flags, appName, accessory string) error {
 	}
 
 	// Runs on the server itself: no SSH hop, local docker and aws.
+	ensureServerPath()
 	executor := ssh.NewLocalExecutor()
 	defer executor.Close()
 	return runBackupRunOn(context.Background(), executor, appName, accessory)
@@ -65,6 +83,9 @@ func runBackupRunOn(ctx context.Context, executor ssh.Executor, appName, accesso
 		return fmt.Errorf("no backup target is configured on this server — run `teploy server backup-target set` from a machine that manages it")
 	}
 	cfg := TargetS3(target)
+	if err := backup.ApplyPolicyEncryption(ctx, executor, &cfg); err != nil {
+		return err
+	}
 
 	client := backup.NewClient(executor, os.Stdout)
 	policy, err := backup.ReadPolicy(ctx, executor, appName)

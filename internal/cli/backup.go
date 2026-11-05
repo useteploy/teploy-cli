@@ -43,6 +43,9 @@ func newBackupCmd(flags *Flags) *cobra.Command {
 	cmd.AddCommand(newBackupScheduleCmd(flags))
 	cmd.AddCommand(newBackupUnscheduleCmd(flags))
 	cmd.AddCommand(newBackupRunCmd(flags))
+	cmd.AddCommand(newBackupStatusCmd(flags))
+	cmd.AddCommand(newBackupFetchCmd(flags))
+	cmd.AddCommand(newBackupKeygenCmd(flags))
 
 	return cmd
 }
@@ -91,6 +94,9 @@ func resolveBackupS3(ctx context.Context, exec ssh.Executor, f *backupTargetFlag
 		}
 		cfg := s3Config(f.bucket, region, f.endpoint)
 		cfg.Prefix = f.prefix
+		if err := backup.ApplyPolicyEncryption(ctx, exec, &cfg); err != nil {
+			return backup.S3Config{}, err
+		}
 		return cfg, nil
 	}
 	target, err := backup.ReadTarget(ctx, exec)
@@ -100,7 +106,11 @@ func resolveBackupS3(ctx context.Context, exec ssh.Executor, f *backupTargetFlag
 	if !TargetConfigured(target) {
 		return backup.S3Config{}, fmt.Errorf("no backup target is configured for this server — set one with `teploy server backup-target set --host S --bucket B` (or pass the legacy --bucket flag)")
 	}
-	return TargetS3(target), nil
+	cfg := TargetS3(target)
+	if err := backup.ApplyPolicyEncryption(ctx, exec, &cfg); err != nil {
+		return backup.S3Config{}, err
+	}
+	return cfg, nil
 }
 
 // TargetConfigured reports whether a stored target exists.
@@ -122,6 +132,8 @@ func TargetS3(t backup.Target) backup.S3Config {
 		Endpoint:     t.Endpoint,
 		Prefix:       t.Prefix,
 		StoredTarget: t.Path,
+
+		PreviousPrefixes: t.PreviousPrefixes,
 	}
 }
 
@@ -187,6 +199,10 @@ type backupCreateDTO struct {
 	Key              string `json:"key"`
 	TeployKey        string `json:"teploy_key,omitempty"`
 	Pruned           int    `json:"pruned"`
+	// Encrypted says the objects are age-encrypted; false means Dash should warn.
+	Encrypted bool `json:"encrypted"`
+	// Objects are every primary and per-database object this backup stored.
+	Objects []backup.BackupObject `json:"objects,omitempty"`
 	// Warnings are coverage problems the backup met; UncoveredDatabases are
 	// databases in the cluster this backup does not contain.
 	Warnings           []string `json:"warnings,omitempty"`
@@ -197,6 +213,8 @@ func newBackupCreateCmd(flags *Flags) *cobra.Command {
 	var (
 		appName    string
 		accessory  string
+		database   string
+		adopted    bool
 		tf         backupTargetFlags
 		keepLast   int
 		maxAgeDays int
@@ -207,23 +225,31 @@ func newBackupCreateCmd(flags *Flags) *cobra.Command {
 		Short: "Create a volume or accessory backup",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runBackupCreate(flags, appName, accessory, &tf, keepLast, maxAgeDays)
+			return runBackupCreate(flags, appName, accessory, database, adopted, &tf, keepLast, maxAgeDays)
 		},
 	}
 
 	cmd.Flags().StringVar(&appName, "app", "", "app name — act on server state instead of teploy.yml (requires --host)")
 	cmd.Flags().StringVar(&accessory, "accessory", "", "back up this accessory instead of the app's volumes")
+	cmd.Flags().StringVar(&database, "database", "", "back up only this database of the accessory")
+	cmd.Flags().BoolVar(&adopted, "adopted", false, "--accessory names an adopted container (see `server backup-policy`), addressed by its docker name (requires --host)")
 	addBackupTargetFlags(cmd, &tf)
 	addRetentionFlags(cmd, &keepLast, &maxAgeDays)
 
 	return cmd
 }
 
-func runBackupCreate(flags *Flags, appName, accessory string, tf *backupTargetFlags, keepLast, maxAgeDays int) error {
+func runBackupCreate(flags *Flags, appName, accessory, database string, adopted bool, tf *backupTargetFlags, keepLast, maxAgeDays int) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
+	if adopted && accessory == "" {
+		return fmt.Errorf("--adopted needs --accessory <container>")
+	}
+	if database != "" && accessory == "" {
+		return fmt.Errorf("--database needs --accessory")
+	}
 
-	appCfg, executor, err := resolveApp(ctx, flags, appName)
+	appCfg, executor, err := resolveBackupApp(ctx, flags, appName, adopted)
 	if err != nil {
 		return err
 	}
@@ -242,11 +268,18 @@ func runBackupCreate(flags *Flags, appName, accessory string, tf *backupTargetFl
 		if err := backup.ValidateBucket(accessory); err != nil {
 			return fmt.Errorf("invalid accessory name %q: %w", accessory, err)
 		}
+		if aErr := applyAdoptedEngine(ctx, client, executor, appCfg.App, accessory); aErr != nil {
+			return aErr
+		}
 		image, env, accErr := client.InspectAccessory(ctx, appCfg.App, accessory)
 		if accErr != nil {
 			return fmt.Errorf("inspecting accessory %s: %w", accessory, accErr)
 		}
-		res, err = client.AccessoryBackup(ctx, appCfg.App, accessory, image, env, cfg)
+		opts := backup.BackupOptions{SingleDatabase: database}
+		if adopted && database == "" {
+			opts.AllDatabases = true
+		}
+		res, err = client.AccessoryBackupWith(ctx, appCfg.App, accessory, image, env, cfg, opts)
 		kind = backup.KindAccessory
 	} else {
 		res, err = client.BackupVolumes(ctx, appCfg.App, cfg)
@@ -318,6 +351,8 @@ func runBackupCreate(flags *Flags, appName, accessory string, tf *backupTargetFl
 			Pruned:             pruned,
 			Warnings:           res.Warnings,
 			UncoveredDatabases: res.UncoveredDatabases,
+			Encrypted:          res.Encrypted,
+			Objects:            res.Objects,
 		})
 	}
 	fmt.Printf("Backup %s created (%s, %d bytes)\n", res.ID, kind, res.SizeBytes)
@@ -326,6 +361,14 @@ func runBackupCreate(flags *Flags, appName, accessory string, tf *backupTargetFl
 	}
 	if pruned > 0 {
 		fmt.Printf("  Pruned %d old backup(s)\n", pruned)
+	}
+	for _, o := range res.Objects {
+		if o.Database != "" {
+			fmt.Printf("  Database %s: %s\n", o.Database, o.Key)
+		}
+	}
+	if !res.Encrypted {
+		fmt.Println("  Not encrypted: no recovery key is configured (teploy backup keygen; teploy server backup-policy set --recipient)")
 	}
 	return nil
 }
@@ -362,6 +405,7 @@ type backupScheduleDTO struct {
 func newBackupListCmd(flags *Flags) *cobra.Command {
 	var (
 		appName string
+		adopted bool
 		tf      backupTargetFlags
 	)
 
@@ -370,21 +414,22 @@ func newBackupListCmd(flags *Flags) *cobra.Command {
 		Short: "List available backups and schedules",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runBackupList(flags, appName, &tf)
+			return runBackupList(flags, appName, adopted, &tf)
 		},
 	}
 
 	cmd.Flags().StringVar(&appName, "app", "", "app name — act on server state instead of teploy.yml (requires --host)")
+	cmd.Flags().BoolVar(&adopted, "adopted", false, "list adopted containers' backups instead of an app's (requires --host)")
 	addBackupTargetFlags(cmd, &tf)
 
 	return cmd
 }
 
-func runBackupList(flags *Flags, appName string, tf *backupTargetFlags) error {
+func runBackupList(flags *Flags, appName string, adopted bool, tf *backupTargetFlags) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
-	appCfg, executor, err := resolveApp(ctx, flags, appName)
+	appCfg, executor, err := resolveBackupApp(ctx, flags, appName, adopted)
 	if err != nil {
 		return err
 	}
@@ -456,6 +501,9 @@ func runBackupList(flags *Flags, appName string, tf *backupTargetFlags) error {
 		if b.Accessory != "" {
 			label += "/" + b.Accessory
 		}
+		if b.Database != "" {
+			label += "/" + b.Database
+		}
 		fmt.Printf("%s  %-18s %10d bytes  %s\n", b.CreatedAt, label, b.SizeBytes, b.Key)
 	}
 	return nil
@@ -512,6 +560,8 @@ type backupRestoreDTO struct {
 	Warnings         []string `json:"warnings,omitempty"`
 	// Database names a non-primary database (--database).
 	Database string `json:"database,omitempty"`
+	// PreBackupID is the automatic backup taken just before this restore.
+	PreBackupID string `json:"pre_backup_id,omitempty"`
 	// Action and Released report --release / --rollback.
 	Action   string   `json:"action,omitempty"`
 	Released []string `json:"released,omitempty"`
@@ -522,6 +572,7 @@ func newBackupRestoreCmd(flags *Flags) *cobra.Command {
 	var (
 		appName   string
 		accessory string
+		adopted   bool
 		tf        backupTargetFlags
 		yes       bool
 		opts      restoreFlags
@@ -538,7 +589,11 @@ func newBackupRestoreCmd(flags *Flags) *cobra.Command {
 			"Non-interactive runs must pass --yes.\n\n" +
 			"A restore whose health check failed, or one that was killed, leaves its\n" +
 			"recovery copies: --release confirms the restore and discards them, and\n" +
-			"--rollback swaps a kept previous postgres database back (no <date>).",
+			"--rollback swaps a kept previous postgres database back (no <date>).\n\n" +
+			"Before anything changes a fresh backup of what is about to be replaced is\n" +
+			"taken; if that fails the restore is refused, unless --no-backup.\n\n" +
+			"--adopted addresses a container by its docker name (no app, so nothing is\n" +
+			"stopped for you: stop what uses it first), one database at a time.",
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			date := ""
@@ -548,10 +603,13 @@ func newBackupRestoreCmd(flags *Flags) *cobra.Command {
 			if err := opts.validate(date, accessory); err != nil {
 				return err
 			}
-			if opts.release || opts.rollback {
-				return runBackupRecoveryAction(flags, appName, accessory, &opts, yes)
+			if adopted && accessory == "" {
+				return fmt.Errorf("--adopted needs --accessory <container>")
 			}
-			return runBackupRestoreWith(flags, appName, accessory, date, &tf, yes, opts.restoreOptions())
+			if opts.release || opts.rollback {
+				return runBackupRecoveryAction(flags, appName, accessory, adopted, &opts, yes)
+			}
+			return runBackupRestoreWith(flags, appName, accessory, adopted, date, &tf, yes, opts.restoreOptions())
 		},
 	}
 
@@ -563,20 +621,22 @@ func newBackupRestoreCmd(flags *Flags) *cobra.Command {
 	cmd.Flags().BoolVar(&opts.force, "force", false, "with --release: discard safety copies whose restore never recorded finishing")
 	cmd.Flags().BoolVar(&opts.rollback, "rollback", false, "swap a kept previous postgres database back into place (needs --accessory, no <date>)")
 	cmd.Flags().StringVar(&opts.recoveryDatabase, "recovery-database", "", "with --rollback: which kept database, when several are")
-	cmd.Flags().StringVar(&opts.database, "database", "", "restore this database from a backup_databases: dump instead of the accessory's primary; with --release or --rollback, act on its copies")
+	cmd.Flags().StringVar(&opts.database, "database", "", "restore this database from its own series instead of the accessory's primary; with --release or --rollback, act on its copies")
 	cmd.Flags().BoolVar(&opts.ignoreSpace, "ignore-space-check", false, "skip the free-space preflight")
+	cmd.Flags().BoolVar(&opts.noBackup, "no-backup", false, "skip the automatic backup taken before the restore")
+	cmd.Flags().BoolVar(&adopted, "adopted", false, "--accessory names an adopted container (requires --host)")
 
 	return cmd
 }
 
 // restoreFlags are the accessory-restore options of `backup restore`.
 type restoreFlags struct {
-	release, rollback, ignoreSpace, force bool
-	recoveryDatabase, database            string
+	release, rollback, ignoreSpace, force, noBackup bool
+	recoveryDatabase, database                      string
 }
 
 func (o *restoreFlags) restoreOptions() backup.RestoreOptions {
-	return backup.RestoreOptions{IgnoreSpaceCheck: o.ignoreSpace, Database: o.database}
+	return backup.RestoreOptions{IgnoreSpaceCheck: o.ignoreSpace, Database: o.database, NoPreBackup: o.noBackup}
 }
 
 func (o *restoreFlags) validate(date, accessory string) error {
@@ -591,6 +651,8 @@ func (o *restoreFlags) validate(date, accessory string) error {
 		return fmt.Errorf("--release and --rollback act on kept copies, not on a backup id")
 	case action && o.ignoreSpace:
 		return fmt.Errorf("--ignore-space-check applies to a restore, not to --release/--rollback")
+	case action && o.noBackup:
+		return fmt.Errorf("--no-backup applies to a restore, not to --release/--rollback")
 	case o.force && !o.release:
 		return fmt.Errorf("--force applies to --release")
 	case !action && date == "":
@@ -605,11 +667,11 @@ func (o *restoreFlags) validate(date, accessory string) error {
 	return nil
 }
 
-func runBackupRestoreWith(flags *Flags, appName, accessory, date string, tf *backupTargetFlags, yes bool, restoreOpts backup.RestoreOptions) error {
+func runBackupRestoreWith(flags *Flags, appName, accessory string, adopted bool, date string, tf *backupTargetFlags, yes bool, restoreOpts backup.RestoreOptions) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
-	appCfg, executor, err := resolveApp(ctx, flags, appName)
+	appCfg, executor, err := resolveBackupApp(ctx, flags, appName, adopted)
 	if err != nil {
 		return err
 	}
@@ -632,8 +694,15 @@ func runBackupRestoreWith(flags *Flags, appName, accessory, date string, tf *bac
 		if !stdinIsTerminal() {
 			return fmt.Errorf("--yes is required to restore without an interactive terminal")
 		}
-		if !confirm(os.Stdout, fmt.Sprintf("Restore %s backup %s for %s (stops the app while it runs)?", restoreKindLabel(accessory), date, appCfg.App)) {
+		if !confirm(os.Stdout, restorePrompt(appCfg.App, accessory, restoreOpts.Database, date)) {
 			return fmt.Errorf("aborted")
+		}
+	}
+
+	// The adopted namespace has no app directory for the lock to live in.
+	if adopted {
+		if _, err := executor.Run(ctx, "mkdir -p "+ssh.ShellQuote("/deployments/"+backup.AdoptedApp)); err != nil {
+			return fmt.Errorf("preparing the adopted namespace's lock directory: %w", err)
 		}
 	}
 
@@ -648,6 +717,9 @@ func runBackupRestoreWith(flags *Flags, appName, accessory, date string, tf *bac
 
 	progress := backupProgressOut(flags)
 	client := backup.NewClient(executor, progress)
+	if err := applyAdoptedEngine(ctx, client, executor, appCfg.App, accessory); err != nil {
+		return err
+	}
 	lc := deploy.NewLifecycle(executor, progress)
 
 	dto := backupRestoreDTO{
@@ -685,6 +757,19 @@ func runBackupRestoreWith(flags *Flags, appName, accessory, date string, tf *bac
 		if aErr != nil {
 			return finishRestoreFailure(flags, ctx, executor, lc, lk, dto, false, nil, aErr)
 		}
+	} else if _, _, _, aErr := client.FindVolumeBackup(ctx, appCfg.App, date, cfg); aErr != nil {
+		return finishRestoreFailure(flags, ctx, executor, lc, lk, dto, false, nil, aErr)
+	}
+	// A fresh copy of what is about to be replaced, before anything stops.
+	if !restoreOpts.NoPreBackup {
+		id, pErr := preOperationBackup(ctx, client, executor, appCfg.App, accessory, restoreOpts.Database, cfg, "this restore")
+		if pErr != nil {
+			return finishRestoreFailure(flags, ctx, executor, lc, lk, dto, false, nil, pErr)
+		}
+		dto.PreBackupID = id
+		if id != "" {
+			fmt.Fprintf(progress, "Backed up the current data first: %s\n", id)
+		}
 	}
 	stopped, qErr := lc.QuiesceApp(ctx, lk, appCfg.App, stopTimeout)
 	for _, c := range stopped {
@@ -693,7 +778,7 @@ func runBackupRestoreWith(flags *Flags, appName, accessory, date string, tf *bac
 	accessoryStopped := false
 	if qErr == nil && accessory != "" {
 		if art.FileRestore {
-			container := appCfg.App + "-" + accessory
+			container := backup.ContainerName(appCfg.App, accessory)
 			if _, sErr := lk.Guarded(ctx, executor, fmt.Sprintf("docker stop --time %d %s", stopTimeout, ssh.ShellQuote(container))); sErr == nil {
 				accessoryStopped = true
 				dto.Stopped = append(dto.Stopped, container)
@@ -735,7 +820,7 @@ func runBackupRestoreWith(flags *Flags, appName, accessory, date string, tf *bac
 		dto.Started = []string{}
 	}
 	if accessoryStopped {
-		container := appCfg.App + "-" + accessory
+		container := backup.ContainerName(appCfg.App, accessory)
 		if _, sErr := lk.Guarded(ctx, executor, "docker start "+ssh.ShellQuote(container)); sErr == nil {
 			dto.Started = append(dto.Started, container)
 		} else if resume.HealthErr == nil {
@@ -779,11 +864,11 @@ func runBackupRestoreWith(flags *Flags, appName, accessory, date string, tf *bac
 // the way out of a restore that was kept (failed health check) or left behind
 // (killed). --release drops the copies with the app running. --rollback stops
 // the app, swaps the previous database back and resumes.
-func runBackupRecoveryAction(flags *Flags, appName, accessory string, opts *restoreFlags, yes bool) error {
+func runBackupRecoveryAction(flags *Flags, appName, accessory string, adopted bool, opts *restoreFlags, yes bool) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
-	appCfg, executor, err := resolveApp(ctx, flags, appName)
+	appCfg, executor, err := resolveBackupApp(ctx, flags, appName, adopted)
 	if err != nil {
 		return err
 	}
@@ -797,6 +882,9 @@ func runBackupRecoveryAction(flags *Flags, appName, accessory string, opts *rest
 	}
 	progress := backupProgressOut(flags)
 	client := backup.NewClient(executor, progress)
+	if err := applyAdoptedEngine(ctx, client, executor, appCfg.App, accessory); err != nil {
+		return err
+	}
 	image, env := inspectAccessoryForRestore(ctx, client, appCfg.App, accessory, appCfg)
 	rc, err := client.FindRecoveryCopies(ctx, appCfg.App, accessory, image, opts.database, env)
 	if err != nil {
@@ -924,7 +1012,7 @@ func inspectAccessoryForRestore(ctx context.Context, client *backup.Client, app,
 // event.
 func finishRestoreFailure(flags *Flags, ctx context.Context, executor ssh.Executor, lc *deploy.Lifecycle, lk *state.Lock, dto backupRestoreDTO, accessoryStopped bool, stopped []docker.Container, rerr error) error {
 	if accessoryStopped {
-		container := dto.App + "-" + dto.Accessory
+		container := backup.ContainerName(dto.App, dto.Accessory)
 		if _, err := lk.Guarded(ctx, executor, "docker start "+ssh.ShellQuote(container)); err == nil {
 			dto.Started = append(dto.Started, container)
 		}
@@ -944,6 +1032,9 @@ func finishRestoreFailure(flags *Flags, ctx context.Context, executor ssh.Execut
 
 func restoreEventDetail(dto backupRestoreDTO) map[string]any {
 	detail := map[string]any{"id": dto.ID, "kind": dto.Kind}
+	if dto.PreBackupID != "" {
+		detail["pre_backup_id"] = dto.PreBackupID
+	}
 	if dto.Accessory != "" {
 		detail["accessory"] = dto.Accessory
 	}
@@ -953,33 +1044,53 @@ func restoreEventDetail(dto backupRestoreDTO) map[string]any {
 	return detail
 }
 
-func restoreKindLabel(accessory string) string {
-	if accessory != "" {
-		return "accessory " + accessory
+// restorePrompt says exactly what a restore will replace, and what it will not
+// protect: an adopted container's users are not stopped for it.
+func restorePrompt(app, accessory, database, date string) string {
+	switch {
+	case app == backup.AdoptedApp && database != "":
+		return fmt.Sprintf("Replace database %s in adopted container %s with backup %s? Nothing that uses it is stopped for you: stop those first.", database, accessory, date)
+	case app == backup.AdoptedApp:
+		return fmt.Sprintf("Replace the data in adopted container %s with backup %s? Nothing that uses it is stopped for you: stop those first.", accessory, date)
+	case accessory != "" && database != "":
+		return fmt.Sprintf("Replace database %s in %s with backup %s (stops %s's containers while it runs)?", database, backup.ContainerName(app, accessory), date, app)
+	case accessory != "":
+		return fmt.Sprintf("Replace the data in %s with backup %s (stops %s's containers while it runs)?", backup.ContainerName(app, accessory), date, app)
 	}
-	return "volume"
+	return fmt.Sprintf("Replace everything in %s's volumes (and its .env, if the backup holds one) with backup %s (stops the app while it runs)?", app, date)
 }
 
 func newBackupPruneCmd(flags *Flags) *cobra.Command {
 	var (
 		appName    string
+		adopted    bool
 		tf         backupTargetFlags
 		accessory  string
 		keepLast   int
 		maxAgeDays int
+		gfs        backup.FleetRetention
 	)
 
 	cmd := &cobra.Command{
 		Use:   "prune",
 		Short: "Delete old backups per a retention policy",
-		Long:  "Removes backups outside the retention policy.\nExample: teploy backup prune --keep-last 7\n         teploy backup prune --max-age-days 30 --keep-last 3",
-		Args:  cobra.NoArgs,
+		Long: "Removes backups outside the retention policy, with every object they keep\n" +
+			"beside them. --keep-daily/--keep-weekly/--keep-monthly keep the newest backup\n" +
+			"of the last N days, ISO weeks and months that have one; --max-age-days keeps\n" +
+			"everything younger than that. The rules are a union, and the newest good\n" +
+			"backup always stays.\nExample: teploy backup prune --keep-last 7\n         teploy backup prune --max-age-days 30 --keep-last 3\n         teploy backup prune --keep-daily 7 --keep-weekly 4 --keep-monthly 12",
+		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runBackupPrune(flags, appName, &tf, accessory, keepLast, maxAgeDays)
+			gfs.KeepLast, gfs.MaxAgeDays = keepLast, maxAgeDays
+			return runBackupPrune(flags, appName, adopted, &tf, accessory, gfs.Policy())
 		},
 	}
 
 	cmd.Flags().StringVar(&appName, "app", "", "app name — act on server state instead of teploy.yml (requires --host)")
+	cmd.Flags().BoolVar(&adopted, "adopted", false, "--accessory names an adopted container (requires --host)")
+	cmd.Flags().IntVar(&gfs.KeepDaily, "keep-daily", 0, "keep the newest backup of the last N days that have one")
+	cmd.Flags().IntVar(&gfs.KeepWeekly, "keep-weekly", 0, "keep the newest backup of the last N ISO weeks that have one")
+	cmd.Flags().IntVar(&gfs.KeepMonthly, "keep-monthly", 0, "keep the newest backup of the last N months that have one")
 	addBackupTargetFlags(cmd, &tf)
 	cmd.Flags().StringVar(&accessory, "accessory", "", "Prune an accessory's backups instead of volumes (accessory name)")
 	addRetentionFlags(cmd, &keepLast, &maxAgeDays)
@@ -987,11 +1098,11 @@ func newBackupPruneCmd(flags *Flags) *cobra.Command {
 	return cmd
 }
 
-func runBackupPrune(flags *Flags, appName string, tf *backupTargetFlags, accessory string, keepLast, maxAgeDays int) error {
+func runBackupPrune(flags *Flags, appName string, adopted bool, tf *backupTargetFlags, accessory string, policy backup.RetentionPolicy) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
-	appCfg, executor, err := resolveApp(ctx, flags, appName)
+	appCfg, executor, err := resolveBackupApp(ctx, flags, appName, adopted)
 	if err != nil {
 		return err
 	}
@@ -1002,9 +1113,8 @@ func runBackupPrune(flags *Flags, appName string, tf *backupTargetFlags, accesso
 		return err
 	}
 
-	policy := backup.RetentionPolicy{KeepLast: keepLast, MaxAgeDays: maxAgeDays}
 	if policy.IsZero() {
-		return fmt.Errorf("nothing to prune: set --keep-last and/or --max-age-days")
+		return fmt.Errorf("nothing to prune: set --keep-last, --keep-daily, --keep-weekly, --keep-monthly and/or --max-age-days")
 	}
 
 	prefix := "volumes"

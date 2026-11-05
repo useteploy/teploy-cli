@@ -59,6 +59,8 @@ type backupTargetDTO struct {
 	Prefix           string `json:"prefix,omitempty"`
 	HasCredentials   bool   `json:"has_credentials"`
 	Path             string `json:"path,omitempty"`
+	// PreviousPrefixes are old prefixes of this bucket list and restore search.
+	PreviousPrefixes []backup.PreviousPrefix `json:"previous_prefixes,omitempty"`
 }
 
 func newServerBackupTargetSetCmd(flags *Flags) *cobra.Command {
@@ -68,6 +70,8 @@ func newServerBackupTargetSetCmd(flags *Flags) *cobra.Command {
 		endpoint      string
 		prefix        string
 		noCredentials bool
+		prevOwned     bool
+		dropPrevious  bool
 	)
 	cmd := &cobra.Command{
 		Use:   "set",
@@ -77,10 +81,15 @@ func newServerBackupTargetSetCmd(flags *Flags) *cobra.Command {
 			"lines: the access key, then the secret key. With a terminal, both are\n" +
 			"prompted with echo off.\n\n" +
 			"Example:\n" +
-			"  printf 'ACCESS\\nSECRET\\n' | teploy server backup-target set --host prod --bucket b --endpoint https://s3.example.com",
+			"  printf 'ACCESS\\nSECRET\\n' | teploy server backup-target set --host prod --bucket b --endpoint https://s3.example.com\n\n" +
+			"Give each server its own --prefix when servers share a bucket. Changing the\n" +
+			"prefix keeps the old one on record: list, verify and restore still find the\n" +
+			"objects there. They are not pruned, because they may be another server's;\n" +
+			"--previous-prefix-owned says only this server ever wrote there, and lets them\n" +
+			"age out under the policy's retention.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runServerBackupTargetSet(flags, bucket, region, endpoint, prefix, noCredentials)
+			return runServerBackupTargetSet(flags, bucket, region, endpoint, prefix, noCredentials, prevOwned, dropPrevious)
 		},
 	}
 	cmd.Flags().StringVar(&bucket, "bucket", "", "S3 bucket name")
@@ -88,10 +97,38 @@ func newServerBackupTargetSetCmd(flags *Flags) *cobra.Command {
 	cmd.Flags().StringVar(&endpoint, "endpoint", "", "S3-compatible endpoint URL (MinIO/B2/R2)")
 	cmd.Flags().StringVar(&prefix, "prefix", "", "key prefix under the bucket (optional)")
 	cmd.Flags().BoolVar(&noCredentials, "no-credentials", false, "store no credentials — use the server's ambient AWS credential chain")
+	cmd.Flags().BoolVar(&prevOwned, "previous-prefix-owned", false, "the previous prefix holds only this server's objects: let retention age them out")
+	cmd.Flags().BoolVar(&dropPrevious, "forget-previous-prefixes", false, "stop looking under previous prefixes (their objects are left in the bucket)")
 	return cmd
 }
 
-func runServerBackupTargetSet(flags *Flags, bucket, region, endpoint, prefix string, noCredentials bool) error {
+// mergePreviousPrefixes carries a target's prefix history across a `set`: the
+// prefix being left joins the list, the prefix being entered leaves it. A new
+// bucket or endpoint starts fresh, since the old location is not reachable from
+// the new config.
+func mergePreviousPrefixes(old backup.Target, bucket, endpoint, prefix string, owned, drop bool) (prev []backup.PreviousPrefix, lost bool) {
+	if !TargetConfigured(old) {
+		return nil, false
+	}
+	if old.Bucket != bucket || old.Endpoint != endpoint {
+		return nil, true
+	}
+	if drop {
+		return nil, false
+	}
+	for _, p := range old.PreviousPrefixes {
+		if p.Prefix != prefix && p.Prefix != old.Prefix {
+			p.Owned = p.Owned || owned
+			prev = append(prev, p)
+		}
+	}
+	if old.Prefix != prefix {
+		prev = append(prev, backup.PreviousPrefix{Prefix: old.Prefix, Owned: owned})
+	}
+	return prev, false
+}
+
+func runServerBackupTargetSet(flags *Flags, bucket, region, endpoint, prefix string, noCredentials, prevOwned, dropPrevious bool) error {
 	if bucket == "" {
 		return fmt.Errorf("--bucket is required")
 	}
@@ -142,7 +179,13 @@ func runServerBackupTargetSet(flags *Flags, bucket, region, endpoint, prefix str
 			return err
 		}
 	}
+	old, err := backup.ReadTarget(ctx, executor)
+	if err != nil {
+		return err
+	}
 	t := backup.Target{Bucket: bucket, Region: region, Endpoint: endpoint, Prefix: prefix, HasCredentials: credsArmor != ""}
+	var lostOld bool
+	t.PreviousPrefixes, lostOld = mergePreviousPrefixes(old, bucket, endpoint, prefix, prevOwned, dropPrevious)
 	path, fallback, err := backup.WriteTarget(ctx, executor, t, credsArmor)
 	if err != nil {
 		return err
@@ -151,6 +194,19 @@ func runServerBackupTargetSet(flags *Flags, bucket, region, endpoint, prefix str
 
 	fmt.Printf("Backup target stored: s3://%s at %s\n", backupTargetLabel(t), path)
 	fmt.Printf("  Credentials: %s\n", credentialMode(t))
+	if lostOld {
+		fmt.Printf("  Note: backups under the old target s3://%s are not reachable from this one and are no longer listed; they were not touched\n", backupTargetLabel(old))
+	}
+	for _, p := range t.PreviousPrefixes {
+		owned := "kept until you remove them (they may be another server's; --previous-prefix-owned lets them age out)"
+		if p.Owned {
+			owned = "ages out under the policy's retention"
+		}
+		fmt.Printf("  Previous prefix %q: still searched by list and restore; %s\n", p.Prefix, owned)
+	}
+	if prefix == "" {
+		fmt.Println("  No prefix: if other servers share this bucket, give each its own --prefix. A namespace another server has written to is never pruned")
+	}
 	if fallback {
 		fmt.Println("  /etc/teploy is not writable by this user — the target lives in ~/.config/teploy instead")
 	}
@@ -187,12 +243,13 @@ func checkReachability(ctx context.Context, executor ssh.Executor, t backup.Targ
 	cfg := TargetS3(t)
 	client := backup.NewClient(executor, io.Discard)
 	if err := client.EnsureAWSCLIPublic(ctx); err != nil {
-		fmt.Fprintf(os.Stderr, "Warning: could not verify the target: %v\n", err)
+		// The target is stored, and every backup through it will fail until this
+		// is fixed: say so in the terms that fix it.
+		fmt.Fprintf(os.Stderr, "Warning: backups through this target will fail: %v\n", err)
 		return
 	}
-	res := ssh.RunDetailed(ctx, executor, cfg.AWS("s3 ls s3://"+cfg.Bucket+"/"))
-	if res.Failed() {
-		fmt.Fprintf(os.Stderr, "Warning: the stored target did not answer `aws s3 ls` (%s) — check the bucket, endpoint and credentials\n", oneLine(res.ExitErrorText()))
+	if err := client.ProbeTarget(ctx, cfg); err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: the stored target did not answer `aws s3 ls` (%s) — check the bucket, endpoint and credentials\n", oneLine(err.Error()))
 		return
 	}
 	fmt.Println("  Reachability: aws s3 ls answered")
@@ -346,6 +403,7 @@ func writeBackupTargetJSON(w io.Writer, host string, target backup.Target) error
 		Host:             host,
 		HasCredentials:   target.HasCredentials,
 		Path:             target.Path,
+		PreviousPrefixes: target.PreviousPrefixes,
 	}
 	if TargetConfigured(target) {
 		dto.Configured = true
@@ -527,7 +585,8 @@ func serverAppNames(ctx context.Context, executor ssh.Executor) ([]string, error
 	seen := map[string]bool{}
 	var apps []string
 	for _, line := range strings.Split(string(res.Stdout), "\n") {
-		if app := strings.TrimSpace(line); app != "" && !seen[app] {
+		// _adopted and _fleet are event-log namespaces, not apps.
+		if app := strings.TrimSpace(line); app != "" && !strings.HasPrefix(app, "_") && !seen[app] {
 			seen[app] = true
 			apps = append(apps, app)
 		}

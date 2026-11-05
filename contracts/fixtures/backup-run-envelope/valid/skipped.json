@@ -1,0 +1,9 @@
+{
+  "machine_interface": 2,
+  "status": "skipped",
+  "started_at": "2026-11-04T03:17:04Z",
+  "duration_ms": 0,
+  "encrypted": false,
+  "targets": [],
+  "error": "another run holds the lock"
+}

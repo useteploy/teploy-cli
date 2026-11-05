@@ -151,6 +151,7 @@ func TestDiscoverBackupSchedules(t *testing.T) {
 func TestResolveBackupS3(t *testing.T) {
 	ctx := context.Background()
 	stored := ssh.NewMockExecutor("srv",
+		ssh.MockCommand{Match: "for p in /etc/teploy/backup-policy.json", Output: "absent\n"},
 		ssh.MockCommand{Match: "for p in /etc/teploy/backup-target.json", Output: "path /etc/teploy/backup-target.json\n" + `{"v":"1","bucket":"kept","region":"eu-west-1","endpoint":"http://127.0.0.1:9100","credentials":"AGE"}`},
 	)
 	cfg, err := resolveBackupS3(ctx, stored, &backupTargetFlags{})

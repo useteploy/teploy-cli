@@ -28,6 +28,8 @@ func teployVersionForServer() string { return cliBuildVersion }
 
 // Flags holds the global CLI flags, passed to subcommands explicitly.
 type Flags struct {
+	// NoBackup skips the backup_before_hooks backup (`deploy --no-backup`).
+	NoBackup   bool
 	Host       string
 	User       string
 	Key        string
@@ -210,12 +212,11 @@ func recordAppEvent(ctx context.Context, exec ssh.Executor, app, kind string, er
 
 // backupRunDetail is the backup.run event detail: what was written, where,
 // how big, how long it took, and the consistency the artifact can claim.
-// Payload encryption (G1) is not implemented yet, so encrypted is false.
 func backupRunDetail(res backup.BackupResult, kind, accessory string) map[string]any {
 	detail := map[string]any{
 		"id": res.ID, "kind": kind, "size_bytes": res.SizeBytes, "key": res.Key,
 		"duration_ms": res.DurationMs, "engine": res.Engine, "consistency": res.Consistency,
-		"encrypted": false,
+		"encrypted": res.Encrypted,
 	}
 	if accessory != "" {
 		detail["accessory"] = accessory

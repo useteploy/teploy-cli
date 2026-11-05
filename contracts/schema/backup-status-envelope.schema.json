@@ -1,0 +1,464 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://teploy.github.io/contracts/schema/backup-status-envelope.schema.json",
+  "title": "`teploy backup status --host S --json`: one read-only report per server (backup-fleet-v1, rev 17). Never carries credentials, env values or heartbeat tokens.",
+  "type": "object",
+  "required": [
+    "machine_interface",
+    "host",
+    "observed_at",
+    "target",
+    "policy",
+    "encrypted",
+    "aws_cli",
+    "age_cli",
+    "entries",
+    "uncovered_databases"
+  ],
+  "properties": {
+    "machine_interface": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "host": {
+      "type": "string",
+      "minLength": 1
+    },
+    "observed_at": {
+      "type": "string"
+    },
+    "target": {
+      "type": "object",
+      "required": [
+        "configured",
+        "has_credentials",
+        "reachable"
+      ],
+      "properties": {
+        "configured": {
+          "type": "boolean"
+        },
+        "bucket": {
+          "type": "string"
+        },
+        "region": {
+          "type": "string"
+        },
+        "endpoint": {
+          "type": "string"
+        },
+        "prefix": {
+          "type": "string"
+        },
+        "has_credentials": {
+          "type": "boolean"
+        },
+        "previous_prefixes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "prefix"
+            ],
+            "properties": {
+              "prefix": {
+                "type": "string"
+              },
+              "owned": {
+                "type": "boolean"
+              }
+            }
+          }
+        },
+        "reachable": {
+          "type": "boolean",
+          "description": "The listing this report needed worked."
+        },
+        "error": {
+          "type": "string"
+        }
+      }
+    },
+    "policy": {
+      "type": "object",
+      "required": [
+        "configured",
+        "cron_installed",
+        "retention",
+        "volumes",
+        "heartbeat_count"
+      ],
+      "properties": {
+        "configured": {
+          "type": "boolean"
+        },
+        "path": {
+          "type": "string"
+        },
+        "interval": {
+          "type": "string"
+        },
+        "cron_installed": {
+          "type": "boolean"
+        },
+        "retention": {
+          "type": "object",
+          "properties": {
+            "keep_last": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "keep_daily": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "keep_weekly": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "keep_monthly": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "max_age_days": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "description": "Union of rules over the good backups (restic forget semantics). keep_daily/weekly/monthly: newest backup of the last N UTC days / ISO weeks / months that have one. max_age_days: keep everything younger (keep-within). The newest good backup always stays."
+        },
+        "excludes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "adopted": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "container",
+              "databases"
+            ],
+            "properties": {
+              "container": {
+                "type": "string"
+              },
+              "engine": {
+                "type": "string"
+              },
+              "databases": {
+                "oneOf": [
+                  {
+                    "const": "all"
+                  },
+                  {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        },
+        "volumes": {
+          "type": "boolean"
+        },
+        "volume_max_gb": {
+          "type": "number",
+          "minimum": 0
+        },
+        "heartbeat_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "heartbeat_hosts": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "scheme://host only: the URLs carry tokens."
+        },
+        "recipient": {
+          "type": "string",
+          "description": "The owner's recovery PUBLIC key."
+        }
+      }
+    },
+    "encrypted": {
+      "type": "boolean",
+      "description": "New objects will be encrypted. false: Dash should warn."
+    },
+    "aws_cli": {
+      "type": "boolean"
+    },
+    "age_cli": {
+      "type": "boolean"
+    },
+    "last_run": {
+      "type": "object",
+      "required": [
+        "at",
+        "status",
+        "targets_ok",
+        "targets_failed",
+        "stale"
+      ],
+      "properties": {
+        "at": {
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "ok",
+            "partial",
+            "failed"
+          ]
+        },
+        "targets_ok": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "targets_failed": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "omissions": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "error": {
+          "type": "string"
+        },
+        "stale": {
+          "type": "boolean",
+          "description": "Older than twice the policy interval."
+        }
+      }
+    },
+    "entries": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "name",
+          "kind",
+          "unmanaged",
+          "adopted",
+          "coverage",
+          "schedule"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Container name, or <app>/volumes."
+          },
+          "kind": {
+            "enum": [
+              "accessory",
+              "adopted",
+              "unmanaged",
+              "volumes"
+            ]
+          },
+          "app": {
+            "type": "string"
+          },
+          "accessory": {
+            "type": "string"
+          },
+          "engine": {
+            "type": "string"
+          },
+          "detection": {
+            "type": "string"
+          },
+          "state": {
+            "type": "string",
+            "description": "Docker state, or missing for an adopted container that is gone."
+          },
+          "unmanaged": {
+            "type": "boolean",
+            "description": "No teploy labels."
+          },
+          "adopted": {
+            "type": "boolean"
+          },
+          "coverage": {
+            "enum": [
+              "covered",
+              "stale",
+              "failing",
+              "uncovered",
+              "excluded",
+              "adopted"
+            ],
+            "description": "adopted = covered, via a policy entry. A failing or stale adopted container reports failing or stale, with adopted:true."
+          },
+          "reason": {
+            "type": "string"
+          },
+          "schedule": {
+            "enum": [
+              "policy",
+              "own",
+              "none"
+            ]
+          },
+          "last_success": {
+            "type": "string"
+          },
+          "last_failure": {
+            "type": "string"
+          },
+          "last_error": {
+            "type": "string"
+          },
+          "newest": {
+            "type": "object",
+            "required": [
+              "id",
+              "key",
+              "size_bytes",
+              "created_at",
+              "encrypted"
+            ],
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "key": {
+                "type": "string",
+                "pattern": "^s3://"
+              },
+              "size_bytes": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "created_at": {
+                "type": "string"
+              },
+              "encrypted": {
+                "type": "boolean"
+              },
+              "previous_prefix": {
+                "type": "boolean"
+              }
+            }
+          },
+          "databases": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "name"
+              ],
+              "properties": {
+                "name": {
+                  "type": "string"
+                },
+                "newest": {
+                  "type": "object",
+                  "required": [
+                    "id",
+                    "key",
+                    "size_bytes",
+                    "created_at",
+                    "encrypted"
+                  ],
+                  "properties": {
+                    "id": {
+                      "type": "string"
+                    },
+                    "key": {
+                      "type": "string",
+                      "pattern": "^s3://"
+                    },
+                    "size_bytes": {
+                      "type": "integer",
+                      "minimum": 0
+                    },
+                    "created_at": {
+                      "type": "string"
+                    },
+                    "encrypted": {
+                      "type": "boolean"
+                    },
+                    "previous_prefix": {
+                      "type": "boolean"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "last_verify": {
+            "type": "object",
+            "required": [
+              "at",
+              "ok"
+            ],
+            "properties": {
+              "at": {
+                "type": "string"
+              },
+              "ok": {
+                "type": "boolean"
+              },
+              "id": {
+                "type": "string"
+              },
+              "metric": {
+                "type": "string"
+              },
+              "database": {
+                "type": "string"
+              }
+            }
+          },
+          "uncovered_databases": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "size_bytes": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      }
+    },
+    "uncovered_databases": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "<container> when nothing covers it, <container>/<database> when one database of a covered container is left out."
+    },
+    "leftover_workspaces": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "warnings": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "leftover_uploads": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Bucket keys of uploads a killed run never published."
+    }
+  }
+}
