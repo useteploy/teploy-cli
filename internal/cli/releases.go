@@ -50,6 +50,7 @@ for teploy.yml-in-a-folder invocations without --app).`,
 		},
 	}
 	cmd.Flags().StringVar(&appName, "app", "", "app name — read state from the server instead of teploy.yml (requires --host)")
+	cmd.AddCommand(newReleasesPruneCmd(flags))
 	return cmd
 }
 

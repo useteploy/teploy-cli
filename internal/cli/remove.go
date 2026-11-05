@@ -378,10 +378,13 @@ func executeRemove(ctx context.Context, exec ssh.Executor, app string, domains [
 		for _, keep := range keeps {
 			keepArgs += " ! -name " + ssh.ShellQuote(keep)
 		}
+		// No directory (lk nil) means an earlier removal already finished.
 		delCmd := fmt.Sprintf("find %s -mindepth 1 -maxdepth 1%s -exec rm -rf {} +",
 			ssh.ShellQuote(appDir), keepArgs)
-		if _, err := exec.Run(ctx, delCmd); err != nil {
-			return nil, fmt.Errorf("removing deploy state under %s: %w", appDir, err)
+		if lk != nil {
+			if _, err := exec.Run(ctx, delCmd); err != nil {
+				return nil, fmt.Errorf("removing deploy state under %s: %w", appDir, err)
+			}
 		}
 		if left, err := exec.Run(ctx, "ls "+ssh.ShellQuote(appDir)+" 2>/dev/null"); err == nil {
 			for _, d := range strings.Fields(left) {

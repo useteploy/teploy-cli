@@ -119,6 +119,7 @@ const (
 	KindBackupPolicy   = "backup_policy.set"
 	KindRouteRemove    = "route.remove"
 	KindReleasesPrune  = "releases.prune"
+	KindServerPrune    = "server.prune"
 )
 
 // detailAllow is the per-kind allowlist of detail keys. Env and secret
@@ -158,6 +159,7 @@ var detailAllow = map[string][]string{
 	KindBackupPolicy:   {"interval", "encrypted", "volumes", "adopted", "error"},
 	KindRouteRemove:    {"route", "hosts", "upstreams", "reason", "error"},
 	KindReleasesPrune:  {"keep", "pruned", "protected", "trigger", "error"},
+	KindServerPrune:    {"build_cache", "dangling", "output", "error"},
 }
 
 // maxErrorDetail bounds the "error" detail so a command's full stderr
