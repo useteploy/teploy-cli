@@ -30,6 +30,7 @@ func newServerCmd(flags *Flags) *cobra.Command {
 	cmd.AddCommand(newServerBackupTargetCmd(flags))
 	cmd.AddCommand(newServerBackupPolicyCmd(flags))
 	cmd.AddCommand(newServerAuditCmd(flags))
+	cmd.AddCommand(newServerSiblingsCmd(flags))
 	cmd.AddCommand(newServerPruneCmd(flags))
 
 	return cmd
