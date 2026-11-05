@@ -987,6 +987,9 @@ func doctorBackupPolicyCheck(ctx context.Context, exec ssh.Executor, now time.Ti
 	sctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
 	st, err := backup.ReadFleetStatus(sctx, exec, now)
+	if errors.Is(err, backup.ErrPolicyHidden) {
+		return doctorCheck{Name: "backup-policy", Result: doctorFail, Detail: err.Error(), Remediation: "connect as root, give this user passwordless sudo, or run on the server: chmod 711 /etc/teploy. Until then every backup through this user is refused rather than risk plaintext"}
+	}
 	if err != nil {
 		return doctorCheck{Name: "backup-policy", Result: doctorWarn, Detail: "could not read the backup status: " + err.Error()}
 	}
@@ -1030,6 +1033,15 @@ func doctorBackupPolicyCheck(ctx context.Context, exec ssh.Executor, now time.Ti
 		if st.Policy.HeartbeatCount == 0 {
 			warns = append(warns, "no heartbeat URL is set, so a job that stops running raises no alert")
 			remedies = append(remedies, "printf '<url>\\n' | teploy server backup-policy set --host <server> --heartbeat-stdin")
+		}
+	}
+	if st.LastRun != nil && len(st.LastRun.Warnings) > 0 {
+		warns = append(warns, "the last backup run warned: "+strings.Join(st.LastRun.Warnings, "; "))
+		remedies = append(remedies, "a refused prune means retention has stopped and storage keeps growing: `teploy server backup-target owners` for a stale marker")
+	}
+	for _, w := range st.Warnings {
+		if strings.Contains(w, "pre-D3") {
+			warns = append(warns, w)
 		}
 	}
 	if st.Target.Configured && st.AWSCLI && !st.Target.Reachable {

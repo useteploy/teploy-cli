@@ -61,6 +61,34 @@ type ContainerFact struct {
 // Unmanaged reports a container with no teploy role.
 func (f ContainerFact) Unmanaged() bool { return f.Role == "" }
 
+// unsupportedDatabases are images of databases teploy has no dump method for.
+// They classify as generic, so nothing else would ever mention them; the same
+// family liveDBMarkers refuses to tar from a running container.
+var unsupportedDatabases = map[string]bool{
+	"clickhouse": true, "clickhouse-server": true, "elasticsearch": true, "opensearch": true,
+	"qdrant": true, "keydb": true, "cassandra": true, "scylla": true, "couchdb": true,
+	"couchbase": true, "influxdb": true, "neo4j": true, "cockroach": true, "rethinkdb": true,
+	"etcd": true, "milvus": true, "weaviate": true, "typesense": true, "meilisearch": true,
+}
+
+// UnsupportedDatabase names a database teploy cannot back up in this container,
+// "" when it can or this is no database. A teploy.engine label asserting generic
+// is the operator saying it is plain files.
+func (f ContainerFact) UnsupportedDatabase() string {
+	if f.EngineErr != nil || f.Engine.IsDB() || f.Engine.Source == "label" || f.Engine.Source == "env-not-server" {
+		return ""
+	}
+	if name := imageName(f.Image); unsupportedDatabases[name] {
+		return name
+	}
+	return ""
+}
+
+// DBLike reports a container holding a database, whether or not teploy can dump it.
+func (f ContainerFact) DBLike() bool {
+	return (f.EngineErr == nil && f.Engine.IsDB()) || f.UnsupportedDatabase() != ""
+}
+
 // inventoryFormat emits one JSON object per container.
 const inventoryFormat = `{"name":{{json .Name}},"image":{{json .Config.Image}},"state":{{json .State.Status}},"labels":{{json .Config.Labels}},"env":{{json .Config.Env}},"entrypoint":{{json .Config.Entrypoint}},"cmd":{{json .Config.Cmd}}}`
 
@@ -238,15 +266,16 @@ func (c *Client) duKB(ctx context.Context, dir string) (int64, bool) {
 
 // EnumerateFleet lists this run's targets and the DB-like containers none of
 // them cover. It reads the server now; nothing is cached between runs.
-func (c *Client) EnumerateFleet(ctx context.Context, p FleetPolicy) ([]FleetTarget, []string, error) {
+func (c *Client) EnumerateFleet(ctx context.Context, p FleetPolicy) ([]FleetTarget, []string, []string, error) {
 	facts, err := c.Inventory(ctx)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	cron, err := ReadCrontab(ctx, c.exec)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
+	var warnings []string
 	ownCron := map[string]bool{}
 	for _, line := range cron {
 		// A hand-written job under a teploy marker (custom) is not an override:
@@ -254,6 +283,9 @@ func (c *Client) EnumerateFleet(ctx context.Context, p FleetPolicy) ([]FleetTarg
 		// policy covering the database as well is how they get retired.
 		if m := FindCronMarker(line); m != nil && m.Kind != KindFleet && m.Form != CronFormCustom {
 			ownCron[m.App+"/"+m.Accessory] = true
+			if m.Form == CronFormLegacy {
+				warnings = append(warnings, fmt.Sprintf("cron marker %s is a pre-D3 shell line: it uploads plaintext whatever this policy says. Rewrite it with `teploy server backup-target set`", m.Tag))
+			}
 		}
 	}
 	policies := map[string]AppPolicy{}
@@ -269,11 +301,14 @@ func (c *Client) EnumerateFleet(ctx context.Context, p FleetPolicy) ([]FleetTarg
 		return ap
 	}
 	base := p.Retention.Policy()
-	override := func(kp *KindPolicy, r RetentionPolicy) RetentionPolicy {
-		if kp == nil || (kp.KeepLast == 0 && kp.MaxAgeDays == 0) {
-			return r
+	// A per-app schedule overrides the policy only while its cron line runs it, and
+	// then this run skips the target. A leftover backup-schedule.json with no line
+	// must not decide this policy's retention: applying one deleted seeded history
+	// in a single run, with a clean status.
+	staleStore := func(kp *KindPolicy, label string) {
+		if kp != nil && (kp.KeepLast != 0 || kp.MaxAgeDays != 0) {
+			warnings = append(warnings, fmt.Sprintf("%s has retention in its backup-schedule.json (keep_last %d, max_age_days %d) but no cron line runs it, so the policy's retention applies; the leftover has no effect", label, kp.KeepLast, kp.MaxAgeDays))
 		}
-		return RetentionPolicy{KeepLast: kp.KeepLast, MaxAgeDays: kp.MaxAgeDays}
 	}
 	adopted := map[string]*AdoptedEntry{}
 	for i := range p.Adopted {
@@ -305,12 +340,12 @@ func (c *Client) EnumerateFleet(ctx context.Context, p FleetPolicy) ([]FleetTarg
 			case f.Name != ContainerName(f.App, f.Accessory):
 				t.Status, t.Reason = TargetFailed, fmt.Sprintf("container %s does not match its labels (expected %s), so it cannot be addressed; adopt it by name", f.Name, ContainerName(f.App, f.Accessory))
 			default:
-				ap := readAppPolicy(f.App)
-				var kp *KindPolicy
-				if ap.Accessories != nil {
-					kp = ap.Accessories[f.Accessory]
+				t.Retention = base
+				if !ownCron[f.App+"/"+f.Accessory] {
+					if ap := readAppPolicy(f.App); ap.Accessories != nil {
+						staleStore(ap.Accessories[f.Accessory], f.Name)
+					}
 				}
-				t.Retention = override(kp, base)
 				switch {
 				case p.Excluded(f.App, f.Accessory, f.Name):
 					t.Status, t.Reason = TargetExcluded, "excluded by policy"
@@ -330,7 +365,7 @@ func (c *Client) EnumerateFleet(ctx context.Context, p FleetPolicy) ([]FleetTarg
 			targets = append(targets, t)
 			continue
 		}
-		if f.EngineErr == nil && f.Engine.IsDB() && !p.Excluded("", "", f.Name) {
+		if f.DBLike() && !p.Excluded("", "", f.Name) {
 			uncovered = append(uncovered, f.Name)
 		}
 	}
@@ -344,12 +379,13 @@ func (c *Client) EnumerateFleet(ctx context.Context, p FleetPolicy) ([]FleetTarg
 	if p.Volumes {
 		trees, err := c.listVolumeTrees(ctx)
 		if err != nil {
-			return targets, uncovered, err
+			return targets, uncovered, warnings, err
 		}
 		for _, tr := range trees {
-			t := FleetTarget{Kind: TargetVolumes, App: tr.App, SizeBytes: tr.KB * 1024}
-			ap := readAppPolicy(tr.App)
-			t.Retention = override(ap.Volumes, base)
+			t := FleetTarget{Kind: TargetVolumes, App: tr.App, SizeBytes: tr.KB * 1024, Retention: base}
+			if !ownCron[tr.App+"/"] {
+				staleStore(readAppPolicy(tr.App).Volumes, tr.App+"/volumes")
+			}
 			switch {
 			case p.Excluded(tr.App, "volumes", ""):
 				t.Status, t.Reason = TargetExcluded, "excluded by policy"
@@ -361,7 +397,7 @@ func (c *Client) EnumerateFleet(ctx context.Context, p FleetPolicy) ([]FleetTarg
 			targets = append(targets, t)
 		}
 	}
-	return targets, uncovered, nil
+	return targets, uncovered, warnings, nil
 }
 
 // RunFleetTarget backs one target up and, only if that fully succeeded, prunes.
@@ -403,8 +439,26 @@ func (c *Client) RunFleetTarget(ctx context.Context, t FleetTarget, s3 S3Config,
 		return r
 	}
 	r.Status = TargetOK
+	// Nothing stored is no new copy: the run that made none is the last one to
+	// delete old ones. And a target that used to have backups and now has nothing
+	// to back up (every database dropped) is an outage, not a quiet success.
+	if len(res.Objects) == 0 {
+		rows, lerr := c.ListBackupsRecursive(ctx, t.App, s3)
+		switch {
+		case lerr != nil:
+			r.Status, r.Reason = TargetFailed, "stored nothing, and could not check for earlier backups: "+lerr.Error()
+		default:
+			for _, row := range rows {
+				if row.Accessory == t.Name && row.Restorable {
+					r.Status, r.Reason = TargetFailed, "this target has earlier backups and now holds nothing to back up: its databases are gone. Nothing was pruned"
+					break
+				}
+			}
+		}
+		return r
+	}
+	c.CleanStaleIncoming(ctx, t.App, s3)
 	if t.Retention.IsZero() {
-		c.CleanStaleIncoming(ctx, t.App, prefix, s3)
 		return r
 	}
 	deleted, perr := c.PruneBackups(ctx, t.App, prefix, s3, t.Retention)

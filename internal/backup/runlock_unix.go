@@ -52,7 +52,13 @@ func AcquireRunLock(path string, now time.Time, staleAfter time.Duration) (*RunL
 			f.Close()
 			return nil, holder, ErrRunLocked
 		}
-		// Alive, stuck and past every deadline it had: it will never let go.
+		// Alive, stuck and past every deadline it had: it will never let go. Its
+		// dumps and uploads run in process groups of their own, which would
+		// outlive it into the next run.
+		children := childPIDs(holder.PID)
+		for _, child := range children {
+			_ = syscall.Kill(-child, syscall.SIGKILL)
+		}
 		if killErr := syscall.Kill(holder.PID, syscall.SIGKILL); killErr != nil {
 			f.Close()
 			return nil, holder, fmt.Errorf("%w (pid %d has held it since %s and could not be stopped: %v)", ErrRunLocked, holder.PID, holder.StartedAt.Format(time.RFC3339), killErr)
@@ -92,6 +98,37 @@ func readRunLockHolder(path string) RunLockHolder {
 		_ = json.Unmarshal(b, &h)
 	}
 	return h
+}
+
+// childPIDs lists a process's direct children from /proc (none where there is no
+// /proc). Every child of a run leads its own group (ssh.localCommand's Setpgid).
+func childPIDs(pid int) []int {
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return nil
+	}
+	var out []int
+	for _, e := range entries {
+		p, err := strconv.Atoi(e.Name())
+		if err != nil {
+			continue
+		}
+		b, err := os.ReadFile("/proc/" + e.Name() + "/stat")
+		if err != nil {
+			continue
+		}
+		// pid (comm) state ppid ...: comm may hold spaces, so cut after the last ).
+		s := string(b)
+		i := strings.LastIndex(s, ")")
+		if i < 0 {
+			continue
+		}
+		f := strings.Fields(s[i+1:])
+		if len(f) >= 2 && f[1] == strconv.Itoa(pid) {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // isTeployProcess guards the kill against a recycled pid.

@@ -68,7 +68,13 @@ type StatusEntry struct {
 	Coverage string `json:"coverage"`
 	Reason   string `json:"reason,omitempty"`
 	// Schedule: policy | own (a per-app cron line) | none.
-	Schedule    string     `json:"schedule"`
+	Schedule string `json:"schedule"`
+	// ScheduleForm is the own line's form: run, or legacy (a pre-D3 shell line,
+	// which uploads plaintext whatever the policy says).
+	ScheduleForm string `json:"schedule_form,omitempty"`
+	// Encrypted says this entry's new objects will be encrypted: the server's
+	// setting, except for a legacy shell line.
+	Encrypted   bool       `json:"encrypted"`
 	LastSuccess *time.Time `json:"last_success,omitempty"`
 	LastFailure *time.Time `json:"last_failure,omitempty"`
 	// LastError is the last failure's message (event-log bounded, no secrets).
@@ -110,6 +116,8 @@ type StatusPolicy struct {
 	HeartbeatHosts []string       `json:"heartbeat_hosts,omitempty"`
 	// Recipient is the owner's recovery PUBLIC key.
 	Recipient string `json:"recipient,omitempty"`
+	// AllowEmpty says a run with zero targets is not a failure.
+	AllowEmpty bool `json:"allow_empty,omitempty"`
 }
 
 // StatusLastRun is the last `backup run --all`.
@@ -119,8 +127,10 @@ type StatusLastRun struct {
 	TargetsOK     int       `json:"targets_ok"`
 	TargetsFailed int       `json:"targets_failed"`
 	Omissions     []string  `json:"omissions,omitempty"`
-	Error         string    `json:"error,omitempty"`
-	Stale         bool      `json:"stale"`
+	// Warnings include prunes that were refused: backups stored, retention stopped.
+	Warnings []string `json:"warnings,omitempty"`
+	Error    string   `json:"error,omitempty"`
+	Stale    bool     `json:"stale"`
 }
 
 // FleetStatus is the whole report.
@@ -162,7 +172,7 @@ func ReadFleetStatus(ctx context.Context, exec ssh.Executor, now time.Time) (Fle
 	st.Policy = StatusPolicy{
 		Configured: policy.Configured(), Path: policy.Path, Interval: policy.Interval, Retention: policy.Retention,
 		Excludes: policy.Excludes, Adopted: policy.Adopted, Volumes: policy.Volumes, VolumeMaxGB: policy.VolumeMaxGB,
-		HeartbeatCount: len(policy.HeartbeatURLs), Recipient: policy.Recipient,
+		HeartbeatCount: len(policy.HeartbeatURLs), Recipient: policy.Recipient, AllowEmpty: policy.AllowEmpty,
 	}
 	for _, h := range MaskedHeartbeats(policy.HeartbeatURLs) {
 		st.Policy.HeartbeatHosts = append(st.Policy.HeartbeatHosts, strings.TrimSuffix(h, "/..."))
@@ -172,20 +182,23 @@ func ReadFleetStatus(ctx context.Context, exec ssh.Executor, now time.Time) (Fle
 		Configured: target.Bucket != "", Bucket: target.Bucket, Region: target.Region, Endpoint: target.Endpoint,
 		Prefix: target.Prefix, HasCredentials: target.HasCredentials, PreviousPrefixes: target.PreviousPrefixes,
 	}
-	if out, err := exec.Run(ctx, "command -v aws >/dev/null 2>&1 && echo aws; command -v age >/dev/null 2>&1 && echo age; true"); err == nil {
+	if out, err := exec.Run(ctx, "command -v aws >/dev/null 2>&1 && aws --version >/dev/null 2>&1 && echo aws; command -v age >/dev/null 2>&1 && echo age; true"); err == nil {
 		for _, t := range splitLines(out) {
 			st.AWSCLI = st.AWSCLI || t == "aws"
 			st.AgeCLI = st.AgeCLI || t == "age"
 		}
 	}
-	ownCron := map[string]bool{}
+	ownCron := map[string]string{}
 	if cron, err := ReadCrontab(ctx, exec); err == nil {
 		for _, line := range cron {
 			if m := FindCronMarker(line); m != nil {
 				if m.Kind == KindFleet {
 					st.Policy.CronInstalled = true
 				} else if m.Form != CronFormCustom {
-					ownCron[m.App+"/"+m.Accessory] = true
+					ownCron[m.App+"/"+m.Accessory] = m.Form
+					if m.Form == CronFormLegacy {
+						st.Warnings = append(st.Warnings, fmt.Sprintf("cron marker %s is a pre-D3 shell line that uploads plaintext whatever the policy says: rewrite it with `teploy server backup-target set`", m.Tag))
+					}
 				}
 			}
 		}
@@ -206,7 +219,10 @@ func ReadFleetStatus(ctx context.Context, exec ssh.Executor, now time.Time) (Fle
 		if region == "" {
 			region = "us-east-1"
 		}
-		cfg = S3Config{Bucket: target.Bucket, Region: region, Endpoint: target.Endpoint, Prefix: target.Prefix, StoredTarget: target.Path, PreviousPrefixes: target.PreviousPrefixes}
+		cfg = S3Config{Bucket: target.Bucket, Region: region, Endpoint: target.Endpoint, Prefix: target.Prefix, PreviousPrefixes: target.PreviousPrefixes}
+		if target.HasCredentials {
+			cfg.StoredTarget = target.Path
+		}
 	}
 	if target.Bucket != "" && st.AWSCLI {
 		if err := c.ProbeTarget(ctx, cfg); err != nil {
@@ -254,7 +270,14 @@ func ReadFleetStatus(ctx context.Context, exec ssh.Executor, now time.Time) (Fle
 	}
 
 	stale := 2 * policy.IntervalDuration()
+	// Covered means a restorable object exists now and is recent, not only that a
+	// run once said so: a wiped namespace, or a run that stored nothing, must not
+	// read as covered.
 	decide := func(e *StatusEntry, excluded bool, covered bool) {
+		limit := stale
+		if e.Schedule == "own" || limit == 0 {
+			limit = 48 * time.Hour
+		}
 		switch {
 		case excluded:
 			e.Coverage = CoverageExcluded
@@ -264,16 +287,20 @@ func ReadFleetStatus(ctx context.Context, exec ssh.Executor, now time.Time) (Fle
 			e.Coverage = CoverageFailing
 		case e.LastSuccess == nil:
 			e.Coverage, e.Reason = CoverageStale, "no backup has succeeded yet"
+		case now.Sub(*e.LastSuccess) > limit:
+			e.Coverage, e.Reason = CoverageStale, fmt.Sprintf("the last success is older than %s", limit)
+		case !st.Target.Reachable:
+			e.Coverage, e.Reason = CoverageStale, "the target did not answer, so whether a backup exists is unknown"
+		case e.Newest == nil:
+			e.Coverage, e.Reason = CoverageStale, "a run succeeded, but the bucket holds no restorable object for it"
 		default:
-			limit := stale
-			if e.Schedule == "own" || limit == 0 {
-				limit = 48 * time.Hour
-			}
-			if now.Sub(*e.LastSuccess) > limit {
-				e.Coverage, e.Reason = CoverageStale, fmt.Sprintf("the last success is older than %s", limit)
-			} else if e.Adopted {
+			created, err := time.Parse(time.RFC3339, e.Newest.CreatedAt)
+			switch {
+			case err != nil || now.Sub(created) > limit:
+				e.Coverage, e.Reason = CoverageStale, fmt.Sprintf("the newest restorable object is older than %s", limit)
+			case e.Adopted:
 				e.Coverage = CoverageAdopted
-			} else {
+			default:
 				e.Coverage = CoverageCovered
 			}
 		}
@@ -286,10 +313,14 @@ func ReadFleetStatus(ctx context.Context, exec ssh.Executor, now time.Time) (Fle
 		}
 		a, isAdopted := adopted[f.Name]
 		isAccessory := f.Role == "accessory" && f.App != "" && f.Accessory != "" && f.Name == ContainerName(f.App, f.Accessory)
-		if !isAdopted && !isAccessory && (f.EngineErr != nil || !f.Engine.IsDB()) {
+		if !isAdopted && !isAccessory && !f.DBLike() {
 			continue
 		}
-		e := StatusEntry{Name: f.Name, Engine: f.Engine.Engine, Detection: f.Engine.Source, State: f.State, Schedule: "none", Unmanaged: f.Unmanaged(), Adopted: isAdopted}
+		e := StatusEntry{Name: f.Name, Engine: f.Engine.Engine, Detection: f.Engine.Source, State: f.State, Schedule: "none", Unmanaged: f.Unmanaged(), Adopted: isAdopted, Encrypted: st.Encrypted}
+		unsupported := f.UnsupportedDatabase()
+		if unsupported != "" {
+			e.Engine, e.Detection = unsupported, "image-name"
+		}
 		var app, name string
 		switch {
 		case isAdopted:
@@ -309,8 +340,9 @@ func ReadFleetStatus(ctx context.Context, exec ssh.Executor, now time.Time) (Fle
 		switch {
 		case isAdopted:
 			covered, e.Schedule = policy.Configured(), "policy"
-		case isAccessory && ownCron[f.App+"/"+f.Accessory]:
-			covered, e.Schedule = true, "own"
+		case isAccessory && ownCron[f.App+"/"+f.Accessory] != "":
+			covered, e.Schedule, e.ScheduleForm = true, "own", ownCron[f.App+"/"+f.Accessory]
+			e.Encrypted = st.Encrypted && e.ScheduleForm != CronFormLegacy
 		case isAccessory && policy.Configured() && policy.Interval != "":
 			covered, e.Schedule = true, "policy"
 		}
@@ -320,7 +352,9 @@ func ReadFleetStatus(ctx context.Context, exec ssh.Executor, now time.Time) (Fle
 		}
 		decide(&e, excluded, covered)
 		if e.Coverage == CoverageUncovered && e.Reason == "" {
-			if e.Kind == "unmanaged" {
+			if unsupported != "" {
+				e.Reason = "teploy has no backup method for " + unsupported + ": back it up another way and exclude it"
+			} else if e.Kind == "unmanaged" {
 				e.Reason = "no policy entry covers this container (adopt it or exclude it)"
 			} else {
 				e.Reason = "no backup policy or schedule covers this accessory"
@@ -348,7 +382,7 @@ func ReadFleetStatus(ctx context.Context, exec ssh.Executor, now time.Time) (Fle
 			found = found || f.Name == a.Container
 		}
 		if !found {
-			e := StatusEntry{Name: a.Container, Kind: TargetAdopted, Accessory: a.Container, Engine: a.Engine, Adopted: true, Unmanaged: true, Schedule: "policy",
+			e := StatusEntry{Name: a.Container, Kind: TargetAdopted, Accessory: a.Container, Engine: a.Engine, Adopted: true, Unmanaged: true, Schedule: "policy", Encrypted: st.Encrypted,
 				Coverage: CoverageFailing, Reason: "adopted container does not exist on this server", State: "missing"}
 			fillEntryEvents(&e, logNS(AdoptedApp), a.Container)
 			fillEntryObjects(&e, listNS(AdoptedApp), a.Container)
@@ -359,13 +393,14 @@ func ReadFleetStatus(ctx context.Context, exec ssh.Executor, now time.Time) (Fle
 		st.Warnings = append(st.Warnings, err.Error())
 	} else {
 		for _, tr := range trees {
-			e := StatusEntry{Name: tr.App + "/volumes", Kind: TargetVolumes, App: tr.App, Schedule: "none", SizeBytes: tr.KB * 1024}
+			e := StatusEntry{Name: tr.App + "/volumes", Kind: TargetVolumes, App: tr.App, Schedule: "none", SizeBytes: tr.KB * 1024, Encrypted: st.Encrypted}
 			guard := policy.VolumeMaxGB > 0 && float64(e.SizeBytes) > policy.VolumeMaxGB*(1<<30)
 			excluded := policy.Excluded(tr.App, "volumes", "") || guard
 			covered := false
 			switch {
-			case ownCron[tr.App+"/"]:
-				covered, e.Schedule = true, "own"
+			case ownCron[tr.App+"/"] != "":
+				covered, e.Schedule, e.ScheduleForm = true, "own", ownCron[tr.App+"/"]
+				e.Encrypted = st.Encrypted && e.ScheduleForm != CronFormLegacy
 			case policy.Volumes && policy.Interval != "":
 				covered, e.Schedule = true, "policy"
 			}
@@ -384,19 +419,14 @@ func ReadFleetStatus(ctx context.Context, exec ssh.Executor, now time.Time) (Fle
 			continue
 		}
 		run := &StatusLastRun{At: ev.TS, Status: detailString(ev.Detail, "status"), TargetsOK: detailInt(ev.Detail, "targets_ok"), TargetsFailed: detailInt(ev.Detail, "targets_failed"), Error: detailString(ev.Detail, "error")}
-		if list, ok := ev.Detail["omissions"].([]any); ok {
-			for _, o := range list {
-				if s, ok := o.(string); ok {
-					run.Omissions = append(run.Omissions, s)
-				}
-			}
-		}
+		run.Omissions = detailStrings(ev.Detail, "omissions")
+		run.Warnings = detailStrings(ev.Detail, "warnings")
 		st.LastRun = run
 	}
 	if st.LastRun != nil && stale > 0 && now.Sub(st.LastRun.At) > stale {
 		st.LastRun.Stale = true
 	}
-	if out, err := exec.Run(ctx, LeftoverWorkspacesProbe()); err == nil {
+	if out, err := exec.Run(ctx, LeftoverWorkspacesProbe(policy.TmpDir)); err == nil {
 		st.LeftoverWorkspaces = splitLines(out)
 	}
 	sort.Strings(st.UncoveredDatabases)
@@ -428,7 +458,9 @@ func (c *Client) statusUncovered(ctx context.Context, app, name string, f *Conta
 }
 
 // fillEntryEvents sets the success, failure and verify facts from an event log.
-// name is the accessory ("" for an app's volumes). Events are oldest first.
+// name is the accessory ("" for an app's volumes). Events are oldest first. Only
+// runs of what covers this entry count: a pre-restore safety backup of one database
+// or a manual one must not mask a failing --all.
 func fillEntryEvents(e *StatusEntry, evs []events.Event, name string) {
 	for _, ev := range evs {
 		acc := detailString(ev.Detail, "accessory")
@@ -438,6 +470,12 @@ func fillEntryEvents(e *StatusEntry, evs []events.Event, name string) {
 		switch ev.Kind {
 		case events.KindBackupRun:
 			if name == "" && detailString(ev.Detail, "kind") != KindVolumes {
+				continue
+			}
+			if detailString(ev.Detail, "trigger") != "" {
+				continue
+			}
+			if managed, _ := ev.Detail["policy_managed"].(bool); e.Schedule == "policy" && !managed {
 				continue
 			}
 			ts := ev.TS
@@ -484,9 +522,10 @@ func fillEntryObjects(e *StatusEntry, rows []ListedBackup, name string) {
 		}
 	}
 	sort.Slice(e.Databases, func(i, j int) bool { return e.Databases[i].Name < e.Databases[j].Name })
-	// Without any event yet, a good object is still evidence of a success: the
-	// history may predate the event log.
-	if e.LastSuccess == nil && e.Newest != nil {
+	// With no event either way, a good object is still evidence of a success: the
+	// history may predate the event log. Never next to a recorded failure: a safety
+	// copy newer than a failing run would hide it.
+	if e.LastSuccess == nil && e.LastFailure == nil && e.Newest != nil {
 		if t, err := time.Parse(time.RFC3339, e.Newest.CreatedAt); err == nil {
 			e.LastSuccess = &t
 		}
@@ -498,6 +537,18 @@ func detailString(d map[string]any, k string) string {
 		return s
 	}
 	return ""
+}
+
+func detailStrings(d map[string]any, k string) []string {
+	var out []string
+	if list, ok := d[k].([]any); ok {
+		for _, o := range list {
+			if s, ok := o.(string); ok {
+				out = append(out, s)
+			}
+		}
+	}
+	return out
 }
 
 func detailInt(d map[string]any, k string) int {

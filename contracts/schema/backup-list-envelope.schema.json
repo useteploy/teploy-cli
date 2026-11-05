@@ -97,7 +97,7 @@
           },
           "database": {
             "type": "string",
-            "description": "Present on one database's own object (rev 17)."
+            "description": "Present on one database's own object, only with `backup list --databases` or --adopted (rev 17): a caller must pass it as `restore --database`, or it would replace the primary."
           },
           "encrypted": {
             "type": "boolean",

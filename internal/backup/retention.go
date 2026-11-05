@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -34,6 +35,8 @@ type RetentionPolicy struct {
 	KeepWeekly  int
 	KeepMonthly int
 	MaxAgeDays  int
+	// IgnoreClock lets a prune run despite a clock disagreement (--ignore-clock).
+	IgnoreClock bool
 }
 
 // IsZero reports whether the policy prunes nothing.
@@ -192,9 +195,24 @@ type pruneObject struct {
 type pruneTree struct {
 	root     []pruneObject            // primary objects
 	series   map[string][]pruneObject // databases/<db>/<id>: per-database objects
-	sidecars []pruneObject            // globals/, meta/, databases/<db>/meta/, teploy/ siblings
-	incoming []pruneObject            // verification-pending uploads
+	sidecars []pruneObject            // globals/, meta/, safety/, databases/<db>/meta/, teploy/ siblings
+	incoming []pruneObject            // verification-pending uploads, at any depth
+	// safety are ids of safety copies a destructive operation took, by the time
+	// they were taken: protected for safetyWindow.
+	safety map[string]time.Time
 }
+
+// safetyWindow is how long a safety copy outlasts every retention rule: long enough
+// to notice that a restore or an upgrade went wrong, and go back.
+const safetyWindow = 7 * 24 * time.Hour
+
+// safetyDir marks an id as a safety copy: <prefix>/safety/<id>.safety.
+const safetyDir = "safety"
+
+// maxClockSkew is how far this machine's clock may be from the store's, and an
+// object's date from now, before a prune refuses: selection is all arithmetic on
+// those two numbers, and a wrong clock deletes real backups with a clean status.
+const maxClockSkew = time.Hour
 
 func idOf(file string) string {
 	id, _, _ := strings.Cut(file, ".")
@@ -204,7 +222,7 @@ func idOf(file string) string {
 // loadPruneTree lists the prefix across the current location and owned previous
 // ones. Anything it does not recognise is never touched.
 func (c *Client) loadPruneTree(ctx context.Context, app, prefix string, s3 S3Config) (pruneTree, error) {
-	tree := pruneTree{series: map[string][]pruneObject{}}
+	tree := pruneTree{series: map[string][]pruneObject{}, safety: map[string]time.Time{}}
 	for _, loc := range s3.locations() {
 		if loc.isPrevious && !loc.previousOwned {
 			continue
@@ -231,10 +249,13 @@ func (c *Client) loadPruneTree(ctx context.Context, app, prefix string, s3 S3Con
 			e.bad = k.Size < artifactFloor(file)
 			obj := pruneObject{key: "s3://" + loc.Bucket + "/" + k.Key, id: idOf(file), entry: e, loc: loc}
 			switch {
+			case slices.Contains(segs, incomingDir):
+				tree.incoming = append(tree.incoming, obj)
 			case len(segs) == 1:
 				tree.root = append(tree.root, obj)
-			case segs[0] == incomingDir:
-				tree.incoming = append(tree.incoming, obj)
+			case len(segs) == 2 && segs[0] == safetyDir:
+				tree.safety[obj.id] = e.time
+				tree.sidecars = append(tree.sidecars, obj)
 			case len(segs) == 3 && segs[0] == "databases":
 				obj.entry.name = segs[1] + "/" + file
 				tree.series[segs[1]] = append(tree.series[segs[1]], obj)
@@ -257,7 +278,12 @@ func (c *Client) loadPruneTree(ctx context.Context, app, prefix string, s3 S3Con
 				}
 				segs := strings.Split(k.Key, "/")
 				if e, ok := newBackupEntry(segs[len(segs)-1]); ok {
-					tree.sidecars = append(tree.sidecars, pruneObject{key: "s3://" + loc.Bucket + "/" + k.Key, id: idOf(segs[len(segs)-1]), entry: e, loc: loc})
+					obj := pruneObject{key: "s3://" + loc.Bucket + "/" + k.Key, id: idOf(segs[len(segs)-1]), entry: e, loc: loc}
+					if slices.Contains(segs, incomingDir) {
+						tree.incoming = append(tree.incoming, obj)
+					} else {
+						tree.sidecars = append(tree.sidecars, obj)
+					}
 				}
 			}
 		}
@@ -275,49 +301,49 @@ func entriesOf(objs []pruneObject) []backupEntry {
 
 // planPrune decides what goes:
 //
-//   - With primary objects, the primary series is selected by the policy; each
-//     database's objects follow their id's fate, except that a database's newest
-//     good object always stays (a database whose dump has been failing keeps its
-//     last good copy) and ids newer than the newest primary stay (a killed run's
-//     extras are harmless until a newer primary supersedes them).
-//   - Without primary objects (adopted containers), each database is its own
-//     series, selected by the policy.
+//   - The primary series and each database's series are each selected by the
+//     policy on their own: a database failing in the last run of each day still
+//     gets its keep_daily, and a primary that disappeared and came back does not
+//     decide a database's history.
+//   - An id the primary series keeps is also kept in every database's series (a
+//     consistent point in time), as an extra keep and never a reason to delete.
+//   - A safety copy a destructive operation took outlasts every rule for
+//     safetyWindow.
 //   - Sidecars go when no surviving object has their id and they are older than
 //     the newest backup.
 func planPrune(tree pruneTree, p RetentionPolicy, now time.Time) (primaries, sidecars []pruneObject) {
 	surviving := map[string]bool{}
-	byName := func(objs []pruneObject, del []string) []pruneObject {
-		names := map[string]bool{}
-		for _, n := range del {
-			names[n] = true
-		}
+	protected := func(id string) bool {
+		t, ok := tree.safety[id]
+		return ok && now.Sub(t) < safetyWindow
+	}
+	pick := func(objs []pruneObject, keepToo func(pruneObject) bool) []pruneObject {
+		del := selectForDeletion(entriesOf(objs), p, now)
 		byEntry := map[string]pruneObject{}
 		for _, o := range objs {
-			if names[o.entry.name] {
-				byEntry[o.entry.name] = o
-			} else {
-				surviving[o.id] = true
-			}
+			byEntry[o.entry.name] = o
 		}
+		doomed := map[string]bool{}
 		out := make([]pruneObject, 0, len(del))
 		for _, n := range del { // the selection's order: newest first
-			if o, ok := byEntry[n]; ok {
-				out = append(out, o)
+			o := byEntry[n]
+			if protected(o.id) || (keepToo != nil && keepToo(o)) {
+				continue
+			}
+			doomed[n] = true
+			out = append(out, o)
+		}
+		for _, o := range objs {
+			if !doomed[o.entry.name] {
+				surviving[o.id] = true
 			}
 		}
 		return out
 	}
-	rootEntries := entriesOf(tree.root)
-	primaries = byName(tree.root, selectForDeletion(rootEntries, p, now))
+	primaries = pick(tree.root, nil)
 	rootKept := map[string]bool{}
-	var newestRoot time.Time
-	for _, o := range tree.root {
-		if surviving[o.id] {
-			rootKept[o.id] = true
-		}
-		if !o.entry.bad && o.entry.time.After(newestRoot) {
-			newestRoot = o.entry.time
-		}
+	for id := range surviving {
+		rootKept[id] = true
 	}
 	dbs := make([]string, 0, len(tree.series))
 	for db := range tree.series {
@@ -325,20 +351,7 @@ func planPrune(tree pruneTree, p RetentionPolicy, now time.Time) (primaries, sid
 	}
 	sort.Strings(dbs)
 	for _, db := range dbs {
-		objs := tree.series[db]
-		if newestRoot.IsZero() {
-			primaries = append(primaries, byName(objs, selectForDeletion(entriesOf(objs), p, now))...)
-			continue
-		}
-		keep := selectKept(entriesOf(objs), RetentionPolicy{}, now) // the newest good one
-		var del []string
-		for _, o := range objs {
-			if rootKept[o.id] || keep[o.entry.name] || !o.entry.time.Before(newestRoot) {
-				continue
-			}
-			del = append(del, o.entry.name)
-		}
-		primaries = append(primaries, byName(objs, del)...)
+		primaries = append(primaries, pick(tree.series[db], func(o pruneObject) bool { return rootKept[o.id] })...)
 	}
 	var newest time.Time
 	for _, objs := range append([][]pruneObject{tree.root}, seriesValues(tree.series)...) {
@@ -370,27 +383,58 @@ func seriesValues(m map[string][]pruneObject) [][]pruneObject {
 	return out
 }
 
-// CleanStaleIncoming removes pending uploads a killed run left under a prefix.
-// Prune does this too; this is for a target with no retention rule. Best effort.
-func (c *Client) CleanStaleIncoming(ctx context.Context, app, prefix string, s3 S3Config) {
-	tree, err := c.loadPruneTree(ctx, app, prefix, s3)
+// CleanStaleIncoming removes pending uploads a killed run left anywhere in a
+// namespace, DR bundles included, whatever its retention. Best effort, and only in
+// a namespace this server alone writes to.
+func (c *Client) CleanStaleIncoming(ctx context.Context, app string, s3 S3Config) {
+	owners, err := c.namespaceOwners(ctx, s3, app)
+	fp := c.fingerprint(ctx)
+	if err != nil || fp == "" || slices.ContainsFunc(owners, func(o string) bool { return o != fp }) {
+		return
+	}
+	keys, err := c.listTree(ctx, s3, app+"/")
 	if err != nil {
 		return
 	}
 	now := time.Now().UTC()
-	for _, o := range tree.incoming {
-		if now.Sub(o.entry.time) > tmpLeftoverMinutes*time.Minute {
-			c.exec.Run(ctx, o.loc.AWS("s3 rm "+ssh.ShellQuote(o.key)))
+	for _, k := range keys {
+		segs := strings.Split(k.Key, "/")
+		if !slices.Contains(segs, incomingDir) {
+			continue
+		}
+		if e, ok := newBackupEntry(segs[len(segs)-1]); ok && now.Sub(e.time) > tmpLeftoverMinutes*time.Minute {
+			c.exec.Run(ctx, s3.AWS("s3 rm "+ssh.ShellQuote("s3://"+s3.Bucket+"/"+k.Key)))
 		}
 	}
 }
 
+// ErrClockSkew marks a prune refused because dates cannot be trusted.
+var ErrClockSkew = errors.New("clock disagreement")
+
+// checkPruneClock refuses arithmetic on dates that cannot be right: this machine's
+// clock against the store's, and any backup dated in the future.
+func checkPruneClock(tree pruneTree, storeNow, now time.Time) error {
+	if !storeNow.IsZero() {
+		if d := now.Sub(storeNow); d > maxClockSkew || d < -maxClockSkew {
+			return fmt.Errorf("%w: this machine's clock says %s and the store's says %s, so nothing was pruned (a wrong clock deletes real backups). Fix the clock, or pass --ignore-clock", ErrClockSkew, now.Format(time.RFC3339), storeNow.Format(time.RFC3339))
+		}
+	}
+	for _, objs := range append([][]pruneObject{tree.root}, seriesValues(tree.series)...) {
+		for _, o := range objs {
+			if o.entry.time.Sub(now) > maxClockSkew {
+				return fmt.Errorf("%w: %s is dated in the future (now %s), and would count as the newest backup, so nothing was pruned. Remove it if it is wrong, or pass --ignore-clock", ErrClockSkew, o.key, now.Format(time.RFC3339))
+			}
+		}
+	}
+	return nil
+}
+
 // PruneBackups deletes backups under s3://<base>/<app>/<prefix>/ that fall
 // outside the retention policy, with every sidecar they keep beside them,
-// returning the deleted backups' names. A zero policy is a no-op. A namespace
-// another server also writes to is refused. A refused delete (bucket locks,
-// keys without delete rights) does not stop the rest: errors are returned
-// together with what was deleted.
+// returning the deleted backups' names. A zero policy is a no-op. A namespace this
+// server cannot prove is its alone is refused, and so is a clock that cannot be
+// trusted. A refused delete (bucket locks, keys without delete rights) does not
+// stop the rest: errors are returned together with what was deleted.
 func (c *Client) PruneBackups(ctx context.Context, app, prefix string, s3 S3Config, p RetentionPolicy) ([]string, error) {
 	if p.IsZero() {
 		return nil, nil
@@ -398,17 +442,40 @@ func (c *Client) PruneBackups(ctx context.Context, app, prefix string, s3 S3Conf
 	if err := c.ensureAWSCLI(ctx); err != nil {
 		return nil, err
 	}
-	if err := c.checkNamespaceOwner(ctx, s3, app); err != nil {
-		return nil, err
-	}
-	tree, err := c.loadPruneTree(ctx, app, prefix, s3)
+	storeNow, err := c.claimNamespace(ctx, s3, app)
 	if err != nil {
 		return nil, err
 	}
-	primaries, sidecars := planPrune(tree, p, time.Now().UTC())
+	// A previous location is checked on its own: owned means this server's old
+	// objects, and a marker from another server there overrides that word.
+	var errs []error
+	cfg := s3
+	cfg.PreviousPrefixes = nil
+	for _, prev := range s3.PreviousPrefixes {
+		if !prev.Owned {
+			continue
+		}
+		loc := s3
+		loc.Prefix, loc.PreviousPrefixes = prev.Prefix, nil
+		if _, cerr := c.claimNamespace(ctx, loc, app); cerr != nil {
+			errs = append(errs, cerr)
+			continue
+		}
+		cfg.PreviousPrefixes = append(cfg.PreviousPrefixes, prev)
+	}
+	tree, err := c.loadPruneTree(ctx, app, prefix, cfg)
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now().UTC()
+	if !p.IgnoreClock {
+		if err := checkPruneClock(tree, storeNow, now); err != nil {
+			return nil, err
+		}
+	}
+	primaries, sidecars := planPrune(tree, p, now)
 
 	var deleted []string
-	var errs []error
 	for _, o := range primaries {
 		if _, err := c.exec.Run(ctx, o.loc.AWS("s3 rm "+ssh.ShellQuote(o.key))); err != nil {
 			errs = append(errs, fmt.Errorf("deleting %s: %w", o.key, err))

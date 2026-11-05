@@ -3,6 +3,7 @@ package backup
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"net/url"
@@ -102,6 +103,13 @@ type FleetPolicy struct {
 	// Recipient is the owner's recovery public key (`teploy backup keygen`).
 	// With one, every object is encrypted to it and the server's own identity.
 	Recipient string `json:"recipient,omitempty"`
+	// AllowEmpty says a run with nothing to back up is fine. Without it, zero
+	// targets is a failure: a lost accessory and an empty docker daemon look the same.
+	AllowEmpty bool `json:"allow_empty,omitempty"`
+	// TmpDir builds backups on another disk. The janitor and doctor look there too.
+	TmpDir string `json:"tmp_dir,omitempty"`
+	// TargetDeadline replaces the 6h deadline of one target ("12h").
+	TargetDeadline string `json:"target_deadline,omitempty"`
 
 	// Path is where the policy was read from (diagnostics only).
 	Path string `json:"-"`
@@ -128,6 +136,14 @@ func (p FleetPolicy) Validate() error {
 	if p.Recipient != "" {
 		if err := ValidateRecipient(p.Recipient); err != nil {
 			return err
+		}
+	}
+	if p.TmpDir != "" && !tmpDirRE.MatchString(p.TmpDir) {
+		return fmt.Errorf("tmp_dir must be an absolute path of letters, digits and . _ - /")
+	}
+	if p.TargetDeadline != "" {
+		if d, err := time.ParseDuration(p.TargetDeadline); err != nil || d <= 0 {
+			return fmt.Errorf("target_deadline must be a positive duration such as 12h")
 		}
 	}
 	for _, e := range p.Excludes {
@@ -163,6 +179,8 @@ func (p FleetPolicy) Validate() error {
 	}
 	return nil
 }
+
+var tmpDirRE = regexp.MustCompile(`^/[A-Za-z0-9._/-]+$`)
 
 var containerNameRE = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,254}$`)
 
@@ -246,20 +264,42 @@ func IntervalCron(interval, seed string) (string, error) {
 	return fmt.Sprintf("%d %d * * 0", m, hour), nil
 }
 
-// readPolicyScript prints "absent" or "path <p>\n<contents>". A file that exists
-// and cannot be read is a failure, not an absence: a non-root CLI user reading
-// "no policy" from a root-owned file would upload plaintext.
-const readPolicyScript = `for p in /etc/teploy/backup-policy.json "$HOME"/.config/teploy/backup-policy.json; do
+// policyReadMarker starts readPolicyScript.
+const policyReadMarker = `if [ -d /etc/teploy ] && [ ! -x /etc/teploy ]; then`
+
+// readPolicyScript prints "absent" or "path <p>\n<contents>", or exits 3 when it
+// cannot tell. Root keeps /etc/teploy 0700, and to a non-root user a file in there
+// does not even exist (`[ -e ]` is false): it read as "no policy", which cleared
+// the recipient and uploaded plaintext on a server configured to encrypt. So an
+// untraversable /etc/teploy is asked through passwordless sudo when that works
+// (deploy users usually have it, cron included); a user with its own policy in
+// ~/.config has made its choice; anyone else gets a refusal, never a guess.
+const readPolicyScript = policyReadMarker + `
+  if command -v sudo >/dev/null 2>&1 && s=$(sudo -n sh -c 'if [ -e /etc/teploy/backup-policy.json ]; then echo present; cat /etc/teploy/backup-policy.json; else echo absent; fi' 2>/dev/null); then
+    case "$s" in present*) printf 'path /etc/teploy/backup-policy.json\n%s\n' "${s#present}"; exit 0;; esac
+  elif [ ! -e "$HOME"/.config/teploy/backup-policy.json ]; then
+    echo "cannot tell whether this server's backups must be encrypted: /etc/teploy is not readable by $(id -un). Connect as root, give this user passwordless sudo, run on the server: chmod 711 /etc/teploy, or set this user's own policy (teploy server backup-policy set)" >&2
+    exit 3
+  fi
+fi
+for p in /etc/teploy/backup-policy.json "$HOME"/.config/teploy/backup-policy.json; do
 if [ -e "$p" ] && [ ! -r "$p" ]; then echo "cannot read $p: run as its owner" >&2; exit 3; fi
 if [ -r "$p" ]; then printf 'path %s\n' "$p"; cat "$p"; exit 0; fi
 done
 echo absent`
+
+// ErrPolicyHidden means a policy may exist that this user cannot read, so whether
+// backups must be encrypted is unknown: everything fails closed on it.
+var ErrPolicyHidden = errors.New("the backup policy cannot be read")
 
 // ReadFleetPolicy loads the server's policy. No policy is (FleetPolicy{}, nil).
 func ReadFleetPolicy(ctx context.Context, exec ssh.Executor) (FleetPolicy, error) {
 	res := ssh.RunDetailed(ctx, exec, readPolicyScript)
 	if res.Err != nil {
 		return FleetPolicy{}, fmt.Errorf("reading the backup policy: %w", res.Err)
+	}
+	if res.ExitCode == 3 {
+		return FleetPolicy{}, fmt.Errorf("%w: %s", ErrPolicyHidden, oneLine(res.ExitErrorText()))
 	}
 	if res.ExitCode != 0 {
 		return FleetPolicy{}, fmt.Errorf("reading the backup policy: %s", res.ExitErrorText())

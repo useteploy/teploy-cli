@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/useteploy/teploy/internal/backup"
@@ -126,15 +127,19 @@ func TargetS3(t backup.Target) backup.S3Config {
 	if region == "" {
 		region = "us-east-1"
 	}
-	return backup.S3Config{
-		Bucket:       t.Bucket,
-		Region:       region,
-		Endpoint:     t.Endpoint,
-		Prefix:       t.Prefix,
-		StoredTarget: t.Path,
-
+	cfg := backup.S3Config{
+		Bucket:           t.Bucket,
+		Region:           region,
+		Endpoint:         t.Endpoint,
+		Prefix:           t.Prefix,
 		PreviousPrefixes: t.PreviousPrefixes,
 	}
+	// Only with credentials: the stored path decrypts them, and a --no-credentials
+	// target has none, so every command through it failed.
+	if t.HasCredentials {
+		cfg.StoredTarget = t.Path
+	}
+	return cfg
 }
 
 // s3Config assembles the legacy flag-driven target. --endpoint switches the
@@ -218,6 +223,7 @@ func newBackupCreateCmd(flags *Flags) *cobra.Command {
 		tf         backupTargetFlags
 		keepLast   int
 		maxAgeDays int
+		deadline   time.Duration
 	)
 
 	cmd := &cobra.Command{
@@ -225,7 +231,7 @@ func newBackupCreateCmd(flags *Flags) *cobra.Command {
 		Short: "Create a volume or accessory backup",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runBackupCreate(flags, appName, accessory, database, adopted, &tf, keepLast, maxAgeDays)
+			return runBackupCreate(flags, appName, accessory, database, adopted, &tf, keepLast, maxAgeDays, deadline)
 		},
 	}
 
@@ -233,13 +239,14 @@ func newBackupCreateCmd(flags *Flags) *cobra.Command {
 	cmd.Flags().StringVar(&accessory, "accessory", "", "back up this accessory instead of the app's volumes")
 	cmd.Flags().StringVar(&database, "database", "", "back up only this database of the accessory")
 	cmd.Flags().BoolVar(&adopted, "adopted", false, "--accessory names an adopted container (see `server backup-policy`), addressed by its docker name (requires --host)")
+	cmd.Flags().DurationVar(&deadline, "deadline", 0, "deadline of this backup (default 6h)")
 	addBackupTargetFlags(cmd, &tf)
 	addRetentionFlags(cmd, &keepLast, &maxAgeDays)
 
 	return cmd
 }
 
-func runBackupCreate(flags *Flags, appName, accessory, database string, adopted bool, tf *backupTargetFlags, keepLast, maxAgeDays int) error {
+func runBackupCreate(flags *Flags, appName, accessory, database string, adopted bool, tf *backupTargetFlags, keepLast, maxAgeDays int, deadline time.Duration) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 	if adopted && accessory == "" {
@@ -261,6 +268,7 @@ func runBackupCreate(flags *Flags, appName, accessory, database string, adopted 
 	}
 
 	client := backup.NewClient(executor, backupProgressOut(flags))
+	client.SetDeadline(deadline)
 
 	var res backup.BackupResult
 	var kind string
@@ -404,19 +412,24 @@ type backupScheduleDTO struct {
 
 func newBackupListCmd(flags *Flags) *cobra.Command {
 	var (
-		appName string
-		adopted bool
-		tf      backupTargetFlags
+		appName   string
+		adopted   bool
+		databases bool
+		tf        backupTargetFlags
 	)
 
 	cmd := &cobra.Command{
 		Use:   "list",
 		Short: "List available backups and schedules",
-		Args:  cobra.NoArgs,
+		Long: "--databases also lists each database's own objects. They are off by default:\n" +
+			"a row carries a database that a caller must pass as `restore --database`, and\n" +
+			"a caller that restores by id alone would replace the primary with the wrong one.",
+		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runBackupList(flags, appName, adopted, &tf)
+			return runBackupList(flags, appName, adopted, databases, &tf)
 		},
 	}
+	cmd.Flags().BoolVar(&databases, "databases", false, "also list each database's own objects (their rows carry \"database\")")
 
 	cmd.Flags().StringVar(&appName, "app", "", "app name — act on server state instead of teploy.yml (requires --host)")
 	cmd.Flags().BoolVar(&adopted, "adopted", false, "list adopted containers' backups instead of an app's (requires --host)")
@@ -425,7 +438,7 @@ func newBackupListCmd(flags *Flags) *cobra.Command {
 	return cmd
 }
 
-func runBackupList(flags *Flags, appName string, adopted bool, tf *backupTargetFlags) error {
+func runBackupList(flags *Flags, appName string, adopted, databases bool, tf *backupTargetFlags) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
@@ -445,9 +458,8 @@ func runBackupList(flags *Flags, appName string, adopted bool, tf *backupTargetF
 	if err != nil {
 		return err
 	}
-	if rows == nil {
-		rows = []backup.ListedBackup{}
-	}
+	// An adopted container's backups are all per-database rows.
+	rows, hidden := filterDatabaseRows(rows, databases || adopted)
 	schedules, err := discoverBackupSchedules(ctx, executor, appCfg.App)
 	if err != nil {
 		return err
@@ -478,6 +490,9 @@ func runBackupList(flags *Flags, appName string, adopted bool, tf *backupTargetF
 		})
 	}
 
+	if hidden > 0 {
+		fmt.Printf("%d per-database object(s) not shown: --databases lists them\n", hidden)
+	}
 	if len(rows) == 0 && len(schedules) == 0 {
 		fmt.Println("No backups or schedules found")
 		return nil
@@ -507,6 +522,20 @@ func runBackupList(flags *Flags, appName string, adopted bool, tf *backupTargetF
 		fmt.Printf("%s  %-18s %10d bytes  %s\n", b.CreatedAt, label, b.SizeBytes, b.Key)
 	}
 	return nil
+}
+
+// filterDatabaseRows drops per-database rows unless asked for, reporting how many.
+func filterDatabaseRows(rows []backup.ListedBackup, keep bool) ([]backup.ListedBackup, int) {
+	out := []backup.ListedBackup{}
+	hidden := 0
+	for _, r := range rows {
+		if r.Database != "" && !keep {
+			hidden++
+			continue
+		}
+		out = append(out, r)
+	}
+	return out, hidden
 }
 
 // discoverBackupSchedules reads the crontab's teploy backup markers and
@@ -593,7 +622,10 @@ func newBackupRestoreCmd(flags *Flags) *cobra.Command {
 			"Before anything changes a fresh backup of what is about to be replaced is\n" +
 			"taken; if that fails the restore is refused, unless --no-backup.\n\n" +
 			"--adopted addresses a container by its docker name (no app, so nothing is\n" +
-			"stopped for you: stop what uses it first), one database at a time.",
+			"stopped for you: stop what uses it first), one database at a time.\n\n" +
+			"--identity is the recovery key file, for a host without the identity that\n" +
+			"encrypted the backup. It is placed on the server privately for this restore\n" +
+			"and removed afterwards.",
 		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			date := ""
@@ -625,6 +657,8 @@ func newBackupRestoreCmd(flags *Flags) *cobra.Command {
 	cmd.Flags().BoolVar(&opts.ignoreSpace, "ignore-space-check", false, "skip the free-space preflight")
 	cmd.Flags().BoolVar(&opts.noBackup, "no-backup", false, "skip the automatic backup taken before the restore")
 	cmd.Flags().BoolVar(&adopted, "adopted", false, "--accessory names an adopted container (requires --host)")
+	cmd.Flags().StringVar(&opts.identity, "identity", "", "recovery key file, to decrypt a backup this host's identity cannot")
+	cmd.Flags().DurationVar(&opts.deadline, "deadline", 0, "deadline of the backup taken first, and of the restore (default 6h each)")
 
 	return cmd
 }
@@ -632,11 +666,12 @@ func newBackupRestoreCmd(flags *Flags) *cobra.Command {
 // restoreFlags are the accessory-restore options of `backup restore`.
 type restoreFlags struct {
 	release, rollback, ignoreSpace, force, noBackup bool
-	recoveryDatabase, database                      string
+	recoveryDatabase, database, identity            string
+	deadline                                        time.Duration
 }
 
 func (o *restoreFlags) restoreOptions() backup.RestoreOptions {
-	return backup.RestoreOptions{IgnoreSpaceCheck: o.ignoreSpace, Database: o.database, NoPreBackup: o.noBackup}
+	return backup.RestoreOptions{IgnoreSpaceCheck: o.ignoreSpace, Database: o.database, NoPreBackup: o.noBackup, IdentityFile: o.identity, Deadline: o.deadline}
 }
 
 func (o *restoreFlags) validate(date, accessory string) error {
@@ -653,6 +688,8 @@ func (o *restoreFlags) validate(date, accessory string) error {
 		return fmt.Errorf("--ignore-space-check applies to a restore, not to --release/--rollback")
 	case action && o.noBackup:
 		return fmt.Errorf("--no-backup applies to a restore, not to --release/--rollback")
+	case action && o.identity != "":
+		return fmt.Errorf("--identity applies to a restore, not to --release/--rollback")
 	case o.force && !o.release:
 		return fmt.Errorf("--force applies to --release")
 	case !action && date == "":
@@ -681,6 +718,12 @@ func runBackupRestoreWith(flags *Flags, appName, accessory string, adopted bool,
 	if err != nil {
 		return err
 	}
+	identityPath, cleanupIdentity, err := placeIdentity(ctx, executor, restoreOpts.IdentityFile)
+	if err != nil {
+		return err
+	}
+	defer cleanupIdentity()
+	cfg.ExtraIdentity = identityPath
 	if err := backup.ValidateDate(date); err != nil {
 		return err
 	}
@@ -717,6 +760,7 @@ func runBackupRestoreWith(flags *Flags, appName, accessory string, adopted bool,
 
 	progress := backupProgressOut(flags)
 	client := backup.NewClient(executor, progress)
+	client.SetDeadline(restoreOpts.Deadline)
 	if err := applyAdoptedEngine(ctx, client, executor, appCfg.App, accessory); err != nil {
 		return err
 	}
@@ -762,7 +806,7 @@ func runBackupRestoreWith(flags *Flags, appName, accessory string, adopted bool,
 	}
 	// A fresh copy of what is about to be replaced, before anything stops.
 	if !restoreOpts.NoPreBackup {
-		id, pErr := preOperationBackup(ctx, client, executor, appCfg.App, accessory, restoreOpts.Database, cfg, "this restore")
+		id, pErr := preOperationBackup(ctx, client, executor, appCfg.App, accessory, cfg, "this restore", preBackupScope{Database: restoreOpts.Database, IgnoreSpace: restoreOpts.IgnoreSpaceCheck})
 		if pErr != nil {
 			return finishRestoreFailure(flags, ctx, executor, lc, lk, dto, false, nil, pErr)
 		}
@@ -1062,13 +1106,14 @@ func restorePrompt(app, accessory, database, date string) string {
 
 func newBackupPruneCmd(flags *Flags) *cobra.Command {
 	var (
-		appName    string
-		adopted    bool
-		tf         backupTargetFlags
-		accessory  string
-		keepLast   int
-		maxAgeDays int
-		gfs        backup.FleetRetention
+		appName     string
+		adopted     bool
+		tf          backupTargetFlags
+		accessory   string
+		keepLast    int
+		maxAgeDays  int
+		gfs         backup.FleetRetention
+		ignoreClock bool
 	)
 
 	cmd := &cobra.Command{
@@ -1082,7 +1127,9 @@ func newBackupPruneCmd(flags *Flags) *cobra.Command {
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			gfs.KeepLast, gfs.MaxAgeDays = keepLast, maxAgeDays
-			return runBackupPrune(flags, appName, adopted, &tf, accessory, gfs.Policy())
+			policy := gfs.Policy()
+			policy.IgnoreClock = ignoreClock
+			return runBackupPrune(flags, appName, adopted, &tf, accessory, policy)
 		},
 	}
 
@@ -1091,6 +1138,7 @@ func newBackupPruneCmd(flags *Flags) *cobra.Command {
 	cmd.Flags().IntVar(&gfs.KeepDaily, "keep-daily", 0, "keep the newest backup of the last N days that have one")
 	cmd.Flags().IntVar(&gfs.KeepWeekly, "keep-weekly", 0, "keep the newest backup of the last N ISO weeks that have one")
 	cmd.Flags().IntVar(&gfs.KeepMonthly, "keep-monthly", 0, "keep the newest backup of the last N months that have one")
+	cmd.Flags().BoolVar(&ignoreClock, "ignore-clock", false, "prune even though this machine's clock disagrees with the store's, or a backup is dated in the future")
 	addBackupTargetFlags(cmd, &tf)
 	cmd.Flags().StringVar(&accessory, "accessory", "", "Prune an accessory's backups instead of volumes (accessory name)")
 	addRetentionFlags(cmd, &keepLast, &maxAgeDays)

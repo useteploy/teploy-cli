@@ -16,6 +16,7 @@ import (
 
 	"filippo.io/age"
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 	"github.com/useteploy/teploy/internal/backup"
 	"github.com/useteploy/teploy/internal/config"
 	"github.com/useteploy/teploy/internal/events"
@@ -113,6 +114,9 @@ func runFleet(ctx context.Context, exec ssh.Executor, out io.Writer, ignoreSpace
 		return res, fleetFailed(res)
 	}
 	res.Encrypted = policy.Recipient != ""
+	if policy.TmpDir != "" {
+		os.Setenv("TEPLOY_BACKUP_TMPDIR", policy.TmpDir)
+	}
 
 	lock, holder, lerr := backup.AcquireRunLock(backup.RunLockPath(policy.Path), started, fleetRunDeadline+time.Hour)
 	if lerr != nil {
@@ -137,6 +141,11 @@ func runFleet(ctx context.Context, exec ssh.Executor, out io.Writer, ignoreSpace
 	cfg := TargetS3(target)
 	cfg.OwnerRecipient = policy.Recipient
 	client := backup.NewClient(exec, out)
+	if policy.TargetDeadline != "" {
+		if d, derr := time.ParseDuration(policy.TargetDeadline); derr == nil {
+			client.SetDeadline(d)
+		}
+	}
 	if err := client.EnsureAWSCLIPublic(ctx); err != nil {
 		return finishFleet(ctx, exec, out, res, policy, started, err, hc)
 	}
@@ -147,20 +156,35 @@ func runFleet(ctx context.Context, exec ssh.Executor, out io.Writer, ignoreSpace
 		res.Warnings = append(res.Warnings, "no recovery key is configured, so objects are stored unencrypted and app .env files are left out of volume backups (teploy backup keygen; teploy server backup-policy set --recipient)")
 	}
 
-	// A killed run's leftovers, now that this run owns the lock. Bounded: a wedged
-	// janitor must not cost the backups.
-	jctx, jcancel := context.WithTimeout(ctx, 5*time.Minute)
-	res.CleanedWorkspaces = len(client.CleanStaleWorkspaces(jctx))
-	res.AbortedUploads = client.AbortStaleUploads(jctx, cfg, started)
-	jcancel()
-
 	ectx, ecancel := context.WithTimeout(ctx, 10*time.Minute)
-	targets, uncovered, err := client.EnumerateFleet(ectx, policy)
+	targets, uncovered, enumWarnings, err := client.EnumerateFleet(ectx, policy)
 	ecancel()
 	if err != nil {
 		return finishFleet(ctx, exec, out, res, policy, started, err, hc)
 	}
 	res.UncoveredContainers = uncovered
+	res.Warnings = append(res.Warnings, enumWarnings...)
+	// Zero targets with a policy: a lost accessory and an empty docker daemon look
+	// exactly like this, and reporting ok would hide them. A server meant to have
+	// nothing yet says so.
+	if len(targets) == 0 && !policy.AllowEmpty {
+		return finishFleet(ctx, exec, out, res, policy, started, fmt.Errorf("the policy found nothing to back up on this server: no accessory, app volume or adopted container. If that is right, set allow_empty (teploy server backup-policy set --allow-empty)"), hc)
+	}
+
+	// A killed run's leftovers, now that this run owns the lock. Bounded: a wedged
+	// janitor must not cost the backups.
+	jctx, jcancel := context.WithTimeout(ctx, 5*time.Minute)
+	res.CleanedWorkspaces = len(client.CleanStaleWorkspaces(jctx))
+	nsSeen := map[string]bool{}
+	var namespaces []string
+	for _, t := range targets {
+		if t.App != "" && !nsSeen[t.App] {
+			nsSeen[t.App] = true
+			namespaces = append(namespaces, t.App)
+		}
+	}
+	res.AbortedUploads = client.AbortStaleUploads(jctx, cfg, namespaces, started)
+	jcancel()
 
 	for _, t := range targets {
 		if ctx.Err() != nil {
@@ -172,6 +196,11 @@ func runFleet(ctx context.Context, exec ssh.Executor, out io.Writer, ignoreSpace
 		r := client.RunFleetTarget(ctx, t, cfg, backup.BackupOptions{IgnoreSpace: ignoreSpace})
 		res.Targets = append(res.Targets, r)
 		recordFleetTargetEvent(ctx, exec, r)
+		// A refused prune is a stored backup and a retention that has stopped: not
+		// something to find only in one target's JSON.
+		for _, w := range r.Warnings {
+			res.Warnings = append(res.Warnings, fleetLabel(r)+": "+w)
+		}
 		switch r.Status {
 		case backup.TargetOK:
 			fmt.Fprintf(out, "OK      %s (%d bytes)\n", fleetLabel(r), r.SizeBytes)
@@ -205,6 +234,9 @@ func recordFleetTargetEvent(ctx context.Context, exec ssh.Executor, r backup.Fle
 	detail := backupRunDetail(r.Result, kind, r.Accessory)
 	detail["policy_managed"] = true
 	detail["pruned"] = r.Pruned
+	if len(r.Warnings) > 0 {
+		detail["warnings"] = r.Warnings
+	}
 	var dbs []string
 	for _, o := range r.Objects {
 		if o.Database != "" {
@@ -314,6 +346,9 @@ type backupPolicyDTO struct {
 	HeartbeatHosts   []string              `json:"heartbeat_hosts,omitempty"`
 	Recipient        string                `json:"recipient,omitempty"`
 	Encrypted        bool                  `json:"encrypted"`
+	AllowEmpty       bool                  `json:"allow_empty,omitempty"`
+	TmpDir           string                `json:"tmp_dir,omitempty"`
+	TargetDeadline   string                `json:"target_deadline,omitempty"`
 }
 
 func newServerBackupPolicyCmd(flags *Flags) *cobra.Command {
@@ -334,11 +369,11 @@ func newServerBackupPolicyCmd(flags *Flags) *cobra.Command {
 }
 
 type policySetFlags struct {
-	stdin, heartbeatStdin, noRecipient, clearHeartbeats, volumes bool
-	interval, recipient                                          string
-	keepLast, keepDaily, keepWeekly, keepMonthly, maxAgeDays     int
-	volumeMaxGB                                                  float64
-	excludes, adopts, removeAdopted                              []string
+	stdin, heartbeatStdin, noRecipient, clearHeartbeats, volumes, allowEmpty bool
+	interval, recipient, tmpDir, targetDeadline                              string
+	keepLast, keepDaily, keepWeekly, keepMonthly, maxAgeDays                 int
+	volumeMaxGB                                                              float64
+	excludes, adopts, removeAdopted                                          []string
 }
 
 func newServerBackupPolicySetCmd(flags *Flags) *cobra.Command {
@@ -381,6 +416,9 @@ func newServerBackupPolicySetCmd(flags *Flags) *cobra.Command {
 	cmd.Flags().BoolVar(&f.noRecipient, "no-recipient", false, "stop encrypting new objects")
 	cmd.Flags().BoolVar(&f.heartbeatStdin, "heartbeat-stdin", false, "read heartbeat URLs from stdin, one per line (replaces the list)")
 	cmd.Flags().BoolVar(&f.clearHeartbeats, "clear-heartbeats", false, "remove every heartbeat URL")
+	cmd.Flags().BoolVar(&f.allowEmpty, "allow-empty", false, "a run with nothing to back up is not a failure (a server with nothing on it yet)")
+	cmd.Flags().StringVar(&f.tmpDir, "tmp-dir", "", "build backups on this disk instead of /var/tmp")
+	cmd.Flags().StringVar(&f.targetDeadline, "target-deadline", "", "deadline of one target (default 6h)")
 	return cmd
 }
 
@@ -429,6 +467,15 @@ func applyPolicyFlags(cmd *cobra.Command, p *backup.FleetPolicy, f *policySetFla
 	}
 	if ch("volume-max-gb") {
 		p.VolumeMaxGB = f.volumeMaxGB
+	}
+	if ch("allow-empty") {
+		p.AllowEmpty = f.allowEmpty
+	}
+	if ch("tmp-dir") {
+		p.TmpDir = f.tmpDir
+	}
+	if ch("target-deadline") {
+		p.TargetDeadline = f.targetDeadline
 	}
 	if ch("recipient") && ch("no-recipient") {
 		return fmt.Errorf("--recipient and --no-recipient are mutually exclusive")
@@ -486,11 +533,20 @@ func readHeartbeatLines(r io.Reader) ([]string, error) {
 func runServerBackupPolicySet(cmd *cobra.Command, flags *Flags, f *policySetFlags) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
+	var err error
 	if f.stdin && f.heartbeatStdin {
 		return fmt.Errorf("--stdin and --heartbeat-stdin both read stdin: put heartbeat_urls in the JSON")
 	}
-	if f.stdin && cmd.Flags().NFlag() > 1 {
-		return fmt.Errorf("--stdin takes the whole policy: combine it with no other policy flags")
+	if f.stdin {
+		// LocalNonPersistentFlags: --host and friends are not policy flags.
+		cmd.LocalNonPersistentFlags().Visit(func(fl *pflag.Flag) {
+			if fl.Name != "stdin" && fl.Name != "no-recipient" && err == nil {
+				err = fmt.Errorf("--stdin takes the whole policy: combine it with no policy flag but --no-recipient")
+			}
+		})
+		if err != nil {
+			return err
+		}
 	}
 	var incoming *backup.FleetPolicy
 	var heartbeats []string
@@ -529,12 +585,23 @@ func runServerBackupPolicySet(cmd *cobra.Command, flags *Flags, f *policySetFlag
 
 func setBackupPolicyOn(ctx context.Context, cmd *cobra.Command, executor ssh.Executor, flags *Flags, f *policySetFlags, incoming *backup.FleetPolicy, heartbeats []string) error {
 	stored, err := backup.ReadFleetPolicy(ctx, executor)
+	if errors.Is(err, backup.ErrPolicyHidden) {
+		// This user cannot see /etc/teploy, and is setting a policy of its own in
+		// ~/.config: that is the way out of the refusal, not another refusal.
+		fmt.Fprintf(os.Stderr, "Warning: %v\nThis user's own policy is stored in ~/.config/teploy and applies to its own runs.\n", err)
+		stored, err = backup.FleetPolicy{}, nil
+	}
 	if err != nil {
 		return err
 	}
 	p := stored
 	if incoming != nil {
 		p = *incoming
+		// A machine-written policy that omits the key must not switch encryption
+		// off as a side effect.
+		if stored.Recipient != "" && p.Recipient == "" && !f.noRecipient {
+			return fmt.Errorf("this policy has no recipient, which would stop encrypting new backups on a server that encrypts them; nothing was changed. Send the recipient, or pass --no-recipient if that is the intent")
+		}
 	} else {
 		if err := applyPolicyFlags(cmd, &p, f); err != nil {
 			return err
@@ -546,6 +613,9 @@ func setBackupPolicyOn(ctx context.Context, cmd *cobra.Command, executor ssh.Exe
 	p.V = "1"
 	if err := p.Validate(); err != nil {
 		return err
+	}
+	if stored.Recipient != "" && p.Recipient == "" {
+		fmt.Fprintln(os.Stderr, "Warning: encryption is now OFF: new backups are stored in plaintext, and app .env files are left out of volume backups")
 	}
 	if p.Retention.Policy().IsZero() && p.Interval != "" {
 		fmt.Fprintln(os.Stderr, "Warning: this policy has no retention rule, so backups are never pruned")
@@ -617,6 +687,7 @@ func policyDTO(host string, p backup.FleetPolicy, cronSpec string) backupPolicyD
 		Interval: p.Interval, Cron: cronSpec, Retention: p.Retention, Excludes: p.Excludes, Adopted: p.Adopted,
 		Volumes: p.Volumes, VolumeMaxGB: p.VolumeMaxGB, HeartbeatCount: len(p.HeartbeatURLs),
 		Recipient: p.Recipient, Encrypted: p.Recipient != "",
+		AllowEmpty: p.AllowEmpty, TmpDir: p.TmpDir, TargetDeadline: p.TargetDeadline,
 	}
 	for _, h := range backup.MaskedHeartbeats(p.HeartbeatURLs) {
 		d.HeartbeatHosts = append(d.HeartbeatHosts, strings.TrimSuffix(h, "/..."))
@@ -642,6 +713,15 @@ func printPolicy(p backup.FleetPolicy, cronSpec string) {
 		fmt.Printf(" (cap %.2f GB per archive)", p.VolumeMaxGB)
 	}
 	fmt.Println()
+	if p.AllowEmpty {
+		fmt.Println("  Nothing to back up: allowed (--allow-empty)")
+	}
+	if p.TmpDir != "" {
+		fmt.Printf("  Builds backups in: %s\n", p.TmpDir)
+	}
+	if p.TargetDeadline != "" {
+		fmt.Printf("  Deadline per target: %s\n", p.TargetDeadline)
+	}
 	for _, a := range p.Adopted {
 		dbs := "all"
 		if !a.Databases.All {
@@ -1071,43 +1151,80 @@ func applyAdoptedEngine(ctx context.Context, client *backup.Client, exec ssh.Exe
 
 // ---- backup before destructive operations ----
 
+// preBackupScope says what a safety backup must cover.
+type preBackupScope struct {
+	// Database scopes a restore's backup to what it replaces ("" = the primary).
+	Database string
+	// All is for an operation that destroys the whole accessory: purge and upgrade.
+	// Every database must be in the backup, or the operation is refused.
+	All bool
+	// IgnoreSpace carries --ignore-space-check: a restore is sometimes how a full
+	// disk gets fixed.
+	IgnoreSpace bool
+}
+
+const noBackupHint = "Fix it, or pass --no-backup to go ahead without one (a restore over corrupt data, where the dump cannot succeed, is what that flag is for)"
+
+// noSuchContainer is the one inspect failure that means there is nothing there. A
+// docker blip must not read as nothing to protect.
+func noSuchContainer(err error) bool {
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "no such object") || strings.Contains(msg, "no such container")
+}
+
 // preOperationBackup stores a copy of what op is about to destroy. A failure
 // refuses the operation and says exactly what is at stake; --no-backup is the
 // operator's explicit way past it (a restore is sometimes the fix for what is
-// breaking the backup, and the local safety copy still exists). Nothing to
-// protect (no such container) is not a failure.
-func preOperationBackup(ctx context.Context, client *backup.Client, exec ssh.Executor, app, accessory, database string, cfg backup.S3Config, op string) (string, error) {
+// breaking the backup, and the local safety copy still exists). Nothing to protect
+// (no such container, a database already gone) is not a failure.
+func preOperationBackup(ctx context.Context, client *backup.Client, exec ssh.Executor, app, accessory string, cfg backup.S3Config, op string, scope preBackupScope) (string, error) {
 	var res backup.BackupResult
 	var err error
 	if accessory == "" {
 		// An empty or missing tree has nothing to protect, and restoring into one
-		// is exactly what must not be refused.
+		// is exactly what must not be refused. An unreadable one is not empty.
 		d := ssh.ShellQuote("/deployments/" + app + "/volumes")
-		if out, lsErr := exec.Run(ctx, "if [ -n \"$(ls -A "+d+" 2>/dev/null)\" ]; then echo yes; fi"); lsErr == nil && strings.TrimSpace(out) != "yes" {
+		out, lsErr := exec.Run(ctx, "if [ ! -e "+d+" ]; then echo empty; elif x=$(ls -A "+d+"); then if [ -n \"$x\" ]; then echo yes; else echo empty; fi; else exit 1; fi")
+		if lsErr != nil {
+			return "", fmt.Errorf("could not read %s's volumes before %s, so nothing was changed: %w\n%s", app, op, lsErr, noBackupHint)
+		}
+		if strings.TrimSpace(out) != "yes" {
 			return "", nil
 		}
-		res, err = client.BackupVolumesWith(ctx, app, cfg, backup.BackupOptions{})
+		res, err = client.BackupVolumesWith(ctx, app, cfg, backup.BackupOptions{IgnoreSpace: scope.IgnoreSpace, SafetyCopy: true})
 		recordPreBackupEvent(ctx, exec, app, accessory, res, err, op)
 		if err != nil {
-			return "", fmt.Errorf("the automatic backup before %s failed, so nothing was changed: %w\nFix it, or pass --no-backup to go ahead without one", op, err)
+			return "", fmt.Errorf("the automatic backup before %s failed, so nothing was changed: %w\n%s", op, err, noBackupHint)
 		}
 		return res.ID, nil
 	}
 	image, env, inspErr := client.InspectAccessory(ctx, app, accessory)
 	if inspErr != nil {
-		return "", nil
+		if noSuchContainer(inspErr) {
+			return "", nil
+		}
+		return "", fmt.Errorf("could not inspect %s before %s, so nothing was changed: %w\n%s", backup.ContainerName(app, accessory), op, inspErr, noBackupHint)
 	}
-	// Only what op will replace, by name: a database that is already gone has
-	// nothing to protect, and restoring it is exactly what must not be refused.
-	if database == "" {
-		database = client.PrimaryDatabase(ctx, app, accessory, image, env)
+	opts := backup.BackupOptions{IgnoreSpace: scope.IgnoreSpace, SafetyCopy: true}
+	if scope.All {
+		opts.AllDatabases = true
+	} else {
+		// Only what op will replace, by name: a database that is already gone has
+		// nothing to protect, and restoring it is exactly what must not be refused.
+		opts.SingleDatabase = scope.Database
+		if opts.SingleDatabase == "" {
+			opts.SingleDatabase = client.PrimaryDatabase(ctx, app, accessory, image, env)
+		}
 	}
-	res, err = client.AccessoryBackupWith(ctx, app, accessory, image, env, cfg, backup.BackupOptions{SingleDatabase: database})
+	res, err = client.AccessoryBackupWith(ctx, app, accessory, image, env, cfg, opts)
 	if err != nil || len(res.Objects) > 0 {
 		recordPreBackupEvent(ctx, exec, app, accessory, res, err, op)
 	}
 	if err != nil {
-		return "", fmt.Errorf("the automatic backup of %s before %s failed, so nothing was changed: %w\nFix it, or pass --no-backup to go ahead without one", backup.ContainerName(app, accessory), op, err)
+		return "", fmt.Errorf("the automatic backup of %s before %s failed, so nothing was changed: %w\n%s", backup.ContainerName(app, accessory), op, err, noBackupHint)
+	}
+	if scope.All && len(res.UncoveredDatabases) > 0 {
+		return "", fmt.Errorf("the automatic backup of %s before %s does not cover %s (names the dump tools cannot address), so nothing was changed\n%s", backup.ContainerName(app, accessory), op, strings.Join(res.UncoveredDatabases, ", "), noBackupHint)
 	}
 	if len(res.Objects) == 0 {
 		return "", nil
@@ -1123,6 +1240,37 @@ func recordPreBackupEvent(ctx context.Context, exec ssh.Executor, app, accessory
 	detail := backupRunDetail(res, kind, accessory)
 	detail["trigger"] = op
 	recordAppEvent(ctx, exec, app, events.KindBackupRun, err, detail)
+}
+
+// placeIdentity puts a local identity file on the server for one operation, in a
+// private directory removed by the returned cleanup. A backup encrypted by another
+// host can be read no other way; that is the one time the recovery key leaves the
+// owner's machine, and only when asked for by flag. The janitor and doctor know the
+// directory, if a kill leaves it behind.
+func placeIdentity(ctx context.Context, exec ssh.Executor, identity string) (string, func(), error) {
+	none := func() {}
+	if identity == "" {
+		return "", none, nil
+	}
+	body, err := os.ReadFile(identity)
+	if err != nil {
+		return "", none, fmt.Errorf("reading the identity file: %w", err)
+	}
+	if _, err := age.ParseIdentities(strings.NewReader(string(body))); err != nil {
+		return "", none, fmt.Errorf("%s is not an age identity file: %w", identity, err)
+	}
+	out, err := exec.Run(ctx, "umask 077; mktemp -d /var/tmp/teploy-dr-identity.XXXXXXXX")
+	if err != nil {
+		return "", none, fmt.Errorf("creating a private directory for the identity: %w", err)
+	}
+	dir := strings.TrimSpace(out)
+	cleanup := func() { exec.Run(context.WithoutCancel(ctx), "rm -rf "+ssh.ShellQuote(dir)) }
+	path := dir + "/identity"
+	if err := exec.Upload(ctx, strings.NewReader(string(body)), path, "0600"); err != nil {
+		cleanup()
+		return "", none, fmt.Errorf("placing the identity: %w", err)
+	}
+	return path, cleanup, nil
 }
 
 // resolvePreBackupTarget is the S3 config the safety backups use: the server's
@@ -1154,7 +1302,10 @@ func backupBeforeDeployHook(ctx context.Context, exec ssh.Executor, appCfg *conf
 	for _, name := range sortedAccessoryNames(appCfg.Accessories) {
 		image, env, err := client.InspectAccessory(ctx, appCfg.App, name)
 		if err != nil {
-			continue
+			if noSuchContainer(err) {
+				continue
+			}
+			return fmt.Errorf("could not inspect %s before this deploy's pre_deploy hook: %w\n%s", backup.ContainerName(appCfg.App, name), err, noBackupHint)
 		}
 		det, err := client.ResolveEngine(ctx, appCfg.App, name, image, env)
 		if err != nil || !det.IsDB() {
@@ -1166,11 +1317,13 @@ func backupBeforeDeployHook(ctx context.Context, exec ssh.Executor, appCfg *conf
 			}
 			haveCfg = true
 		}
-		id, err := preOperationBackup(ctx, client, exec, appCfg.App, name, "", cfg, "this deploy's pre_deploy hook")
+		id, err := preOperationBackup(ctx, client, exec, appCfg.App, name, cfg, "this deploy's pre_deploy hook", preBackupScope{All: true})
 		if err != nil {
 			return err
 		}
-		fmt.Fprintf(out, "Backed up %s before the pre_deploy hook: %s\n", backup.ContainerName(appCfg.App, name), id)
+		if id != "" {
+			fmt.Fprintf(out, "Backed up %s before the pre_deploy hook: %s\n", backup.ContainerName(appCfg.App, name), id)
+		}
 	}
 	return nil
 }

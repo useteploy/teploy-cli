@@ -12,7 +12,10 @@ func newStoreMock(host string, cmds ...ssh.MockCommand) *ssh.MockExecutor {
 
 var storeStubs = []ssh.MockCommand{
 	{Match: "sha256sum", Output: "abc  f\n4096\n"},
+	{Match: "{ cat /etc/machine-id", Output: "0123456789abcdef0123456789abcdef  -\n"},
 	{Match: "{ ", Output: "abc  -\n"},
+	{Match: "printf '%s\\n'", Output: ""},
+	{Match: "for p in /etc/teploy/age-key", Output: ""},
 	{Match: "aws s3api head-object", Output: `{"ContentLength":4096,"Metadata":{"sha256":"abc"}}`},
 }
 

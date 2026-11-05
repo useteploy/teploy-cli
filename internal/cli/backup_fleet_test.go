@@ -90,28 +90,38 @@ func TestRestorePromptNamesWhatIsReplaced(t *testing.T) {
 }
 
 func TestMergePreviousPrefixes(t *testing.T) {
-	old := backup.Target{Bucket: "b", Endpoint: "e", Prefix: "", PreviousPrefixes: []backup.PreviousPrefix{{Prefix: "older"}}}
-	prev, lost := mergePreviousPrefixes(old, "b", "e", "srv1", false, false)
-	if lost || len(prev) != 2 || prev[0].Prefix != "older" || prev[1].Prefix != "" || prev[1].Owned {
-		t.Fatalf("%+v %v", prev, lost)
+	old := backup.Target{Bucket: "b", Endpoint: "e", Prefix: "mine", PreviousPrefixes: []backup.PreviousPrefix{{Prefix: ""}, {Prefix: "older", Owned: true}}}
+	// owned applies only to the prefix being left, never to the shared root.
+	prev, lost, err := mergePreviousPrefixes(old, "b", "e", "srv1", true, false, nil)
+	if err != nil || lost || len(prev) != 3 {
+		t.Fatalf("%+v %v %v", prev, lost, err)
 	}
-	// Moving back to an old prefix takes it off the list.
-	prev, _ = mergePreviousPrefixes(backup.Target{Bucket: "b", Endpoint: "e", Prefix: "srv1", PreviousPrefixes: []backup.PreviousPrefix{{Prefix: ""}}}, "b", "e", "", false, false)
+	for _, p := range prev {
+		want := p.Prefix == "mine" || p.Prefix == "older"
+		if p.Owned != want {
+			t.Fatalf("%q owned=%v: %+v", p.Prefix, p.Owned, prev)
+		}
+	}
+	// An earlier one is claimed by name, and only one that exists.
+	prev, _, err = mergePreviousPrefixes(old, "b", "e", "mine", false, false, []string{""})
+	if err != nil || len(prev) != 2 || !prev[0].Owned {
+		t.Fatalf("%+v %v", prev, err)
+	}
+	if _, _, err := mergePreviousPrefixes(old, "b", "e", "mine", false, false, []string{"never"}); err == nil {
+		t.Fatal("claiming an unknown prefix must be refused")
+	}
+	// Moving back takes it off the list.
+	prev, _, _ = mergePreviousPrefixes(backup.Target{Bucket: "b", Endpoint: "e", Prefix: "srv1", PreviousPrefixes: []backup.PreviousPrefix{{Prefix: ""}}}, "b", "e", "", false, false, nil)
 	if len(prev) != 1 || prev[0].Prefix != "srv1" {
 		t.Fatalf("%+v", prev)
 	}
-	// Same prefix: no new history, and ownership can be declared.
-	prev, _ = mergePreviousPrefixes(backup.Target{Bucket: "b", Endpoint: "e", Prefix: "srv1", PreviousPrefixes: []backup.PreviousPrefix{{Prefix: ""}}}, "b", "e", "srv1", true, false)
-	if len(prev) != 1 || !prev[0].Owned {
-		t.Fatalf("%+v", prev)
-	}
-	if prev, lost := mergePreviousPrefixes(old, "other", "e", "x", false, false); !lost || prev != nil {
+	if prev, lost, _ := mergePreviousPrefixes(old, "other", "e", "x", false, false, nil); !lost || prev != nil {
 		t.Fatalf("a new bucket starts fresh: %+v %v", prev, lost)
 	}
-	if prev, lost := mergePreviousPrefixes(old, "b", "e", "x", false, true); lost || prev != nil {
+	if prev, lost, _ := mergePreviousPrefixes(old, "b", "e", "x", false, true, nil); lost || prev != nil {
 		t.Fatalf("forget: %+v %v", prev, lost)
 	}
-	if prev, lost := mergePreviousPrefixes(backup.Target{}, "b", "e", "x", false, false); lost || prev != nil {
+	if prev, lost, _ := mergePreviousPrefixes(backup.Target{}, "b", "e", "x", false, false, nil); lost || prev != nil {
 		t.Fatalf("first target: %+v %v", prev, lost)
 	}
 }
@@ -266,7 +276,7 @@ func TestRunFleetNoTargetHeartbeatsDown(t *testing.T) {
 	defer srv.Close()
 	dir := t.TempDir()
 	mock := ssh.NewMockExecutor("h",
-		ssh.MockCommand{Match: "for p in /etc/teploy/backup-policy.json", Output: "path " + dir + "/backup-policy.json\n" + `{"v":"1","interval":"1h","heartbeat_urls":["` + srv.URL + `/api/push/SECRET"]}`},
+		ssh.MockCommand{Match: "if [ -d /etc/teploy ] && [ ! -x /etc/teploy ]", Output: "path " + dir + "/backup-policy.json\n" + `{"v":"1","interval":"1h","heartbeat_urls":["` + srv.URL + `/api/push/SECRET"]}`},
 		ssh.MockCommand{Match: "for p in /etc/teploy/backup-target.json", Output: "absent\n"},
 		ssh.MockCommand{Match: "python3 -c", Output: `{"seq":1,"ts":"2026-01-01T00:00:00Z"}`},
 	)
@@ -289,7 +299,7 @@ func TestRunFleetNoTargetHeartbeatsDown(t *testing.T) {
 }
 
 func TestRunFleetWithNoPolicyFails(t *testing.T) {
-	mock := ssh.NewMockExecutor("h", ssh.MockCommand{Match: "for p in /etc/teploy/backup-policy.json", Output: "absent\n"})
+	mock := ssh.NewMockExecutor("h", ssh.MockCommand{Match: "if [ -d /etc/teploy ] && [ ! -x /etc/teploy ]", Output: "absent\n"})
 	res, err := runFleet(context.Background(), mock, io.Discard, false, nil)
 	if err == nil || res.Status != backup.RunFailed || !strings.Contains(res.Error, "backup-policy set") {
 		t.Fatalf("%v %+v", err, res)
@@ -308,7 +318,7 @@ func TestRunFleetStandsDownOnOverlap(t *testing.T) {
 	}
 	defer lock.Release()
 	mock := ssh.NewMockExecutor("h",
-		ssh.MockCommand{Match: "for p in /etc/teploy/backup-policy.json", Output: "path " + dir + "/backup-policy.json\n" + `{"v":"1","heartbeat_urls":["` + srv.URL + `/hb"]}`},
+		ssh.MockCommand{Match: "if [ -d /etc/teploy ] && [ ! -x /etc/teploy ]", Output: "path " + dir + "/backup-policy.json\n" + `{"v":"1","heartbeat_urls":["` + srv.URL + `/hb"]}`},
 	)
 	res, err := runFleet(context.Background(), mock, io.Discard, false, nil)
 	if err != nil || res.Status != "skipped" {
@@ -332,7 +342,7 @@ func TestRunFleetPartialFailure(t *testing.T) {
 		return string(b)
 	}
 	mock := ssh.NewMockExecutor("h",
-		ssh.MockCommand{Match: "for p in /etc/teploy/backup-policy.json", Output: "path " + dir + "/backup-policy.json\n" + `{"v":"1","interval":"1h","retention":{"keep_last":1},"heartbeat_urls":["` + srv.URL + `/hb"]}`},
+		ssh.MockCommand{Match: "if [ -d /etc/teploy ] && [ ! -x /etc/teploy ]", Output: "path " + dir + "/backup-policy.json\n" + `{"v":"1","interval":"1h","retention":{"keep_last":1},"heartbeat_urls":["` + srv.URL + `/hb"]}`},
 		ssh.MockCommand{Match: "for p in /etc/teploy/backup-target.json", Output: "path /etc/teploy/backup-target.json\n" + `{"v":"1","bucket":"b","region":"r"}`},
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
 		ssh.MockCommand{Match: "for d in", Output: ""},
@@ -381,7 +391,7 @@ func TestPreOperationBackupRefuses(t *testing.T) {
 		ssh.MockCommand{Match: "python3 -c", Output: `{"seq":1,"ts":"2026-01-01T00:00:00Z"}`},
 	)
 	client := backup.NewClient(mock, io.Discard)
-	_, err := preOperationBackup(context.Background(), client, mock, "a", "db", "", backup.S3Config{Bucket: "b", Region: "r"}, "this restore")
+	_, err := preOperationBackup(context.Background(), client, mock, "a", "db", backup.S3Config{Bucket: "b", Region: "r"}, "this restore", preBackupScope{})
 	if err == nil || !strings.Contains(err.Error(), "--no-backup") || !strings.Contains(err.Error(), "nothing was changed") {
 		t.Fatalf("err = %v", err)
 	}
@@ -389,8 +399,8 @@ func TestPreOperationBackupRefuses(t *testing.T) {
 
 // No such container: nothing to protect, not a refusal.
 func TestPreOperationBackupNothingToProtect(t *testing.T) {
-	mock := ssh.NewMockExecutor("h", ssh.MockCommand{Match: "docker inspect -f", Err: errors.New("exit status 1: no such object")})
-	id, err := preOperationBackup(context.Background(), backup.NewClient(mock, io.Discard), mock, "a", "db", "", backup.S3Config{Bucket: "b", Region: "r"}, "this restore")
+	mock := ssh.NewMockExecutor("h", ssh.MockCommand{Match: "docker inspect -f", Err: errors.New("exit status 1: Error: No such object: a-db")})
+	id, err := preOperationBackup(context.Background(), backup.NewClient(mock, io.Discard), mock, "a", "db", backup.S3Config{Bucket: "b", Region: "r"}, "this restore", preBackupScope{})
 	if err != nil || id != "" {
 		t.Fatalf("%q %v", id, err)
 	}
@@ -414,7 +424,7 @@ func TestPreOperationBackupOfADroppedDatabaseIsNotARefusal(t *testing.T) {
 		ssh.MockCommand{Match: "aws s3api", Output: `{"ContentLength":4096,"Metadata":{"sha256":"abc"}}`},
 		ssh.MockCommand{Match: "python3 -c", Output: `{"seq":1,"ts":"2026-01-01T00:00:00Z"}`},
 	)
-	id, err := preOperationBackup(context.Background(), backup.NewClient(mock, io.Discard), mock, "a", "db", "", backup.S3Config{Bucket: "b", Region: "r"}, "this restore")
+	id, err := preOperationBackup(context.Background(), backup.NewClient(mock, io.Discard), mock, "a", "db", backup.S3Config{Bucket: "b", Region: "r"}, "this restore", preBackupScope{})
 	if err != nil || id != "" {
 		t.Fatalf("a dropped database must not refuse the restore that brings it back: %q %v", id, err)
 	}
@@ -448,7 +458,7 @@ func TestEnsureServerPathCompletesCronPath(t *testing.T) {
 func TestSetBackupPolicyFromStdin(t *testing.T) {
 	t.Setenv("TEPLOY_SERVER_BINARY", "/opt/teploy")
 	mock := ssh.NewMockExecutor("srv",
-		ssh.MockCommand{Match: "for p in /etc/teploy/backup-policy.json", Output: "absent\n"},
+		ssh.MockCommand{Match: "if [ -d /etc/teploy ] && [ ! -x /etc/teploy ]", Output: "absent\n"},
 		ssh.MockCommand{Match: "for p in /etc/teploy/backup-target.json", Output: "path /etc/teploy/backup-target.json\n" + `{"v":"1","bucket":"b","region":"r"}`},
 		ssh.MockCommand{Match: "sched_daemon=no", Output: "daemon=yes\nenabled=enabled\ncrontab=yes\nteploy_entries=0\n"},
 		ssh.MockCommand{Match: "which age", Output: "/usr/bin/age"},
@@ -492,11 +502,68 @@ func TestSetBackupPolicyFromStdin(t *testing.T) {
 
 	// Refused before anything is stored.
 	bad := backup.FleetPolicy{Adopted: []backup.AdoptedEntry{{Container: "x'; rm -rf /", Databases: backup.DatabaseSelector{All: true}}}}
-	refused := ssh.NewMockExecutor("srv", ssh.MockCommand{Match: "for p in /etc/teploy/backup-policy.json", Output: "absent\n"})
+	refused := ssh.NewMockExecutor("srv", ssh.MockCommand{Match: "if [ -d /etc/teploy ] && [ ! -x /etc/teploy ]", Output: "absent\n"})
 	if err := setBackupPolicyOn(context.Background(), &cobra.Command{}, refused, &Flags{}, &policySetFlags{stdin: true}, &bad, nil); err == nil {
 		t.Fatal("a hostile container name must be refused")
 	}
 	if len(refused.Calls) != 1 {
 		t.Fatalf("refused policy touched the server: %v", refused.Calls)
+	}
+}
+
+// Per-database rows reach Dash only when asked for: it restores a row by id and
+// accessory alone, and restoring a database row that way replaces the primary.
+func TestFilterDatabaseRows(t *testing.T) {
+	rows := []backup.ListedBackup{{ID: "1"}, {ID: "1", Database: "analytics"}}
+	got, hidden := filterDatabaseRows(rows, false)
+	if len(got) != 1 || hidden != 1 || got[0].Database != "" {
+		t.Fatalf("%+v %d", got, hidden)
+	}
+	got, hidden = filterDatabaseRows(rows, true)
+	if len(got) != 2 || hidden != 0 {
+		t.Fatalf("%+v %d", got, hidden)
+	}
+	if got, _ := filterDatabaseRows(nil, false); got == nil {
+		t.Fatal("must encode as []")
+	}
+}
+
+// A --no-credentials target has nothing to decrypt.
+func TestTargetS3StoredOnlyWithCredentials(t *testing.T) {
+	if cfg := TargetS3(backup.Target{Bucket: "b", Path: "/etc/teploy/backup-target.json"}); cfg.StoredTarget != "" {
+		t.Fatalf("%+v", cfg)
+	}
+	if cfg := TargetS3(backup.Target{Bucket: "b", Path: "/p", HasCredentials: true}); cfg.StoredTarget != "/p" {
+		t.Fatalf("%+v", cfg)
+	}
+}
+
+// Zero targets is a failure unless the policy allows it.
+func TestRunFleetZeroTargets(t *testing.T) {
+	var got []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { got = append(got, r.URL.RequestURI()) }))
+	defer srv.Close()
+	dir := t.TempDir()
+	mk := func(extra string) *ssh.MockExecutor {
+		return ssh.NewMockExecutor("h",
+			ssh.MockCommand{Match: "if [ -d /etc/teploy ] && [ ! -x /etc/teploy ]", Output: "path " + dir + "/backup-policy.json\n" + `{"v":"1","interval":"1h"` + extra + `,"heartbeat_urls":["` + srv.URL + `/hb"]}`},
+			ssh.MockCommand{Match: "for p in /etc/teploy/backup-target.json", Output: "path /etc/teploy/backup-target.json\n" + `{"v":"1","bucket":"b","region":"r"}`},
+			ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
+			ssh.MockCommand{Match: "for d in", Output: ""},
+			ssh.MockCommand{Match: "ids=$(docker ps -aq", Output: ""},
+			ssh.MockCommand{Match: "crontab -l", Output: ""},
+			ssh.MockCommand{Match: "python3 -c", Output: `{"seq":1,"ts":"2026-01-01T00:00:00Z"}`},
+		)
+	}
+	res, err := runFleet(context.Background(), mk(""), io.Discard, false, nil)
+	if err == nil || res.Status != backup.RunFailed || !strings.Contains(res.Error, "allow_empty") {
+		t.Fatalf("%v %+v", err, res)
+	}
+	if !strings.Contains(got[len(got)-1], "status=down") {
+		t.Fatalf("%v", got)
+	}
+	res, err = runFleet(context.Background(), mk(`,"allow_empty":true`), io.Discard, false, nil)
+	if err != nil || res.Status != backup.RunOK {
+		t.Fatalf("%v %+v", err, res)
 	}
 }

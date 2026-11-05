@@ -119,6 +119,16 @@
     },
     "encrypted": {
       "type": "boolean"
+    },
+    "allow_empty": {
+      "type": "boolean",
+      "description": "Zero targets is not a failure."
+    },
+    "tmp_dir": {
+      "type": "string"
+    },
+    "target_deadline": {
+      "type": "string"
     }
   }
 }

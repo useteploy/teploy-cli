@@ -256,8 +256,18 @@ type Client struct {
 	// engineOverride forces a container's engine: an adopted entry's engine:,
 	// which has no label to live on.
 	engineOverride map[string]string
-	// deadline overrides BackupDeadline (tests shorten it).
+	// deadline overrides BackupDeadline (--deadline, the policy, tests).
 	deadline time.Duration
+	// readBack overrides readBackMax (tests shorten it).
+	readBack int64
+}
+
+// SetDeadline overrides the per-operation deadline of backups, restores and
+// verifies through this client.
+func (c *Client) SetDeadline(d time.Duration) {
+	if d > 0 {
+		c.deadline = d
+	}
 }
 
 // NewClient creates a new backup client.
@@ -421,6 +431,9 @@ func (c *Client) BackupVolumesWith(ctx context.Context, app string, s3 S3Config,
 	res.Key, res.SizeBytes = stored.Key, stored.Size
 	res.Objects = append(res.Objects, BackupObject{Key: stored.Key, Size: stored.Size, Encrypted: stored.Encrypted})
 	c.markNamespaceOwner(ctx, s3, app)
+	if opts.SafetyCopy {
+		c.markSafetyCopy(ctx, s3, fmt.Sprintf("s3://%s/%s/volumes/", s3.Base(), app), timestamp, &res)
+	}
 	fmt.Fprintf(c.out, "Backup complete: %s\n", res.Key)
 	return res, nil
 }
@@ -788,26 +801,75 @@ func (c *Client) SetSchedule(ctx context.Context, schedule, command, marker stri
 
 // AWSCLIRemedy is the exact way to give a server the aws CLI. `teploy setup`
 // runs AWSCLIInstallScript; Ubuntu 24.04+ has no apt package for it.
-const AWSCLIRemedy = "run `teploy setup` against the server, or on the server: apt-get install -y awscli || { curl -fsSL \"https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip\" -o /tmp/awscliv2.zip && python3 -m zipfile -e /tmp/awscliv2.zip /tmp/awscliv2 && chmod -R 755 /tmp/awscliv2/aws && /tmp/awscliv2/aws/install; }"
+const AWSCLIRemedy = "run `teploy setup` against the server (it installs the distribution's package, else AWS's bundle with its signature checked), or on the server: apt-get install -y awscli, else AWS's installer as documented at https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html"
 
-// AWSCLIInstallScript installs the aws CLI: the distribution package when it
-// has one, else AWS's own bundle. python3 unpacks it (unzip may be absent), which
-// drops the file modes, so they are restored for every user before installing:
-// with u+x alone the installed aws runs for root and "Permission denied"s for cron.
+// awsCLIKeyFingerprint and awsCLIPublicKey pin AWS's bundle signer, from
+// docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html (key
+// A6310ACC4672475C, expires 2027-07-01; a signature made before expiry stays
+// VALIDSIG, and a new key means updating this, not trusting whatever is served).
+const awsCLIKeyFingerprint = "FB5DB77FD5C118B80511ADA8A6310ACC4672475C"
+
+const awsCLIPublicKey = `-----BEGIN PGP PUBLIC KEY BLOCK-----
+
+mQINBF2Cr7UBEADJZHcgusOJl7ENSyumXh85z0TRV0xJorM2B/JL0kHOyigQluUG
+ZMLhENaG0bYatdrKP+3H91lvK050pXwnO/R7fB/FSTouki4ciIx5OuLlnJZIxSzx
+PqGl0mkxImLNbGWoi6Lto0LYxqHN2iQtzlwTVmq9733zd3XfcXrZ3+LblHAgEt5G
+TfNxEKJ8soPLyWmwDH6HWCnjZ/aIQRBTIQ05uVeEoYxSh6wOai7ss/KveoSNBbYz
+gbdzoqI2Y8cgH2nbfgp3DSasaLZEdCSsIsK1u05CinE7k2qZ7KgKAUIcT/cR/grk
+C6VwsnDU0OUCideXcQ8WeHutqvgZH1JgKDbznoIzeQHJD238GEu+eKhRHcz8/jeG
+94zkcgJOz3KbZGYMiTh277Fvj9zzvZsbMBCedV1BTg3TqgvdX4bdkhf5cH+7NtWO
+lrFj6UwAsGukBTAOxC0l/dnSmZhJ7Z1KmEWilro/gOrjtOxqRQutlIqG22TaqoPG
+fYVN+en3Zwbt97kcgZDwqbuykNt64oZWc4XKCa3mprEGC3IbJTBFqglXmZ7l9ywG
+EEUJYOlb2XrSuPWml39beWdKM8kzr1OjnlOm6+lpTRCBfo0wa9F8YZRhHPAkwKkX
+XDeOGpWRj4ohOx0d2GWkyV5xyN14p2tQOCdOODmz80yUTgRpPVQUtOEhXQARAQAB
+tCFBV1MgQ0xJIFRlYW0gPGF3cy1jbGlAYW1hem9uLmNvbT6JAlQEEwEIAD4CGwMF
+CwkIBwIGFQoJCAsCBBYCAwECHgECF4AWIQT7Xbd/1cEYuAURraimMQrMRnJHXAUC
+akV0ygUJDqP4lQAKCRCmMQrMRnJHXFHjD/9eyZLYcKuQOlLvtqSDtUBiEZf6ZZjM
+i3ygYH8rJNtuToUH+HvSpe819urJCquXhDrlK6N+aqW0hCLtNABJG/vsafIgvIYJ
+hSGgpgtNnQyMV1jViRWqPjbouw8OkYKBThUfT1i2Y+wn58ifs6ODBCmTexWtXspA
+Si+Gt49xDOW0APmbOPnI+a4HJW6tVEo6MWS0WjzpiBayR3d1A4pt4YrPfSdDgpLo
+h2SLQqlRqvvVZJaWBjhkErNFpfsBA06sDcPEOb0G8LBUbR4WOcdvhe5LubJbZuxC
+AG9kNPCVeQP1ixwjgjXKysaxeQ6rv0VzIQgRp6tLVLWhy6AKDNvLjFSsmXZ1Wl08
+Y/RlOHXlzLuQMRE6sR1wOdRxc9TsrNWTGiBK65cvSWOy03JeBkQQ8pesqltiyxI9
+U21kkgiXtTSKNGfKK8pO27D81YANhRqPK7iTp6kuFiY2WtOg90KTMNlIT+Ff85Y2
+b1rHj6Z0SrCkJujhWk3IBPic/wJgz01LEc/OAdUPlby90RJZcIBhSlWhT7mXnXIO
+c0HWlNQrns2s3CTyYwZSiSlYe9ApeLwhjDo8NhbFuCAy61l6O5UsR4AfZxx/rGKv
+2wFb1/RN/P4gNe6vmxZAPjR0AQcwD3tc2McimOLr/22kmPz8IH3I0X7WoSFr0Biz
+E91G7bb0hOb/cA==
+=knv7
+-----END PGP PUBLIC KEY BLOCK-----
+`
+
+// AWSCLIInstallScript installs the aws CLI: the distribution package when it has
+// one, else AWS's own bundle, which runs as root, so its signature is checked
+// against the pinned key first (TLS alone is not enough for that). python3 unpacks
+// it (unzip may be absent), which drops the file modes, so they are restored for
+// every user before installing: with u+x alone the installed aws runs for root and
+// "Permission denied"s for cron. Success is `aws --version` running, not `command
+// -v aws`: the glibc bundle on a musl host is present and cannot start.
 const AWSCLIInstallScript = `set -e
 export DEBIAN_FRONTEND=noninteractive
-if apt-get install -y -qq awscli >/dev/null 2>&1 && command -v aws >/dev/null 2>&1; then exit 0; fi
+if apt-get install -y -qq awscli >/dev/null 2>&1 && aws --version >/dev/null 2>&1; then exit 0; fi
+command -v gpg >/dev/null 2>&1 || apt-get install -y -qq gnupg >/dev/null 2>&1 || { echo "gpg is needed to verify AWS's bundle" >&2; exit 1; }
 d=$(mktemp -d /tmp/teploy-awscli.XXXXXXXX)
 trap 'rm -rf "$d"' EXIT
-curl -fsSL --max-time 300 "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip" -o "$d/a.zip"
+GNUPGHOME="$d/g"; export GNUPGHOME; mkdir -m 700 "$GNUPGHOME"
+u="https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip"
+curl -fsSL --max-time 300 "$u" -o "$d/a.zip"
+curl -fsSL --max-time 60 "$u.sig" -o "$d/a.sig"
+cat > "$d/key" <<'TEPLOY_KEY'
+` + awsCLIPublicKey + `TEPLOY_KEY
+gpg --batch --quiet --import "$d/key" 2>/dev/null
+gpg --batch --status-fd 1 --verify "$d/a.sig" "$d/a.zip" 2>/dev/null | grep -q "^\[GNUPG:\] VALIDSIG ` + awsCLIKeyFingerprint + ` " || { echo "AWS's bundle did not verify against the pinned signing key; nothing was installed" >&2; exit 1; }
 python3 -m zipfile -e "$d/a.zip" "$d/x"
 chmod -R 755 "$d/x/aws"
 "$d/x/aws/install" --update
-command -v aws >/dev/null 2>&1`
+aws --version >/dev/null 2>&1 || { echo "AWS's bundle installed but does not run here (a musl libc?): install your distribution's aws-cli package" >&2; exit 1; }`
 
 func (c *Client) ensureAWSCLI(ctx context.Context) error {
-	if _, err := c.exec.Run(ctx, "which aws"); err != nil {
-		return fmt.Errorf("aws CLI not found on server — %s", AWSCLIRemedy)
+	// That it runs, not only that it is there: a glibc bundle on a musl host is.
+	if _, err := c.exec.Run(ctx, "which aws >/dev/null && aws --version >/dev/null 2>&1"); err != nil {
+		return fmt.Errorf("aws CLI not found or not runnable on server — %s", AWSCLIRemedy)
 	}
 	return nil
 }

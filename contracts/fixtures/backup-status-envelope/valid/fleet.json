@@ -62,6 +62,9 @@
     "omissions": [
       "redis-cache: a database container no policy entry covers (adopt or exclude it)"
     ],
+    "warnings": [
+      "blog-db: prune: shared backup namespace: another server (aaaaaaaaaaaaaaaa) also stores blog backups"
+    ],
     "stale": false
   },
   "entries": [
@@ -77,6 +80,7 @@
       "adopted": false,
       "coverage": "covered",
       "schedule": "policy",
+      "encrypted": true,
       "last_success": "2026-11-04T03:17:04Z",
       "newest": {
         "id": "20261104-031704-1f2e3d4c5b6a7988",
@@ -103,6 +107,7 @@
       "adopted": true,
       "coverage": "adopted",
       "schedule": "policy",
+      "encrypted": true,
       "last_success": "2026-11-04T03:17:04Z",
       "newest": {
         "id": "20261104-031704-1f2e3d4c5b6a7988",
@@ -135,6 +140,7 @@
       "adopted": true,
       "coverage": "failing",
       "schedule": "policy",
+      "encrypted": true,
       "last_failure": "2026-11-04T02:17:04Z",
       "last_error": "dumping omni: exit status 1",
       "uncovered_databases": [
@@ -151,7 +157,38 @@
       "adopted": false,
       "coverage": "uncovered",
       "reason": "no policy entry covers this container (adopt or exclude it)",
-      "schedule": "none"
+      "schedule": "none",
+      "encrypted": false
+    },
+    {
+      "name": "shop-db",
+      "kind": "accessory",
+      "app": "shop",
+      "accessory": "db",
+      "engine": "postgres",
+      "detection": "env",
+      "state": "running",
+      "unmanaged": false,
+      "adopted": false,
+      "coverage": "stale",
+      "reason": "a run succeeded, but the bucket holds no restorable object for it",
+      "schedule": "own",
+      "schedule_form": "legacy",
+      "encrypted": false,
+      "last_success": "2026-11-04T03:17:04Z"
+    },
+    {
+      "name": "analytics-ch",
+      "kind": "unmanaged",
+      "engine": "clickhouse-server",
+      "detection": "image-name",
+      "state": "running",
+      "unmanaged": true,
+      "adopted": false,
+      "coverage": "uncovered",
+      "reason": "teploy has no backup method for clickhouse-server: back it up another way and exclude it",
+      "schedule": "none",
+      "encrypted": false
     },
     {
       "name": "blog/volumes",
@@ -162,11 +199,16 @@
       "coverage": "excluded",
       "reason": "50.00 GB is over the policy's volume_max_gb 20.00",
       "schedule": "policy",
+      "encrypted": true,
       "size_bytes": 53687091200
     }
   ],
   "uncovered_databases": [
+    "analytics-ch",
     "omni_postgres/reports",
     "redis-cache"
+  ],
+  "warnings": [
+    "cron marker teploy-accessory-backup:shop:db is a pre-D3 shell line that uploads plaintext whatever the policy says: rewrite it with `teploy server backup-target set`"
   ]
 }

@@ -110,7 +110,7 @@ func TestExcludedMatches(t *testing.T) {
 }
 
 func TestReadFleetPolicyFailsClosed(t *testing.T) {
-	mock := ssh.NewMockExecutor("h", ssh.MockCommand{Match: "for p in", Err: errors.New("exit status 3: cannot read /etc/teploy/backup-policy.json")})
+	mock := ssh.NewMockExecutor("h", ssh.MockCommand{Match: policyReadMarker, Err: errors.New("exit status 3: cannot read /etc/teploy/backup-policy.json")})
 	if _, err := ReadFleetPolicy(context.Background(), mock); err == nil {
 		t.Fatal("an unreadable policy must not read as no policy")
 	}
@@ -118,7 +118,7 @@ func TestReadFleetPolicyFailsClosed(t *testing.T) {
 	if err := ApplyPolicyEncryption(context.Background(), mock, &cfg); err == nil {
 		t.Fatal("an unreadable policy must refuse, not go on unencrypted")
 	}
-	mock = ssh.NewMockExecutor("h", ssh.MockCommand{Match: "for p in", Output: "path /etc/teploy/backup-policy.json\n" + `{"v":"1","recipient":"` + testOwnerRecipient + `"}`})
+	mock = ssh.NewMockExecutor("h", ssh.MockCommand{Match: policyReadMarker, Output: "path /etc/teploy/backup-policy.json\n" + `{"v":"1","recipient":"` + testOwnerRecipient + `"}`})
 	if err := ApplyPolicyEncryption(context.Background(), mock, &cfg); err != nil || cfg.OwnerRecipient != testOwnerRecipient {
 		t.Fatalf("%v %+v", err, cfg)
 	}
@@ -154,7 +154,7 @@ func TestEnumerateFleet(t *testing.T) {
 	)
 	p := FleetPolicy{Retention: FleetRetention{KeepLast: 3}, Volumes: true, VolumeMaxGB: 1, Excludes: []string{"gone/volumes"},
 		Adopted: []AdoptedEntry{{Container: "omni_postgres", Databases: DatabaseSelector{All: true}}, {Container: "missing", Databases: DatabaseSelector{All: true}}}}
-	targets, uncovered, err := NewClient(mock, io.Discard).EnumerateFleet(context.Background(), p)
+	targets, uncovered, _, err := NewClient(mock, io.Discard).EnumerateFleet(context.Background(), p)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -348,10 +348,10 @@ func TestFleetStatusCoverage(t *testing.T) {
 		inventoryLine("stray", "redis:7", "running", nil, "REDIS_VERSION=7"),
 	}, "\n")
 	now := mustTime(t, "20260201-120000")
-	evA := `{"v":1,"id":"1","seq":1,"ts":"2026-02-01T11:00:00Z","app":"a","kind":"backup.run","outcome":"succeeded","detail":{"accessory":"db","kind":"accessory"}}`
-	evAd := `{"v":1,"id":"2","seq":1,"ts":"2026-01-01T11:00:00Z","app":"_adopted","kind":"backup.run","outcome":"failed","detail":{"accessory":"b_mysql","kind":"accessory","error":"boom"}}`
+	evA := `{"v":1,"id":"1","seq":1,"ts":"2026-02-01T11:00:00Z","app":"a","kind":"backup.run","outcome":"succeeded","detail":{"accessory":"db","kind":"accessory","policy_managed":true}}`
+	evAd := `{"v":1,"id":"2","seq":1,"ts":"2026-01-01T11:00:00Z","app":"_adopted","kind":"backup.run","outcome":"failed","detail":{"accessory":"b_mysql","kind":"accessory","error":"boom","policy_managed":true}}`
 	mock := ssh.NewMockExecutor("h",
-		ssh.MockCommand{Match: "for p in /etc/teploy/backup-policy.json", Output: "path /etc/teploy/backup-policy.json\n" + `{"v":"1","interval":"1h","recipient":"` + testOwnerRecipient + `","heartbeat_urls":["https://d/api/push/SECRETTOKEN"],"adopted":[{"container":"b_mysql","databases":"all"},{"container":"gone","databases":"all"}]}`},
+		ssh.MockCommand{Match: "if [ -d /etc/teploy ] && [ ! -x /etc/teploy ]", Output: "path /etc/teploy/backup-policy.json\n" + `{"v":"1","interval":"1h","recipient":"` + testOwnerRecipient + `","heartbeat_urls":["https://d/api/push/SECRETTOKEN"],"adopted":[{"container":"b_mysql","databases":"all"},{"container":"gone","databases":"all"}]}`},
 		ssh.MockCommand{Match: "for p in /etc/teploy/backup-target.json", Output: "path /etc/teploy/backup-target.json\n" + `{"v":"1","bucket":"bk","region":"r","prefix":"p","credentials":"SECRETARMOR"}`},
 		ssh.MockCommand{Match: "command -v aws >/dev/null", Output: "aws\nage\n"},
 		ssh.MockCommand{Match: "crontab -l", Output: "5 * * * * /usr/local/bin/teploy backup run --all # [teploy-backup-all]\n"},
@@ -360,7 +360,7 @@ func TestFleetStatusCoverage(t *testing.T) {
 		ssh.MockCommand{Match: "( c=$(python3", Output: "2026-02-01 11:00:00 1000 p/a/accessories/db/20260201-110000.pgdump.age\n"},
 		ssh.MockCommand{Match: "python3 -c", Output: evA + "\n" + evAd + "\n"},
 		ssh.MockCommand{Match: "for d in /deployments/*/volumes", Output: ""},
-		ssh.MockCommand{Match: "for d in /var/tmp/teploy-backup.", Output: "/var/tmp/teploy-backup.old\n"},
+		ssh.MockCommand{Match: "for d in '/var/tmp'/teploy-backup.", Output: "/var/tmp/teploy-backup.old\n"},
 	)
 	st, err := ReadFleetStatus(context.Background(), mock, now)
 	if err != nil {
@@ -430,5 +430,188 @@ func TestEntryObjectsAndEvents(t *testing.T) {
 	}
 	if e.LastSuccess == nil {
 		t.Fatal("a good object is evidence of a success")
+	}
+}
+
+// ---- review regressions ----
+
+// A leftover backup-schedule.json with no cron line must not decide retention.
+func TestEnumerateIgnoresAStaleScheduleStore(t *testing.T) {
+	labels := map[string]string{"teploy.role": "accessory", "teploy.app": "a", "teploy.accessory": "db"}
+	mock := ssh.NewMockExecutor("h",
+		ssh.MockCommand{Match: "ids=$(docker ps -aq", Output: inventoryLine("a-db", "postgres:17", "running", labels, "PG_MAJOR=17")},
+		ssh.MockCommand{Match: "crontab -l", Output: ""},
+		ssh.MockCommand{Match: "cat", Output: `{"accessories":{"db":{"keep_last":2}}}`},
+	)
+	p := FleetPolicy{Retention: FleetRetention{KeepDaily: 30, KeepWeekly: 8, KeepMonthly: 12}}
+	targets, _, warnings, err := NewClient(mock, io.Discard).EnumerateFleet(context.Background(), p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := targets[0].Retention; got.KeepDaily != 30 || got.KeepLast != 0 {
+		t.Fatalf("retention = %+v", got)
+	}
+	if len(warnings) != 1 || !strings.Contains(warnings[0], "no cron line runs it") {
+		t.Fatalf("warnings = %v", warnings)
+	}
+}
+
+// Stored nothing: no prune, ever. With earlier backups, a failure.
+func TestRunFleetTargetStoredNothing(t *testing.T) {
+	mk := func(listing string) *ssh.MockExecutor {
+		return newStoreMock("h",
+			ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
+			ssh.MockCommand{Match: "docker inspect -f", Output: "{}\n[]\n[]\n"},
+			ssh.MockCommand{Match: "umask 077", Output: "/var/tmp/teploy-backup.t\n"},
+			ssh.MockCommand{Match: "docker exec 'a-db' pg_dumpall", Output: ""},
+			ssh.MockCommand{Match: "docker exec 'a-db' psql -X -qtA -v ON_ERROR_STOP=1 -U 'postgres' -d 'postgres' -c 'SELECT datname", Output: "postgres\n"},
+			ssh.MockCommand{Match: "docker exec", Output: "0\n"},
+			ssh.MockCommand{Match: "rm -rf", Output: ""},
+			ssh.MockCommand{Match: "aws s3 ls", Output: listing},
+			ssh.MockCommand{Match: "aws s3", Output: ""},
+		)
+	}
+	target := FleetTarget{Kind: TargetAccessory, App: "a", Name: "db", Container: "a-db", Fact: &ContainerFact{Image: "postgres:17", Env: map[string]string{"PG_MAJOR": "17", "POSTGRES_DB": "app"}}, Retention: RetentionPolicy{KeepLast: 1}}
+	mock := mk("2026-01-01 00:00:00 1000 a/accessories/db/20260101-000000.pgdump\n")
+	r := NewClient(mock, io.Discard).RunFleetTarget(context.Background(), target, S3Config{Bucket: "b", Region: "r"}, BackupOptions{})
+	if r.Status != TargetFailed || !strings.Contains(r.Reason, "earlier backups") {
+		t.Fatalf("%+v", r)
+	}
+	for _, c := range mock.Calls {
+		if strings.Contains(c, "s3 rm") && !strings.Contains(c, ".incoming") {
+			t.Fatalf("pruned after storing nothing: %s", c)
+		}
+	}
+	// Nothing yet and no history: ok, and the summary names it.
+	mock = mk("")
+	r = NewClient(mock, io.Discard).RunFleetTarget(context.Background(), target, S3Config{Bucket: "b", Region: "r"}, BackupOptions{})
+	if r.Status != TargetOK || len(r.Objects) != 0 {
+		t.Fatalf("%+v", r)
+	}
+}
+
+// Databases teploy has no method for are generic, and would otherwise vanish.
+func TestUnsupportedDatabasesAreReported(t *testing.T) {
+	inv := strings.Join([]string{
+		inventoryLine("ch", "clickhouse/clickhouse-server:24", "running", nil),
+		inventoryLine("es", "docker.elastic.co/elasticsearch/elasticsearch:8", "running", nil),
+		inventoryLine("q", "qdrant/qdrant", "running", nil),
+		inventoryLine("web", "nginx", "running", nil),
+		inventoryLine("declared", "qdrant/qdrant", "running", map[string]string{EngineLabel: "generic"}),
+	}, "\n")
+	mock := ssh.NewMockExecutor("h",
+		ssh.MockCommand{Match: "ids=$(docker ps -aq", Output: inv},
+		ssh.MockCommand{Match: "crontab -l", Output: ""},
+	)
+	_, uncovered, _, err := NewClient(mock, io.Discard).EnumerateFleet(context.Background(), FleetPolicy{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(uncovered, ",") != "ch,es,q" {
+		t.Fatalf("uncovered = %v", uncovered)
+	}
+}
+
+// Covered needs a restorable object now, from what covers the entry.
+func TestStatusCoverageNeedsAnObject(t *testing.T) {
+	labels := map[string]string{"teploy.role": "accessory", "teploy.app": "a", "teploy.accessory": "db"}
+	now := mustTime(t, "20260201-120000")
+	ev := func(ts, outcome, extra string) string {
+		return `{"v":1,"id":"1","seq":1,"ts":"` + ts + `","app":"a","kind":"backup.run","outcome":"` + outcome + `","detail":{"accessory":"db","kind":"accessory"` + extra + `}}`
+	}
+	run := func(events, listing string) StatusEntry {
+		mock := ssh.NewMockExecutor("h",
+			ssh.MockCommand{Match: policyReadMarker, Output: "path /etc/teploy/backup-policy.json\n" + `{"v":"1","interval":"1h"}`},
+			ssh.MockCommand{Match: "for p in /etc/teploy/backup-target.json", Output: "path /etc/teploy/backup-target.json\n" + `{"v":"1","bucket":"bk","region":"r"}`},
+			ssh.MockCommand{Match: "command -v aws >/dev/null", Output: "aws\nage\n"},
+			ssh.MockCommand{Match: "crontab -l", Output: "5 * * * * /usr/local/bin/teploy backup run --all # [teploy-backup-all]\n"},
+			ssh.MockCommand{Match: "ids=$(docker ps -aq", Output: inventoryLine("a-db", "redis:7", "running", labels, "REDIS_VERSION=7")},
+			ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
+			ssh.MockCommand{Match: "aws s3 ls", Output: listing},
+			ssh.MockCommand{Match: "python3 -c", Output: events},
+			ssh.MockCommand{Match: "for d in /deployments/*/volumes", Output: ""},
+		)
+		st, err := ReadFleetStatus(context.Background(), mock, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return st.Entries[0]
+	}
+	fresh := "2026-02-01 11:00:00 1000 a/accessories/db/20260201-110000.rdb.gz\n"
+	if e := run(ev("2026-02-01T11:00:00Z", "succeeded", `,"policy_managed":true`), fresh); e.Coverage != CoverageCovered {
+		t.Fatalf("covered: %+v", e)
+	}
+	// The namespace is gone from the bucket.
+	if e := run(ev("2026-02-01T11:00:00Z", "succeeded", `,"policy_managed":true`), ""); e.Coverage != CoverageStale || !strings.Contains(e.Reason, "no restorable object") {
+		t.Fatalf("wiped: %+v", e)
+	}
+	// A pre-op single-database success does not mask a failing --all.
+	evs := ev("2026-02-01T10:00:00Z", "failed", `,"policy_managed":true,"error":"boom"`) + "\n" + ev("2026-02-01T11:00:00Z", "succeeded", `,"trigger":"this restore"`)
+	if e := run(evs, fresh); e.Coverage != CoverageFailing {
+		t.Fatalf("masked: %+v", e)
+	}
+	// Nor does a manual backup.
+	evs = ev("2026-02-01T10:00:00Z", "failed", `,"policy_managed":true,"error":"boom"`) + "\n" + ev("2026-02-01T11:00:00Z", "succeeded", "")
+	if e := run(evs, fresh); e.Coverage != CoverageFailing {
+		t.Fatalf("masked by a manual run: %+v", e)
+	}
+	// A successful run that is old, with an old object.
+	if e := run(ev("2026-01-01T11:00:00Z", "succeeded", `,"policy_managed":true`), "2026-01-01 11:00:00 1000 a/accessories/db/20260101-110000.rdb.gz\n"); e.Coverage != CoverageStale {
+		t.Fatalf("old: %+v", e)
+	}
+}
+
+func TestStatusReportsALegacyLinePerEntry(t *testing.T) {
+	labels := map[string]string{"teploy.role": "accessory", "teploy.app": "a", "teploy.accessory": "db"}
+	mock := ssh.NewMockExecutor("h",
+		ssh.MockCommand{Match: policyReadMarker, Output: "path /etc/teploy/backup-policy.json\n" + `{"v":"1","interval":"1h","recipient":"` + testOwnerRecipient + `"}`},
+		ssh.MockCommand{Match: "for p in /etc/teploy/backup-target.json", Output: "absent\n"},
+		ssh.MockCommand{Match: "command -v aws >/dev/null", Output: "aws\nage\n"},
+		ssh.MockCommand{Match: "crontab -l", Output: "0 5 * * * TEPLOY_S3_ACCESS_KEY=ak /usr/local/bin/teploy accessory backup db --local --app a --bucket b # [teploy-accessory-backup:a:db]\n"},
+		ssh.MockCommand{Match: "ids=$(docker ps -aq", Output: inventoryLine("a-db", "redis:7", "running", labels, "REDIS_VERSION=7")},
+		ssh.MockCommand{Match: "python3 -c", Output: ""},
+		ssh.MockCommand{Match: "for d in /deployments/*/volumes", Output: ""},
+	)
+	st, err := ReadFleetStatus(context.Background(), mock, mustTime(t, "20260201-120000"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := st.Entries[0]
+	if e.Encrypted || e.ScheduleForm != CronFormLegacy || !st.Encrypted {
+		t.Fatalf("%+v", e)
+	}
+	if !strings.Contains(strings.Join(st.Warnings, ""), "pre-D3") {
+		t.Fatalf("%v", st.Warnings)
+	}
+}
+
+// A policy this user cannot read is no policy to nobody: it fails closed.
+func TestHiddenPolicyFailsClosed(t *testing.T) {
+	mock := ssh.NewMockExecutor("h", ssh.MockCommand{Match: policyReadMarker, Err: errors.New("exit status 3: cannot tell whether this server's backups must be encrypted")})
+	_, err := ReadFleetPolicy(context.Background(), mock)
+	if !errors.Is(err, ErrPolicyHidden) {
+		t.Fatalf("%v", err)
+	}
+	var cfg S3Config
+	if err := ApplyPolicyEncryption(context.Background(), mock, &cfg); !errors.Is(err, ErrPolicyHidden) {
+		t.Fatalf("%v", err)
+	}
+}
+
+func TestPolicyValidateNewFields(t *testing.T) {
+	if (FleetPolicy{TmpDir: "relative"}).Validate() == nil || (FleetPolicy{TmpDir: "/a b"}).Validate() == nil {
+		t.Fatal("tmp_dir")
+	}
+	if (FleetPolicy{TargetDeadline: "soon"}).Validate() == nil || (FleetPolicy{TargetDeadline: "12h", TmpDir: "/mnt/big"}).Validate() != nil {
+		t.Fatal("target_deadline")
+	}
+}
+
+func TestChildPIDs(t *testing.T) {
+	if _, err := os.Stat("/proc/self/stat"); err != nil {
+		t.Skip("no /proc")
+	}
+	if len(childPIDs(1)) == 0 {
+		t.Fatal("pid 1 has children")
 	}
 }

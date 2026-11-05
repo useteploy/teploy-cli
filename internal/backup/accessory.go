@@ -30,6 +30,9 @@ type BackupOptions struct {
 	SingleDatabase string
 	// IgnoreSpace skips the free-space preflight.
 	IgnoreSpace bool
+	// SafetyCopy marks what this backup stores as a destructive operation's way
+	// back: retention leaves it alone for safetyWindow.
+	SafetyCopy bool
 }
 
 // PrimaryDatabase names the database a default restore of this accessory would
@@ -162,8 +165,19 @@ func (c *Client) AccessoryBackupWith(ctx context.Context, app, name, image strin
 		failed[missing] = "listed for backup but not on the server"
 	}
 
+	primary := true
+	switch {
+	case opts.SingleDatabase != "" && (!coverage.PrimaryIsSingle || coverage.PrimaryMissing):
+		primary = false
+	case (det.Engine == EnginePostgres || det.Engine == EngineMySQL || det.Engine == EngineMariaDB) && (adopted || (multi && coverage.PrimaryMissing)):
+		// Nothing named this container's primary database: every database has
+		// its own series. Pruning sees that as one series per database.
+		primary = false
+	}
+
 	// Sidecars and extra databases first: the primary object commits the backup.
-	if det.Engine == EnginePostgres {
+	// No database, no sidecar: a roles file alone is not a backup of anything.
+	if det.Engine == EnginePostgres && (primary || len(coverage.Extra) > 0) {
 		if w := c.backupPostgresGlobals(ctx, pgT, timestamp, workDir, s3, app, name); w != "" {
 			res.Warnings = append(res.Warnings, w)
 			fmt.Fprintf(c.out, "Warning: %s\n", w)
@@ -181,15 +195,6 @@ func (c *Client) AccessoryBackupWith(ctx context.Context, app, name, image strin
 		fmt.Fprintf(c.out, "Backed up database %s\n", db)
 	}
 
-	primary := true
-	switch {
-	case opts.SingleDatabase != "" && (!coverage.PrimaryIsSingle || coverage.PrimaryMissing):
-		primary = false
-	case (det.Engine == EnginePostgres || det.Engine == EngineMySQL || det.Engine == EngineMariaDB) && (adopted || (multi && coverage.PrimaryMissing)):
-		// Nothing named this container's primary database: every database has
-		// its own series. Pruning sees that as one series per database.
-		primary = false
-	}
 	if primary {
 		obj, consistency, perr := c.backupPrimary(ctx, app, name, det, env, pgT, workDir, timestamp, s3, opts)
 		res.Consistency = consistency
@@ -213,11 +218,23 @@ func (c *Client) AccessoryBackupWith(ctx context.Context, app, name, image strin
 	}
 	res.FailedDatabases = failed
 	c.markNamespaceOwner(ctx, s3, app)
+	if opts.SafetyCopy {
+		c.markSafetyCopy(ctx, s3, seriesPrefix(s3, app, name, ""), timestamp, &res)
+	}
 	if len(failed) > 0 {
 		return res, joinDatabaseFailures(failed, nil)
 	}
 	fmt.Fprintf(c.out, "Backup complete: %s\n", res.Key)
 	return res, nil
+}
+
+// markSafetyCopy records an id as a safety copy. Failing to is reported, not fatal:
+// the copy exists, and only its protection from retention is lost.
+func (c *Client) markSafetyCopy(ctx context.Context, s3 S3Config, prefix, id string, res *BackupResult) {
+	key := prefix + safetyDir + "/" + id + ".safety"
+	if _, err := c.exec.Run(ctx, "printf '%s\\n' safety | "+s3.AWS("s3 cp - "+ssh.ShellQuote(key))); err != nil {
+		res.Warnings = append(res.Warnings, fmt.Sprintf("could not protect safety copy %s from retention: %v", id, err))
+	}
 }
 
 // joinDatabaseFailures renders per-database failures into one error.

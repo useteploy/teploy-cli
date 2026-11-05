@@ -98,7 +98,8 @@ func purgeInventory(ctx context.Context, exec ssh.Executor, app string) (accesso
 		}
 	}
 	slices.Sort(accessoriesNames)
-	out, err := exec.Run(ctx, "d="+ssh.ShellQuote("/deployments/"+app+"/volumes")+`; if [ -d "$d" ] && [ -n "$(ls -A "$d" 2>/dev/null)" ]; then echo yes; fi; true`)
+	// An unreadable tree is an error, not an empty one.
+	out, err := exec.Run(ctx, "d="+ssh.ShellQuote("/deployments/"+app+"/volumes")+`; if [ ! -e "$d" ]; then echo empty; elif x=$(ls -A "$d"); then if [ -n "$x" ]; then echo yes; else echo empty; fi; else exit 1; fi`)
 	if err != nil {
 		return nil, false, fmt.Errorf("checking volumes: %w", err)
 	}
@@ -116,14 +117,19 @@ func backupBeforePurge(ctx context.Context, exec ssh.Executor, app string, accs 
 	}
 	client := backup.NewClient(exec, out)
 	for _, acc := range accs {
-		id, err := preOperationBackup(ctx, client, exec, app, acc, "", cfg, "remove --purge")
+		// Every database: a purge destroys them all, not just the primary.
+		id, err := preOperationBackup(ctx, client, exec, app, acc, cfg, "remove --purge", preBackupScope{All: true})
 		if err != nil {
 			return err
 		}
-		fmt.Fprintf(out, "Backed up %s first: %s\n", backup.ContainerName(app, acc), id)
+		if id == "" {
+			fmt.Fprintf(out, "%s has nothing to back up\n", backup.ContainerName(app, acc))
+		} else {
+			fmt.Fprintf(out, "Backed up every database of %s first: %s\n", backup.ContainerName(app, acc), id)
+		}
 	}
 	if volumes {
-		id, err := preOperationBackup(ctx, client, exec, app, "", "", cfg, "remove --purge")
+		id, err := preOperationBackup(ctx, client, exec, app, "", cfg, "remove --purge", preBackupScope{})
 		if err != nil {
 			return err
 		}

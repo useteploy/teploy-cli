@@ -41,12 +41,12 @@ func doctorHappyMock() *ssh.MockExecutor {
 		ssh.MockCommand{Match: "sched_daemon=no", Output: "daemon=yes\nenabled=enabled\ncrontab=yes\nteploy_entries=0\n"},
 		ssh.MockCommand{Match: "for d in /var/tmp/teploy-pre-restore.*", Output: ""},
 		ssh.MockCommand{Match: "docker ps --filter label=teploy.role=accessory", Output: ""},
-		ssh.MockCommand{Match: "for p in /etc/teploy/backup-policy.json", Output: "absent\n"},
+		ssh.MockCommand{Match: "if [ -d /etc/teploy ] && [ ! -x /etc/teploy ]", Output: "absent\n"},
 		ssh.MockCommand{Match: "for p in /etc/teploy/backup-target.json", Output: "absent\n"},
 		ssh.MockCommand{Match: "command -v aws >/dev/null", Output: "aws\nage\n"},
 		ssh.MockCommand{Match: "ids=$(docker ps -aq", Output: ""},
 		ssh.MockCommand{Match: "for d in /deployments/*/volumes", Output: ""},
-		ssh.MockCommand{Match: "for d in /var/tmp/teploy-backup", Output: ""},
+		ssh.MockCommand{Match: "for d in '/var/tmp'/teploy-backup", Output: ""},
 		ssh.MockCommand{Match: "python3 -c", Output: ""},
 	)
 }
@@ -206,10 +206,11 @@ func TestDoctorHumanTable(t *testing.T) {
 		ssh.MockCommand{Match: "for d in /var/tmp/teploy-pre-restore.*", Output: ""},
 		ssh.MockCommand{Match: "docker ps --filter label=teploy.role=accessory", Output: ""},
 		ssh.MockCommand{Match: "for p in /etc/teploy/backup-", Output: "absent\n"},
+		ssh.MockCommand{Match: "if [ -d /etc/teploy ] && [ ! -x /etc/teploy ]", Output: "absent\n"},
 		ssh.MockCommand{Match: "command -v aws >/dev/null", Output: "aws\nage\n"},
 		ssh.MockCommand{Match: "ids=$(docker ps -aq", Output: ""},
 		ssh.MockCommand{Match: "for d in /deployments/*/volumes", Output: ""},
-		ssh.MockCommand{Match: "for d in /var/tmp/teploy-backup", Output: ""},
+		ssh.MockCommand{Match: "for d in '/var/tmp'/teploy-backup", Output: ""},
 		ssh.MockCommand{Match: "python3 -c", Output: ""},
 	)
 	report, _ := doctorRun(context.Background(), doctorTestDeps(mock), &Flags{}, "", doctorTestApp(), nil)
@@ -726,10 +727,11 @@ func assertDoctorReadOnlyCalls(t *testing.T, calls []string) {
 		"for d in /var/tmp/teploy-pre-restore.*",
 		"docker ps --filter label=teploy.role=accessory",
 		"for p in /etc/teploy/backup-",
+		"if [ -d /etc/teploy ] && [ ! -x /etc/teploy ]",
 		"command -v aws >/dev/null",
 		"ids=$(docker ps -aq",
 		"for d in /deployments/*/volumes",
-		"for d in /var/tmp/teploy-backup",
+		"for d in '/var/tmp'/teploy-backup",
 		"python3 -c",
 	}
 	for _, call := range calls {

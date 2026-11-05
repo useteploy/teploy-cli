@@ -141,6 +141,11 @@ type RestoreOptions struct {
 	Database string
 	// NoPreBackup skips the automatic backup the CLI takes before a restore.
 	NoPreBackup bool
+	// IdentityFile is a local age identity (--identity) the CLI places on the
+	// server for this restore.
+	IdentityFile string
+	// Deadline overrides the operation deadline (--deadline).
+	Deadline time.Duration
 }
 
 // AccessoryRestoreWith is AccessoryRestoreKeep with options.

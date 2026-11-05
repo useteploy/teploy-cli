@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -267,6 +268,7 @@ func TestPruneToleratesRefusedDeletes(t *testing.T) {
 func putMock(extra ...ssh.MockCommand) *ssh.MockExecutor {
 	base := []ssh.MockCommand{
 		{Match: "sha256sum", Output: "abc  f\n4096\n"},
+		{Match: "{ cat /etc/machine-id", Output: "0123456789abcdef0123456789abcdef  -\n"},
 		{Match: "{ ", Output: "abc  -\n"},
 		{Match: "aws s3api head-object", Output: `{"ContentLength":4096,"Metadata":{"sha256":"abc"}}`},
 		{Match: "aws s3 cp", Output: "ok\n"},
@@ -400,7 +402,7 @@ func TestFetchDecryptsWithServerIdentityAndNamesTheWayOut(t *testing.T) {
 	}
 	dec := false
 	for _, c := range mock.Calls {
-		dec = dec || strings.HasPrefix(c, "umask 077; age -d -i \"$(if [ -r /etc/teploy/age-key ]")
+		dec = dec || strings.HasPrefix(c, "umask 077; age -d $(for p in /etc/teploy/age-key")
 	}
 	if !dec {
 		t.Fatalf("no decrypt: %v", mock.Calls)
@@ -750,5 +752,295 @@ func TestBundleDownloadFindsEncryptedAndLegacyMembers(t *testing.T) {
 	}
 	if strings.Contains(strings.Join(legacy.Calls, "\n"), "age -d") {
 		t.Fatalf("a plain member must not be decrypted: %v", legacy.Calls)
+	}
+}
+
+// ---- review regressions ----
+
+// A database failing in the last run of each day has its own history: keep_daily
+// holds for it, not only for the primary's ids.
+func TestPruneSelectsEachDatabaseSeriesOnItsOwn(t *testing.T) {
+	r := "a/accessories/db/"
+	var lines []string
+	var wantKept []string
+	for d := 1; d <= 9; d++ {
+		early := "2026010" + string(rune('0'+d)) + "-020000"
+		late := "2026010" + string(rune('0'+d)) + "-200000"
+		lines = append(lines, "d t 1000 "+r+early+".pgdump", "d t 1000 "+r+late+".pgdump", "d t 1000 "+r+"databases/x/"+early+".pgdump")
+		if d >= 7 {
+			wantKept = append(wantKept, "s3://b/"+r+"databases/x/"+early+".pgdump")
+		}
+	}
+	mock := treeMock(strings.Join(lines, "\n"))
+	if _, err := NewClient(mock, io.Discard).PruneBackups(context.Background(), "a", "accessories/db", S3Config{Bucket: "b", Region: "r"}, RetentionPolicy{KeepDaily: 3}); err != nil {
+		t.Fatal(err)
+	}
+	removed := map[string]bool{}
+	for _, k := range rmKeys(mock) {
+		removed[k] = true
+	}
+	for _, k := range wantKept {
+		if removed[k] {
+			t.Fatalf("keep_daily 3 must keep %s: %v", k, rmKeys(mock))
+		}
+	}
+	if !removed["s3://b/"+r+"databases/x/20260106-020000.pgdump"] {
+		t.Fatalf("the series past its keep_daily was not pruned: %v", rmKeys(mock))
+	}
+}
+
+// A primary that reappears after a series-only period does not decide the
+// databases' history, and one dropped long ago does not freeze it.
+func TestPruneDatabaseSeriesIgnoresThePrimarysPeriods(t *testing.T) {
+	r := "a/accessories/db/"
+	lines := []string{"d t 1000 " + r + "20260201-000000.pgdump"} // reappeared today
+	for d := 10; d <= 28; d++ {
+		lines = append(lines, "d t 1000 "+r+"databases/x/202601"+strconv.Itoa(d)+"-000000.pgdump")
+	}
+	mock := treeMock(strings.Join(lines, "\n"))
+	if _, err := NewClient(mock, io.Discard).PruneBackups(context.Background(), "a", "accessories/db", S3Config{Bucket: "b", Region: "r"}, RetentionPolicy{KeepLast: 5}); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(rmKeys(mock)); got != 14 {
+		t.Fatalf("19 objects with keep_last 5 must lose 14, lost %d", got)
+	}
+	// The primary long gone: the series is still selected.
+	lines[0] = "d t 1000 " + r + "20200101-000000.pgdump"
+	mock = treeMock(strings.Join(lines, "\n"))
+	if _, err := NewClient(mock, io.Discard).PruneBackups(context.Background(), "a", "accessories/db", S3Config{Bucket: "b", Region: "r"}, RetentionPolicy{KeepLast: 5}); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(rmKeys(mock)); got != 14 {
+		t.Fatalf("an old primary froze the series: lost %d", got)
+	}
+}
+
+func TestPruneOwnersFailClosed(t *testing.T) {
+	ctx := context.Background()
+	p := RetentionPolicy{KeepLast: 1}
+	s3 := S3Config{Bucket: "b", Region: "r"}
+	// A listing that fails is not "no owners".
+	mock := newStoreMock("h",
+		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
+		ssh.MockCommand{Match: "aws s3 ls 's3://b/a/.owners/'", Err: errors.New("exit status 254: SlowDown")},
+		ssh.MockCommand{Match: "aws s3 ls", Output: "d t 1000 a/volumes/20240101-000000.tar.gz\nd t 1000 a/volumes/20240102-000000.tar.gz\n"},
+		ssh.MockCommand{Match: "aws s3 rm", Output: ""},
+	)
+	if _, err := NewClient(mock, io.Discard).PruneBackups(ctx, "a", "volumes", s3, p); !errors.Is(err, ErrSharedNamespace) {
+		t.Fatalf("err = %v", err)
+	}
+	if len(rmKeys(mock)) != 0 {
+		t.Fatal("deleted on a failed owners listing")
+	}
+	// Empty machine-id and hostname hash to one value on every such host.
+	mock = ssh.NewMockExecutor("h",
+		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
+		ssh.MockCommand{Match: "{ cat /etc/machine-id", Output: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  -\n"},
+		ssh.MockCommand{Match: "aws s3 ls", Output: ""},
+		ssh.MockCommand{Match: "aws s3 rm", Output: ""},
+	)
+	if _, err := NewClient(mock, io.Discard).PruneBackups(ctx, "a", "volumes", s3, p); !errors.Is(err, ErrSharedNamespace) {
+		t.Fatalf("an unidentifiable server: %v", err)
+	}
+	// A clone: same machine-id and hostname, another age identity.
+	mock = ssh.NewMockExecutor("h",
+		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
+		ssh.MockCommand{Match: "{ cat /etc/machine-id", Output: "0123456789abcdef0123456789abcdef  -\n"},
+		ssh.MockCommand{Match: "aws s3 ls 's3://b/a/.owners/'", Output: "d t 20 a/.owners/0123456789abcdef\n"},
+		ssh.MockCommand{Match: "aws s3 cp 's3://b/a/.owners/0123456789abcdef' -", Output: `{"recipient":"` + testOwnerRecipient + `"}`},
+		ssh.MockCommand{Match: "for p in /etc/teploy/age-key", Output: testServerRecipient + "\n"},
+		ssh.MockCommand{Match: "aws s3 rm", Output: ""},
+	)
+	if _, err := NewClient(mock, io.Discard).PruneBackups(ctx, "a", "volumes", s3, p); !errors.Is(err, ErrSharedNamespace) || !strings.Contains(err.Error(), "--clear") {
+		t.Fatalf("a clone: %v", err)
+	}
+}
+
+// The marker is written before anything is deleted.
+func TestPruneMarksBeforeItDeletes(t *testing.T) {
+	r := "a/volumes/"
+	mock := treeMock("d t 1000 " + r + "20240103-000000.tar.gz\nd t 1000 " + r + "20240102-000000.tar.gz\n")
+	if _, err := NewClient(mock, io.Discard).PruneBackups(context.Background(), "a", "volumes", S3Config{Bucket: "b", Region: "r"}, RetentionPolicy{KeepLast: 1}); err != nil {
+		t.Fatal(err)
+	}
+	marked, deleted := -1, -1
+	for i, c := range mock.Calls {
+		if marked < 0 && strings.Contains(c, ".owners/0123456789abcdef") && strings.HasPrefix(c, "printf") {
+			marked = i
+		}
+		if deleted < 0 && strings.HasPrefix(c, "aws s3 rm") {
+			deleted = i
+		}
+	}
+	if marked < 0 || deleted < 0 || marked > deleted {
+		t.Fatalf("marked at %d, deleted at %d: %v", marked, deleted, mock.Calls)
+	}
+}
+
+func TestPruneRefusesAWrongClock(t *testing.T) {
+	ctx := context.Background()
+	r := "a/volumes/"
+	listing := "d t 1000 " + r + "20240103-000000.tar.gz\nd t 1000 " + r + "20240102-000000.tar.gz\n"
+	// The store says it is a year from now: this machine is slow, or the store fast.
+	future := time.Now().UTC().AddDate(1, 0, 0).Format(time.RFC3339)
+	mock := ssh.NewMockExecutor("h",
+		ssh.MockCommand{Match: "{ cat /etc/machine-id", Output: "0123456789abcdef0123456789abcdef  -\n"},
+		ssh.MockCommand{Match: "printf", Output: ""},
+		ssh.MockCommand{Match: "for p in /etc/teploy/age-key", Output: ""},
+		ssh.MockCommand{Match: "aws s3api head-object", Output: `{"ContentLength":1,"LastModified":"` + future + `"}`},
+		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
+		ssh.MockCommand{Match: "aws s3 ls", Output: listing},
+		ssh.MockCommand{Match: "aws s3 rm", Output: ""},
+	)
+	_, err := NewClient(mock, io.Discard).PruneBackups(ctx, "a", "volumes", S3Config{Bucket: "b", Region: "r"}, RetentionPolicy{KeepLast: 1})
+	if !errors.Is(err, ErrClockSkew) || len(rmKeys(mock)) != 0 {
+		t.Fatalf("err = %v, removed %v", err, rmKeys(mock))
+	}
+	if _, err := NewClient(mock, io.Discard).PruneBackups(ctx, "a", "volumes", S3Config{Bucket: "b", Region: "r"}, RetentionPolicy{KeepLast: 1, IgnoreClock: true}); err != nil {
+		t.Fatalf("--ignore-clock: %v", err)
+	}
+	// A backup dated in the future would count as the newest: keep_last 1 would
+	// then delete today's real one.
+	mock = treeMock("d t 1000 " + r + time.Now().UTC().AddDate(1, 0, 0).Format("20060102-150405") + ".tar.gz\nd t 1000 " + r + time.Now().UTC().Format("20060102-150405") + ".tar.gz\n")
+	_, err = NewClient(mock, io.Discard).PruneBackups(ctx, "a", "volumes", S3Config{Bucket: "b", Region: "r"}, RetentionPolicy{KeepLast: 1})
+	if !errors.Is(err, ErrClockSkew) || len(rmKeys(mock)) != 0 {
+		t.Fatalf("future-dated: err = %v, removed %v", err, rmKeys(mock))
+	}
+}
+
+func TestPrunePendingUploadsAtAnyDepth(t *testing.T) {
+	r := "a/accessories/db/"
+	listing := strings.Join([]string{
+		"d t 1000 " + r + "20240103-000000.pgdump",
+		"d t 1000 " + r + "databases/x/.incoming/20240101-000000.pgdump",
+		"d t 1000 " + r + "globals/.incoming/20240101-000000.sql.gz",
+		"d t 1000 " + r + "meta/.incoming/20240101-000000.json",
+		"d t 1000 " + r + ".incoming/20240101-000000.pgdump",
+	}, "\n")
+	mock := treeMock(listing)
+	if _, err := NewClient(mock, io.Discard).PruneBackups(context.Background(), "a", "accessories/db", S3Config{Bucket: "b", Region: "r"}, RetentionPolicy{KeepLast: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if got := rmKeys(mock); len(got) != 4 {
+		t.Fatalf("removed %v", got)
+	}
+}
+
+// A destructive operation's safety copy outlasts retention for its window.
+func TestPruneProtectsSafetyCopies(t *testing.T) {
+	r := "a/accessories/db/"
+	recent := time.Now().UTC().Add(-time.Hour).Format("20060102-150405")
+	newer := time.Now().UTC().Add(-time.Minute).Format("20060102-150405")
+	old := time.Now().UTC().AddDate(0, 0, -30).Format("20060102-150405")
+	listing := strings.Join([]string{
+		"d t 1000 " + r + newer + ".pgdump",
+		"d t 1000 " + r + recent + ".pgdump",
+		"d t 8 " + r + "safety/" + recent + ".safety",
+		"d t 1000 " + r + old + ".pgdump",
+		"d t 8 " + r + "safety/" + old + ".safety",
+	}, "\n")
+	mock := treeMock(listing)
+	if _, err := NewClient(mock, io.Discard).PruneBackups(context.Background(), "a", "accessories/db", S3Config{Bucket: "b", Region: "r"}, RetentionPolicy{KeepLast: 1}); err != nil {
+		t.Fatal(err)
+	}
+	got := strings.Join(rmKeys(mock), ",")
+	if strings.Contains(got, recent) {
+		t.Fatalf("a recent safety copy was pruned: %s", got)
+	}
+	if !strings.Contains(got, old+".pgdump") || !strings.Contains(got, "safety/"+old) {
+		t.Fatalf("a safety copy past its window, with its marker, must go: %s", got)
+	}
+}
+
+func TestPutLargeObjectUsesAProviderChecksum(t *testing.T) {
+	ctx := context.Background()
+	big := func(extra ...ssh.MockCommand) *ssh.MockExecutor {
+		return putMock(append(extra, ssh.MockCommand{Match: "aws s3api head-object", Output: `{"ContentLength":4096,"Metadata":{"sha256":"abc"},"ChecksumSHA256":"AAA=-3"}`})...)
+	}
+	c := func(m *ssh.MockExecutor) *Client { cl := NewClient(m, io.Discard); cl.readBack = 1; return cl }
+	mock := big()
+	if _, err := c(mock).put(ctx, S3Config{Bucket: "b", Region: "r"}, "/w/x", "s3://b/k/1.pgdump"); err != nil {
+		t.Fatal(err)
+	}
+	joined := strings.Join(mock.Calls, "\n")
+	if !strings.Contains(joined, "--checksum-algorithm SHA256") || strings.Contains(joined, "{ aws s3 cp") {
+		t.Fatalf("calls: %s", joined)
+	}
+	// A whole-object digest that differs refuses.
+	mock = putMock(
+		ssh.MockCommand{Match: "aws s3api head-object", Output: `{"ContentLength":4096,"Metadata":{"sha256":"abc"},"ChecksumSHA256":"bm9wZQ=="}`},
+	)
+	if _, err := c(mock).put(ctx, S3Config{Bucket: "b", Region: "r"}, "/w/x", "s3://b/k/1.pgdump"); err == nil || !strings.Contains(err.Error(), "checksum mismatch") {
+		t.Fatalf("err = %v", err)
+	}
+	// A store or CLI without it falls back, and says so.
+	var out strings.Builder
+	mock = big(ssh.MockCommand{Match: "aws s3 cp '/w/x' 's3://b/k/.incoming/1.pgdump' --metadata 'sha256=abc' --checksum-algorithm", Err: errors.New("exit status 2: Unknown options: --checksum-algorithm")})
+	cl := NewClient(mock, &out)
+	cl.readBack = 1
+	if _, err := cl.put(ctx, S3Config{Bucket: "b", Region: "r"}, "/w/x", "s3://b/k/1.pgdump"); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "verified by size alone") {
+		t.Fatalf("out: %s", out.String())
+	}
+}
+
+func TestFetchPassesNoMissingIdentity(t *testing.T) {
+	mock := putMock(ssh.MockCommand{Match: "umask 077; age -d", Output: ""})
+	if err := NewClient(mock, io.Discard).fetch(context.Background(), S3Config{Bucket: "b", Region: "r", ExtraIdentity: "/tmp/owner"}, "s3://b/k/1.pgdump.age", "/w/x"); err != nil {
+		t.Fatal(err)
+	}
+	var dec string
+	for _, c := range mock.Calls {
+		if strings.HasPrefix(c, "umask 077; age -d") {
+			dec = c
+		}
+	}
+	if !strings.Contains(dec, `[ -r "$p" ]`) || !strings.Contains(dec, "-i '/tmp/owner'") || strings.Contains(dec, `-i "$(`) {
+		t.Fatalf("%s", dec)
+	}
+}
+
+func TestAddressableDBRefusesAConnectionURI(t *testing.T) {
+	if addressableDB("postgresql://host/x") || addressableDB("postgres://u@h/x") {
+		t.Fatal("pg_dump reads these as conninfo")
+	}
+}
+
+func TestStaleWorkspacesLookInTheConfiguredDir(t *testing.T) {
+	t.Setenv("TEPLOY_BACKUP_TMPDIR", "/data/tmp")
+	if !strings.Contains(tmpGlobs("", "teploy-backup.*"), "'/data/tmp'/teploy-backup.*") {
+		t.Fatal(tmpGlobs("", "teploy-backup.*"))
+	}
+	t.Setenv("TEPLOY_BACKUP_TMPDIR", "")
+	if !strings.Contains(LeftoverWorkspacesProbe("/mnt/big"), "'/mnt/big'/teploy-backup.*") {
+		t.Fatal(LeftoverWorkspacesProbe("/mnt/big"))
+	}
+}
+
+// A bucket-wide multipart listing would catch other servers' uploads.
+func TestAbortStaleUploadsIsScopedToOwnedNamespaces(t *testing.T) {
+	old := time.Now().UTC().AddDate(0, 0, -2).Format(time.RFC3339)
+	mock := newStoreMock("h",
+		ssh.MockCommand{Match: "aws s3 ls 's3://b/mine/.owners/'", Output: "d t 20 mine/.owners/0123456789abcdef\n"},
+		ssh.MockCommand{Match: "aws s3 ls 's3://b/shared/.owners/'", Output: "d t 20 shared/.owners/aaaaaaaaaaaaaaaa\n"},
+		ssh.MockCommand{Match: "aws s3api list-multipart-uploads", Output: `{"Uploads":[{"Key":"mine/x","UploadId":"u1","Initiated":"` + old + `"}]}`},
+		ssh.MockCommand{Match: "aws s3api abort-multipart-upload", Output: ""},
+	)
+	if n := NewClient(mock, io.Discard).AbortStaleUploads(context.Background(), S3Config{Bucket: "b", Region: "r"}, []string{"mine", "shared"}, time.Now().UTC()); n != 1 {
+		t.Fatalf("aborted %d", n)
+	}
+	lists := 0
+	for _, c := range mock.Calls {
+		if strings.HasPrefix(c, "aws s3api list-multipart-uploads") {
+			lists++
+			if !strings.Contains(c, "--prefix 'mine/'") {
+				t.Fatalf("unscoped: %s", c)
+			}
+		}
+	}
+	if lists != 1 {
+		t.Fatalf("lists = %d", lists)
 	}
 }

@@ -185,6 +185,9 @@
         "recipient": {
           "type": "string",
           "description": "The owner's recovery PUBLIC key."
+        },
+        "allow_empty": {
+          "type": "boolean"
         }
       }
     },
@@ -238,6 +241,13 @@
         "stale": {
           "type": "boolean",
           "description": "Older than twice the policy interval."
+        },
+        "warnings": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Includes refused prunes: the backup is stored, retention has stopped."
         }
       }
     },
@@ -251,7 +261,8 @@
           "unmanaged",
           "adopted",
           "coverage",
-          "schedule"
+          "schedule",
+          "encrypted"
         ],
         "properties": {
           "name": {
@@ -298,7 +309,7 @@
               "excluded",
               "adopted"
             ],
-            "description": "adopted = covered, via a policy entry. A failing or stale adopted container reports failing or stale, with adopted:true."
+            "description": "adopted = covered, via a policy entry. A failing or stale adopted container reports failing or stale, with adopted:true. covered and adopted require a restorable object in the bucket within the limit; only policy runs count for a policy-covered entry."
           },
           "reason": {
             "type": "string"
@@ -430,6 +441,17 @@
           "size_bytes": {
             "type": "integer",
             "minimum": 0
+          },
+          "encrypted": {
+            "type": "boolean",
+            "description": "This entry's new objects will be encrypted: the server's setting, except under a legacy shell cron line."
+          },
+          "schedule_form": {
+            "enum": [
+              "run",
+              "legacy"
+            ],
+            "description": "The own schedule's form; legacy uploads plaintext whatever the policy says."
           }
         }
       }

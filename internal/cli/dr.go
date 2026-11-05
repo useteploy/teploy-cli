@@ -8,7 +8,6 @@ import (
 	"io"
 	"os"
 	"os/signal"
-	"strings"
 
 	"github.com/spf13/cobra"
 	"github.com/useteploy/teploy/internal/backup"
@@ -53,12 +52,19 @@ func drStoreFlags(cmd *cobra.Command, bucket, region, endpoint, dir *string) {
 	cmd.Flags().StringVar(region, "region", "", "AWS region (default: the stored target's region, else us-east-1)")
 	cmd.Flags().StringVar(endpoint, "endpoint", "", "S3-compatible endpoint URL (MinIO/B2/R2); creds from TEPLOY_S3_ACCESS_KEY/SECRET_KEY or AWS_* env")
 	cmd.Flags().StringVar(dir, "dir", "", "store bundles in a directory on the server (offline bundles) instead of S3")
+	cmd.Flags().StringVar(&drPrefix, "prefix", "", "key prefix under --bucket (a stored target has its own)")
 }
 
 // drStore builds the BundleStore from the flags; with neither --bucket nor
 // --dir the server's stored backup target is used (stored credentials and
 // all — no bucket or credentials need to travel with the command).
 func drStore(ctx context.Context, exec ssh.Executor, bucket, region, endpoint, dir string) (backup.BundleStore, error) {
+	if drPrefix != "" && (bucket == "" || dir != "") {
+		return nil, fmt.Errorf("--prefix goes with --bucket: the stored target already has its own")
+	}
+	if err := backup.ValidatePrefix(drPrefix); err != nil {
+		return nil, err
+	}
 	switch {
 	case dir != "" && bucket != "":
 		return nil, fmt.Errorf("choose one bundle target: --bucket (S3) or --dir (server directory), not both")
@@ -76,6 +82,7 @@ func drStore(ctx context.Context, exec ssh.Executor, bucket, region, endpoint, d
 			return nil, err
 		}
 		cfg := s3Config(bucket, r, endpoint)
+		cfg.Prefix = drPrefix
 		if err := backup.ApplyPolicyEncryption(ctx, exec, &cfg); err != nil {
 			return nil, err
 		}
@@ -95,32 +102,17 @@ func drStore(ctx context.Context, exec ssh.Executor, bucket, region, endpoint, d
 	return backup.S3BundleStore{S3: cfg}, nil
 }
 
-// withBundleIdentity puts a local identity file on the server for this restore
-// only, in a private directory removed by the returned cleanup. An encrypted
-// bundle restored on a host that did not make it can be read no other way; that
-// is the one time the recovery key leaves the owner's machine, and only when
-// asked for by flag.
+// drPrefix is the shared --prefix of the dr commands.
+var drPrefix string
+
+// withBundleIdentity places the recovery key for a bundle restore (placeIdentity):
+// an encrypted bundle on a host that did not make it can be read no other way.
 func withBundleIdentity(ctx context.Context, exec ssh.Executor, store backup.BundleStore, identity string) (backup.BundleStore, string, func(), error) {
-	none := func() {}
-	if identity == "" {
-		return store, "", none, nil
-	}
-	body, err := os.ReadFile(identity)
+	path, cleanup, err := placeIdentity(ctx, exec, identity)
 	if err != nil {
-		return nil, "", none, fmt.Errorf("reading the identity file: %w", err)
+		return nil, "", cleanup, err
 	}
-	out, err := exec.Run(ctx, "umask 077; mktemp -d /var/tmp/teploy-dr-identity.XXXXXXXX")
-	if err != nil {
-		return nil, "", none, fmt.Errorf("creating a private directory for the identity: %w", err)
-	}
-	dir := strings.TrimSpace(out)
-	cleanup := func() { exec.Run(context.WithoutCancel(ctx), "rm -rf "+ssh.ShellQuote(dir)) }
-	path := dir + "/identity"
-	if err := exec.Upload(ctx, strings.NewReader(string(body)), path, "0600"); err != nil {
-		cleanup()
-		return nil, "", none, fmt.Errorf("placing the identity: %w", err)
-	}
-	if s3, ok := store.(backup.S3BundleStore); ok {
+	if s3, ok := store.(backup.S3BundleStore); ok && path != "" {
 		s3.S3.ExtraIdentity = path
 		store = s3
 	}

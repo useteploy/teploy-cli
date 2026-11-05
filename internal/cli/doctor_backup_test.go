@@ -11,16 +11,17 @@ import (
 
 func doctorPolicyMock(policy, target string, tools string, cron, events string) *ssh.MockExecutor {
 	return ssh.NewMockExecutor("h",
-		ssh.MockCommand{Match: "for p in /etc/teploy/backup-policy.json", Output: policy},
+		ssh.MockCommand{Match: "if [ -d /etc/teploy ] && [ ! -x /etc/teploy ]", Output: policy},
 		ssh.MockCommand{Match: "for p in /etc/teploy/backup-target.json", Output: target},
 		ssh.MockCommand{Match: "command -v aws >/dev/null", Output: tools},
 		ssh.MockCommand{Match: "crontab -l", Output: cron},
 		ssh.MockCommand{Match: "ids=$(docker ps -aq", Output: ""},
 		ssh.MockCommand{Match: "which aws", Output: "/usr/bin/aws\n"},
 		ssh.MockCommand{Match: "( c=$(python3", Output: ""},
+		ssh.MockCommand{Match: "aws s3 ls", Output: ""},
 		ssh.MockCommand{Match: "python3 -c", Output: events},
 		ssh.MockCommand{Match: "for d in /deployments/*/volumes", Output: ""},
-		ssh.MockCommand{Match: "for d in /var/tmp/teploy-backup.", Output: ""},
+		ssh.MockCommand{Match: "for d in '/var/tmp'/teploy-backup.", Output: ""},
 	)
 }
 

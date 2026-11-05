@@ -2,13 +2,15 @@ package backup
 
 import (
 	"context"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
 	"path"
 	"regexp"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -44,8 +46,10 @@ const ageSuffix = ".age"
 const incomingDir = ".incoming"
 
 // readBackMax is the largest object whose bytes are read back and hashed after
-// upload; above it the stored size and the checksum recorded at upload stand
-// in (plus the aws CLI's own transfer checksums). Bandwidth, not safety.
+// upload. Above it the object is uploaded with a provider-verified checksum
+// (--checksum-algorithm SHA256: the store checks every part on receipt) and that
+// is read back instead: reading a large backup back costs bandwidth, and our own
+// metadata proves only what we sent.
 const readBackMax = 256 << 20
 
 // agelessFloorOverhead is what age adds to a tiny object (header with two
@@ -133,7 +137,6 @@ func (c *Client) encryptLocal(ctx context.Context, s3 S3Config, local string) (s
 	}
 	q := ssh.ShellQuote
 	enc := local + ageSuffix
-	id := ageIdentityShell
 	cmd := fmt.Sprintf("age -r %s -r %s -o %s %s", q(s3.OwnerRecipient), q(server), q(enc), q(local))
 	if _, err := c.exec.Run(ctx, cmd); err != nil {
 		c.exec.Run(context.WithoutCancel(ctx), "rm -f "+q(enc))
@@ -142,7 +145,7 @@ func (c *Client) encryptLocal(ctx context.Context, s3 S3Config, local string) (s
 	// cmp reads the decrypted stream to its end and compares it with the
 	// plaintext: a decrypt failure shows up as a short stream, so losing age's
 	// exit status in this pipe cannot hide anything.
-	check := fmt.Sprintf(`age -d -i "%s" %s | cmp -s - %s`, id, q(enc), q(local))
+	check := fmt.Sprintf(`age -d %s %s | cmp -s - %s`, ageIdentityArgs, q(enc), q(local))
 	if _, err := c.exec.Run(ctx, check); err != nil {
 		c.exec.Run(context.WithoutCancel(ctx), "rm -f "+q(enc))
 		return "", fmt.Errorf("the encrypted backup did not decrypt back to its plaintext with the server's identity (nothing was uploaded): %w", err)
@@ -153,9 +156,11 @@ func (c *Client) encryptLocal(ctx context.Context, s3 S3Config, local string) (s
 	return enc, nil
 }
 
-// ageIdentityShell expands to the server's identity path (same try-order as
-// ensureAgeIdentity). It is a command substitution, for use inside "...".
-const ageIdentityShell = `$(if [ -r /etc/teploy/age-key ]; then printf '%s' /etc/teploy/age-key; else printf '%s' /deployments/.age-key; fi)`
+// ageIdentityArgs expands to "-i <path>" for the server's identity, same
+// try-order as ensureAgeIdentity, and to nothing on a host that has none (or only
+// the public-key marker left behind when the key moved). age aborts on a missing
+// -i file, so a clean host recovering with --identity must not pass one.
+const ageIdentityArgs = `$(for p in /etc/teploy/age-key /deployments/.age-key; do if [ -r "$p" ] && grep -q '^AGE-SECRET-KEY-' "$p" 2>/dev/null; then printf -- '-i %s' "$p"; break; fi; done)`
 
 // localFacts measures a file: size and SHA-256, in one command.
 func (c *Client) localFacts(ctx context.Context, local string) (int64, string, error) {
@@ -185,26 +190,73 @@ func incomingKey(key string) string {
 type objectHead struct {
 	Size   int64
 	SHA256 string
+	// ProviderSHA256 is the store's own checksum (base64), when it kept one and
+	// was asked: "xxx-N" for a multipart object, whose parts it checked on receipt.
+	ProviderSHA256 string
+	// LastModified is the store's clock at the object's last write.
+	LastModified time.Time
 }
 
 // head reads an object's size and recorded checksum.
 func (c *Client) head(ctx context.Context, s3 S3Config, key string) (objectHead, error) {
+	return c.headArgs(ctx, s3, key, "")
+}
+
+func (c *Client) headArgs(ctx context.Context, s3 S3Config, key, extra string) (objectHead, error) {
 	bucket, k, err := splitS3URI(key)
 	if err != nil {
 		return objectHead{}, err
 	}
-	res := ssh.RunDetailed(ctx, c.exec, s3.AWS("s3api head-object --bucket "+ssh.ShellQuote(bucket)+" --key "+ssh.ShellQuote(k)))
+	res := ssh.RunDetailed(ctx, c.exec, s3.AWS("s3api head-object --bucket "+ssh.ShellQuote(bucket)+" --key "+ssh.ShellQuote(k)+extra))
 	if res.Failed() {
 		return objectHead{}, fmt.Errorf("reading %s: %s", key, oneLine(res.ExitErrorText()))
 	}
 	var h struct {
-		ContentLength int64             `json:"ContentLength"`
-		Metadata      map[string]string `json:"Metadata"`
+		ContentLength  int64             `json:"ContentLength"`
+		Metadata       map[string]string `json:"Metadata"`
+		ChecksumSHA256 string            `json:"ChecksumSHA256"`
+		LastModified   string            `json:"LastModified"`
 	}
 	if err := json.Unmarshal(res.Stdout, &h); err != nil {
 		return objectHead{}, fmt.Errorf("reading %s: unexpected reply: %w", key, err)
 	}
-	return objectHead{Size: h.ContentLength, SHA256: h.Metadata["sha256"]}, nil
+	out := objectHead{Size: h.ContentLength, SHA256: h.Metadata["sha256"], ProviderSHA256: h.ChecksumSHA256}
+	// aws CLI v2 prints RFC 3339, v1 an HTTP date.
+	for _, layout := range []string{time.RFC3339, time.RFC1123, "Mon, 02 Jan 2006 15:04:05 GMT"} {
+		if t, err := time.Parse(layout, h.LastModified); err == nil {
+			out.LastModified = t.UTC()
+			break
+		}
+	}
+	return out, nil
+}
+
+func (c *Client) readBackLimit() int64 {
+	if c.readBack > 0 {
+		return c.readBack
+	}
+	return readBackMax
+}
+
+// sha256HexToBase64 converts a sha256sum digest to the form a provider reports.
+func sha256HexToBase64(h string) string {
+	b, err := hex.DecodeString(h)
+	if err != nil {
+		return ""
+	}
+	return base64.StdEncoding.EncodeToString(b)
+}
+
+// checksumUnsupported recognises a CLI or provider that cannot take
+// --checksum-algorithm: an old aws CLI, a store without additional checksums.
+func checksumUnsupported(err error) bool {
+	msg := strings.ToLower(err.Error())
+	for _, s := range []string{"unknown options", "notimplemented", "not implemented", "invalidargument", "invalidrequest", "unsupported", "x-amz-checksum", "x-amz-sdk-checksum"} {
+		if strings.Contains(msg, s) {
+			return true
+		}
+	}
+	return false
 }
 
 // splitS3URI splits s3://bucket/key.
@@ -250,8 +302,22 @@ func (c *Client) put(ctx context.Context, s3 S3Config, local, key string) (store
 	}
 	pending := incomingKey(final)
 	q := ssh.ShellQuote
-	if _, err := c.exec.Run(ctx, s3.AWS(fmt.Sprintf("s3 cp %s %s --metadata %s", q(src), q(pending), q("sha256="+sum)))); err != nil {
-		return none, fmt.Errorf("uploading: %w", err)
+	upload := fmt.Sprintf("s3 cp %s %s --metadata %s", q(src), q(pending), q("sha256="+sum))
+	large := size > c.readBackLimit()
+	providerChecked := large
+	var uerr error
+	if large {
+		_, uerr = c.exec.Run(ctx, s3.AWS(upload+" --checksum-algorithm SHA256"))
+		if uerr != nil && checksumUnsupported(uerr) {
+			providerChecked = false
+			fmt.Fprintf(c.out, "Warning: this store or aws CLI has no upload checksums, so %s is verified by size alone: %v\n", path.Base(final), oneLine(uerr.Error()))
+			_, uerr = c.exec.Run(ctx, s3.AWS(upload))
+		}
+	} else {
+		_, uerr = c.exec.Run(ctx, s3.AWS(upload))
+	}
+	if uerr != nil {
+		return none, fmt.Errorf("uploading: %w", uerr)
 	}
 	removePending := func() {
 		rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
@@ -275,7 +341,22 @@ func (c *Client) put(ctx context.Context, s3 S3Config, local, key string) (store
 		removePending()
 		return none, fmt.Errorf("verifying the upload: %w", err)
 	}
-	if size <= readBackMax {
+	if providerChecked {
+		// The store checked every part on receipt; a single-part object's digest
+		// can be compared whole, and a store that kept none has proved nothing.
+		h, err := c.headArgs(ctx, s3, pending, " --checksum-mode ENABLED")
+		if err != nil {
+			removePending()
+			return none, fmt.Errorf("verifying the upload: %w", err)
+		}
+		if h.ProviderSHA256 != "" && !strings.Contains(h.ProviderSHA256, "-") && h.ProviderSHA256 != sha256HexToBase64(sum) {
+			removePending()
+			return none, fmt.Errorf("the store's checksum of the upload does not match what was sent (checksum mismatch)")
+		}
+		if h.ProviderSHA256 == "" {
+			fmt.Fprintf(c.out, "Warning: the store keeps no checksum for %s; it is verified by size alone\n", path.Base(final))
+		}
+	} else if !large {
 		// A pipe, but compared by value: anything short of the exact bytes
 		// (a failed read included) produces a different hash.
 		out, err := c.exec.Run(ctx, "{ "+s3.AWS("s3 cp "+q(pending)+" -")+"; } | sha256sum")
@@ -342,7 +423,7 @@ func (c *Client) fetch(ctx context.Context, s3 S3Config, key, dest string) error
 	if !encrypted {
 		return nil
 	}
-	ids := `-i "` + ageIdentityShell + `"`
+	ids := ageIdentityArgs
 	if s3.ExtraIdentity != "" {
 		ids += " -i " + q(s3.ExtraIdentity)
 	}
@@ -351,7 +432,7 @@ func (c *Client) fetch(ctx context.Context, s3 S3Config, key, dest string) error
 		if errors.Is(ctx.Err(), context.Canceled) {
 			return ctx.Err()
 		}
-		return fmt.Errorf("decrypting %s with this server's identity failed (encrypted to other recipients, or corrupt; on another machine use `teploy backup fetch --identity`): %w", key, err)
+		return fmt.Errorf("decrypting %s failed: it is corrupt, or encrypted to other recipients than this server's identity (pass --identity <recovery key file>, or `teploy backup fetch --identity` on another machine): %w", key, err)
 	}
 	c.exec.Run(ctx, "rm -f "+q(raw))
 	return nil
@@ -417,12 +498,13 @@ func decodeDBSegment(seg string) string {
 
 // addressableDB reports whether a database name can be handed to the engine
 // tools as one literal shell-quoted argument. pg_dump and psql read a name with
-// "=" as a connection string, and every tool reads a leading "-" as an option;
+// "=" or a URI scheme as a connection string, and every tool reads a leading "-"
+// as an option;
 // control characters cannot survive line-based listings. Everything else,
 // including quotes, spaces and $(...), is safe once shell-quoted. A name that
 // fails this is reported as not backed up, never skipped silently.
 func addressableDB(db string) bool {
-	if db == "" || len(db) > 64 || db[0] == '-' || strings.Contains(db, "=") {
+	if db == "" || len(db) > 64 || db[0] == '-' || strings.Contains(db, "=") || strings.Contains(db, "://") {
 		return false
 	}
 	for _, r := range db {
@@ -573,64 +655,90 @@ func artifactFloor(name string) int64 {
 // any one target, shorter than a disk can afford to wait.
 const tmpLeftoverMinutes = 420
 
-// workspaceGlobs are what the run cleans up: private run workspaces a killed
-// backup can leave (dumps, possibly a credential file), and a recovery key a
-// killed `dr restore --identity` left on this server. Only ever this: a killed
-// restore's own files can be the only copy of something.
-const workspaceGlobs = "/var/tmp/teploy-backup.* /tmp/teploy-backup.* /var/tmp/teploy-dr-identity.*"
+// tmpBases are the directories backup workspaces can be under: disk, /tmp from
+// older runs, and a configured TEPLOY_BACKUP_TMPDIR or policy tmp_dir, which is
+// where a killed run's plaintext dump would otherwise sit forever unnoticed.
+func tmpBases(extra string) []string {
+	bases := []string{"/var/tmp", "/tmp"}
+	for _, d := range []string{backupTmpDir(), extra} {
+		d = strings.TrimRight(strings.TrimSpace(d), "/")
+		if d != "" && !slices.Contains(bases, d) {
+			bases = append(bases, d)
+		}
+	}
+	return bases
+}
 
-// leftoverGlobs are what doctor and status report: the above, plus a kept or
-// killed restore's and verify's scratch files.
-const leftoverGlobs = workspaceGlobs + " /var/tmp/teploy-restore.* /tmp/teploy-restore.* /tmp/teploy-volume-restore.* /var/tmp/teploy-verify.*"
+func tmpGlobs(extra string, names ...string) string {
+	var out []string
+	for _, base := range tmpBases(extra) {
+		for _, n := range names {
+			out = append(out, ssh.ShellQuote(base)+"/"+n)
+		}
+	}
+	return strings.Join(out, " ")
+}
 
-// CleanStaleWorkspaces removes run workspaces older than the leftover age and
-// returns what it removed. Only called while holding the run lock, so a live
-// `backup run --all` cannot be hit; the age protects a concurrent manual one.
+// CleanStaleWorkspaces removes run workspaces (dumps, possibly a credential file)
+// and any recovery key a killed `restore --identity` left, once they are older
+// than the leftover age, and returns what it removed. Only called while holding
+// the run lock, so a live `backup run --all` cannot be hit; the age protects a
+// concurrent manual one. Never a killed restore's own files: those can be the only
+// copy of something.
 func (c *Client) CleanStaleWorkspaces(ctx context.Context) []string {
-	out, err := c.exec.Run(ctx, fmt.Sprintf(`for d in %s; do [ -d "$d" ] || continue; if [ -n "$(find "$d" -maxdepth 0 -mmin +%d 2>/dev/null)" ]; then rm -rf -- "$d" && printf '%%s\n' "$d"; fi; done; true`, workspaceGlobs, tmpLeftoverMinutes))
+	out, err := c.exec.Run(ctx, fmt.Sprintf(`for d in %s; do [ -d "$d" ] || continue; if [ -n "$(find "$d" -maxdepth 0 -mmin +%d 2>/dev/null)" ]; then rm -rf -- "$d" && printf '%%s\n' "$d"; fi; done; true`, tmpGlobs("", "teploy-backup.*", "teploy-dr-identity.*"), tmpLeftoverMinutes))
 	if err != nil {
 		return nil
 	}
 	return splitLines(out)
 }
 
-// LeftoverWorkspacesProbe lists workspaces past the leftover age, for doctor.
-func LeftoverWorkspacesProbe() string {
-	return fmt.Sprintf(`for d in %s; do [ -d "$d" ] || continue; if [ -n "$(find "$d" -maxdepth 0 -mmin +%d 2>/dev/null)" ]; then printf '%%s\n' "$d"; fi; done; docker ps -a --filter name=teploy-backup-verify- --format 'container {{.Names}}' 2>/dev/null; true`, leftoverGlobs, tmpLeftoverMinutes)
+// LeftoverWorkspacesProbe lists what doctor and status report: the above plus a
+// kept or killed restore's and verify's scratch files and containers.
+func LeftoverWorkspacesProbe(tmpDir string) string {
+	globs := tmpGlobs(tmpDir, "teploy-backup.*", "teploy-dr-identity.*", "teploy-restore.*", "teploy-volume-restore.*", "teploy-verify.*")
+	return fmt.Sprintf(`for d in %s; do [ -d "$d" ] || continue; if [ -n "$(find "$d" -maxdepth 0 -mmin +%d 2>/dev/null)" ]; then printf '%%s\n' "$d"; fi; done; docker ps -a --filter name=teploy-backup-verify- --format 'container {{.Names}}' 2>/dev/null; true`, globs, tmpLeftoverMinutes)
 }
 
-// AbortStaleUploads aborts multipart uploads a killed run left under the base
-// (they are invisible in listings and bill storage). Best effort; returns how
-// many were aborted.
-func (c *Client) AbortStaleUploads(ctx context.Context, s3 S3Config, now time.Time) int {
+// AbortStaleUploads aborts multipart uploads a killed run left under the given
+// namespaces (invisible in listings, and they bill storage). Scoped to namespaces
+// only this server writes to: with no prefix a bucket-wide list would catch other
+// servers' uploads. Best effort; returns how many were aborted.
+func (c *Client) AbortStaleUploads(ctx context.Context, s3 S3Config, namespaces []string, now time.Time) int {
 	q := ssh.ShellQuote
-	args := "s3api list-multipart-uploads --bucket " + q(s3.Bucket) + " --output json"
-	if s3.Prefix != "" {
-		args += " --prefix " + q(s3.Prefix+"/")
-	}
-	res := ssh.RunDetailed(ctx, c.exec, s3.AWS(args))
-	if res.Failed() {
-		return 0
-	}
-	var list struct {
-		Uploads []struct {
-			Key       string `json:"Key"`
-			UploadID  string `json:"UploadId"`
-			Initiated string `json:"Initiated"`
-		} `json:"Uploads"`
-	}
-	if json.Unmarshal(res.Stdout, &list) != nil {
-		return 0
-	}
-	sort.Slice(list.Uploads, func(i, j int) bool { return list.Uploads[i].Key < list.Uploads[j].Key })
 	aborted := 0
-	for _, u := range list.Uploads {
-		t, err := time.Parse(time.RFC3339, u.Initiated)
-		if err != nil || now.Sub(t) < tmpLeftoverMinutes*time.Minute {
+	for _, ns := range namespaces {
+		owners, err := c.namespaceOwners(ctx, s3, ns)
+		fp := c.fingerprint(ctx)
+		if err != nil || fp == "" || slices.ContainsFunc(owners, func(o string) bool { return o != fp }) {
 			continue
 		}
-		if _, err := c.exec.Run(ctx, s3.AWS("s3api abort-multipart-upload --bucket "+q(s3.Bucket)+" --key "+q(u.Key)+" --upload-id "+q(u.UploadID))); err == nil {
-			aborted++
+		prefix := ns + "/"
+		if s3.Prefix != "" {
+			prefix = s3.Prefix + "/" + prefix
+		}
+		res := ssh.RunDetailed(ctx, c.exec, s3.AWS("s3api list-multipart-uploads --bucket "+q(s3.Bucket)+" --prefix "+q(prefix)+" --output json"))
+		if res.Failed() {
+			continue
+		}
+		var list struct {
+			Uploads []struct {
+				Key       string `json:"Key"`
+				UploadID  string `json:"UploadId"`
+				Initiated string `json:"Initiated"`
+			} `json:"Uploads"`
+		}
+		if json.Unmarshal(res.Stdout, &list) != nil {
+			continue
+		}
+		for _, u := range list.Uploads {
+			t, err := time.Parse(time.RFC3339, u.Initiated)
+			if err != nil || now.Sub(t) < tmpLeftoverMinutes*time.Minute {
+				continue
+			}
+			if _, err := c.exec.Run(ctx, s3.AWS("s3api abort-multipart-upload --bucket "+q(s3.Bucket)+" --key "+q(u.Key)+" --upload-id "+q(u.UploadID))); err == nil {
+				aborted++
+			}
 		}
 	}
 	return aborted
@@ -639,88 +747,215 @@ func (c *Client) AbortStaleUploads(ctx context.Context, s3 S3Config, now time.Ti
 // ---- namespace ownership ----
 
 // ownersDir holds one marker per server that has written into an app namespace:
-// <base>/<app>/.owners/<fingerprint>. Prune refuses a namespace with another
-// server's marker, so a shared bucket or a reused prefix can never make one
-// server delete another's backups.
+// <base>/<app>/.owners/<fingerprint>, a JSON body naming the server's age public
+// key. Prune refuses a namespace with another server's marker, so a shared bucket
+// or a reused prefix can never make one server delete another's backups. Anything
+// short of proof of sole ownership refuses: a listing that fails is not "no owners".
+//
+// The fingerprint is a hash of /etc/machine-id and the hostname (an empty
+// machine-id, or a clone's copy of one, is not enough by itself), and the body's
+// recipient tells apart two hosts that share both. It is in the body and not the
+// name so that an identity created later does not make a server its own stranger.
+//
+// Residual: an upgraded server's first prune cannot tell its own unmarked legacy
+// objects from those of a server that has not upgraded yet (AUDIT_OPEN).
 const ownersDir = ".owners"
 
 var ownerMarkerRE = regexp.MustCompile(`^[0-9a-f]{16}$`)
 
-// fingerprint identifies this server: a hash of its machine id, else its age
-// recipient. Empty when neither can be read.
+// ownerMarker is a marker's body.
+type ownerMarker struct {
+	Recipient string `json:"recipient,omitempty"`
+	FirstSeen string `json:"first_seen,omitempty"`
+}
+
+// fingerprint identifies this server. Empty when it cannot be worked out.
 func (c *Client) fingerprint(ctx context.Context) string {
 	if c.serverFP != "" {
 		return c.serverFP
 	}
-	out, err := c.exec.Run(ctx, `{ cat /etc/machine-id 2>/dev/null || hostname; } | sha256sum`)
+	out, err := c.exec.Run(ctx, `{ cat /etc/machine-id 2>/dev/null; hostname 2>/dev/null; } | sha256sum`)
 	if err != nil {
 		return ""
 	}
 	f := strings.Fields(out)
-	if len(f) == 0 || len(f[0]) < 16 {
+	if len(f) == 0 || len(f[0]) < 16 || !ownerMarkerRE.MatchString(f[0][:16]) {
 		return ""
 	}
-	if !ownerMarkerRE.MatchString(f[0][:16]) {
+	// sha256 of empty input: neither source answered, and every such host agrees.
+	if strings.HasPrefix(f[0], "e3b0c44298fc1c14") {
 		return ""
 	}
 	c.serverFP = f[0][:16]
 	return c.serverFP
 }
 
+// localRecipient is this server's age public key, "" when it has no identity.
+func (c *Client) localRecipient(ctx context.Context) string {
+	out, err := c.exec.Run(ctx, `for p in /etc/teploy/age-key /deployments/.age-key; do if [ -r "$p" ] && grep -q '^AGE-SECRET-KEY-' "$p" 2>/dev/null; then age-keygen -y "$p" 2>/dev/null; break; fi; done; true`)
+	if err != nil {
+		return ""
+	}
+	if r := strings.TrimSpace(out); recipientRE.MatchString(r) {
+		return r
+	}
+	return ""
+}
+
 func namespaceOwnersPrefix(s3 S3Config, app string) string {
 	return fmt.Sprintf("s3://%s/%s/%s/", s3.Base(), app, ownersDir)
 }
 
-// namespaceOwners lists the servers that have marked this namespace.
-func (c *Client) namespaceOwners(ctx context.Context, s3 S3Config, app string) []string {
-	out, err := c.exec.Run(ctx, s3.AWS("s3 ls "+ssh.ShellQuote(namespaceOwnersPrefix(s3, app))))
+// namespaceOwners lists the servers that have marked this namespace. An empty
+// namespace is no owners; a listing that fails is an error, never "no owners".
+func (c *Client) namespaceOwners(ctx context.Context, s3 S3Config, app string) ([]string, error) {
+	keys, err := c.listTree(ctx, s3, app+"/"+ownersDir+"/")
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	var owners []string
-	for _, line := range strings.Split(out, "\n") {
-		f := strings.Fields(line)
-		if len(f) > 0 && ownerMarkerRE.MatchString(f[len(f)-1]) {
-			owners = append(owners, f[len(f)-1])
+	for _, k := range keys {
+		name := path.Base(k.Key)
+		if ownerMarkerRE.MatchString(name) {
+			owners = append(owners, name)
 		}
 	}
-	return owners
+	return owners, nil
+}
+
+func (c *Client) readOwnerMarker(ctx context.Context, s3 S3Config, key string) ownerMarker {
+	var m ownerMarker
+	if res := ssh.RunDetailed(ctx, c.exec, s3.AWS("s3 cp "+ssh.ShellQuote(key)+" -")); !res.Failed() {
+		_ = json.Unmarshal(res.Stdout, &m)
+	}
+	return m
+}
+
+func (c *Client) writeOwnerMarker(ctx context.Context, s3 S3Config, key string, m ownerMarker) error {
+	body, err := json.Marshal(m)
+	if err != nil {
+		return err
+	}
+	_, err = c.exec.Run(ctx, "printf '%s\\n' "+ssh.ShellQuote(string(body))+" | "+s3.AWS("s3 cp - "+ssh.ShellQuote(key)))
+	return err
 }
 
 // markNamespaceOwner records this server as a writer of the namespace. Best
-// effort; called after a successful backup.
+// effort, after a successful backup; a prune claims the namespace for itself.
 func (c *Client) markNamespaceOwner(ctx context.Context, s3 S3Config, app string) {
 	fp := c.fingerprint(ctx)
 	if fp == "" {
 		return
 	}
-	for _, o := range c.namespaceOwners(ctx, s3, app) {
-		if o == fp {
-			return
-		}
+	owners, err := c.namespaceOwners(ctx, s3, app)
+	if err != nil || slices.Contains(owners, fp) {
+		return
 	}
-	key := namespaceOwnersPrefix(s3, app) + fp
-	c.exec.Run(ctx, "printf '%s\\n' "+ssh.ShellQuote(time.Now().UTC().Format(time.RFC3339))+" | "+s3.AWS("s3 cp - "+ssh.ShellQuote(key)))
+	_ = c.writeOwnerMarker(ctx, s3, namespaceOwnersPrefix(s3, app)+fp, ownerMarker{Recipient: c.localRecipient(ctx), FirstSeen: time.Now().UTC().Format(time.RFC3339)})
 }
 
-// ErrSharedNamespace marks a prune refused because another server writes there.
+// ErrSharedNamespace marks a prune refused because this server cannot show it is
+// the only one writing there.
 var ErrSharedNamespace = errors.New("shared backup namespace")
 
-// checkNamespaceOwner refuses when another server has marked this namespace.
-func (c *Client) checkNamespaceOwner(ctx context.Context, s3 S3Config, app string) error {
-	owners := c.namespaceOwners(ctx, s3, app)
-	if len(owners) == 0 {
-		return nil
+// claimNamespace proves this server may prune the namespace, marks it (a prune
+// never runs on an unmarked namespace), and returns the store's clock as read from
+// the marker it just wrote: the one reference a wrong server clock cannot fool.
+func (c *Client) claimNamespace(ctx context.Context, s3 S3Config, app string) (time.Time, error) {
+	var none time.Time
+	base := "s3://" + s3.Base()
+	owners, err := c.namespaceOwners(ctx, s3, app)
+	if err != nil {
+		return none, fmt.Errorf("%w: could not list the owners of %s/%s, so nothing was pruned: %v", ErrSharedNamespace, base, app, err)
 	}
 	fp := c.fingerprint(ctx)
+	if fp == "" {
+		return none, fmt.Errorf("%w: this server cannot identify itself (no machine-id or hostname), so nothing was pruned", ErrSharedNamespace)
+	}
 	var others []string
 	for _, o := range owners {
 		if o != fp {
 			others = append(others, o)
 		}
 	}
-	if len(others) == 0 {
-		return nil
+	if len(others) > 0 {
+		return none, fmt.Errorf("%w: another server (%s) also stores %s backups under %s, so pruning here could delete its copies; nothing was pruned. Give each server its own prefix (`teploy server backup-target set --prefix <server>`). If that marker is this server before a rebuild: `teploy server backup-target owners --clear %s`", ErrSharedNamespace, strings.Join(others, ", "), app, base, strings.Join(others, ","))
 	}
-	return fmt.Errorf("%w: another server (%s) also stores %s backups under s3://%s, so pruning here could delete its copies; nothing was pruned. Give each server its own prefix (`teploy server backup-target set --prefix <server>`)", ErrSharedNamespace, strings.Join(others, ", "), app, s3.Base())
+	key := namespaceOwnersPrefix(s3, app) + fp
+	self := c.localRecipient(ctx)
+	m := ownerMarker{Recipient: self, FirstSeen: time.Now().UTC().Format(time.RFC3339)}
+	if slices.Contains(owners, fp) {
+		old := c.readOwnerMarker(ctx, s3, key)
+		if old.FirstSeen != "" {
+			m.FirstSeen = old.FirstSeen
+		}
+		if old.Recipient != "" && self != "" && old.Recipient != self {
+			return none, fmt.Errorf("%w: the marker for this machine under %s/%s names another age identity (%s), so this is a clone or a rebuilt server; nothing was pruned. If it is this server's own old marker: `teploy server backup-target owners --clear %s`", ErrSharedNamespace, base, app, old.Recipient, fp)
+		}
+		if self == "" {
+			m.Recipient = old.Recipient
+		}
+	}
+	if err := c.writeOwnerMarker(ctx, s3, key, m); err != nil {
+		return none, fmt.Errorf("%w: could not mark %s/%s as this server's before pruning, so nothing was pruned: %v", ErrSharedNamespace, base, app, err)
+	}
+	h, err := c.head(ctx, s3, key)
+	if err != nil {
+		return none, nil // no clock reading; the marker is what mattered
+	}
+	return h.LastModified, nil
+}
+
+// NamespaceMarker is one server's marker in one namespace.
+type NamespaceMarker struct {
+	Namespace   string `json:"namespace"`
+	Fingerprint string `json:"fingerprint"`
+	Key         string `json:"key"`
+	Self        bool   `json:"self"`
+}
+
+// ListNamespaceMarkers lists every owner marker under the base.
+func (c *Client) ListNamespaceMarkers(ctx context.Context, s3 S3Config) ([]NamespaceMarker, error) {
+	keys, err := c.listTree(ctx, s3, "")
+	if err != nil {
+		return nil, err
+	}
+	fp := c.fingerprint(ctx)
+	var out []NamespaceMarker
+	for _, k := range keys {
+		rel, ok := s3.relToBase(k.Key)
+		if !ok {
+			continue
+		}
+		segs := strings.Split(rel, "/")
+		if len(segs) == 3 && segs[1] == ownersDir && ownerMarkerRE.MatchString(segs[2]) {
+			out = append(out, NamespaceMarker{Namespace: segs[0], Fingerprint: segs[2], Key: "s3://" + s3.Bucket + "/" + k.Key, Self: segs[2] == fp})
+		}
+	}
+	return out, nil
+}
+
+// ClearNamespaceMarkers removes a fingerprint's markers (a server that no longer
+// exists, a rebuild's old self), returning the keys removed.
+func (c *Client) ClearNamespaceMarkers(ctx context.Context, s3 S3Config, fingerprint string) ([]string, error) {
+	if !ownerMarkerRE.MatchString(fingerprint) {
+		return nil, fmt.Errorf("invalid fingerprint %q", fingerprint)
+	}
+	markers, err := c.ListNamespaceMarkers(ctx, s3)
+	if err != nil {
+		return nil, err
+	}
+	var removed []string
+	var errs []error
+	for _, m := range markers {
+		if m.Fingerprint != fingerprint {
+			continue
+		}
+		if _, err := c.exec.Run(ctx, s3.AWS("s3 rm "+ssh.ShellQuote(m.Key))); err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		removed = append(removed, m.Key)
+	}
+	return removed, errors.Join(errs...)
 }
