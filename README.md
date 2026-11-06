@@ -837,6 +837,14 @@ aws s3api put-bucket-lifecycle-configuration --bucket B --lifecycle-configuratio
 
 On B2 the same thing in its own terms is a lifecycle rule with `fileNamePrefix`
 `PREFIX/.incoming/`, `daysFromUploadingToHiding` 1 and `daysFromHidingToDeleting` 1.
+The S3 form above does not fit B2, which wants a paired rule per prefix.
+
+B2 also keeps hidden versions forever by default, and a key without `deleteFiles` can only
+hide, so backups that retention removes stay billed until a rule deletes them. Add a second
+rule with `fileNamePrefix` `PREFIX/`, `daysFromHidingToDeleting` 30 and no
+`daysFromUploadingToHiding`, which would hide live backups. Overlapping rules are allowed,
+and B2 applies the smallest value of each property. The B2 application key needs `listFiles`,
+`readFiles`, `writeFiles` and `readBucketLifecycleRules`.
 
 The aws CLI must be at least 2.23.0 (or 1.37.0), the first to send a checksum on every
 upload, which a bucket with Object Lock requires. An older one is refused with the remedy,
