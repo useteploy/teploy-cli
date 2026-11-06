@@ -4,6 +4,8 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [0.1.54] - 2026-11-05
+
 ### Added
 
 - `teploy server siblings <server> --json`: read-only sibling discovery
