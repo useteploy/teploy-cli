@@ -46,6 +46,7 @@ func newBackupCmd(flags *Flags) *cobra.Command {
 	cmd.AddCommand(newBackupRunCmd(flags))
 	cmd.AddCommand(newBackupStatusCmd(flags))
 	cmd.AddCommand(newBackupFetchCmd(flags))
+	cmd.AddCommand(newBackupHeadCmd(flags))
 	cmd.AddCommand(newBackupKeygenCmd(flags))
 
 	return cmd
