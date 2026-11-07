@@ -24,6 +24,7 @@ func newBackupRunCmd(flags *Flags) *cobra.Command {
 		appName     string
 		accessory   string
 		all         bool
+		detach      bool
 		ignoreSpace bool
 	)
 	cmd := &cobra.Command{
@@ -35,9 +36,19 @@ func newBackupRunCmd(flags *Flags) *cobra.Command {
 			"and each of its databases, app volumes when enabled, adopted containers), one\n" +
 			"target at a time. One target failing does not stop the others; the exit status\n" +
 			"is nonzero for anything but a clean run, and nothing of a failed target is\n" +
-			"pruned. A run that finds another one running stands down.",
+			"pruned. A run that finds another one running stands down.\n\n" +
+			"--all --detach --host S runs from anywhere: it starts that same run on the\n" +
+			"server so that it survives this connection, under the same lock, and returns\n" +
+			"within seconds. A second one reports already_running. Results reach status and\n" +
+			"events as a normal run's do.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if detach {
+				if !all || appName != "" || accessory != "" {
+					return fmt.Errorf("--detach starts `backup run --all`: it needs --all, and takes no --app or --accessory")
+				}
+				return runBackupRunDetach(flags, ignoreSpace)
+			}
 			if all {
 				if appName != "" || accessory != "" {
 					return fmt.Errorf("--all takes no --app or --accessory: it works out its own targets")
@@ -50,6 +61,7 @@ func newBackupRunCmd(flags *Flags) *cobra.Command {
 	cmd.Flags().StringVar(&appName, "app", "", "app name (required without --all)")
 	cmd.Flags().StringVar(&accessory, "accessory", "", "back up this accessory instead of the app's volumes")
 	cmd.Flags().BoolVar(&all, "all", false, "back up everything the server's backup policy covers")
+	cmd.Flags().BoolVar(&detach, "detach", false, "with --all and --host: start the run on the server and return; it survives this connection")
 	cmd.Flags().BoolVar(&ignoreSpace, "ignore-space-check", false, "with --all: skip the free-space preflights")
 	return cmd
 }

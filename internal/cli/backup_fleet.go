@@ -753,7 +753,7 @@ func orDetected(engine string) string {
 func ensureFleetBinary(ctx context.Context, executor ssh.Executor) (string, error) {
 	bin := scheduledTeployPath()
 	supports := func() bool {
-		return !ssh.RunDetailed(ctx, executor, ssh.ShellQuote(bin)+" backup run --help 2>/dev/null | grep -q -- --all").Failed()
+		return fleetBinarySupportsAll(ctx, executor, bin)
 	}
 	if supports() {
 		return bin, nil
