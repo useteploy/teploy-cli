@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://teploy.github.io/contracts/schema/backup-head-envelope.schema.json",
+  "title": "`teploy backup head <key> --bytes N --host S --json` (backup-setup-v1, rev 21): the first bytes of a stored object, as stored, through the server's stored target. N is 1 to 262144; a larger N is refused, not clamped. A key outside the server's own and previous prefixes is refused. It never decrypts, so an encrypted object's data_base64 is ciphertext. Refusals and store failures use the error envelope.",
+  "type": "object",
+  "required": ["machine_interface", "host", "key", "encrypted", "requested_bytes", "length", "total_size", "data_base64"],
+  "properties": {
+    "machine_interface": {"type": "integer", "minimum": 1},
+    "host": {"type": "string"},
+    "key": {"type": "string", "pattern": "^s3://"},
+    "encrypted": {"type": "boolean", "description": "the key ends in .age"},
+    "requested_bytes": {"type": "integer", "minimum": 1, "maximum": 262144},
+    "length": {"type": "integer", "minimum": 1, "maximum": 262144, "description": "bytes returned; less than requested_bytes when the object is shorter"},
+    "total_size": {"type": ["integer", "null"], "minimum": 0, "description": "the whole object's size; null when the store did not say"},
+    "data_base64": {"type": "string", "contentEncoding": "base64"}
+  }
+}

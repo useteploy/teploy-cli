@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://teploy.github.io/contracts/schema/backup-detach-envelope.schema.json",
+  "title": "`teploy backup run --all --detach --host S --json` (backup-setup-v1, rev 21): starts the cron line's `backup run --all` on the server, under its flock, and looks at it for about 3 seconds. Later results reach `backup status` and `events` as a normal run's do. Exit 0 for started and already_running; finished exits as the run would have; failed exits nonzero. A binary too old to run it, or a failure to start, uses the error envelope.",
+  "type": "object",
+  "required": ["machine_interface", "host", "requested_at", "status"],
+  "properties": {
+    "machine_interface": {"type": "integer", "minimum": 1},
+    "host": {"type": "string"},
+    "requested_at": {"type": "string", "format": "date-time"},
+    "status": {
+      "enum": ["started", "already_running", "finished", "failed"],
+      "description": "started: still running when it looked. already_running: another run holds the lock and this one stood down. finished: it ended within the first seconds, see result. failed: it ended without a result, see error."
+    },
+    "pid": {"type": "integer", "minimum": 1},
+    "log": {"type": "string", "description": "the run's progress on the server (0600, removed after 14 days)"},
+    "result": {"type": "object", "description": "with finished: the run's own result, as in backup-run-envelope without machine_interface", "required": ["status", "started_at", "duration_ms", "encrypted", "targets"]},
+    "error": {"type": "string"}
+  }
+}

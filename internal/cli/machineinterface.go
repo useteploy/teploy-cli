@@ -208,6 +208,16 @@ const (
 	// confirms; unrecognised dev.teploy.product values pass through
 	// verbatim. siblings-envelope pins the JSON.
 	CapServerSiblingsV1 = "siblings-v1"
+	// CapBackupSetupV1: what Dash's simple backup setup calls.
+	// `server backup-preflight [--install-tools] [--upgrade-binary] --json`
+	// (read-only unless a flag says otherwise; failed probes read as unknown),
+	// `backup head <key> --bytes N --json` (ranged read, never decrypts, own
+	// prefixes only) and `backup run --all --detach --json` (survives the
+	// connection, same lock). `backup-target owners` skips previous locations
+	// it cannot reach and `--clear` takes --json and no longer stops partway.
+	// backup-preflight-envelope, backup-head-envelope and backup-detach-envelope
+	// pin the JSON.
+	CapBackupSetupV1 = "backup-setup-v1"
 )
 
 // MachineCapabilities returns every capability token this build
@@ -254,7 +264,8 @@ func MachineCapabilities() []string {
 		CapEnvConfigGuardV1,
 		CapDomainsCheckV1,
 		CapServerAuditV1,
-		CapServerSiblingsV1}
+		CapServerSiblingsV1,
+		CapBackupSetupV1}
 	sort.Strings(tokens)
 	return tokens
 }
