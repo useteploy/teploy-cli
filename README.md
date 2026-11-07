@@ -841,7 +841,7 @@ The S3 form above does not fit B2, which wants a paired rule per prefix.
 
 B2 also keeps hidden versions forever by default, and a key without `deleteFiles` can only
 hide, so backups that retention removes stay billed until a rule deletes them. Add a second
-rule with `fileNamePrefix` `PREFIX/`, `daysFromHidingToDeleting` 30 and no
+rule with `fileNamePrefix` `PREFIX/`, `daysFromHidingToDeleting` 14 and no
 `daysFromUploadingToHiding`, which would hide live backups. Overlapping rules are allowed,
 and B2 applies the smallest value of each property. The B2 application key needs `listFiles`,
 `readFiles`, `writeFiles` and `readBucketLifecycleRules`.
