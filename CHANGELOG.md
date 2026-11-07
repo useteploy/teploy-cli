@@ -4,6 +4,8 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [0.1.55] - 2026-11-06
+
 ### Added
 
 - `teploy server backup-preflight --host S [--json]`: what a server needs before
