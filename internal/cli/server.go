@@ -28,6 +28,7 @@ func newServerCmd(flags *Flags) *cobra.Command {
 	cmd.AddCommand(newServerListCmd(flags))
 	cmd.AddCommand(newServerStatusCmd(flags))
 	cmd.AddCommand(newServerBackupTargetCmd(flags))
+	cmd.AddCommand(newServerBackupPreflightCmd(flags))
 	cmd.AddCommand(newServerBackupPolicyCmd(flags))
 	cmd.AddCommand(newServerAuditCmd(flags))
 	cmd.AddCommand(newServerSiblingsCmd(flags))

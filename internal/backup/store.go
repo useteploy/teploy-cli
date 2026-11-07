@@ -98,7 +98,7 @@ func (c *Client) serverRecipient(ctx context.Context) (string, error) {
 		return c.serverRecip, nil
 	}
 	if out, err := c.exec.Run(ctx, "command -v age >/dev/null 2>&1 && command -v age-keygen >/dev/null 2>&1 && echo ok"); err != nil || strings.TrimSpace(out) != "ok" {
-		return "", fmt.Errorf("the age tool is not installed on this server, so nothing can be encrypted (run `teploy setup`, or apt-get install age)")
+		return "", fmt.Errorf("the age tool is not installed on this server, so nothing can be encrypted (run `teploy server backup-preflight --host <server> --install-tools` or `teploy setup`, or apt-get install age)")
 	}
 	id, err := ensureAgeIdentity(ctx, c.exec)
 	if err != nil {
@@ -623,7 +623,11 @@ func (c *Client) listTree(ctx context.Context, s3 S3Config, rel string) ([]store
 		if res.ExitCode == 1 && strings.TrimSpace(string(res.Stdout)) == "" && strings.TrimSpace(string(res.Stderr)) == "" {
 			return nil, nil
 		}
-		return nil, fmt.Errorf("listing %s: %s", root, oneLine(res.ExitErrorText()))
+		reason := oneLine(res.ExitErrorText())
+		if reason == "" {
+			reason = fmt.Sprintf("aws exited with status %d and gave no reason", res.ExitCode)
+		}
+		return nil, fmt.Errorf("listing %s: %s", root, reason)
 	}
 	var out []storedKey
 	for _, line := range strings.Split(string(res.Stdout), "\n") {
@@ -1085,6 +1089,38 @@ const markerRecentWindow = 7 * 24 * time.Hour
 // ErrMarkerRecent marks a clear refused because the namespace is in use.
 var ErrMarkerRecent = errors.New("recently active backup namespace")
 
+// CheckMarkersClearable says whether a clear here would be refused, removing nothing:
+// ErrMarkerRecent if so, a plain error if this location did not answer. A clear across
+// several locations asks every one first, so that a refusal removes nothing anywhere.
+func (c *Client) CheckMarkersClearable(ctx context.Context, s3 S3Config, fingerprint string, now time.Time) error {
+	if !ownerMarkerRE.MatchString(fingerprint) {
+		return fmt.Errorf("invalid fingerprint %q", fingerprint)
+	}
+	markers, err := c.ListNamespaceMarkers(ctx, s3)
+	if err != nil {
+		return err
+	}
+	return c.checkMarkersIdle(ctx, s3, markers, fingerprint, now)
+}
+
+func (c *Client) checkMarkersIdle(ctx context.Context, s3 S3Config, markers []NamespaceMarker, fingerprint string, now time.Time) error {
+	for _, m := range markers {
+		if m.Fingerprint != fingerprint {
+			continue
+		}
+		keys, err := c.listTree(ctx, s3, m.Namespace+"/")
+		if err != nil {
+			return fmt.Errorf("%w: could not tell how recently %s was written to, so nothing was removed (--force to remove it anyway): %v", ErrMarkerRecent, m.Namespace, err)
+		}
+		for _, k := range keys {
+			if !k.Modified.IsZero() && now.Sub(k.Modified) < markerRecentWindow {
+				return fmt.Errorf("%w: %s was written to on %s, so %s may be a live server, and without its marker a prune here deletes its backups; nothing was removed. If that server is really gone: --force", ErrMarkerRecent, m.Namespace, k.Modified.Format("2006-01-02"), fingerprint)
+			}
+		}
+	}
+	return nil
+}
+
 // ClearNamespaceMarkers removes a fingerprint's markers (a server that no longer
 // exists, a rebuild's old self), returning the keys removed. The marker is all that
 // stops another server's prune from deleting that server's objects, so a namespace
@@ -1100,19 +1136,8 @@ func (c *Client) ClearNamespaceMarkers(ctx context.Context, s3 S3Config, fingerp
 		return nil, err
 	}
 	if !force {
-		for _, m := range markers {
-			if m.Fingerprint != fingerprint {
-				continue
-			}
-			keys, err := c.listTree(ctx, s3, m.Namespace+"/")
-			if err != nil {
-				return nil, fmt.Errorf("%w: could not tell how recently %s was written to, so nothing was removed (--force to remove it anyway): %v", ErrMarkerRecent, m.Namespace, err)
-			}
-			for _, k := range keys {
-				if !k.Modified.IsZero() && now.Sub(k.Modified) < markerRecentWindow {
-					return nil, fmt.Errorf("%w: %s was written to on %s, so %s may be a live server, and without its marker a prune here deletes its backups; nothing was removed. If that server is really gone: --force", ErrMarkerRecent, m.Namespace, k.Modified.Format("2006-01-02"), fingerprint)
-				}
-			}
+		if err := c.checkMarkersIdle(ctx, s3, markers, fingerprint, now); err != nil {
+			return nil, err
 		}
 	}
 	var removed []string

@@ -1,0 +1,107 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://teploy.github.io/contracts/schema/backup-preflight-envelope.schema.json",
+  "title": "`teploy server backup-preflight --host S [--install-tools] [--upgrade-binary] --json` (backup-setup-v1, rev 21). Read-only without a flag. A probe that fails reads as unknown or null, never as fine. An unreachable server is a report with exit 0. With a flag, the exit status is nonzero when that action failed or was refused, and the report is printed either way, describing the server after the action.",
+  "type": "object",
+  "required": ["machine_interface", "host", "observed_at", "reachable", "binary", "tools", "disk", "target", "policy"],
+  "properties": {
+    "machine_interface": {"type": "integer", "minimum": 1},
+    "host": {"type": "string"},
+    "observed_at": {"type": "string", "format": "date-time"},
+    "reachable": {"type": "boolean"},
+    "error": {"type": "string", "description": "why the server did not answer, or why the probe did not finish"},
+    "binary": {
+      "type": "object",
+      "required": ["path", "state", "fleet_engine", "cli_version", "same_as_cli"],
+      "properties": {
+        "path": {"type": "string"},
+        "state": {"enum": ["ok", "missing", "no_fleet_engine", "unknown"]},
+        "version": {"type": "string"},
+        "fleet_engine": {"type": ["boolean", "null"], "description": "whether it speaks `backup run --all`; null is unknown"},
+        "cli_version": {"type": "string"},
+        "same_as_cli": {"type": ["boolean", "null"]},
+        "detail": {"type": "string"}
+      }
+    },
+    "tools": {
+      "type": "object",
+      "required": ["aws", "age", "python3"],
+      "properties": {
+        "aws": {"$ref": "#/$defs/tool"},
+        "age": {"$ref": "#/$defs/tool"},
+        "python3": {"$ref": "#/$defs/tool"}
+      }
+    },
+    "disk": {
+      "type": "object",
+      "required": ["path", "free_bytes"],
+      "properties": {
+        "path": {"type": "string", "description": "where backups are built: the policy's tmp_dir, else /var/tmp"},
+        "free_bytes": {"type": ["integer", "null"], "minimum": 0},
+        "detail": {"type": "string"}
+      }
+    },
+    "target": {
+      "type": "object",
+      "required": ["state", "has_credentials"],
+      "properties": {
+        "state": {"enum": ["configured", "absent", "unknown"]},
+        "bucket": {"type": "string"},
+        "endpoint": {"type": "string"},
+        "prefix": {"type": "string"},
+        "has_credentials": {"type": "boolean"},
+        "detail": {"type": "string"}
+      }
+    },
+    "policy": {
+      "type": "object",
+      "required": ["state", "encrypted", "cron_installed", "managed_elsewhere"],
+      "properties": {
+        "state": {"enum": ["configured", "absent", "unknown"]},
+        "path": {"type": "string"},
+        "interval": {"type": "string"},
+        "encrypted": {"type": "boolean"},
+        "heartbeat_hosts": {"type": "array", "items": {"type": "string"}, "description": "hosts only, never tokens: lets a consumer tell its own heartbeat from someone else's"},
+        "cron_installed": {"type": ["boolean", "null"]},
+        "managed_elsewhere": {"enum": ["no", "yes", "unknown"], "description": "yes: the policy file is a symlink, belongs to another user or cannot be replaced by this one, or it has an interval and this user's crontab has no line for it. See managed_reasons."},
+        "managed_reasons": {"type": "array", "items": {"type": "string"}},
+        "detail": {"type": "string"}
+      }
+    },
+    "tools_install": {
+      "type": "array",
+      "description": "only with --install-tools; one row per tool, python3 first",
+      "items": {
+        "type": "object",
+        "required": ["tool", "action"],
+        "properties": {
+          "tool": {"enum": ["python3", "age", "aws"]},
+          "action": {"enum": ["already_done", "done", "failed"]},
+          "detail": {"type": "string"}
+        }
+      }
+    },
+    "binary_upgrade": {
+      "type": "object",
+      "description": "only with --upgrade-binary",
+      "required": ["action"],
+      "properties": {
+        "action": {"enum": ["already_done", "done", "failed", "refused"]},
+        "from": {"type": "string"},
+        "to": {"type": "string"},
+        "detail": {"type": "string"}
+      }
+    }
+  },
+  "$defs": {
+    "tool": {
+      "type": "object",
+      "required": ["state"],
+      "properties": {
+        "state": {"enum": ["ok", "missing", "outdated", "unknown"], "description": "outdated: aws below the minimum version"},
+        "version": {"type": "string"},
+        "detail": {"type": "string"}
+      }
+    }
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "machine_interface": 2,
+  "host": "192.0.2.10",
+  "key": "s3://teploy-backups/teploy/srv1/blog/accessories/db/20261104-031704-1f2e3d4c5b6a7988.pgdump.age",
+  "encrypted": true,
+  "requested_bytes": 22,
+  "length": 22,
+  "total_size": 1048576,
+  "data_base64": "YWdlLWVuY3J5cHRpb24ub3JnL3YxCg=="
+}

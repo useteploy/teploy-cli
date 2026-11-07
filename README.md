@@ -938,7 +938,9 @@ server backup-target owners` lists the markers; `--clear <fingerprint>` removes 
 a server that is gone, or this one before a rebuild. Without its marker a prune here deletes
 that server's backups, so a namespace written to in the last week needs `--force`, and every
 clear or refusal is an event in the `_fleet` log. A policy with no prefix in a bucket another
-server writes to is flagged by `teploy doctor`.
+server writes to is flagged by `teploy doctor`. A previous prefix it cannot
+reach, which is all of them for a key limited to the current prefix, is skipped with a
+warning and listed in `skipped_locations`.
 
 The fingerprint is a hash of `/etc/machine-id` and the hostname, plus the server's age public
 key in the marker. Two things follow, on purpose rather than papered over with an id file a
@@ -966,7 +968,27 @@ stale runs, no heartbeat, a missing `aws` or `age`, a target that does not answe
 leftover workspaces and uploads, a refused prune, a legacy shell cron line (which
 uploads plaintext whatever the policy says), and databases nothing backs up. `teploy
 setup` installs `aws` (AWS's bundle, signature checked, where the distribution has no
-package) and `age`.
+package) and `age`. `backup-target set` does not: it checks and warns.
+
+```bash
+teploy server backup-preflight --host prod [--json]    # read-only: what this server needs
+teploy server backup-preflight --host prod --install-tools    # aws, age, python3, nothing else
+teploy server backup-preflight --host prod --upgrade-binary   # this CLI's version on the server
+teploy backup run --all --detach --host prod [--json]  # survives a dropped connection
+teploy backup head s3://b/prod/app/volumes/20261104-030000.tar.gz.age --bytes 131072 --host prod --json
+```
+
+`backup-preflight` reports the server's teploy binary, `aws` against its minimum version,
+`age`, `python3`, free disk where backups are built, and whether a target and a policy
+exist and something else looks after the policy. A probe that fails reads as unknown,
+never as fine. It changes nothing unless a flag asks: `--install-tools` does none of
+`teploy setup`'s hardening, and `--upgrade-binary` is the only way an engine fix reaches a
+server whose binary already supports `--all`. It never downgrades.
+
+`backup run --all --detach` starts the same run the cron line does, under the same lock: a
+second one reports `already_running`. `backup head` reads the start of an object as stored,
+at most 256 KiB, under the server's own or previous prefixes. It never decrypts: it is how a
+recovery key gets proved in a browser.
 
 Accessory backups are engine-aware. The engine is detected from the
 container — the accessory's `engine:` in `teploy.yml` (set on the container

@@ -1,5 +1,25 @@
 # Open audit items
 
+## 2026-11-06 — Dash simple backup setup CLI
+
+Plan: `../_internal/DASH_SIMPLE_SETUP_PLAN_2026-11-06.md`. Branch `backup-setup`.
+`server backup-preflight`, `backup head`, `backup run --all --detach`, owners
+fixes, capability `backup-setup-v1`, contracts rev 21.
+
+Open / deferred:
+- `ensureFleetBinary` still installs the latest release, unasked, when
+  `backup-policy set` finds a binary with no `--all`. Left alone: it only fires when
+  the policy could not run at all. `--upgrade-binary` is the consented path for
+  everything else, and a binary that has `--all` is still never touched implicitly.
+- "Managed by something else" has no marker to read, so it is evidence: a policy
+  file that is a symlink, owned by another user, not replaceable by this user, or an
+  interval with no cron line in this user's crontab. Heartbeat hosts are reported so
+  a consumer can tell its own from someone else's.
+- A run that stands down later than the 3 seconds the start script watches reports
+  `started`. A run is in progress either way, and it does not start a second one.
+- teploy-dash `backupstorage.go:35` says the CLI's `set` may install age and the aws
+  CLI. It installs age only. Not this repo's comment; for the Dash side of this work.
+
 ## 2026-11-05 — Dash auto-config Programme B CLI: server siblings
 
 Plan: `../_internal/DASH_AUTOCONFIG_PLAN_2026-11-03.md` section 10. Branch

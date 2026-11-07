@@ -645,6 +645,69 @@ func TestContractsSiblingsGolden(t *testing.T) {
 	writeFixture(t, "siblings-envelope/valid/none.json", none.collect(t))
 }
 
+// TestContractsBackupSetupGolden pins what Dash's simple backup setup calls (rev 21,
+// backup-setup-v1). Preflight fixtures come from the real collector and actions over a
+// mock executor, the detached run's from the real start path, head's from the real DTO.
+func TestContractsBackupSetupGolden(t *testing.T) {
+	ctx := context.Background()
+	const host = "192.0.2.10"
+
+	ready := collectBackupPreflight(ctx, ssh.NewMockExecutor(host, preflightCommands(probeReady, targetStored, policyStored, cronFleet, managedPlain)...), serverTeployPath, "0.1.55", setupNow)
+	writeFixture(t, "backup-preflight-envelope/valid/ready.json", ready)
+
+	bare := collectBackupPreflight(ctx, ssh.NewMockExecutor(host, preflightCommands(probeBare, "absent\n", "absent\n", "", "")...), serverTeployPath, "0.1.55", setupNow)
+	writeFixture(t, "backup-preflight-envelope/valid/needs-setup.json", bare)
+
+	unknown := collectBackupPreflight(ctx, ssh.NewMockExecutor(host,
+		ssh.MockCommand{Match: "sh -c '" + preflightProbeMarker, Output: "binary_broken\t1\naws\tsome wrapper\n"},
+		ssh.MockCommand{Match: "for p in /etc/teploy/backup-target.json", Output: "garbage"},
+		ssh.MockCommand{Match: "if [ -d /etc/teploy ]", Err: errors.New("exit status 3: cannot tell whether this server's backups must be encrypted")},
+	), serverTeployPath, "0.1.55", setupNow)
+	writeFixture(t, "backup-preflight-envelope/valid/unknown.json", unknown)
+
+	writeFixture(t, "backup-preflight-envelope/valid/unreachable.json", unreachablePreflight(host, serverTeployPath, "0.1.55", errors.New("dial tcp 192.0.2.10:22: i/o timeout"), setupNow))
+
+	acted, err := backupPreflightOn(ctx, installMock(probeBare, probeReady), preflightOptions{
+		InstallTools: true, UpgradeBinary: true, Binary: serverTeployPath, CLIVersion: "0.1.55", Now: setupNow,
+		InstallRelease: func(context.Context, ssh.Executor, string, string, ...string) (string, error) { return "0.1.55", nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFixture(t, "backup-preflight-envelope/valid/after-actions.json", acted)
+
+	total := int64(1048576)
+	writeFixture(t, "backup-head-envelope/valid/encrypted.json", newBackupHeadDTO(host, 22, backup.ObjectStart{
+		Key: "s3://teploy-backups/teploy/srv1/blog/accessories/db/20261104-031704-1f2e3d4c5b6a7988.pgdump.age", Data: []byte("age-encryption.org/v1\n"), TotalSize: &total, Encrypted: true,
+	}))
+
+	started, err := startDetachedRun(ctx, detachMock("started 4242 /root/.config/teploy/backup-runs/run.AbCd1234\n"), false, events.Actor{}, setupNow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFixture(t, "backup-detach-envelope/valid/started.json", started)
+
+	skipped, _ := json.Marshal(backupRunEnvelope{MachineInterface: MachineInterface, FleetRunResult: backup.FleetRunResult{Status: "skipped", StartedAt: setupNow, Targets: []backup.FleetTargetResult{}, Error: "another run holds the lock"}})
+	running, err := startDetachedRun(ctx, detachMock("finished 4243 /root/.config/teploy/backup-runs/run.EfGh5678\n"+detachResultMark+"\n"+string(skipped)+"\n"+detachLogMark+"\n"), false, events.Actor{}, setupNow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFixture(t, "backup-detach-envelope/valid/already-running.json", running)
+
+	failedRun, _ := json.Marshal(backupRunEnvelope{MachineInterface: MachineInterface, FleetRunResult: backup.FleetRunResult{Status: backup.RunFailed, StartedAt: setupNow, Targets: []backup.FleetTargetResult{}, Error: "no backup policy on this server: set one with `teploy server backup-policy set`"}})
+	finished, err := startDetachedRun(ctx, detachMock("finished 4244 /root/.config/teploy/backup-runs/run.IjKl9012\n"+detachResultMark+"\n"+string(failedRun)+"\n"+detachLogMark+"\n"), false, events.Actor{}, setupNow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFixture(t, "backup-detach-envelope/valid/finished.json", finished)
+
+	died, err := startDetachedRun(ctx, detachMock("finished 4245 /root/.config/teploy/backup-runs/run.MnOp3456\n"+detachResultMark+"\n"+detachLogMark+"\nError: docker: permission denied\n"), false, events.Actor{}, setupNow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeFixture(t, "backup-detach-envelope/valid/failed.json", died)
+}
+
 func TestContractsBackupFleetGolden(t *testing.T) {
 	at := time.Date(2026, 11, 4, 3, 17, 4, 0, time.UTC)
 	failedAt := at.Add(-time.Hour)

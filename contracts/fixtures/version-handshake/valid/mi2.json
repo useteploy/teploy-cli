@@ -5,6 +5,7 @@
     "autodeploy-redeploy",
     "backup-fleet-v1",
     "backup-json-v1",
+    "backup-setup-v1",
     "backup-target-v1",
     "config-home-v1",
     "config-merge-v1",

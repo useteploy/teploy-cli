@@ -799,9 +799,10 @@ func (c *Client) SetSchedule(ctx context.Context, schedule, command, marker stri
 	return nil
 }
 
-// AWSCLIRemedy is the exact way to give a server the aws CLI. `teploy setup`
-// runs AWSCLIInstallScript; Ubuntu 24.04+ has no apt package for it.
-const AWSCLIRemedy = "run `teploy setup` against the server (it installs the distribution's package if that is new enough, else AWS's bundle with its signature checked), or on the server: AWS's installer as documented at https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html"
+// AWSCLIRemedy is the exact way to give a server the aws CLI. `backup-preflight
+// --install-tools` and `teploy setup` run AWSCLIInstallScript, and nothing else does:
+// `backup-target set` and a run only check for it. Ubuntu 24.04+ has no apt package.
+const AWSCLIRemedy = "run `teploy server backup-preflight --host <server> --install-tools` (backup tools only) or `teploy setup` against the server (either installs the distribution's package if that is new enough, else AWS's bundle with its signature checked), or on the server: AWS's installer as documented at https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html"
 
 // The oldest aws CLIs teploy runs on: the first to send a checksum header on every
 // upload by default. A store with Object Lock (B2's included) refuses an upload with
@@ -815,6 +816,15 @@ const (
 var awsCLIMinimum = fmt.Sprintf("2.%d.0 (or 1.%d.0)", awsCLIMinV2Minor, awsCLIMinV1Minor)
 
 var awsVersionRE = regexp.MustCompile(`aws-cli/(\d+)\.(\d+)\.(\d+)`)
+
+// AWSCLIVersion reads the version out of `aws --version` output, "" when it is not one.
+func AWSCLIVersion(versionOutput string) string {
+	m := awsVersionRE.FindStringSubmatch(versionOutput)
+	if m == nil {
+		return ""
+	}
+	return m[1] + "." + m[2] + "." + m[3]
+}
 
 // AWSCLIVersionProblem reads `aws --version` output and says what is wrong with it,
 // "" when nothing is, or when it is not a version (a wrapper): the first upload would
@@ -888,6 +898,7 @@ export DEBIAN_FRONTEND=noninteractive
 if aws_ok; then exit 0; fi
 if apt-get install -y -qq awscli >/dev/null 2>&1 && aws_ok; then exit 0; fi
 apt-get remove -y -qq awscli >/dev/null 2>&1 || true
+command -v curl >/dev/null 2>&1 || apt-get install -y -qq curl >/dev/null 2>&1 || { echo "curl is needed to download AWS's bundle" >&2; exit 1; }
 command -v gpg >/dev/null 2>&1 || apt-get install -y -qq gnupg >/dev/null 2>&1 || { echo "gpg is needed to verify AWS's bundle" >&2; exit 1; }
 d=$(mktemp -d /tmp/teploy-awscli.XXXXXXXX)
 trap 'rm -rf "$d"' EXIT

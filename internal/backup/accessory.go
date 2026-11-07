@@ -63,13 +63,16 @@ func (c *Client) backupDeadline() time.Duration {
 	return BackupDeadline
 }
 
+// DefaultTmpDir is where a backup builds with no tmp_dir in its policy.
+const DefaultTmpDir = "/var/tmp"
+
 // backupTmpDir is where a backup builds its artifacts: disk, not the tmpfs /tmp
 // is on many hosts, which a database dump would fill along with the RAM.
 func backupTmpDir() string {
 	if d := strings.TrimSpace(os.Getenv("TEPLOY_BACKUP_TMPDIR")); d != "" {
 		return strings.TrimRight(d, "/")
 	}
-	return "/var/tmp"
+	return DefaultTmpDir
 }
 
 func (c *Client) newBackupWorkspace(ctx context.Context) (string, func(), error) {

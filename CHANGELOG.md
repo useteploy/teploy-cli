@@ -4,6 +4,49 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+### Added
+
+- `teploy server backup-preflight --host S [--json]`: what a server needs before
+  backups can start. Whether it answers, its teploy binary's version and whether that
+  has the fleet engine, aws against its minimum version, age, python3, free disk where
+  backups are built, whether a target and policy exist, and whether something else
+  looks after the policy. Read-only. A probe that fails reads as unknown, never as fine,
+  and an unreachable server is a report rather than an error.
+- `backup-preflight --install-tools`: installs aws (the same script `teploy setup` runs,
+  signature check included), age and python3 where missing, and nothing else. Idempotent,
+  reports each result, and checks each tool reads as fine afterwards. Recorded as a
+  `server.tools_install` event.
+- `backup-preflight --upgrade-binary`: the consented way for engine fixes to reach a
+  server. Installs the release matching this CLI's version through the verified install
+  path and checks it afterwards. Refuses a development CLI and a downgrade. Recorded as a
+  `server.binary_upgrade` event. Nothing upgrades without the flag.
+- `teploy backup head <key> --bytes N --host S [--json]`: a ranged read of an object as
+  stored, through the server's stored target, as base64. At most 256 KiB, only under the
+  server's own or previous prefixes, and it never decrypts.
+- `teploy backup run --all --detach --host S [--json]`: starts the same `backup run --all`
+  on the server so that it survives a dropped connection, under the same lock, and returns
+  within seconds. A second one reports `already_running` and exits 0. Results reach status
+  and events as a normal run's do, so it counts for coverage. Recorded as a `backup.detach`
+  event. Too old a server binary is a refusal naming `--upgrade-binary`.
+- Contracts: `backup-preflight-envelope`, `backup-head-envelope` and
+  `backup-detach-envelope` (schemas + generated fixtures, corpus rev 21); version-handshake
+  advertises `backup-setup-v1`.
+
+### Fixed
+
+- `server backup-target owners` no longer fails outright on a previous location it cannot
+  reach, which is every previous location for a key limited to the current prefix: each is
+  skipped with a warning and listed in `skipped_locations`. `--clear` asks every location
+  first, so a refusal removes nothing anywhere, then tries all of them instead of stopping
+  at the first failure, and now takes `--json`.
+- `backup status` always says why a configured target is not reachable. With no aws CLI the
+  reason was empty, which a consumer showed as a bare "cannot reach"; a listing that failed
+  silently now names its exit status too.
+- Messages and comments no longer imply that `backup-target set` installs the aws CLI: it
+  checks and warns. The remedy now names `backup-preflight --install-tools`.
+- AWS's bundle installer installs curl when it is missing, on a server `teploy setup` never
+  prepared.
+
 ## [0.1.54] - 2026-11-05
 
 ### Added

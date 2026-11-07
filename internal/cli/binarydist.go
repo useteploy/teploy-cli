@@ -21,16 +21,20 @@ import (
 // extractBinary), just targeting the server's platform instead of the
 // operator's local one, and uploading instead of self-replacing.
 func deployTeployBinaryToServer(ctx context.Context, exec ssh.Executor, remotePath string, capabilities ...string) (version string, err error) {
-	goos, goarch, err := serverPlatform(ctx, exec)
-	if err != nil {
-		return "", fmt.Errorf("detecting server platform: %w", err)
-	}
-
 	latest, err := fetchLatestRelease(ctx)
 	if err != nil {
 		return "", fmt.Errorf("checking latest teploy release: %w", err)
 	}
-	latestVersion := strings.TrimPrefix(latest.TagName, "v")
+	return installTeployRelease(ctx, exec, remotePath, latest.TagName, capabilities...)
+}
+
+// installTeployRelease is that pipeline for one named release tag.
+func installTeployRelease(ctx context.Context, exec ssh.Executor, remotePath, tag string, capabilities ...string) (version string, err error) {
+	goos, goarch, err := serverPlatform(ctx, exec)
+	if err != nil {
+		return "", fmt.Errorf("detecting server platform: %w", err)
+	}
+	version = strings.TrimPrefix(tag, "v")
 
 	// goreleaser publishes archives named teploy_{os}_{arch}.tar.gz plus a
 	// checksums.txt — matches update.go's runUpdate exactly, just with the
@@ -41,8 +45,8 @@ func deployTeployBinaryToServer(ctx context.Context, exec ssh.Executor, remotePa
 	const binName = "teploy"
 	assetName := fmt.Sprintf("teploy_%s_%s.%s", goos, goarch, ext)
 
-	archiveURL := fmt.Sprintf("%s/%s/%s", downloadBase, latest.TagName, assetName)
-	checksumURL := fmt.Sprintf("%s/%s/checksums.txt", downloadBase, latest.TagName)
+	archiveURL := fmt.Sprintf("%s/%s/%s", downloadBase, tag, assetName)
+	checksumURL := fmt.Sprintf("%s/%s/checksums.txt", downloadBase, tag)
 
 	archive, err := downloadToBytes(ctx, archiveURL)
 	if err != nil {
@@ -66,11 +70,11 @@ func deployTeployBinaryToServer(ctx context.Context, exec ssh.Executor, remotePa
 		return "", fmt.Errorf("extracting binary: %w", err)
 	}
 
-	if err := installServerBinary(ctx, exec, remotePath, binData, latestVersion, capabilities...); err != nil {
+	if err := installServerBinary(ctx, exec, remotePath, binData, version, capabilities...); err != nil {
 		return "", err
 	}
 
-	return latestVersion, nil
+	return version, nil
 }
 
 // serverPlatform runs uname on the target and maps the result to Go's

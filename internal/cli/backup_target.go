@@ -66,7 +66,11 @@ func newServerBackupTargetOwnersCmd(flags *Flags) *cobra.Command {
 			"no longer exists, or this one before a rebuild. Backups are not touched. Do not\n" +
 			"clear a server that still writes here: give it its own --prefix. A namespace\n" +
 			"written to in the last week is refused without --force, and every clear is\n" +
-			"recorded in the server's event log.",
+			"recorded in the server's event log. A refusal anywhere removes nothing anywhere.\n\n" +
+			"A previous prefix that does not answer (a key limited to the current prefix\n" +
+			"cannot reach one) is skipped with a warning and reported; its markers stay. The\n" +
+			"current prefix not answering is an error, after every other location has been\n" +
+			"tried.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
@@ -96,24 +100,25 @@ func newServerBackupTargetOwnersCmd(flags *Flags) *cobra.Command {
 				locs = append(locs, l)
 			}
 			if clear != "" {
-				total, err := clearOwnerMarkers(ctx, executor, client, locs, clear, force, time.Now())
+				total, skipped, err := clearOwnerMarkers(ctx, executor, client, locs, clear, force, time.Now())
+				if flags.JSON {
+					return errors.Join(err, json.NewEncoder(os.Stdout).Encode(ownersClearDTO{MachineInterface: MachineInterface, Host: executor.Host(), Fingerprint: clear, Removed: total, SkippedLocations: skipped}))
+				}
+				warnSkippedLocations(skipped)
 				if err != nil {
 					return err
 				}
 				fmt.Printf("Removed %d marker(s) of %s\n", total, clear)
 				return nil
 			}
-			markers := []backup.NamespaceMarker{}
-			for _, l := range locs {
-				m, err := client.ListNamespaceMarkers(ctx, l)
-				if err != nil {
-					return err
-				}
-				markers = append(markers, m...)
+			markers, skipped, err := listOwnerMarkers(ctx, client, locs)
+			if err != nil {
+				return err
 			}
 			if flags.JSON {
-				return json.NewEncoder(os.Stdout).Encode(map[string]any{"machine_interface": MachineInterface, "host": executor.Host(), "markers": markers})
+				return json.NewEncoder(os.Stdout).Encode(ownersListDTO{MachineInterface: MachineInterface, Host: executor.Host(), Markers: markers, SkippedLocations: skipped})
 			}
+			warnSkippedLocations(skipped)
 			for _, m := range markers {
 				who := "another server"
 				if m.Self {
@@ -129,26 +134,125 @@ func newServerBackupTargetOwnersCmd(flags *Flags) *cobra.Command {
 	return cmd
 }
 
+// skippedLocation is a previous prefix that could not be read or changed.
+type skippedLocation struct {
+	Prefix string `json:"prefix"`
+	Reason string `json:"reason"`
+}
+
+// ownersListDTO is `server backup-target owners --json`.
+type ownersListDTO struct {
+	MachineInterface int                      `json:"machine_interface"`
+	Host             string                   `json:"host"`
+	Markers          []backup.NamespaceMarker `json:"markers"`
+	SkippedLocations []skippedLocation        `json:"skipped_locations"`
+}
+
+// ownersClearDTO is `server backup-target owners --clear --json`, printed whether or
+// not the clear succeeded: part of it may have.
+type ownersClearDTO struct {
+	MachineInterface int               `json:"machine_interface"`
+	Host             string            `json:"host"`
+	Fingerprint      string            `json:"fingerprint"`
+	Removed          int               `json:"removed"`
+	SkippedLocations []skippedLocation `json:"skipped_locations"`
+}
+
+func skipLocation(l backup.S3Config, err error) skippedLocation {
+	return skippedLocation{Prefix: l.Prefix, Reason: oneLine(err.Error())}
+}
+
+func warnSkippedLocations(skipped []skippedLocation) {
+	for _, s := range skipped {
+		where := "the bucket root"
+		if s.Prefix != "" {
+			where = "prefix " + s.Prefix
+		}
+		fmt.Fprintf(os.Stderr, "Warning: previous location %s was skipped: %s\n", where, s.Reason)
+	}
+}
+
+// listOwnerMarkers lists every location. locs[0] is the current prefix: it failing is
+// an error, since an empty list would read as no owners. A previous one failing is a
+// warning, because a key limited to the current prefix cannot reach it.
+func listOwnerMarkers(ctx context.Context, client *backup.Client, locs []backup.S3Config) ([]backup.NamespaceMarker, []skippedLocation, error) {
+	markers := []backup.NamespaceMarker{}
+	skipped := []skippedLocation{}
+	for i, l := range locs {
+		m, err := client.ListNamespaceMarkers(ctx, l)
+		if err != nil {
+			if i == 0 {
+				return nil, nil, err
+			}
+			skipped = append(skipped, skipLocation(l, err))
+			continue
+		}
+		markers = append(markers, m...)
+	}
+	return markers, skipped, nil
+}
+
 // clearOwnerMarkers removes a fingerprint's markers from every location, and records
 // it: the marker is all that stops a prune deleting that server's objects, so its
 // removal is an event whether it went through or was refused.
-func clearOwnerMarkers(ctx context.Context, exec ssh.Executor, client *backup.Client, locs []backup.S3Config, fingerprint string, force bool, now time.Time) (int, error) {
+//
+// Every location is asked first, so a refusal removes nothing anywhere. After that
+// nothing stops it partway: each location is tried, a previous one failing is skipped
+// and reported, and the current one failing is the error returned at the end.
+func clearOwnerMarkers(ctx context.Context, exec ssh.Executor, client *backup.Client, locs []backup.S3Config, fingerprint string, force bool, now time.Time) (int, []skippedLocation, error) {
 	total := 0
-	var err error
-	for _, l := range locs {
-		removed, cerr := client.ClearNamespaceMarkers(ctx, l, fingerprint, force, now)
-		total += len(removed)
-		if cerr != nil {
-			err = cerr
-			break
+	skipped := []skippedLocation{}
+	var errs []error
+	finish := func() (int, []skippedLocation, error) {
+		err := errors.Join(errs...)
+		events.Record(ctx, exec, ownerClearEvent(fingerprint, force, total, skipped, err))
+		return total, skipped, err
+	}
+	failed := func(i int, l backup.S3Config, err error) {
+		if i == 0 {
+			errs = append(errs, err)
+		} else {
+			skipped = append(skipped, skipLocation(l, err))
 		}
 	}
-	events.Record(ctx, exec, ownerClearEvent(fingerprint, force, total, err))
-	return total, err
+	tryable := make([]bool, len(locs))
+	for i, l := range locs {
+		tryable[i] = true
+		if force {
+			continue
+		}
+		if err := client.CheckMarkersClearable(ctx, l, fingerprint, now); err != nil {
+			if errors.Is(err, backup.ErrMarkerRecent) {
+				errs = []error{err}
+				return finish()
+			}
+			tryable[i] = false
+			failed(i, l, err)
+		}
+	}
+	for i, l := range locs {
+		if !tryable[i] {
+			continue
+		}
+		// Already checked above, or --force: this step only removes.
+		removed, err := client.ClearNamespaceMarkers(ctx, l, fingerprint, true, now)
+		total += len(removed)
+		if err != nil {
+			failed(i, l, err)
+		}
+	}
+	return finish()
 }
 
-func ownerClearEvent(fingerprint string, force bool, removed int, err error) events.Event {
+func ownerClearEvent(fingerprint string, force bool, removed int, skipped []skippedLocation, err error) events.Event {
 	ev := events.Event{App: backup.FleetApp, Kind: events.KindBackupOwners, Outcome: events.Succeeded, Detail: map[string]any{"fingerprint": fingerprint, "force": force, "removed": removed}}
+	if len(skipped) > 0 {
+		prefixes := make([]string, 0, len(skipped))
+		for _, s := range skipped {
+			prefixes = append(prefixes, s.Prefix)
+		}
+		ev.Detail["skipped_locations"] = prefixes
+	}
 	if err != nil {
 		ev.Outcome = events.Failed
 		if errors.Is(err, backup.ErrMarkerRecent) {
@@ -202,7 +306,9 @@ func newServerBackupTargetSetCmd(flags *Flags) *cobra.Command {
 			"--previous-prefix-owned says only this server ever wrote under the prefix\n" +
 			"being left, and --claim-previous-prefix says it of an earlier one, which lets\n" +
 			"them age out under the policy's retention (never where another server's\n" +
-			"marker says otherwise).",
+			"marker says otherwise).\n\n" +
+			"This does not install the aws CLI. It checks for it and warns; install it with\n" +
+			"`teploy server backup-preflight --install-tools` or `teploy setup`.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runServerBackupTargetSet(flags, bucket, region, endpoint, prefix, noCredentials, prevOwned, dropPrevious, claimPrevious)
@@ -383,7 +489,7 @@ func checkReachability(ctx context.Context, executor ssh.Executor, t backup.Targ
 	client := backup.NewClient(executor, io.Discard)
 	if err := client.EnsureAWSCLIPublic(ctx); err != nil {
 		// The target is stored, and every backup through it will fail until this
-		// is fixed: say so in the terms that fix it.
+		// is fixed: say so in the terms that fix it. This does not install aws.
 		fmt.Fprintf(os.Stderr, "Warning: backups through this target will fail: %v\n", err)
 		return
 	}

@@ -184,23 +184,23 @@ func TestClearOwnerMarkersIsRecorded(t *testing.T) {
 		t.Fatalf("no event: %v", mock.Calls)
 	}
 	mock := mk()
-	n, err := clearOwnerMarkers(context.Background(), mock, backup.NewClient(mock, io.Discard), s3, "aaaaaaaaaaaaaaaa", false, now)
+	n, _, err := clearOwnerMarkers(context.Background(), mock, backup.NewClient(mock, io.Discard), s3, "aaaaaaaaaaaaaaaa", false, now)
 	if !errors.Is(err, backup.ErrMarkerRecent) || n != 0 {
 		t.Fatalf("%d %v", n, err)
 	}
 	recorded(mock)
 	mock = mk()
-	if n, err = clearOwnerMarkers(context.Background(), mock, backup.NewClient(mock, io.Discard), s3, "aaaaaaaaaaaaaaaa", true, now); err != nil || n != 1 {
+	if n, _, err = clearOwnerMarkers(context.Background(), mock, backup.NewClient(mock, io.Discard), s3, "aaaaaaaaaaaaaaaa", true, now); err != nil || n != 1 {
 		t.Fatalf("%d %v", n, err)
 	}
 	recorded(mock)
 	// Through Sanitize, which is what reaches the log: a kind's detail is allowlisted.
-	ev := ownerClearEvent("f", false, 0, backup.ErrMarkerRecent)
+	ev := ownerClearEvent("f", false, 0, nil, backup.ErrMarkerRecent)
 	events.Sanitize(&ev)
 	if ev.Outcome != events.Refused || ev.Detail["fingerprint"] != "f" || ev.Detail["error"] == nil {
 		t.Fatalf("%+v", ev)
 	}
-	ev = ownerClearEvent("f", true, 1, nil)
+	ev = ownerClearEvent("f", true, 1, nil, nil)
 	events.Sanitize(&ev)
 	if ev.Outcome != events.Succeeded || ev.Detail["force"] != true || ev.Detail["removed"] != 1 {
 		t.Fatalf("%+v", ev)
