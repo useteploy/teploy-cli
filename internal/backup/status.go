@@ -200,7 +200,9 @@ func ReadFleetStatus(ctx context.Context, exec ssh.Executor, now time.Time) (Fle
 		Configured: target.Bucket != "", Bucket: target.Bucket, Region: target.Region, Endpoint: target.Endpoint,
 		Prefix: target.Prefix, HasCredentials: target.HasCredentials, PreviousPrefixes: target.PreviousPrefixes,
 	}
+	toolsRead := false
 	if out, err := exec.Run(ctx, `command -v aws >/dev/null 2>&1 && v=$(aws --version 2>&1) && echo "aws $v"; command -v age >/dev/null 2>&1 && echo age; true`); err == nil {
+		toolsRead = true
 		for _, t := range splitLines(out) {
 			if t == "aws" || strings.HasPrefix(t, "aws ") {
 				st.AWSCLI = true
@@ -251,6 +253,10 @@ func ReadFleetStatus(ctx context.Context, exec ssh.Executor, now time.Time) (Fle
 		} else {
 			st.Target.Reachable = true
 		}
+	} else if target.Bucket != "" {
+		// Not reachable has to say why: nothing tried the target, and an empty reason
+		// reads as the target failing.
+		st.Target.Error = awsAbsentCause(toolsRead)
 	}
 	if st.Target.Reachable {
 		st.Target.IncomingLifecycle = c.incomingLifecycle(ctx, cfg)
@@ -480,6 +486,14 @@ func ReadFleetStatus(ctx context.Context, exec ssh.Executor, now time.Time) (Fle
 	}
 	sort.Strings(st.UncoveredDatabases)
 	return st, nil
+}
+
+// awsAbsentCause is the plain reason a target was never tried.
+func awsAbsentCause(toolsRead bool) string {
+	if !toolsRead {
+		return "could not check whether the aws CLI is on this server, so the target was not tried"
+	}
+	return "the aws CLI is not installed on this server, or does not run, so the target was not tried"
 }
 
 // incomingLifecycle reads the bucket's lifecycle rules for one that expires

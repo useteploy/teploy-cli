@@ -120,6 +120,9 @@ const (
 	KindRouteRemove    = "route.remove"
 	KindReleasesPrune  = "releases.prune"
 	KindServerPrune    = "server.prune"
+	KindBackupDetach   = "backup.detach"
+	KindServerTools    = "server.tools_install"
+	KindServerBinary   = "server.binary_upgrade"
 )
 
 // detailAllow is the per-kind allowlist of detail keys. Env and secret
@@ -154,12 +157,15 @@ var detailAllow = map[string][]string{
 	KindBackupVerify:   {"accessory", "database", "date", "ok", "engine", "kind", "metric", "key", "size_bytes", "duration_ms", "encrypted", "error"},
 	KindBackupRestore:  {"id", "kind", "accessory", "action", "database", "released", "pre_backup_id", "error"},
 	KindBackupTarget:   {"id", "kind", "accessory", "error"},
-	KindBackupOwners:   {"fingerprint", "force", "removed", "error"},
+	KindBackupOwners:   {"fingerprint", "force", "removed", "skipped_locations", "error"},
 	KindBackupAll:      {"status", "targets_ok", "targets_failed", "omissions", "encrypted", "duration_ms", "heartbeats_ok", "heartbeats_failed", "warnings", "error"},
 	KindBackupPolicy:   {"interval", "encrypted", "volumes", "adopted", "error"},
 	KindRouteRemove:    {"route", "hosts", "upstreams", "reason", "error"},
 	KindReleasesPrune:  {"keep", "pruned", "protected", "trigger", "error"},
 	KindServerPrune:    {"build_cache", "dangling", "output", "error"},
+	KindBackupDetach:   {"status", "pid", "log", "error"},
+	KindServerTools:    {"installed", "failed", "error"},
+	KindServerBinary:   {"from", "to", "error"},
 }
 
 // maxErrorDetail bounds the "error" detail so a command's full stderr
