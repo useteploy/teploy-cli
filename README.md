@@ -573,6 +573,18 @@ teploy network setup <provider>    # VPN mesh (tailscale, headscale, netbird)
 teploy network status / join       # VPN management
 ```
 
+### Teploy Cloud servers
+
+`teploy cloud` buys and deletes managed servers on [Teploy Cloud](https://cloud.teploy.com) with an organization API key. A created server is added to `~/.teploy/servers.yml` and set up with `teploy setup`, so it is ready for `teploy deploy`. See [docs/cloud.md](docs/cloud.md).
+
+```
+teploy cloud login                       # API key (hidden) + organization id, stored in ~/.teploy/cloud.yml
+teploy cloud sizes --provider vultr      # what can be bought, with monthly prices
+teploy cloud server create web1 --provider vultr --region ewr --size vc2-1c-1gb
+teploy cloud servers                     # the organization's servers
+teploy cloud server delete web1
+```
+
 ### Domains
 
 ```bash
@@ -1240,6 +1252,7 @@ One app runs one image; multi-image stacks are refused, not approximated — see
 - [CI/CD](docs/ci-deploy.md) — push-to-deploy with Forgejo/GitHub Actions
 - [Secrets scanning](docs/secrets-scanning.md) — Gitleaks recipe
 - [Resilience](docs/resilience.md) — surviving server loss (topology + runbook)
+- [Teploy Cloud](docs/cloud.md) — buying managed servers from the CLI
 
 ## Comparison
 

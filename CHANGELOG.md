@@ -4,6 +4,20 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+### Added
+
+- `teploy cloud`: connects the CLI to Teploy Cloud (https://cloud.teploy.com).
+  `login` (API key read hidden or with `--key-stdin`, `--org`; checked, then stored in
+  `~/.teploy/cloud.yml` with mode 0600), `logout`, `status`, `servers`, `regions`,
+  `sizes`, `server create` and `server delete`. `server create` registers the local SSH
+  public key if Cloud does not have it, shows the monthly price and asks before buying
+  (`--yes` skips), sends one `Idempotency-Key` across retries, waits for the server to
+  become active, adds it to servers.yml as `root@<ip>` (refusing an existing name) and
+  runs `teploy setup` unless `--no-setup`. `server delete` asks first and removes the
+  servers.yml entry only when its host is the deleted server's address.
+  `TEPLOY_CLOUD_URL` selects another instance; plain http is refused except to
+  localhost.
+
 ## [0.1.55] - 2026-11-06
 
 ### Added
