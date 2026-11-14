@@ -9,12 +9,21 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
 - `teploy cloud`: connects the CLI to Teploy Cloud (https://cloud.teploy.com).
   `login` (API key read hidden or with `--key-stdin`, `--org`; checked, then stored in
   `~/.teploy/cloud.yml` with mode 0600), `logout`, `status`, `servers`, `regions`,
-  `sizes`, `server create` and `server delete`. `server create` registers the local SSH
-  public key if Cloud does not have it, shows the monthly price and asks before buying
-  (`--yes` skips), sends one `Idempotency-Key` across retries, waits for the server to
-  become active, adds it to servers.yml as `root@<ip>` (refusing an existing name) and
-  runs `teploy setup` unless `--no-setup`. `server delete` asks first and removes the
-  servers.yml entry only when its host is the deleted server's address.
+  `sizes`, `server create`, `server attach` and `server delete`. `server create` shows
+  the monthly price and asks before buying (`--yes` skips); only then registers the
+  public half of the SSH key the CLI connects with (`--key`, else the default identity;
+  derived from the private key, so the two always match). The purchase is sent once,
+  never retried: when its answer is lost (timeout, connection error, 5xx) the CLI lists
+  the organization's servers and continues with the one new server of that name, or
+  reports that nothing was bought. It waits for the server to be active with a real
+  address (never Teploy Cloud's `0.0.0.0` placeholder), adds it to servers.yml as
+  `root@<ip>` (refusing an existing name) and runs `teploy setup` unless `--no-setup`.
+  A failure after the purchase prints the `teploy cloud server attach <id>` command that
+  finishes the job without buying again. `server delete` asks first and removes the
+  servers.yml entry only when its host is the deleted server's address. Every `--json`
+  document carries `machine_interface` (capability `cloud-v1`, contracts corpus rev 22).
+  docs/cloud.md lists the API key permissions needed (`read:servers`, `write:servers`,
+  owner/admin role to create and delete) and where the organization id is.
   `TEPLOY_CLOUD_URL` selects another instance; plain http is refused except to
   localhost.
 

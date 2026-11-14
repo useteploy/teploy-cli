@@ -582,6 +582,7 @@ teploy cloud login                       # API key (hidden) + organization id, s
 teploy cloud sizes --provider vultr      # what can be bought, with monthly prices
 teploy cloud server create web1 --provider vultr --region ewr --size vc2-1c-1gb
 teploy cloud servers                     # the organization's servers
+teploy cloud server attach <id>          # finish a bought server if create stopped after the purchase
 teploy cloud server delete web1
 ```
 
