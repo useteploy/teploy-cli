@@ -26,6 +26,12 @@ found from each other.
 
 <!-- Append new entries below this line. Newest first. -->
 
+_No open entries._
+
+---
+
+## Closed
+
 ## 2026-09-08 — comma-separated domains fail DNS validation as one literal hostname
 
 - **Area:** cli (validate, deploy) + dns
@@ -56,4 +62,9 @@ found from each other.
   two-host domain string next to the existing `nonPublicDomainWarnings` and
   `splitDomains` tests.
 - **Reporter:** hardware-site session, 2026-09-08.
-- **Status:** open
+- **Status:** fixed (65f67df, released in v0.1.51)
+- **Update 2026-11-14:** fixed in `65f67df` ("fix(dns): check each host, …"):
+  `validate`, `deploy` and the folderless deploy path all call
+  `validateDomainDNS` (`internal/cli/dnscheck.go`), which splits the domain on
+  `,`, trims each host and validates it alone; `dns.Validate` has no other
+  caller. Moved to Closed; the entry was never moved when the fix landed.
