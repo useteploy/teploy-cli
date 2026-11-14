@@ -19,5 +19,16 @@ jobs:
       - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
         with:
           go-version: '1.26'
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt-clean (run gofmt -w on them):"
+            echo "$unformatted"
+            exit 1
+          fi
       - run: go vet ./...
+      # Fails only on a vulnerability the code actually reaches; the version
+      # is pinned so a govulncheck release cannot change CI on its own.
+      - run: go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
       - run: go test -race ./...
