@@ -79,11 +79,11 @@ func TestDeploy_NormalizesDefaultContainerPort(t *testing.T) {
 	var buf bytes.Buffer
 	d := NewDeployer(mock, &buf)
 	err := d.Deploy(context.Background(), Config{
-		App:    "myapp",
-		Domain: "myapp.com",
-		Image:  "myapp:latest",
+		App:     "myapp",
+		Domain:  "myapp.com",
+		Image:   "myapp:latest",
 		Version: "abc123",
-		Health: HealthConfig{Timeout: 5 * time.Second, Interval: 10 * time.Millisecond},
+		Health:  HealthConfig{Timeout: 5 * time.Second, Interval: 10 * time.Millisecond},
 	})
 	if err != nil {
 		t.Fatalf("Deploy: %v", err)

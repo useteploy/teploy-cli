@@ -243,4 +243,3 @@ func readSecretAuditConf(path string) (map[string]string, error) {
 	}
 	return conf, nil
 }
-

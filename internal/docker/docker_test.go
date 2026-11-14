@@ -772,7 +772,10 @@ func TestPublishBinding_IPv6AndValidation(t *testing.T) {
 	if _, err := publishBinding("", 49152, 80); err == nil {
 		t.Error("an empty bind must be rejected here (the caller supplies the default)")
 	}
-	for _, tc := range []struct{ bind string; hp, cp int }{
+	for _, tc := range []struct {
+		bind   string
+		hp, cp int
+	}{
 		{"host.example.com", 49152, 80},
 		{"127.0.0.1", 0, 80},
 		{"127.0.0.1", 65536, 80},

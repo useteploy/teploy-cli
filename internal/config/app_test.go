@@ -1,8 +1,8 @@
 package config
 
 import (
-	"testing"
 	"strings"
+	"testing"
 )
 
 // TCL-35: accessory volume keys become path segments under the accessory
@@ -38,13 +38,13 @@ func TestValidate_RejectsUnsafeAccessoryVolumes(t *testing.T) {
 // IPv6, and unknown protocols fail.
 func TestParsePublishSpec_grammar(t *testing.T) {
 	valid := map[string]PublishSpec{
-		"3000":                        {ContainerPort: 3000},
-		"3000/udp":                    {ContainerPort: 3000, Proto: "udp"},
-		"9100:9000":                   {HostPort: 9100, ContainerPort: 9000},
-		"127.0.0.1:9100:9000":         {Bind: "127.0.0.1", HostPort: 9100, ContainerPort: 9000},
-		"[::1]:9100:9000":             {Bind: "::1", HostPort: 9100, ContainerPort: 9000},
-		"[::1]::9000":                 {Bind: "::1", ContainerPort: 9000},
-		"0.0.0.0:51820:51820/udp":     {Bind: "0.0.0.0", HostPort: 51820, ContainerPort: 51820, Proto: "udp"},
+		"3000":                    {ContainerPort: 3000},
+		"3000/udp":                {ContainerPort: 3000, Proto: "udp"},
+		"9100:9000":               {HostPort: 9100, ContainerPort: 9000},
+		"127.0.0.1:9100:9000":     {Bind: "127.0.0.1", HostPort: 9100, ContainerPort: 9000},
+		"[::1]:9100:9000":         {Bind: "::1", HostPort: 9100, ContainerPort: 9000},
+		"[::1]::9000":             {Bind: "::1", ContainerPort: 9000},
+		"0.0.0.0:51820:51820/udp": {Bind: "0.0.0.0", HostPort: 51820, ContainerPort: 51820, Proto: "udp"},
 	}
 	for in, want := range valid {
 		got, err := ParsePublishSpec(in)

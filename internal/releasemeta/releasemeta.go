@@ -88,9 +88,9 @@ type Health struct {
 // so rollback restores the target release's edge config instead of the
 // current config file's.
 type CaddyRoute struct {
-	TLSCert     string            `json:"tls_cert,omitempty"`
-	TLSKey      string            `json:"tls_key,omitempty"`
-	TLSInternal bool              `json:"tls_internal,omitempty"`
+	TLSCert     string `json:"tls_cert,omitempty"`
+	TLSKey      string `json:"tls_key,omitempty"`
+	TLSInternal bool   `json:"tls_internal,omitempty"`
 	// TLSHTTPOnly is nil on records written before this field existed; every
 	// caddy release since records it, so the record can turn the flag off too.
 	TLSHTTPOnly *bool             `json:"tls_http_only,omitempty"`

@@ -25,11 +25,11 @@ type AgentTemplate struct {
 
 // AgentConfig is the input to the agent HCL.
 type AgentConfig struct {
-	VaultAddr   string
-	RoleIDPath  string
+	VaultAddr    string
+	RoleIDPath   string
 	SecretIDPath string
-	TokenSink   string
-	Templates   []AgentTemplate
+	TokenSink    string
+	Templates    []AgentTemplate
 }
 
 // RenderAgentConfig produces the OpenBao Agent HCL (pure/testable): auto-auth

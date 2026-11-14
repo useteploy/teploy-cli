@@ -620,8 +620,8 @@ func TestDeploy_SameVersion(t *testing.T) {
 		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state' ]", Output: "present\n" + existingState},
 		ssh.MockCommand{Match: "ss -tln", Output: ssOutput},
 		// Rename existing container.
-ssh.MockCommand{Match: "docker inspect -f '{{.State.Status}}' 'myapp-web-abc123_replaced'", Output: ""},
-				ssh.MockCommand{Match: "docker rename", Output: ""},
+		ssh.MockCommand{Match: "docker inspect -f '{{.State.Status}}' 'myapp-web-abc123_replaced'", Output: ""},
+		ssh.MockCommand{Match: "docker rename", Output: ""},
 		ssh.MockCommand{Match: "docker run", Output: "newcontainer"},
 		ssh.MockCommand{Match: "docker inspect -f '{{json .State}}'", Output: `{"Status":"running","Running":true}`},
 		ssh.MockCommand{Match: "docker inspect -f", Output: "running"},
@@ -1347,8 +1347,8 @@ func TestDeploy_SameVersionWithWorkers(t *testing.T) {
 		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state.json' ]", Output: "absent"},
 		ssh.MockCommand{Match: "if [ ! -e '/deployments/myapp/state' ]", Output: "present\n" + stateContent},
 		ssh.MockCommand{Match: "ss -tln", Output: ssOutput},
-ssh.MockCommand{Match: "docker inspect -f '{{.State.Status}}' 'myapp-", Output: ""},
-				// Rename existing containers.
+		ssh.MockCommand{Match: "docker inspect -f '{{.State.Status}}' 'myapp-", Output: ""},
+		// Rename existing containers.
 		ssh.MockCommand{Match: "docker rename", Output: ""},
 		// Start new containers.
 		ssh.MockCommand{Match: "docker run", Output: "redeploycontainer"},

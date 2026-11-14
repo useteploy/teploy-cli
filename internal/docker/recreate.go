@@ -141,9 +141,9 @@ type containerInspect struct {
 		RestartPolicy struct {
 			Name string
 		}
-		Runtime  string // HostConfig.Runtime (runc, runsc, …)
-		Memory   int64  // bytes
-		NanoCpus int64  // nano-CPUs (1 CPU = 1e9)
+		Runtime   string // HostConfig.Runtime (runc, runsc, …)
+		Memory    int64  // bytes
+		NanoCpus  int64  // nano-CPUs (1 CPU = 1e9)
 		LogConfig struct {
 			Type   string
 			Config map[string]string

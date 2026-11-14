@@ -530,12 +530,12 @@ func TestStaticDeploy_RecordsReleaseMetadata(t *testing.T) {
 
 	var buf bytes.Buffer
 	err = NewStaticDeployer(mock, &buf).Deploy(context.Background(), StaticConfig{
-		App:    "myapp",
-		Domain: "myapp.com",
-		Source: src,
-		SPA:    true,
+		App:     "myapp",
+		Domain:  "myapp.com",
+		Source:  src,
+		SPA:     true,
 		Headers: map[string]string{"X-Static": "1"},
-		Cache:  map[string]string{"assets/*": "max-age=3600"},
+		Cache:   map[string]string{"assets/*": "max-age=3600"},
 	})
 	if err != nil {
 		t.Fatalf("Deploy: %v", err)
