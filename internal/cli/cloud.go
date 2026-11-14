@@ -741,6 +741,10 @@ func runCloudServerCreate(ctx context.Context, flags *Flags, env *cloudEnv, o cl
 	req := cloud.CreateServerRequest{Provider: o.provider, Name: o.name, Region: o.region, Size: size.ID, SSHKeyID: keyID}
 	res := &cloudServerResultDTO{MachineInterface: MachineInterface, Setup: cloudSetupNotRun}
 	srv, err := client.CreateServer(ctx, req, idemKey)
+	if err == nil && srv.ID == "" {
+		// A success that does not say which server: look for it.
+		err = errors.New("Teploy Cloud answered without a server id")
+	}
 	switch {
 	case err == nil:
 		fmt.Fprintf(progress, "Created server %s (id %s); waiting for it to become active\n", srv.Name, srv.ID)
@@ -752,12 +756,12 @@ func runCloudServerCreate(ctx context.Context, flags *Flags, env *cloudEnv, o cl
 			o.name, o.name)}
 	default:
 		fmt.Fprintf(progress, "The create request did not complete (%v).\nChecking whether Teploy Cloud bought %q anyway; the request is not sent again.\n", err, o.name)
-		srv, err = findNewCloudServer(ctx, env, client, before, o.name, err)
+		srv, err = findNewCloudServer(ctx, env, client, before, req, err)
 		if err != nil {
 			return err
 		}
 		res.Adopted = true
-		fmt.Fprintf(progress, "Found server %s (id %s), bought by that request; continuing with it\n", srv.Name, srv.ID)
+		fmt.Fprintf(progress, "Found server %s (id %s), created by that request; continuing with it\n", srv.Name, srv.ID)
 	}
 	resumeKey := flags.Key
 	if resumeKey == "" && o.sshKey != "" {
@@ -767,10 +771,16 @@ func runCloudServerCreate(ctx context.Context, flags *Flags, env *cloudEnv, o cl
 }
 
 // findNewCloudServer looks for the server a create with an unknown outcome
-// may have bought: a server named name whose id was not in before. It reads
-// the list up to env.confirmChecks times, pollInterval apart (a purchase
-// still in progress is listed from its reservation on). It never posts.
-func findNewCloudServer(ctx context.Context, env *cloudEnv, client *cloud.Client, before []cloud.Server, name string, createErr error) (*cloud.Server, error) {
+// may have bought: a server whose id was not in before, with the requested
+// name and, where the row says them, the requested provider, region and
+// size (Teploy Cloud stores them as sent, so a same-named server somebody
+// else created meanwhile with another shape is not taken for ours). It
+// reads the list up to env.confirmChecks times, pollInterval apart (a
+// purchase still in progress is listed from its reservation on). It never
+// posts.
+func findNewCloudServer(ctx context.Context, env *cloudEnv, client *cloud.Client, before []cloud.Server, want cloud.CreateServerRequest, createErr error) (*cloud.Server, error) {
+	name := want.Name
+	differs := func(got, asked string) bool { return got != "" && got != asked }
 	known := make(map[string]bool, len(before))
 	for _, s := range before {
 		known[s.ID] = true
@@ -794,9 +804,13 @@ func findNewCloudServer(ctx context.Context, env *cloudEnv, client *cloud.Client
 		listErr = nil
 		var fresh []cloud.Server
 		for _, s := range servers {
-			if !known[s.ID] && s.Name == name {
-				fresh = append(fresh, s)
+			if known[s.ID] || s.Name != name {
+				continue
 			}
+			if differs(s.Provider, want.Provider) || differs(s.ProviderRegion, want.Region) || differs(s.ProviderSize, want.Size) {
+				continue
+			}
+			fresh = append(fresh, s)
 		}
 		switch len(fresh) {
 		case 0:
@@ -819,8 +833,8 @@ func findNewCloudServer(ctx context.Context, env *cloudEnv, client *cloud.Client
 			name, createErr, listErr, name)}
 	}
 	return nil, &cloudPurchaseUnknownError{msg: fmt.Sprintf(
-		"server %q was not bought: the create request failed (%v) and no new server of that name is in the organization. Run `teploy cloud servers` before trying again in case it appears late; if it does, finish it with `teploy cloud server attach <id>` instead of creating another",
-		name, createErr)}
+		"server %q does not appear to have been bought: the create request failed (%v) and no new server of that name is listed in the organization. Teploy Cloud may still be working on the request, so run `teploy cloud servers` in a few minutes before trying again; if %q shows up, finish it with `teploy cloud server attach <id>` instead of creating another",
+		name, createErr, name)}
 }
 
 // finishCloudServer takes a bought server to the end: wait until it is
@@ -973,7 +987,7 @@ func waitForActive(ctx context.Context, env *cloudEnv, client *cloud.Client, srv
 			return srv, nil
 		}
 		if srv.Status == "error" {
-			return nil, fmt.Errorf("%w: server %s (id %s) failed to provision: status error (see the Teploy Cloud dashboard, then `teploy cloud server delete %s`)",
+			return nil, fmt.Errorf("%w: server %s (id %s) failed to provision: status error. Teploy Cloud removes a server that failed while it was being created and refunds its charge; if `teploy cloud servers` still lists it in a few minutes, see the Teploy Cloud dashboard and remove it with `teploy cloud server delete %s`",
 				errCloudServerTerminal, srv.Name, srv.ID, srv.ID)
 		}
 		shown := srv.Status

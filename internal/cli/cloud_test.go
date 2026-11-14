@@ -47,6 +47,8 @@ type fakeCloud struct {
 	postStatus   int
 	postBody     string
 	postKeepsRow bool
+	// foreignOnPost is a row somebody else creates while the create runs.
+	foreignOnPost map[string]any
 	// pollsToActive: GETs before the server is active; pollsToAddress:
 	// GETs before it has a real address (0.0.0.0 until then).
 	pollsToActive  int
@@ -113,7 +115,10 @@ func (f *fakeCloud) handler(t *testing.T) http.Handler {
 		f.idemKeys = append(f.idemKeys, r.Header.Get("Idempotency-Key"))
 		var body map[string]string
 		json.NewDecoder(r.Body).Decode(&body)
-		if f.postStatus >= 400 && f.postStatus < 500 {
+		if f.foreignOnPost != nil {
+			f.addServer(f.foreignOnPost)
+		}
+		if f.postStatus >= 400 && f.postStatus < 500 && !f.postKeepsRow {
 			w.WriteHeader(f.postStatus)
 			w.Write([]byte(f.postBody))
 			return
@@ -579,7 +584,7 @@ func TestCloudServerCreate502NothingBought(t *testing.T) {
 	if err == nil {
 		t.Fatal("create with a failed purchase succeeded")
 	}
-	if !errors.Is(err, errCloudPurchaseUnknown) || !strings.Contains(err.Error(), "was not bought") || !strings.Contains(err.Error(), "teploy cloud servers") {
+	if !errors.Is(err, errCloudPurchaseUnknown) || !strings.Contains(err.Error(), "does not appear to have been bought") || !strings.Contains(err.Error(), "teploy cloud servers") {
 		t.Errorf("error does not say what happened and how to check: %v", err)
 	}
 	if h.fake.createPosts != 1 {
@@ -614,6 +619,51 @@ func TestCloudServerCreate4xxNoRetry(t *testing.T) {
 	}
 	if h.fake.createPosts != 1 || h.fake.lists != 1 {
 		t.Errorf("posts %d, lists %d (want 1 and the before-list only)", h.fake.createPosts, h.fake.lists)
+	}
+}
+
+// TestCloudServerCreateDoesNotAdoptAnotherShape: a same-named server that
+// appears during a failed create but is in another region or of another
+// size is somebody else's; it is not adopted as the purchase.
+func TestCloudServerCreateDoesNotAdoptAnotherShape(t *testing.T) {
+	for _, foreign := range []map[string]any{
+		{"id": "theirs", "name": "web1", "status": "active", "ipAddress": "198.51.100.9", "provider": "vultr", "providerRegion": "fra", "providerSize": "vc2-1c-1gb"},
+		{"id": "theirs", "name": "web1", "status": "active", "ipAddress": "198.51.100.9", "provider": "vultr", "providerRegion": "ewr", "providerSize": "vc2-4c-8gb"},
+		{"id": "theirs", "name": "web1", "status": "active", "ipAddress": "198.51.100.9", "provider": "hetzner", "providerRegion": "ewr", "providerSize": "vc2-1c-1gb"},
+	} {
+		h := newCloudHarness(t)
+		h.login()
+		h.fake.foreignOnPost = foreign
+		h.fake.postStatus = 503
+		h.fake.postBody = `{"success":false,"error":{"code":"SERVICE_UNAVAILABLE","message":"try again"}}`
+		err := h.run(append(createArgs, "--yes", "--no-setup")...)
+		if err == nil || !errors.Is(err, errCloudPurchaseUnknown) {
+			t.Fatalf("%v: got %v\n%s", foreign, err, h.out)
+		}
+		if len(h.serversYML()) != 0 {
+			t.Errorf("%v: adopted into servers.yml: %v", foreign, h.serversYML())
+		}
+	}
+}
+
+// TestCloudServerCreateIdempotencyConflictIsNotARefusal: a 409 saying a
+// request with this Idempotency-Key is still running means an earlier copy
+// of the POST (re-sent by a proxy) is buying the server. The CLI must not
+// say "nothing was bought"; it looks for the server and adopts it.
+func TestCloudServerCreateIdempotencyConflictIsNotARefusal(t *testing.T) {
+	h := newCloudHarness(t)
+	h.login()
+	h.fake.postStatus = 409
+	h.fake.postKeepsRow = true
+	h.fake.postBody = `{"success":false,"error":{"code":"IDEMPOTENCY_ERROR","message":"A request with this Idempotency-Key is still in progress"}}`
+	if err := h.run(append(createArgs, "--yes", "--no-setup")...); err != nil {
+		t.Fatalf("create: %v\n%s", err, h.out)
+	}
+	if strings.Contains(h.out.String(), "nothing was bought") || h.fake.createPosts != 1 {
+		t.Errorf("posts %d, output:\n%s", h.fake.createPosts, h.out)
+	}
+	if s := h.serversYML()["web1"]; s.Host != "203.0.113.7" {
+		t.Errorf("servers.yml entry %+v", s)
 	}
 }
 

@@ -193,6 +193,10 @@ func TestOutcomeKnown(t *testing.T) {
 		{&APIError{Status: 400}, true},
 		{&APIError{Status: 403, Code: "TRUST_LIMIT"}, true},
 		{fmt.Errorf("wrapped: %w", &APIError{Status: 409}), true},
+		{&APIError{Status: 409, Code: "BILLING_ITEM_LIMIT"}, true},
+		// An earlier copy of the same request is running: not "no effect".
+		{&APIError{Status: 409, Code: "IDEMPOTENCY_ERROR"}, false},
+		{&APIError{Status: 408}, false},
 		{&APIError{Status: 502}, false},
 		{&APIError{Status: 503}, false},
 		{context.DeadlineExceeded, false},
@@ -225,5 +229,43 @@ func TestCredentialsFileMode(t *testing.T) {
 	}
 	if _, err := LoadCredentials(path); !errors.Is(err, ErrNotLoggedIn) {
 		t.Fatalf("got %v", err)
+	}
+}
+
+// TestCreateServerIsNotResentByTheTransport: net/http re-sends a request by
+// itself when a reused connection dies before any answer and the request
+// carries an Idempotency-Key header. For the purchase that is a second
+// POST to a Teploy Cloud that may not deduplicate; it must go out once.
+func TestCreateServerIsNotResentByTheTransport(t *testing.T) {
+	var posts atomic.Int32
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			w.Write([]byte(`{"success":true,"data":[]}`))
+			return
+		}
+		posts.Add(1)
+		// The request arrived (the purchase runs); the connection dies
+		// before a byte of the answer.
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		conn.Close()
+	})
+	// A list first, as the CLI does, so the POST reuses its connection:
+	// the transport only re-sends on a reused connection.
+	if _, err := c.ListServers(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	_, err := c.CreateServer(context.Background(), CreateServerRequest{Name: "web"}, "k1")
+	if err == nil {
+		t.Fatal("create over a dropped connection succeeded")
+	}
+	if OutcomeKnown(err) {
+		t.Errorf("a dropped create reported a known outcome: %v", err)
+	}
+	if n := posts.Load(); n != 1 {
+		t.Fatalf("create was posted %d times, want exactly 1", n)
 	}
 }

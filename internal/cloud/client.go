@@ -236,10 +236,15 @@ type envelope struct {
 }
 
 func (c *Client) do(ctx context.Context, method, path string, body any, headers map[string]string, out any) error {
-	return c.doTimeout(ctx, RequestTimeout, method, path, body, headers, out)
+	return c.doTimeout(ctx, RequestTimeout, false, method, path, body, headers, out)
 }
 
-func (c *Client) doTimeout(ctx context.Context, timeout time.Duration, method, path string, body any, headers map[string]string, out any) error {
+// doTimeout sends one request. once forbids net/http from sending it a
+// second time on its own: the transport re-sends a request whose
+// connection died before any answer when it can rewind the body and the
+// request is a GET or carries an Idempotency-Key header, and it follows
+// 307/308 redirects the same way. Without GetBody it can do neither.
+func (c *Client) doTimeout(ctx context.Context, timeout time.Duration, once bool, method, path string, body any, headers map[string]string, out any) error {
 	var rdr io.Reader
 	if body != nil {
 		b, err := json.Marshal(body)
@@ -253,6 +258,9 @@ func (c *Client) doTimeout(ctx context.Context, timeout time.Duration, method, p
 	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, rdr)
 	if err != nil {
 		return fmt.Errorf("building request: %w", err)
+	}
+	if once {
+		req.GetBody = nil
 	}
 	req.Header.Set("Authorization", "Bearer "+c.key)
 	req.Header.Set("X-Organization-Id", c.orgID)
@@ -362,11 +370,14 @@ func (c *Client) GetServer(ctx context.Context, id string) (*Server, error) {
 // retried here: a timeout, transport failure or 5xx leaves the outcome
 // unknown, and the caller must look for the server rather than post again.
 // idempotencyKey is sent as the Idempotency-Key header so a Teploy Cloud
-// that honours it can deduplicate; callers must not rely on that.
+// that honours it can deduplicate; callers must not rely on that. The
+// header would also make net/http's transport re-send the POST by itself
+// after a connection that died without an answer, so the request is built
+// unreplayable (doTimeout's once).
 func (c *Client) CreateServer(ctx context.Context, r CreateServerRequest, idempotencyKey string) (*Server, error) {
 	var s Server
 	h := map[string]string{"Idempotency-Key": idempotencyKey}
-	if err := c.doTimeout(ctx, c.createTimeout, http.MethodPost, "/api/v1/servers", r, h, &s); err != nil {
+	if err := c.doTimeout(ctx, c.createTimeout, true, http.MethodPost, "/api/v1/servers", r, h, &s); err != nil {
 		return nil, err
 	}
 	return &s, nil
@@ -413,8 +424,21 @@ func (c *Client) CreateSSHKey(ctx context.Context, name, publicKey string) (*SSH
 
 // OutcomeKnown reports whether a failed request certainly had no effect:
 // a 4xx answer from Teploy Cloud. A transport failure, a timeout, a 5xx or
-// an unreadable success leaves the outcome unknown.
+// an unreadable success leaves the outcome unknown. So do two 4xx answers:
+// 408 (a proxy gave up waiting while Teploy Cloud may still be working) and
+// the idempotency conflict, which says an earlier copy of this very request
+// (re-sent by something between the CLI and Teploy Cloud) is running or
+// was answered differently.
 func OutcomeKnown(err error) bool {
 	var ae *APIError
-	return errors.As(err, &ae) && ae.Status >= 400 && ae.Status < 500
+	if !errors.As(err, &ae) || ae.Status < 400 || ae.Status >= 500 {
+		return false
+	}
+	if ae.Status == http.StatusRequestTimeout {
+		return false
+	}
+	if ae.Status == http.StatusConflict && strings.EqualFold(ae.Code, "idempotency_error") {
+		return false
+	}
+	return true
 }
