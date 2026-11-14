@@ -27,8 +27,13 @@ const DefaultBaseURL = "https://cloud.teploy.com"
 // BaseURLEnv overrides the base URL (e.g. a local instance).
 const BaseURLEnv = "TEPLOY_CLOUD_URL"
 
-// RequestTimeout bounds every request.
+// RequestTimeout bounds every request except the server create.
 const RequestTimeout = 30 * time.Second
+
+// CreateRequestTimeout bounds POST /api/v1/servers. Teploy Cloud provisions
+// inside that request (pricing, billing, the provider's create, the
+// firewall), so it is given far longer than a read.
+const CreateRequestTimeout = 120 * time.Second
 
 const maxResponseBytes = 8 << 20
 
@@ -101,8 +106,9 @@ type APIError struct {
 }
 
 func (e *APIError) Error() string {
-	switch e.Code {
-	case "trust_limit", "platform_capacity":
+	// Teploy Cloud upper-cases its codes on the wire (TRUST_LIMIT,
+	// PLATFORM_CAPACITY); its message for these is complete on its own.
+	if (strings.EqualFold(e.Code, "trust_limit") || strings.EqualFold(e.Code, "platform_capacity")) && e.Message != "" {
 		return e.Message
 	}
 	msg := e.Message
@@ -134,6 +140,8 @@ type Client struct {
 	key     string
 	orgID   string
 	http    *http.Client
+	// createTimeout bounds CreateServer (CreateRequestTimeout by default).
+	createTimeout time.Duration
 }
 
 // ResolveBaseURL picks the base URL: $TEPLOY_CLOUD_URL, else stored, else
@@ -189,14 +197,27 @@ func New(baseURL, key, orgID string) (*Client, error) {
 		baseURL: base,
 		key:     strings.TrimSpace(key),
 		orgID:   strings.TrimSpace(orgID),
-		http:    &http.Client{Timeout: RequestTimeout},
+		// No client-wide timeout: each call sets its own deadline on the
+		// request context (RequestTimeout, or createTimeout for a create).
+		http:          &http.Client{},
+		createTimeout: CreateRequestTimeout,
 	}, nil
+}
+
+// SetCreateTimeout changes how long CreateServer waits for Teploy Cloud's
+// answer. Tests use it; d <= 0 restores CreateRequestTimeout.
+func (c *Client) SetCreateTimeout(d time.Duration) {
+	if d <= 0 {
+		d = CreateRequestTimeout
+	}
+	c.createTimeout = d
 }
 
 // BaseURL is the validated base URL the client talks to.
 func (c *Client) BaseURL() string { return c.baseURL }
 
-// NewIdempotencyKey returns a random key for one logical create.
+// NewIdempotencyKey returns a random key for one logical create (one
+// `teploy cloud server create` invocation).
 func NewIdempotencyKey() (string, error) {
 	var b [16]byte
 	if _, err := rand.Read(b[:]); err != nil {
@@ -215,6 +236,10 @@ type envelope struct {
 }
 
 func (c *Client) do(ctx context.Context, method, path string, body any, headers map[string]string, out any) error {
+	return c.doTimeout(ctx, RequestTimeout, method, path, body, headers, out)
+}
+
+func (c *Client) doTimeout(ctx context.Context, timeout time.Duration, method, path string, body any, headers map[string]string, out any) error {
 	var rdr io.Reader
 	if body != nil {
 		b, err := json.Marshal(body)
@@ -223,7 +248,7 @@ func (c *Client) do(ctx context.Context, method, path string, body any, headers 
 		}
 		rdr = bytes.NewReader(b)
 	}
-	ctx, cancel := context.WithTimeout(ctx, RequestTimeout)
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, rdr)
 	if err != nil {
@@ -333,12 +358,15 @@ func (c *Client) GetServer(ctx context.Context, id string) (*Server, error) {
 	return &s, nil
 }
 
-// CreateServer provisions a server. idempotencyKey must be the same on
-// every retry of one logical create.
+// CreateServer provisions (buys) a server. It is sent once and never
+// retried here: a timeout, transport failure or 5xx leaves the outcome
+// unknown, and the caller must look for the server rather than post again.
+// idempotencyKey is sent as the Idempotency-Key header so a Teploy Cloud
+// that honours it can deduplicate; callers must not rely on that.
 func (c *Client) CreateServer(ctx context.Context, r CreateServerRequest, idempotencyKey string) (*Server, error) {
 	var s Server
 	h := map[string]string{"Idempotency-Key": idempotencyKey}
-	if err := c.do(ctx, http.MethodPost, "/api/v1/servers", r, h, &s); err != nil {
+	if err := c.doTimeout(ctx, c.createTimeout, http.MethodPost, "/api/v1/servers", r, h, &s); err != nil {
 		return nil, err
 	}
 	return &s, nil
@@ -383,15 +411,10 @@ func (c *Client) CreateSSHKey(ctx context.Context, name, publicKey string) (*SSH
 	return &k, nil
 }
 
-// IsRetryable reports whether a failed create can be retried with the same
-// idempotency key: a transport failure or a 5xx response.
-func IsRetryable(err error) bool {
-	if err == nil {
-		return false
-	}
+// OutcomeKnown reports whether a failed request certainly had no effect:
+// a 4xx answer from Teploy Cloud. A transport failure, a timeout, a 5xx or
+// an unreadable success leaves the outcome unknown.
+func OutcomeKnown(err error) bool {
 	var ae *APIError
-	if errors.As(err, &ae) {
-		return ae.Status >= 500
-	}
-	return !errors.Is(err, context.Canceled)
+	return errors.As(err, &ae) && ae.Status >= 400 && ae.Status < 500
 }

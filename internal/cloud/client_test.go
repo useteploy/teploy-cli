@@ -3,12 +3,15 @@ package cloud
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 const testKey = "tp_test_0123456789abcdefSECRET"
@@ -67,8 +70,9 @@ func TestClientErrorEnvelope(t *testing.T) {
 		{401, `{"success":false,"error":{"code":"UNAUTHORIZED","message":"Invalid API key"}}`, "teploy cloud login", "", "UNAUTHORIZED"},
 		{402, `{"success":false,"error":{"code":"PAYMENT_REQUIRED","message":"No card"}}`, "Add a card at https://cloud.teploy.com", "", "PAYMENT_REQUIRED"},
 		{400, `{"success":false,"error":{"code":"BAD_REQUEST","message":"Add a payment method first"}}`, "Add a card", "", "BAD_REQUEST"},
-		{403, `{"success":false,"error":{"code":"trust_limit","message":"New accounts may run 2 servers."}}`, "New accounts may run 2 servers.", "code", "trust_limit"},
-		{503, `{"success":false,"error":{"code":"platform_capacity","message":"No capacity right now."}}`, "No capacity right now.", "HTTP", "platform_capacity"},
+		// Teploy Cloud sends these codes upper-cased (apiv1.go v1Fail).
+		{403, `{"success":false,"error":{"code":"TRUST_LIMIT","message":"New accounts may run 2 servers."}}`, "New accounts may run 2 servers.", "code", "TRUST_LIMIT"},
+		{503, `{"success":false,"error":{"code":"PLATFORM_CAPACITY","message":"No capacity right now."}}`, "No capacity right now.", "HTTP", "PLATFORM_CAPACITY"},
 		{502, `<html>bad gateway</html>`, "HTTP 502", "", "unknown"},
 	}
 	for _, tc := range cases {
@@ -149,6 +153,54 @@ func TestCreateServerSendsIdempotencyKey(t *testing.T) {
 	s, err := c.CreateServer(context.Background(), CreateServerRequest{Name: "web"}, "k1")
 	if err != nil || s.ID != "s1" {
 		t.Fatalf("%v %+v", err, s)
+	}
+}
+
+func TestCreateServerTimeoutIsSeparateAndNotRetried(t *testing.T) {
+	var posts atomic.Int32
+	release := make(chan struct{})
+	// Closed before the test server's Close (a t.Cleanup), which waits for
+	// this handler.
+	defer close(release)
+	c := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		posts.Add(1)
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	})
+	if c.createTimeout != CreateRequestTimeout || CreateRequestTimeout < 2*RequestTimeout {
+		t.Fatalf("create timeout %s, read timeout %s", c.createTimeout, RequestTimeout)
+	}
+	c.SetCreateTimeout(50 * time.Millisecond)
+	_, err := c.CreateServer(context.Background(), CreateServerRequest{Name: "web"}, "k1")
+	if err == nil {
+		t.Fatal("slow create succeeded")
+	}
+	if OutcomeKnown(err) {
+		t.Errorf("a timed-out create reported a known outcome: %v", err)
+	}
+	if n := posts.Load(); n != 1 {
+		t.Errorf("create posted %d times, want 1", n)
+	}
+}
+
+func TestOutcomeKnown(t *testing.T) {
+	for _, tc := range []struct {
+		err  error
+		want bool
+	}{
+		{&APIError{Status: 400}, true},
+		{&APIError{Status: 403, Code: "TRUST_LIMIT"}, true},
+		{fmt.Errorf("wrapped: %w", &APIError{Status: 409}), true},
+		{&APIError{Status: 502}, false},
+		{&APIError{Status: 503}, false},
+		{context.DeadlineExceeded, false},
+		{errors.New("connection reset"), false},
+	} {
+		if got := OutcomeKnown(tc.err); got != tc.want {
+			t.Errorf("OutcomeKnown(%v) = %v, want %v", tc.err, got, tc.want)
+		}
 	}
 }
 

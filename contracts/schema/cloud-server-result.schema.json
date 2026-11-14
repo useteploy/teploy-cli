@@ -1,0 +1,98 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://teploy.github.io/contracts/schema/cloud-server-result.schema.json",
+  "title": "`teploy cloud server create --yes --no-setup --json` and `teploy cloud server attach --no-setup --json` (rev 22, cloud-v1): printed on stdout whenever a server exists on Teploy Cloud, also when the command then exits 1 (ok false, error, resume). When nothing was bought only the error envelope is printed (on stderr); a create whose outcome could not be established reports code uncertain-outcome there.",
+  "type": "object",
+  "required": [
+    "machine_interface",
+    "ok",
+    "server",
+    "adopted",
+    "servers_yml",
+    "setup"
+  ],
+  "properties": {
+    "machine_interface": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "ok": {
+      "type": "boolean"
+    },
+    "server": {
+      "$ref": "#/$defs/server"
+    },
+    "adopted": {
+      "type": "boolean",
+      "description": "true when the create request's outcome was unknown (timeout, connection error, 5xx) and the one new server of the requested name was found in the organization's list afterwards. The request is never sent twice."
+    },
+    "servers_yml": {
+      "type": "string",
+      "description": "The ~/.teploy/servers.yml name the server is under, or empty when it was not added."
+    },
+    "setup": {
+      "enum": [
+        "done",
+        "skipped",
+        "not_run"
+      ]
+    },
+    "error": {
+      "type": "string",
+      "description": "Present when ok is false."
+    },
+    "resume": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "minItems": 1,
+      "description": "argv that finishes the job without buying again (teploy cloud server attach <id> ..., or teploy setup <ip> --name <name> ...); absent when ok is true or nothing can resume (the server failed to provision or no longer exists)."
+    }
+  },
+  "$defs": {
+    "server": {
+      "type": "object",
+      "required": [
+        "id",
+        "name",
+        "status",
+        "ip_address",
+        "provider",
+        "region",
+        "size",
+        "price_monthly_cents"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "name": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string",
+          "description": "Teploy Cloud's server status (active, provisioning, inactive, error, rebooting, suspended). A consumer must treat an unknown value as not ready."
+        },
+        "ip_address": {
+          "type": "string",
+          "description": "The server's IPv4; empty until the provider assigns one (Teploy Cloud's 0.0.0.0 placeholder is reported as empty, never as an address)."
+        },
+        "provider": {
+          "type": "string"
+        },
+        "region": {
+          "type": "string"
+        },
+        "size": {
+          "type": "string"
+        },
+        "price_monthly_cents": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    }
+  }
+}
