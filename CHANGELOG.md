@@ -14,8 +14,9 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
   public half of the SSH key the CLI connects with (`--key`, else the default identity;
   derived from the private key, so the two always match). The purchase is sent once,
   never retried: when its answer is lost (timeout, connection error, 5xx) the CLI lists
-  the organization's servers and continues with the one new server of that name, or
-  reports that nothing was bought. It waits for the server to be active with a real
+  the organization's servers and continues with the one new server of that name,
+  provider, region and size, or reports that the server does not appear to have been
+  bought and to check again before retrying. It waits for the server to be active with a real
   address (never Teploy Cloud's `0.0.0.0` placeholder), adds it to servers.yml as
   `root@<ip>` (refusing an existing name) and runs `teploy setup` unless `--no-setup`.
   A failure after the purchase prints the `teploy cloud server attach <id>` command that
