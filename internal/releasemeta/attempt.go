@@ -147,8 +147,12 @@ func (a Attempt) TLSDir() string {
 // TLSCertPath / TLSKeyPath are the attempt's cert/key as seen INSIDE the
 // caddy container (what the Caddyfile site block references): the host's
 // /deployments/caddy/tls/att/... is mounted at /etc/caddy.
-func (a Attempt) TLSCertPath() string { return "/etc/caddy/tls/att/" + a.App + "/" + a.Name() + "/" + a.App + ".crt" }
-func (a Attempt) TLSKeyPath() string  { return "/etc/caddy/tls/att/" + a.App + "/" + a.Name() + "/" + a.App + ".key" }
+func (a Attempt) TLSCertPath() string {
+	return "/etc/caddy/tls/att/" + a.App + "/" + a.Name() + "/" + a.App + ".crt"
+}
+func (a Attempt) TLSKeyPath() string {
+	return "/etc/caddy/tls/att/" + a.App + "/" + a.Name() + "/" + a.App + ".key"
+}
 
 // tlsAttemptRootFor is the host root holding ONE app's per-attempt TLS
 // directories (audit A01). The legacy flat root

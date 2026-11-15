@@ -13,7 +13,7 @@ func TestParseRef(t *testing.T) {
 		{"secret:DB_PASS", "DB_PASS", "value", true}, // no #field -> defaults to "value" (flat secret)
 		{"secret:db#", "db", "value", true},          // empty field -> "value"
 		{"plain-value", "", "", false},
-		{"secret:", "", "", false},         // no name
+		{"secret:", "", "", false},          // no name
 		{"secret:#password", "", "", false}, // no name
 	}
 	for _, c := range cases {

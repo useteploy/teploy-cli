@@ -7,7 +7,6 @@ import (
 	"testing"
 )
 
-
 // TestExtractBinary_BoundedAndSingleRegular is the T48 regression: archive
 // members are read under a decompressed-size bound, non-regular and
 // duplicate matches are refused, and the entry count is capped — the old

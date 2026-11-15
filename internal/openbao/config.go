@@ -33,7 +33,7 @@ type SealSpec struct {
 	// Static:
 	KeyID string // current_key_id (stable UUID)
 	// AWS KMS:
-	KMSKeyID string
+	KMSKeyID  string
 	KMSRegion string
 	// Transit:
 	TransitAddress string
@@ -43,11 +43,11 @@ type SealSpec struct {
 
 // ServerConfig is the input to the OpenBao server config.hcl.
 type ServerConfig struct {
-	StoragePath string   // container path for storage, e.g. /openbao/data
-	ListenAddr  string   // e.g. 0.0.0.0:8200
-	ClusterAddr string   // node's own cluster_addr, e.g. http://<node>:8201 (raft HA)
-	TLSDisable  bool     // true only for private-mesh/dev; production terminates TLS
-	TLSCertFile string   // container path (when TLSDisable is false)
+	StoragePath string // container path for storage, e.g. /openbao/data
+	ListenAddr  string // e.g. 0.0.0.0:8200
+	ClusterAddr string // node's own cluster_addr, e.g. http://<node>:8201 (raft HA)
+	TLSDisable  bool   // true only for private-mesh/dev; production terminates TLS
+	TLSCertFile string // container path (when TLSDisable is false)
 	TLSKeyFile  string
 	APIAddr     string
 	Seal        SealSpec

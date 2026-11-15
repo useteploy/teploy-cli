@@ -90,7 +90,7 @@ func TestWrite_RoundTripAndPathValidation(t *testing.T) {
 	rec := &Record{
 		App: "myapp", Hash: "v1",
 		DeploymentType: "container", IngressMode: "host", Domain: "myapp.io",
-		Ports: []Port{{HostPort: 7460, ContainerPort: 7460, Bind: "0.0.0.0", Primary: true, Fixed: true}},
+		Ports:    []Port{{HostPort: 7460, ContainerPort: 7460, Bind: "0.0.0.0", Primary: true, Fixed: true}},
 		EnvFiles: []string{"/deployments/myapp/.env"},
 	}
 	if err := Write(context.Background(), mock, rec); err != nil {

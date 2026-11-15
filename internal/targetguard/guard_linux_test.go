@@ -95,19 +95,19 @@ func (e *localExecutor) Upload(_ context.Context, content io.Reader, remotePath 
 	return uploadErr
 }
 
-func (e *localExecutor) Close() error      { return nil }
-func (e *localExecutor) Host() string      { return "local" }
-func (e *localExecutor) User() string      { return "root" }
+func (e *localExecutor) Close() error { return nil }
+func (e *localExecutor) Host() string { return "local" }
+func (e *localExecutor) User() string { return "root" }
 
 // The three C01-1 acceptance invariants, for real:
 //
-// 1. Two concurrent guarded effects SERIALIZE — one waits, neither
-//    interleaves inside the critical section.
-// 2. A killed helper auto-releases the lock (process death — the property
-//    the mkdir lock lacks); the next guarded effect is NOT blocked.
-// 3. Generation fencing: a plan prepared against generation 3 is refused
-//    when generation 7 is committed (GUARD_FENCED), and the effect does
-//    not run.
+//  1. Two concurrent guarded effects SERIALIZE — one waits, neither
+//     interleaves inside the critical section.
+//  2. A killed helper auto-releases the lock (process death — the property
+//     the mkdir lock lacks); the next guarded effect is NOT blocked.
+//  3. Generation fencing: a plan prepared against generation 3 is refused
+//     when generation 7 is committed (GUARD_FENCED), and the effect does
+//     not run.
 func TestGuardSerializesConcurrentEffects(t *testing.T) {
 	root := t.TempDir()
 	exec := &localExecutor{root: root}
