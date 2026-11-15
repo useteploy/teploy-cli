@@ -1,0 +1,23 @@
+{
+  "machine_interface": 2,
+  "provider": "vultr",
+  "region": "ewr",
+  "sizes": [
+    {
+      "id": "vc2-1c-1gb",
+      "vcpus": 1,
+      "memory_mb": 1024,
+      "disk_gb": 25,
+      "price_monthly_cents": 600
+    },
+    {
+      "id": "vc2-2c-4gb",
+      "slug": "vc2-2c-4gb",
+      "name": "2 vCPU, 4 GB",
+      "vcpus": 2,
+      "memory_mb": 4096,
+      "disk_gb": 80,
+      "price_monthly_cents": 2400
+    }
+  ]
+}

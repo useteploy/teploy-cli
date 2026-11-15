@@ -7,6 +7,7 @@
     "backup-json-v1",
     "backup-setup-v1",
     "backup-target-v1",
+    "cloud-v1",
     "config-home-v1",
     "config-merge-v1",
     "config-unprivileged-v1",

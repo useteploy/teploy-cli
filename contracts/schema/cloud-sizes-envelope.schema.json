@@ -1,0 +1,66 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://teploy.github.io/contracts/schema/cloud-sizes-envelope.schema.json",
+  "title": "`teploy cloud sizes --provider P [--region R] --json` (rev 22, cloud-v1): the sizes a provider sells and what Teploy Cloud charges for each per month.",
+  "type": "object",
+  "required": [
+    "machine_interface",
+    "provider",
+    "sizes"
+  ],
+  "properties": {
+    "machine_interface": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "provider": {
+      "type": "string",
+      "minLength": 1
+    },
+    "region": {
+      "type": "string",
+      "description": "Absent when --region was not given."
+    },
+    "sizes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "vcpus",
+          "memory_mb",
+          "disk_gb",
+          "price_monthly_cents"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "slug": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "vcpus": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "memory_mb": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "disk_gb": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "price_monthly_cents": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "machine_interface": 2,
+  "provider": "vultr",
+  "regions": [
+    {
+      "id": "ewr",
+      "name": "New Jersey",
+      "country": "US",
+      "continent": "North America",
+      "available": true
+    },
+    {
+      "id": "fra",
+      "name": "Frankfurt",
+      "country": "DE",
+      "continent": "Europe",
+      "available": false
+    }
+  ]
+}

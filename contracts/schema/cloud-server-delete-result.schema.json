@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://teploy.github.io/contracts/schema/cloud-server-delete-result.schema.json",
+  "title": "`teploy cloud server delete --yes --json` (rev 22, cloud-v1): the deleted server and whether its servers.yml entry was removed (only when its host was the server's address). Failures use the error envelope on stderr and never emit this shape.",
+  "type": "object",
+  "required": [
+    "machine_interface",
+    "ok",
+    "server",
+    "servers_yml_removed"
+  ],
+  "properties": {
+    "machine_interface": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "ok": {
+      "const": true
+    },
+    "server": {
+      "$ref": "#/$defs/server"
+    },
+    "servers_yml_removed": {
+      "type": "boolean"
+    }
+  },
+  "$defs": {
+    "server": {
+      "type": "object",
+      "required": [
+        "id",
+        "name",
+        "status",
+        "ip_address",
+        "provider",
+        "region",
+        "size",
+        "price_monthly_cents"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "name": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string",
+          "description": "Teploy Cloud's server status (active, provisioning, inactive, error, rebooting, suspended). A consumer must treat an unknown value as not ready."
+        },
+        "ip_address": {
+          "type": "string",
+          "description": "The server's IPv4; empty until the provider assigns one (Teploy Cloud's 0.0.0.0 placeholder is reported as empty, never as an address)."
+        },
+        "provider": {
+          "type": "string"
+        },
+        "region": {
+          "type": "string"
+        },
+        "size": {
+          "type": "string"
+        },
+        "price_monthly_cents": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    }
+  }
+}

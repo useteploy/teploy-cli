@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://teploy.github.io/contracts/schema/cloud-providers-envelope.schema.json",
+  "title": "`teploy cloud regions --json` without --provider (rev 22, cloud-v1): the provider catalogue.",
+  "type": "object",
+  "required": [
+    "machine_interface",
+    "providers"
+  ],
+  "properties": {
+    "machine_interface": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "providers": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "type",
+          "name",
+          "managed_available"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "minLength": 1
+          },
+          "name": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "managed_available": {
+            "type": "boolean",
+            "description": "Whether Teploy Cloud sells managed servers from this provider now."
+          }
+        }
+      }
+    }
+  }
+}

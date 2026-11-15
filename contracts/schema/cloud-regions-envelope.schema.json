@@ -1,0 +1,50 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://teploy.github.io/contracts/schema/cloud-regions-envelope.schema.json",
+  "title": "`teploy cloud regions --provider P --json` (rev 22, cloud-v1): the regions a provider offers for managed servers.",
+  "type": "object",
+  "required": [
+    "machine_interface",
+    "provider",
+    "regions"
+  ],
+  "properties": {
+    "machine_interface": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "provider": {
+      "type": "string",
+      "minLength": 1
+    },
+    "regions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "available"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "name": {
+            "type": "string"
+          },
+          "country": {
+            "type": "string"
+          },
+          "continent": {
+            "type": "string"
+          },
+          "available": {
+            "type": "boolean"
+          }
+        }
+      }
+    }
+  }
+}

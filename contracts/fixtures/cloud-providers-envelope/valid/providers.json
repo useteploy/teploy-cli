@@ -1,0 +1,17 @@
+{
+  "machine_interface": 2,
+  "providers": [
+    {
+      "type": "vultr",
+      "name": "Vultr",
+      "description": "Cloud compute worldwide",
+      "managed_available": true
+    },
+    {
+      "type": "hetzner",
+      "name": "Hetzner Cloud",
+      "description": "High-performance cloud servers in Europe",
+      "managed_available": false
+    }
+  ]
+}
