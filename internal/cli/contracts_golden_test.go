@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/useteploy/teploy/internal/backup"
+	"github.com/useteploy/teploy/internal/cloud"
 	"github.com/useteploy/teploy/internal/config"
 	"github.com/useteploy/teploy/internal/confighome"
 	"github.com/useteploy/teploy/internal/events"
@@ -767,4 +768,50 @@ func TestContractsBackupFleetGolden(t *testing.T) {
 	writeFixture(t, "backup-run-envelope/valid/skipped.json", backupRunEnvelope{MachineInterface: MachineInterface, FleetRunResult: backup.FleetRunResult{
 		Status: "skipped", StartedAt: at, Targets: []backup.FleetTargetResult{}, Error: "another run holds the lock",
 	}})
+}
+
+// TestContractsCloudGolden pins `teploy cloud ... --json` (cloud-v1): the
+// envelopes are built by the same functions the commands call
+// (cloudServersEnvelope, cloudProvidersEnvelope, cloudRegionsEnvelope,
+// cloudSizesEnvelope, cloudServerRow) from Teploy Cloud's wire shapes,
+// including the 0.0.0.0 placeholder a provisioning server carries.
+func TestContractsCloudGolden(t *testing.T) {
+	active := cloud.Server{ID: "3f2c9a7e-5b1d-4c8e-9a0f-1b2c3d4e5f60", Name: "web1", IPAddress: "203.0.113.7", Status: "active",
+		Provider: "vultr", ProviderRegion: "ewr", ProviderSize: "vc2-1c-1gb", PriceMonthlyCents: 600}
+	provisioning := cloud.Server{ID: "8a7b6c5d-4e3f-4a1b-8c9d-0e1f2a3b4c5d", Name: "web2", IPAddress: "0.0.0.0", Status: "provisioning",
+		Provider: "vultr", ProviderRegion: "ewr", ProviderSize: "vc2-1c-1gb", PriceMonthlyCents: 600}
+
+	writeFixture(t, "cloud-status-envelope/valid/key-works.json", cloudStatusDTO{MachineInterface: MachineInterface,
+		BaseURL: cloud.DefaultBaseURL, LoggedIn: true, OrgID: "org_example", KeyWorks: true})
+	writeFixture(t, "cloud-status-envelope/valid/key-rejected.json", cloudStatusDTO{MachineInterface: MachineInterface,
+		BaseURL: cloud.DefaultBaseURL, LoggedIn: true, OrgID: "org_example",
+		Error: (&cloud.APIError{Status: 401, Code: "UNAUTHORIZED", Message: "Invalid API key"}).Error()})
+	writeFixture(t, "cloud-status-envelope/valid/logged-out.json", cloudStatusDTO{MachineInterface: MachineInterface, BaseURL: cloud.DefaultBaseURL})
+
+	writeFixture(t, "cloud-servers-envelope/valid/servers.json", cloudServersEnvelope([]cloud.Server{active, provisioning}))
+	writeFixture(t, "cloud-servers-envelope/valid/none.json", cloudServersEnvelope(nil))
+	writeFixture(t, "cloud-providers-envelope/valid/providers.json", cloudProvidersEnvelope([]cloud.Provider{
+		{Type: "vultr", Name: "Vultr", Description: "Cloud compute worldwide", ManagedAvailable: true},
+		{Type: "hetzner", Name: "Hetzner Cloud", Description: "High-performance cloud servers in Europe"},
+	}))
+	writeFixture(t, "cloud-regions-envelope/valid/regions.json", cloudRegionsEnvelope("vultr", []cloud.Region{
+		{ID: "ewr", Name: "New Jersey", Country: "US", Continent: "North America", Available: true},
+		{ID: "fra", Name: "Frankfurt", Country: "DE", Continent: "Europe", Available: false},
+	}))
+	writeFixture(t, "cloud-sizes-envelope/valid/sizes.json", cloudSizesEnvelope("vultr", "ewr", []cloud.Size{
+		{ID: "vc2-1c-1gb", VCPUs: 1, Memory: 1024, Disk: 25, PriceMonthlyCents: 600},
+		{ID: "vc2-2c-4gb", Slug: "vc2-2c-4gb", Name: "2 vCPU, 4 GB", VCPUs: 2, Memory: 4096, Disk: 80, PriceMonthlyCents: 2400},
+	}))
+
+	ready := active
+	writeFixture(t, "cloud-server-result/valid/created.json", cloudServerResultDTO{MachineInterface: MachineInterface, OK: true,
+		Server: cloudServerRow(ready), ServersYML: "web1", Setup: cloudSetupSkipped})
+	writeFixture(t, "cloud-server-result/valid/adopted.json", cloudServerResultDTO{MachineInterface: MachineInterface, OK: true,
+		Server: cloudServerRow(ready), Adopted: true, ServersYML: "web1", Setup: cloudSetupSkipped})
+	writeFixture(t, "cloud-server-result/valid/failed-after-purchase.json", cloudServerResultDTO{MachineInterface: MachineInterface,
+		Server: cloudServerRow(provisioning), Setup: cloudSetupNotRun,
+		Error:  "server web2 (id " + provisioning.ID + ") is not active with an address after 10m0s (status provisioning)",
+		Resume: []string{"teploy", "cloud", "server", "attach", provisioning.ID, "--no-setup"}})
+	writeFixture(t, "cloud-server-delete-result/valid/deleted.json", cloudServerDeleteDTO{MachineInterface: MachineInterface, OK: true,
+		Server: cloudServerRow(active), ServersYMLRemoved: true})
 }

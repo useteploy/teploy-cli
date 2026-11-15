@@ -1,0 +1,8 @@
+{
+  "machine_interface": 2,
+  "base_url": "https://cloud.teploy.com",
+  "logged_in": true,
+  "org_id": "org_example",
+  "key_works": false,
+  "error": "teploy cloud: Invalid API key (code UNAUTHORIZED, HTTP 401)\nRun `teploy cloud login` with a valid API key."
+}

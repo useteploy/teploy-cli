@@ -218,6 +218,19 @@ const (
 	// backup-preflight-envelope, backup-head-envelope and backup-detach-envelope
 	// pin the JSON.
 	CapBackupSetupV1 = "backup-setup-v1"
+	// CapCloudV1: `teploy cloud` (Teploy Cloud managed servers). Every
+	// --json document carries machine_interface: `cloud status`
+	// (cloud-status-envelope; exits 0 under --json, the key check is in the
+	// document), `cloud servers` (cloud-servers-envelope), `cloud regions`
+	// without/with --provider (cloud-providers-envelope /
+	// cloud-regions-envelope), `cloud sizes` (cloud-sizes-envelope),
+	// `cloud server create|attach --yes --no-setup --json`
+	// (cloud-server-result, printed whenever a server exists, with ok,
+	// error and the resume argv) and `cloud server delete --yes --json`
+	// (cloud-server-delete-result). `server create` sends its purchase once
+	// and never re-posts it; an unknown outcome is reconciled by listing
+	// and adopting the one new server of the name, else uncertain-outcome.
+	CapCloudV1 = "cloud-v1"
 )
 
 // MachineCapabilities returns every capability token this build
@@ -265,7 +278,8 @@ func MachineCapabilities() []string {
 		CapDomainsCheckV1,
 		CapServerAuditV1,
 		CapServerSiblingsV1,
-		CapBackupSetupV1}
+		CapBackupSetupV1,
+		CapCloudV1}
 	sort.Strings(tokens)
 	return tokens
 }

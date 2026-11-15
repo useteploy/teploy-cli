@@ -1,0 +1,26 @@
+{
+  "machine_interface": 2,
+  "ok": false,
+  "server": {
+    "id": "8a7b6c5d-4e3f-4a1b-8c9d-0e1f2a3b4c5d",
+    "name": "web2",
+    "status": "provisioning",
+    "ip_address": "",
+    "provider": "vultr",
+    "region": "ewr",
+    "size": "vc2-1c-1gb",
+    "price_monthly_cents": 600
+  },
+  "adopted": false,
+  "servers_yml": "",
+  "setup": "not_run",
+  "error": "server web2 (id 8a7b6c5d-4e3f-4a1b-8c9d-0e1f2a3b4c5d) is not active with an address after 10m0s (status provisioning)",
+  "resume": [
+    "teploy",
+    "cloud",
+    "server",
+    "attach",
+    "8a7b6c5d-4e3f-4a1b-8c9d-0e1f2a3b4c5d",
+    "--no-setup"
+  ]
+}

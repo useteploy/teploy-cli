@@ -95,13 +95,15 @@ func refuseAdmission(err error) error {
 // effect was in flight has an unknown fate until reconciled (the C01
 // crash-window machinery treats every interrupted window as INSPECT),
 // which is precisely the class automation must not render as a plain
-// failure. Everything else is internal until its site is migrated (S2
-// generalization).
+// failure. A `cloud server create` whose request outcome could not be
+// established (errCloudPurchaseUnknown) is the same class. Everything else
+// is internal until its site is migrated (S2 generalization).
 func classifyMachineError(err error) string {
 	switch {
 	case errors.Is(err, errPlanDrift), errors.Is(err, errConfigConflict):
 		return codeConflict
-	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded),
+		errors.Is(err, errCloudPurchaseUnknown):
 		return codeUncertainOutcome
 	case errors.Is(err, config.ErrInvalidConfig),
 		errors.Is(err, config.ErrNoConfig),
@@ -129,6 +131,9 @@ func writeMachineErrorEnvelope(out io.Writer, err error) error {
 		}
 	case codeUncertainOutcome:
 		message = "interrupted — outcome unknown until reconciled"
+		if errors.Is(err, errCloudPurchaseUnknown) {
+			message = "server purchase outcome unknown — check `teploy cloud servers`"
+		}
 	}
 	return json.NewEncoder(out).Encode(machineErrorEnvelope{
 		MachineInterface: MachineInterface,
