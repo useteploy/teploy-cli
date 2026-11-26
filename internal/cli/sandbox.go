@@ -321,7 +321,7 @@ func sandboxProbeCommand() string {
 		`echo "state=$(systemctl is-active %[1]s 2>/dev/null || true)"; `+
 		`if [ -x %[4]s ]; then echo "version=$(%[4]s version 2>/dev/null || echo unknown)"; else echo version=absent; fi; `+
 		`if pgrep -x teploy-sandbox >/dev/null 2>&1; then echo process=running; else echo process=none; fi; `+
-		`if ls %5s/*.conf >/dev/null 2>&1; then echo dropins=present; else echo dropins=none; fi`,
+		`if ls %[5]s/*.conf >/dev/null 2>&1; then echo dropins=present; else echo dropins=none; fi`,
 		sandboxUnitName, sandboxUnitPath, sandboxUnitMarker, sandboxEnginePath, sandboxUnitPath+".d")
 }
 

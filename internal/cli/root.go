@@ -5,6 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/useteploy/teploy/internal/backup"
+	"github.com/useteploy/teploy/internal/events"
+	"github.com/useteploy/teploy/internal/ssh"
+	"github.com/useteploy/teploy/internal/state"
+	"github.com/useteploy/teploy/internal/trigger"
 	"io"
 	"os"
 	"os/user"
@@ -13,11 +18,6 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
-	"github.com/useteploy/teploy/internal/backup"
-	"github.com/useteploy/teploy/internal/events"
-	"github.com/useteploy/teploy/internal/ssh"
-	"github.com/useteploy/teploy/internal/state"
-	"github.com/useteploy/teploy/internal/trigger"
 )
 
 // cliBuildVersion is the version NewRootCmd was built with (used where a

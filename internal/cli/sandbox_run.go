@@ -40,7 +40,7 @@ func newSandboxExecCmd(flags *Flags, env *sandboxEnv) *cobra.Command {
 			"output. The `--` ends teploy's own flags. Each word after it is passed as the\n" +
 			"argument your shell made of it, so quoting survives; shell syntax (a pipe, a\n" +
 			"redirect) goes inside one quoted word: -- 'ls | wc -l'. The output is the command's,\n" +
-			"byte for byte.\n\n" +
+			"byte for byte, from an engine that is a release.\n\n" +
 			"Exit status: the command's own, as ssh passes it on (0, or the status it exited\n" +
 			"with; a command its --timeout ended exits 124). 255 is a failure of teploy's own:\n" +
 			"it could not reach the engine, the sandbox could not run the command, or the stream\n" +

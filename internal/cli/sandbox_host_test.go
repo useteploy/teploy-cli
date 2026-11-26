@@ -9,6 +9,9 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -296,6 +299,38 @@ func TestReleaseCompare(t *testing.T) {
 	} {
 		if got := releaseCompare(c.a, c.b); got != c.want {
 			t.Errorf("releaseCompare(%q, %q) = %d, want %d", c.a, c.b, got, c.want)
+		}
+	}
+}
+
+// The probe reads whether the service has drop-ins: what systemd runs is
+// the service file and them together, and a run of `host` refuses them.
+func TestSandboxProbeReadsDropins(t *testing.T) {
+	if command := sandboxProbeCommand(); !strings.Contains(command, "if ls /etc/systemd/system/teploy-sandbox.service.d/*.conf >/dev/null 2>&1; then echo dropins=present; else echo dropins=none; fi") {
+		t.Errorf("the probe does not look for the service's drop-ins:\n%s", command)
+	}
+	// The question as the shell answers it, with and without a drop-in.
+	dir := t.TempDir()
+	for _, c := range []struct {
+		make func()
+		want string
+	}{
+		{func() {}, "dropins=none"},
+		{func() {
+			if err := os.Mkdir(filepath.Join(dir, "service.d"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+		}, "dropins=none"},
+		{func() {
+			if err := os.WriteFile(filepath.Join(dir, "service.d", "override.conf"), []byte("[Service]\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}, "dropins=present"},
+	} {
+		c.make()
+		out, err := exec.Command("sh", "-c", fmt.Sprintf("if ls %s/*.conf >/dev/null 2>&1; then echo dropins=present; else echo dropins=none; fi", filepath.Join(dir, "service.d"))).Output()
+		if err != nil || strings.TrimSpace(string(out)) != c.want {
+			t.Errorf("the shell answers %q, %v; want %q", out, err, c.want)
 		}
 	}
 }

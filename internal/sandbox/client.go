@@ -594,8 +594,8 @@ func workPath(raw string) (string, error) {
 	}
 	path := raw
 	if inside, leading := strings.CutPrefix(raw, "/"); leading {
-		// A leading slash names the sandbox's root: `/src` is /src, and
-		// `/work` and `/work/…` are the work root and what is in it.
+		// A leading slash is dropped (`/src` is `src` in /work), and the
+		// work root may be written in full: `/work` and `/work/…`.
 		if inside == "work" || inside == "work/" {
 			return "", nil // the work root, its slash optional
 		}
