@@ -3,12 +3,9 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"github.com/useteploy/teploy/internal/backup"
-	"github.com/useteploy/teploy/internal/events"
-	"github.com/useteploy/teploy/internal/ssh"
-	"github.com/useteploy/teploy/internal/state"
-	"github.com/useteploy/teploy/internal/trigger"
+	"io"
 	"os"
 	"os/user"
 	"sort"
@@ -16,6 +13,11 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/useteploy/teploy/internal/backup"
+	"github.com/useteploy/teploy/internal/events"
+	"github.com/useteploy/teploy/internal/ssh"
+	"github.com/useteploy/teploy/internal/state"
+	"github.com/useteploy/teploy/internal/trigger"
 )
 
 // cliBuildVersion is the version NewRootCmd was built with (used where a
@@ -56,6 +58,13 @@ type Flags struct {
 }
 
 func NewRootCmd(version string) *cobra.Command {
+	return newRootCmd(version, newSandboxCmd)
+}
+
+// newRootCmd is NewRootCmd with the `teploy sandbox` group built by the
+// caller, on the root's own flags: a test binds the real commands to a
+// harness this way, and the rest of the root is the real one.
+func newRootCmd(version string, sandbox func(*Flags) *cobra.Command) *cobra.Command {
 	flags := &Flags{}
 	cliBuildVersion = version
 
@@ -149,7 +158,7 @@ func NewRootCmd(version string) *cobra.Command {
 	root.AddCommand(newNetworkCmd(flags))
 	root.AddCommand(newServerCmd(flags))
 	root.AddCommand(newCloudCmd(flags))
-	root.AddCommand(newSandboxCmd(flags))
+	root.AddCommand(sandbox(flags))
 	root.AddCommand(newScaleCmd(flags))
 	root.AddCommand(newAutoDeployCmd(flags))
 	root.AddCommand(newMaintenanceCmd(flags))
@@ -160,11 +169,31 @@ func NewRootCmd(version string) *cobra.Command {
 }
 
 func Execute(version string) {
-	root := NewRootCmd(version)
+	os.Exit(runRoot(NewRootCmd(version), os.Stderr))
+}
+
+// runRoot is one invocation of root, without the exit: 0, or the status
+// its failure says.
+func runRoot(root *cobra.Command, errOut io.Writer) int {
 	if err := root.Execute(); err != nil {
-		reportExecutionError(root, err, os.Stderr)
-		os.Exit(1)
+		reportExecutionError(root, err, errOut)
+		return exitStatus(err)
 	}
+	return 0
+}
+
+// exitStatus is the status a failed invocation exits with. It is 1 for
+// every command (X02 D10: 0 success, 1 failure, and 2 stays drift's CI
+// signal), unless the error carries one of its own. One command's do:
+// `sandbox exec` returns the command's own status, as ssh and docker exec
+// do, and 255 for a failure of teploy's own (sandboxCommandError,
+// sandboxExecError).
+func exitStatus(err error) int {
+	var status interface{ ExitCode() int }
+	if errors.As(err, &status) {
+		return status.ExitCode()
+	}
+	return 1
 }
 
 // resolveActor builds the event actor: --actor, else $TEPLOY_ACTOR, else

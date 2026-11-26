@@ -1,0 +1,6 @@
+{
+  "code": "command-failed",
+  "detail": "exit status 3",
+  "machine_interface": 2,
+  "message": "the command exited with status 3"
+}

@@ -19,7 +19,10 @@ import (
 // from the data channel — while stdout keeps carrying only successful
 // output. Exit codes stay 0/1/2 exactly (D10): the envelope is the
 // detail channel, not a new exit signal. Without --json the historical
-// plain-text stderr line is unchanged.
+// plain-text stderr line is unchanged. One command is the exception, by
+// review: `teploy sandbox exec` exits with the command's own status and
+// with 255 for a failure of its own, since a caller that runs a command
+// wants its status (exitStatus, root.go); its envelope is as everywhere.
 
 // Machine error codes — closed taxonomy v1 (X02 §2.3). Consumers must
 // treat an unknown code as internal (forward-safe). Codes marked
@@ -53,6 +56,11 @@ const (
 	// Success with a flag — traffic switched but the outcome is not
 	// clean (UNMIGRATED: currently internal).
 	codeDegraded = "degraded"
+	// A command run by `teploy sandbox exec` did not end well: it exited
+	// nonzero, or its timeout ended it. It is the command's outcome, not a
+	// failure of teploy's (those stay `internal` here and exit 255), and
+	// teploy exits with the command's own status.
+	codeCommandFailed = "command-failed"
 	// Everything else, and every failure whose site has not been
 	// migrated to a specific code yet.
 	codeInternal = "internal"
@@ -110,7 +118,10 @@ func refuseAdmission(err error) error {
 // unsupported. Everything else is internal until its site is migrated (S2
 // generalization).
 func classifyMachineError(err error) string {
+	var command *sandboxCommandError
 	switch {
+	case errors.As(err, &command):
+		return codeCommandFailed
 	case errors.Is(err, errPlanDrift), errors.Is(err, errConfigConflict),
 		sandbox.IsConflict(err), errors.Is(err, errSandboxWrongState):
 		return codeConflict
@@ -132,7 +143,13 @@ func classifyMachineError(err error) string {
 func writeMachineErrorEnvelope(out io.Writer, err error) error {
 	code := classifyMachineError(err)
 	message := "command failed"
+	var command *sandboxCommandError
 	switch code {
+	case codeCommandFailed:
+		message = "the command did not end well"
+		if errors.As(err, &command) && command.envelopeMessage != "" {
+			message = command.envelopeMessage
+		}
 	case codeConfigInvalid:
 		message = "invalid teploy configuration"
 		if errors.Is(err, errDeployAdmission) {
@@ -169,7 +186,7 @@ func writeMachineErrorEnvelope(out io.Writer, err error) error {
 }
 
 // reportExecutionError renders a failed root invocation's error the way
-// Execute does before exiting 1: the machine envelope under --json, the
+// Execute does before exiting: the machine envelope under --json, the
 // plain error text otherwise. A flag-parse failure never reaches parsed
 // --json state and keeps the plain form.
 func reportExecutionError(root *cobra.Command, err error, out io.Writer) {

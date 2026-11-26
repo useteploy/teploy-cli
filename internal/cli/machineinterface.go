@@ -238,14 +238,19 @@ const (
 	// it. Every --json document carries
 	// machine_interface: sandbox-run-result (`new|stop|resume|fork --json`),
 	// sandbox-runs-envelope (`ls --json`, with the engine's driver),
-	// sandbox-exec-result (`exec --json`: captured output, exit_code null
-	// when the stream died before the exit), sandbox-destroy-result (`rm
-	// --yes --json`), sandbox-copy-result (`cp --json`) and
-	// sandbox-host-result (`host --yes --json`: install, upgrade, start or
-	// unchanged). An engine that is not installed, not running, or without
-	// the driver asked for is error-envelope code `unsupported`; a create,
-	// fork or exec whose outcome is unknown is `uncertain-outcome`; the
-	// engine's 409 is `conflict`. Event kind `sandbox.host` under `_fleet`.
+	// sandbox-exec-result (`exec --json`: captured output, printed only
+	// once the engine took the command; exit_code null when the stream
+	// died before the exit), sandbox-destroy-result (`rm --yes --json`),
+	// sandbox-copy-result (`cp --json`) and sandbox-host-result (`host
+	// --yes --json`: install, upgrade, start or unchanged). An engine that
+	// is not installed, not running, or without the driver asked for, and
+	// a CLI build with no pinned hash for the engine release, are
+	// error-envelope code `unsupported`; a create, fork or exec whose
+	// outcome is unknown is `uncertain-outcome`; the engine's 409 is
+	// `conflict`; a command run by `exec` that exited nonzero, or whose
+	// timeout ended it, is `command-failed` (teploy exits with the
+	// command's status; 255 for a failure of its own). Event kind
+	// `sandbox.host` under `_fleet`.
 	CapSandboxV1 = "sandbox-v1"
 )
 

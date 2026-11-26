@@ -39,20 +39,28 @@ func newSandboxExecCmd(flags *Flags, env *sandboxEnv) *cobra.Command {
 		Long: "Run a command in a running sandbox, through sh -c in its /work, and stream its\n" +
 			"output. The `--` ends teploy's own flags. Each word after it is passed as the\n" +
 			"argument your shell made of it, so quoting survives; shell syntax (a pipe, a\n" +
-			"redirect) goes inside one quoted word: -- 'ls | wc -l'. A command that exits\n" +
-			"nonzero makes teploy exit nonzero.\n\n" +
+			"redirect) goes inside one quoted word: -- 'ls | wc -l'.\n\n" +
+			"Exit status: the command's own, as ssh passes it on (0, or the status it exited\n" +
+			"with; a command its --timeout ended exits 124). 255 is a failure of teploy's own:\n" +
+			"it could not reach the engine, the sandbox could not run the command, or the stream\n" +
+			"ended before the exit was known.\n\n" +
 			"With --json, stdout carries {machine_interface, server, host, run_id, exit_code,\n" +
 			"timed_out, duration_ms, stdout, stderr, truncated}: the output is captured (at most\n" +
-			"1 MiB a stream) instead of streamed. exit_code is null when the stream ended before\n" +
-			"the command's exit was known.\n\n" +
+			"1 MiB a stream) instead of streamed. The document is printed only once the engine\n" +
+			"has taken the command; an exec it refused prints the error envelope on stderr alone.\n" +
+			"exit_code is null when the stream ended before the command's exit was known. A\n" +
+			"command that exits nonzero is error-envelope code command-failed.\n\n" +
 			"Examples:\n" +
 			"  teploy sandbox exec 01JCV5ZK3Q7X9B2D4E6F8A0B1C --host prod -- echo hello\n" +
 			"  teploy sandbox exec 01JCV5ZK3Q7X9B2D4E6F8A0B1C --host prod --timeout 10m -- make test",
 		// Everything after the `--` is the command, flags and all: teploy's
 		// own flags end at the `--`, so one id must come before it.
+		// A usage error is a failure of this command's own too (255, like
+		// every other): the status is the command's or teploy's, with no
+		// third thing.
 		Args: func(cmd *cobra.Command, args []string) error {
 			if cmd.ArgsLenAtDash() != 1 || len(args) < 2 {
-				return errors.New("usage: teploy sandbox exec <id> -- <command> (the `--` ends teploy's own flags)")
+				return &sandboxExecError{err: errors.New("usage: teploy sandbox exec <id> -- <command> (the `--` ends teploy's own flags)")}
 			}
 			return nil
 		},
@@ -64,10 +72,26 @@ func newSandboxExecCmd(flags *Flags, env *sandboxEnv) *cobra.Command {
 	cmd.Flags().DurationVar(&o.timeout, "timeout", 0, "how long the command may run (default 2m)")
 	cmd.Flags().StringArrayVar(&o.env, "env", nil, "KEY=VALUE in the command's environment (repeatable)")
 	cmd.Flags().StringVar(&o.workdir, "workdir", "", "directory to run in, relative to the sandbox's /work")
+	cmd.SetFlagErrorFunc(func(_ *cobra.Command, err error) error { return &sandboxExecError{err: err} })
 	return cmd
 }
 
 func runSandboxExec(ctx context.Context, flags *Flags, env *sandboxEnv, o sandboxExecOptions, id string, words []string) error {
+	err := execInSandbox(ctx, flags, env, o, id, words)
+	if err == nil {
+		return nil
+	}
+	// The command's own status is teploy's. Anything else is a failure of
+	// this command's own, and must not read as one: 255.
+	var command *sandboxCommandError
+	if errors.As(err, &command) {
+		return err
+	}
+	return &sandboxExecError{err: err}
+}
+
+// execInSandbox runs the command and prints what became of it.
+func execInSandbox(ctx context.Context, flags *Flags, env *sandboxEnv, o sandboxExecOptions, id string, words []string) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -184,16 +208,58 @@ func (d *sandboxDaemon) execFailure(ctx context.Context, id string, err error, s
 		id, d.server, err)}
 }
 
+// How `sandbox exec` ends, as an exit status (exitStatus, root.go):
+//
+//   - the command exited 0: 0;
+//   - it exited with another status, or its timeout ended it: that
+//     status, as ssh and docker exec pass a command's status on;
+//   - anything else is a failure of teploy's own, and 255: the engine
+//     could not be reached or refused, the sandbox could not run the
+//     command, the stream ended before the exit. 255 because a caller that
+//     branches on a command's status must never read one of those as the
+//     command having exited with it. A command that itself exits 255
+//     cannot be told from them by the status alone; under --json the
+//     classes can (command-failed, and the document on stdout).
+const sandboxExecFailure = 255
+
+// sandboxCommandError is how the command itself ended badly: it exited
+// with code, or its timeout ended it. The error is of the machine error
+// class command-failed; envelopeMessage is what the envelope says of it.
+type sandboxCommandError struct {
+	code            int
+	envelopeMessage string
+	err             error
+}
+
+func (e *sandboxCommandError) Error() string { return e.err.Error() }
+func (e *sandboxCommandError) Unwrap() error { return e.err }
+func (e *sandboxCommandError) ExitCode() int { return e.code }
+
+// sandboxExecError is any other failure of `sandbox exec`: the command's
+// status is not known, or there was none.
+type sandboxExecError struct{ err error }
+
+func (e *sandboxExecError) Error() string { return e.err.Error() }
+func (e *sandboxExecError) Unwrap() error { return e.err }
+func (e *sandboxExecError) ExitCode() int { return sandboxExecFailure }
+
 // sandboxExecStatus is the command's own outcome as an error: nonzero is
 // nonzero, a timeout says so, and -1 is the sandbox failing to run it.
 func sandboxExecStatus(result sandbox.ExecResult, wait time.Duration) error {
+	timedOut := fmt.Errorf("the command timed out after %s", wait)
 	switch {
+	case result.TimedOut && result.ExitCode > 0:
+		// The engine ends a command at its timeout with its status (124,
+		// as coreutils timeout does): it is passed on like any other.
+		return &sandboxCommandError{code: result.ExitCode, envelopeMessage: "the command timed out", err: timedOut}
 	case result.TimedOut:
-		return fmt.Errorf("the command timed out after %s", wait)
+		return timedOut // no status to pass on: teploy's own failure
 	case result.ExitCode == -1:
 		return errors.New("the sandbox could not run the command; its reason is in its stderr")
+	case result.ExitCode > 255:
+		return fmt.Errorf("the command exited with %d, which is not a status this CLI can pass on", result.ExitCode)
 	case result.ExitCode != 0:
-		return fmt.Errorf("exit status %d", result.ExitCode)
+		return &sandboxCommandError{code: result.ExitCode, envelopeMessage: fmt.Sprintf("the command exited with status %d", result.ExitCode), err: fmt.Errorf("exit status %d", result.ExitCode)}
 	}
 	return nil
 }

@@ -7,7 +7,7 @@
   "additionalProperties": false,
   "properties": {
     "machine_interface": {"type": "integer", "minimum": 1},
-    "code": {"type": "string", "enum": ["config-invalid", "internal", "conflict", "uncertain-outcome", "degraded", "unsupported"]},
+    "code": {"type": "string", "enum": ["config-invalid", "internal", "conflict", "uncertain-outcome", "degraded", "unsupported", "command-failed"]},
     "message": {"type": "string", "minLength": 1},
     "detail": {"type": "string"}
   }

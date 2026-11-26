@@ -77,7 +77,7 @@ Every command but `host` names the server with `--host`: a name from servers.yml
 
 `stop` and `resume` of a sandbox already in that state are not errors: they say so.
 
-A command that exits nonzero makes `exec` exit nonzero; a command that times out says so.
+**Exit status of `exec`.** It is the command's own, as `ssh` passes it on: `0` when the command exited 0, and the status it exited with otherwise (a command its `--timeout` ended exits 124). When teploy itself fails, `exec` exits `255`: the engine could not be reached or refused, the sandbox could not run the command, the stream ended before the exit was known, or the invocation was wrong. So `255` always means teploy, except that a command which itself exits 255 looks the same by status alone; under `--json` the classes tell them apart (`command-failed` is the command). This is the one teploy command that does not exit 1 on failure: a command's status is passed through, `2` included.
 
 ## When something is wrong on the server
 
@@ -93,7 +93,7 @@ Under `--json` all three are the error envelope with code `unsupported`, and so 
 
 A create and a fork are sent once, never twice: a retry would make a second sandbox. When the engine's answer is lost, the command says the outcome is unknown, and to list the sandboxes before trying again. Every sandbox the CLI makes carries the label `teploy.cli-run=<id>` for exactly that: `ls` shows it.
 
-An `exec` whose stream dies before the command's exit is reported the same way, as an outcome that is not known: closing the stream ends the command on the engine's side, but whether it had finished by then is not known. Under `--json` both are code `uncertain-outcome`.
+An `exec` whose stream dies before the command's exit is reported the same way, as an outcome that is not known: closing the stream ends the command on the engine's side, but whether it had finished by then is not known. So is an `exec` whose answer never came. Neither is sent again. Under `--json` all of these are code `uncertain-outcome`.
 
 ## The vm driver
 
@@ -112,9 +112,9 @@ Every `--json` document carries `machine_interface` at its root, like the rest o
 | `cp` | `{machine_interface, server, host, run_id, path, direction, bytes}` |
 | `host` | `{machine_interface, server, host, ok, action, version, from, addr, token_file}` |
 
-A measure the engine did not take is left out of a run's `usage`, never reported as zero. `exec --json` captures the output (at most 1 MiB a stream, `truncated` says so) instead of streaming it; `exit_code` is the command's, `-1` when the sandbox itself could not run it, and `null` when the stream died before the exit was known. The document is printed for a nonzero exit too, and teploy then exits 1. `host --json` reports `action` as `install`, `upgrade`, `start` or `unchanged`, with `from` on an upgrade only.
+A measure the engine did not take is left out of a run's `usage`, never reported as zero. `exec --json` captures the output (at most 1 MiB a stream, `truncated` says so) instead of streaming it; `exit_code` is the command's, `-1` when the sandbox itself could not run it, and `null` when the stream died before the exit was known. The document is printed only once the engine has taken the command, and for a nonzero exit too: teploy then exits with the command's status. An `exec` the engine refused (a sandbox that is not there, a stopped one, a bad id) prints nothing on stdout, only the error envelope. `host --json` reports `action` as `install`, `upgrade`, `start` or `unchanged`, with `from` on an upgrade only.
 
-Failures are the error envelope on stderr. An engine that cannot serve a request is `unsupported`; the engine's own refusal of a request in the wrong state (a command in a stopped sandbox) is `conflict`; an outcome that is not known is `uncertain-outcome`.
+Failures are the error envelope on stderr. An engine that cannot serve a request is `unsupported`; the engine's own refusal of a request in the wrong state (a command in a stopped sandbox) is `conflict`; an outcome that is not known is `uncertain-outcome`; a command that exited nonzero, or that its timeout ended, is `command-failed`. Everything else is `internal`.
 
 `host` records a `sandbox.host` event in the server's history when it changes something.
 

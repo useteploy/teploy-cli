@@ -882,6 +882,33 @@ func TestContractsSandboxGolden(t *testing.T) {
 	// exec: ended, failed, and a stream that died before the exit
 	writeFixture(t, "sandbox-exec-result/valid/exited.json", printed(h, "exec", made, "--", "sh", "-c", "echo out; echo err >&2"))
 	writeFixture(t, "sandbox-exec-result/valid/failed.json", failed(h, "exec", made, "--", "exit", "3"))
+
+	// The error envelope of that failure, from the real envelope writer on
+	// the real command's error: the command's status is teploy's, and the
+	// class says it was the command that failed.
+	h.flags.JSON = true
+	h.out.Reset()
+	_, err := h.json("exec", made, "--", "exit", "3")
+	if err == nil {
+		t.Fatal("a command exiting 3 succeeded")
+	}
+	var envelope bytes.Buffer
+	if err := writeMachineErrorEnvelope(&envelope, err); err != nil {
+		t.Fatal(err)
+	}
+	var document any
+	if err := json.Unmarshal(envelope.Bytes(), &document); err != nil {
+		t.Fatal(err)
+	}
+	writeFixture(t, "error-envelope/valid/command-failed.json", document)
+	h.flags.JSON = false
+
+	// A timeout is the command's outcome too, with the status it ended with.
+	h.engine.setExecHook(func(w http.ResponseWriter) {
+		sandboxSSE(w, [2]string{"stdout", "partial"}, [2]string{"exit", `{"exitCode":124,"timedOut":true}`})
+	})
+	writeFixture(t, "sandbox-exec-result/valid/timed-out.json", failed(h, "exec", made, "--timeout", "5s", "--", "sleep 9"))
+
 	h.engine.setExecHook(func(w http.ResponseWriter) { sandboxSSE(w, [2]string{"stdout", "half"}) })
 	writeFixture(t, "sandbox-exec-result/valid/unknown-outcome.json", failed(h, "exec", made, "--", "true"))
 

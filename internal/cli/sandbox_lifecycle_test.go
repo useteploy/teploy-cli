@@ -209,7 +209,8 @@ func TestSandboxCopy(t *testing.T) {
 }
 
 // What a machine consumer reads when a sandbox command fails. The exit code
-// stays 1; the envelope is where the reason's class is.
+// stays 1; the envelope is where the reason's class is. (`exec` is the
+// exception, with the command's status or 255: sandbox_exec_status_test.go.)
 func TestSandboxErrorEnvelope(t *testing.T) {
 	notInstalled := func(t *testing.T) error {
 		h := newSandboxHarness(t,

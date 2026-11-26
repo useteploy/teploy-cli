@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://teploy.github.io/contracts/schema/sandbox-exec-result.schema.json",
-  "title": "`teploy sandbox exec --json` (rev 23, sandbox-v1): how the command ended, with its output captured instead of streamed. The document is printed when the command exits nonzero too (teploy then exits 1).",
+  "title": "`teploy sandbox exec --json` (rev 23, sandbox-v1): how the command ended, with its output captured instead of streamed. Printed only once the engine has taken the command (it answered 200): an exec it refused prints the error envelope on stderr alone. It is printed when the command exits nonzero too: teploy then exits with the command's own status (255 for a failure of teploy's own) and the error envelope on stderr is code `command-failed`.",
   "type": "object",
   "required": [
     "machine_interface",
