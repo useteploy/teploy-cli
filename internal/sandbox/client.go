@@ -559,11 +559,42 @@ func ValidID(id string) (string, error) {
 // ValidWorkPath checks a path against the files API's rule before it is
 // sent: relative to /work, with no empty segment and no traversal. A
 // leading slash is accepted and dropped, so `/src/app.go` and `src/app.go`
-// name the same file.
+// name the same file; and the sandbox's work root may be written in full,
+// so `/work/src/app.go` too names `src/app.go`, not `work/src/app.go` under
+// it. The path has to name something in /work: /work itself is a
+// directory (ValidWorkDir takes it, for a directory to run in).
 func ValidWorkPath(raw string) (string, error) {
-	path := strings.TrimPrefix(strings.TrimSpace(raw), "/")
+	path, err := workPath(raw)
+	if err != nil {
+		return "", err
+	}
 	if path == "" {
+		return "", notSent(fmt.Errorf("path %q is the sandbox's /work itself, a directory; name a file in it", strings.TrimSpace(raw)))
+	}
+	return path, nil
+}
+
+// ValidWorkDir is ValidWorkPath for a directory to run a command in (an
+// exec's cwd), which may be the sandbox's /work itself: that is "".
+func ValidWorkDir(raw string) (string, error) {
+	return workPath(raw)
+}
+
+// workPath is a path as the files API and an exec's cwd take it: relative
+// to the sandbox's /work. "" is /work itself, for a path that names it.
+func workPath(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
 		return "", notSent(errors.New("the path is empty; it is relative to the sandbox's /work"))
+	}
+	path := raw
+	if inside, leading := strings.CutPrefix(raw, "/"); leading {
+		// A leading slash names the sandbox's root: `/src` is /src, and
+		// `/work` and `/work/…` are the work root and what is in it.
+		if inside == "work" || inside == "work/" {
+			return "", nil // the work root, its slash optional
+		}
+		path = strings.TrimPrefix(inside, "work/")
 	}
 	for _, segment := range strings.Split(path, "/") {
 		if segment == "" || segment == "." || segment == ".." {

@@ -71,7 +71,7 @@ func newSandboxExecCmd(flags *Flags, env *sandboxEnv) *cobra.Command {
 	bindSandboxDaemonFlags(cmd, &o.daemon)
 	cmd.Flags().DurationVar(&o.timeout, "timeout", 0, "how long the command may run (default 2m)")
 	cmd.Flags().StringArrayVar(&o.env, "env", nil, "KEY=VALUE in the command's environment (repeatable)")
-	cmd.Flags().StringVar(&o.workdir, "workdir", "", "directory to run in, relative to the sandbox's /work")
+	cmd.Flags().StringVar(&o.workdir, "workdir", "", "directory to run in, relative to the sandbox's /work (/work itself when not given; /work/… may be written in full)")
 	cmd.SetFlagErrorFunc(func(_ *cobra.Command, err error) error { return &sandboxExecError{err: err} })
 	return cmd
 }
@@ -112,7 +112,7 @@ func execInSandbox(ctx context.Context, flags *Flags, env *sandboxEnv, o sandbox
 	}
 	workdir := ""
 	if strings.TrimSpace(o.workdir) != "" {
-		if workdir, err = sandbox.ValidWorkPath(o.workdir); err != nil {
+		if workdir, err = sandbox.ValidWorkDir(o.workdir); err != nil {
 			return fmt.Errorf("--workdir: %w", err)
 		}
 	}
@@ -573,8 +573,9 @@ func newSandboxCPCmd(flags *Flags, env *sandboxEnv) *cobra.Command {
 		Use:   "cp <id>:<path> <local> | cp <local> <id>:<path>",
 		Short: "Copy a file to or from a sandbox",
 		Long: "Copy one file between this machine and a running sandbox. The sandbox's side is\n" +
-			"<id>:<path>, relative to the sandbox's /work (a leading slash is allowed). At most\n" +
-			"64 MiB. With the docker driver a write creates the file's directory when it is\n" +
+			"<id>:<path>, relative to the sandbox's /work (a leading slash is allowed, and /work/\n" +
+			"may be written in full: 01J…:/work/app.tar.gz is 01J…:app.tar.gz). At most 64 MiB.\n" +
+			"With the docker driver a write creates the file's directory when it is\n" +
 			"missing.\n\n" +
 			"With --json, the envelope is {machine_interface, server, host, run_id, path,\n" +
 			"direction, bytes}.\n\n" +
@@ -697,9 +698,17 @@ func readSandboxLocalCopy(name string) ([]byte, error) {
 // writeSandboxLocalCopy writes a copy from a sandbox whole or not at all:
 // a temporary file beside the target, then a rename over it. A target that
 // is a directory receives the file under its own name.
+//
+// A file that is already there keeps its mode, as `cp` leaves it: only what
+// the file holds changes. A new one is 0644 (the engine's files route says
+// nothing of the sandbox file's mode).
 func writeSandboxLocalCopy(target, name string, content []byte) (string, error) {
 	if info, err := os.Stat(target); err == nil && info.IsDir() {
 		target = filepath.Join(target, name)
+	}
+	mode := os.FileMode(0o644)
+	if info, err := os.Stat(target); err == nil && !info.IsDir() {
+		mode = info.Mode().Perm()
 	}
 	tmp, err := os.CreateTemp(filepath.Dir(target), "."+filepath.Base(target)+".teploy-*")
 	if err != nil {
@@ -711,7 +720,7 @@ func writeSandboxLocalCopy(target, name string, content []byte) (string, error) 
 		tmp.Close()
 		return "", fmt.Errorf("writing %s: %w", target, err)
 	}
-	if err := tmp.Chmod(0o644); err != nil {
+	if err := tmp.Chmod(mode); err != nil {
 		tmp.Close()
 		return "", fmt.Errorf("writing %s: %w", target, err)
 	}

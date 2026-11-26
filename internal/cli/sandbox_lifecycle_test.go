@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -206,6 +207,85 @@ func TestSandboxCopy(t *testing.T) {
 	if doc, err = h.json("cp", id+":again.bin", filepath.Join(dir, "back.bin")); err != nil || doc["direction"] != "from_sandbox" {
 		t.Errorf("the envelope is %v, %v", doc, err)
 	}
+
+	// The sandbox's work root may be written in full: /work/… is …, as
+	// everyone reads it, and not a directory named work under /work.
+	h.out.Reset()
+	if err := h.run("cp", local, id+":/work/full/root.bin"); err != nil {
+		t.Fatal(err)
+	}
+	if content, ok := h.engine.file(id, "full/root.bin"); !ok || string(content) != "payload\x00" {
+		t.Errorf("/work/full/root.bin went to %q (present %v)", content, ok)
+	}
+	if !strings.Contains(h.out.String(), "to "+id+":full/root.bin on prod") {
+		t.Errorf("output %q", h.out.String())
+	}
+	h.out.Reset()
+	if doc, err = h.json("cp", local, id+":/work/doc.bin"); err != nil || doc["path"] != "doc.bin" {
+		t.Errorf("the envelope is %v, %v", doc, err)
+	}
+	// /work itself is a directory, and the sandbox's root is not in /work.
+	h.out.Reset()
+	if err := h.run("cp", local, id+":/work"); err == nil || !strings.Contains(err.Error(), "is the sandbox's /work itself, a directory") {
+		t.Errorf("cp to /work itself: %v", err)
+	}
+	if err := h.run("cp", id+":/work", filepath.Join(dir, "x")); err == nil || !strings.Contains(err.Error(), "is the sandbox's /work itself, a directory") {
+		t.Errorf("cp from /work itself: %v", err)
+	}
+	if err := h.run("cp", local, id+(":/")); err == nil || !strings.Contains(err.Error(), "must stay inside the sandbox's /work") {
+		t.Errorf("cp to the sandbox's root: %v", err)
+	}
+}
+
+// A copy out of a sandbox keeps the mode of a file that is already there,
+// as `cp` leaves it: only what the file holds changes. A new file is 0644.
+func TestSandboxCopyOutKeepsTheExistingMode(t *testing.T) {
+	h := newInstalledSandboxHarness(t)
+	id := withRun(h, "running")
+	dir := t.TempDir()
+	local := filepath.Join(dir, "app.tar.gz")
+	if err := os.WriteFile(local, []byte("payload"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.run("cp", local, id+":app.tar.gz"); err != nil {
+		t.Fatal(err)
+	}
+	for _, mode := range []os.FileMode{0o600, 0o755, 0o640} {
+		target := filepath.Join(dir, fmt.Sprintf("out-%o.bin", mode))
+		if err := os.WriteFile(target, []byte("what was there"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(target, mode); err != nil {
+			t.Fatal(err)
+		}
+		if err := h.run("cp", id+":app.tar.gz", target); err != nil {
+			t.Fatalf("%o: %v", mode, err)
+		}
+		info, err := os.Stat(target)
+		if err != nil || string(mustRead(t, target)) != "payload" {
+			t.Fatalf("%o: the file is %v, %v", mode, info, err)
+		}
+		if info.Mode().Perm() != mode {
+			t.Errorf("a file with mode %o came back with %o: `cp` keeps the destination's mode", mode, info.Mode().Perm())
+		}
+	}
+	// A new file is 0644, whatever the umask (as before).
+	fresh := filepath.Join(dir, "fresh.bin")
+	if err := h.run("cp", id+":app.tar.gz", fresh); err != nil {
+		t.Fatal(err)
+	}
+	if info, err := os.Stat(fresh); err != nil || info.Mode().Perm() != 0o644 {
+		t.Errorf("a new file has mode %v, %v; want 0644", info, err)
+	}
+}
+
+func mustRead(t *testing.T, name string) []byte {
+	t.Helper()
+	content, err := os.ReadFile(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return content
 }
 
 // What a machine consumer reads when a sandbox command fails. The exit code

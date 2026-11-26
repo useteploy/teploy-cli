@@ -15,6 +15,9 @@ import (
 	"time"
 )
 
+// refused marks a path a test wants refused (it is no path anyone could want).
+const refused = "\x00refused"
+
 const (
 	testToken = "01TESTTOKEN0123456789ABCDEFGHJK01TESTTOKEN0123456789AB"
 	testID    = "01JCV5ZK3Q7X9B2D4E6F8A0B1C"
@@ -682,6 +685,65 @@ func TestExecEndsWithItsContext(t *testing.T) {
 	_, err := client.Exec(ctx, testID, ExecRequest{Cmd: "sleep 1000"}, func(Stream, string) {})
 	if err == nil || ctx.Err() == nil {
 		t.Fatalf("an exec outlived its context: %v", err)
+	}
+}
+
+// A path is relative to the sandbox's /work. A leading slash names the
+// sandbox's root, and may be dropped; the work root may be written in
+// full, so that `/work/src` is `src` and not `work/src` under it. Only the
+// sandbox's root (`/`) is not a path in /work.
+func TestWorkPaths(t *testing.T) {
+	for _, c := range []struct{ raw, dir string }{
+		{"src/app.go", "src/app.go"},
+		{" src/app.go ", "src/app.go"},
+		{"/src/app.go", "src/app.go"},
+		{"/work/src/app.go", "src/app.go"},
+		{"/work/a/b/c.txt", "a/b/c.txt"},
+		{"/work", ""}, // /work itself: a directory to run in, never a file
+		{"/work/", ""},
+		{"workspace/app.go", "workspace/app.go"},
+		{"work/src/app.go", "work/src/app.go"}, // no leading slash: a directory named work, in /work
+		{"/workspace/app.go", "workspace/app.go"},
+		{"/workx/app.go", "workx/app.go"},
+		{"/", refused},
+		{"", refused},
+		{"//work/src/app.go", refused},
+		{"/work//src/app.go", refused},
+		{"/work/../etc/passwd", refused},
+		{"/work/./src", refused},
+		{"..", refused},
+		{"a/../b", refused},
+		{"a//b", refused},
+		{"./a", refused},
+		{"a/./b", refused},
+	} {
+		// A directory to run in.
+		got, err := ValidWorkDir(c.raw)
+		if c.dir == refused {
+			if !NotSent(err) {
+				t.Errorf("ValidWorkDir(%q) = %q, %v; want it refused", c.raw, got, err)
+			}
+		} else if err != nil || got != c.dir {
+			t.Errorf("ValidWorkDir(%q) = %q, %v; want %q", c.raw, got, err, c.dir)
+		}
+		// A file's path follows the same rule, except that /work itself,
+		// a directory, names no file.
+		got, err = ValidWorkPath(c.raw)
+		if c.dir == "" && c.raw != "" && c.raw != "/" {
+			if !NotSent(err) || !strings.Contains(fmt.Sprint(err), "is the sandbox's /work itself, a directory") {
+				t.Errorf("ValidWorkPath(%q) = %q, %v; want /work itself refused as a directory", c.raw, got, err)
+			}
+			continue
+		}
+		if c.dir == refused {
+			if !NotSent(err) {
+				t.Errorf("ValidWorkPath(%q) = %q, %v; want it refused", c.raw, got, err)
+			}
+			continue
+		}
+		if err != nil || got != c.dir {
+			t.Errorf("ValidWorkPath(%q) = %q, %v; want %q", c.raw, got, err, c.dir)
+		}
 	}
 }
 

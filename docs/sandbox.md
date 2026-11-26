@@ -73,8 +73,8 @@ Every command but `host` names the server with `--host`: a name from servers.yml
 |---|---|
 | `new --image IMAGE` | Creates a sandbox and prints its id. `--ttl` (default 30m), `--network none\|allowlist\|open`, `--env KEY=VALUE` (repeatable), `--cpus`, `--memory-mb`, `--pids`, `--user default\|root`, `--label KEY=VALUE` (repeatable, at most 15), `--on-expire destroy\|stop`, `--driver`. |
 | `ls` | Lists every sandbox, running and stopped, oldest first. |
-| `exec <id> -- <command>` | Runs a command in a running sandbox and streams its output. The `--` ends teploy's own flags: each word after it is passed as the argument your shell made of it, so quoting survives; shell syntax (a pipe, a redirect) goes inside one quoted word, as in `-- 'ls \| wc -l'`. `--timeout` (default 2m), `--env`, `--workdir`. |
-| `cp` | Copies one file (at most 64 MiB). The sandbox's side is `<id>:<path>`, relative to its `/work`. |
+| `exec <id> -- <command>` | Runs a command in a running sandbox and streams its output. The `--` ends teploy's own flags: each word after it is passed as the argument your shell made of it, so quoting survives; shell syntax (a pipe, a redirect) goes inside one quoted word, as in `-- 'ls \| wc -l'`. `--timeout` (default 2m), `--env`, `--workdir` (a directory in the sandbox's `/work`; `/work/…` may be written in full, and `/work` is the default). |
+| `cp` | Copies one file (at most 64 MiB). The sandbox's side is `<id>:<path>`, relative to its `/work` (`/work/…` may be written in full). A copy out keeps the mode of a file that is already there, as `cp` does; a new file is `0644`. |
 | `stop <id>` | Stops it and keeps its filesystem. |
 | `resume <id>` | Resumes a stopped one. `--ttl`. |
 | `fork <id>` | A new sandbox from this one's filesystem. `--ttl`, `--label`, `--driver`. |

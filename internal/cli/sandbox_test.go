@@ -193,6 +193,29 @@ func TestSandboxExecTakesTheCommandAfterTheDash(t *testing.T) {
 	if got := h.engine.execs[1].Cmd; got != `'echo' 'a  b' 'it'"'"'s'` {
 		t.Errorf("the command line sent was %s", got)
 	}
+
+	// --workdir is relative to the sandbox's /work, which may be written
+	// in full: /work is the work root itself (the default), /work/build
+	// is build, and the sandbox's root is not somewhere to run in.
+	for _, c := range []struct{ workdir, cwd string }{
+		{"", ""}, {"/work", ""}, {"/work/", ""}, {"build", "build"}, {"/build", "build"}, {"/work/build", "build"},
+	} {
+		h.out.Reset()
+		if err := h.run("exec", "--workdir", c.workdir, id, "--", "true"); err != nil {
+			t.Fatalf("--workdir %q: %v", c.workdir, err)
+		}
+		if got := h.engine.execs[len(h.engine.execs)-1].Cwd; got != c.cwd {
+			t.Errorf("--workdir %q sent cwd %q, want %q", c.workdir, got, c.cwd)
+		}
+	}
+	// (A leading slash elsewhere names the sandbox's root and is dropped,
+	// so `/etc` would be `etc` in /work: the rule the files route has.)
+	for _, workdir := range []string{"/", "/work/../etc", "build/..", "/work/.."} {
+		before := h.engine.execCount()
+		if err := h.run("exec", "--workdir", workdir, id, "--", "true"); err == nil || !strings.Contains(err.Error(), "--workdir: ") || h.engine.execCount() != before {
+			t.Errorf("--workdir %q: %v (%d execs sent; want none)", workdir, err, h.engine.execCount()-before)
+		}
+	}
 }
 
 func TestSandboxCopyArgs(t *testing.T) {
