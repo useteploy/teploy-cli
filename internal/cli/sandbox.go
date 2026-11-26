@@ -307,6 +307,9 @@ type engineProbe struct {
 	state          string // the service's systemd state: active, inactive, failed...
 	version        string // "" when the binary is not there
 	processRunning bool
+	// dropins: the service has drop-ins (teploy-sandbox.service.d/*.conf),
+	// which change how systemd runs it whatever its own file says.
+	dropins bool
 }
 
 // sandboxProbeCommand is the one command that reads the probe. It always
@@ -317,8 +320,9 @@ func sandboxProbeCommand() string {
 		`if grep -qs '%[3]s' %[2]s; then echo managed=yes; else echo managed=no; fi; `+
 		`echo "state=$(systemctl is-active %[1]s 2>/dev/null || true)"; `+
 		`if [ -x %[4]s ]; then echo "version=$(%[4]s version 2>/dev/null || echo unknown)"; else echo version=absent; fi; `+
-		`if pgrep -x teploy-sandbox >/dev/null 2>&1; then echo process=running; else echo process=none; fi`,
-		sandboxUnitName, sandboxUnitPath, sandboxUnitMarker, sandboxEnginePath)
+		`if pgrep -x teploy-sandbox >/dev/null 2>&1; then echo process=running; else echo process=none; fi; `+
+		`if ls %5s/*.conf >/dev/null 2>&1; then echo dropins=present; else echo dropins=none; fi`,
+		sandboxUnitName, sandboxUnitPath, sandboxUnitMarker, sandboxEnginePath, sandboxUnitPath+".d")
 }
 
 // probeSandboxEngine asks the server what is installed and running.
@@ -348,6 +352,8 @@ func probeSandboxEngine(ctx context.Context, link ssh.Forwarder) engineProbe {
 			}
 		case "process":
 			probe.processRunning = value == "running"
+		case "dropins":
+			probe.dropins = value == "present"
 		}
 	}
 	return probe

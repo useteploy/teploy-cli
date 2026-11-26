@@ -404,6 +404,10 @@ func TestRestartCost(t *testing.T) {
 }
 
 func TestSandboxHostChangesNothingWhenItRefuses(t *testing.T) {
+	// A probe with drop-ins: everything else as a current, running install.
+	withDropins := func(probe string) string {
+		return strings.Replace(probe, "dropins=none", "dropins=present", 1)
+	}
 	for _, c := range []struct {
 		name   string
 		probe  string
@@ -414,6 +418,8 @@ func TestSandboxHostChangesNothingWhenItRefuses(t *testing.T) {
 			"teploy-sandbox is already installed on prod as /etc/systemd/system/teploy-sandbox.service, and `teploy sandbox host` did not install it. Nothing was changed: this command never replaces a service it did not write.\nTo use that daemon, pass --addr and --token-file to the other sandbox commands"},
 		{"a newer release than this CLI's", sandboxProbeLines(true, true, true, "active", "9.9.9", true), "refused",
 			"prod already has teploy-sandbox 9.9.9, which is newer than the " + sandboxEngineVersion + " this CLI installs. Nothing was changed: update the CLI (`teploy update`) rather than downgrading the engine"},
+		{"a service with drop-ins", sandboxProbeLines(true, true, true, "active", "0.1.0", true), "refused",
+			"teploy-sandbox's service on prod has drop-ins (/etc/systemd/system/teploy-sandbox.service.d/*.conf), which `teploy sandbox host` neither wrote nor reads: they change how the engine runs, whatever its service file says. Nothing was changed."},
 		{"an engine outside systemd", sandboxProbeLines(true, false, false, "inactive", "dev", true), "refused",
 			"teploy-sandbox is on prod but is not run by systemd (a binary at /usr/local/bin/teploy-sandbox, or a process running), so `teploy sandbox host` did not install it. Nothing was changed."},
 		{"a hand-started engine at the address", nothingInstalled, "",
@@ -421,6 +427,9 @@ func TestSandboxHostChangesNothingWhenItRefuses(t *testing.T) {
 		{"another service at the address", nothingInstalled, "other",
 			"something that is not the sandbox engine already listens at 127.0.0.1:7439 on prod. Nothing was changed: the engine this command installs listens at that address."},
 	} {
+		if c.name == "a service with drop-ins" {
+			c.probe = withDropins(c.probe)
+		}
 		h := newSandboxHarness(t, hostCommands(c.probe)...)
 		switch c.tunnel {
 		case "refused":

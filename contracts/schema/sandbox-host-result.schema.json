@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://teploy.github.io/contracts/schema/sandbox-host-result.schema.json",
-  "title": "`teploy sandbox host --yes --json` (rev 23, sandbox-v1): what was done to the server's engine and the engine as it is now. A server `host` refuses (a service it did not install, a newer release, a binary that is not the one this CLI pins), or an engine that does not answer after it was changed (what was there is put back first), is the error envelope on stderr, never this shape.",
+  "title": "`teploy sandbox host --yes --json` (rev 23, sandbox-v1): what was done to the server's engine and the engine as it is now. A server `host` refuses (a service it did not install, one with drop-ins, a newer release, a binary that is not the one this CLI pins), or an engine that does not answer after it was changed (what was there is put back first), is the error envelope on stderr, never this shape.",
   "type": "object",
   "required": [
     "machine_interface",

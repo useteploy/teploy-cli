@@ -140,8 +140,9 @@ func newSandboxHostCmd(flags *Flags, env *sandboxEnv) *cobra.Command {
 			"running sandbox, keeps the stopped ones, and cuts off every command still running\n" +
 			"in one. An upgrade keeps the binary it replaces as teploy-sandbox.prev, and puts\n" +
 			"it back if the new engine does not answer. A teploy-sandbox service this command\n" +
-			"did not install is never replaced. Asks before anything that restarts the engine,\n" +
-			"and before an install, unless --yes.\n\n" +
+			"did not install is never replaced, and one with drop-ins (its .service.d directory)\n" +
+			"is refused: they change how the engine runs, whatever its service file says. Asks\n" +
+			"before anything that restarts the engine, and before an install, unless --yes.\n\n" +
 			"Only the docker driver is installed. The vm driver is experimental and is opted\n" +
 			"into per command with --driver vm on a server where it is already set up.\n\n" +
 			"With --json, the envelope is {machine_interface, server, host, ok, action, version,\n" +
@@ -310,6 +311,14 @@ func (d *sandboxDaemon) planSandboxHost(ctx context.Context, probe engineProbe, 
 	if probe.unitPresent {
 		if !probe.managed {
 			return sandboxHostPlan{}, fmt.Errorf("teploy-sandbox is already installed on %s as %s, and `teploy sandbox host` did not install it. Nothing was changed: this command never replaces a service it did not write.\nTo use that daemon, pass --addr and --token-file to the other sandbox commands", d.server, sandboxUnitPath)
+		}
+		if probe.dropins {
+			// What systemd runs is the service file and its drop-ins together:
+			// with one there, "the service file is as this CLI writes it"
+			// would say nothing about how the engine runs (its address
+			// included), and a restart would run it with the drop-in in
+			// effect.
+			return sandboxHostPlan{}, fmt.Errorf("teploy-sandbox's service on %s has drop-ins (%s.d/*.conf), which `teploy sandbox host` neither wrote nor reads: they change how the engine runs, whatever its service file says. Nothing was changed.\nMove them away and run this again, or pass --addr and --token-file to the other sandbox commands to use the daemon as it runs", d.server, sandboxUnitPath)
 		}
 		switch {
 		case probe.version == pinned && !unitDiffers && probe.state == "active":
