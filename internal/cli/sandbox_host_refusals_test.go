@@ -187,8 +187,10 @@ func TestSandboxHostRefusesServersItCannotInstallOn(t *testing.T) {
 	}
 }
 
-// The binary is published only after the release's checksum matched and the
-// candidate ran on the server and reported this release.
+// The binary is published only after it matched the hash this CLI pins
+// and the release's checksum, and the candidate ran on the server and
+// reported this release. (A binary that is not the pinned one at all is
+// TestSandboxHostInstallsOnlyThePinnedBinary.)
 func TestSandboxHostRefusesAReleaseItCannotTrust(t *testing.T) {
 	pinned := strings.TrimPrefix(sandboxEngineVersion, "v")
 	checksumsOf := func(binary []byte, asset string) []byte {
@@ -201,12 +203,12 @@ func TestSandboxHostRefusesAReleaseItCannotTrust(t *testing.T) {
 		notPublished bool
 		candidate    ssh.MockCommand
 		want         string
-		// staged: the release passed its checksum, so a candidate was staged.
+		// staged: the release passed its checks, so a candidate was staged.
 		staged bool
 	}{
-		{"a checksum that does not match", engineBinary, checksumsOf([]byte("another binary"), "teploy-sandbox_linux_amd64"), false,
+		{"checksums.txt that do not match", engineBinary, checksumsOf([]byte("another binary"), "teploy-sandbox_linux_amd64"), false,
 			ssh.MockCommand{Match: "'/tmp/teploy-install.sandbox/teploy-sandbox' version", Output: pinned},
-			"checksum mismatch for teploy-sandbox_linux_amd64 of teploy-sandbox " + sandboxEngineVersion + ": refusing to install (want ", false},
+			"teploy-sandbox_linux_amd64 of teploy-sandbox " + sandboxEngineVersion + " does not match the release's checksums.txt either: refusing to install (pinned and downloaded ", false},
 		{"a release that was never published", nil, nil, true,
 			ssh.MockCommand{Match: "'/tmp/teploy-install.sandbox/teploy-sandbox' version", Output: pinned},
 			"downloading teploy-sandbox_linux_amd64: GET " + sandboxEngineURL("teploy-sandbox_linux_amd64") + " returned status 404\n(there is no such release yet if this version has not been published; see https://github.com/useteploy/teploy-sandbox/releases)", false},
@@ -222,6 +224,7 @@ func TestSandboxHostRefusesAReleaseItCannotTrust(t *testing.T) {
 	} {
 		h := newSandboxHarness(t, hostCommands(nothingInstalled, c.candidate)...)
 		engineStartsWhen(h)
+		h.release(engineBinary) // the pin is this binary's hash
 		h.env.fetch = func(ctx context.Context, url string) ([]byte, error) {
 			if c.notPublished {
 				return nil, fmt.Errorf("GET %s returned status 404", url)

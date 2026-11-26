@@ -5,7 +5,8 @@ package cli
 // systemd service bound to the server's loopback.
 //
 // The engine is a pinned GitHub release (teploy-sandbox): the binary is
-// downloaded here, checked against the release's checksums.txt, run once
+// downloaded here, checked against the SHA-256 this CLI pins for it (the
+// release's checksums.txt is checked too, as a second opinion), run once
 // on the server to confirm the version, and only then published. It is
 // never built from source on the server.
 //
@@ -37,6 +38,24 @@ import (
 // server that already has this version is left alone, and one with an
 // older one is upgraded on its next `sandbox host`.
 const sandboxEngineVersion = "v0.1.0"
+
+// sandboxEngineSHA256 is what `sandbox host` installs, by platform: the
+// SHA-256 of the release's binary, copied by hand from the release's
+// checksums.txt and reviewed together with the version bump. The download
+// is checked against THIS, not against a checksums.txt fetched with it: a
+// binary and the checksums.txt beside it can be replaced together (the
+// release, or the account that owns it), and this table cannot.
+//
+// TODO: v0.1.0 is not published yet. When it is, put each binary's
+// SHA-256 here, read from the binaries themselves and compared with
+// https://github.com/useteploy/teploy-sandbox/releases/download/v0.1.0/checksums.txt,
+// before any CLI release that installs it. While a platform's entry is
+// empty, `sandbox host` refuses to install on that platform rather than
+// trust checksums.txt alone.
+var sandboxEngineSHA256 = map[string]string{
+	"linux/amd64": "",
+	"linux/arm64": "",
+}
 
 const (
 	sandboxEngineRepo  = "useteploy/teploy-sandbox"
@@ -104,8 +123,9 @@ func newSandboxHostCmd(flags *Flags, env *sandboxEnv) *cobra.Command {
 		Long: "Install the sandbox engine (teploy-sandbox) on a server you already manage with\n" +
 			"teploy, and run it as a systemd service. The server needs systemd and Docker (as\n" +
 			"`teploy setup` leaves it) and root or passwordless sudo.\n\n" +
-			"The engine is a pinned release: the binary is checked against the release's\n" +
-			"checksum before it is installed, and never built on the server. The service runs\n" +
+			"The engine is a pinned release: the binary is checked against the hash this CLI\n" +
+			"pins for it (and the release's checksum) before it is installed, and never built\n" +
+			"on the server. The service runs\n" +
 			"as root, listens on the server's loopback only (never a public address), and is\n" +
 			"reached by the other sandbox commands over SSH.\n\n" +
 			"Running it again is safe: a server with this CLI's version is left as it is, one\n" +
@@ -129,7 +149,8 @@ func newSandboxHostCmd(flags *Flags, env *sandboxEnv) *cobra.Command {
 
 // installSandboxEngine puts the pinned engine release on the server: the
 // platform's binary and the release's checksums.txt are downloaded here
-// (fetch), the checksum is checked before anything is uploaded, the
+// (fetch), the binary is checked against the hash this CLI pins for it
+// before anything is uploaded (and against checksums.txt after that), the
 // candidate is run once on the server to confirm it is the release it
 // claims, and only then is it published over whatever was there.
 func installSandboxEngine(ctx context.Context, link ssh.Forwarder, fetch func(ctx context.Context, url string) ([]byte, error)) error {
@@ -141,21 +162,33 @@ func installSandboxEngine(ctx context.Context, link ssh.Forwarder, fetch func(ct
 		return fmt.Errorf("the sandbox engine has releases for linux servers only, and this server is %s", goos)
 	}
 	asset := fmt.Sprintf("teploy-sandbox_%s_%s", goos, goarch)
+	pinned := sandboxEngineSHA256[goos+"/"+goarch]
+	if pinned == "" {
+		// A capability this CLI build lacks: there is nothing to check
+		// the download against, so nothing is downloaded.
+		return &sandboxUnavailableError{err: fmt.Errorf(
+			"%w: %s on %s/%s is not pinned, so it cannot tell the real binary from a substituted one. Nothing was changed.\nThe hash is added to the CLI when that release is published: run `teploy update`, then this again",
+			errSandboxUnpinned, sandboxEngineVersion, goos, goarch)}
+	}
 	binary, err := fetch(ctx, sandboxEngineURL(asset))
 	if err != nil {
 		return fmt.Errorf("teploy-sandbox %s: downloading %s: %w\n(there is no such release yet if this version has not been published; see https://github.com/%s/releases)",
 			sandboxEngineVersion, asset, err, sandboxEngineRepo)
 	}
+	got := fmt.Sprintf("%x", sha256.Sum256(binary))
+	if !strings.EqualFold(got, pinned) {
+		return fmt.Errorf("%s of teploy-sandbox %s is not the binary this CLI pins: refusing to install (pinned %s, downloaded %s)", asset, sandboxEngineVersion, pinned, got)
+	}
 	checksums, err := fetch(ctx, sandboxEngineURL("checksums.txt"))
 	if err != nil {
 		return fmt.Errorf("teploy-sandbox %s: downloading checksums.txt: %w", sandboxEngineVersion, err)
 	}
-	want, err := checksumFor(checksums, asset)
+	published, err := checksumFor(checksums, asset)
 	if err != nil {
 		return fmt.Errorf("teploy-sandbox %s: %w", sandboxEngineVersion, err)
 	}
-	if got := fmt.Sprintf("%x", sha256.Sum256(binary)); !strings.EqualFold(got, want) {
-		return fmt.Errorf("checksum mismatch for %s of teploy-sandbox %s: refusing to install (want %s, got %s)", asset, sandboxEngineVersion, want, got)
+	if !strings.EqualFold(got, published) {
+		return fmt.Errorf("%s of teploy-sandbox %s does not match the release's checksums.txt either: refusing to install (pinned and downloaded %s, checksums.txt %s)", asset, sandboxEngineVersion, got, published)
 	}
 	candidate, cleanup, err := stageServerBinary(ctx, link, "teploy-sandbox", binary)
 	if err != nil {

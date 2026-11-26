@@ -234,7 +234,8 @@ const (
 	// CapSandboxV1: `teploy sandbox` — sandboxes on a server the user
 	// manages (early access, self-hosted). The engine is the teploy-sandbox
 	// daemon, reached over the SSH connection; the install is a pinned
-	// release with its checksum checked. Every --json document carries
+	// release whose binary is checked against the hash this CLI pins for
+	// it. Every --json document carries
 	// machine_interface: sandbox-run-result (`new|stop|resume|fork --json`),
 	// sandbox-runs-envelope (`ls --json`, with the engine's driver),
 	// sandbox-exec-result (`exec --json`: captured output, exit_code null

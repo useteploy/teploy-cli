@@ -45,6 +45,11 @@ var (
 	// lost, or an exec whose stream died: the effect may or may not have
 	// happened.
 	errSandboxOutcomeUnknown = errors.New("the sandbox request's outcome is unknown")
+	// errSandboxUnpinned marks a CLI build that has no pinned hash for the
+	// engine release `host` would install. It is of the engine-unavailable
+	// class too (a capability this binary lacks, error-envelope code
+	// `unsupported`), and never a state of the server.
+	errSandboxUnpinned = errors.New("this CLI build has no pinned hash for the sandbox engine")
 	// errSandboxAborted is a confirmation that was not given.
 	errSandboxAborted = errors.New("aborted: nothing was changed")
 	// errSandboxWrongState is a request about a sandbox that is in the

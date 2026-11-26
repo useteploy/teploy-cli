@@ -39,7 +39,7 @@ A daemon that was set up another way (by hand, or by teploy-ship) can be used wi
 teploy sandbox host <server> [--yes] [--json]
 ```
 
-The engine is a pinned release of `teploy-sandbox` (`v0.1.0`), downloaded by the CLI from the repository's GitHub releases: the binary is checked against the release's checksum before anything is uploaded, then run once on the server to confirm it is the release it claims, and only then published. It is never built on the server. If that release has not been published, the command says so and installs nothing.
+The engine is a pinned release of `teploy-sandbox` (`v0.1.0`), downloaded by the CLI from the repository's GitHub releases: the binary is checked against the SHA-256 the CLI pins for it (and against the release's checksum) before anything is uploaded, then run once on the server to confirm it is the release it claims, and only then published. It is never built on the server. The pinned hashes are in the CLI (`sandboxEngineSHA256` in `internal/cli/sandbox_host.go`) and are filled in when the release is published; until then `host` says it has no pinned hash and installs nothing. If the release has not been published, the command says so and installs nothing.
 
 It leaves on the server:
 
@@ -87,7 +87,7 @@ The commands look at the server before they fail, and say which of these it is:
 - **it is installed and its service is not running**: the systemctl commands that show why and start it, and the last lines of its log when the server lets them be read;
 - **the vm driver is not available**: the engine runs the docker driver.
 
-Under `--json` all three are the error envelope with code `unsupported`.
+Under `--json` all three are the error envelope with code `unsupported`, and so is a CLI build that has no pinned hash for the engine release it would install.
 
 ## Losing an answer
 

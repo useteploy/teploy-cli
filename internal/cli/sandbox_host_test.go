@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 	"testing"
 
@@ -56,9 +57,11 @@ func engineStartsWhen(h *sandboxHarness) {
 	}
 }
 
-// release is the pinned release for a test: a binary and its checksums,
-// and the URLs that were asked for.
+// release is the pinned release for a test: this CLI build pins the
+// binary's hash, the release serves that binary and its checksums, and the
+// URLs that were asked for are kept.
 func (h *sandboxHarness) release(binary []byte) *[]string {
+	pinEngine(h.t, "linux/amd64", fmt.Sprintf("%x", sha256.Sum256(binary)))
 	fetched := []string{}
 	h.env.fetch = func(ctx context.Context, url string) ([]byte, error) {
 		fetched = append(fetched, url)
@@ -72,6 +75,22 @@ func (h *sandboxHarness) release(binary []byte) *[]string {
 		return nil, fmt.Errorf("GET %s returned status 404", url)
 	}
 	return &fetched
+}
+
+// pinEngine is what this CLI build pins for a platform, for one test: the
+// table is empty until the release is published, and every test that gets
+// as far as a download needs a pin of its own.
+func pinEngine(t *testing.T, platform, sum string) {
+	t.Helper()
+	before, had := sandboxEngineSHA256[platform]
+	sandboxEngineSHA256[platform] = sum
+	t.Cleanup(func() {
+		if had {
+			sandboxEngineSHA256[platform] = before
+			return
+		}
+		delete(sandboxEngineSHA256, platform)
+	})
 }
 
 // callsInOrder reports whether each part begins a command the server was
@@ -119,6 +138,99 @@ func TestSandboxEngineRelease(t *testing.T) {
 	}
 	if got, want := sandboxEngineURL("teploy-sandbox_linux_amd64"), "https://github.com/useteploy/teploy-sandbox/releases/download/"+sandboxEngineVersion+"/teploy-sandbox_linux_amd64"; got != want {
 		t.Errorf("the release URL is %s, want %s", got, want)
+	}
+}
+
+// The pinned hashes are one for each platform the release is published
+// for, and no other: a platform without an entry is one `host` refuses.
+// Each is empty (until the release is published) or a SHA-256.
+func TestSandboxEnginePinnedHashes(t *testing.T) {
+	platforms := make([]string, 0, len(sandboxEngineSHA256))
+	sum := regexp.MustCompile(`^[0-9a-f]{64}$`)
+	for platform, hash := range sandboxEngineSHA256 {
+		platforms = append(platforms, platform)
+		if hash != "" && !sum.MatchString(hash) {
+			t.Errorf("the hash pinned for %s is %q: want a SHA-256 in lower-case hex, or empty", platform, hash)
+		}
+	}
+	sort.Strings(platforms)
+	if got := strings.Join(platforms, " "); got != "linux/amd64 linux/arm64" {
+		t.Errorf("the platforms with a pinned hash are %q, want the two the release publishes", got)
+	}
+}
+
+// A binary this CLI does not pin is refused, however consistent the
+// release it came from is: a substituted binary with a checksums.txt
+// rewritten for it passes the checksum and fails here. With no pin for
+// the platform at all, nothing is even downloaded.
+func TestSandboxHostInstallsOnlyThePinnedBinary(t *testing.T) {
+	sumOf := func(binary []byte) string { return fmt.Sprintf("%x", sha256.Sum256(binary)) }
+	substituted := []byte("#!/bin/sh\necho " + strings.TrimPrefix(sandboxEngineVersion, "v") + "\n# not the pinned one\n")
+
+	h := newSandboxHarness(t, hostCommands(nothingInstalled)...)
+	engineStartsWhen(h)
+	h.release(engineBinary)
+	// The release serves another binary, with a checksums.txt that agrees
+	// with it.
+	h.env.fetch = func(ctx context.Context, url string) ([]byte, error) {
+		if url == sandboxEngineURL("checksums.txt") {
+			return []byte(sumOf(substituted) + "  teploy-sandbox_linux_amd64\n"), nil
+		}
+		return substituted, nil
+	}
+	err := h.run("host", "prod", "--yes")
+	if err == nil || !strings.Contains(err.Error(), "teploy-sandbox_linux_amd64 of teploy-sandbox "+sandboxEngineVersion+" is not the binary this CLI pins: refusing to install (pinned "+sumOf(engineBinary)+", downloaded "+sumOf(substituted)+")") {
+		t.Errorf("got %v, want the substituted binary refused by the pinned hash", err)
+	}
+	if call := changedNothing(h.link.Calls); call != "" {
+		t.Errorf("the server was changed: %s", call)
+	}
+	if callsInOrder(h.link.Calls, "umask 077; mktemp -d") {
+		t.Error("a binary that failed its pinned hash was staged on the server")
+	}
+
+	// The pin and checksums.txt must agree: a release whose checksums.txt
+	// names another binary than the pinned one is not installed either.
+	h = newSandboxHarness(t, hostCommands(nothingInstalled)...)
+	engineStartsWhen(h)
+	h.release(engineBinary)
+	h.env.fetch = func(ctx context.Context, url string) ([]byte, error) {
+		if url == sandboxEngineURL("checksums.txt") {
+			return []byte(sumOf(substituted) + "  teploy-sandbox_linux_amd64\n"), nil
+		}
+		return engineBinary, nil
+	}
+	if err := h.run("host", "prod", "--yes"); err == nil || !strings.Contains(err.Error(), "does not match the release's checksums.txt either: refusing to install") {
+		t.Errorf("got %v, want a release whose checksums.txt disagrees with the pin refused", err)
+	}
+	if call := changedNothing(h.link.Calls); call != "" {
+		t.Errorf("the server was changed: %s", call)
+	}
+
+	// Until the hash is pinned, `host` has nothing to check a download
+	// against: it refuses before it downloads anything, and says why.
+	h = newSandboxHarness(t, hostCommands(nothingInstalled)...)
+	engineStartsWhen(h)
+	pinEngine(t, "linux/amd64", "")
+	fetched := []string{}
+	h.env.fetch = func(ctx context.Context, url string) ([]byte, error) {
+		fetched = append(fetched, url)
+		return engineBinary, nil
+	}
+	err = h.run("host", "prod", "--yes")
+	for _, want := range []string{"this CLI build has no pinned hash for the sandbox engine: " + sandboxEngineVersion + " on linux/amd64", "Nothing was changed", "teploy update"} {
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("the error does not say %q:\n%v", want, err)
+		}
+	}
+	if classifyMachineError(err) != codeUnsupported {
+		t.Errorf("a CLI build without the pin is the unsupported class, got %s", classifyMachineError(err))
+	}
+	if len(fetched) != 0 {
+		t.Errorf("with nothing to check a download against, %v was fetched", fetched)
+	}
+	if call := changedNothing(h.link.Calls); call != "" {
+		t.Errorf("the server was changed: %s", call)
 	}
 }
 

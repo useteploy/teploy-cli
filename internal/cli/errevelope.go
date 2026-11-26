@@ -36,8 +36,9 @@ const (
 	codeTargetUnreachable = "target-unreachable"
 	// The requested verb needs a capability this binary lacks; names the
 	// remedy. Migrated for the sandbox engine only (not installed on the
-	// server, its service not running, or without the driver asked for);
-	// every other site stays internal until its migration.
+	// server, its service not running, without the driver asked for, or
+	// with no hash pinned in this CLI build for the release `sandbox host`
+	// would install); every other site stays internal until its migration.
 	codeUnsupported = "unsupported"
 	// Idempotency/ambiguity refusal — e.g. the ambiguous-preview class.
 	// Migrated for a plan/apply drift, a config conflict and a sandbox in
@@ -104,7 +105,8 @@ func refuseAdmission(err error) error {
 // established (errCloudPurchaseUnknown) is the same class, and so is a
 // sandbox create, fork or exec whose outcome could not be known
 // (errSandboxOutcomeUnknown). A sandbox engine that cannot serve a request
-// (not installed, not running, or without the driver asked for) is
+// (not installed, not running, or without the driver asked for), and a CLI
+// build with no hash pinned for the engine release it would install, are
 // unsupported. Everything else is internal until its site is migrated (S2
 // generalization).
 func classifyMachineError(err error) string {
@@ -146,6 +148,9 @@ func writeMachineErrorEnvelope(out io.Writer, err error) error {
 		}
 	case codeUnsupported:
 		message = "the sandbox engine cannot serve this request on this server"
+		if errors.Is(err, errSandboxUnpinned) {
+			message = "this CLI build has no pinned hash for the sandbox engine release it would install"
+		}
 	case codeUncertainOutcome:
 		message = "interrupted — outcome unknown until reconciled"
 		if errors.Is(err, errCloudPurchaseUnknown) {
