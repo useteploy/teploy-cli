@@ -34,10 +34,17 @@ Decisions worth reviewing:
 - **`stop` and `resume` of a sandbox already in that state succeed**: the contract
   says a repeat is a 409 and to read the run to confirm.
 - **`rm` asks first; `--json` needs `--yes`** there and on `host`.
-- **Error taxonomy.** Three sites migrated: the engine unavailable (not installed,
-  not running, without the driver asked for) is `unsupported`; the engine's 409 is
-  `conflict`; an unknown outcome is `uncertain-outcome`. The rest of those sites
+- **Error taxonomy.** Four sites migrated and one code added: the engine unavailable
+  (not installed, not running, without the driver asked for, or with no hash pinned in
+  this CLI build for the release `host` would install) is `unsupported`; the engine's 409
+  is `conflict`; an unknown outcome is `uncertain-outcome`; a command run by `exec` that
+  exited nonzero, or whose timeout ended it, is `command-failed`. The rest of those sites
   stay internal (S2 list unchanged).
+- **`exec`'s exit status is the command's** (0, or the status it exited with; 124 when
+  its timeout ended it), and 255 for a failure of teploy's own. It is the one command
+  whose status is not 0/1/2 (D10), by review: a caller that runs a command wants its
+  status, and must never read teploy's failure as the command's exit. A command that
+  itself exits 255 looks the same by status alone; under `--json` the classes differ.
 - **`host` downloads the release on the operator's machine and uploads it**
   (`installTeployRelease`'s pipeline: checksum, a staged candidate run once on the
   server, then an atomic publish under flock), not with curl on the server.
@@ -45,13 +52,21 @@ Decisions worth reviewing:
   listens on `127.0.0.1:7439` only, and carries a marker. A unit without the marker
   is never replaced, nor is anything already at that address.
 - **The pinned release is `v0.1.0`**, a guess at the first teploy-sandbox tag. It is
-  one constant (`sandboxEngineVersion`).
+  one constant (`sandboxEngineVersion`), and `sandboxEngineSHA256` beside it is the
+  SHA-256 of each platform's binary. The download is checked against that, then against
+  the release's checksums.txt: a binary and the checksums beside it can be replaced
+  together, the table cannot.
+- **What a restart costs is the engine's own rule** (its README, "Surviving a restart"):
+  the running sandboxes made with `--on-expire stop` are stopped and kept, every other
+  running one is destroyed, and every command still running in one is cut off. The
+  prompt says so with the counts.
 
 Open / deferred:
 
-- **No teploy-sandbox release is published.** `host` downloads a pinned release and
-  checks its checksum; until a `v0.1.0` release exists (or the constant is bumped to
-  one that does) the command says so and installs nothing.
+- **No teploy-sandbox release is published, and the pinned hashes are empty.** Until
+  `v0.1.0` exists and its two hashes are in `sandboxEngineSHA256` (with a TODO saying
+  where each comes from), `host` refuses before it downloads: this CLI build has no
+  pinned hash for that engine (`unsupported`). It never falls back to checksums.txt.
 - **Not exercised live.** No server was touched. The systemd unit, the release
   download and the tunnel are verified by tests only: an in-process SSH server for
   the forward, a mock executor for the server's commands, and an engine in-process
@@ -65,15 +80,25 @@ Open / deferred:
 - **A daemon teploy-ship set up on the same server** (a unit without the marker,
   listening on `0.0.0.0:7439`) makes `host` refuse, and a second engine cannot take
   the default port. The other commands can use that daemon with `--addr` and
-  `--token-file` when it answers on the server's loopback.
+  `--token-file`. `--addr` has to be the server's loopback, as an IP (the engine speaks
+  plain HTTP, so the bearer token would travel to any other address unencrypted):
+  another address, or a name, needs `--allow-remote-addr` too.
 - **Not exposed:** recoverable execs (`X-Exec-Id`; `exec` streams, and a stream that
   dies is an unknown outcome), leases, snapshots, the warm cache, remote storage, and
   the access routes (published ports, SSH). `cp` is one file.
 - **The vm driver** is not installed by `host`; `--driver vm` is an opt-in for a
   server already running it, and no VM setting is exposed.
-- **Upgrading the engine restarts it**, which destroys the running sandboxes (the
-  engine's own rule: no container outlives its daemon). The prompt says so and counts
-  them; there is no drain.
+- **Upgrading the engine restarts it** (no container outlives its daemon; there is no
+  drain). The prompt says what that costs and counts it. The binary an upgrade replaces
+  is kept as `teploy-sandbox.prev` and put back, with the service restarted, if the new
+  engine does not answer; the same for a service file the run rewrote. The `.prev` copy
+  stays after a good upgrade (root-owned, about as large as the engine) for a rollback
+  by hand.
+- **`host` reads the service file** to tell whether it is as this CLI writes it, and
+  rewrites it when it differs (`action: repair`), restarting the engine only then. What
+  systemd runs is that file and its drop-ins together, so a service with a drop-in
+  (`teploy-sandbox.service.d/*.conf`) is refused with nothing changed rather than called
+  up to date.
 - **`exec` output is byte-exact** (review of 2026-11-26): the engine is asked for
   `outputEncoding: base64`, which it speaks from its first release, and the chunks
   are decoded here. Under `--json` a stream that is not valid UTF-8 is given as
@@ -89,6 +114,16 @@ Open / deferred:
 - **`ls` makes three requests** (health, the list, capacity for the driver), and
   `rm` reads the run before destroying it.
 - **The health wait after a start is 30 s**, not a flag.
+
+Review of 2026-11-26 (the three tests the review wrote are in
+`sandbox_review_test.go`, as written): the exec document is printed only once the engine
+took the command (a refusal prints the error envelope alone; a lost answer and a 200 that
+is not a stream are the unknown outcome, where they were internal with a document saying
+"unknown"); `exec`'s exit status; `--addr` on the loopback only; the pinned hashes; the
+restart rule in the prompt; `.prev` kept and put back; the service file staged in the
+run's private `mktemp -d` directory with the binary, not at a fixed `/tmp` path; the
+service file rewritten when it differs; no empty "from" for a missing binary; `/work/…`
+as the work root; `cp` out keeping an existing file's mode; byte-exact output.
 
 Verified: unit/hermetic only. Command parsing and validation (nothing connects for a
 refused request); the API client against an httptest engine (the wire's field names,

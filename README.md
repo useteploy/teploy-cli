@@ -591,13 +591,15 @@ teploy cloud server delete web1
 `teploy sandbox` runs isolated sandboxes on a server you already manage with teploy. It is early access and self-hosted: the engine (`teploy-sandbox`) is installed on your server as a systemd service bound to its loopback, and the commands reach it over SSH. See [docs/sandbox.md](docs/sandbox.md).
 
 ```
-teploy sandbox host prod                               # install and start the engine (a pinned, checksum-checked release)
+teploy sandbox host prod                               # install and start the engine (a pinned release, checked against the hash the CLI pins for it)
 teploy sandbox new --host prod --image alpine:3.20     # create a sandbox and print its id
 teploy sandbox ls --host prod                          # every sandbox on the server
-teploy sandbox exec <id> --host prod -- echo hello     # run a command in one, streaming its output
+teploy sandbox exec <id> --host prod -- echo hello     # run a command in one, streaming its output; teploy exits with the command's status
 teploy sandbox cp <id>:out/report.pdf . --host prod    # copy a file out (or in)
 teploy sandbox stop | resume | fork | rm <id> --host prod
 ```
+
+`exec` is the one teploy command whose exit status is not 0 or 1: it is the command's own, as `ssh` passes it on, and 255 when teploy itself fails. Its output is the command's, byte for byte. The engine's bearer token only ever travels to the server's loopback: `--addr` with another address needs `--allow-remote-addr`.
 
 ### Domains
 
