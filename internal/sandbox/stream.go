@@ -3,6 +3,7 @@ package sandbox
 import (
 	"bufio"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -27,11 +28,15 @@ const maxSSELineBytes = 16 << 20
 
 var errLineTooLong = fmt.Errorf("a line of the engine's stream is longer than %d bytes", maxSSELineBytes)
 
-// Errors of an exec's stream. Either leaves the command's fate unknown: the
-// stream is the only word on how it ended, and it did not end with an exit.
+// Errors of an exec's stream. Each leaves the command's fate unknown: the
+// stream is the only word on how it ended, and it gave no exit that could
+// be read.
 var (
 	ErrStreamEnded = errors.New("the engine's stream ended before the command's exit arrived")
 	ErrBadExit     = errors.New("the engine's exit frame could not be read")
+	// ErrBadChunk is an output chunk not in the encoding that was asked
+	// for: a daemon that answered in text where base64 was requested.
+	ErrBadChunk = errors.New("the engine's output was not in the encoding it was asked for")
 )
 
 // execHeaderTimeout is how long the engine may take to start answering an
@@ -90,7 +95,7 @@ func (c *Client) ExecStream(ctx context.Context, id string, req ExecRequest, wri
 			return fmt.Errorf("the engine answered the exec with %q, not an event stream", contentType)
 		}
 		var streamErr error
-		result, streamErr = readExecStream(resp.Body, write)
+		result, streamErr = readExecStream(resp.Body, write, req.OutputEncoding == "base64")
 		return streamErr
 	})
 	return result, err
@@ -101,7 +106,13 @@ func (c *Client) ExecStream(ctx context.Context, id string, req ExecRequest, wri
 // chunk that held line feeds is one `data:` line per line of it, and is
 // joined back with "\n"; a carriage return is sent raw and is kept raw. An
 // event the client does not know is ignored, as the contract asks.
-func readExecStream(body io.Reader, write func(Stream, string)) (ExecResult, error) {
+//
+// In base64 (the encoding the request asked for) every stdout and stderr
+// chunk is one base64 line, decoded before it is passed on: what the
+// command wrote, byte for byte. A chunk that is not base64 is ErrBadChunk:
+// the daemon answered in another encoding than the one it was asked for,
+// and its output cannot be read.
+func readExecStream(body io.Reader, write func(Stream, string), base64Mode bool) (ExecResult, error) {
 	reader := newLineReader(body)
 	var (
 		result ExecResult
@@ -119,6 +130,13 @@ func readExecStream(body io.Reader, write func(Stream, string)) (ExecResult, err
 		event, data = "", nil
 		switch name {
 		case Stdout, Stderr:
+			if base64Mode {
+				raw, err := base64.StdEncoding.Strict().DecodeString(chunk)
+				if err != nil {
+					return ErrBadChunk
+				}
+				chunk = string(raw)
+			}
 			write(name, chunk)
 		case "exit":
 			var exit struct {

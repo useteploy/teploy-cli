@@ -2,6 +2,7 @@ package sandbox
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -622,6 +623,70 @@ func TestExecStartedIsSaidOnceA200Arrived(t *testing.T) {
 	// Exec is ExecStream without wanting to know.
 	if _, err := client.Exec(context.Background(), "not-an-id", ExecRequest{Cmd: "true"}, func(Stream, string) {}); !NotSent(err) {
 		t.Errorf("Exec: %v", err)
+	}
+}
+
+// Asked for base64, the engine sends every output chunk as one base64 line:
+// what the command wrote comes back byte for byte, a byte that is not
+// valid UTF-8 and a carriage return included (the text mode replaces the
+// first and a line-based parser may eat the second). The exit frame stays
+// JSON.
+func TestExecDecodesBase64(t *testing.T) {
+	rec := &recorder{}
+	output := "ok\n\xff\xfe\x00\x01\rprogress 100%\r\n"
+	client := newTestClient(t, rec, func(w http.ResponseWriter, req *http.Request) {
+		startStream(w)
+		// Two chunks out of one, split where a reader would: the bytes
+		// must come back whole and in order.
+		sseFrame(w, "stdout", base64.StdEncoding.EncodeToString([]byte(output[:4])))
+		sseFrame(w, "stderr", base64.StdEncoding.EncodeToString([]byte("\xfferr\r")))
+		sseFrame(w, "stdout", base64.StdEncoding.EncodeToString([]byte(output[4:])))
+		sseFrame(w, "exit", `{"exitCode":0,"timedOut":false}`)
+	})
+	var got []string
+	_, err := client.Exec(context.Background(), testID, ExecRequest{Cmd: "x", OutputEncoding: "base64"}, func(stream Stream, chunk string) {
+		got = append(got, string(stream)+"="+chunk)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"stdout=" + output[:4], "stderr=\xfferr\r", "stdout=" + output[4:]}; strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Errorf("chunks %q, want %q", got, want)
+	}
+	if body := string(rec.at(t, 0).body); !strings.Contains(body, `"outputEncoding":"base64"`) {
+		t.Errorf("Exec sent %s", body)
+	}
+	// Not asked for, the field is left out: an older daemon sees the
+	// request it always saw.
+	if _, _ = client.Exec(context.Background(), testID, ExecRequest{Cmd: "x"}, func(Stream, string) {}); strings.Contains(string(rec.at(t, 1).body), "outputEncoding") {
+		t.Errorf("a text exec sent %s", rec.at(t, 1).body)
+	}
+}
+
+// A daemon that answers in another encoding than the one it was asked for
+// (one that does not know the field) cannot be read: its text would be
+// taken for base64. That is an error, and the command's fate is unknown,
+// never output that quietly says something else.
+func TestExecAnsweredInAnotherEncoding(t *testing.T) {
+	client := newTestClient(t, &recorder{}, func(w http.ResponseWriter, req *http.Request) {
+		startStream(w)
+		sseFrame(w, "stdout", "not base64 at all")
+	})
+	called := false
+	_, err := client.Exec(context.Background(), testID, ExecRequest{Cmd: "x", OutputEncoding: "base64"}, func(Stream, string) { called = true })
+	if !errors.Is(err, ErrBadChunk) || called || OutcomeKnown(err) {
+		t.Errorf("got %v (output passed on: %v, outcome known: %v), want ErrBadChunk with nothing passed on and the outcome unknown", err, called, OutcomeKnown(err))
+	}
+	// Text that happens to be base64 cannot be told apart: it is decoded.
+	// (Only a daemon that documents the field is asked for base64: the
+	// teploy CLI asks a release at or after the first with it.)
+	client = newTestClient(t, &recorder{}, func(w http.ResponseWriter, req *http.Request) {
+		startStream(w)
+		sseFrame(w, "stdout", base64.StdEncoding.EncodeToString([]byte("done")))
+		sseFrame(w, "exit", `{"exitCode":0,"timedOut":false}`)
+	})
+	if _, err := client.Exec(context.Background(), testID, ExecRequest{Cmd: "x", OutputEncoding: "base64"}, func(Stream, string) {}); err != nil {
+		t.Errorf("a canonical base64 chunk: %v", err)
 	}
 }
 

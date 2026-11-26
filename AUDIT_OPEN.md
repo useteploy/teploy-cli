@@ -74,8 +74,14 @@ Open / deferred:
 - **Upgrading the engine restarts it**, which destroys the running sandboxes (the
   engine's own rule: no container outlives its daemon). The prompt says so and counts
   them; there is no drain.
-- **`exec` output is in the engine's text mode** (invalid UTF-8 replaced, carriage
-  returns raw): not byte-exact. The base64 mode is not exposed.
+- **`exec` output is byte-exact** (review of 2026-11-26): the engine is asked for
+  `outputEncoding: base64`, which it speaks from its first release, and the chunks
+  are decoded here. Under `--json` a stream that is not valid UTF-8 is given as
+  `stdout_base64`/`stderr_base64` beside its text (JSON strings are UTF-8). Only an
+  engine that reports a release at or after `v0.1.0` is asked: one that reports no
+  version may predate the field and would answer in text, which cannot be told from
+  base64 in general, so it gets text, as before. A release engine that answers in
+  text anyway is an unknown outcome, never output read as something it is not.
 - **teploy-dash's contracts job** pins an older corpus revision, and its expectation
   table (`ci/validate-contracts.mjs`) must gain the six `sandbox-*` artifacts (and the
   rev 22 `cloud-*` ones, which it lacks too) when the pin moves to rev 23. Not done

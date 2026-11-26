@@ -250,6 +250,11 @@ type ExecRequest struct {
 	Cwd        string            `json:"cwd,omitempty"` // relative to /work
 	TimeoutSec int               `json:"timeoutSec,omitempty"`
 	Env        map[string]string `json:"env,omitempty"`
+	// OutputEncoding is "" (the engine's text mode: invalid UTF-8 becomes
+	// U+FFFD) or "base64" (the output byte for byte, every chunk one base64
+	// line). Only ask a daemon that documents the field for "base64": one
+	// that does not know it answers in text, which would be read as base64.
+	OutputEncoding string `json:"outputEncoding,omitempty"`
 }
 
 // ExecResult is how an exec ended.

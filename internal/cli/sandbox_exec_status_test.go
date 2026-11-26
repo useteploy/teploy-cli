@@ -20,6 +20,7 @@ import (
 	"testing"
 
 	"github.com/spf13/cobra"
+	"github.com/useteploy/teploy/internal/sandbox"
 )
 
 // invoke runs args through the real root and returns the status the process
@@ -69,8 +70,8 @@ func TestSandboxExecExitStatusIsTheCommands(t *testing.T) {
 	// other status.
 	h := newInstalledSandboxHarness(t)
 	id := withRun(h, "running")
-	h.engine.setExecHook(func(w http.ResponseWriter) {
-		sandboxSSE(w, [2]string{"stdout", "killed"}, [2]string{"exit", `{"exitCode":137,"timedOut":false}`})
+	h.engine.setExecHook(func(w http.ResponseWriter, req sandbox.ExecRequest) {
+		sandboxSSE(w, req, [2]string{"stdout", "killed"}, [2]string{"exit", `{"exitCode":137,"timedOut":false}`})
 	})
 	if status := h.invoke("sandbox", "exec", id, "--host", "prod", "--", "true"); status != 137 {
 		t.Errorf("a command killed by a signal made teploy exit %d, want 137", status)
@@ -89,24 +90,26 @@ func TestSandboxExecTeploysOwnFailuresExit255(t *testing.T) {
 		return []string{"exec", withRun(h, "running"), "--", "true"}
 	}
 	atCapacity := func(h *sandboxHarness) []string {
-		h.engine.setExecHook(func(w http.ResponseWriter) {
+		h.engine.setExecHook(func(w http.ResponseWriter, req sandbox.ExecRequest) {
 			sandboxProblem(w, http.StatusServiceUnavailable, "at-capacity", "the daemon is full")
 		})
 		return []string{"exec", withRun(h, "running"), "--", "true"}
 	}
 	couldNotRun := func(h *sandboxHarness) []string {
-		h.engine.setExecHook(func(w http.ResponseWriter) {
-			sandboxSSE(w, [2]string{"stderr", "sandbox: docker exec failed"}, [2]string{"exit", `{"exitCode":-1,"timedOut":false}`})
+		h.engine.setExecHook(func(w http.ResponseWriter, req sandbox.ExecRequest) {
+			sandboxSSE(w, req, [2]string{"stderr", "sandbox: docker exec failed"}, [2]string{"exit", `{"exitCode":-1,"timedOut":false}`})
 		})
 		return []string{"exec", withRun(h, "running"), "--", "true"}
 	}
 	streamDied := func(h *sandboxHarness) []string {
-		h.engine.setExecHook(func(w http.ResponseWriter) { sandboxSSE(w, [2]string{"stdout", "half"}) })
+		h.engine.setExecHook(func(w http.ResponseWriter, req sandbox.ExecRequest) { sandboxSSE(w, req, [2]string{"stdout", "half"}) })
 		return []string{"exec", withRun(h, "running"), "--", "true"}
 	}
 	noStatus := func(h *sandboxHarness) []string {
 		// A timeout the engine did not give a status for: nothing to pass on.
-		h.engine.setExecHook(func(w http.ResponseWriter) { sandboxSSE(w, [2]string{"exit", `{"exitCode":0,"timedOut":true}`}) })
+		h.engine.setExecHook(func(w http.ResponseWriter, req sandbox.ExecRequest) {
+			sandboxSSE(w, req, [2]string{"exit", `{"exitCode":0,"timedOut":true}`})
+		})
 		return []string{"exec", withRun(h, "running"), "--", "true"}
 	}
 	lostAnswer := func(h *sandboxHarness) []string {
@@ -114,7 +117,9 @@ func TestSandboxExecTeploysOwnFailuresExit255(t *testing.T) {
 		return []string{"exec", withRun(h, "running"), "--", "true"}
 	}
 	outOfRange := func(h *sandboxHarness) []string {
-		h.engine.setExecHook(func(w http.ResponseWriter) { sandboxSSE(w, [2]string{"exit", `{"exitCode":300,"timedOut":false}`}) })
+		h.engine.setExecHook(func(w http.ResponseWriter, req sandbox.ExecRequest) {
+			sandboxSSE(w, req, [2]string{"exit", `{"exitCode":300,"timedOut":false}`})
+		})
 		return []string{"exec", withRun(h, "running"), "--", "true"}
 	}
 	for _, c := range []struct {
@@ -187,8 +192,8 @@ func TestSandboxExitStatusUnderJSON(t *testing.T) {
 	// A timeout is the command's outcome too: its status, and the class.
 	h = newInstalledSandboxHarness(t)
 	id = withRun(h, "running")
-	h.engine.setExecHook(func(w http.ResponseWriter) {
-		sandboxSSE(w, [2]string{"stdout", "partial"}, [2]string{"exit", `{"exitCode":124,"timedOut":true}`})
+	h.engine.setExecHook(func(w http.ResponseWriter, req sandbox.ExecRequest) {
+		sandboxSSE(w, req, [2]string{"stdout", "partial"}, [2]string{"exit", `{"exitCode":124,"timedOut":true}`})
 	})
 	if status := h.invoke("sandbox", "exec", "--json", id, "--host", "prod", "--timeout", "5s", "--", "sleep 9"); status != 124 {
 		t.Errorf("a timed-out command made teploy exit %d, want 124", status)

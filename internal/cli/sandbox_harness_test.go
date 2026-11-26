@@ -10,6 +10,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -266,6 +267,10 @@ func (e *fakeSandboxEngine) runRoute(w http.ResponseWriter, r *http.Request, res
 		}
 		var req sandbox.ExecRequest
 		_ = json.NewDecoder(r.Body).Decode(&req)
+		if req.OutputEncoding != "" && req.OutputEncoding != "base64" {
+			sandboxProblem(w, http.StatusBadRequest, "bad-request", "outputEncoding must be base64 or omitted.")
+			return
+		}
 		e.execs = append(e.execs, req)
 		if e.loseExecAnswer {
 			conn, _, err := w.(http.Hijacker).Hijack()
@@ -301,7 +306,8 @@ func (e *fakeSandboxEngine) runRoute(w http.ResponseWriter, r *http.Request, res
 
 // sandboxStreamLocalCommand runs the command here, through sh -c as the
 // daemon does, and frames its real output and exit as the daemon frames
-// them: one frame a read, a `data:` line a line of it, exit last.
+// them: one frame a read, a `data:` line a line of it, exit last. Asked for
+// base64, every chunk is one base64 line, as the daemon sends it.
 func sandboxStreamLocalCommand(w http.ResponseWriter, req sandbox.ExecRequest) {
 	cmd := exec.Command("sh", "-c", req.Cmd)
 	stdout, _ := cmd.StdoutPipe()
@@ -312,19 +318,12 @@ func sandboxStreamLocalCommand(w http.ResponseWriter, req sandbox.ExecRequest) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.WriteHeader(http.StatusOK)
+	base64Mode := req.OutputEncoding == "base64"
 	var mu sync.Mutex
-	frame := func(event string, chunk []byte) {
+	frame := func(event, data string) {
 		mu.Lock()
 		defer mu.Unlock()
-		fmt.Fprintf(w, "event: %s\n", event)
-		for _, line := range strings.Split(strings.TrimSuffix(string(chunk), "\n"), "\n") {
-			fmt.Fprintf(w, "data: %s\n", line)
-		}
-		if strings.HasSuffix(string(chunk), "\n") {
-			fmt.Fprint(w, "data: \n")
-		}
-		fmt.Fprint(w, "\n")
-		w.(http.Flusher).Flush()
+		sandboxFrame(w, event, data, base64Mode)
 	}
 	var wg sync.WaitGroup
 	for stream, event := range map[io.Reader]string{stdout: "stdout", stderr: "stderr"} {
@@ -335,7 +334,7 @@ func sandboxStreamLocalCommand(w http.ResponseWriter, req sandbox.ExecRequest) {
 			for {
 				n, err := reader.Read(buffer)
 				if n > 0 {
-					frame(event, buffer[:n])
+					frame(event, string(buffer[:n]))
 				}
 				if err != nil {
 					return
@@ -350,7 +349,27 @@ func sandboxStreamLocalCommand(w http.ResponseWriter, req sandbox.ExecRequest) {
 			code = exit.ExitCode()
 		}
 	}
-	frame("exit", []byte(fmt.Sprintf(`{"exitCode":%d,"timedOut":false}`, code)))
+	sandboxFrame(w, "exit", fmt.Sprintf(`{"exitCode":%d,"timedOut":false}`, code), false)
+}
+
+// sandboxFrame writes one frame as the daemon writes it: the event, one
+// `data:` line a line of the chunk (in base64 a chunk is one line by
+// construction), a blank line, then a flush. The exit frame is JSON in
+// either encoding.
+func sandboxFrame(w http.ResponseWriter, event, data string, base64Mode bool) {
+	fmt.Fprintf(w, "event: %s\n", event)
+	if base64Mode {
+		fmt.Fprintf(w, "data: %s\n", base64.StdEncoding.EncodeToString([]byte(data)))
+	} else {
+		for _, line := range strings.Split(strings.TrimSuffix(data, "\n"), "\n") {
+			fmt.Fprintf(w, "data: %s\n", line)
+		}
+		if strings.HasSuffix(data, "\n") {
+			fmt.Fprint(w, "data: \n")
+		}
+	}
+	fmt.Fprint(w, "\n")
+	w.(http.Flusher).Flush()
 }
 
 // engineState reads or writes the fake engine's state under its lock: a
@@ -374,12 +393,18 @@ func withRun(h *sandboxHarness, state string) string {
 	})
 }
 
-// sandboxSSE answers an exec with frames written as the engine writes them.
-func sandboxSSE(w http.ResponseWriter, frames ...[2]string) {
+// sandboxSSE answers an exec with frames written as the engine writes
+// them, in the encoding the exec asked for: output frames as the daemon
+// frames that encoding, the exit frame always as its JSON.
+func sandboxSSE(w http.ResponseWriter, req sandbox.ExecRequest, frames ...[2]string) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.WriteHeader(http.StatusOK)
 	for _, frame := range frames {
+		if frame[0] == "stdout" || frame[0] == "stderr" {
+			sandboxFrame(w, frame[0], frame[1], req.OutputEncoding == "base64")
+			continue
+		}
 		fmt.Fprintf(w, "event: %s\ndata: %s\n\n", frame[0], frame[1])
 	}
 }
@@ -588,9 +613,10 @@ func (e *fakeSandboxEngine) execCount() int {
 	return engineState(e, func() int { return len(e.execs) })
 }
 
-// setExecHook makes the engine answer every exec with frames of the test's.
-func (e *fakeSandboxEngine) setExecHook(hook func(w http.ResponseWriter)) {
-	engineState(e, func() bool { e.execHook = func(w http.ResponseWriter, _ sandbox.ExecRequest) { hook(w) }; return true })
+// setExecHook makes the engine answer every exec itself: with the request
+// it was asked, so a test can answer in the encoding the CLI asked for.
+func (e *fakeSandboxEngine) setExecHook(hook func(w http.ResponseWriter, req sandbox.ExecRequest)) {
+	engineState(e, func() bool { e.execHook = hook; return true })
 }
 
 // file is what a sandbox holds at path.

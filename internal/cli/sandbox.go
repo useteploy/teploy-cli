@@ -554,6 +554,23 @@ func (d *sandboxDaemon) explainRun(ctx context.Context, id string, err error) er
 	return d.explain(err)
 }
 
+// sandboxBase64Since is the first teploy-sandbox release whose exec
+// answers in base64 when asked (the wire contract's `outputEncoding`).
+const sandboxBase64Since = "0.1.0"
+
+// sendsBytes says whether the engine can be asked for a command's output
+// byte for byte: it is a release at or after the first that documents
+// `outputEncoding: base64`. Anything else, a build that reports no version
+// included, is asked for text, the default, which it certainly speaks: a
+// daemon that ignored the field would have its text read as base64. With
+// text, the engine replaces a byte that is not valid UTF-8 with U+FFFD.
+func (d *sandboxDaemon) sendsBytes() bool {
+	if _, _, ok := parseRelease(d.health.Version); !ok {
+		return false
+	}
+	return releaseCompare(d.health.Version, sandboxBase64Since) >= 0
+}
+
 // checkDriver reads the engine's driver and refuses the request when the
 // one asked for is not the one the engine runs. The CLI targets the docker
 // driver; the vm driver is experimental and is opted into with --driver vm.

@@ -238,9 +238,11 @@ const (
 	// it. Every --json document carries
 	// machine_interface: sandbox-run-result (`new|stop|resume|fork --json`),
 	// sandbox-runs-envelope (`ls --json`, with the engine's driver),
-	// sandbox-exec-result (`exec --json`: captured output, printed only
-	// once the engine took the command; exit_code null when the stream
-	// died before the exit), sandbox-destroy-result (`rm --yes --json`),
+	// sandbox-exec-result (`exec --json`: captured output had from the
+	// engine byte for byte (stdout_base64/stderr_base64 when a stream is
+	// not valid UTF-8), printed only once the engine took the command;
+	// exit_code null when the stream died before the exit),
+	// sandbox-destroy-result (`rm --yes --json`),
 	// sandbox-copy-result (`cp --json`) and sandbox-host-result (`host
 	// --yes --json`: install, upgrade, repair, start or unchanged). An engine that
 	// is not installed, not running, or without the driver asked for, and

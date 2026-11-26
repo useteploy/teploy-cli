@@ -39,17 +39,20 @@ func newSandboxExecCmd(flags *Flags, env *sandboxEnv) *cobra.Command {
 		Long: "Run a command in a running sandbox, through sh -c in its /work, and stream its\n" +
 			"output. The `--` ends teploy's own flags. Each word after it is passed as the\n" +
 			"argument your shell made of it, so quoting survives; shell syntax (a pipe, a\n" +
-			"redirect) goes inside one quoted word: -- 'ls | wc -l'.\n\n" +
+			"redirect) goes inside one quoted word: -- 'ls | wc -l'. The output is the command's,\n" +
+			"byte for byte.\n\n" +
 			"Exit status: the command's own, as ssh passes it on (0, or the status it exited\n" +
 			"with; a command its --timeout ended exits 124). 255 is a failure of teploy's own:\n" +
 			"it could not reach the engine, the sandbox could not run the command, or the stream\n" +
 			"ended before the exit was known.\n\n" +
 			"With --json, stdout carries {machine_interface, server, host, run_id, exit_code,\n" +
 			"timed_out, duration_ms, stdout, stderr, truncated}: the output is captured (at most\n" +
-			"1 MiB a stream) instead of streamed. The document is printed only once the engine\n" +
-			"has taken the command; an exec it refused prints the error envelope on stderr alone.\n" +
-			"exit_code is null when the stream ended before the command's exit was known. A\n" +
-			"command that exits nonzero is error-envelope code command-failed.\n\n" +
+			"1 MiB a stream) instead of streamed. stdout and stderr are text; a stream holding\n" +
+			"bytes that are not valid UTF-8 is also given as stdout_base64 or stderr_base64, byte\n" +
+			"for byte. The document is printed only once the engine has taken the command; an\n" +
+			"exec it refused prints the error envelope on stderr alone. exit_code is null when\n" +
+			"the stream ended before the command's exit was known. A command that exits nonzero\n" +
+			"is error-envelope code command-failed.\n\n" +
 			"Examples:\n" +
 			"  teploy sandbox exec 01JCV5ZK3Q7X9B2D4E6F8A0B1C --host prod -- echo hello\n" +
 			"  teploy sandbox exec 01JCV5ZK3Q7X9B2D4E6F8A0B1C --host prod --timeout 10m -- make test",
@@ -126,6 +129,11 @@ func execInSandbox(ctx context.Context, flags *Flags, env *sandboxEnv, o sandbox
 	}
 	defer d.Close()
 	req := sandbox.ExecRequest{Cmd: sandboxCommand(words), Cwd: workdir, TimeoutSec: timeoutSec, Env: commandEnv}
+	// The output is had from the engine byte for byte when it can: what the
+	// command wrote is what is printed, and what the document holds.
+	if d.sendsBytes() {
+		req.OutputEncoding = "base64"
+	}
 
 	// Under --json the output is captured for the document; otherwise it is
 	// streamed as it arrives.

@@ -9,7 +9,9 @@ package cli
 // absent is not zero.
 
 import (
+	"encoding/base64"
 	"time"
+	"unicode/utf8"
 
 	"github.com/useteploy/teploy/internal/sandbox"
 )
@@ -107,6 +109,12 @@ func sandboxRunsEnvelope(d *sandboxDaemon, driver string, runs []sandbox.Run) sa
 // sandbox itself could not run it), or null when the stream ended before
 // the command's exit was known. stdout and stderr hold at most 1 MiB each;
 // truncated says a stream was longer.
+//
+// The output is had from the engine byte for byte (it is asked for base64
+// when it is a release that speaks it), and stdout and stderr are it as
+// text. JSON strings are UTF-8, so a stream holding bytes that are not is
+// also given as stdout_base64 or stderr_base64: the exact bytes, present
+// only then (absent means the text is already byte for byte).
 type sandboxExecDTO struct {
 	MachineInterface int    `json:"machine_interface"`
 	Server           string `json:"server"`
@@ -117,6 +125,8 @@ type sandboxExecDTO struct {
 	DurationMS       int64  `json:"duration_ms"`
 	Stdout           string `json:"stdout"`
 	Stderr           string `json:"stderr"`
+	StdoutBase64     string `json:"stdout_base64,omitempty"`
+	StderrBase64     string `json:"stderr_base64,omitempty"`
 	Truncated        bool   `json:"truncated"`
 }
 
@@ -125,6 +135,14 @@ func sandboxExecEnvelope(d *sandboxDaemon, id string, result sandbox.ExecResult,
 		MachineInterface: MachineInterface, Server: d.server, Host: d.host, RunID: id,
 		DurationMS: elapsed.Milliseconds(), Stdout: stdout.text.String(), Stderr: stderr.text.String(),
 		Truncated: stdout.truncated || stderr.truncated,
+	}
+	// encoding/json writes each byte of stdout that is not valid UTF-8 as
+	// U+FFFD; the bytes themselves go beside it.
+	if !utf8.ValidString(dto.Stdout) {
+		dto.StdoutBase64 = base64.StdEncoding.EncodeToString([]byte(dto.Stdout))
+	}
+	if !utf8.ValidString(dto.Stderr) {
+		dto.StderrBase64 = base64.StdEncoding.EncodeToString([]byte(dto.Stderr))
 	}
 	if err == nil {
 		code := result.ExitCode

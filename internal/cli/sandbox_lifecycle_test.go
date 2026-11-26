@@ -312,7 +312,9 @@ func TestSandboxErrorEnvelope(t *testing.T) {
 	}
 	refusedByEngine := func(t *testing.T) error {
 		h := newInstalledSandboxHarness(t)
-		h.engine.setExecHook(func(w http.ResponseWriter) { sandboxProblem(w, 503, "at-capacity", "the daemon is full") })
+		h.engine.setExecHook(func(w http.ResponseWriter, req sandbox.ExecRequest) {
+			sandboxProblem(w, 503, "at-capacity", "the daemon is full")
+		})
 		return h.run("exec", withRun(h, "running"), "--", "true")
 	}
 	for _, c := range []struct {

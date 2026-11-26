@@ -4,6 +4,7 @@ package cli
 // they send, what they print, and their --json documents.
 
 import (
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"net/http"
@@ -189,15 +190,15 @@ func TestSandboxExec(t *testing.T) {
 	// A timeout, and a sandbox that could not run the command, are each
 	// said as themselves.
 	h.run("resume", id)
-	h.engine.setExecHook(func(w http.ResponseWriter) {
-		sandboxSSE(w, [2]string{"stdout", "partial"}, [2]string{"exit", `{"exitCode":124,"timedOut":true}`})
+	h.engine.setExecHook(func(w http.ResponseWriter, req sandbox.ExecRequest) {
+		sandboxSSE(w, req, [2]string{"stdout", "partial"}, [2]string{"exit", `{"exitCode":124,"timedOut":true}`})
 	})
 	h.out.Reset()
 	if err := h.run("exec", id, "--timeout", "5s", "--", "sleep 9"); err == nil || err.Error() != "the command timed out after 5s" || h.out.String() != "partial" {
 		t.Errorf("a timeout: %v, output %q", err, h.out.String())
 	}
-	h.engine.setExecHook(func(w http.ResponseWriter) {
-		sandboxSSE(w, [2]string{"stderr", "sandbox: docker exec failed"}, [2]string{"exit", `{"exitCode":-1,"timedOut":false}`})
+	h.engine.setExecHook(func(w http.ResponseWriter, req sandbox.ExecRequest) {
+		sandboxSSE(w, req, [2]string{"stderr", "sandbox: docker exec failed"}, [2]string{"exit", `{"exitCode":-1,"timedOut":false}`})
 	})
 	h.out.Reset()
 	h.errOut.Reset()
@@ -206,7 +207,7 @@ func TestSandboxExec(t *testing.T) {
 	}
 
 	// A stream that dies before the exit leaves the command's fate unknown.
-	h.engine.setExecHook(func(w http.ResponseWriter) { sandboxSSE(w, [2]string{"stdout", "half"}) })
+	h.engine.setExecHook(func(w http.ResponseWriter, req sandbox.ExecRequest) { sandboxSSE(w, req, [2]string{"stdout", "half"}) })
 	h.out.Reset()
 	err = h.run("exec", id, "--", "true")
 	if !errors.Is(err, errSandboxOutcomeUnknown) || classifyMachineError(err) != codeUncertainOutcome || h.out.String() != "half" {
@@ -231,7 +232,7 @@ func TestSandboxExecJSONRefusalPrintsOnlyTheError(t *testing.T) {
 	}
 	full := func(t *testing.T) (*sandboxHarness, []string) {
 		h := newInstalledSandboxHarness(t)
-		h.engine.setExecHook(func(w http.ResponseWriter) {
+		h.engine.setExecHook(func(w http.ResponseWriter, req sandbox.ExecRequest) {
 			sandboxProblem(w, http.StatusServiceUnavailable, "at-capacity", "the daemon is full")
 		})
 		return h, []string{"exec", withRun(h, "running"), "--", "true"}
@@ -307,7 +308,7 @@ func TestSandboxExecWithALostAnswer(t *testing.T) {
 func TestSandboxExecAnsweredWithSomethingElse(t *testing.T) {
 	h := newInstalledSandboxHarness(t)
 	id := withRun(h, "running")
-	h.engine.setExecHook(func(w http.ResponseWriter) {
+	h.engine.setExecHook(func(w http.ResponseWriter, req sandbox.ExecRequest) {
 		w.Header().Set("Content-Type", "text/html")
 		fmt.Fprint(w, "<h1>login</h1>")
 	})
@@ -318,6 +319,96 @@ func TestSandboxExecAnsweredWithSomethingElse(t *testing.T) {
 	}
 	if doc := h.jsonDocument(); doc["exit_code"] != nil || doc["stdout"] != "" {
 		t.Errorf("the document is %v", doc)
+	}
+}
+
+// The output is had from the engine byte for byte: the exec asks a daemon
+// that speaks base64 for it, and what the command wrote is what is
+// printed, and what the document holds (a stream that is not valid UTF-8
+// is given as base64 beside its text).
+func TestSandboxExecOutputIsByteForByte(t *testing.T) {
+	const bytes = "\xff\xfe\x00\x01\rprogress 50%\rprogress 100%\r\nlast line without a newline"
+	// The command makes its bytes with printf's escapes (an argument cannot
+	// hold a NUL).
+	h := newInstalledSandboxHarness(t) // the engine says 0.1.0: a release that speaks base64
+	id := withRun(h, "running")
+	if err := h.run("exec", id, "--", "printf", `\377\376\000\001\rprogress 50%%\rprogress 100%%\r\nlast line without a newline`); err != nil {
+		t.Fatal(err)
+	}
+	if h.out.String() != bytes {
+		t.Errorf("the output came back %q, want the command's bytes %q", h.out.String(), bytes)
+	}
+	if sent := h.engine.execs[0]; sent.OutputEncoding != "base64" {
+		t.Errorf("the engine was asked %+v, want outputEncoding base64", sent)
+	}
+
+	h.out.Reset()
+	doc, err := h.json("exec", id, "--", "printf", `\377\376\000\001\rprogress 50%%\rprogress 100%%\r\nlast line without a newline`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if doc["stdout"] != "\ufffd\ufffd\x00\x01\rprogress 50%\rprogress 100%\r\nlast line without a newline" {
+		t.Errorf("stdout in the document is %q", doc["stdout"])
+	}
+	if doc["stdout_base64"] != base64.StdEncoding.EncodeToString([]byte(bytes)) {
+		t.Errorf("stdout_base64 in the document is %v", doc["stdout_base64"])
+	}
+	if _, present := doc["stderr_base64"]; present {
+		t.Errorf("an empty stderr has a base64 form: %v", doc)
+	}
+	decoded, err := base64.StdEncoding.DecodeString(fmt.Sprint(doc["stdout_base64"]))
+	if err != nil || string(decoded) != bytes {
+		t.Errorf("stdout_base64 decodes to %q, %v", decoded, err)
+	}
+
+	// Text that is valid UTF-8 is already byte for byte: no base64 form.
+	h.out.Reset()
+	doc, err = h.json("exec", id, "--", "sh", "-c", "echo héllo; echo err >&2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if doc["stdout"] != "héllo\n" || doc["stderr"] != "err\n" {
+		t.Errorf("the document is %v", doc)
+	}
+	for _, key := range []string{"stdout_base64", "stderr_base64"} {
+		if _, present := doc[key]; present {
+			t.Errorf("%s is in the document for valid UTF-8: %v", key, doc)
+		}
+	}
+}
+
+// Only a daemon that documents base64 is asked for it. One that reports no
+// version (a build from before the field, or any dev build) gets the
+// request it always got, and its text is read as text.
+func TestSandboxExecAsksForBytesOnlyWhereTheyAreSpoken(t *testing.T) {
+	for _, c := range []struct {
+		version string
+		asks    bool
+	}{
+		{"0.1.0", true}, {"0.2.0", true}, {"1.0.0", true}, {"0.1.0-rc.1", false}, {"0.0.9", false}, {"dev", false}, {"", false},
+	} {
+		h := newInstalledSandboxHarness(t)
+		engineState(h.engine, func() bool { h.engine.version = c.version; return true })
+		id := withRun(h, "running")
+		if err := h.run("exec", id, "--", "echo", "text"); err != nil {
+			t.Fatalf("%s: %v", c.version, err)
+		}
+		if asked := h.engine.execs[0].OutputEncoding == "base64"; asked != c.asks || h.out.String() != "text\n" {
+			t.Errorf("engine %q: asked for base64 %v (want %v), output %q", c.version, asked, c.asks, h.out.String())
+		}
+	}
+
+	// A daemon that says it is a release and answers in text anyway cannot
+	// be read: the output is not passed on as something it is not, and the
+	// command's fate is unknown.
+	h := newInstalledSandboxHarness(t)
+	id := withRun(h, "running")
+	h.engine.setExecHook(func(w http.ResponseWriter, _ sandbox.ExecRequest) {
+		fmt.Fprint(w, "event: stdout\ndata: looks like text\n\nevent: exit\ndata: {\"exitCode\":0,\"timedOut\":false}\n\n")
+	})
+	err := h.run("exec", id, "--", "true")
+	if !errors.Is(err, errSandboxOutcomeUnknown) || classifyMachineError(err) != codeUncertainOutcome || h.out.Len() != 0 {
+		t.Errorf("text where base64 was asked: %v (%s), output %q", err, classifyMachineError(err), h.out.String())
 	}
 }
 
@@ -349,8 +440,8 @@ func TestSandboxExecJSON(t *testing.T) {
 	}
 
 	// Output past the capture is cut and said to be.
-	h.engine.setExecHook(func(w http.ResponseWriter) {
-		sandboxSSE(w, [2]string{"stdout", strings.Repeat("x", sandboxExecCapture+10)}, [2]string{"exit", `{"exitCode":0,"timedOut":false}`})
+	h.engine.setExecHook(func(w http.ResponseWriter, req sandbox.ExecRequest) {
+		sandboxSSE(w, req, [2]string{"stdout", strings.Repeat("x", sandboxExecCapture+10)}, [2]string{"exit", `{"exitCode":0,"timedOut":false}`})
 	})
 	h.out.Reset()
 	if err := h.run("exec", id, "--", "true"); err != nil {
@@ -361,7 +452,9 @@ func TestSandboxExecJSON(t *testing.T) {
 	}
 
 	// A stream that died before the exit: no exit code, and unknown.
-	h.engine.setExecHook(func(w http.ResponseWriter) { sandboxSSE(w, [2]string{"stdout", "partial"}) })
+	h.engine.setExecHook(func(w http.ResponseWriter, req sandbox.ExecRequest) {
+		sandboxSSE(w, req, [2]string{"stdout", "partial"})
+	})
 	h.out.Reset()
 	err = h.run("exec", id, "--", "true")
 	if !errors.Is(err, errSandboxOutcomeUnknown) || classifyMachineError(err) != codeUncertainOutcome {

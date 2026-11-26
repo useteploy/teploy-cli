@@ -903,13 +903,16 @@ func TestContractsSandboxGolden(t *testing.T) {
 	writeFixture(t, "error-envelope/valid/command-failed.json", document)
 	h.flags.JSON = false
 
+	// exec: output that is not valid UTF-8, given as base64 beside its text
+	writeFixture(t, "sandbox-exec-result/valid/binary-output.json", printed(h, "exec", made, "--", "printf", `\377\376\r\n`))
+
 	// A timeout is the command's outcome too, with the status it ended with.
-	h.engine.setExecHook(func(w http.ResponseWriter) {
-		sandboxSSE(w, [2]string{"stdout", "partial"}, [2]string{"exit", `{"exitCode":124,"timedOut":true}`})
+	h.engine.setExecHook(func(w http.ResponseWriter, req sandbox.ExecRequest) {
+		sandboxSSE(w, req, [2]string{"stdout", "partial"}, [2]string{"exit", `{"exitCode":124,"timedOut":true}`})
 	})
 	writeFixture(t, "sandbox-exec-result/valid/timed-out.json", failed(h, "exec", made, "--timeout", "5s", "--", "sleep 9"))
 
-	h.engine.setExecHook(func(w http.ResponseWriter) { sandboxSSE(w, [2]string{"stdout", "half"}) })
+	h.engine.setExecHook(func(w http.ResponseWriter, req sandbox.ExecRequest) { sandboxSSE(w, req, [2]string{"stdout", "half"}) })
 	writeFixture(t, "sandbox-exec-result/valid/unknown-outcome.json", failed(h, "exec", made, "--", "true"))
 
 	// rm and cp
