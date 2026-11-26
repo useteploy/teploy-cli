@@ -53,7 +53,19 @@ func execHeaderTimeout(seconds int) time.Duration {
 // the stream then dies before the exit frame, the error wraps
 // ErrStreamEnded or ErrBadExit: closing the stream ends the command on the
 // engine's side, but whether it had finished by then is not known.
-func (c *Client) Exec(ctx context.Context, id string, req ExecRequest, write func(stream Stream, chunk string)) (ExecResult, error) {
+func (c *Client) Exec(ctx context.Context, id string, req ExecRequest, write func(Stream, string)) (ExecResult, error) {
+	return c.ExecStream(ctx, id, req, write, nil)
+}
+
+// ExecStream is Exec, and says when the command became the engine's.
+// started is called once a 200 has arrived and the stream is about to be
+// read; it is not called for a refusal before the stream (the engine's
+// problem answer, a request that did not leave, or no answer at all). A
+// caller that reports on the command can tell "nothing ran" (no 200, and
+// OutcomeKnown says the engine refused it) from "it may have run" (a 200,
+// or a lost answer), which is what the wire contract asks: an exec is not
+// to be retried once the stream may have started.
+func (c *Client) ExecStream(ctx context.Context, id string, req ExecRequest, write func(Stream, string), started func()) (ExecResult, error) {
 	path, err := runPath(id, "exec")
 	if err != nil {
 		return ExecResult{}, err
@@ -69,6 +81,10 @@ func (c *Client) Exec(ctx context.Context, id string, req ExecRequest, write fun
 		if resp.StatusCode != http.StatusOK {
 			raw, readErr := readBounded(resp.Body, maxJSONBytes)
 			return problemFrom(resp.StatusCode, raw, readErr)
+		}
+		// The engine only answers 200 once it has taken the command.
+		if started != nil {
+			started()
 		}
 		if contentType := resp.Header.Get("Content-Type"); !strings.HasPrefix(contentType, "text/event-stream") {
 			return fmt.Errorf("the engine answered the exec with %q, not an event stream", contentType)

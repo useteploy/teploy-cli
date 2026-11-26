@@ -70,6 +70,9 @@ type fakeSandboxEngine struct {
 	// loseCreateAnswer makes a create that may have made its run hang up
 	// without a word: the lost answer the contract says never to retry.
 	loseCreateAnswer bool
+	// loseExecAnswer is the same for an exec: the command may be running
+	// when the connection goes.
+	loseExecAnswer bool
 	// execHook, when set, answers every exec itself.
 	execHook func(w http.ResponseWriter, req sandbox.ExecRequest)
 }
@@ -264,6 +267,13 @@ func (e *fakeSandboxEngine) runRoute(w http.ResponseWriter, r *http.Request, res
 		var req sandbox.ExecRequest
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		e.execs = append(e.execs, req)
+		if e.loseExecAnswer {
+			conn, _, err := w.(http.Hijacker).Hijack()
+			if err == nil {
+				conn.Close()
+				return
+			}
+		}
 		// The stream is written outside the lock, as the daemon streams it.
 		e.mu.Unlock()
 		defer func() { e.mu.Lock() }()

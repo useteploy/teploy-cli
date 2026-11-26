@@ -567,6 +567,61 @@ func TestExecStreamThatEndsWithoutAnExit(t *testing.T) {
 	}
 }
 
+// started says when a 200 arrived, and only then. A caller that reports on
+// a command must tell an exec the engine refused (nothing ran) from one
+// whose stream it took and then lost, and from one that was never answered.
+func TestExecStartedIsSaidOnceA200Arrived(t *testing.T) {
+	cases := map[string]struct {
+		write   func(w http.ResponseWriter)
+		started bool // a 200 arrived
+		known   bool // OutcomeKnown: nothing ran, or the exit arrived
+	}{
+		"refused before the stream": {func(w http.ResponseWriter) {
+			problem(w, http.StatusConflict, "conflict", "run "+testID+" is stopped")
+		}, false, true},
+		"ran to its exit": {func(w http.ResponseWriter) {
+			startStream(w)
+			sseFrame(w, "exit", `{"exitCode":3,"timedOut":false}`)
+		}, true, true},
+		"dies after the 200": {func(w http.ResponseWriter) {
+			startStream(w)
+			sseFrame(w, "stdout", "half")
+		}, true, false},
+		"a 200 that is not a stream": {func(w http.ResponseWriter) {
+			w.Header().Set("Content-Type", "text/html")
+			io.WriteString(w, "<h1>login</h1>")
+		}, true, false},
+		"no answer": {func(w http.ResponseWriter) {
+			// Take the connection and hang up without a word.
+			conn, _, err := w.(http.Hijacker).Hijack()
+			if err == nil {
+				conn.Close()
+			}
+		}, false, false},
+	}
+	for name, c := range cases {
+		client := newTestClient(t, &recorder{}, func(w http.ResponseWriter, req *http.Request) { c.write(w) })
+		started := false
+		_, err := client.ExecStream(context.Background(), testID, ExecRequest{Cmd: "true"}, func(Stream, string) {}, func() { started = true })
+		if started != c.started {
+			t.Errorf("%s: started = %v, want %v", name, started, c.started)
+		}
+		if OutcomeKnown(err) != c.known {
+			t.Errorf("%s: OutcomeKnown = %v, want %v (%v)", name, !c.known, c.known, err)
+		}
+	}
+	// A request that did not leave never starts anything.
+	client := newTestClient(t, &recorder{}, guarded)
+	started := false
+	if _, err := client.ExecStream(context.Background(), "not-an-id", ExecRequest{Cmd: "true"}, func(Stream, string) {}, func() { started = true }); !NotSent(err) || started {
+		t.Errorf("an id that is not one: started = %v, err = %v", started, err)
+	}
+	// Exec is ExecStream without wanting to know.
+	if _, err := client.Exec(context.Background(), "not-an-id", ExecRequest{Cmd: "true"}, func(Stream, string) {}); !NotSent(err) {
+		t.Errorf("Exec: %v", err)
+	}
+}
+
 // The last frame may lack the blank line that ends it: the exit still counts.
 func TestExecExitWithoutItsClosingBlankLine(t *testing.T) {
 	client := newTestClient(t, &recorder{}, func(w http.ResponseWriter, req *http.Request) {

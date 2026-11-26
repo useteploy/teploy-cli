@@ -5,6 +5,7 @@ package cli
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"regexp"
 	"strings"
@@ -210,6 +211,113 @@ func TestSandboxExec(t *testing.T) {
 	err = h.run("exec", id, "--", "true")
 	if !errors.Is(err, errSandboxOutcomeUnknown) || classifyMachineError(err) != codeUncertainOutcome || h.out.String() != "half" {
 		t.Errorf("a stream that died: %v, output %q", err, h.out.String())
+	}
+}
+
+// A refusal before the stream ran nothing, so there is nothing to report
+// on: under --json stdout stays empty and the error envelope is the whole
+// answer. (It used to print an exec document with exit_code null, which the
+// contract reads as "the command may have finished".)
+func TestSandboxExecJSONRefusalPrintsOnlyTheError(t *testing.T) {
+	stopped := func(t *testing.T) (*sandboxHarness, []string) {
+		h := newInstalledSandboxHarness(t)
+		return h, []string{"exec", withRun(h, "stopped"), "--", "true"}
+	}
+	notThere := func(t *testing.T) (*sandboxHarness, []string) {
+		return newInstalledSandboxHarness(t), []string{"exec", sandboxTestID(9), "--", "true"}
+	}
+	badID := func(t *testing.T) (*sandboxHarness, []string) {
+		return newInstalledSandboxHarness(t), []string{"exec", "../v1/runs", "--", "true"}
+	}
+	full := func(t *testing.T) (*sandboxHarness, []string) {
+		h := newInstalledSandboxHarness(t)
+		h.engine.setExecHook(func(w http.ResponseWriter) {
+			sandboxProblem(w, http.StatusServiceUnavailable, "at-capacity", "the daemon is full")
+		})
+		return h, []string{"exec", withRun(h, "running"), "--", "true"}
+	}
+	unreachable := func(t *testing.T) (*sandboxHarness, []string) {
+		h := newInstalledSandboxHarness(t)
+		h.link.setTunnel("refused")
+		return h, []string{"exec", withRun(h, "running"), "--", "true"}
+	}
+	for _, c := range []struct {
+		name string
+		run  func(t *testing.T) (*sandboxHarness, []string)
+		code string
+	}{
+		{"a stopped sandbox", stopped, codeConflict},
+		{"a sandbox that is not there", notThere, codeInternal},
+		{"an id that is not one", badID, codeInternal},
+		{"an engine at capacity", full, codeInternal},
+		{"an engine that cannot be reached", unreachable, codeUnsupported},
+	} {
+		h, args := c.run(t)
+		h.flags.JSON = true
+		err := h.run(args...)
+		if err == nil {
+			t.Errorf("%s: the exec succeeded", c.name)
+			continue
+		}
+		if h.out.Len() != 0 {
+			t.Errorf("%s: a refused exec printed on stdout: %s", c.name, h.out.String())
+		}
+		if code := classifyMachineError(err); code != c.code {
+			t.Errorf("%s: the class is %s, want %s (%v)", c.name, code, c.code, err)
+		}
+	}
+
+	// An id that is not one never reaches the server at all.
+	h, args := badID(t)
+	if err := h.run(args...); err == nil || h.engine.execCount() != 0 || len(h.connected) != 0 {
+		t.Errorf("an id that is not one was sent: err %v, %d execs, connected to %v", err, h.engine.execCount(), h.connected)
+	}
+}
+
+// An answer that never came is not a document either. The command was
+// sent, so it may be running: that is the unknown outcome, and the exec is
+// not sent again.
+func TestSandboxExecWithALostAnswer(t *testing.T) {
+	for _, json := range []bool{false, true} {
+		h := newInstalledSandboxHarness(t)
+		id := withRun(h, "running")
+		engineState(h.engine, func() bool { h.engine.loseExecAnswer = true; return true })
+		h.flags.JSON = json
+		err := h.run("exec", id, "--", "rm -rf /tmp/x")
+		if err == nil || !errors.Is(err, errSandboxOutcomeUnknown) || classifyMachineError(err) != codeUncertainOutcome {
+			t.Errorf("--json %v: a lost answer is not the unknown outcome: %v (%s)", json, err, classifyMachineError(err))
+		}
+		for _, want := range []string{"was sent, but no answer from the engine arrived", "whether it ran is unknown", "it is not sent again"} {
+			if err != nil && !strings.Contains(err.Error(), want) {
+				t.Errorf("--json %v: the error does not say %q: %v", json, want, err)
+			}
+		}
+		if h.out.Len() != 0 {
+			t.Errorf("--json %v: an exec that was never answered printed on stdout: %s", json, h.out.String())
+		}
+		if h.engine.execCount() != 1 {
+			t.Errorf("--json %v: the engine was asked %d times; an exec is never sent twice", json, h.engine.execCount())
+		}
+	}
+}
+
+// A 200 says the engine took the command. When what follows is not the
+// stream, the command's exit is still not known: the document says so with
+// a null exit_code, and the error is the unknown outcome, not a failure.
+func TestSandboxExecAnsweredWithSomethingElse(t *testing.T) {
+	h := newInstalledSandboxHarness(t)
+	id := withRun(h, "running")
+	h.engine.setExecHook(func(w http.ResponseWriter) {
+		w.Header().Set("Content-Type", "text/html")
+		fmt.Fprint(w, "<h1>login</h1>")
+	})
+	h.flags.JSON = true
+	err := h.run("exec", id, "--", "true")
+	if !errors.Is(err, errSandboxOutcomeUnknown) || classifyMachineError(err) != codeUncertainOutcome {
+		t.Errorf("a 200 that is not the stream is not the unknown outcome: %v (%s)", err, classifyMachineError(err))
+	}
+	if doc := h.jsonDocument(); doc["exit_code"] != nil || doc["stdout"] != "" {
+		t.Errorf("the document is %v", doc)
 	}
 }
 

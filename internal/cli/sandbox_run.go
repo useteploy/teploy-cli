@@ -92,6 +92,10 @@ func runSandboxExec(ctx context.Context, flags *Flags, env *sandboxEnv, o sandbo
 			return fmt.Errorf("--workdir: %w", err)
 		}
 	}
+	// An id that is not one is refused before anything is opened.
+	if _, err := sandbox.ValidID(id); err != nil {
+		return err
+	}
 	d, err := openSandboxDaemon(ctx, env, flags, o.daemon)
 	if err != nil {
 		return err
@@ -99,34 +103,44 @@ func runSandboxExec(ctx context.Context, flags *Flags, env *sandboxEnv, o sandbo
 	defer d.Close()
 	req := sandbox.ExecRequest{Cmd: sandboxCommand(words), Cwd: workdir, TimeoutSec: timeoutSec, Env: commandEnv}
 
-	if !flags.JSON {
-		result, err := d.client.Exec(ctx, id, req, func(stream sandbox.Stream, chunk string) {
+	// Under --json the output is captured for the document; otherwise it is
+	// streamed as it arrives.
+	var stdout, stderr sandboxCapture
+	var print func(stream sandbox.Stream, chunk string)
+	if flags.JSON {
+		print = func(stream sandbox.Stream, chunk string) {
+			if stream == sandbox.Stderr {
+				stderr.write(chunk)
+				return
+			}
+			stdout.write(chunk)
+		}
+	} else {
+		print = func(stream sandbox.Stream, chunk string) {
 			if stream == sandbox.Stderr {
 				fmt.Fprint(env.errOut, chunk)
 				return
 			}
 			fmt.Fprint(env.out, chunk)
-		})
-		if err != nil {
-			return d.execFailure(ctx, id, err)
 		}
-		return sandboxExecStatus(result, wait)
 	}
-
-	var stdout, stderr sandboxCapture
+	started := false // the engine answered 200: the command is the engine's
 	start := env.now()
-	result, err := d.client.Exec(ctx, id, req, func(stream sandbox.Stream, chunk string) {
-		if stream == sandbox.Stderr {
-			stderr.write(chunk)
-			return
+	result, err := d.client.ExecStream(ctx, id, req, print, func() { started = true })
+
+	// The document is printed once the engine has taken the command, and
+	// only then: it says how the command ended, even when that is "not
+	// known" (a stream that died before the exit; exit_code is null). An
+	// exec the engine refused, or that was never answered, has nothing to
+	// report on: a document with a null exit_code would say "it may have
+	// finished", and nothing ran. Only the error envelope is printed.
+	if flags.JSON && started {
+		if err := writeJSONTo(env.out, sandboxExecEnvelope(d, id, result, err, env.now().Sub(start), stdout, stderr)); err != nil {
+			return err
 		}
-		stdout.write(chunk)
-	})
-	if err := writeJSONTo(env.out, sandboxExecEnvelope(d, id, result, err, env.now().Sub(start), stdout, stderr)); err != nil {
-		return err
 	}
 	if err != nil {
-		return d.execFailure(ctx, id, err)
+		return d.execFailure(ctx, id, err, started)
 	}
 	return sandboxExecStatus(result, wait)
 }
@@ -145,16 +159,29 @@ func sandboxCommand(words []string) string {
 	return strings.Join(quoted, " ")
 }
 
-// execFailure is the failure of an exec itself (not of the command it ran).
-// A stream that died before the exit frame leaves the command's fate
-// unknown: it is not reported as a failure.
-func (d *sandboxDaemon) execFailure(ctx context.Context, id string, err error) error {
-	if errors.Is(err, sandbox.ErrStreamEnded) || errors.Is(err, sandbox.ErrBadExit) {
+// execFailure is the failure of an exec itself (not of the command it
+// ran). started says whether the engine answered 200, i.e. took the
+// command.
+//
+// An exec the engine refused before the stream (404, 409, 503...), or
+// that was not sent at all, ran nothing: OutcomeKnown says so, and the
+// error is explained like that of any other request about a run. Anything
+// else after the request left leaves the command's fate unknown: the
+// stream is the only word on how it ended, and no exit arrived (the
+// stream died, or no answer came at all). That is not reported as a
+// failure: it is the unknown-outcome class.
+func (d *sandboxDaemon) execFailure(ctx context.Context, id string, err error, started bool) error {
+	if sandbox.OutcomeKnown(err) {
+		return d.explainRun(ctx, id, err)
+	}
+	if started {
 		return &sandboxUnknownOutcomeError{err: fmt.Errorf(
 			"the stream from sandbox %s on %s ended before its command's exit arrived, so whether the command finished is unknown (%v).\nClosing the stream ends the command on the engine's side",
 			id, d.server, err)}
 	}
-	return d.explainRun(ctx, id, err)
+	return &sandboxUnknownOutcomeError{err: fmt.Errorf(
+		"the command for sandbox %s on %s was sent, but no answer from the engine arrived (%v), so whether it ran is unknown.\nClosing the connection ends the command on the engine's side; it is not sent again",
+		id, d.server, err)}
 }
 
 // sandboxExecStatus is the command's own outcome as an error: nonzero is
