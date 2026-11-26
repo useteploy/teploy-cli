@@ -31,7 +31,7 @@ Every other command opens the SSH connection teploy always opens, reads the engi
 
 The server needs systemd and Docker, as `teploy setup` leaves them. `host` needs root or passwordless sudo. The other commands need the server's sshd to allow TCP forwarding, which is its default; one configured with `AllowTcpForwarding no` is told apart and said so.
 
-A daemon that was set up another way (by hand, or by teploy-ship) can be used without `host`: pass `--addr` with the address it listens on and `--token-file` with the path of its token.
+A daemon that was set up another way (by hand, or by teploy-ship) can be used without `host`: pass `--addr` with the address it listens on and `--token-file` with the path of its token. `--addr` has to be on the server's loopback, written as an IP (`127.0.0.1:7439`, `[::1]:7439`): the engine speaks plain HTTP, so the bearer token would travel to any other address unencrypted. An engine on another address or a name needs `--allow-remote-addr` as well, and only makes sense on a network you trust.
 
 ## Installing: `sandbox host`
 

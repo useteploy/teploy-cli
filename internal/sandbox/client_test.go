@@ -796,7 +796,7 @@ func TestClientIgnoresTheEnvironmentsProxy(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 	var dialed []string
-	client, err := New("engine.internal:7439", testToken, func(ctx context.Context, network, addr string) (net.Conn, error) {
+	client, err := NewRemote("engine.internal:7439", testToken, func(ctx context.Context, network, addr string) (net.Conn, error) {
 		dialed = append(dialed, addr)
 		return net.Dial(network, server.Listener.Addr().String())
 	})
@@ -843,13 +843,12 @@ func TestDialFailure(t *testing.T) {
 
 func TestParseAddr(t *testing.T) {
 	for in, want := range map[string]string{
-		"127.0.0.1:7439":        "http://127.0.0.1:7439",
-		":7439":                 "http://127.0.0.1:7439",
-		" 127.0.0.1:7439 ":      "http://127.0.0.1:7439",
-		"10.0.0.5:7439":         "http://10.0.0.5:7439",
-		"sandbox.internal:7439": "http://sandbox.internal:7439",
-		"[::1]:7439":            "http://[::1]:7439",
-		"[fd00::5]:7439":        "http://[fd00::5]:7439",
+		"127.0.0.1:7439":          "http://127.0.0.1:7439",
+		"127.5.4.3:7439":          "http://127.5.4.3:7439",
+		":7439":                   "http://127.0.0.1:7439",
+		" 127.0.0.1:7439 ":        "http://127.0.0.1:7439",
+		"[::1]:7439":              "http://[::1]:7439",
+		"[::ffff:127.0.0.1]:7439": "http://[::ffff:127.0.0.1]:7439",
 	} {
 		if addr, base, err := ParseAddr(in); err != nil || addr != strings.TrimPrefix(want, "http://") || base != want {
 			t.Errorf("ParseAddr(%q) = %q, %q, %v; want %q", in, addr, base, err, want)
@@ -862,5 +861,58 @@ func TestParseAddr(t *testing.T) {
 	}
 	if _, err := New("127.0.0.1:7439", "  ", nil); err == nil {
 		t.Error("an empty token was accepted")
+	}
+}
+
+// The bearer token travels to the engine's address in cleartext, so an
+// address that is not the server's loopback is refused: another host, a
+// private one too, a name (even one that usually means the loopback), and
+// an address that stands for any interface.
+func TestParseAddrRefusesWhatIsNotTheLoopback(t *testing.T) {
+	for _, addr := range []string{"203.0.113.7:80", "10.0.0.5:7439", "192.168.1.2:7439", "172.17.0.1:7439", "100.64.0.7:7439", "[fd00::5]:7439", "[fe80::1]:7439", "0.0.0.0:7439", "[::]:7439", "localhost:7439", "attacker.example:443", "127.0.0.1.example.com:7439", "127.1:7439"} {
+		_, _, err := ParseAddr(addr)
+		if !errors.Is(err, ErrOffLoopback) {
+			t.Errorf("ParseAddr(%q) = %v, want a refusal off the loopback; the token would travel there in cleartext", addr, err)
+		}
+	}
+	// The same addresses are host:port, and are taken with the opt-in.
+	for _, addr := range []string{"10.0.0.5:7439", "sandbox.internal:7439", "[fd00::5]:7439", "localhost:7439"} {
+		if got, _, err := ParseAddrRemote(addr); err != nil || got != addr {
+			t.Errorf("ParseAddrRemote(%q) = %q, %v; want the address, with the opt-in", addr, got, err)
+		}
+	}
+	// The opt-in lifts one rule, not the others.
+	for _, in := range []string{"", "7439", "127.0.0.1", "http://10.0.0.5:7439", "10.0.0.5:7439/path"} {
+		if _, _, err := ParseAddrRemote(in); err == nil {
+			t.Errorf("ParseAddrRemote(%q) was accepted", in)
+		}
+	}
+}
+
+// A client for an address off the loopback can only be made by asking for
+// it: New takes the loopback, as ParseAddr does, and NewRemote is the
+// opt-in. So no caller sends the token anywhere but the loopback by
+// accident.
+func TestOnlyNewRemoteTakesAnAddressOffTheLoopback(t *testing.T) {
+	if _, err := New("10.0.0.5:7439", testToken, nil); !errors.Is(err, ErrOffLoopback) {
+		t.Errorf("New for an address off the loopback: %v, want a refusal", err)
+	}
+	dialed := false
+	dial := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		dialed = true
+		return nil, errors.New("nothing there")
+	}
+	client, err := NewRemote("10.0.0.5:7439", testToken, dial)
+	if err != nil {
+		t.Fatalf("NewRemote: %v", err)
+	}
+	if client.Addr() != "10.0.0.5:7439" {
+		t.Errorf("the client is for %q", client.Addr())
+	}
+	// And it goes where it was told to, not through a proxy.
+	t.Setenv("HTTPS_PROXY", "http://127.0.0.1:9")
+	_, _ = client.Capacity(context.Background())
+	if !dialed {
+		t.Error("the client did not dial its own address")
 	}
 }

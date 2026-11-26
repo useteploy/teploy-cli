@@ -111,6 +111,49 @@ func TestSandboxNewValidatesItsFlags(t *testing.T) {
 	}
 }
 
+// The engine speaks plain HTTP, so the bearer token would travel to
+// whatever --addr names, unencrypted. An address that is not the server's
+// loopback is refused, before anything is connected, and is taken with
+// --allow-remote-addr.
+func TestSandboxAddrOffTheLoopbackNeedsTheOptIn(t *testing.T) {
+	for _, addr := range []string{"10.0.0.5:7439", "attacker.example:443", "localhost:7439", "[fd00::5]:7439"} {
+		h := newInstalledSandboxHarness(t)
+		err := h.run("ls", "--addr", addr)
+		for _, want := range []string{"engine address \"" + addr + "\" is not on the server's loopback", "the bearer token would be sent there in cleartext", "pass --allow-remote-addr", "only on a network you trust"} {
+			if err == nil || !strings.Contains(err.Error(), want) {
+				t.Errorf("--addr %s: the error does not say %q: %v", addr, want, err)
+			}
+		}
+		if len(h.connected) != 0 || h.link.dials != 0 {
+			t.Errorf("--addr %s: the server was connected to (%d) or the address dialed (%d) for an address that was refused", addr, len(h.connected), h.link.dials)
+		}
+		h = newInstalledSandboxHarness(t)
+		h.flags.JSON = true
+		if err := h.run("ls", "--addr", addr); err == nil || classifyMachineError(err) != codeInternal || h.out.Len() != 0 {
+			t.Errorf("--addr %s under --json: %v (%s), stdout %q", addr, err, classifyMachineError(err), h.out.String())
+		}
+	}
+
+	// With the opt-in the address is used.
+	h := newInstalledSandboxHarness(t)
+	if err := h.run("ls", "--addr", "10.0.0.5:7439", "--allow-remote-addr"); err != nil || !strings.Contains(h.out.String(), "No sandboxes on prod") {
+		t.Errorf("with --allow-remote-addr: %v, output %q", err, h.out.String())
+	}
+	if len(h.connected) != 1 {
+		t.Errorf("connected to %v", h.connected)
+	}
+
+	// Every command but `host` (which installs at the loopback itself) has it.
+	for _, cmd := range newSandboxCmd(&Flags{}).Commands() {
+		if cmd.Name() == "host" {
+			continue
+		}
+		if cmd.Flags().Lookup("allow-remote-addr") == nil {
+			t.Errorf("`sandbox %s` has no --allow-remote-addr", cmd.Name())
+		}
+	}
+}
+
 func TestSandboxExecTakesTheCommandAfterTheDash(t *testing.T) {
 	id := sandboxTestID(0)
 	for _, args := range [][]string{{"exec"}, {"exec", id}, {"exec", id, "--"}, {"exec", id, "echo", "hi"}} {

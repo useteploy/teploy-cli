@@ -64,11 +64,34 @@ type Client struct {
 	dial    DialFunc
 }
 
+// ErrOffLoopback marks an engine address that is not on the server's
+// loopback. The bearer token is sent to the address in cleartext HTTP, so
+// ParseAddr refuses anything else: the caller has to opt in, with
+// ParseAddrRemote and NewRemote.
+var ErrOffLoopback = errors.New("is not on the server's loopback, and the bearer token would be sent there in cleartext")
+
 // ParseAddr validates an engine address as the SERVER sees it (host:port,
 // or :port for the server's loopback) and returns it with the engine's
-// base URL there. The host is never resolved here: with a tunnel, the dial
-// function decides where a connection goes.
+// base URL there. The host has to be the server's loopback, as an IP
+// literal (127.0.0.0/8, ::1) or empty: the token travels to it in
+// cleartext. It is never resolved, and a name is not taken, even
+// `localhost`: with a tunnel the server's resolver decides where a name
+// goes, and the client cannot see it. An address off the loopback is
+// refused with an error that wraps ErrOffLoopback; ParseAddrRemote takes
+// one.
 func ParseAddr(raw string) (addr, baseURL string, err error) {
+	return parseAddr(raw, false)
+}
+
+// ParseAddrRemote is ParseAddr for an address off the server's loopback:
+// any host, a name included. Only for a user who opted in (the teploy
+// CLI's --allow-remote-addr): the engine speaks plain HTTP, so the bearer
+// token travels to that address as it is.
+func ParseAddrRemote(raw string) (addr, baseURL string, err error) {
+	return parseAddr(raw, true)
+}
+
+func parseAddr(raw string, remote bool) (addr, baseURL string, err error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return "", "", errors.New("the engine's address is empty")
@@ -87,14 +110,35 @@ func ParseAddr(raw string) (addr, baseURL string, err error) {
 	if host == "" {
 		host = "127.0.0.1"
 	}
+	if !remote && !loopback(host) {
+		return "", "", fmt.Errorf("engine address %q %w", raw, ErrOffLoopback)
+	}
 	addr = net.JoinHostPort(host, port)
 	return addr, "http://" + addr, nil
 }
 
-// New returns a client for the engine at addr (as ParseAddr accepts it). A
-// nil dial uses net/http's own.
+// loopback says whether host is a loopback address written as one.
+func loopback(host string) bool {
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+// New returns a client for the engine at addr, as ParseAddr accepted it:
+// the server's loopback. A nil dial uses net/http's own.
 func New(addr, token string, dial DialFunc) (*Client, error) {
-	_, baseURL, err := ParseAddr(addr)
+	return newClient(addr, token, dial, false)
+}
+
+// NewRemote is New for an engine off the server's loopback, as
+// ParseAddrRemote accepted it. It is the one way this package sends the
+// token anywhere but the loopback, so a caller cannot end up there
+// without having asked.
+func NewRemote(addr, token string, dial DialFunc) (*Client, error) {
+	return newClient(addr, token, dial, true)
+}
+
+func newClient(addr, token string, dial DialFunc, remote bool) (*Client, error) {
+	_, baseURL, err := parseAddr(addr, remote)
 	if err != nil {
 		return nil, err
 	}

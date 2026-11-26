@@ -157,6 +157,9 @@ func newSandboxCmdWithEnv(flags *Flags, env *sandboxEnv) *cobra.Command {
 type sandboxDaemonOptions struct {
 	addr      string
 	tokenFile string
+	// allowRemoteAddr lets addr name an address off the server's loopback
+	// (--allow-remote-addr). Off it, the token is never sent there.
+	allowRemoteAddr bool
 }
 
 func (o sandboxDaemonOptions) withDefaults() sandboxDaemonOptions {
@@ -172,6 +175,7 @@ func (o sandboxDaemonOptions) withDefaults() sandboxDaemonOptions {
 func bindSandboxDaemonFlags(cmd *cobra.Command, o *sandboxDaemonOptions) {
 	cmd.Flags().StringVar(&o.addr, "addr", "", "the engine's host:port on the server (default "+sandboxDefaultAddr+")")
 	cmd.Flags().StringVar(&o.tokenFile, "token-file", "", "the engine's bearer token file on the server (default "+sandboxTokenFile+")")
+	cmd.Flags().BoolVar(&o.allowRemoteAddr, "allow-remote-addr", false, "let --addr name an address off the server's loopback (another host, or a name). The engine speaks plain HTTP, so the bearer token travels to it unencrypted: only on a network you trust")
 }
 
 // sandboxDaemon is the engine on one server: the SSH connection, and a
@@ -181,9 +185,12 @@ type sandboxDaemon struct {
 	host      string // the SSH host
 	addr      string
 	tokenFile string
-	link      ssh.Forwarder
-	client    *sandbox.Client
-	health    sandbox.Health
+	// allowRemoteAddr: addr may be off the server's loopback, because the
+	// user passed --allow-remote-addr.
+	allowRemoteAddr bool
+	link            ssh.Forwarder
+	client          *sandbox.Client
+	health          sandbox.Health
 }
 
 // Close releases the SSH connection.
@@ -214,15 +221,26 @@ func openSandboxDaemon(ctx context.Context, env *sandboxEnv, flags *Flags, o san
 		return nil, fmt.Errorf("resolving server %q: %w", flags.Host, err)
 	}
 	o = o.withDefaults()
-	addr, _, err := sandbox.ParseAddr(o.addr)
+	// The engine speaks plain HTTP, so the bearer token would travel to
+	// whatever --addr names, unencrypted. It is only ever sent to the
+	// server's loopback unless the user opted out of that with
+	// --allow-remote-addr.
+	parseAddr := sandbox.ParseAddr
+	if o.allowRemoteAddr {
+		parseAddr = sandbox.ParseAddrRemote
+	}
+	addr, _, err := parseAddr(o.addr)
 	if err != nil {
+		if errors.Is(err, sandbox.ErrOffLoopback) {
+			return nil, fmt.Errorf("%w.\nTo use an engine on another address, pass --allow-remote-addr (the token then travels to it unencrypted, so only on a network you trust)", err)
+		}
 		return nil, err
 	}
 	link, err := env.connect(ctx, host, user, key)
 	if err != nil {
 		return nil, fmt.Errorf("connecting to %s: %w", flags.Host, err)
 	}
-	d := &sandboxDaemon{server: flags.Host, host: host, addr: addr, tokenFile: o.tokenFile, link: link}
+	d := &sandboxDaemon{server: flags.Host, host: host, addr: addr, tokenFile: o.tokenFile, allowRemoteAddr: o.allowRemoteAddr, link: link}
 	if err := d.open(ctx); err != nil {
 		_ = link.Close()
 		return nil, err
@@ -356,11 +374,16 @@ func (d *sandboxDaemon) serviceLog(ctx context.Context) string {
 // the given token: every request travels on a connection forwarded through
 // the SSH connection.
 func (d *sandboxDaemon) dialEngine(token string) (*sandbox.Client, error) {
-	return sandbox.New(d.addr, token, func(ctx context.Context, network, _ string) (net.Conn, error) {
+	dial := func(ctx context.Context, network, _ string) (net.Conn, error) {
 		// Always the engine's address: a request cannot be steered to
 		// another through its URL.
 		return d.link.ForwardDial(ctx, d.addr)
-	})
+	}
+	// sandbox.New takes the loopback only; NewRemote is the opt-in.
+	if d.allowRemoteAddr {
+		return sandbox.NewRemote(d.addr, token, dial)
+	}
+	return sandbox.New(d.addr, token, dial)
 }
 
 // sandboxListener is what answers at the engine's address on the server.

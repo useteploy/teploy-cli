@@ -37,6 +37,11 @@ func TestReviewParseAddrRefusesNonLoopback(t *testing.T) {
 			t.Errorf("ParseAddr(%q) accepted a non-loopback address; the token would travel there in cleartext", addr)
 		}
 	}
+	// 10.0.0.5 is taken with the opt-in (--allow-remote-addr: ParseAddrRemote
+	// here), and only with it.
+	if _, _, err := sandbox.ParseAddrRemote("10.0.0.5:7439"); err != nil {
+		t.Errorf("with --allow-remote-addr, ParseAddrRemote(%q) refused the address: %v", "10.0.0.5:7439", err)
+	}
 }
 
 // A command's own exit status is classified as an infrastructure failure.
