@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"os/exec"
 	"strings"
 	"testing"
 
@@ -240,5 +241,22 @@ func TestExitStatus(t *testing.T) {
 	}
 	if got := exitStatus(fmt.Errorf("wrapped: %w", &sandboxExecError{err: errors.New("x")})); got != sandboxExecFailure {
 		t.Errorf("a failure of exec's own through a wrap is %d, want %d", got, sandboxExecFailure)
+	}
+}
+
+// A local tool's failure (docker, rsync, an editor, a static build), wrapped
+// into any other command's error, is still 1: its *exec.ExitError has an
+// ExitCode() of its own, which must never become teploy's status (2 is
+// drift's CI signal; rsync's 23 or a signal's -1 mean nothing to a caller).
+func TestALocalToolsExitStatusIsNotTeploys(t *testing.T) {
+	for _, code := range []int{2, 23} {
+		err := exec.Command("sh", "-c", fmt.Sprintf("exit %d", code)).Run()
+		var exitErr *exec.ExitError
+		if !errors.As(err, &exitErr) {
+			t.Fatalf("sh exit %d gave %v, want an *exec.ExitError", code, err)
+		}
+		if got := exitStatus(fmt.Errorf("static build: %w", err)); got != 1 {
+			t.Errorf("a wrapped local tool exiting %d makes teploy exit %d, want 1", code, got)
+		}
 	}
 }

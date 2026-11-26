@@ -779,19 +779,32 @@ func (d *sandboxDaemon) putBack(ctx context.Context, env *sandboxEnv, progress i
 		what = "the previous binary (" + previousBinary + ")"
 	}
 	fmt.Fprintf(progress, "\nThe engine did not answer with what this run changed. Putting back %s and starting the service again...\n", what)
+	// Both are tried whatever the other did, and the error says what each
+	// one came to: an old binary under a new service file (or the other way
+	// round) is not "put back", and the person reading it must know which
+	// half to finish by hand.
+	var failed []string
+	var done []string
 	if previousBinary != "" {
 		if _, err := d.link.Run(ctx, fmt.Sprintf("%smv -f -- %s %s", sudo, ssh.ShellQuote(sandboxEnginePrevPath), ssh.ShellQuote(sandboxEnginePath))); err != nil {
-			return fmt.Errorf("%v\n\nThe previous engine (%s) could not be put back: %w.\nIt is still at %s: put it back with `mv -f %s %s` on %s, then `systemctl restart %s`",
-				cause, previousBinary, err, sandboxEnginePrevPath, sandboxEnginePrevPath, sandboxEnginePath, d.server, sandboxUnitName)
+			failed = append(failed, fmt.Sprintf("The previous engine (%s) could not be put back: %v.\nIt is still at %s: put it back with `mv -f %s %s` on %s.",
+				previousBinary, err, sandboxEnginePrevPath, sandboxEnginePrevPath, sandboxEnginePath, d.server))
+		} else {
+			done = append(done, "The previous engine ("+previousBinary+") was put back.")
 		}
 	}
 	if previousUnit != "" {
 		if err := installSandboxUnit(ctx, d.link, sudo, stage, previousUnit); err != nil {
-			return fmt.Errorf("%v\n\nThe service file that was there could not be put back: %w", cause, err)
+			failed = append(failed, fmt.Sprintf("The service file that was there could not be put back: %v.\n%s still holds the one this run wrote.", err, sandboxUnitPath))
+		} else if err := daemonReload(ctx, d.link, sudo); err != nil {
+			failed = append(failed, fmt.Sprintf("The service file that was there was put back, but systemd did not reload it: %v.", err))
+		} else {
+			done = append(done, "The service file that was there was put back.")
 		}
-		if err := daemonReload(ctx, d.link, sudo); err != nil {
-			return fmt.Errorf("%v\n\n%w", cause, err)
-		}
+	}
+	if len(failed) > 0 {
+		msg := strings.Join(append(done, failed...), "\n")
+		return fmt.Errorf("%v\n\n%s\nFinish that by hand, then `systemctl daemon-reload` and `systemctl restart %s` on %s. The service was not restarted", cause, msg, sandboxUnitName, d.server)
 	}
 	if _, err := d.link.Run(ctx, sudo+"systemctl restart "+sandboxUnitName); err != nil {
 		return fmt.Errorf("%v\n\nIt was put back, but its service could not be restarted: %w", cause, err)

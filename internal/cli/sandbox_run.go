@@ -239,17 +239,17 @@ type sandboxCommandError struct {
 	err             error
 }
 
-func (e *sandboxCommandError) Error() string { return e.err.Error() }
-func (e *sandboxCommandError) Unwrap() error { return e.err }
-func (e *sandboxCommandError) ExitCode() int { return e.code }
+func (e *sandboxCommandError) Error() string         { return e.err.Error() }
+func (e *sandboxCommandError) Unwrap() error         { return e.err }
+func (e *sandboxCommandError) teployExitStatus() int { return e.code }
 
 // sandboxExecError is any other failure of `sandbox exec`: the command's
 // status is not known, or there was none.
 type sandboxExecError struct{ err error }
 
-func (e *sandboxExecError) Error() string { return e.err.Error() }
-func (e *sandboxExecError) Unwrap() error { return e.err }
-func (e *sandboxExecError) ExitCode() int { return sandboxExecFailure }
+func (e *sandboxExecError) Error() string         { return e.err.Error() }
+func (e *sandboxExecError) Unwrap() error         { return e.err }
+func (e *sandboxExecError) teployExitStatus() int { return sandboxExecFailure }
 
 // sandboxExecStatus is the command's own outcome as an error: nonzero is
 // nonzero, a timeout says so, and -1 is the sandbox failing to run it.

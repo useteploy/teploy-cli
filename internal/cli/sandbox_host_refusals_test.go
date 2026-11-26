@@ -630,3 +630,40 @@ func TestSandboxHostSaysWhyWhenTheEngineDoesNotAnswer(t *testing.T) {
 		}
 	}
 }
+
+// When the previous binary cannot be put back, the service file the run
+// rewrote is still put back, and the error says which half happened and
+// which did not, and that the service was not restarted: never "put back".
+func TestSandboxHostReportsAHalfDonePutBack(t *testing.T) {
+	h := newSandboxHarness(t, hostCommands(sandboxProbeLines(true, true, true, "active", "0.0.9", true), tokenCommand(sandboxTokenFile, sandboxTestToken),
+		ssh.MockCommand{Match: catUnit, Output: olderUnit},
+		ssh.MockCommand{Match: putBackPrev, Err: errors.New("read-only file system")},
+	)...)
+	withRun(h, "running")
+	engineNeverAnswersAgain(h)
+	h.release(engineBinary)
+	h.env.startTimeout = 3 * time.Second
+	err := h.run("host", "prod", "--yes")
+	if err == nil {
+		t.Fatal("an engine that never answered read as upgraded")
+	}
+	for _, want := range []string{
+		"The previous engine (0.0.9) could not be put back: read-only file system",
+		"The service file that was there was put back.",
+		"The service was not restarted",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the error does not say %q:\n%v", want, err)
+		}
+	}
+	if strings.Contains(err.Error(), "was put back and restarted") {
+		t.Errorf("a half-done put-back reads as done:\n%v", err)
+	}
+	calls := h.link.Calls
+	if !callsInOrder(calls, putBackPrev, "install -o 0 -g 0 -m 0644 "+stagedUnit) {
+		t.Errorf("the service file was not put back after the binary failed to be:\n%s", strings.Join(calls, "\n"))
+	}
+	if count(calls, "systemctl restart teploy-sandbox.service") != 1 {
+		t.Errorf("the service was restarted after a half-done put-back:\n%s", strings.Join(calls, "\n"))
+	}
+}

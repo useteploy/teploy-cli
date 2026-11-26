@@ -187,11 +187,14 @@ func runRoot(root *cobra.Command, errOut io.Writer) int {
 // signal), unless the error carries one of its own. One command's do:
 // `sandbox exec` returns the command's own status, as ssh and docker exec
 // do, and 255 for a failure of teploy's own (sandboxCommandError,
-// sandboxExecError).
+// sandboxExecError). The method is unexported on purpose: an
+// *exec.ExitError from a local tool (docker, rsync, an editor, a static
+// build) has ExitCode() too, and wrapped into any other command's error it
+// must still exit 1, never the tool's own status.
 func exitStatus(err error) int {
-	var status interface{ ExitCode() int }
+	var status interface{ teployExitStatus() int }
 	if errors.As(err, &status) {
-		return status.ExitCode()
+		return status.teployExitStatus()
 	}
 	return 1
 }
