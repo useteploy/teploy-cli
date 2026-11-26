@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://teploy.github.io/contracts/schema/sandbox-copy-result.schema.json",
+  "title": "`teploy sandbox cp --json` (rev 23, sandbox-v1): one file copied to or from a sandbox.",
+  "type": "object",
+  "required": [
+    "machine_interface",
+    "server",
+    "host",
+    "run_id",
+    "path",
+    "direction",
+    "bytes"
+  ],
+  "properties": {
+    "machine_interface": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "server": {
+      "type": "string",
+      "description": "The server as the command was given it (--host)."
+    },
+    "host": {
+      "type": "string",
+      "description": "The SSH host the server resolved to."
+    },
+    "run_id": {
+      "type": "string",
+      "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+    },
+    "path": {
+      "type": "string",
+      "description": "The file's path relative to the sandbox's /work."
+    },
+    "direction": {
+      "type": "string",
+      "enum": [
+        "to_sandbox",
+        "from_sandbox"
+      ]
+    },
+    "bytes": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "How many bytes were copied."
+    }
+  }
+}

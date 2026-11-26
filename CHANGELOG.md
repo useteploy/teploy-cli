@@ -27,6 +27,18 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
   owner/admin role to create and delete) and where the organization id is.
   `TEPLOY_CLOUD_URL` selects another instance; plain http is refused except to
   localhost.
+- `teploy sandbox`: sandboxes on a server the user manages (early access, self-hosted).
+  `host <server>` installs the sandbox engine (teploy-sandbox: a pinned release, its
+  checksum checked, never built on the server) as a systemd service bound to the server's
+  loopback. The other commands reach it through the SSH connection, with the engine's
+  bearer token, the way teploy-ship talks to its daemon: `new`, `ls`, `exec <id> -- <cmd>`,
+  `cp`, `stop`, `resume`, `fork`, `rm`. The docker driver is the target; `--driver vm` opts
+  into the experimental one. An engine that is not installed (with `teploy sandbox host` to
+  run), not running (with the commands that show why and start it), or without the driver
+  asked for is said as such, and is error-envelope code `unsupported`; a create, fork or exec
+  whose outcome is unknown is `uncertain-outcome`. Every `--json` document carries
+  `machine_interface` (capability `sandbox-v1`, contracts corpus rev 23). docs/sandbox.md.
+  `host` needs a published teploy-sandbox release for the version it pins.
 
 ## [0.1.55] - 2026-11-06
 

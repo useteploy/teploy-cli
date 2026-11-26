@@ -9,6 +9,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/useteploy/teploy/internal/config"
+	"github.com/useteploy/teploy/internal/sandbox"
 )
 
 // Structured error envelope for machine mode (X02 §2.3, S3-lite wiring).
@@ -34,10 +35,14 @@ const (
 	// internal).
 	codeTargetUnreachable = "target-unreachable"
 	// The requested verb needs a capability this binary lacks; names the
-	// remedy (UNMIGRATED: currently internal).
+	// remedy. Migrated for the sandbox engine only (not installed on the
+	// server, its service not running, or without the driver asked for);
+	// every other site stays internal until its migration.
 	codeUnsupported = "unsupported"
-	// Idempotency/ambiguity refusal — e.g. the ambiguous-preview class
-	// (UNMIGRATED: currently internal).
+	// Idempotency/ambiguity refusal — e.g. the ambiguous-preview class.
+	// Migrated for a plan/apply drift, a config conflict and a sandbox in
+	// the wrong state (the engine's 409); every other site stays internal
+	// until its migration.
 	codeConflict = "conflict"
 	// The effect's fate is unknown pending reconciliation; never
 	// rendered or recorded as failure. Wired for interrupted commands
@@ -96,14 +101,21 @@ func refuseAdmission(err error) error {
 // crash-window machinery treats every interrupted window as INSPECT),
 // which is precisely the class automation must not render as a plain
 // failure. A `cloud server create` whose request outcome could not be
-// established (errCloudPurchaseUnknown) is the same class. Everything else
-// is internal until its site is migrated (S2 generalization).
+// established (errCloudPurchaseUnknown) is the same class, and so is a
+// sandbox create, fork or exec whose outcome could not be known
+// (errSandboxOutcomeUnknown). A sandbox engine that cannot serve a request
+// (not installed, not running, or without the driver asked for) is
+// unsupported. Everything else is internal until its site is migrated (S2
+// generalization).
 func classifyMachineError(err error) string {
 	switch {
-	case errors.Is(err, errPlanDrift), errors.Is(err, errConfigConflict):
+	case errors.Is(err, errPlanDrift), errors.Is(err, errConfigConflict),
+		sandbox.IsConflict(err), errors.Is(err, errSandboxWrongState):
 		return codeConflict
+	case errors.Is(err, errSandboxEngineUnavailable):
+		return codeUnsupported
 	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded),
-		errors.Is(err, errCloudPurchaseUnknown):
+		errors.Is(err, errCloudPurchaseUnknown), errors.Is(err, errSandboxOutcomeUnknown):
 		return codeUncertainOutcome
 	case errors.Is(err, config.ErrInvalidConfig),
 		errors.Is(err, config.ErrNoConfig),
@@ -129,10 +141,18 @@ func writeMachineErrorEnvelope(out io.Writer, err error) error {
 		if errors.Is(err, errConfigConflict) {
 			message = "config changed since it was read"
 		}
+		if sandbox.IsConflict(err) || errors.Is(err, errSandboxWrongState) {
+			message = "the sandbox is in the wrong state for this request"
+		}
+	case codeUnsupported:
+		message = "the sandbox engine cannot serve this request on this server"
 	case codeUncertainOutcome:
 		message = "interrupted — outcome unknown until reconciled"
 		if errors.Is(err, errCloudPurchaseUnknown) {
 			message = "server purchase outcome unknown — check `teploy cloud servers`"
+		}
+		if errors.Is(err, errSandboxOutcomeUnknown) {
+			message = "sandbox request outcome unknown — list the sandboxes before trying again"
 		}
 	}
 	return json.NewEncoder(out).Encode(machineErrorEnvelope{

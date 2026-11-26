@@ -586,6 +586,19 @@ teploy cloud server attach <id>          # finish a bought server if create stop
 teploy cloud server delete web1
 ```
 
+### Sandboxes (early access, self-hosted)
+
+`teploy sandbox` runs isolated sandboxes on a server you already manage with teploy. It is early access and self-hosted: the engine (`teploy-sandbox`) is installed on your server as a systemd service bound to its loopback, and the commands reach it over SSH. See [docs/sandbox.md](docs/sandbox.md).
+
+```
+teploy sandbox host prod                               # install and start the engine (a pinned, checksum-checked release)
+teploy sandbox new --host prod --image alpine:3.20     # create a sandbox and print its id
+teploy sandbox ls --host prod                          # every sandbox on the server
+teploy sandbox exec <id> --host prod -- echo hello     # run a command in one, streaming its output
+teploy sandbox cp <id>:out/report.pdf . --host prod    # copy a file out (or in)
+teploy sandbox stop | resume | fork | rm <id> --host prod
+```
+
 ### Domains
 
 ```bash

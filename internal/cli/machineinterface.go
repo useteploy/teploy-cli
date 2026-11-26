@@ -231,6 +231,21 @@ const (
 	// and never re-posts it; an unknown outcome is reconciled by listing
 	// and adopting the one new server of the name, else uncertain-outcome.
 	CapCloudV1 = "cloud-v1"
+	// CapSandboxV1: `teploy sandbox` — sandboxes on a server the user
+	// manages (early access, self-hosted). The engine is the teploy-sandbox
+	// daemon, reached over the SSH connection; the install is a pinned
+	// release with its checksum checked. Every --json document carries
+	// machine_interface: sandbox-run-result (`new|stop|resume|fork --json`),
+	// sandbox-runs-envelope (`ls --json`, with the engine's driver),
+	// sandbox-exec-result (`exec --json`: captured output, exit_code null
+	// when the stream died before the exit), sandbox-destroy-result (`rm
+	// --yes --json`), sandbox-copy-result (`cp --json`) and
+	// sandbox-host-result (`host --yes --json`: install, upgrade, start or
+	// unchanged). An engine that is not installed, not running, or without
+	// the driver asked for is error-envelope code `unsupported`; a create,
+	// fork or exec whose outcome is unknown is `uncertain-outcome`; the
+	// engine's 409 is `conflict`. Event kind `sandbox.host` under `_fleet`.
+	CapSandboxV1 = "sandbox-v1"
 )
 
 // MachineCapabilities returns every capability token this build
@@ -279,7 +294,8 @@ func MachineCapabilities() []string {
 		CapServerAuditV1,
 		CapServerSiblingsV1,
 		CapBackupSetupV1,
-		CapCloudV1}
+		CapCloudV1,
+		CapSandboxV1}
 	sort.Strings(tokens)
 	return tokens
 }

@@ -149,6 +149,7 @@ func NewRootCmd(version string) *cobra.Command {
 	root.AddCommand(newNetworkCmd(flags))
 	root.AddCommand(newServerCmd(flags))
 	root.AddCommand(newCloudCmd(flags))
+	root.AddCommand(newSandboxCmd(flags))
 	root.AddCommand(newScaleCmd(flags))
 	root.AddCommand(newAutoDeployCmd(flags))
 	root.AddCommand(newMaintenanceCmd(flags))

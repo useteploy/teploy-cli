@@ -1,0 +1,9 @@
+{
+  "machine_interface": 2,
+  "server": "prod",
+  "host": "203.0.113.10",
+  "run_id": "01JCV5ZK3Q7X9B2D4E6F8A0B01",
+  "path": "app.tar.gz",
+  "direction": "to_sandbox",
+  "bytes": 7
+}

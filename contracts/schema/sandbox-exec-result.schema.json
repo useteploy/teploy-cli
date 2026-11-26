@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://teploy.github.io/contracts/schema/sandbox-exec-result.schema.json",
+  "title": "`teploy sandbox exec --json` (rev 23, sandbox-v1): how the command ended, with its output captured instead of streamed. The document is printed when the command exits nonzero too (teploy then exits 1).",
+  "type": "object",
+  "required": [
+    "machine_interface",
+    "server",
+    "host",
+    "run_id",
+    "exit_code",
+    "timed_out",
+    "duration_ms",
+    "stdout",
+    "stderr",
+    "truncated"
+  ],
+  "properties": {
+    "machine_interface": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "server": {
+      "type": "string",
+      "description": "The server as the command was given it (--host)."
+    },
+    "host": {
+      "type": "string",
+      "description": "The SSH host the server resolved to."
+    },
+    "run_id": {
+      "type": "string",
+      "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+    },
+    "exit_code": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "description": "The command's exit status; -1 when the sandbox itself could not run the command (stderr says why); null when the stream ended before the command's exit was known, in which case whether it finished is unknown."
+    },
+    "timed_out": {
+      "type": "boolean",
+      "description": "The command's own timeout ended it."
+    },
+    "duration_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "stdout": {
+      "type": "string",
+      "description": "The command's standard output, at most 1 MiB."
+    },
+    "stderr": {
+      "type": "string",
+      "description": "The command's standard error, at most 1 MiB."
+    },
+    "truncated": {
+      "type": "boolean",
+      "description": "A stream was longer than the capture and was cut."
+    }
+  }
+}

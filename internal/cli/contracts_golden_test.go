@@ -12,6 +12,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -27,6 +28,7 @@ import (
 	"github.com/useteploy/teploy/internal/gitsource"
 	"github.com/useteploy/teploy/internal/preview"
 	"github.com/useteploy/teploy/internal/releasemeta"
+	"github.com/useteploy/teploy/internal/sandbox"
 	"github.com/useteploy/teploy/internal/ssh"
 )
 
@@ -814,4 +816,88 @@ func TestContractsCloudGolden(t *testing.T) {
 		Resume: []string{"teploy", "cloud", "server", "attach", provisioning.ID, "--no-setup"}})
 	writeFixture(t, "cloud-server-delete-result/valid/deleted.json", cloudServerDeleteDTO{MachineInterface: MachineInterface, OK: true,
 		Server: cloudServerRow(active), ServersYMLRemoved: true})
+}
+
+// TestContractsSandboxGolden pins `teploy sandbox ... --json` (sandbox-v1).
+// The run and exec documents are what the real commands printed, over the
+// mock SSH connection to an engine in-process. The host documents come from
+// the builder the command uses, with the version as an argument: bumping
+// the pinned release must not move the corpus.
+func TestContractsSandboxGolden(t *testing.T) {
+	// printed is the document a successful command printed.
+	printed := func(h *sandboxHarness, args ...string) json.RawMessage {
+		t.Helper()
+		h.out.Reset()
+		if _, err := h.json(args...); err != nil {
+			t.Fatalf("%v: %v", args, err)
+		}
+		return json.RawMessage(h.out.Bytes())
+	}
+	// failed is the document a command printed before failing: an exec whose
+	// command did not end well still reports what it knows.
+	failed := func(h *sandboxHarness, args ...string) json.RawMessage {
+		t.Helper()
+		h.flags.JSON = true
+		h.out.Reset()
+		if err := h.run(args...); err == nil {
+			t.Fatalf("%v: succeeded where the fixture needs a failure", args)
+		}
+		h.flags.JSON = false
+		return json.RawMessage(h.out.Bytes())
+	}
+
+	// ls: a running sandbox the CLI made, and a stopped one carrying
+	// everything a run can.
+	h := newInstalledSandboxHarness(t)
+	h.nameServer("prod", "203.0.113.10", "deploy")
+	made := sandboxTestID(0)
+	engineState(h.engine, func() bool {
+		cpu, rx, tx, disk := 1.5, int64(2048), int64(4096), int64(1048576)
+		sampled := h.clock
+		stopped, retain, leaseUntil := h.clock.Add(time.Hour), h.clock.Add(14*24*time.Hour), h.clock.Add(10*time.Minute)
+		h.engine.runs = []sandbox.Run{
+			{ID: made, Image: "alpine:3.20", Network: "allowlist", User: "ship", State: "running", CreatedAt: h.clock, ExpiresAt: h.clock.Add(30 * time.Minute), OnExpire: "destroy",
+				Labels: map[string]string{"team": "x", sandboxRunLabel: "3f9a1c0b7d2e"},
+				Usage:  sandbox.Usage{RunningSec: 60, CPUSeconds: &cpu, RxBytes: &rx, TxBytes: &tx, DiskBytes: &disk, SampledAt: &sampled}},
+			{ID: sandboxTestID(1), Image: "alpine:3.20", Network: "none", User: "root", State: "stopped", CreatedAt: h.clock, ExpiresAt: h.clock.Add(30 * time.Minute), OnExpire: "stop",
+				Labels: map[string]string{"a": "1"}, ForkedFrom: made, StoppedAt: &stopped, RetainUntil: &retain, Usage: sandbox.Usage{RunningSec: 300},
+				Lease: &sandbox.Lease{Holder: "ship:run-1", Generation: 2, ExpiresAt: leaseUntil}},
+		}
+		return true
+	})
+	writeFixture(t, "sandbox-runs-envelope/valid/two-runs.json", printed(h, "ls"))
+	h = newInstalledSandboxHarness(t)
+	h.nameServer("prod", "203.0.113.10", "deploy")
+	writeFixture(t, "sandbox-runs-envelope/valid/none.json", printed(h, "ls"))
+
+	// new, stop and fork
+	h = newInstalledSandboxHarness(t)
+	h.nameServer("prod", "203.0.113.10", "deploy")
+	writeFixture(t, "sandbox-run-result/valid/created.json", printed(h, "new", "--image", "alpine:3.20", "--ttl", "2h", "--network", "allowlist"))
+	made = sandboxTestID(0)
+	writeFixture(t, "sandbox-run-result/valid/stopped.json", printed(h, "stop", made))
+	h.run("resume", made)
+	writeFixture(t, "sandbox-run-result/valid/forked.json", printed(h, "fork", made))
+
+	// exec: ended, failed, and a stream that died before the exit
+	writeFixture(t, "sandbox-exec-result/valid/exited.json", printed(h, "exec", made, "--", "sh", "-c", "echo out; echo err >&2"))
+	writeFixture(t, "sandbox-exec-result/valid/failed.json", failed(h, "exec", made, "--", "exit", "3"))
+	h.engine.setExecHook(func(w http.ResponseWriter) { sandboxSSE(w, [2]string{"stdout", "half"}) })
+	writeFixture(t, "sandbox-exec-result/valid/unknown-outcome.json", failed(h, "exec", made, "--", "true"))
+
+	// rm and cp
+	writeFixture(t, "sandbox-destroy-result/valid/destroyed.json", printed(h, "rm", "-y", made))
+	made = withRun(h, "running")
+	local := filepath.Join(t.TempDir(), "app.tar.gz")
+	if err := os.WriteFile(local, []byte("payload"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeFixture(t, "sandbox-copy-result/valid/to-sandbox.json", printed(h, "cp", local, made+":app.tar.gz"))
+	writeFixture(t, "sandbox-copy-result/valid/from-sandbox.json", printed(h, "cp", made+":app.tar.gz", filepath.Join(t.TempDir(), "app.tar.gz")))
+
+	// host: installed, upgraded (from the version it replaced), unchanged
+	const addr, tokenFile, engine = "127.0.0.1:7439", "/var/lib/teploy-sandbox/token", "0.1.0"
+	writeFixture(t, "sandbox-host-result/valid/installed.json", sandboxHostEnvelope("prod", "203.0.113.10", sandboxHostPlan{action: sandboxHostInstall}, engine, addr, tokenFile))
+	writeFixture(t, "sandbox-host-result/valid/upgraded.json", sandboxHostEnvelope("prod", "203.0.113.10", sandboxHostPlan{action: sandboxHostUpgrade, from: "0.0.9"}, engine, addr, tokenFile))
+	writeFixture(t, "sandbox-host-result/valid/unchanged.json", sandboxHostEnvelope("prod", "203.0.113.10", sandboxHostPlan{action: sandboxHostUnchanged}, engine, addr, tokenFile))
 }

@@ -1,0 +1,85 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://teploy.github.io/contracts/schema/sandbox-host-result.schema.json",
+  "title": "`teploy sandbox host --yes --json` (rev 23, sandbox-v1): what was done to the server's engine and the engine as it is now. A server `host` refuses (a service it did not install, a newer release, a release that fails its checksum) or an engine that does not answer is the error envelope on stderr, never this shape.",
+  "type": "object",
+  "required": [
+    "machine_interface",
+    "server",
+    "host",
+    "ok",
+    "action",
+    "version",
+    "addr",
+    "token_file"
+  ],
+  "properties": {
+    "machine_interface": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "server": {
+      "type": "string",
+      "description": "The server as the command was given it."
+    },
+    "host": {
+      "type": "string",
+      "description": "The SSH host the server resolved to."
+    },
+    "ok": {
+      "const": true
+    },
+    "action": {
+      "type": "string",
+      "enum": [
+        "install",
+        "upgrade",
+        "start",
+        "unchanged"
+      ],
+      "description": "install: the engine was installed and started. upgrade: a release was replaced and the service restarted (running sandboxes on it were destroyed). start: the installed service was started. unchanged: the server already had this CLI's release running."
+    },
+    "version": {
+      "type": "string",
+      "description": "The engine's release as it reports it (no leading v)."
+    },
+    "from": {
+      "type": "string",
+      "description": "Only on upgrade: the release that was there before."
+    },
+    "addr": {
+      "type": "string",
+      "description": "Where the engine listens on the server: its loopback."
+    },
+    "token_file": {
+      "type": "string",
+      "description": "The engine's bearer token file on the server, as the other sandbox commands find it."
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "const": "upgrade"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "then": {
+        "required": [
+          "from"
+        ]
+      },
+      "else": {
+        "not": {
+          "required": [
+            "from"
+          ]
+        }
+      }
+    }
+  ]
+}
