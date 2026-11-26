@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://teploy.github.io/contracts/schema/sandbox-host-result.schema.json",
-  "title": "`teploy sandbox host --yes --json` (rev 23, sandbox-v1): what was done to the server's engine and the engine as it is now. A server `host` refuses (a service it did not install, a newer release, a release that fails its checksum) or an engine that does not answer is the error envelope on stderr, never this shape.",
+  "title": "`teploy sandbox host --yes --json` (rev 23, sandbox-v1): what was done to the server's engine and the engine as it is now. A server `host` refuses (a service it did not install, a newer release, a binary that is not the one this CLI pins), or an engine that does not answer after it was changed (what was there is put back first), is the error envelope on stderr, never this shape.",
   "type": "object",
   "required": [
     "machine_interface",
@@ -34,10 +34,11 @@
       "enum": [
         "install",
         "upgrade",
+        "repair",
         "start",
         "unchanged"
       ],
-      "description": "install: the engine was installed and started. upgrade: a release was replaced and the service restarted (running sandboxes on it were destroyed). start: the installed service was started. unchanged: the server already had this CLI's release running."
+      "description": "install: the engine was installed and started. upgrade: a release was replaced and the service restarted (by the engine's own rule for a restart: running sandboxes made with `--on-expire stop` are stopped and kept, other running ones are destroyed, and commands still running in them are cut off). repair: the service file was not what this CLI writes and was rewritten; the service was restarted if it was running, started otherwise. start: the installed service was started. unchanged: the server already had this CLI's release running, with the service file this CLI writes."
     },
     "version": {
       "type": "string",
@@ -45,7 +46,7 @@
     },
     "from": {
       "type": "string",
-      "description": "Only on upgrade: the release that was there before."
+      "description": "Only on upgrade: the release that was there before. Left out when there was no binary to name."
     },
     "addr": {
       "type": "string",
@@ -66,11 +67,6 @@
         },
         "required": [
           "action"
-        ]
-      },
-      "then": {
-        "required": [
-          "from"
         ]
       },
       "else": {

@@ -36,15 +36,25 @@ func hostCommands(probe string, extra ...ssh.MockCommand) []ssh.MockCommand {
 		{Match: "uname -m", Output: "x86_64"},
 		{Match: "umask 077; mktemp -d", Output: "/tmp/teploy-install.sandbox"},
 		{Match: "'/tmp/teploy-install.sandbox/teploy-sandbox' version", Output: strings.TrimPrefix(sandboxEngineVersion, "v")},
+		{Match: "cp -p -- '/usr/local/bin/teploy-sandbox' '/usr/local/bin/teploy-sandbox.prev'", Output: ""},
 		{Match: "flock -w 30", Output: ""},
-		{Match: "rm -f --", Output: ""},
 		{Match: "rm -rf --", Output: ""},
+		// The service file as this CLI writes it: a re-run on it changes nothing.
+		{Match: "cat -- '/etc/systemd/system/teploy-sandbox.service'", Output: sandboxSystemdUnit()},
 		{Match: "install -", Output: ""},
 		{Match: "systemctl ", Output: ""},
 		{Match: "python3 -c ", Output: `{"seq":1,"ts":"2026-11-25T16:00:01Z"}`}, // the event log's writer
 	}
 	return append(append([]ssh.MockCommand{}, extra...), defaults...)
 }
+
+const (
+	stagedBinary = "'/tmp/teploy-install.sandbox/teploy-sandbox'"
+	stagedUnit   = "'/tmp/teploy-install.sandbox/teploy-sandbox.service'"
+	keepPrevious = "cp -p -- '/usr/local/bin/teploy-sandbox' '/usr/local/bin/teploy-sandbox.prev'"
+	putBackPrev  = "mv -f -- '/usr/local/bin/teploy-sandbox.prev' '/usr/local/bin/teploy-sandbox'"
+	catUnit      = "cat -- '/etc/systemd/system/teploy-sandbox.service'"
+)
 
 // engineStartsWhen makes the tunnel reach the engine once the service is
 // started or restarted: before that nothing listens at the address.
@@ -55,6 +65,45 @@ func engineStartsWhen(h *sandboxHarness) {
 			h.link.setTunnel("")
 		}
 	}
+}
+
+// engineAnswersOnlyWithTheOldOne is a change whose new engine never comes
+// up: from the first start of the service on (the restart that ran the
+// change) the tunnel is refused, until what was there is put back.
+func engineAnswersOnlyWithTheOldOne(h *sandboxHarness) {
+	restarted, putBack := false, false
+	h.link.setTunnel("refused")
+	h.link.beforeRun = func(cmd string) {
+		switch {
+		case strings.Contains(cmd, "systemctl start "), strings.Contains(cmd, "systemctl restart "):
+			if !putBack {
+				h.link.setTunnel("refused")
+			}
+			restarted = true
+		case restarted && (strings.HasPrefix(cmd, putBackPrev) || strings.HasPrefix(cmd, "install -o 0 -g 0 -m 0644 "+stagedUnit)):
+			putBack = true
+			h.link.setTunnel("") // what was there is back
+		}
+	}
+}
+
+// engineNeverAnswersAgain is the same, with an engine that does not answer
+// when put back either.
+func engineNeverAnswersAgain(h *sandboxHarness) {
+	h.link.setTunnel("refused")
+	h.link.beforeRun = func(cmd string) {
+		if strings.Contains(cmd, "systemctl start ") || strings.Contains(cmd, "systemctl restart ") {
+			h.link.setTunnel("refused")
+		}
+	}
+}
+
+// lastCall is the last command the server was asked.
+func lastCall(calls []string) string {
+	if len(calls) == 0 {
+		return ""
+	}
+	return calls[len(calls)-1]
 }
 
 // release is the pinned release for a test: this CLI build pins the
@@ -259,7 +308,7 @@ func TestSandboxHostInstalls(t *testing.T) {
 	h.link.beforeRun = func(cmd string) {
 		start(cmd)
 		if strings.HasPrefix(cmd, "install -o 0 -g 0 -m 0644") {
-			staged = h.link.Files["/tmp/teploy-sandbox.service"] // while it is still on the server
+			staged = h.link.Files["/tmp/teploy-install.sandbox/teploy-sandbox.service"] // while it is still on the server
 		}
 	}
 	fetched := h.release(engineBinary)
@@ -281,8 +330,8 @@ func TestSandboxHostInstalls(t *testing.T) {
 	if !callsInOrder(calls,
 		"id -u", "command -v systemctl", "docker info --format", "if command -v systemctl", "uname -s", "uname -m",
 		"umask 077; mktemp -d", "'/tmp/teploy-install.sandbox/teploy-sandbox' version", "flock -w 30",
-		"install -d -o 0 -g 0 -m 0700 '/var/lib/teploy-sandbox'", "UPLOAD:/tmp/teploy-sandbox.service",
-		"install -o 0 -g 0 -m 0644 '/tmp/teploy-sandbox.service' '/etc/systemd/system/teploy-sandbox.service'",
+		"install -d -o 0 -g 0 -m 0700 '/var/lib/teploy-sandbox'", "UPLOAD:/tmp/teploy-install.sandbox/teploy-sandbox.service",
+		"install -o 0 -g 0 -m 0644 "+stagedUnit+" '/etc/systemd/system/teploy-sandbox.service'",
 		"systemctl daemon-reload", "systemctl enable teploy-sandbox.service", "systemctl start teploy-sandbox.service",
 	) || !callsInOrder(calls, "systemctl start teploy-sandbox.service", "python3 -c ") {
 		t.Errorf("the server was not asked in the order of an install:\n%s", strings.Join(calls, "\n"))
@@ -297,10 +346,18 @@ func TestSandboxHostInstalls(t *testing.T) {
 	if string(staged) != sandboxSystemdUnit() {
 		t.Errorf("the unit staged on the server is %q", staged)
 	}
-	// Nothing is left staged before the service is touched, and the
-	// connection is closed.
-	if !callsInOrder(calls, "flock -w 30", "rm -rf -- '/tmp/teploy-install.sandbox'", "systemctl enable teploy-sandbox.service") || !callsInOrder(calls, "install -o 0 -g 0 -m 0644", "rm -f -- '/tmp/teploy-sandbox.service'", "systemctl enable teploy-sandbox.service") {
-		t.Errorf("the staging was not cleaned up:\n%s", strings.Join(calls, "\n"))
+	// Everything was staged in the one private directory the binary was
+	// (never at a fixed path in /tmp), and it is the last thing removed.
+	for path := range h.link.Files {
+		if path != "/tmp/teploy-install.sandbox/teploy-sandbox" && path != "/tmp/teploy-install.sandbox/teploy-sandbox.service" {
+			t.Errorf("%s was uploaded outside the staging directory", path)
+		}
+	}
+	// (h.link.Calls, read now that the run has returned: the removal is the
+	// run's last act.)
+	all := h.link.Calls
+	if !callsInOrder(all, "systemctl enable teploy-sandbox.service", "rm -rf -- '/tmp/teploy-install.sandbox'") || lastCall(all) != "rm -rf -- '/tmp/teploy-install.sandbox'" {
+		t.Errorf("the staging directory was not removed after everything else (last: %s):\n%s", lastCall(all), strings.Join(all, "\n"))
 	}
 	if !h.link.isClosed() {
 		t.Error("the connection was left open")
@@ -326,7 +383,7 @@ func TestSandboxHostInstalls(t *testing.T) {
 // What `sandbox host` leaves in the server's history: the kind, and only
 // the detail the kind allows (events.Sanitize drops the rest).
 func TestSandboxHostEvent(t *testing.T) {
-	for action, from := range map[sandboxAction]string{sandboxHostInstall: "", sandboxHostUpgrade: "0.1.0", sandboxHostStart: "0.1.0"} {
+	for action, from := range map[sandboxAction]string{sandboxHostInstall: "", sandboxHostUpgrade: "0.1.0", sandboxHostRepair: "0.1.0", sandboxHostStart: "0.1.0"} {
 		event := sandboxHostEvent(sandboxHostPlan{action: action, from: from})
 		events.Sanitize(&event)
 		want := map[string]any{"action": string(action), "version": strings.TrimPrefix(sandboxEngineVersion, "v")}
@@ -336,6 +393,15 @@ func TestSandboxHostEvent(t *testing.T) {
 		if event.App != "_fleet" || event.Kind != events.KindSandboxHost || event.Outcome != events.Succeeded || fmt.Sprint(event.Detail) != fmt.Sprint(want) {
 			t.Errorf("%s: the event is %+v, want detail %v", action, event, want)
 		}
+	}
+	// An upgrade over a missing binary has no version to name.
+	event := sandboxHostEvent(sandboxHostPlan{action: sandboxHostUpgrade})
+	events.Sanitize(&event)
+	if want := map[string]any{"action": "upgrade", "version": strings.TrimPrefix(sandboxEngineVersion, "v")}; fmt.Sprint(event.Detail) != fmt.Sprint(want) {
+		t.Errorf("an upgrade with no previous version: the event is %+v, want detail %v", event.Detail, want)
+	}
+	if doc := sandboxHostEnvelope("prod", "prod", sandboxHostPlan{action: sandboxHostUpgrade}, "0.1.0", "127.0.0.1:7439", sandboxTokenFile); doc.From != "" {
+		t.Errorf("an upgrade with no previous version names from %q", doc.From)
 	}
 }
 
@@ -384,7 +450,7 @@ func TestSandboxHostLeavesACurrentInstallAlone(t *testing.T) {
 		t.Errorf("a server with this version had a release downloaded: %v", *fetched)
 	}
 	for _, command := range h.link.Calls {
-		if strings.HasPrefix(command, "flock") || strings.HasPrefix(command, "install -") || strings.Contains(command, "systemctl restart") || strings.Contains(command, "systemctl start") || strings.Contains(command, "python3 -c ") {
+		if strings.HasPrefix(command, "flock") || strings.HasPrefix(command, "install -") || strings.HasPrefix(command, "UPLOAD:") || strings.Contains(command, "systemctl daemon-reload") || strings.Contains(command, "systemctl restart") || strings.Contains(command, "systemctl start") || strings.Contains(command, "python3 -c ") {
 			t.Errorf("a current install was changed: %s", command)
 		}
 	}
@@ -419,7 +485,7 @@ func TestSandboxHostStartsAStoppedService(t *testing.T) {
 		t.Errorf("starting a stopped service downloaded a release (%v) or asked (%q)", *fetched, h.prompts)
 	}
 	for _, command := range h.link.Calls {
-		if strings.HasPrefix(command, "flock") || strings.HasPrefix(command, "install -") || strings.Contains(command, "systemctl restart") {
+		if strings.HasPrefix(command, "flock") || strings.HasPrefix(command, "install -") || strings.HasPrefix(command, "UPLOAD:") || strings.Contains(command, "systemctl daemon-reload") || strings.Contains(command, "systemctl restart") {
 			t.Errorf("starting a stopped service changed the install: %s", command)
 		}
 	}

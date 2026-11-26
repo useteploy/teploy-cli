@@ -110,15 +110,15 @@ func serverPlatform(ctx context.Context, exec ssh.Executor) (goos, goarch string
 	return goos, goarch, nil
 }
 
-// stageServerBinary creates a private staging directory on the server and
-// uploads data there as name (mode 0700). It returns the candidate's path
-// and a cleanup that removes the directory; on failure nothing is left.
-func stageServerBinary(ctx context.Context, executor ssh.Executor, name string, data []byte) (candidate string, cleanup func(), err error) {
+// createStagingDir makes a private staging directory on the server (mode
+// 0700, its name chosen by mktemp) and returns it with a cleanup that
+// removes it, with everything put there since.
+func createStagingDir(ctx context.Context, executor ssh.Executor) (dir string, cleanup func(), err error) {
 	out, err := executor.Run(ctx, "umask 077; mktemp -d /tmp/teploy-install.XXXXXXXX")
 	if err != nil {
 		return "", nil, fmt.Errorf("creating binary staging directory: %w", err)
 	}
-	dir := strings.TrimSpace(out)
+	dir = strings.TrimSpace(out)
 	if !strings.HasPrefix(dir, "/tmp/teploy-install.") || strings.ContainsAny(dir, "\n\r") || path.Dir(dir) != "/tmp" {
 		return "", nil, fmt.Errorf("invalid binary staging directory")
 	}
@@ -127,10 +127,32 @@ func stageServerBinary(ctx context.Context, executor ssh.Executor, name string, 
 		defer cancel()
 		_, _ = executor.Run(removeCtx, "rm -rf -- "+ssh.ShellQuote(dir))
 	}
-	candidate = path.Join(dir, name)
-	if err := executor.Upload(ctx, bytes.NewReader(data), candidate, "0700"); err != nil {
+	return dir, cleanup, nil
+}
+
+// uploadStaged puts data into a staging directory as name, with mode (0700
+// for a binary to run, 0644 for a file to install elsewhere), and returns
+// its path.
+func uploadStaged(ctx context.Context, executor ssh.Executor, dir, name string, data []byte, mode string) (string, error) {
+	candidate := path.Join(dir, name)
+	if err := executor.Upload(ctx, bytes.NewReader(data), candidate, mode); err != nil {
+		return "", fmt.Errorf("uploading %s candidate: %w", name, err)
+	}
+	return candidate, nil
+}
+
+// stageServerBinary creates a private staging directory on the server and
+// uploads data there as name (mode 0700). It returns the candidate's path
+// and a cleanup that removes the directory; on failure nothing is left.
+func stageServerBinary(ctx context.Context, executor ssh.Executor, name string, data []byte) (candidate string, cleanup func(), err error) {
+	dir, cleanup, err := createStagingDir(ctx, executor)
+	if err != nil {
+		return "", nil, err
+	}
+	candidate, err = uploadStaged(ctx, executor, dir, name, data, "0700")
+	if err != nil {
 		cleanup()
-		return "", nil, fmt.Errorf("uploading %s candidate: %w", name, err)
+		return "", nil, err
 	}
 	return candidate, cleanup, nil
 }

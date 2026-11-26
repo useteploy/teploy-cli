@@ -46,15 +46,20 @@ It leaves on the server:
 | What | Where |
 |---|---|
 | the engine | `/usr/local/bin/teploy-sandbox` |
+| the binary an upgrade replaced (after an upgrade) | `/usr/local/bin/teploy-sandbox.prev`, put back automatically if the new engine does not answer |
 | the service | `/etc/systemd/system/teploy-sandbox.service`, owned by root and marked as written by this command |
 | the token (`0600`), the stopped sandboxes' registry and the warm cache | `/var/lib/teploy-sandbox/` |
 
 Running it again is safe:
 
-- the server has this CLI's release running: nothing is done;
-- it has an older one: it is upgraded. That restarts the engine, which destroys the sandboxes running on it (stopped ones are kept), so it asks first;
+- the server has this CLI's release running, with the service file this CLI writes: nothing is done;
+- it has an older one: it is upgraded. The binary it replaces is kept as `teploy-sandbox.prev`, and put back (the service restarted) if the new engine does not answer. It asks first, because it restarts the engine;
+- the service file is not what this CLI writes (changed by hand, or written by another CLI version): it is rewritten. The engine is restarted if it was running, so it asks first then; a service that was not running is just started. If the engine does not answer with the new file, the one that was there is put back;
 - the service is installed and stopped: it is started;
+- the binary is gone but the service is still installed: it is installed again;
 - the server has a newer release than this CLI's: nothing is changed. Update the CLI (`teploy update`) instead.
+
+**What a restart costs.** It is the engine's own rule, from its README ("Surviving a restart"): the running sandboxes made with `--on-expire stop` are stopped and kept, every other running sandbox is destroyed, the stopped ones stay, and every command still running in a sandbox is cut off. The prompt says so, with the counts.
 
 It never replaces what it did not install. A `teploy-sandbox.service` without its marker, a binary put there by hand, a daemon already answering at `127.0.0.1:7439`, or another service on that port is refused with nothing changed.
 

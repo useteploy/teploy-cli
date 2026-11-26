@@ -926,5 +926,8 @@ func TestContractsSandboxGolden(t *testing.T) {
 	const addr, tokenFile, engine = "127.0.0.1:7439", "/var/lib/teploy-sandbox/token", "0.1.0"
 	writeFixture(t, "sandbox-host-result/valid/installed.json", sandboxHostEnvelope("prod", "203.0.113.10", sandboxHostPlan{action: sandboxHostInstall}, engine, addr, tokenFile))
 	writeFixture(t, "sandbox-host-result/valid/upgraded.json", sandboxHostEnvelope("prod", "203.0.113.10", sandboxHostPlan{action: sandboxHostUpgrade, from: "0.0.9"}, engine, addr, tokenFile))
+	// An upgrade over a missing binary has no version to name: no `from`.
+	writeFixture(t, "sandbox-host-result/valid/upgraded-no-binary.json", sandboxHostEnvelope("prod", "203.0.113.10", sandboxHostPlan{action: sandboxHostUpgrade}, engine, addr, tokenFile))
+	writeFixture(t, "sandbox-host-result/valid/repaired.json", sandboxHostEnvelope("prod", "203.0.113.10", sandboxHostPlan{action: sandboxHostRepair, from: engine}, engine, addr, tokenFile))
 	writeFixture(t, "sandbox-host-result/valid/unchanged.json", sandboxHostEnvelope("prod", "203.0.113.10", sandboxHostPlan{action: sandboxHostUnchanged}, engine, addr, tokenFile))
 }

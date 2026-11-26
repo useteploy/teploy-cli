@@ -19,6 +19,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"strconv"
@@ -67,8 +68,11 @@ const (
 	sandboxTokenFile   = "/var/lib/teploy-sandbox/token"
 	sandboxStateRoot   = "/var/lib/teploy-sandbox"
 	sandboxEnginePath  = "/usr/local/bin/teploy-sandbox"
-	sandboxUnitName    = "teploy-sandbox.service"
-	sandboxUnitPath    = "/etc/systemd/system/" + sandboxUnitName
+	// sandboxEnginePrevPath is where an upgrade keeps the binary it
+	// replaces, to put back if the new engine does not answer.
+	sandboxEnginePrevPath = sandboxEnginePath + ".prev"
+	sandboxUnitName       = "teploy-sandbox.service"
+	sandboxUnitPath       = "/etc/systemd/system/" + sandboxUnitName
 
 	// sandboxUnitMarker in a unit file says `teploy sandbox host` wrote it.
 	sandboxUnitMarker = "Installed by: teploy sandbox host"
@@ -78,6 +82,7 @@ const (
 const (
 	sandboxHostInstall   = "install"
 	sandboxHostUpgrade   = "upgrade"
+	sandboxHostRepair    = "repair"
 	sandboxHostStart     = "start"
 	sandboxHostUnchanged = "unchanged"
 )
@@ -125,17 +130,23 @@ func newSandboxHostCmd(flags *Flags, env *sandboxEnv) *cobra.Command {
 			"`teploy setup` leaves it) and root or passwordless sudo.\n\n" +
 			"The engine is a pinned release: the binary is checked against the hash this CLI\n" +
 			"pins for it (and the release's checksum) before it is installed, and never built\n" +
-			"on the server. The service runs\n" +
-			"as root, listens on the server's loopback only (never a public address), and is\n" +
-			"reached by the other sandbox commands over SSH.\n\n" +
-			"Running it again is safe: a server with this CLI's version is left as it is, one\n" +
-			"with an older version is upgraded (which restarts the engine and destroys running\n" +
-			"sandboxes; stopped ones are kept). A teploy-sandbox service this command did not\n" +
-			"install is never replaced. Asks before installing or upgrading unless --yes.\n\n" +
+			"on the server. The service runs as root, listens on the server's loopback only\n" +
+			"(never a public address), and is reached by the other sandbox commands over SSH.\n\n" +
+			"Running it again is safe. A server with this CLI's version and service file is left\n" +
+			"as it is. One with an older version is upgraded, and one whose service file was\n" +
+			"changed since this command wrote it has it rewritten: both restart the engine if\n" +
+			"it is running. On a restart the engine, by its own rule, stops the running\n" +
+			"sandboxes made with `--on-expire stop` and keeps them, destroys every other\n" +
+			"running sandbox, keeps the stopped ones, and cuts off every command still running\n" +
+			"in one. An upgrade keeps the binary it replaces as teploy-sandbox.prev, and puts\n" +
+			"it back if the new engine does not answer. A teploy-sandbox service this command\n" +
+			"did not install is never replaced. Asks before anything that restarts the engine,\n" +
+			"and before an install, unless --yes.\n\n" +
 			"Only the docker driver is installed. The vm driver is experimental and is opted\n" +
 			"into per command with --driver vm on a server where it is already set up.\n\n" +
 			"With --json, the envelope is {machine_interface, server, host, ok, action, version,\n" +
-			"from, addr, token_file}; --json needs --yes.\n\n" +
+			"from, addr, token_file}, action being install, upgrade, repair, start or unchanged;\n" +
+			"--json needs --yes.\n\n" +
 			"Example:\n  teploy sandbox host prod",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -147,76 +158,67 @@ func newSandboxHostCmd(flags *Flags, env *sandboxEnv) *cobra.Command {
 	return cmd
 }
 
-// installSandboxEngine puts the pinned engine release on the server: the
-// platform's binary and the release's checksums.txt are downloaded here
-// (fetch), the binary is checked against the hash this CLI pins for it
-// before anything is uploaded (and against checksums.txt after that), the
-// candidate is run once on the server to confirm it is the release it
-// claims, and only then is it published over whatever was there.
-func installSandboxEngine(ctx context.Context, link ssh.Forwarder, fetch func(ctx context.Context, url string) ([]byte, error)) error {
+// fetchSandboxEngine downloads the pinned engine release for the server's
+// platform and checks it here, before anything is uploaded: against the
+// hash this CLI pins for it, then against the release's checksums.txt.
+func fetchSandboxEngine(ctx context.Context, link ssh.Forwarder, fetch func(ctx context.Context, url string) ([]byte, error)) ([]byte, error) {
 	goos, goarch, err := serverPlatform(ctx, link)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if goos != "linux" {
-		return fmt.Errorf("the sandbox engine has releases for linux servers only, and this server is %s", goos)
+		return nil, fmt.Errorf("the sandbox engine has releases for linux servers only, and this server is %s", goos)
 	}
 	asset := fmt.Sprintf("teploy-sandbox_%s_%s", goos, goarch)
 	pinned := sandboxEngineSHA256[goos+"/"+goarch]
 	if pinned == "" {
 		// A capability this CLI build lacks: there is nothing to check
 		// the download against, so nothing is downloaded.
-		return &sandboxUnavailableError{err: fmt.Errorf(
+		return nil, &sandboxUnavailableError{err: fmt.Errorf(
 			"%w: %s on %s/%s is not pinned, so it cannot tell the real binary from a substituted one. Nothing was changed.\nThe hash is added to the CLI when that release is published: run `teploy update`, then this again",
 			errSandboxUnpinned, sandboxEngineVersion, goos, goarch)}
 	}
 	binary, err := fetch(ctx, sandboxEngineURL(asset))
 	if err != nil {
-		return fmt.Errorf("teploy-sandbox %s: downloading %s: %w\n(there is no such release yet if this version has not been published; see https://github.com/%s/releases)",
+		return nil, fmt.Errorf("teploy-sandbox %s: downloading %s: %w\n(there is no such release yet if this version has not been published; see https://github.com/%s/releases)",
 			sandboxEngineVersion, asset, err, sandboxEngineRepo)
 	}
 	got := fmt.Sprintf("%x", sha256.Sum256(binary))
 	if !strings.EqualFold(got, pinned) {
-		return fmt.Errorf("%s of teploy-sandbox %s is not the binary this CLI pins: refusing to install (pinned %s, downloaded %s)", asset, sandboxEngineVersion, pinned, got)
+		return nil, fmt.Errorf("%s of teploy-sandbox %s is not the binary this CLI pins: refusing to install (pinned %s, downloaded %s)", asset, sandboxEngineVersion, pinned, got)
 	}
 	checksums, err := fetch(ctx, sandboxEngineURL("checksums.txt"))
 	if err != nil {
-		return fmt.Errorf("teploy-sandbox %s: downloading checksums.txt: %w", sandboxEngineVersion, err)
+		return nil, fmt.Errorf("teploy-sandbox %s: downloading checksums.txt: %w", sandboxEngineVersion, err)
 	}
 	published, err := checksumFor(checksums, asset)
 	if err != nil {
-		return fmt.Errorf("teploy-sandbox %s: %w", sandboxEngineVersion, err)
+		return nil, fmt.Errorf("teploy-sandbox %s: %w", sandboxEngineVersion, err)
 	}
 	if !strings.EqualFold(got, published) {
-		return fmt.Errorf("%s of teploy-sandbox %s does not match the release's checksums.txt either: refusing to install (pinned and downloaded %s, checksums.txt %s)", asset, sandboxEngineVersion, got, published)
+		return nil, fmt.Errorf("%s of teploy-sandbox %s does not match the release's checksums.txt either: refusing to install (pinned and downloaded %s, checksums.txt %s)", asset, sandboxEngineVersion, got, published)
 	}
-	candidate, cleanup, err := stageServerBinary(ctx, link, "teploy-sandbox", binary)
-	if err != nil {
-		return err
-	}
-	defer cleanup()
-	if err := checkServerBinaryVersion(ctx, link, candidate, strings.TrimPrefix(sandboxEngineVersion, "v")); err != nil {
-		return fmt.Errorf("the %s release of teploy-sandbox does not run on this server: %w", sandboxEngineVersion, err)
-	}
-	return publishServerBinary(ctx, link, candidate, sandboxEnginePath)
+	return binary, nil
 }
 
-// installSandboxUnit writes the service unit into place, owned by root
-// whoever uploaded it (a service that runs as root must not be editable
-// without root), and has systemd read it again.
-func installSandboxUnit(ctx context.Context, link ssh.Forwarder, sudo string) error {
-	staged := "/tmp/" + sandboxUnitName
-	if err := link.Upload(ctx, strings.NewReader(sandboxSystemdUnit()), staged, "0644"); err != nil {
+// installSandboxUnit stages the service unit in dir, the run's private
+// staging directory (where the binary is too), and installs it from
+// there, owned by root whoever uploaded it (a service that runs as root
+// must not be editable without root). It does not have systemd read its
+// units again: daemonReload does, once, after the last unit was installed.
+func installSandboxUnit(ctx context.Context, link ssh.Forwarder, sudo, dir, unit string) error {
+	staged, err := uploadStaged(ctx, link, dir, sandboxUnitName, []byte(unit), "0644")
+	if err != nil {
 		return fmt.Errorf("staging the engine's service: %w", err)
 	}
-	defer func() {
-		cleanup, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		defer cancel()
-		_, _ = link.Run(cleanup, "rm -f -- "+ssh.ShellQuote(staged))
-	}()
 	if _, err := link.Run(ctx, fmt.Sprintf("%sinstall -o 0 -g 0 -m 0644 %s %s", sudo, ssh.ShellQuote(staged), ssh.ShellQuote(sandboxUnitPath))); err != nil {
 		return fmt.Errorf("installing %s: %w", sandboxUnitPath, err)
 	}
+	return nil
+}
+
+// daemonReload has systemd read its units again, after one was installed.
+func daemonReload(ctx context.Context, link ssh.Forwarder, sudo string) error {
 	if _, err := link.Run(ctx, sudo+"systemctl daemon-reload"); err != nil {
 		return fmt.Errorf("systemctl daemon-reload: %w", err)
 	}
@@ -255,44 +257,67 @@ func (d *sandboxDaemon) hostPreflight(ctx context.Context, sudo string) error {
 	return nil
 }
 
-// runningSandboxes is how many sandboxes are running on the engine, for the
-// warning a restart needs. -1 when that could not be read.
-func (d *sandboxDaemon) runningSandboxes(ctx context.Context) int {
+// runningSandboxes is how many running sandboxes a restart of the engine
+// destroys, and how many it stops and keeps: on a graceful shutdown the
+// engine stops the runs made with `--on-expire stop` and destroys every
+// other running one (restartCost). Both -1 when that could not be read.
+func (d *sandboxDaemon) runningSandboxes(ctx context.Context) (destroyed, kept int) {
 	token, err := readSandboxToken(ctx, d.link, d.tokenFile)
 	if err != nil {
-		return -1
+		return -1, -1
 	}
 	client, err := d.dialEngine(token)
 	if err != nil {
-		return -1
+		return -1, -1
 	}
 	runs, err := client.List(ctx)
 	if err != nil {
-		return -1
+		return -1, -1
 	}
-	running := 0
 	for _, run := range runs {
-		if run.State == "running" {
-			running++
+		if run.State != "running" {
+			continue
 		}
+		if run.OnExpire == "stop" {
+			kept++
+			continue
+		}
+		destroyed++
 	}
-	return running
+	return destroyed, kept
+}
+
+// unitOnServer is the service file as it is on the server. ok is false when
+// it could not be read: the caller cannot then tell whether it is as this
+// CLI writes it.
+func (d *sandboxDaemon) unitOnServer(ctx context.Context, sudo string) (unit string, ok bool) {
+	out, err := d.link.Run(ctx, sudo+"cat -- "+ssh.ShellQuote(sandboxUnitPath))
+	if err != nil {
+		return "", false
+	}
+	return out, true
 }
 
 // planSandboxHost decides what this run does with what the server has.
 // A service this command did not install is refused, and so is anything
 // already at the engine's address on a server that has no engine.
-func (d *sandboxDaemon) planSandboxHost(ctx context.Context, probe engineProbe) (sandboxHostPlan, error) {
+//
+// With this CLI's version installed, the service file decides: as this CLI
+// writes it, the service is left alone or started; different (changed by
+// hand, or written by another CLI version), it is rewritten (repair).
+func (d *sandboxDaemon) planSandboxHost(ctx context.Context, probe engineProbe, unitDiffers bool) (sandboxHostPlan, error) {
 	pinned := strings.TrimPrefix(sandboxEngineVersion, "v")
 	if probe.unitPresent {
 		if !probe.managed {
 			return sandboxHostPlan{}, fmt.Errorf("teploy-sandbox is already installed on %s as %s, and `teploy sandbox host` did not install it. Nothing was changed: this command never replaces a service it did not write.\nTo use that daemon, pass --addr and --token-file to the other sandbox commands", d.server, sandboxUnitPath)
 		}
 		switch {
-		case probe.version == pinned && probe.state == "active":
+		case probe.version == pinned && !unitDiffers && probe.state == "active":
 			return sandboxHostPlan{action: sandboxHostUnchanged, from: pinned}, nil
-		case probe.version == pinned:
+		case probe.version == pinned && !unitDiffers:
 			return sandboxHostPlan{action: sandboxHostStart, from: pinned}, nil
+		case probe.version == pinned:
+			return sandboxHostPlan{action: sandboxHostRepair, from: pinned}, nil
 		case releaseCompare(probe.version, pinned) > 0:
 			return sandboxHostPlan{}, fmt.Errorf("%s already has teploy-sandbox %s, which is newer than the %s this CLI installs. Nothing was changed: update the CLI (`teploy update`) rather than downgrading the engine", d.server, probe.version, sandboxEngineVersion)
 		default:
@@ -398,14 +423,15 @@ func comparePrerelease(a, b string) int {
 
 // sandboxHostEnvelope is `sandbox host --yes --json`: what was done and the
 // engine as it is now. version is without its v, as the engine reports it.
-// An upgrade says which version it replaced.
+// An upgrade says which version it replaced (from); one over a missing
+// binary has none to name, and the field is left out.
 func sandboxHostEnvelope(server, host string, plan sandboxHostPlan, version, addr, tokenFile string) sandboxHostResultDTO {
 	res := sandboxHostResultDTO{
 		MachineInterface: MachineInterface, Server: server, Host: host, OK: true,
 		Action: string(plan.action), Version: version, Addr: addr, TokenFile: tokenFile,
 	}
 	if plan.action == sandboxHostUpgrade {
-		res.From = plan.from // the version that was there before
+		res.From = plan.from // the version that was there before, if there was one
 	}
 	return res
 }
@@ -414,7 +440,7 @@ func sandboxHostEnvelope(server, host string, plan sandboxHostPlan, version, add
 // history when it changed something.
 func sandboxHostEvent(plan sandboxHostPlan) events.Event {
 	detail := map[string]any{"action": string(plan.action), "version": strings.TrimPrefix(sandboxEngineVersion, "v")}
-	if plan.action == sandboxHostUpgrade {
+	if plan.action == sandboxHostUpgrade && plan.from != "" {
 		detail["from"] = plan.from // the version that was there before
 	}
 	return events.Event{App: backup.FleetApp, Kind: events.KindSandboxHost, Outcome: events.Succeeded, Detail: detail}
@@ -458,6 +484,69 @@ func (d *sandboxDaemon) waitHealthy(ctx context.Context, env *sandboxEnv) (sandb
 		message += "\n\nLast log lines:\n" + log
 	}
 	return sandbox.Health{}, errors.New(message)
+}
+
+// sandboxHostPrompt is what a run asks before it changes the engine, and ""
+// when it has nothing to ask. A run that restarts a running engine says
+// what that costs (restartCost); one that only starts a stopped service,
+// or rewrites the file of one that is not running, has nothing to lose.
+func sandboxHostPrompt(d *sandboxDaemon, plan sandboxHostPlan, state string, destroyed, kept int) string {
+	const missing = "Its service is installed there, but its binary is missing from " + sandboxEnginePath + "."
+	switch plan.action {
+	case sandboxHostInstall:
+		return fmt.Sprintf("Install the sandbox engine (teploy-sandbox %s) on %s as a systemd service at %s, running as root with access to Docker?", sandboxEngineVersion, d.server, d.addr)
+	case sandboxHostUpgrade:
+		if plan.from == "" {
+			if cost := restartCost(state, destroyed, kept); cost != "" {
+				return fmt.Sprintf("Install the sandbox engine (teploy-sandbox %s) on %s? %s The service restarts, and %s.", sandboxEngineVersion, d.server, missing, cost)
+			}
+			return fmt.Sprintf("Install the sandbox engine (teploy-sandbox %s) on %s? %s The service will be started.", sandboxEngineVersion, d.server, missing)
+		}
+		if cost := restartCost(state, destroyed, kept); cost != "" {
+			return fmt.Sprintf("Upgrade the sandbox engine on %s from %s to %s? The service restarts, and %s.", d.server, plan.from, sandboxEngineVersion, cost)
+		}
+		return fmt.Sprintf("Upgrade the sandbox engine on %s from %s to %s? Its service is not running; it will be started.", d.server, plan.from, sandboxEngineVersion)
+	case sandboxHostRepair:
+		cost := restartCost(state, destroyed, kept)
+		if cost == "" {
+			return "" // nothing is running: the file is rewritten and the service started
+		}
+		return fmt.Sprintf("Rewrite the sandbox engine's service file on %s? It was changed since `teploy sandbox host` wrote it. The service restarts, and %s.", d.server, cost)
+	}
+	return ""
+}
+
+// restartCost says what restarting the engine costs the sandboxes on it, as
+// the end of a sentence ("The service restarts, and ..."), for a service
+// that is running. "" when it is not: nothing outlives the engine, so a
+// service that is not running has no sandbox to lose.
+//
+// It is the engine's own rule for a graceful shutdown, which a systemd
+// restart is (its README, "Surviving a restart"): the running sandboxes
+// made with `--on-expire stop` are stopped and kept, every other running
+// sandbox is destroyed, the stopped ones stay, and every command still
+// running in one is cut off. A crash stops nothing; this is not a crash.
+//
+// destroyed and kept are what runningSandboxes counted. When it could not
+// count (-1), the rule is said without numbers rather than guessed at.
+func restartCost(state string, destroyed, kept int) string {
+	if state != "active" {
+		return ""
+	}
+	var sandboxes string
+	switch {
+	case destroyed < 0:
+		sandboxes = "running sandboxes on it are destroyed, except the ones made with `--on-expire stop`, which are stopped and kept"
+	case destroyed == 0 && kept == 0:
+		return "no sandbox is lost (none is running on it)"
+	case kept == 0:
+		sandboxes = fmt.Sprintf("%d running sandbox(es) on it are destroyed", destroyed)
+	case destroyed == 0:
+		sandboxes = fmt.Sprintf("%d running sandbox(es) on it, the ones made with `--on-expire stop`, are stopped and kept", kept)
+	default:
+		sandboxes = fmt.Sprintf("%d running sandbox(es) on it are destroyed and %d, the ones made with `--on-expire stop`, are stopped and kept", destroyed, kept)
+	}
+	return sandboxes + "; stopped ones are kept, and every command still running in one is cut off"
 }
 
 func runSandboxHost(ctx context.Context, flags *Flags, env *sandboxEnv, server, driver string, yes bool) error {
@@ -504,27 +593,69 @@ func runSandboxHost(ctx context.Context, flags *Flags, env *sandboxEnv, server, 
 	if !probe.ok {
 		return fmt.Errorf("%s did not answer when asked what is installed there", server)
 	}
-	plan, err := d.planSandboxHost(ctx, probe)
+	// The service file as it is, when there is one. It is rewritten only if
+	// it differs from what this CLI writes (a re-run of the same version
+	// changes nothing), and what it was is kept to put back if the rewrite
+	// is what leaves the engine not answering. One that cannot be read
+	// counts as different: it is rewritten.
+	unitBefore, unitReadable := "", false
+	if probe.unitPresent {
+		unitBefore, unitReadable = d.unitOnServer(ctx, sudo)
+	}
+	unitDiffers := !unitReadable || strings.TrimSpace(unitBefore) != strings.TrimSpace(sandboxSystemdUnit())
+	plan, err := d.planSandboxHost(ctx, probe, unitDiffers)
 	if err != nil {
 		return err
 	}
 
 	pinned := strings.TrimPrefix(sandboxEngineVersion, "v")
+	// What a restart costs, for the prompt: only a running engine has
+	// sandboxes on it to count.
+	destroyed, kept := -1, -1
+	if probe.state == "active" {
+		destroyed, kept = d.runningSandboxes(ctx)
+	}
+	if prompt := sandboxHostPrompt(d, plan, probe.state, destroyed, kept); prompt != "" && !yes && !env.confirm(prompt) {
+		return errSandboxAborted
+	}
+
+	// stage is this run's private staging directory on the server: the
+	// binary's candidate and the service file are put there, and nowhere
+	// else. It is removed when the run ends, however it ends.
+	var stage string
+	cleanup := func() {}
+	defer func() { cleanup() }()
+	// What to put back if the engine does not answer after this run: the
+	// version whose binary an upgrade kept as teploy-sandbox.prev, and the
+	// service file this run rewrote.
+	previousBinary, previousUnit := "", ""
 	switch plan.action {
 	case sandboxHostInstall, sandboxHostUpgrade:
-		prompt := fmt.Sprintf("Install the sandbox engine (teploy-sandbox %s) on %s as a systemd service at %s, running as root with access to Docker?", sandboxEngineVersion, server, d.addr)
-		if plan.action == sandboxHostUpgrade {
-			lost := "Running sandboxes on it are destroyed; stopped ones are kept."
-			if running := d.runningSandboxes(ctx); running >= 0 {
-				lost = fmt.Sprintf("%d running sandbox(es) on it are destroyed; stopped ones are kept.", running)
-			}
-			prompt = fmt.Sprintf("Upgrade the sandbox engine on %s from %s to %s? Its service restarts, and %s", server, plan.from, sandboxEngineVersion, lost)
-		}
-		if !yes && !env.confirm(prompt) {
-			return errSandboxAborted
-		}
 		fmt.Fprintf(progress, "Installing teploy-sandbox %s (%s) from %s...\n", sandboxEngineVersion, plan.action, sandboxEngineRepo)
-		if err := installSandboxEngine(ctx, link, env.fetch); err != nil {
+		binary, err := fetchSandboxEngine(ctx, link, env.fetch)
+		if err != nil {
+			return err
+		}
+		if stage, cleanup, err = createStagingDir(ctx, link); err != nil {
+			return err
+		}
+		candidate, err := uploadStaged(ctx, link, stage, "teploy-sandbox", binary, "0700")
+		if err != nil {
+			return err
+		}
+		// The candidate runs once on the server before it is published:
+		// a binary that does not report this release is never installed.
+		if err := checkServerBinaryVersion(ctx, link, candidate, pinned); err != nil {
+			return fmt.Errorf("the %s release of teploy-sandbox does not run on this server: %w", sandboxEngineVersion, err)
+		}
+		if plan.action == sandboxHostUpgrade && probe.version != "" {
+			fmt.Fprintf(progress, "Keeping the current binary as %s, to put back if the new engine does not answer...\n", sandboxEnginePrevPath)
+			if _, err := link.Run(ctx, fmt.Sprintf("%scp -p -- %s %s", sudo, ssh.ShellQuote(sandboxEnginePath), ssh.ShellQuote(sandboxEnginePrevPath))); err != nil {
+				return fmt.Errorf("keeping the current engine as %s: %w", sandboxEnginePrevPath, err)
+			}
+			previousBinary = plan.from
+		}
+		if err := publishServerBinary(ctx, link, candidate, sandboxEnginePath); err != nil {
 			return err
 		}
 		if plan.action == sandboxHostInstall {
@@ -532,28 +663,55 @@ func runSandboxHost(ctx context.Context, flags *Flags, env *sandboxEnv, server, 
 				return fmt.Errorf("creating %s: %w", sandboxStateRoot, err)
 			}
 		}
-		fmt.Fprintln(progress, "Writing the systemd service...")
-		if err := installSandboxUnit(ctx, link, sudo); err != nil {
-			return err
-		}
 	case sandboxHostStart:
 		fmt.Fprintf(progress, "The sandbox engine (%s) is installed on %s but its service is %s; starting it\n", sandboxEngineVersion, server, probe.state)
+	}
+
+	if unitDiffers {
+		if stage == "" {
+			if stage, cleanup, err = createStagingDir(ctx, link); err != nil {
+				return err
+			}
+		}
+		fmt.Fprintln(progress, "Writing the systemd service...")
+		if err := installSandboxUnit(ctx, link, sudo, stage, sandboxSystemdUnit()); err != nil {
+			return err
+		}
+		if err := daemonReload(ctx, link, sudo); err != nil {
+			return err
+		}
+		if probe.unitPresent {
+			previousUnit = unitBefore // there was one; this run replaced it
+		}
 	}
 
 	if _, err := link.Run(ctx, sudo+"systemctl enable "+sandboxUnitName); err != nil {
 		return fmt.Errorf("enabling %s: %w", sandboxUnitName, err)
 	}
-	if plan.action != sandboxHostUnchanged {
-		verb := "start"
-		if plan.action == sandboxHostUpgrade {
-			verb = "restart"
-		}
-		if _, err := link.Run(ctx, sudo+"systemctl "+verb+" "+sandboxUnitName); err != nil {
-			return fmt.Errorf("systemctl %s %s: %w", verb, sandboxUnitName, err)
+	// The service is started when it is not running, and restarted when
+	// this run replaced what it runs (a new binary, or another service
+	// file). A re-run that changed nothing touches it.
+	start, restarted := "start", false
+	switch {
+	case plan.action == sandboxHostUpgrade, plan.action == sandboxHostRepair && probe.state == "active":
+		start, restarted = "restart", true
+	case plan.action == sandboxHostUnchanged:
+		start = ""
+	}
+	if start != "" {
+		if _, err := link.Run(ctx, sudo+"systemctl "+start+" "+sandboxUnitName); err != nil {
+			return fmt.Errorf("systemctl %s %s: %w", start, sandboxUnitName, err)
 		}
 	}
 	fmt.Fprintln(progress, "Waiting for the engine to answer...")
 	if _, err := d.waitHealthy(ctx, env); err != nil {
+		if previousBinary != "" || previousUnit != "" {
+			// The way back does not hang on the wait that failed, or on a
+			// Ctrl-C that ended it: it has time of its own.
+			wayBack, cancelWayBack := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
+			defer cancelWayBack()
+			return d.putBack(wayBack, env, progress, sudo, stage, previousBinary, previousUnit, err)
+		}
 		return err
 	}
 
@@ -568,11 +726,70 @@ func runSandboxHost(ctx context.Context, flags *Flags, env *sandboxEnv, server, 
 	case sandboxHostInstall:
 		fmt.Fprintf(env.out, "\nInstalled the sandbox engine (teploy-sandbox %s) on %s and started it at %s\n\n  teploy sandbox new --host %s --image alpine:3.20\n", sandboxEngineVersion, server, d.addr, server)
 	case sandboxHostUpgrade:
-		fmt.Fprintf(env.out, "\nUpgraded the sandbox engine on %s from %s to %s and restarted it\n", server, plan.from, sandboxEngineVersion)
+		if plan.from == "" {
+			fmt.Fprintf(env.out, "\nUpgraded the sandbox engine on %s to %s (its binary was missing) and restarted it\n", server, sandboxEngineVersion)
+			break
+		}
+		if previousBinary == "" {
+			fmt.Fprintf(env.out, "\nUpgraded the sandbox engine on %s from %s to %s and restarted it\n", server, plan.from, sandboxEngineVersion)
+			break
+		}
+		fmt.Fprintf(env.out, "\nUpgraded the sandbox engine on %s from %s to %s and restarted it. The previous binary is kept as %s\n", server, plan.from, sandboxEngineVersion, sandboxEnginePrevPath)
+	case sandboxHostRepair:
+		if restarted {
+			fmt.Fprintf(env.out, "\nRewrote the sandbox engine's service file on %s (it had been changed) and restarted the engine\n", server)
+		} else {
+			fmt.Fprintf(env.out, "\nRewrote the sandbox engine's service file on %s (it had been changed) and started the engine\n", server)
+		}
 	case sandboxHostStart:
 		fmt.Fprintf(env.out, "\nStarted the sandbox engine's service on %s (%s)\n", server, sandboxEngineVersion)
 	default:
 		fmt.Fprintf(env.out, "\nThe sandbox engine on %s is up to date (%s) and running\n", server, sandboxEngineVersion)
 	}
 	return nil
+}
+
+// putBack is what `sandbox host` does when the engine does not answer after
+// the run changed it, and there is something to put back: the binary an
+// upgrade kept (as teploy-sandbox.prev) and the service file the run
+// rewrote. Each goes back where it was, the service starts again, and the
+// engine that was there is waited for. The error returned says all of it:
+// why the new one was not accepted, and whether the old one is back.
+func (d *sandboxDaemon) putBack(ctx context.Context, env *sandboxEnv, progress io.Writer, sudo, stage, previousBinary, previousUnit string, cause error) error {
+	// The engine that was there: the version whose binary was kept, or,
+	// for a rewritten service file, this CLI's own version.
+	there := strings.TrimPrefix(sandboxEngineVersion, "v")
+	if previousBinary != "" {
+		there = previousBinary
+	}
+	what := "the service file"
+	switch {
+	case previousBinary != "" && previousUnit != "":
+		what = "the previous binary (" + previousBinary + ") and the service file"
+	case previousBinary != "":
+		what = "the previous binary (" + previousBinary + ")"
+	}
+	fmt.Fprintf(progress, "\nThe engine did not answer with what this run changed. Putting back %s and starting the service again...\n", what)
+	if previousBinary != "" {
+		if _, err := d.link.Run(ctx, fmt.Sprintf("%smv -f -- %s %s", sudo, ssh.ShellQuote(sandboxEnginePrevPath), ssh.ShellQuote(sandboxEnginePath))); err != nil {
+			return fmt.Errorf("%v\n\nThe previous engine (%s) could not be put back: %w.\nIt is still at %s: put it back with `mv -f %s %s` on %s, then `systemctl restart %s`",
+				cause, previousBinary, err, sandboxEnginePrevPath, sandboxEnginePrevPath, sandboxEnginePath, d.server, sandboxUnitName)
+		}
+	}
+	if previousUnit != "" {
+		if err := installSandboxUnit(ctx, d.link, sudo, stage, previousUnit); err != nil {
+			return fmt.Errorf("%v\n\nThe service file that was there could not be put back: %w", cause, err)
+		}
+		if err := daemonReload(ctx, d.link, sudo); err != nil {
+			return fmt.Errorf("%v\n\n%w", cause, err)
+		}
+	}
+	if _, err := d.link.Run(ctx, sudo+"systemctl restart "+sandboxUnitName); err != nil {
+		return fmt.Errorf("%v\n\nIt was put back, but its service could not be restarted: %w", cause, err)
+	}
+	if _, err := d.waitHealthy(ctx, env); err != nil {
+		return fmt.Errorf("%v\n\nThe engine that was there (%s) was put back and restarted, but it does not answer either:\n%v", cause, there, err)
+	}
+	fmt.Fprintln(progress, "It answers again.")
+	return fmt.Errorf("%v\n\nThe engine that was there (%s) was put back and restarted, and it answers again. Nothing was upgraded", cause, there)
 }

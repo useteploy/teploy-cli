@@ -242,7 +242,7 @@ const (
 	// once the engine took the command; exit_code null when the stream
 	// died before the exit), sandbox-destroy-result (`rm --yes --json`),
 	// sandbox-copy-result (`cp --json`) and sandbox-host-result (`host
-	// --yes --json`: install, upgrade, start or unchanged). An engine that
+	// --yes --json`: install, upgrade, repair, start or unchanged). An engine that
 	// is not installed, not running, or without the driver asked for, and
 	// a CLI build with no pinned hash for the engine release, are
 	// error-envelope code `unsupported`; a create, fork or exec whose
