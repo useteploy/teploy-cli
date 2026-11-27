@@ -37,9 +37,10 @@ func newSandboxExecCmd(flags *Flags, env *sandboxEnv) *cobra.Command {
 		Use:   "exec <id> -- <command>",
 		Short: "Run a command in a sandbox",
 		Long: "Run a command in a running sandbox, through sh -c in its /work, and stream its\n" +
-			"output. The `--` ends teploy's own flags. Each word after it is passed as the\n" +
-			"argument your shell made of it, so quoting survives; shell syntax (a pipe, a\n" +
-			"redirect) goes inside one quoted word: -- 'ls | wc -l'. The output is the command's,\n" +
+			"output. The `--` ends teploy's own flags. A single word after it is a command line\n" +
+			"of its own, so shell syntax (a pipe, a redirect) goes inside one quoted word:\n" +
+			"-- 'ls | wc -l'. Several words are each passed as the argument your shell made of\n" +
+			"it, so quoting survives: -- echo 'a  b'. The output is the command's,\n" +
 			"byte for byte, from an engine that is a release.\n\n" +
 			"Exit status: the command's own, as ssh passes it on (0, or the status it exited\n" +
 			"with; a command its --timeout ended exits 124). 255 is a failure of teploy's own:\n" +
@@ -174,12 +175,16 @@ func execInSandbox(ctx context.Context, flags *Flags, env *sandboxEnv, o sandbox
 }
 
 // sandboxCommand builds the command line the engine runs (sh -c) from the
-// words after the `--`. Each is quoted, so the arguments the sandbox's
-// command receives are the words as this shell received them: a shell has
-// already taken the user's quotes away, and joining with spaces would lose
-// an argument's own spaces. Shell syntax reaches the sandbox the way it
-// reaches any program: inside one quoted word (`-- 'ls | wc -l'`).
+// words after the `--`. One word is a command line of its own and is
+// passed as it is, so shell syntax works the way it does with ssh:
+// `-- 'ls | wc -l'`. Several words are each quoted, so the arguments the
+// sandbox's command receives are the words as this shell received them: a
+// shell has already taken the user's quotes away, and joining with spaces
+// would lose an argument's own spaces (`-- echo 'a  b'`).
 func sandboxCommand(words []string) string {
+	if len(words) == 1 {
+		return words[0]
+	}
 	quoted := make([]string, len(words))
 	for i, word := range words {
 		quoted[i] = ssh.ShellQuote(word)

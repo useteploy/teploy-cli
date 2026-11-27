@@ -179,8 +179,9 @@ func sandboxCopyEnvelope(d *sandboxDaemon, id, filePath, direction string, bytes
 }
 
 // sandboxHostResultDTO is `sandbox host --yes --json`: what was done
-// (action: install, upgrade, start or unchanged) and the engine as it is
-// now. from is the version an upgrade replaced.
+// (action: install, upgrade, repair, start or unchanged) and the engine as
+// it is now. from is the version that was there (none on an install, or on
+// an upgrade over a missing binary).
 type sandboxHostResultDTO struct {
 	MachineInterface int    `json:"machine_interface"`
 	Server           string `json:"server"`

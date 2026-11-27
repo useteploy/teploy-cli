@@ -194,6 +194,19 @@ func TestSandboxExecTakesTheCommandAfterTheDash(t *testing.T) {
 		t.Errorf("the command line sent was %s", got)
 	}
 
+	// One word is a command line of its own: shell syntax in it works, as
+	// with ssh, and is sent as written (not quoted into one program name).
+	h.out.Reset()
+	if err := h.run("exec", id, "--", "printf 'a\\nb\\n' | wc -l | tr -d ' '"); err != nil {
+		t.Fatal(err)
+	}
+	if got := h.out.String(); got != "2\n" {
+		t.Errorf("a pipe in one word gave %q, want 2", got)
+	}
+	if got := h.engine.execs[2].Cmd; got != "printf 'a\\nb\\n' | wc -l | tr -d ' '" {
+		t.Errorf("one word was sent as %s, want it as written", got)
+	}
+
 	// --workdir is relative to the sandbox's /work, which may be written
 	// in full: /work is the work root itself (the default), /work/build
 	// is build, and the sandbox's root is not somewhere to run in.
