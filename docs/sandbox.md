@@ -61,7 +61,7 @@ Running it again is safe:
 
 **What a restart costs.** It is the engine's own rule, from its README ("Surviving a restart"): the running sandboxes made with `--on-expire stop` are stopped and kept, every other running sandbox is destroyed, the stopped ones stay, and every command still running in a sandbox is cut off. The prompt says so, with the counts.
 
-It never replaces what it did not install. A `teploy-sandbox.service` without its marker, a binary put there by hand, a daemon already answering at `127.0.0.1:7439`, or another service on that port is refused with nothing changed. So is a service with drop-ins (`teploy-sandbox.service.d/*.conf`): they change how the engine runs, whatever its service file says, so nothing here can be said of it; move them away first.
+It never replaces what it did not install. A `teploy-sandbox.service` without its marker, a binary put there by hand, a daemon already answering at `127.0.0.1:7439`, or another service on that port is refused with nothing changed. So is a service with its own drop-ins (a `teploy-sandbox.service.d` directory in any of systemd's unit directories, as `systemctl show -p DropInPaths` reports them; drop-ins the distribution applies to every service are not counted): they change how the engine runs, whatever its service file says, so nothing here can be said of it; move them away first.
 
 `--json` needs `--yes`.
 

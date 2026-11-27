@@ -343,7 +343,15 @@ func TestSandboxProbeReadsDropins(t *testing.T) {
 			name:        "multiple drop-in locations",
 			script:      "#!/bin/sh\nif [ \"$1\" = show ]; then echo '/etc/systemd/system.control/teploy-sandbox.service.d/50-MemoryMax.conf /usr/lib/systemd/system/service.d/10-env.conf'; fi\nexit 0\n",
 			wantDropins: true,
-			wantPaths:   "/etc/systemd/system.control/teploy-sandbox.service.d/50-MemoryMax.conf /usr/lib/systemd/system/service.d/10-env.conf",
+			wantPaths:   "/etc/systemd/system.control/teploy-sandbox.service.d/50-MemoryMax.conf",
+		},
+		{
+			// Fedora ships this for every service; it is the distribution's,
+			// not a change to how this engine runs, and must not refuse.
+			name:        "only a distro-wide drop-in for every service",
+			script:      "#!/bin/sh\nif [ \"$1\" = show ]; then echo '/usr/lib/systemd/system/service.d/10-timeout-abort.conf'; fi\nexit 0\n",
+			wantDropins: false,
+			wantPaths:   "",
 		},
 		{
 			name:        "systemctl show fails",
@@ -384,7 +392,8 @@ func TestSandboxProbeReadsDropins(t *testing.T) {
 		{"dropins=", false, ""},
 		{"dropins=   \t ", false, ""},
 		{"dropins=/etc/systemd/system/teploy-sandbox.service.d/override.conf", true, "/etc/systemd/system/teploy-sandbox.service.d/override.conf"},
-		{"dropins=/etc/systemd/system/service.d/10-a.conf /run/systemd/system/teploy-sandbox.service.d/20-b.conf", true, "/etc/systemd/system/service.d/10-a.conf /run/systemd/system/teploy-sandbox.service.d/20-b.conf"},
+		{"dropins=/etc/systemd/system/service.d/10-a.conf /run/systemd/system/teploy-sandbox.service.d/20-b.conf", true, "/run/systemd/system/teploy-sandbox.service.d/20-b.conf"},
+		{"dropins=/usr/lib/systemd/system/service.d/10-timeout-abort.conf", false, ""},
 	} {
 		raw := strings.Replace(sandboxProbeLines(true, true, true, "active", "0.1.0", true), "dropins=", c.line, 1)
 		h := newSandboxHarness(t, ssh.MockCommand{Match: "if command -v systemctl", Output: raw})

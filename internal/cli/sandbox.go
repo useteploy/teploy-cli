@@ -326,6 +326,22 @@ func sandboxProbeCommand() string {
 		sandboxUnitName, sandboxUnitPath, sandboxUnitMarker, sandboxEnginePath)
 }
 
+// ownDropins keeps, of systemd's DropInPaths for the service, the drop-ins
+// written for this unit itself (a teploy-sandbox.service.d directory, in
+// any of systemd's unit roots). DropInPaths also lists drop-ins that apply
+// to every service (service.d/, e.g. Fedora's own
+// /usr/lib/systemd/system/service.d/10-timeout-abort.conf): those come
+// with the distribution, and refusing them would refuse whole distros.
+func ownDropins(value string) string {
+	var own []string
+	for _, path := range strings.Fields(value) {
+		if strings.Contains(path, "/"+sandboxUnitName+".d/") {
+			own = append(own, path)
+		}
+	}
+	return strings.Join(own, " ")
+}
+
 // probeSandboxEngine asks the server what is installed and running.
 func probeSandboxEngine(ctx context.Context, link ssh.Forwarder) engineProbe {
 	out, err := link.Run(ctx, sandboxProbeCommand())
@@ -354,7 +370,7 @@ func probeSandboxEngine(ctx context.Context, link ssh.Forwarder) engineProbe {
 		case "process":
 			probe.processRunning = value == "running"
 		case "dropins":
-			paths := strings.TrimSpace(value)
+			paths := ownDropins(value)
 			probe.dropinPaths = paths
 			probe.dropins = paths != ""
 		}
