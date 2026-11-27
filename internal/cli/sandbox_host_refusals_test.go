@@ -406,7 +406,7 @@ func TestRestartCost(t *testing.T) {
 func TestSandboxHostChangesNothingWhenItRefuses(t *testing.T) {
 	// A probe with drop-ins: everything else as a current, running install.
 	withDropins := func(probe string) string {
-		return strings.Replace(probe, "dropins=none", "dropins=present", 1)
+		return strings.Replace(probe, "dropins=", "dropins=/run/systemd/system/teploy-sandbox.service.d/override.conf", 1)
 	}
 	for _, c := range []struct {
 		name   string
@@ -419,7 +419,7 @@ func TestSandboxHostChangesNothingWhenItRefuses(t *testing.T) {
 		{"a newer release than this CLI's", sandboxProbeLines(true, true, true, "active", "9.9.9", true), "refused",
 			"prod already has teploy-sandbox 9.9.9, which is newer than the " + sandboxEngineVersion + " this CLI installs. Nothing was changed: update the CLI (`teploy update`) rather than downgrading the engine"},
 		{"a service with drop-ins", sandboxProbeLines(true, true, true, "active", "0.1.0", true), "refused",
-			"teploy-sandbox's service on prod has drop-ins (/etc/systemd/system/teploy-sandbox.service.d/*.conf), which `teploy sandbox host` neither wrote nor reads: they change how the engine runs, whatever its service file says. Nothing was changed."},
+			"teploy-sandbox's service on prod has drop-ins (/run/systemd/system/teploy-sandbox.service.d/override.conf), which `teploy sandbox host` neither wrote nor reads: they change how the engine runs, whatever its service file says. Nothing was changed."},
 		{"an engine outside systemd", sandboxProbeLines(true, false, false, "inactive", "dev", true), "refused",
 			"teploy-sandbox is on prod but is not run by systemd (a binary at /usr/local/bin/teploy-sandbox, or a process running), so `teploy sandbox host` did not install it. Nothing was changed."},
 		{"a hand-started engine at the address", nothingInstalled, "",
@@ -665,5 +665,111 @@ func TestSandboxHostReportsAHalfDonePutBack(t *testing.T) {
 	}
 	if count(calls, "systemctl restart teploy-sandbox.service") != 1 {
 		t.Errorf("the service was restarted after a half-done put-back:\n%s", strings.Join(calls, "\n"))
+	}
+}
+
+// When a service was stopped before the run and an upgrade or repair fails
+// its health check, putBack restores the previous binary and unit without
+// restarting the service (stopping the failed start instead) and says so.
+func TestSandboxHostPutBackDoesNotStartAStoppedService(t *testing.T) {
+	// Failed upgrade of an inactive service.
+	h := newSandboxHarness(t, hostCommands(sandboxProbeLines(true, true, true, "inactive", "0.0.9", false),
+		ssh.MockCommand{Match: catUnit, Output: olderUnit},
+		ssh.MockCommand{Match: putBackPrev, Output: ""},
+	)...)
+	engineNeverAnswersAgain(h)
+	units := unitsInstalled(h)
+	h.release(engineBinary)
+	h.env.startTimeout = 3 * time.Second
+	start := h.clock
+
+	err := h.run("host", "prod", "--yes")
+	if err == nil {
+		t.Fatal("an engine that never answered read as upgraded")
+	}
+	for _, want := range []string{
+		"did not answer at 127.0.0.1:7439 on prod within 3s",
+		"The engine that was there (0.0.9) was put back, and its service was left stopped (it was inactive before this run). Nothing was upgraded",
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the error does not say %q:\n%v", want, err)
+		}
+	}
+	for _, forbidden := range []string{"was put back and restarted", "answers again"} {
+		if strings.Contains(err.Error(), forbidden) {
+			t.Errorf("the error falsely claims %q:\n%v", forbidden, err)
+		}
+	}
+	if !strings.Contains(h.out.String(), "without starting the service (it was inactive before)") ||
+		strings.Contains(h.out.String(), "starting the service again") ||
+		strings.Contains(h.out.String(), "It answers again.") {
+		t.Errorf("progress output does not match a stopped rollback:\n%s", h.out.String())
+	}
+
+	calls := h.link.Calls
+	if count(calls, "systemctl restart teploy-sandbox.service") != 1 {
+		t.Errorf("rollback restarted a service that was inactive before:\n%s", strings.Join(calls, "\n"))
+	}
+	if count(calls, "systemctl start teploy-sandbox.service") != 0 {
+		t.Errorf("rollback started a service that was inactive before:\n%s", strings.Join(calls, "\n"))
+	}
+	if !callsInOrder(calls,
+		"systemctl restart teploy-sandbox.service",
+		"systemctl stop teploy-sandbox.service",
+		putBackPrev,
+		"install -o 0 -g 0 -m 0644 "+stagedUnit,
+		"systemctl daemon-reload",
+	) {
+		t.Errorf("rollback did not stop the failed start and restore binary+unit:\n%s", strings.Join(calls, "\n"))
+	}
+	if len(*units) != 2 || (*units)[0] != sandboxSystemdUnit() || (*units)[1] != olderUnit {
+		t.Errorf("the service files installed were %q", *units)
+	}
+	if waited := h.clock.Sub(start); waited >= 2*h.env.startTimeout {
+		t.Errorf("rollback waited for a stopped service to become healthy (elapsed %s)", waited)
+	}
+	for _, call := range calls {
+		if strings.HasPrefix(call, "python3 -c ") {
+			t.Errorf("a failed upgrade was written to the history as done")
+		}
+	}
+	if lastCall(calls) != "rm -rf -- '/tmp/teploy-install.sandbox'" {
+		t.Errorf("the staging directory was left:\n%s", strings.Join(calls, "\n"))
+	}
+
+	// Failed repair of a service in failed state: leaves it stopped too,
+	// never calling systemctl restart at all.
+	pinned := strings.TrimPrefix(sandboxEngineVersion, "v")
+	h = newSandboxHarness(t, hostCommands(sandboxProbeLines(true, true, true, "failed", pinned, false),
+		ssh.MockCommand{Match: catUnit, Output: olderUnit},
+	)...)
+	engineNeverAnswersAgain(h)
+	h.env.startTimeout = 3 * time.Second
+	err = h.run("host", "prod", "--yes")
+	if err == nil || !strings.Contains(err.Error(), "The engine that was there ("+pinned+") was put back, and its service was left stopped (it was failed before this run). Nothing was upgraded") {
+		t.Fatalf("got %v, want stopped rollback message for failed prior state", err)
+	}
+	if count(h.link.Calls, "systemctl start teploy-sandbox.service") != 1 ||
+		count(h.link.Calls, "systemctl restart teploy-sandbox.service") != 0 ||
+		!callsInOrder(h.link.Calls, "systemctl start teploy-sandbox.service", "systemctl stop teploy-sandbox.service", "install -o 0 -g 0 -m 0644 "+stagedUnit, "systemctl daemon-reload") {
+		t.Errorf("unexpected repair rollback commands:\n%s", strings.Join(h.link.Calls, "\n"))
+	}
+
+	// If stopping the failed start itself fails, the files are still
+	// restored and the error reports that stopping did not succeed.
+	h = newSandboxHarness(t, hostCommands(sandboxProbeLines(true, true, true, "inactive", "0.0.9", false),
+		ssh.MockCommand{Match: catUnit, Output: olderUnit},
+		ssh.MockCommand{Match: putBackPrev, Output: ""},
+		ssh.MockCommand{Match: "systemctl stop teploy-sandbox.service", Err: errors.New("bus error")},
+	)...)
+	engineNeverAnswersAgain(h)
+	h.release(engineBinary)
+	h.env.startTimeout = 3 * time.Second
+	err = h.run("host", "prod", "--yes")
+	if err == nil || !strings.Contains(err.Error(), "its service was not started (it was inactive before this run), but stopping the failed start did not succeed: bus error") {
+		t.Fatalf("got %v, want honest stop failure message", err)
+	}
+	if !callsInOrder(h.link.Calls, "systemctl stop teploy-sandbox.service", putBackPrev, "install -o 0 -g 0 -m 0644 "+stagedUnit) {
+		t.Errorf("binary and unit were not restored after stop failure:\n%s", strings.Join(h.link.Calls, "\n"))
 	}
 }

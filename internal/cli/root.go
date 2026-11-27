@@ -95,6 +95,9 @@ func newRootCmd(version string, sandbox func(*Flags) *cobra.Command) *cobra.Comm
 						return encodeErr
 					}
 				}
+				if isSandboxExecCmd(cmd) {
+					return wrapSandboxExecFailure(failure)
+				}
 				return failure
 			}
 			return nil
@@ -175,7 +178,11 @@ func Execute(version string) {
 // runRoot is one invocation of root, without the exit: 0, or the status
 // its failure says.
 func runRoot(root *cobra.Command, errOut io.Writer) int {
-	if err := root.Execute(); err != nil {
+	cmd, err := root.ExecuteC()
+	if err != nil {
+		if isSandboxExecCmd(cmd) {
+			err = wrapSandboxExecFailure(err)
+		}
 		reportExecutionError(root, err, errOut)
 		return exitStatus(err)
 	}

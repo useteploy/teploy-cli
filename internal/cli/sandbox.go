@@ -307,9 +307,10 @@ type engineProbe struct {
 	state          string // the service's systemd state: active, inactive, failed...
 	version        string // "" when the binary is not there
 	processRunning bool
-	// dropins: the service has drop-ins (teploy-sandbox.service.d/*.conf),
+	// dropins: the service has systemd drop-ins (DropInPaths is non-empty),
 	// which change how systemd runs it whatever its own file says.
-	dropins bool
+	dropins     bool
+	dropinPaths string
 }
 
 // sandboxProbeCommand is the one command that reads the probe. It always
@@ -321,8 +322,24 @@ func sandboxProbeCommand() string {
 		`echo "state=$(systemctl is-active %[1]s 2>/dev/null || true)"; `+
 		`if [ -x %[4]s ]; then echo "version=$(%[4]s version 2>/dev/null || echo unknown)"; else echo version=absent; fi; `+
 		`if pgrep -x teploy-sandbox >/dev/null 2>&1; then echo process=running; else echo process=none; fi; `+
-		`if ls %[5]s/*.conf >/dev/null 2>&1; then echo dropins=present; else echo dropins=none; fi`,
-		sandboxUnitName, sandboxUnitPath, sandboxUnitMarker, sandboxEnginePath, sandboxUnitPath+".d")
+		`echo "dropins=$(systemctl show -p DropInPaths --value %[1]s 2>/dev/null || true)"`,
+		sandboxUnitName, sandboxUnitPath, sandboxUnitMarker, sandboxEnginePath)
+}
+
+// ownDropins keeps, of systemd's DropInPaths for the service, the drop-ins
+// written for this unit itself (a teploy-sandbox.service.d directory, in
+// any of systemd's unit roots). DropInPaths also lists drop-ins that apply
+// to every service (service.d/, e.g. Fedora's own
+// /usr/lib/systemd/system/service.d/10-timeout-abort.conf): those come
+// with the distribution, and refusing them would refuse whole distros.
+func ownDropins(value string) string {
+	var own []string
+	for _, path := range strings.Fields(value) {
+		if strings.Contains(path, "/"+sandboxUnitName+".d/") {
+			own = append(own, path)
+		}
+	}
+	return strings.Join(own, " ")
 }
 
 // probeSandboxEngine asks the server what is installed and running.
@@ -353,7 +370,9 @@ func probeSandboxEngine(ctx context.Context, link ssh.Forwarder) engineProbe {
 		case "process":
 			probe.processRunning = value == "running"
 		case "dropins":
-			probe.dropins = value == "present"
+			paths := ownDropins(value)
+			probe.dropinPaths = paths
+			probe.dropins = paths != ""
 		}
 	}
 	return probe

@@ -139,9 +139,9 @@ func newSandboxHostCmd(flags *Flags, env *sandboxEnv) *cobra.Command {
 			"running sandbox, keeps the stopped ones, and cuts off every command still running\n" +
 			"in one. An upgrade keeps the binary it replaces as teploy-sandbox.prev, and puts\n" +
 			"it back if the new engine does not answer. A teploy-sandbox service this command\n" +
-			"did not install is never replaced, and one with drop-ins (its .service.d directory)\n" +
-			"is refused: they change how the engine runs, whatever its service file says. Asks\n" +
-			"before anything that restarts the engine, and before an install, unless --yes.\n\n" +
+			"did not install is never replaced, and one with systemd drop-ins is refused: they\n" +
+			"change how the engine runs, whatever its service file says. Asks before anything\n" +
+			"that restarts the engine, and before an install, unless --yes.\n\n" +
 			"Only the docker driver is installed. The vm driver is experimental and is opted\n" +
 			"into per command with --driver vm on a server where it is already set up.\n\n" +
 			"With --json, the envelope is {machine_interface, server, host, ok, action, version,\n" +
@@ -317,7 +317,11 @@ func (d *sandboxDaemon) planSandboxHost(ctx context.Context, probe engineProbe, 
 			// would say nothing about how the engine runs (its address
 			// included), and a restart would run it with the drop-in in
 			// effect.
-			return sandboxHostPlan{}, fmt.Errorf("teploy-sandbox's service on %s has drop-ins (%s.d/*.conf), which `teploy sandbox host` neither wrote nor reads: they change how the engine runs, whatever its service file says. Nothing was changed.\nMove them away and run this again, or pass --addr and --token-file to the other sandbox commands to use the daemon as it runs", d.server, sandboxUnitPath)
+			where := probe.dropinPaths
+			if where == "" {
+				where = sandboxUnitPath + ".d/*.conf"
+			}
+			return sandboxHostPlan{}, fmt.Errorf("teploy-sandbox's service on %s has drop-ins (%s), which `teploy sandbox host` neither wrote nor reads: they change how the engine runs, whatever its service file says. Nothing was changed.\nMove them away and run this again, or pass --addr and --token-file to the other sandbox commands to use the daemon as it runs", d.server, where)
 		}
 		switch {
 		case probe.version == pinned && !unitDiffers && probe.state == "active":
@@ -718,7 +722,7 @@ func runSandboxHost(ctx context.Context, flags *Flags, env *sandboxEnv, server, 
 			// Ctrl-C that ended it: it has time of its own.
 			wayBack, cancelWayBack := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
 			defer cancelWayBack()
-			return d.putBack(wayBack, env, progress, sudo, stage, previousBinary, previousUnit, err)
+			return d.putBack(wayBack, env, progress, sudo, stage, previousBinary, previousUnit, probe.state, err)
 		}
 		return err
 	}
@@ -760,10 +764,12 @@ func runSandboxHost(ctx context.Context, flags *Flags, env *sandboxEnv, server, 
 // putBack is what `sandbox host` does when the engine does not answer after
 // the run changed it, and there is something to put back: the binary an
 // upgrade kept (as teploy-sandbox.prev) and the service file the run
-// rewrote. Each goes back where it was, the service starts again, and the
-// engine that was there is waited for. The error returned says all of it:
-// why the new one was not accepted, and whether the old one is back.
-func (d *sandboxDaemon) putBack(ctx context.Context, env *sandboxEnv, progress io.Writer, sudo, stage, previousBinary, previousUnit string, cause error) error {
+// rewrote. Each goes back where it was; if the service was active before
+// the run it is restarted and waited for, and if it was not running before
+// the failed start is stopped and the service is left stopped. The error
+// returned says all of it: why the new one was not accepted, and what
+// became of what was there.
+func (d *sandboxDaemon) putBack(ctx context.Context, env *sandboxEnv, progress io.Writer, sudo, stage, previousBinary, previousUnit, priorState string, cause error) error {
 	// The engine that was there: the version whose binary was kept, or,
 	// for a rewritten service file, this CLI's own version.
 	there := strings.TrimPrefix(sandboxEngineVersion, "v")
@@ -777,7 +783,23 @@ func (d *sandboxDaemon) putBack(ctx context.Context, env *sandboxEnv, progress i
 	case previousBinary != "":
 		what = "the previous binary (" + previousBinary + ")"
 	}
-	fmt.Fprintf(progress, "\nThe engine did not answer with what this run changed. Putting back %s and starting the service again...\n", what)
+	wasActive := priorState == "active"
+	priorLabel := priorState
+	if priorLabel == "" {
+		priorLabel = "not running"
+	}
+	if wasActive {
+		fmt.Fprintf(progress, "\nThe engine did not answer with what this run changed. Putting back %s and starting the service again...\n", what)
+	} else {
+		fmt.Fprintf(progress, "\nThe engine did not answer with what this run changed. Putting back %s without starting the service (it was %s before)...\n", what, priorLabel)
+	}
+	// If the service was not running before this run, stop the failed start
+	// before restoring files so systemd's Restart=on-failure cannot launch
+	// the restored binary behind our back.
+	var stopErr error
+	if !wasActive {
+		_, stopErr = d.link.Run(ctx, sudo+"systemctl stop "+sandboxUnitName)
+	}
 	// Both are tried whatever the other did, and the error says what each
 	// one came to: an old binary under a new service file (or the other way
 	// round) is not "put back", and the person reading it must know which
@@ -802,8 +824,20 @@ func (d *sandboxDaemon) putBack(ctx context.Context, env *sandboxEnv, progress i
 		}
 	}
 	if len(failed) > 0 {
+		if stopErr != nil {
+			failed = append(failed, fmt.Sprintf("Stopping the failed start did not succeed: %v.", stopErr))
+		}
 		msg := strings.Join(append(done, failed...), "\n")
-		return fmt.Errorf("%v\n\n%s\nFinish that by hand, then `systemctl daemon-reload` and `systemctl restart %s` on %s. The service was not restarted", cause, msg, sandboxUnitName, d.server)
+		if wasActive {
+			return fmt.Errorf("%v\n\n%s\nFinish that by hand, then `systemctl daemon-reload` and `systemctl restart %s` on %s. The service was not restarted", cause, msg, sandboxUnitName, d.server)
+		}
+		return fmt.Errorf("%v\n\n%s\nFinish that by hand, then `systemctl daemon-reload` on %s. The service was not started (it was %s before this run)", cause, msg, d.server, priorLabel)
+	}
+	if !wasActive {
+		if stopErr != nil {
+			return fmt.Errorf("%v\n\nThe engine that was there (%s) was put back, and its service was not started (it was %s before this run), but stopping the failed start did not succeed: %w", cause, there, priorLabel, stopErr)
+		}
+		return fmt.Errorf("%v\n\nThe engine that was there (%s) was put back, and its service was left stopped (it was %s before this run). Nothing was upgraded", cause, there, priorLabel)
 	}
 	if _, err := d.link.Run(ctx, sudo+"systemctl restart "+sandboxUnitName); err != nil {
 		return fmt.Errorf("%v\n\nIt was put back, but its service could not be restarted: %w", cause, err)

@@ -110,7 +110,7 @@ func sandboxProbeLines(systemd, unit, managed bool, state, version string, proce
 		"state=" + state,
 		"version=" + version,
 		"process=" + running,
-		"dropins=none",
+		"dropins=",
 	}, "\n")
 }
 
