@@ -61,12 +61,13 @@ Decisions worth reviewing:
   running one is destroyed, and every command still running in one is cut off. The
   prompt says so with the counts.
 
+Closed (2026-11-27): teploy-sandbox `v0.1.0` is published (immutable release, `v*`
+tag ruleset) and its two hashes are pinned in `sandboxEngineSHA256`. Both binaries
+were rebuilt from the tag with go1.26.11 and the release workflow's flags and came out
+byte-identical to the release's.
+
 Open / deferred:
 
-- **No teploy-sandbox release is published, and the pinned hashes are empty.** Until
-  `v0.1.0` exists and its two hashes are in `sandboxEngineSHA256` (with a TODO saying
-  where each comes from), `host` refuses before it downloads: this CLI build has no
-  pinned hash for that engine (`unsupported`). It never falls back to checksums.txt.
 - **Not exercised live.** No server was touched. The systemd unit, the release
   download and the tunnel are verified by tests only: an in-process SSH server for
   the forward, a mock executor for the server's commands, and an engine in-process

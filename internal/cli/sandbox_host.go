@@ -47,15 +47,14 @@ const sandboxEngineVersion = "v0.1.0"
 // binary and the checksums.txt beside it can be replaced together (the
 // release, or the account that owns it), and this table cannot.
 //
-// TODO: v0.1.0 is not published yet. When it is, put each binary's
-// SHA-256 here, read from the binaries themselves and compared with
-// https://github.com/useteploy/teploy-sandbox/releases/download/v0.1.0/checksums.txt,
-// before any CLI release that installs it. While a platform's entry is
-// empty, `sandbox host` refuses to install on that platform rather than
-// trust checksums.txt alone.
+// v0.1.0: read from the release's binaries, matched against its
+// checksums.txt, and reproduced byte for byte from the tag (go1.26.11,
+// the release workflow's flags) on 2026-11-27. While a platform's entry
+// is empty, `sandbox host` refuses to install on that platform rather
+// than trust checksums.txt alone.
 var sandboxEngineSHA256 = map[string]string{
-	"linux/amd64": "",
-	"linux/arm64": "",
+	"linux/amd64": "a871704de3ce7dcb73316a9bbb26c7aa011e6ccce1b4776e80d2a927f9ee6585",
+	"linux/arm64": "fffd99f1d139a842714558062117943a0bdd3a1b83106338e4309b1997a20725",
 }
 
 const (

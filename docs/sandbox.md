@@ -39,7 +39,7 @@ A daemon that was set up another way (by hand, or by teploy-ship) can be used wi
 teploy sandbox host <server> [--yes] [--json]
 ```
 
-The engine is a pinned release of `teploy-sandbox` (`v0.1.0`), downloaded by the CLI from the repository's GitHub releases: the binary is checked against the SHA-256 the CLI pins for it (and against the release's checksum) before anything is uploaded, then run once on the server to confirm it is the release it claims, and only then published. It is never built on the server. The pinned hashes are in the CLI (`sandboxEngineSHA256` in `internal/cli/sandbox_host.go`) and are filled in when the release is published; until then `host` says it has no pinned hash and installs nothing. If the release has not been published, the command says so and installs nothing.
+The engine is a pinned release of `teploy-sandbox` (`v0.1.0`), downloaded by the CLI from the repository's GitHub releases: the binary is checked against the SHA-256 the CLI pins for it (and against the release's checksum) before anything is uploaded, then run once on the server to confirm it is the release it claims, and only then published. It is never built on the server. The pinned hashes are in the CLI (`sandboxEngineSHA256` in `internal/cli/sandbox_host.go`), reviewed with each version bump; a platform with no pinned hash is refused.
 
 It leaves on the server:
 
