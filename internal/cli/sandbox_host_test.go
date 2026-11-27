@@ -303,34 +303,95 @@ func TestReleaseCompare(t *testing.T) {
 	}
 }
 
-// The probe reads whether the service has drop-ins: what systemd runs is
-// the service file and them together, and a run of `host` refuses them.
+// The probe reads whether the service has drop-ins via systemd's
+// DropInPaths (covering /etc/systemd/system, /run/systemd/system,
+// /etc/systemd/system.control, /usr/lib/systemd/system, and top-level
+// service.d/), always exits 0, and probeSandboxEngine parses empty vs
+// non-empty DropInPaths.
 func TestSandboxProbeReadsDropins(t *testing.T) {
-	if command := sandboxProbeCommand(); !strings.Contains(command, "if ls /etc/systemd/system/teploy-sandbox.service.d/*.conf >/dev/null 2>&1; then echo dropins=present; else echo dropins=none; fi") {
-		t.Errorf("the probe does not look for the service's drop-ins:\n%s", command)
+	command := sandboxProbeCommand()
+	wantDropinsCmd := `echo "dropins=$(systemctl show -p DropInPaths --value teploy-sandbox.service 2>/dev/null || true)"`
+	if !strings.Contains(command, wantDropinsCmd) {
+		t.Errorf("the probe does not read DropInPaths via systemctl show:\n%s", command)
 	}
-	// The question as the shell answers it, with and without a drop-in.
-	dir := t.TempDir()
+	if strings.Contains(command, "/etc/systemd/system/teploy-sandbox.service.d/*.conf") {
+		t.Errorf("the probe still hardcodes a single drop-in directory:\n%s", command)
+	}
+
+	// Run the real probe command in sh against a stub systemctl on PATH to
+	// confirm it always exits 0 and emits key=value lines for empty,
+	// single, multi-location, and failing systemctl invocations.
 	for _, c := range []struct {
-		make func()
-		want string
+		name        string
+		script      string
+		wantDropins bool
+		wantPaths   string
 	}{
-		{func() {}, "dropins=none"},
-		{func() {
-			if err := os.Mkdir(filepath.Join(dir, "service.d"), 0o755); err != nil {
-				t.Fatal(err)
-			}
-		}, "dropins=none"},
-		{func() {
-			if err := os.WriteFile(filepath.Join(dir, "service.d", "override.conf"), []byte("[Service]\n"), 0o644); err != nil {
-				t.Fatal(err)
-			}
-		}, "dropins=present"},
+		{
+			name:        "empty DropInPaths",
+			script:      "#!/bin/sh\nif [ \"$1\" = show ]; then echo ''; fi\nexit 0\n",
+			wantDropins: false,
+			wantPaths:   "",
+		},
+		{
+			name:        "runtime drop-in",
+			script:      "#!/bin/sh\nif [ \"$1\" = show ]; then echo '/run/systemd/system/teploy-sandbox.service.d/override.conf'; fi\nexit 0\n",
+			wantDropins: true,
+			wantPaths:   "/run/systemd/system/teploy-sandbox.service.d/override.conf",
+		},
+		{
+			name:        "multiple drop-in locations",
+			script:      "#!/bin/sh\nif [ \"$1\" = show ]; then echo '/etc/systemd/system.control/teploy-sandbox.service.d/50-MemoryMax.conf /usr/lib/systemd/system/service.d/10-env.conf'; fi\nexit 0\n",
+			wantDropins: true,
+			wantPaths:   "/etc/systemd/system.control/teploy-sandbox.service.d/50-MemoryMax.conf /usr/lib/systemd/system/service.d/10-env.conf",
+		},
+		{
+			name:        "systemctl show fails",
+			script:      "#!/bin/sh\nif [ \"$1\" = show ]; then echo 'Failed to connect to bus' >&2; exit 1; fi\nexit 0\n",
+			wantDropins: false,
+			wantPaths:   "",
+		},
 	} {
-		c.make()
-		out, err := exec.Command("sh", "-c", fmt.Sprintf("if ls %s/*.conf >/dev/null 2>&1; then echo dropins=present; else echo dropins=none; fi", filepath.Join(dir, "service.d"))).Output()
-		if err != nil || strings.TrimSpace(string(out)) != c.want {
-			t.Errorf("the shell answers %q, %v; want %q", out, err, c.want)
+		t.Run(c.name, func(t *testing.T) {
+			binDir := t.TempDir()
+			systemctlPath := filepath.Join(binDir, "systemctl")
+			if err := os.WriteFile(systemctlPath, []byte(c.script), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			sh := exec.Command("sh", "-c", command)
+			sh.Env = append(os.Environ(), "PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+			out, err := sh.Output()
+			if err != nil {
+				t.Fatalf("sandboxProbeCommand exited with error: %v\nout:\n%s", err, out)
+			}
+			h := newSandboxHarness(t, ssh.MockCommand{Match: "if command -v systemctl", Output: string(out)})
+			probe := probeSandboxEngine(context.Background(), h.link)
+			if !probe.ok {
+				t.Fatalf("probe.ok = false; out:\n%s", out)
+			}
+			if probe.dropins != c.wantDropins || probe.dropinPaths != c.wantPaths {
+				t.Errorf("probe dropins = (%v, %q), want (%v, %q)\nout:\n%s", probe.dropins, probe.dropinPaths, c.wantDropins, c.wantPaths, out)
+			}
+		})
+	}
+
+	// Direct parsing of empty, whitespace-only, and non-empty DropInPaths lines.
+	for _, c := range []struct {
+		line        string
+		wantDropins bool
+		wantPaths   string
+	}{
+		{"dropins=", false, ""},
+		{"dropins=   \t ", false, ""},
+		{"dropins=/etc/systemd/system/teploy-sandbox.service.d/override.conf", true, "/etc/systemd/system/teploy-sandbox.service.d/override.conf"},
+		{"dropins=/etc/systemd/system/service.d/10-a.conf /run/systemd/system/teploy-sandbox.service.d/20-b.conf", true, "/etc/systemd/system/service.d/10-a.conf /run/systemd/system/teploy-sandbox.service.d/20-b.conf"},
+	} {
+		raw := strings.Replace(sandboxProbeLines(true, true, true, "active", "0.1.0", true), "dropins=", c.line, 1)
+		h := newSandboxHarness(t, ssh.MockCommand{Match: "if command -v systemctl", Output: raw})
+		probe := probeSandboxEngine(context.Background(), h.link)
+		if !probe.ok || probe.dropins != c.wantDropins || probe.dropinPaths != c.wantPaths {
+			t.Errorf("parse %q => ok=%v dropins=%v paths=%q, want ok=true dropins=%v paths=%q",
+				c.line, probe.ok, probe.dropins, probe.dropinPaths, c.wantDropins, c.wantPaths)
 		}
 	}
 }

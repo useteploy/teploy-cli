@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"net/http"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -258,5 +259,94 @@ func TestALocalToolsExitStatusIsNotTeploys(t *testing.T) {
 		if got := exitStatus(fmt.Errorf("static build: %w", err)); got != 1 {
 			t.Errorf("a wrapped local tool exiting %d makes teploy exit %d, want 1", code, got)
 		}
+	}
+}
+
+// Failures before RunE of `sandbox exec` (such as root's PersistentPreRunE
+// failing to chdir on --project-dir) must still exit 255, while every other
+// command's pre-RunE failure keeps exiting 1.
+func TestSandboxExecPreRunFailuresExit255(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "missing")
+
+	for _, c := range []struct {
+		name string
+		args func(id string) []string
+		want int
+	}{
+		{
+			name: "sandbox exec with --project-dir before subcommand",
+			args: func(id string) []string {
+				return []string{"--project-dir", missing, "sandbox", "exec", id, "--host", "prod", "--", "true"}
+			},
+			want: sandboxExecFailure,
+		},
+		{
+			name: "sandbox exec with --project-dir after subcommand",
+			args: func(id string) []string {
+				return []string{"sandbox", "exec", "--project-dir", missing, id, "--host", "prod", "--", "true"}
+			},
+			want: sandboxExecFailure,
+		},
+		{
+			name: "sandbox exec with invalid root persistent flag value",
+			args: func(id string) []string {
+				return []string{"--wait", "not-a-duration", "sandbox", "exec", id, "--host", "prod", "--", "true"}
+			},
+			want: sandboxExecFailure,
+		},
+		{
+			name: "sandbox exec with unknown shorthand before subcommand",
+			args: func(id string) []string {
+				return []string{"-C", missing, "sandbox", "exec", id, "--host", "prod", "--", "true"}
+			},
+			want: sandboxExecFailure,
+		},
+		{
+			name: "sandbox ls with --project-dir exits 1",
+			args: func(_ string) []string {
+				return []string{"--project-dir", missing, "sandbox", "ls", "--host", "prod"}
+			},
+			want: 1,
+		},
+		{
+			name: "top-level exec (not sandbox exec) with --project-dir exits 1",
+			args: func(_ string) []string {
+				return []string{"--project-dir", missing, "exec", "prod", "true"}
+			},
+			want: 1,
+		},
+		{
+			name: "version with --project-dir exits 1",
+			args: func(_ string) []string {
+				return []string{"--project-dir", missing, "version"}
+			},
+			want: 1,
+		},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			h := newInstalledSandboxHarness(t)
+			id := withRun(h, "running")
+			if got := h.invoke(c.args(id)...); got != c.want {
+				t.Errorf("runRoot exited %d, want %d\nstderr: %s", got, c.want, h.errOut.String())
+			}
+			if h.engine.execCount() != 0 {
+				t.Errorf("engine ran %d execs despite pre-RunE failure", h.engine.execCount())
+			}
+		})
+	}
+
+	// Under --json, a pre-RunE failure on `sandbox exec` exits 255 and
+	// writes the error envelope to stderr with nothing on stdout.
+	h := newInstalledSandboxHarness(t)
+	id := withRun(h, "running")
+	if got := h.invoke("--json", "--project-dir", missing, "sandbox", "exec", id, "--host", "prod", "--", "true"); got != sandboxExecFailure {
+		t.Fatalf("--json pre-RunE failure exited %d, want %d\nstderr: %s", got, sandboxExecFailure, h.errOut.String())
+	}
+	if h.out.Len() != 0 {
+		t.Errorf("--json pre-RunE failure wrote to stdout: %q", h.out.String())
+	}
+	env := h.errorEnvelope(t)
+	if env["code"] != codeInternal || !strings.Contains(fmt.Sprint(env["detail"]), "changing to project directory") {
+		t.Errorf("unexpected error envelope: %v", env)
 	}
 }

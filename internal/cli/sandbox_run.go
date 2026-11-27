@@ -86,11 +86,7 @@ func runSandboxExec(ctx context.Context, flags *Flags, env *sandboxEnv, o sandbo
 	}
 	// The command's own status is teploy's. Anything else is a failure of
 	// this command's own, and must not read as one: 255.
-	var command *sandboxCommandError
-	if errors.As(err, &command) {
-		return err
-	}
-	return &sandboxExecError{err: err}
+	return wrapSandboxExecFailure(err)
 }
 
 // execInSandbox runs the command and prints what became of it.
@@ -250,6 +246,27 @@ type sandboxExecError struct{ err error }
 func (e *sandboxExecError) Error() string         { return e.err.Error() }
 func (e *sandboxExecError) Unwrap() error         { return e.err }
 func (e *sandboxExecError) teployExitStatus() int { return sandboxExecFailure }
+
+// isSandboxExecCmd reports whether cmd is `teploy sandbox exec` (not
+// `teploy exec`, which is container exec and exits 1 on failure).
+func isSandboxExecCmd(cmd *cobra.Command) bool {
+	if cmd == nil || cmd.Name() != "exec" {
+		return false
+	}
+	parent := cmd.Parent()
+	return parent != nil && parent.Name() == "sandbox" && (parent.Parent() == nil || parent.Parent() == cmd.Root())
+}
+
+// wrapSandboxExecFailure marks an error from `sandbox exec` that does not
+// already carry a teploy exit status (such as a failure in root's
+// PersistentPreRunE before RunE runs) as a failure of teploy's own (255).
+func wrapSandboxExecFailure(err error) error {
+	var status interface{ teployExitStatus() int }
+	if errors.As(err, &status) {
+		return err
+	}
+	return &sandboxExecError{err: err}
+}
 
 // sandboxExecStatus is the command's own outcome as an error: nonzero is
 // nonzero, a timeout says so, and -1 is the sandbox failing to run it.
