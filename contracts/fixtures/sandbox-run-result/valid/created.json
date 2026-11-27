@@ -1,0 +1,21 @@
+{
+  "machine_interface": 2,
+  "server": "prod",
+  "host": "203.0.113.10",
+  "run": {
+    "id": "01JCV5ZK3Q7X9B2D4E6F8A0B00",
+    "image": "alpine:3.20",
+    "network": "allowlist",
+    "user": "ship",
+    "state": "running",
+    "created_at": "2026-11-25T16:00:00Z",
+    "expires_at": "2026-11-25T18:00:00Z",
+    "on_expire": "destroy",
+    "labels": {
+      "teploy.cli-run": "3f9a1c0b7d2e"
+    },
+    "usage": {
+      "running_sec": 0
+    }
+  }
+}

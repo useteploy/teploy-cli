@@ -110,51 +110,71 @@ func serverPlatform(ctx context.Context, exec ssh.Executor) (goos, goarch string
 	return goos, goarch, nil
 }
 
-// installServerBinary validates a private candidate before one atomic,
-// serialized publication. The incumbent is never replaced by a refused
-// candidate; privileged destinations use the supported passwordless sudo path.
-func installServerBinary(ctx context.Context, executor ssh.Executor, destination string, data []byte, version string, capabilities ...string) error {
-	if !path.IsAbs(destination) || path.Clean(destination) != destination {
-		return fmt.Errorf("binary destination must be a clean absolute path")
-	}
+// createStagingDir makes a private staging directory on the server (mode
+// 0700, its name chosen by mktemp) and returns it with a cleanup that
+// removes it, with everything put there since.
+func createStagingDir(ctx context.Context, executor ssh.Executor) (dir string, cleanup func(), err error) {
 	out, err := executor.Run(ctx, "umask 077; mktemp -d /tmp/teploy-install.XXXXXXXX")
 	if err != nil {
-		return fmt.Errorf("creating binary staging directory: %w", err)
+		return "", nil, fmt.Errorf("creating binary staging directory: %w", err)
 	}
-	dir := strings.TrimSpace(out)
+	dir = strings.TrimSpace(out)
 	if !strings.HasPrefix(dir, "/tmp/teploy-install.") || strings.ContainsAny(dir, "\n\r") || path.Dir(dir) != "/tmp" {
-		return fmt.Errorf("invalid binary staging directory")
+		return "", nil, fmt.Errorf("invalid binary staging directory")
 	}
-	defer func() {
-		cleanup, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	cleanup = func() {
+		removeCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
-		_, _ = executor.Run(cleanup, "rm -rf -- "+ssh.ShellQuote(dir))
-	}()
-	candidate := path.Join(dir, "teploy")
-	if err := executor.Upload(ctx, bytes.NewReader(data), candidate, "0700"); err != nil {
-		return fmt.Errorf("uploading teploy candidate: %w", err)
+		_, _ = executor.Run(removeCtx, "rm -rf -- "+ssh.ShellQuote(dir))
 	}
-	checkCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	actual, err := executor.Run(checkCtx, ssh.ShellQuote(candidate)+" version")
+	return dir, cleanup, nil
+}
+
+// uploadStaged puts data into a staging directory as name, with mode (0700
+// for a binary to run, 0644 for a file to install elsewhere), and returns
+// its path.
+func uploadStaged(ctx context.Context, executor ssh.Executor, dir, name string, data []byte, mode string) (string, error) {
+	candidate := path.Join(dir, name)
+	if err := executor.Upload(ctx, bytes.NewReader(data), candidate, mode); err != nil {
+		return "", fmt.Errorf("uploading %s candidate: %w", name, err)
+	}
+	return candidate, nil
+}
+
+// stageServerBinary creates a private staging directory on the server and
+// uploads data there as name (mode 0700). It returns the candidate's path
+// and a cleanup that removes the directory; on failure nothing is left.
+func stageServerBinary(ctx context.Context, executor ssh.Executor, name string, data []byte) (candidate string, cleanup func(), err error) {
+	dir, cleanup, err := createStagingDir(ctx, executor)
+	if err != nil {
+		return "", nil, err
+	}
+	candidate, err = uploadStaged(ctx, executor, dir, name, data, "0700")
+	if err != nil {
+		cleanup()
+		return "", nil, err
+	}
+	return candidate, cleanup, nil
+}
+
+// checkServerBinaryVersion runs a staged candidate's `version` and requires
+// exactly want: a wrong artifact must never pass on a successful exit.
+func checkServerBinaryVersion(ctx context.Context, executor ssh.Executor, candidate, want string) error {
+	actual, err := executor.Run(ctx, ssh.ShellQuote(candidate)+" version")
 	if err != nil {
 		return fmt.Errorf("candidate binary failed to run: %w", err)
 	}
-	if strings.TrimSpace(actual) != "teploy "+version {
-		return fmt.Errorf("candidate version mismatch: expected teploy %s", version)
+	if strings.TrimSpace(actual) != want {
+		return fmt.Errorf("candidate version mismatch: expected %s", want)
 	}
-	for _, capability := range capabilities {
-		var args []string
-		for _, arg := range strings.Fields(capability) {
-			args = append(args, ssh.ShellQuote(arg))
-		}
-		if len(args) == 0 {
-			return fmt.Errorf("empty binary capability")
-		}
-		if _, err := executor.Run(checkCtx, ssh.ShellQuote(candidate)+" "+strings.Join(args, " ")+" --help >/dev/null 2>&1"); err != nil {
-			return fmt.Errorf("candidate does not support %s: %w", capability, err)
-		}
-	}
+	return nil
+}
+
+// publishServerBinary moves candidate over destination atomically, under a
+// lock, and with passwordless sudo when the SSH user is not root and the
+// destination is a system path (/usr, /opt). The incumbent is never left
+// half-replaced.
+func publishServerBinary(ctx context.Context, executor ssh.Executor, candidate, destination string) error {
 	prefix := ""
 	if strings.HasPrefix(destination, "/usr/") || strings.HasPrefix(destination, "/opt/") {
 		prefix = sudoPrefixFor(ctx, executor)
@@ -175,4 +195,36 @@ mv -f -- "$stage" %s`, ssh.ShellQuote(path.Join(path.Dir(destination), ".teploy-
 		return fmt.Errorf("publishing verified binary: %w", err)
 	}
 	return nil
+}
+
+// installServerBinary validates a private candidate before one atomic,
+// serialized publication. The incumbent is never replaced by a refused
+// candidate; privileged destinations use the supported passwordless sudo path.
+func installServerBinary(ctx context.Context, executor ssh.Executor, destination string, data []byte, version string, capabilities ...string) error {
+	if !path.IsAbs(destination) || path.Clean(destination) != destination {
+		return fmt.Errorf("binary destination must be a clean absolute path")
+	}
+	candidate, cleanup, err := stageServerBinary(ctx, executor, "teploy", data)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+	checkCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	if err := checkServerBinaryVersion(checkCtx, executor, candidate, "teploy "+version); err != nil {
+		return err
+	}
+	for _, capability := range capabilities {
+		var args []string
+		for _, arg := range strings.Fields(capability) {
+			args = append(args, ssh.ShellQuote(arg))
+		}
+		if len(args) == 0 {
+			return fmt.Errorf("empty binary capability")
+		}
+		if _, err := executor.Run(checkCtx, ssh.ShellQuote(candidate)+" "+strings.Join(args, " ")+" --help >/dev/null 2>&1"); err != nil {
+			return fmt.Errorf("candidate does not support %s: %w", capability, err)
+		}
+	}
+	return publishServerBinary(ctx, executor, candidate, destination)
 }

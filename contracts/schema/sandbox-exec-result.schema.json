@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://teploy.github.io/contracts/schema/sandbox-exec-result.schema.json",
+  "title": "`teploy sandbox exec --json` (rev 23, sandbox-v1): how the command ended, with its output captured instead of streamed. The output is had from the engine byte for byte (the engine is asked for base64 when it is a release that speaks it); stdout and stderr are it as text, and a stream holding bytes that are not valid UTF-8 is given as base64 beside it. Printed only once the engine has taken the command (it answered 200): an exec it refused prints the error envelope on stderr alone. It is printed when the command exits nonzero too: teploy then exits with the command's own status (255 for a failure of teploy's own) and the error envelope on stderr is code `command-failed`.",
+  "type": "object",
+  "required": [
+    "machine_interface",
+    "server",
+    "host",
+    "run_id",
+    "exit_code",
+    "timed_out",
+    "duration_ms",
+    "stdout",
+    "stderr",
+    "truncated"
+  ],
+  "properties": {
+    "machine_interface": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "server": {
+      "type": "string",
+      "description": "The server as the command was given it (--host)."
+    },
+    "host": {
+      "type": "string",
+      "description": "The SSH host the server resolved to."
+    },
+    "run_id": {
+      "type": "string",
+      "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+    },
+    "exit_code": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "description": "The command's exit status; -1 when the sandbox itself could not run the command (stderr says why); null when the stream ended before the command's exit was known, in which case whether it finished is unknown."
+    },
+    "timed_out": {
+      "type": "boolean",
+      "description": "The command's own timeout ended it."
+    },
+    "duration_ms": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "stdout": {
+      "type": "string",
+      "description": "The command's standard output, at most 1 MiB. Text: each byte that is not valid UTF-8 is U+FFFD, and stdout_base64 then holds the stream itself."
+    },
+    "stderr": {
+      "type": "string",
+      "description": "The command's standard error, at most 1 MiB. Text: each byte that is not valid UTF-8 is U+FFFD, and stderr_base64 then holds the stream itself."
+    },
+    "stdout_base64": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9+/]*={0,2}$",
+      "description": "Only when stdout holds bytes that are not valid UTF-8: the stream byte for byte, in base64 (at most 1 MiB decoded). Absent means stdout is already byte for byte."
+    },
+    "stderr_base64": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9+/]*={0,2}$",
+      "description": "Only when stderr holds bytes that are not valid UTF-8: the stream byte for byte, in base64 (at most 1 MiB decoded). Absent means stderr is already byte for byte."
+    },
+    "truncated": {
+      "type": "boolean",
+      "description": "A stream was longer than the capture and was cut."
+    }
+  }
+}

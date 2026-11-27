@@ -11,7 +11,8 @@ the operator-facing version.
 
 Exit codes are stable and minimal: `0` success, `1` command failure. `2`
 is reserved as `teploy drift --exit-code`'s CI signal and is never used
-by other commands (`doctor` fails with 1, never 2).
+by other commands (`doctor` fails with 1, never 2). One command is the
+exception: `teploy sandbox exec`, below.
 
 Under `--json`, a failed command additionally writes one JSON document to
 **stderr** (stdout keeps only successful output):
@@ -25,17 +26,31 @@ The closed code taxonomy:
 | Code | Meaning | Wired today |
 |---|---|---|
 | `config-invalid` | Config (teploy.yml/TOML/destination/Compose) failed to load or validate, or a deploy request was refused before any effect (admission) | Yes — config errors and deploy admission refusals |
-| `conflict` | The request is coherent but the world moved under it (plan/apply drift refusal) | Yes |
+| `conflict` | The request is coherent but the world moved under it (plan/apply drift refusal) | Yes — plan/apply drift, a config changed since it was read, a sandbox in the wrong state for a request |
 | `internal` | Everything else, including not-yet-migrated failure sites | Yes (default) |
 | `target-unreachable` | SSH/transport failure | Reserved — currently classifies as `internal` |
-| `unsupported` | The verb needs a capability this binary lacks | Reserved |
-| `uncertain-outcome` | The effect's fate is unknown pending reconciliation | Reserved |
+| `unsupported` | The verb needs a capability this binary lacks | Yes — the sandbox engine is not installed on the server, not running, or without the driver asked for; a CLI build with no pinned hash for the engine release it would install |
+| `uncertain-outcome` | The effect's fate is unknown pending reconciliation | Yes — an interrupted command, a cloud server purchase whose outcome could not be established, a sandbox create, fork or exec whose outcome is unknown |
 | `degraded` | Success with a flag — traffic switched but the outcome is not clean | Reserved |
+| `command-failed` | A command run by `teploy sandbox exec` exited nonzero, or its timeout ended it | Yes — `sandbox exec` only |
 
 Reserved means the code exists in the schema and consumers must decode it,
 but no error site classifies into it yet; treat an unknown code as
 `internal` (forward-safe). Machine consumers: stderr is the error channel,
 stdout is data, and the exit code stays the pass/fail signal.
+
+`teploy sandbox exec` is the one command whose exit code is not that
+signal. It exits with the **command's** status, as `ssh` does: `0` when the
+command exited 0, and the status the command exited with otherwise (one its
+`--timeout` ended exits 124). When teploy itself fails (the engine cannot be
+reached or refused the exec, the stream ended before the exit was known,
+the invocation was wrong), it exits `255`. So a script that runs a command
+in a sandbox gets its status, and `255` always means teploy, with one
+limit: a command that itself exits 255 looks the same by status alone.
+Under `--json` the classes tell them apart (`command-failed` is the
+command; anything else is teploy). A command exiting 2 is passed on like
+any other: a script that must tell drift's 2 from a command's 2 knows
+which command it ran.
 
 A note on honest outcomes: a deploy whose traffic switched but whose
 predecessor retirement partially failed is recorded in `teploy log` as

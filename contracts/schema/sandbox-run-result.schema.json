@@ -1,0 +1,165 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://teploy.github.io/contracts/schema/sandbox-run-result.schema.json",
+  "title": "`teploy sandbox new|stop|resume|fork --json` (rev 23, sandbox-v1): one sandbox as the engine on the server reports it. Failures use the error envelope on stderr and never emit this shape.",
+  "type": "object",
+  "required": [
+    "machine_interface",
+    "server",
+    "host",
+    "run"
+  ],
+  "properties": {
+    "machine_interface": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "server": {
+      "type": "string",
+      "description": "The server as the command was given it (--host)."
+    },
+    "host": {
+      "type": "string",
+      "description": "The SSH host the server resolved to."
+    },
+    "run": {
+      "$ref": "#/$defs/run"
+    }
+  },
+  "$defs": {
+    "run": {
+      "type": "object",
+      "required": [
+        "id",
+        "image",
+        "network",
+        "user",
+        "state",
+        "created_at",
+        "expires_at",
+        "on_expire",
+        "usage"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$",
+          "description": "A 26-character ULID: the sandbox's identity for its whole life (stop and resume keep it)."
+        },
+        "image": {
+          "type": "string",
+          "description": "What the sandbox was created from."
+        },
+        "network": {
+          "type": "string",
+          "description": "none, allowlist or open. A value not listed here is passed through as the engine reported it."
+        },
+        "user": {
+          "type": "string",
+          "description": "The account commands run as in the sandbox: root, or the engine's sandbox user."
+        },
+        "state": {
+          "type": "string",
+          "description": "running or stopped. A consumer must treat any other value as not finished, and ask again."
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "expires_at": {
+          "type": "string",
+          "format": "date-time",
+          "description": "The running deadline. A stopped run ignores it (retain_until governs it instead)."
+        },
+        "on_expire": {
+          "type": "string",
+          "description": "destroy or stop: what the engine does with the sandbox at expires_at."
+        },
+        "labels": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "The run's labels. The CLI adds one of its own to every sandbox it makes (teploy.cli-run), which is how a create whose answer was lost is found again."
+        },
+        "usage": {
+          "$ref": "#/$defs/usage"
+        },
+        "stopped_at": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Only while stopped."
+        },
+        "retain_until": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Only while stopped: when the engine deletes the sandbox and its filesystem."
+        },
+        "forked_from": {
+          "type": "string",
+          "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$",
+          "description": "Only on a fork: the sandbox it was started from."
+        },
+        "lease": {
+          "$ref": "#/$defs/lease"
+        }
+      }
+    },
+    "usage": {
+      "type": "object",
+      "required": [
+        "running_sec"
+      ],
+      "description": "What the engine has measured. A measure the engine did not take is absent, never zero: a consumer must not read its absence as 0.",
+      "properties": {
+        "running_sec": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Seconds spent running, summed across stop and resume."
+        },
+        "cpu_seconds": {
+          "type": "number",
+          "minimum": 0
+        },
+        "rx_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "tx_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "disk_bytes": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "The latest observed size of what the sandbox has written: a level, not a running total."
+        },
+        "sampled_at": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    },
+    "lease": {
+      "type": "object",
+      "required": [
+        "holder",
+        "generation",
+        "expires_at"
+      ],
+      "properties": {
+        "holder": {
+          "type": "string"
+        },
+        "generation": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "expires_at": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    }
+  }
+}

@@ -33,6 +33,7 @@
     "releases-json-v1",
     "repair-debt",
     "rollback-json-v1",
+    "sandbox-v1",
     "secret-stdin-v1",
     "server-audit-v1",
     "server-rename",

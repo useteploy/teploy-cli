@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://teploy.github.io/contracts/schema/sandbox-destroy-result.schema.json",
+  "title": "`teploy sandbox rm --yes --json` (rev 23, sandbox-v1): the sandbox that was destroyed. Failures use the error envelope on stderr and never emit this shape.",
+  "type": "object",
+  "required": [
+    "machine_interface",
+    "server",
+    "host",
+    "run_id"
+  ],
+  "properties": {
+    "machine_interface": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "server": {
+      "type": "string",
+      "description": "The server as the command was given it (--host)."
+    },
+    "host": {
+      "type": "string",
+      "description": "The SSH host the server resolved to."
+    },
+    "run_id": {
+      "type": "string",
+      "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$"
+    }
+  }
+}

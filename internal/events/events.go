@@ -123,6 +123,8 @@ const (
 	KindBackupDetach   = "backup.detach"
 	KindServerTools    = "server.tools_install"
 	KindServerBinary   = "server.binary_upgrade"
+	// `teploy sandbox host` installed, upgraded or started the sandbox engine.
+	KindSandboxHost = "sandbox.host"
 )
 
 // detailAllow is the per-kind allowlist of detail keys. Env and secret
@@ -166,6 +168,7 @@ var detailAllow = map[string][]string{
 	KindBackupDetach:   {"status", "pid", "log", "error"},
 	KindServerTools:    {"installed", "failed", "error"},
 	KindServerBinary:   {"from", "to", "error"},
+	KindSandboxHost:    {"action", "version", "from", "error"},
 }
 
 // maxErrorDetail bounds the "error" detail so a command's full stderr

@@ -1,0 +1,12 @@
+{
+  "machine_interface": 2,
+  "server": "prod",
+  "host": "203.0.113.10",
+  "run_id": "01JCV5ZK3Q7X9B2D4E6F8A0B00",
+  "exit_code": 3,
+  "timed_out": false,
+  "duration_ms": 0,
+  "stdout": "",
+  "stderr": "",
+  "truncated": false
+}

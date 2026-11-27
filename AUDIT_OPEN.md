@@ -1,5 +1,146 @@
 # Open audit items
 
+## 2026-11-25 — `teploy sandbox` (early access, self-hosted)
+
+Branch `feat/sandbox-command`. `teploy sandbox host|new|ls|exec|cp|stop|resume|fork|rm`,
+capability `sandbox-v1`, contracts rev 23. Companion: the release workflow on
+teploy-sandbox (PR #16), which is where `host` installs the engine from.
+
+**The mechanism reused.** teploy-ship talks to the daemon over plain HTTP with
+`Authorization: Bearer <token>`, the token read from a file on the sandbox host
+(`SHIP_SANDBOX_URL` + `SHIP_SANDBOX_TOKEN`, `src/durable.ts`). The CLI speaks that
+same HTTP API with the same bearer token (`internal/sandbox`, written against
+`docs/wire-contract.md`), and adds only the road: an SSH `direct-tcpip` channel to the
+engine's loopback address (`ssh.Forwarder.ForwardDial`). There is no second way to
+talk to the daemon.
+
+Decisions worth reviewing:
+
+- **A tunnel, not a remote exec.** Ship's model is HTTP to the daemon. A tunnel keeps
+  it that (the same requests, the SSE exec stream, raw file bodies) without curl on
+  the server and without the token in a remote argv. Cost: sshd must allow TCP
+  forwarding (its default); one that does not is told apart (`ssh.ForwardRefused`).
+- **The token** is read over SSH (`cat`, or `sudo -n cat` for a non-root user) and
+  sent only in the Authorization header. It is in no error, output or log (pinned by
+  test). The path is the unit's `--token-file`, not the daemon's default
+  (`/var/lib/teploy-sandbox/token`, where ship's docs put it, vs
+  `/deployments/sandbox/token`): the unit passes it explicitly.
+- **A create and a fork are never sent twice** (the contract's retry rule). A lost
+  answer is `uncertain-outcome`, and every run the CLI makes carries the label
+  `teploy.cli-run=<12 hex>` so it can be found by `ls`. A fork gets its own label.
+- **`exec` quotes each word after the `--`**, so arguments arrive as this shell
+  received them. `teploy exec` joins with spaces instead (the ssh model); joining
+  here would have turned `printf "%s\n" "a b"` into something else.
+- **`stop` and `resume` of a sandbox already in that state succeed**: the contract
+  says a repeat is a 409 and to read the run to confirm.
+- **`rm` asks first; `--json` needs `--yes`** there and on `host`.
+- **Error taxonomy.** Four sites migrated and one code added: the engine unavailable
+  (not installed, not running, without the driver asked for, or with no hash pinned in
+  this CLI build for the release `host` would install) is `unsupported`; the engine's 409
+  is `conflict`; an unknown outcome is `uncertain-outcome`; a command run by `exec` that
+  exited nonzero, or whose timeout ended it, is `command-failed`. The rest of those sites
+  stay internal (S2 list unchanged).
+- **`exec`'s exit status is the command's** (0, or the status it exited with; 124 when
+  its timeout ended it), and 255 for a failure of teploy's own. It is the one command
+  whose status is not 0/1/2 (D10), by review: a caller that runs a command wants its
+  status, and must never read teploy's failure as the command's exit. A command that
+  itself exits 255 looks the same by status alone; under `--json` the classes differ.
+- **`host` downloads the release on the operator's machine and uploads it**
+  (`installTeployRelease`'s pipeline: checksum, a staged candidate run once on the
+  server, then an atomic publish under flock), not with curl on the server.
+- **The unit** runs as root (the engine drives Docker and reads the host's /proc),
+  listens on `127.0.0.1:7439` only, and carries a marker. A unit without the marker
+  is never replaced, nor is anything already at that address.
+- **The pinned release is `v0.1.0`**, a guess at the first teploy-sandbox tag. It is
+  one constant (`sandboxEngineVersion`), and `sandboxEngineSHA256` beside it is the
+  SHA-256 of each platform's binary. The download is checked against that, then against
+  the release's checksums.txt: a binary and the checksums beside it can be replaced
+  together, the table cannot.
+- **What a restart costs is the engine's own rule** (its README, "Surviving a restart"):
+  the running sandboxes made with `--on-expire stop` are stopped and kept, every other
+  running one is destroyed, and every command still running in one is cut off. The
+  prompt says so with the counts.
+
+Closed (2026-11-27): teploy-sandbox `v0.1.0` is published (immutable release, `v*`
+tag ruleset) and its two hashes are pinned in `sandboxEngineSHA256`. Both binaries
+were rebuilt from the tag with go1.26.11 and the release workflow's flags and came out
+byte-identical to the release's.
+
+Open / deferred:
+
+- **Not exercised live.** No server was touched. The systemd unit, the release
+  download and the tunnel are verified by tests only: an in-process SSH server for
+  the forward, a mock executor for the server's commands, and an engine in-process
+  for the wire. The first run against a real server is still to do; the unit's
+  `After=docker.service`, the non-root sudo path and the journal read are the parts
+  most likely to differ there.
+- **No systemd sandboxing on the unit** (no `ProtectSystem`, `NoNewPrivileges`): the
+  engine drives Docker, so it is root-equivalent whatever the unit says, and each
+  directive risks a path that cannot be exercised without a systemd host. The loopback
+  bind is what keeps it in.
+- **A daemon teploy-ship set up on the same server** (a unit without the marker,
+  listening on `0.0.0.0:7439`) makes `host` refuse, and a second engine cannot take
+  the default port. The other commands can use that daemon with `--addr` and
+  `--token-file`. `--addr` has to be the server's loopback, as an IP (the engine speaks
+  plain HTTP, so the bearer token would travel to any other address unencrypted):
+  another address, or a name, needs `--allow-remote-addr` too.
+- **Not exposed:** recoverable execs (`X-Exec-Id`; `exec` streams, and a stream that
+  dies is an unknown outcome), leases, snapshots, the warm cache, remote storage, and
+  the access routes (published ports, SSH). `cp` is one file.
+- **The vm driver** is not installed by `host`; `--driver vm` is an opt-in for a
+  server already running it, and no VM setting is exposed.
+- **Upgrading the engine restarts it** (no container outlives its daemon; there is no
+  drain). The prompt says what that costs and counts it. The binary an upgrade replaces
+  is kept as `teploy-sandbox.prev` and put back, with the service restarted, if the new
+  engine does not answer; the same for a service file the run rewrote. The `.prev` copy
+  stays after a good upgrade (root-owned, about as large as the engine) for a rollback
+  by hand.
+- **`host` reads the service file** to tell whether it is as this CLI writes it, and
+  rewrites it when it differs (`action: repair`), restarting the engine only then. What
+  systemd runs is that file and its drop-ins together, so a service with a drop-in
+  (`teploy-sandbox.service.d/*.conf`) is refused with nothing changed rather than called
+  up to date.
+- **`exec` output is byte-exact** (review of 2026-11-26): the engine is asked for
+  `outputEncoding: base64`, which it speaks from its first release, and the chunks
+  are decoded here. Under `--json` a stream that is not valid UTF-8 is given as
+  `stdout_base64`/`stderr_base64` beside its text (JSON strings are UTF-8). Only an
+  engine that reports a release at or after `v0.1.0` is asked: one that reports no
+  version may predate the field and would answer in text, which cannot be told from
+  base64 in general, so it gets text, as before. A release engine that answers in
+  text anyway is an unknown outcome, never output read as something it is not.
+- **teploy-dash's contracts job** pins an older corpus revision, and its expectation
+  table (`ci/validate-contracts.mjs`) must gain the six `sandbox-*` artifacts (and the
+  rev 22 `cloud-*` ones, which it lacks too) when the pin moves to rev 23. Not done
+  here: that is dash's repo.
+- **`ls` makes three requests** (health, the list, capacity for the driver), and
+  `rm` reads the run before destroying it.
+- **The health wait after a start is 30 s**, not a flag.
+
+Review of 2026-11-26 (the three tests the review wrote are in
+`sandbox_review_test.go`, as written): the exec document is printed only once the engine
+took the command (a refusal prints the error envelope alone; a lost answer and a 200 that
+is not a stream are the unknown outcome, where they were internal with a document saying
+"unknown"); `exec`'s exit status; `--addr` on the loopback only; the pinned hashes; the
+restart rule in the prompt; `.prev` kept and put back; the service file staged in the
+run's private `mktemp -d` directory with the binary, not at a fixed `/tmp` path; the
+service file rewritten when it differs; no empty "from" for a missing binary; `/work/…`
+as the work root; `cp` out keeping an existing file's mode; byte-exact output.
+
+Verified: unit/hermetic only. Command parsing and validation (nothing connects for a
+refused request); the API client against an httptest engine (the wire's field names,
+problem answers, a create sent once when its answer is lost, the SSE stream: split
+chunks, raw carriage returns, unknown events, a stream that dies); the forward against
+an in-process SSH server (loopback, refused, prohibited, bounded by its context,
+net/http over it, ends with the connection); every command over a mock SSH connection
+to an engine in-process (what is sent, what is printed, the `--json` documents); each
+way the engine cannot be reached; `host` in each of its four outcomes and in fifteen
+refusals (five it changes nothing on, five servers it cannot install on, five releases
+it cannot trust), with nothing changed on a refusal; the schemas against their fixtures
+with the validator dash pins (ajv 8.17.1). Mutations checked to fail their test: a
+public bind in the unit, a skipped checksum, a publish before the candidate ran, a
+skipped driver check, an unhonoured proxy, a followed redirect, the frame bug in the
+SSE reader.
+
 ## 2026-11-06 — Dash simple backup setup CLI
 
 Plan: `../_internal/DASH_SIMPLE_SETUP_PLAN_2026-11-06.md`. Branch `backup-setup`.

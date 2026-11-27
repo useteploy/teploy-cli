@@ -1,0 +1,54 @@
+{
+  "machine_interface": 2,
+  "server": "prod",
+  "host": "203.0.113.10",
+  "driver": "docker",
+  "runs": [
+    {
+      "id": "01JCV5ZK3Q7X9B2D4E6F8A0B00",
+      "image": "alpine:3.20",
+      "network": "allowlist",
+      "user": "ship",
+      "state": "running",
+      "created_at": "2026-11-25T16:00:00Z",
+      "expires_at": "2026-11-25T16:30:00Z",
+      "on_expire": "destroy",
+      "labels": {
+        "team": "x",
+        "teploy.cli-run": "3f9a1c0b7d2e"
+      },
+      "usage": {
+        "running_sec": 60,
+        "cpu_seconds": 1.5,
+        "rx_bytes": 2048,
+        "tx_bytes": 4096,
+        "disk_bytes": 1048576,
+        "sampled_at": "2026-11-25T16:00:00Z"
+      }
+    },
+    {
+      "id": "01JCV5ZK3Q7X9B2D4E6F8A0B01",
+      "image": "alpine:3.20",
+      "network": "none",
+      "user": "root",
+      "state": "stopped",
+      "created_at": "2026-11-25T16:00:00Z",
+      "expires_at": "2026-11-25T16:30:00Z",
+      "on_expire": "stop",
+      "labels": {
+        "a": "1"
+      },
+      "usage": {
+        "running_sec": 300
+      },
+      "stopped_at": "2026-11-25T17:00:00Z",
+      "retain_until": "2026-12-09T16:00:00Z",
+      "forked_from": "01JCV5ZK3Q7X9B2D4E6F8A0B00",
+      "lease": {
+        "holder": "ship:run-1",
+        "generation": 2,
+        "expires_at": "2026-11-25T16:10:00Z"
+      }
+    }
+  ]
+}

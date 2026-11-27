@@ -9,6 +9,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/useteploy/teploy/internal/config"
+	"github.com/useteploy/teploy/internal/sandbox"
 )
 
 // Structured error envelope for machine mode (X02 §2.3, S3-lite wiring).
@@ -18,7 +19,10 @@ import (
 // from the data channel — while stdout keeps carrying only successful
 // output. Exit codes stay 0/1/2 exactly (D10): the envelope is the
 // detail channel, not a new exit signal. Without --json the historical
-// plain-text stderr line is unchanged.
+// plain-text stderr line is unchanged. One command is the exception, by
+// review: `teploy sandbox exec` exits with the command's own status and
+// with 255 for a failure of its own, since a caller that runs a command
+// wants its status (exitStatus, root.go); its envelope is as everywhere.
 
 // Machine error codes — closed taxonomy v1 (X02 §2.3). Consumers must
 // treat an unknown code as internal (forward-safe). Codes marked
@@ -34,10 +38,15 @@ const (
 	// internal).
 	codeTargetUnreachable = "target-unreachable"
 	// The requested verb needs a capability this binary lacks; names the
-	// remedy (UNMIGRATED: currently internal).
+	// remedy. Migrated for the sandbox engine only (not installed on the
+	// server, its service not running, without the driver asked for, or
+	// with no hash pinned in this CLI build for the release `sandbox host`
+	// would install); every other site stays internal until its migration.
 	codeUnsupported = "unsupported"
-	// Idempotency/ambiguity refusal — e.g. the ambiguous-preview class
-	// (UNMIGRATED: currently internal).
+	// Idempotency/ambiguity refusal — e.g. the ambiguous-preview class.
+	// Migrated for a plan/apply drift, a config conflict and a sandbox in
+	// the wrong state (the engine's 409); every other site stays internal
+	// until its migration.
 	codeConflict = "conflict"
 	// The effect's fate is unknown pending reconciliation; never
 	// rendered or recorded as failure. Wired for interrupted commands
@@ -47,6 +56,11 @@ const (
 	// Success with a flag — traffic switched but the outcome is not
 	// clean (UNMIGRATED: currently internal).
 	codeDegraded = "degraded"
+	// A command run by `teploy sandbox exec` did not end well: it exited
+	// nonzero, or its timeout ended it. It is the command's outcome, not a
+	// failure of teploy's (those stay `internal` here and exit 255), and
+	// teploy exits with the command's own status.
+	codeCommandFailed = "command-failed"
 	// Everything else, and every failure whose site has not been
 	// migrated to a specific code yet.
 	codeInternal = "internal"
@@ -96,14 +110,25 @@ func refuseAdmission(err error) error {
 // crash-window machinery treats every interrupted window as INSPECT),
 // which is precisely the class automation must not render as a plain
 // failure. A `cloud server create` whose request outcome could not be
-// established (errCloudPurchaseUnknown) is the same class. Everything else
-// is internal until its site is migrated (S2 generalization).
+// established (errCloudPurchaseUnknown) is the same class, and so is a
+// sandbox create, fork or exec whose outcome could not be known
+// (errSandboxOutcomeUnknown). A sandbox engine that cannot serve a request
+// (not installed, not running, or without the driver asked for), and a CLI
+// build with no hash pinned for the engine release it would install, are
+// unsupported. Everything else is internal until its site is migrated (S2
+// generalization).
 func classifyMachineError(err error) string {
+	var command *sandboxCommandError
 	switch {
-	case errors.Is(err, errPlanDrift), errors.Is(err, errConfigConflict):
+	case errors.As(err, &command):
+		return codeCommandFailed
+	case errors.Is(err, errPlanDrift), errors.Is(err, errConfigConflict),
+		sandbox.IsConflict(err), errors.Is(err, errSandboxWrongState):
 		return codeConflict
+	case errors.Is(err, errSandboxEngineUnavailable):
+		return codeUnsupported
 	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded),
-		errors.Is(err, errCloudPurchaseUnknown):
+		errors.Is(err, errCloudPurchaseUnknown), errors.Is(err, errSandboxOutcomeUnknown):
 		return codeUncertainOutcome
 	case errors.Is(err, config.ErrInvalidConfig),
 		errors.Is(err, config.ErrNoConfig),
@@ -118,7 +143,13 @@ func classifyMachineError(err error) string {
 func writeMachineErrorEnvelope(out io.Writer, err error) error {
 	code := classifyMachineError(err)
 	message := "command failed"
+	var command *sandboxCommandError
 	switch code {
+	case codeCommandFailed:
+		message = "the command did not end well"
+		if errors.As(err, &command) && command.envelopeMessage != "" {
+			message = command.envelopeMessage
+		}
 	case codeConfigInvalid:
 		message = "invalid teploy configuration"
 		if errors.Is(err, errDeployAdmission) {
@@ -129,10 +160,21 @@ func writeMachineErrorEnvelope(out io.Writer, err error) error {
 		if errors.Is(err, errConfigConflict) {
 			message = "config changed since it was read"
 		}
+		if sandbox.IsConflict(err) || errors.Is(err, errSandboxWrongState) {
+			message = "the sandbox is in the wrong state for this request"
+		}
+	case codeUnsupported:
+		message = "the sandbox engine cannot serve this request on this server"
+		if errors.Is(err, errSandboxUnpinned) {
+			message = "this CLI build has no pinned hash for the sandbox engine release it would install"
+		}
 	case codeUncertainOutcome:
 		message = "interrupted — outcome unknown until reconciled"
 		if errors.Is(err, errCloudPurchaseUnknown) {
 			message = "server purchase outcome unknown — check `teploy cloud servers`"
+		}
+		if errors.Is(err, errSandboxOutcomeUnknown) {
+			message = "sandbox request outcome unknown — list the sandboxes before trying again"
 		}
 	}
 	return json.NewEncoder(out).Encode(machineErrorEnvelope{
@@ -144,7 +186,7 @@ func writeMachineErrorEnvelope(out io.Writer, err error) error {
 }
 
 // reportExecutionError renders a failed root invocation's error the way
-// Execute does before exiting 1: the machine envelope under --json, the
+// Execute does before exiting: the machine envelope under --json, the
 // plain error text otherwise. A flag-parse failure never reaches parsed
 // --json state and keeps the plain form.
 func reportExecutionError(root *cobra.Command, err error, out io.Writer) {
