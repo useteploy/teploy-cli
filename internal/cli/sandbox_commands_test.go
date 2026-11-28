@@ -91,7 +91,7 @@ func TestSandboxList(t *testing.T) {
 func TestSandboxNew(t *testing.T) {
 	h := newInstalledSandboxHarness(t)
 	err := h.run("new", "--image", "alpine:3.20", "--ttl", "2h", "--network", "allowlist", "--env", "CI=true",
-		"--cpus", "1.5", "--memory-mb", "512", "--pids", "64", "--user", "root", "--label", "team=x", "--on-expire", "stop")
+		"--cpus", "1.5", "--memory-mb", "512", "--pids", "64", "--run-as", "root", "--label", "team=x", "--on-expire", "stop")
 	if err != nil {
 		t.Fatal(err)
 	}

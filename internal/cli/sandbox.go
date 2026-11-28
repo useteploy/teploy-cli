@@ -285,9 +285,7 @@ func (e *sandboxTokenError) Unwrap() error { return e.err }
 // travels only inside the SSH connection, and then only in an
 // Authorization header: it is never printed, logged, or put in an error.
 func readSandboxToken(ctx context.Context, link ssh.Forwarder, tokenFile string) (string, error) {
-	out, err := link.Run(ctx, fmt.Sprintf(
-		`f=%s; if [ ! -e "$f" ]; then printf '%s\n'; elif [ "$(id -u)" = 0 ]; then cat -- "$f"; else sudo -n cat -- "$f"; fi`,
-		ssh.ShellQuote(tokenFile), sandboxTokenMarker))
+	out, err := link.Run(ctx, sandboxTokenCommand(tokenFile))
 	if err != nil {
 		return "", &sandboxTokenError{err: fmt.Errorf("reading the engine's token from %s needs root or passwordless sudo: %w", tokenFile, err)}
 	}
@@ -296,6 +294,18 @@ func readSandboxToken(ctx context.Context, link ssh.Forwarder, tokenFile string)
 		return "", errSandboxTokenMissing
 	}
 	return token, nil
+}
+
+// sandboxTokenCommand prints the token file, or sandboxTokenMarker when
+// it is not there. The test for "there" runs with the same privilege as
+// the read: the engine keeps its token in a root-only directory, so a
+// user with passwordless sudo cannot even see that the file exists, and
+// testing as that user called every installed engine "not installed".
+// A sudo that asks for a password fails the command (it is not "absent").
+func sandboxTokenCommand(tokenFile string) string {
+	read := fmt.Sprintf(`if [ -e "$1" ]; then cat -- "$1"; else printf '%%s\n' %s; fi`, sandboxTokenMarker)
+	return fmt.Sprintf(`f=%s; if [ "$(id -u)" = 0 ]; then sh -c %s sh "$f"; else sudo -n sh -c %s sh "$f"; fi`,
+		ssh.ShellQuote(tokenFile), ssh.ShellQuote(read), ssh.ShellQuote(read))
 }
 
 // engineProbe is what the server says about the engine when asked.
@@ -810,7 +820,7 @@ func newSandboxNewCmd(flags *Flags, env *sandboxEnv) *cobra.Command {
 	cmd.Flags().Float64Var(&o.cpus, "cpus", 0, "CPUs the sandbox may use (default 1)")
 	cmd.Flags().IntVar(&o.memoryMB, "memory-mb", 0, "memory in MiB (default 1024)")
 	cmd.Flags().IntVar(&o.pids, "pids", 0, "processes the sandbox may have (default 256)")
-	cmd.Flags().StringVar(&o.user, "user", "", "run as root instead of the image's sandbox user: default (or empty) or root")
+	cmd.Flags().StringVar(&o.user, "run-as", "", "the user commands run as in the sandbox: default (the image's sandbox user) or root. --user is the SSH user, as everywhere else")
 	cmd.Flags().StringArrayVar(&o.labels, "label", nil, "KEY=VALUE label on the run (repeatable, at most 15)")
 	cmd.Flags().StringVar(&o.driver, "driver", "docker", "docker (default), or vm to opt into the experimental vm driver")
 	cmd.Flags().StringVar(&o.onExpire, "on-expire", "", "at the ttl: destroy the sandbox (default) or stop it and keep its filesystem")
@@ -853,7 +863,7 @@ func (o sandboxNewOptions) request(mintLabel func() (string, error)) (sandbox.Cr
 	case "root":
 		req.User = "root"
 	default:
-		return req, "", fmt.Errorf("--user must be default or root (got %q)", o.user)
+		return req, "", fmt.Errorf("--run-as must be default or root (got %q)", o.user)
 	}
 	if len(o.labels) > maxSandboxUserLabels {
 		return req, "", fmt.Errorf("at most %d --label: the engine takes 16 and the CLI adds one of its own", maxSandboxUserLabels)
