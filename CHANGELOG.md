@@ -4,6 +4,8 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
 
 ## [Unreleased]
 
+## [0.1.56] - 2026-11-27
+
 ### Added
 
 - `teploy cloud`: connects the CLI to Teploy Cloud (https://cloud.teploy.com).
