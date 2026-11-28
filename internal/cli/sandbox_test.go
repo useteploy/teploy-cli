@@ -83,7 +83,7 @@ func TestSandboxNewValidatesItsFlags(t *testing.T) {
 		{[]string{"new", "--image", "alpine", "--label", "x"}, `--label "x" is not KEY=VALUE`},
 		{[]string{"new", "--image", "alpine", "--cpus", "-1"}, "must not be negative"},
 		{[]string{"new", "--image", "alpine", "--memory-mb", "-5"}, "must not be negative"},
-		{[]string{"new", "--image", "alpine", "--user", "admin"}, "--user must be default or root"},
+		{[]string{"new", "--image", "alpine", "--run-as", "admin"}, "--run-as must be default or root"},
 		{[]string{"new", "--image", "alpine", "--on-expire", "pause"}, "--on-expire must be destroy or stop"},
 		{[]string{"new", "--image", "alpine", "--driver", "firecracker"}, "--driver must be docker, or vm"},
 		{[]string{"new", "--image", "alpine", "--addr", "http://127.0.0.1:7439"}, "is not host:port"},

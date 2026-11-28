@@ -42,7 +42,9 @@ All notable changes to teploy are documented here. Format follows [Keep a Change
   `uncertain-outcome`; a command run by `exec` that exited nonzero is `command-failed`.
   `exec` exits with the command's own status (255 when teploy itself fails), and its
   output is the command's, byte for byte. `--addr` names the server's loopback; another
-  address needs `--allow-remote-addr`. Every `--json` document carries
+  address needs `--allow-remote-addr`. `new --run-as root` runs commands as root in a
+  sandbox; `--user` is the SSH user, as on every command, and a non-root SSH user needs
+  passwordless sudo. Every `--json` document carries
   `machine_interface` (capability `sandbox-v1`, contracts corpus rev 23). docs/sandbox.md.
   `host` needs a published teploy-sandbox release for the version it pins, and that
   release's hashes in the CLI (`sandboxEngineSHA256`).

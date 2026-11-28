@@ -17,7 +17,7 @@ teploy sandbox rm 01JCV5ZK3Q7X9B2D4E6F8A0B1C --host prod
 
 ## What a sandbox is
 
-A sandbox is a container the engine starts from a Docker image on the server. It gets its own filesystem and network namespace. It has no network unless you ask for one (`--network allowlist` or `--network open`), and it is destroyed when its TTL passes (30 minutes by default, 24 hours at most) unless you stop it first or asked for `--on-expire stop`. Commands run in it through `sh -c` in `/work`, as the image's `ship` user when it has one and as root otherwise (`--user root` forces root). It may use 1 CPU, 1024 MiB and 256 processes unless you say otherwise (`--cpus`, `--memory-mb`, `--pids`).
+A sandbox is a container the engine starts from a Docker image on the server. It gets its own filesystem and network namespace. It has no network unless you ask for one (`--network allowlist` or `--network open`), and it is destroyed when its TTL passes (30 minutes by default, 24 hours at most) unless you stop it first or asked for `--on-expire stop`. Commands run in it through `sh -c` in `/work`, as the image's `ship` user when it has one and as root otherwise (`--run-as root` forces root; `--user` is the SSH user, as on every command). It may use 1 CPU, 1024 MiB and 256 processes unless you say otherwise (`--cpus`, `--memory-mb`, `--pids`).
 
 Any Docker image works. The engine's own README documents the rest of what a run can be.
 
